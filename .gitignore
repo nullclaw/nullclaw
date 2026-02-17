@@ -1,0 +1,14 @@
+zig-out/
+zig-cache/
+.zig-cache/
+*.db
+*.db-journal
+.DS_Store
+.env
+.env.*
+!.env.example
+*.swp
+*~
+*.bak
+*.a
+reference/

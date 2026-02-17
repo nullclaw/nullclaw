@@ -1,0 +1,10 @@
+#!/bin/sh
+# pre-commit: enforce zig fmt on all source files.
+# Activate: git config core.hooksPath .githooks
+
+output=$(zig fmt --check src/ 2>&1)
+if [ $? -ne 0 ]; then
+    echo "zig fmt check failed. Run: zig fmt src/"
+    echo "$output"
+    exit 1
+fi

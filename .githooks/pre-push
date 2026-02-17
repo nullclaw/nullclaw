@@ -1,0 +1,10 @@
+#!/bin/sh
+# pre-push: run the full test suite before pushing.
+# Activate: git config core.hooksPath .githooks
+
+echo "Running tests..."
+zig build test --summary all 2>&1
+if [ $? -ne 0 ]; then
+    echo "Tests failed. Fix before pushing."
+    exit 1
+fi

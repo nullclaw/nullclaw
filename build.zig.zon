@@ -1,0 +1,16 @@
+.{
+    .name = .nullclaw,
+    .version = "0.1.0",
+    .fingerprint = 0xe73e13d1c95956c2,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // SQLite — C library, linked via build.zig
+        // No Zig package deps yet; we use stdlib + C interop
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+    },
+}
