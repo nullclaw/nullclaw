@@ -213,14 +213,14 @@ const MockProvider = struct {
 
     fn mockChat(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        allocator: std.mem.Allocator,
         _: ChatRequest,
         model: []const u8,
         _: f64,
     ) anyerror!ChatResponse {
         const self: *MockProvider = @ptrCast(@alignCast(ptr));
         self.last_model = model;
-        return ChatResponse{ .content = self.response };
+        return ChatResponse{ .content = try allocator.dupe(u8, self.response) };
     }
 
     fn mockSupportsNativeTools(ptr: *anyopaque) bool {
@@ -471,6 +471,7 @@ test "vtable chat delegates with hint routing" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("write code")};
     const request = ChatRequest{ .messages = &msgs };
     const result = try prov.chat(std.testing.allocator, request, "hint:code", 0.5);
+    defer if (result.content) |c| std.testing.allocator.free(c);
     try std.testing.expectEqualStrings("smart-chat", result.contentOrEmpty());
     try std.testing.expectEqualStrings("codellama", mock_smart.last_model);
 }

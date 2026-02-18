@@ -67,7 +67,7 @@ pub const CodexCliProvider = struct {
     ) anyerror!ChatResponse {
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
         const content = try runCodex(allocator, prompt);
-        return ChatResponse{ .content = content, .model = "codex-cli" };
+        return ChatResponse{ .content = content, .model = try allocator.dupe(u8, "codex-cli") };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {

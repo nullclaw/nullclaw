@@ -212,7 +212,7 @@ pub const WsClient = struct {
         var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
         if (is_masked) try self.readExact(&mask_key);
 
-        if (payload_len > 64 * 1024 * 1024) return error.FrameTooLarge;
+        if (payload_len > 4 * 1024 * 1024) return error.FrameTooLarge;
 
         const plen: usize = @intCast(payload_len);
         const payload: []u8 = if (plen > 0) blk: {
@@ -339,6 +339,10 @@ pub const WsClient = struct {
             switch (frame.opcode) {
                 .text, .continuation => {
                     try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
                     if (frame.fin) return message.toOwnedSlice(self.allocator);
                 },
                 .ping => {}, // auto-handled inside readFrame

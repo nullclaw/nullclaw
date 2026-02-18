@@ -39,16 +39,22 @@ pub fn transcribeFile(
     file_path: []const u8,
     opts: TranscribeOptions,
 ) TranscribeError![]const u8 {
-    // Read audio file
-    const file_data = readFileData(allocator, file_path) catch return error.FileReadFailed;
-    defer allocator.free(file_data);
-
     // Generate random boundary (16 hex chars)
     const boundary = generateBoundary() catch return error.BoundaryGenerationFailed;
 
-    // Build multipart body
-    const body = buildMultipartBody(allocator, &boundary, file_data, opts) catch return error.OutOfMemory;
-    defer allocator.free(body);
+    // Build temp file path
+    var tmp_path_buf: [256]u8 = undefined;
+    var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
+    tmp_fbs.writer().print("/tmp/nullclaw_voice_{d}.bin", .{getPid()}) catch
+        return error.FileReadFailed;
+    const tmp_path_len = tmp_fbs.pos;
+    tmp_path_buf[tmp_path_len] = 0;
+    const tmp_path: [:0]const u8 = tmp_path_buf[0..tmp_path_len :0];
+
+    // Write multipart body directly to temp file (avoids holding file_data + body in memory)
+    writeMultipartToTempFile(tmp_path, file_path, &boundary, opts) catch
+        return error.FileReadFailed;
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
 
     // Build headers
     var content_type_buf: [128]u8 = undefined;
@@ -63,24 +69,17 @@ pub fn transcribeFile(
         return error.ApiRequestFailed;
     const auth_hdr = auth_fbs.getWritten();
 
-    // POST via curl (using curlPostRaw for multipart — no default Content-Type)
-    const resp = curlPostMultipart(
+    // POST via curl using --data-binary @tempfile
+    const resp = curlPostFromFile(
         allocator,
         "https://api.groq.com/openai/v1/audio/transcriptions",
-        body,
+        tmp_path,
         &.{ auth_hdr, content_type_hdr },
     ) catch return error.ApiRequestFailed;
     defer allocator.free(resp);
 
     // Parse {"text":"..."} from response
     return parseTranscriptionText(allocator, resp) catch return error.InvalidResponse;
-}
-
-/// Read entire file into memory (max 50 MB).
-fn readFileData(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
-    const file = try std.fs.openFileAbsolute(file_path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, 50 * 1024 * 1024);
 }
 
 /// Generate a random 32-character hex boundary string.
@@ -137,6 +136,58 @@ fn buildMultipartBody(
     return body.toOwnedSlice(allocator);
 }
 
+/// Write multipart/form-data directly to a temp file, streaming the audio file
+/// through without building the full body in memory.
+/// This avoids holding both file_data and multipart body in RAM simultaneously.
+fn writeMultipartToTempFile(
+    tmp_path: [:0]const u8,
+    audio_path: []const u8,
+    boundary: []const u8,
+    opts: TranscribeOptions,
+) !void {
+    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    defer tmp_file.close();
+
+    // Write file part header
+    try tmp_file.writeAll("--");
+    try tmp_file.writeAll(boundary);
+    try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
+
+    // Stream audio file directly (no intermediate buffer)
+    {
+        const audio_file = try std.fs.openFileAbsolute(audio_path, .{});
+        defer audio_file.close();
+        var buf: [32768]u8 = undefined;
+        while (true) {
+            const n = try audio_file.read(&buf);
+            if (n == 0) break;
+            try tmp_file.writeAll(buf[0..n]);
+        }
+    }
+    try tmp_file.writeAll("\r\n");
+
+    // Write model part
+    try tmp_file.writeAll("--");
+    try tmp_file.writeAll(boundary);
+    try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n");
+    try tmp_file.writeAll(opts.model);
+    try tmp_file.writeAll("\r\n");
+
+    // Write language part (optional)
+    if (opts.language) |lang| {
+        try tmp_file.writeAll("--");
+        try tmp_file.writeAll(boundary);
+        try tmp_file.writeAll("\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n");
+        try tmp_file.writeAll(lang);
+        try tmp_file.writeAll("\r\n");
+    }
+
+    // Closing boundary
+    try tmp_file.writeAll("--");
+    try tmp_file.writeAll(boundary);
+    try tmp_file.writeAll("--\r\n");
+}
+
 /// Parse the "text" field from a JSON response like {"text":"transcribed text here"}.
 fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_resp, .{}) catch
@@ -148,40 +199,18 @@ fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) !
     return try allocator.dupe(u8, text_val.string);
 }
 
-/// HTTP POST via curl subprocess without default Content-Type header.
-/// Used for multipart/form-data where Content-Type includes boundary.
-fn curlPostMultipart(
+/// HTTP POST via curl subprocess, reading body from a file on disk.
+/// Used for multipart/form-data where body has already been written to a temp file.
+fn curlPostFromFile(
     allocator: std.mem.Allocator,
     url: []const u8,
-    body: []const u8,
+    file_path: [:0]const u8,
     headers: []const []const u8,
 ) ![]u8 {
-    // Write body to a temp file to avoid argv size limits with binary data.
-    // Use --data-binary @file instead of -d.
-    var tmp_path_buf: [256]u8 = undefined;
-    var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
-    const pid = getPid();
-    try tmp_fbs.writer().print("/tmp/nullclaw_voice_{d}.bin", .{pid});
-    const tmp_path_slice = tmp_fbs.getWritten();
-
-    // Null-terminate for the OS
-    var tmp_path_z: [256]u8 = undefined;
-    @memcpy(tmp_path_z[0..tmp_path_slice.len], tmp_path_slice);
-    tmp_path_z[tmp_path_slice.len] = 0;
-    const tmp_path_sentinel: [:0]const u8 = tmp_path_z[0..tmp_path_slice.len :0];
-
-    // Write body to temp file
-    {
-        const tmp_file = try std.fs.createFileAbsolute(tmp_path_sentinel, .{});
-        defer tmp_file.close();
-        try tmp_file.writeAll(body);
-    }
-    defer std.fs.deleteFileAbsolute(tmp_path_sentinel) catch {};
-
-    // Build data-binary arg: @/tmp/...
+    // Build data-binary arg: @/path/to/file
     var data_arg_buf: [300]u8 = undefined;
     var data_fbs = std.io.fixedBufferStream(&data_arg_buf);
-    try data_fbs.writer().print("@{s}", .{tmp_path_slice});
+    try data_fbs.writer().print("@{s}", .{file_path});
     const data_arg = data_fbs.getWritten();
 
     var argv_buf: [32][]const u8 = undefined;

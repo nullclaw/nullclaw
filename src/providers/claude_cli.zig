@@ -77,7 +77,7 @@ pub const ClaudeCliProvider = struct {
         // Extract last user message as prompt
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
         const content = try runClaude(allocator, prompt, effective_model);
-        return ChatResponse{ .content = content, .model = effective_model };
+        return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {

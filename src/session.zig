@@ -222,13 +222,13 @@ const MockProvider = struct {
 
     fn mockChat(
         ptr: *anyopaque,
-        _: Allocator,
+        allocator: Allocator,
         _: providers.ChatRequest,
         _: []const u8,
         _: f64,
     ) anyerror!providers.ChatResponse {
         const self: *MockProvider = @ptrCast(@alignCast(ptr));
-        return .{ .content = self.response };
+        return .{ .content = try allocator.dupe(u8, self.response) };
     }
 
     fn mockSupportsNativeTools(_: *anyopaque) bool {

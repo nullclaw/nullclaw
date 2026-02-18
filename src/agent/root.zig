@@ -229,6 +229,16 @@ pub const Agent = struct {
             const max_len = @min(transcript.len, COMPACTION_MAX_SUMMARY_CHARS);
             return try self.allocator.dupe(u8, transcript[0..max_len]);
         };
+        // Free response's heap-allocated fields after extracting what we need
+        defer {
+            if (summary_resp.content) |c| {
+                if (c.len > 0) self.allocator.free(c);
+            }
+            if (summary_resp.model.len > 0) self.allocator.free(summary_resp.model);
+            if (summary_resp.reasoning_content) |rc| {
+                if (rc.len > 0) self.allocator.free(rc);
+            }
+        }
 
         const raw_summary = summary_resp.contentOrEmpty();
         const max_len = @min(raw_summary.len, COMPACTION_MAX_SUMMARY_CHARS);
@@ -413,7 +423,9 @@ pub const Agent = struct {
             const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
             defer self.allocator.free(tool_instructions);
 
-            const full_system = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ system_prompt, tool_instructions });
+            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
+            @memcpy(full_system[0..system_prompt.len], system_prompt);
+            @memcpy(full_system[system_prompt.len..], tool_instructions);
 
             try self.history.append(self.allocator, .{
                 .role = .system,
@@ -454,11 +466,13 @@ pub const Agent = struct {
         } };
         self.observer.recordEvent(&start_event);
 
-        // Tool call loop
+        // Tool call loop — reuse a single arena across iterations (retains pages)
+        var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer iter_arena.deinit();
+
         var iteration: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
-            var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer iter_arena.deinit();
+            _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
@@ -646,9 +660,10 @@ pub const Agent = struct {
                 // No tool calls — final response
                 const final_text = try self.allocator.dupe(u8, display_text);
 
+                // Dupe from display_text directly (not from final_text) to avoid double-dupe
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
-                    .content = try self.allocator.dupe(u8, final_text),
+                    .content = try self.allocator.dupe(u8, display_text),
                 });
 
                 // Auto-compaction before hard trimming to preserve context
@@ -668,6 +683,10 @@ pub const Agent = struct {
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
+
+                // Free provider response fields (content, tool_calls, model)
+                // All borrows have been duped into final_text and history at this point.
+                self.freeResponseFields(&response);
 
                 return final_text;
             }
@@ -699,6 +718,7 @@ pub const Agent = struct {
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
+            try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
 
             for (parsed_calls) |call| {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
@@ -732,6 +752,9 @@ pub const Agent = struct {
             });
 
             self.trimHistory();
+
+            // Free provider response fields now that all borrows are consumed.
+            self.freeResponseFields(&response);
         }
 
         return error.MaxToolIterationsExceeded;
@@ -808,6 +831,30 @@ pub const Agent = struct {
         return messages;
     }
 
+    /// Free heap-allocated fields of a ChatResponse.
+    /// Providers allocate content, tool_calls, and model on the heap.
+    /// After extracting/duping what we need, call this to prevent leaks.
+    fn freeResponseFields(self: *Agent, resp: *ChatResponse) void {
+        if (resp.content) |c| {
+            if (c.len > 0) self.allocator.free(c);
+        }
+        for (resp.tool_calls) |tc| {
+            if (tc.id.len > 0) self.allocator.free(tc.id);
+            if (tc.name.len > 0) self.allocator.free(tc.name);
+            if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
+        }
+        if (resp.tool_calls.len > 0) self.allocator.free(resp.tool_calls);
+        if (resp.model.len > 0) self.allocator.free(resp.model);
+        if (resp.reasoning_content) |rc| {
+            if (rc.len > 0) self.allocator.free(rc);
+        }
+        // Mark as consumed to prevent double-free
+        resp.content = null;
+        resp.tool_calls = &.{};
+        resp.model = "";
+        resp.reasoning_content = null;
+    }
+
     /// Trim history to prevent unbounded growth.
     /// Preserves the system prompt (first message) and the most recent messages.
     fn trimHistory(self: *Agent) void {
@@ -830,6 +877,11 @@ pub const Agent = struct {
         const src = self.history.items[start + to_remove ..];
         std.mem.copyForwards(OwnedMessage, self.history.items[start..], src);
         self.history.items.len -= to_remove;
+
+        // Shrink backing array if capacity is much larger than needed
+        if (self.history.capacity > self.history.items.len * 2 + 8) {
+            self.history.shrinkAndFree(self.allocator, self.history.items.len);
+        }
     }
 
     /// Run a single message through the agent and return the response.

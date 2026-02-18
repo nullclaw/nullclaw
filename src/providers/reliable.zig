@@ -605,7 +605,7 @@ const MockInnerProvider = struct {
 
     fn mockChat(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        allocator: std.mem.Allocator,
         _: ChatRequest,
         _: []const u8,
         _: f64,
@@ -615,7 +615,7 @@ const MockInnerProvider = struct {
         if (self.call_count <= self.fail_until) {
             return error.ProviderError;
         }
-        return ChatResponse{ .content = "mock chat" };
+        return ChatResponse{ .content = try allocator.dupe(u8, "mock chat") };
     }
 
     fn mockSupportsNativeTools(ptr: *anyopaque) bool {
@@ -706,7 +706,7 @@ const ModelAwareMock = struct {
 
     fn modelChat(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        allocator: std.mem.Allocator,
         _: ChatRequest,
         model: []const u8,
         _: f64,
@@ -717,7 +717,7 @@ const ModelAwareMock = struct {
         if (self.failsModel(model)) {
             return error.ModelUnavailable;
         }
-        return ChatResponse{ .content = self.response };
+        return ChatResponse{ .content = try allocator.dupe(u8, self.response) };
     }
 
     fn modelSupportsNativeTools(ptr: *anyopaque) bool {
@@ -772,6 +772,7 @@ test "ReliableProvider vtable chat retries then recovers" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const request = ChatRequest{ .messages = &msgs };
     const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
+    defer if (result.content) |c| std.testing.allocator.free(c);
     try std.testing.expectEqualStrings("mock chat", result.content.?);
     try std.testing.expect(mock.call_count == 2);
 }
@@ -955,6 +956,7 @@ test "multi-provider chat fallback" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const request = ChatRequest{ .messages = &msgs };
     const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
+    defer if (result.content) |c| std.testing.allocator.free(c);
     try std.testing.expectEqualStrings("mock chat", result.content.?);
     try std.testing.expect(primary.call_count == 1);
     try std.testing.expect(fallback.call_count == 1);
