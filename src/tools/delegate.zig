@@ -175,7 +175,12 @@ test "delegate schema has agent and prompt" {
 }
 
 test "delegate executes gracefully without config" {
-    var dt = DelegateTool{};
+    const agents = [_]NamedAgentConfig{.{
+        .name = "researcher",
+        .provider = "test",
+        .model = "test",
+    }};
+    var dt = DelegateTool{ .agents = &agents };
     const t = dt.tool();
     const parsed = try root.parseTestArgs("{\"agent\": \"researcher\", \"prompt\": \"test\"}");
     defer parsed.deinit();
@@ -226,7 +231,12 @@ test "delegate blank prompt rejected" {
 }
 
 test "delegate with valid params handles missing provider gracefully" {
-    var dt = DelegateTool{};
+    const agents = [_]NamedAgentConfig{.{
+        .name = "coder",
+        .provider = "test",
+        .model = "test",
+    }};
+    var dt = DelegateTool{ .agents = &agents };
     const t = dt.tool();
     const parsed = try root.parseTestArgs("{\"agent\": \"coder\", \"prompt\": \"Write a function\"}");
     defer parsed.deinit();
@@ -262,7 +272,12 @@ test "delegate empty JSON rejected" {
 }
 
 test "delegate with context field handles missing provider gracefully" {
-    var dt = DelegateTool{};
+    const agents = [_]NamedAgentConfig{.{
+        .name = "coder",
+        .provider = "test",
+        .model = "test",
+    }};
+    var dt = DelegateTool{ .agents = &agents };
     const t = dt.tool();
     const parsed = try root.parseTestArgs("{\"agent\": \"coder\", \"prompt\": \"fix bug\", \"context\": \"file.zig\"}");
     defer parsed.deinit();
