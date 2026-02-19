@@ -433,7 +433,13 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         cfg.default_model = defaultModelForProvider(cfg.default_provider);
     }
 
-    // Ensure workspace directory exists
+    // Ensure parent config directory and workspace directory exist
+    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
     std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -441,6 +447,9 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
 
     // Scaffold workspace files
     try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{});
+
+    // Save config so subsequent commands can find it
+    try cfg.save();
 
     // Print summary
     try stdout.print("  [OK] Workspace:  {s}\n", .{cfg.workspace_dir});
@@ -697,7 +706,13 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     try out.print("  -> {s}\n\n", .{cfg.workspace_dir});
 
     // ── Apply ──
-    // Ensure workspace directory exists
+    // Ensure parent config directory and workspace directory exist
+    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
     std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
