@@ -5,6 +5,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.20";
+
     const sqlite3_dep = b.dependency("sqlite3", .{
         .target = target,
         .optimize = optimize,
@@ -12,12 +14,17 @@ pub fn build(b: *std.Build) void {
     const sqlite3 = sqlite3_dep.artifact("sqlite3");
     sqlite3.root_module.addCMacro("SQLITE_ENABLE_FTS5", "1");
 
+    var build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", app_version);
+    const build_options_module = build_options.createModule();
+
     // ---------- library module (importable by consumers) ----------
     const lib_mod = b.addModule("nullclaw", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addImport("build_options", build_options_module);
     lib_mod.linkLibrary(sqlite3);
 
     // ---------- executable ----------
@@ -32,6 +39,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addImport("build_options", build_options_module);
 
     // Link SQLite on the compile step (not the module)
     exe.linkLibrary(sqlite3);

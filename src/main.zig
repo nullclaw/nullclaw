@@ -29,6 +29,7 @@ const Command = enum {
     models,
     auth,
     help,
+    version,
 };
 
 fn parseCommand(arg: []const u8) ?Command {
@@ -50,6 +51,9 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
+        .{ "version", .version },
+        .{ "--version", .version },
+        .{ "-V", .version },
     });
     return command_map.get(arg);
 }
@@ -86,6 +90,7 @@ pub fn main() !void {
         .onboard => try runOnboard(allocator, sub_args),
         .doctor => try yc.doctor.run(allocator),
         .help => printUsage(),
+        .version => std.debug.print("nullclaw {s}\n", .{yc.version.string}),
         .gateway => try runGateway(allocator, sub_args),
         .daemon => try runDaemon(allocator, sub_args),
         .service => try runService(allocator, sub_args),
@@ -1232,6 +1237,7 @@ fn printUsage() void {
         \\  daemon      Start long-running runtime (gateway + channels + heartbeat)
         \\  service     Manage OS service lifecycle (install/start/stop/status/uninstall)
         \\  status      Show system status
+        \\  version     Show CLI version
         \\  doctor      Run diagnostics
         \\  cron        Manage scheduled tasks
         \\  channel     Manage channels (Telegram, Discord, Slack, ...)
@@ -1247,6 +1253,7 @@ fn printUsage() void {
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  daemon [--port PORT] [--host HOST]
+        \\  version | --version | -V
         \\  service <install|start|stop|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS]
         \\  channel <list|start|doctor|add|remove> [ARGS]
@@ -1263,6 +1270,9 @@ fn printUsage() void {
 test "parse known commands" {
     try std.testing.expectEqual(.agent, parseCommand("agent").?);
     try std.testing.expectEqual(.status, parseCommand("status").?);
+    try std.testing.expectEqual(.version, parseCommand("version").?);
+    try std.testing.expectEqual(.version, parseCommand("--version").?);
+    try std.testing.expectEqual(.version, parseCommand("-V").?);
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);

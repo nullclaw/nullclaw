@@ -15,6 +15,7 @@ pub const websocket = @import("websocket.zig");
 pub const bus = @import("bus.zig");
 pub const config = @import("config.zig");
 pub const util = @import("util.zig");
+pub const version = @import("version.zig");
 pub const state = @import("state.zig");
 pub const status = @import("status.zig");
 pub const onboard = @import("onboard.zig");

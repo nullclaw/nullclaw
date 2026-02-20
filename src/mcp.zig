@@ -9,6 +9,7 @@ const std = @import("std");
 const tools_mod = @import("tools/root.zig");
 const config_mod = @import("config.zig");
 const yc = @import("root.zig");
+const ver = @import("version.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.mcp);
@@ -79,9 +80,14 @@ pub const McpServer = struct {
         self.child = child;
 
         // Send initialize request
-        const init_resp = try self.sendRequest(self.allocator, "initialize",
-            \\{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nullclaw","version":"0.1.0"}}
+        const init_params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"nullclaw\",\"version\":\"{s}\"}}}}",
+            .{ver.string},
         );
+        defer self.allocator.free(init_params);
+
+        const init_resp = try self.sendRequest(self.allocator, "initialize", init_params);
         defer self.allocator.free(init_resp);
 
         // Verify we got a valid response (has protocolVersion in result)

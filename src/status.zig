@@ -1,7 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
-
-const version = "0.1.0";
+const version = @import("version.zig");
 
 pub fn run(allocator: std.mem.Allocator) !void {
     var buf: [4096]u8 = undefined;
@@ -10,14 +9,14 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     var cfg = Config.load(allocator) catch {
         try w.print("nullclaw Status (no config found -- run `nullclaw onboard` first)\n", .{});
-        try w.print("\nVersion: {s}\n", .{version});
+        try w.print("\nVersion: {s}\n", .{version.string});
         try w.flush();
         return;
     };
     defer cfg.deinit();
 
     try w.print("nullclaw Status\n\n", .{});
-    try w.print("Version:     {s}\n", .{version});
+    try w.print("Version:     {s}\n", .{version.string});
     try w.print("Workspace:   {s}\n", .{cfg.workspace_dir});
     try w.print("Config:      {s}\n", .{cfg.config_path});
     try w.print("\n", .{});
