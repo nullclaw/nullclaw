@@ -13,6 +13,8 @@ pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_
 
 const log = std.log.scoped(.main);
 
+const version = "0.1.0";
+
 const Command = enum {
     agent,
     gateway,
@@ -29,6 +31,7 @@ const Command = enum {
     models,
     auth,
     help,
+    version_cmd,
 };
 
 fn parseCommand(arg: []const u8) ?Command {
@@ -50,6 +53,9 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
+        .{ "version", .version_cmd },
+        .{ "--version", .version_cmd },
+        .{ "-V", .version_cmd },
     });
     return command_map.get(arg);
 }
@@ -86,6 +92,7 @@ pub fn main() !void {
         .onboard => try runOnboard(allocator, sub_args),
         .doctor => try yc.doctor.run(allocator),
         .help => printUsage(),
+        .version_cmd => std.debug.print("nullclaw {s}\n", .{version}),
         .gateway => try runGateway(allocator, sub_args),
         .daemon => try runDaemon(allocator, sub_args),
         .service => try runService(allocator, sub_args),
