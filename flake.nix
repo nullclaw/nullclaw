@@ -35,7 +35,10 @@
               description = "Fastest, smallest, and fully autonomous AI assistant infrastructure written in Zig ";
               homepage = "https://github.com/nullclaw/nullclaw";
               license = licenses.mit;
-              maintainers = with maintainers; [ psynyde ];
+              maintainers = [
+                { name = "Igor Somov"; github = "DonPrus"; }
+                { name = "psynyde"; github = "psynyde"; }
+              ];
               platforms = platforms.all;
             };
           };
