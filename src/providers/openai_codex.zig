@@ -56,6 +56,20 @@ pub const OpenAiCodexProvider = struct {
             }
         }
 
+        // Fallback: try Codex CLI token (~/.codex/auth.json) if no stored credential
+        if (self.access_token == null) {
+            if (tryLoadCodexCliToken(allocator)) |token| {
+                self.access_token = token.access_token;
+                self.refresh_token = token.refresh_token;
+                self.expires_at = token.expires_at;
+                allocator.free(token.token_type);
+
+                if (self.access_token) |at| {
+                    self.account_id = extractAccountIdFromJwt(allocator, at) catch null;
+                }
+            }
+        }
+
         return self;
     }
 
@@ -582,6 +596,109 @@ pub fn extractAccountIdFromJwt(allocator: std.mem.Allocator, token: []const u8) 
     }
 
     return null;
+}
+
+// ── Codex CLI Token Import ────────────────────────────────────────────────
+
+/// Try to load OAuth tokens from Codex CLI at ~/.codex/auth.json.
+/// Returns an OAuthToken with access_token, refresh_token, and decoded JWT exp.
+/// Returns null on any error (file not found, parse failure, etc.).
+pub fn tryLoadCodexCliToken(allocator: std.mem.Allocator) ?auth.OAuthToken {
+    const home = std.posix.getenv("HOME") orelse return null;
+    const path = std.fmt.allocPrint(allocator, "{s}/.codex/auth.json", .{home}) catch return null;
+    defer allocator.free(path);
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
+    defer allocator.free(json_bytes);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    // Codex CLI format: { "tokens": { "access_token": "...", "refresh_token": "..." }, ... }
+    const tokens_val = root_obj.get("tokens") orelse return null;
+    const tokens_obj = switch (tokens_val) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    const access_token_str = switch (tokens_obj.get("access_token") orelse return null) {
+        .string => |s| s,
+        else => return null,
+    };
+    if (access_token_str.len == 0) return null;
+
+    const access_token = allocator.dupe(u8, access_token_str) catch return null;
+    errdefer allocator.free(access_token);
+
+    const refresh_token: ?[]const u8 = if (tokens_obj.get("refresh_token")) |rt_val| blk: {
+        switch (rt_val) {
+            .string => |s| break :blk if (s.len > 0) allocator.dupe(u8, s) catch null else null,
+            else => break :blk null,
+        }
+    } else null;
+
+    // Decode JWT exp
+    const expires_at = decodeJwtExp(allocator, access_token);
+
+    // Check expiration — skip if already expired (past the 300s buffer)
+    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at) {
+        allocator.free(access_token);
+        if (refresh_token) |rt| allocator.free(rt);
+        return null;
+    }
+
+    const token_type = allocator.dupe(u8, "Bearer") catch {
+        allocator.free(access_token);
+        if (refresh_token) |rt| allocator.free(rt);
+        return null;
+    };
+
+    return .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at = expires_at,
+        .token_type = token_type,
+    };
+}
+
+/// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
+fn decodeJwtExp(allocator: std.mem.Allocator, token: []const u8) i64 {
+    const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return 0;
+    const rest = token[first_dot + 1 ..];
+    const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse return 0;
+    const payload_b64 = rest[0..second_dot];
+    if (payload_b64.len == 0) return 0;
+
+    const Decoder = std.base64.url_safe_no_pad.Decoder;
+    const decoded_len = Decoder.calcSizeForSlice(payload_b64) catch return 0;
+    const decoded = allocator.alloc(u8, decoded_len) catch return 0;
+    defer allocator.free(decoded);
+    Decoder.decode(decoded, payload_b64) catch return 0;
+
+    const json_parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return 0;
+    defer json_parsed.deinit();
+
+    const obj = switch (json_parsed.value) {
+        .object => |o| o,
+        else => return 0,
+    };
+
+    if (obj.get("exp")) |exp_val| {
+        switch (exp_val) {
+            .integer => |i| return i,
+            .float => |f| return @intFromFloat(f),
+            else => {},
+        }
+    }
+    return 0;
 }
 
 // ════════════════════════════════════════════════════════════════════════════

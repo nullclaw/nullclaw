@@ -332,7 +332,10 @@ pub fn refreshAccessToken(
         .location = .{ .url = token_url },
         .method = .POST,
         .payload = payload,
-        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .name = "User-Agent", .value = "nullClaw/1.0" },
+        },
         .response_writer = &aw.writer,
     });
     if (result.status != .ok) return error.TokenRefreshFailed;
@@ -456,7 +459,10 @@ pub fn startDeviceCodeFlow(
         .location = .{ .url = device_auth_url },
         .method = .POST,
         .payload = payload,
-        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .name = "User-Agent", .value = "nullClaw/1.0" },
+        },
         .response_writer = &aw.writer,
     });
     if (result.status != .ok) return error.DeviceCodeRequestFailed;
@@ -540,7 +546,10 @@ pub fn pollDeviceCode(
             .location = .{ .url = token_url },
             .method = .POST,
             .payload = payload,
-            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+                .{ .name = "User-Agent", .value = "nullClaw/1.0" },
+            },
             .response_writer = &aw.writer,
         }) catch continue;
 

@@ -937,19 +937,13 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 
     if (std.mem.eql(u8, subcmd, "login")) {
-        // Check for --manual and --token flags
-        var manual = false;
-        var token_arg: ?[]const u8 = null;
-        for (rest, 0..) |arg, i| {
-            if (std.mem.eql(u8, arg, "--manual")) manual = true;
-            if (std.mem.eql(u8, arg, "--token") and i + 1 < rest.len) {
-                token_arg = rest[i + 1];
-                manual = true;
-            }
+        var import_codex = false;
+        for (rest) |arg| {
+            if (std.mem.eql(u8, arg, "--import-codex")) import_codex = true;
         }
 
-        if (manual) {
-            runAuthManualLogin(allocator, codex, auth_mod, token_arg);
+        if (import_codex) {
+            runAuthImportCodex(allocator, codex, auth_mod);
         } else {
             runAuthDeviceCodeLogin(allocator, codex, auth_mod);
         }
@@ -999,8 +993,7 @@ fn printAuthUsage() void {
         \\
         \\Commands:
         \\  login <provider>                    Authenticate via device code flow
-        \\  login <provider> --manual           Paste token interactively
-        \\  login <provider> --token TOKEN      Pass token directly
+        \\  login <provider> --import-codex     Import from Codex CLI (~/.codex/auth.json)
         \\  status <provider>                   Show authentication status
         \\  logout <provider>                   Remove stored credentials
         \\
@@ -1009,8 +1002,7 @@ fn printAuthUsage() void {
         \\
         \\Examples:
         \\  nullclaw auth login openai-codex
-        \\  nullclaw auth login openai-codex --manual
-        \\  nullclaw auth login openai-codex --token eyJhb...
+        \\  nullclaw auth login openai-codex --import-codex
         \\  nullclaw auth status openai-codex
         \\  nullclaw auth logout openai-codex
         \\
@@ -1030,8 +1022,9 @@ fn runAuthDeviceCodeLogin(
         codex.OAUTH_DEVICE_URL,
         codex.OAUTH_SCOPE,
     ) catch {
-        std.debug.print("Failed to start device code flow.\n", .{});
-        std.debug.print("If blocked by Cloudflare, try: nullclaw auth login --manual\n", .{});
+        std.debug.print("Failed to start device code flow (likely Cloudflare block).\n", .{});
+        std.debug.print("Alternative:\n", .{});
+        std.debug.print("  nullclaw auth login openai-codex --import-codex   (import from Codex CLI)\n", .{});
         std.process.exit(1);
     };
     defer dc.deinit(allocator);
@@ -1060,136 +1053,155 @@ fn runAuthDeviceCodeLogin(
     saveAndPrintResult(allocator, codex, auth_mod, token);
 }
 
-fn runAuthManualLogin(
+fn runAuthImportCodex(
     allocator: std.mem.Allocator,
     codex: type,
     auth_mod: type,
-    token_arg: ?[]const u8,
 ) void {
-    var raw_token: []const u8 = undefined;
+    const home = std.posix.getenv("HOME") orelse {
+        std.debug.print("HOME not set.\n", .{});
+        std.process.exit(1);
+    };
 
-    if (token_arg) |t| {
-        // Token passed via --token flag
-        raw_token = cleanToken(t);
-    } else {
-        // Interactive stdin — read token
-        std.debug.print(
-            \\Manual token entry for OpenAI Codex.
-            \\
-            \\Tip: use --token VALUE to avoid interactive paste issues:
-            \\  nullclaw auth login --manual --token eyJhb...
-            \\
-            \\Or paste your token from the Authorization header and press Enter:
-            \\
-        , .{});
+    const path = std.fmt.allocPrint(allocator, "{s}/.codex/auth.json", .{home}) catch {
+        std.debug.print("Out of memory.\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(path);
 
-        raw_token = readTokenFromStdin();
-    }
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        std.debug.print("Could not open {s}\n", .{path});
+        std.debug.print("Install and authenticate with Codex CLI first.\n", .{});
+        std.process.exit(1);
+    };
+    defer file.close();
 
-    if (raw_token.len == 0) {
-        std.debug.print("No token found in input.\n", .{});
+    const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch {
+        std.debug.print("Failed to read {s}\n", .{path});
+        std.process.exit(1);
+    };
+    defer allocator.free(json_bytes);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch {
+        std.debug.print("Failed to parse {s}\n", .{path});
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            std.debug.print("Invalid format in {s}\n", .{path});
+            std.process.exit(1);
+        },
+    };
+
+    // Extract tokens object
+    const tokens_val = root_obj.get("tokens") orelse {
+        std.debug.print("No \"tokens\" field in {s}\n", .{path});
+        std.process.exit(1);
+    };
+    const tokens_obj = switch (tokens_val) {
+        .object => |o| o,
+        else => {
+            std.debug.print("Invalid \"tokens\" field in {s}\n", .{path});
+            std.process.exit(1);
+        },
+    };
+
+    const access_token_str = switch (tokens_obj.get("access_token") orelse {
+        std.debug.print("No access_token in Codex CLI credentials.\n", .{});
+        std.process.exit(1);
+    }) {
+        .string => |s| s,
+        else => {
+            std.debug.print("Invalid access_token in Codex CLI credentials.\n", .{});
+            std.process.exit(1);
+        },
+    };
+
+    if (access_token_str.len == 0) {
+        std.debug.print("Empty access_token in Codex CLI credentials.\n", .{});
         std.process.exit(1);
     }
 
-    std.debug.print("Token received ({d} bytes).\n", .{raw_token.len});
+    const refresh_token_str: ?[]const u8 = if (tokens_obj.get("refresh_token")) |rt_val| switch (rt_val) {
+        .string => |s| if (s.len > 0) s else null,
+        else => null,
+    } else null;
 
-    // Build an OAuthToken with no expiry (manual tokens don't have expiry info)
+    // Decode JWT exp from access_token
+    const expires_at = decodeJwtExp(allocator, access_token_str);
+
     const token = auth_mod.OAuthToken{
-        .access_token = raw_token,
-        .refresh_token = null,
-        .expires_at = 0,
+        .access_token = access_token_str,
+        .refresh_token = refresh_token_str,
+        .expires_at = expires_at,
         .token_type = "Bearer",
     };
 
-    // Save (saveCredential dupes the strings internally)
     auth_mod.saveCredential(allocator, codex.CREDENTIAL_KEY, token) catch {
         std.debug.print("Failed to save credential.\n", .{});
         std.process.exit(1);
     };
 
-    const account_id = codex.extractAccountIdFromJwt(allocator, raw_token) catch null;
+    const account_id = codex.extractAccountIdFromJwt(allocator, access_token_str) catch null;
     defer if (account_id) |id| allocator.free(id);
 
+    std.debug.print("Imported from Codex CLI ({s})\n", .{path});
     if (account_id) |id| {
-        std.debug.print("Authenticated (account: {s})\n", .{id});
+        std.debug.print("  Account: {s}\n", .{id});
+    }
+    std.debug.print("  Access token: {d} bytes\n", .{access_token_str.len});
+    if (refresh_token_str != null) {
+        std.debug.print("  Refresh token: present\n", .{});
     } else {
-        std.debug.print("Token saved successfully.\n", .{});
+        std.debug.print("  Refresh token: absent\n", .{});
+    }
+    if (expires_at != 0) {
+        const remaining = expires_at - std.time.timestamp();
+        if (remaining > 0) {
+            std.debug.print("  Expires in: {d}h {d}m\n", .{
+                @divTrunc(remaining, 3600),
+                @divTrunc(@mod(remaining, 3600), 60),
+            });
+        } else {
+            std.debug.print("  Token: expired (will auto-refresh)\n", .{});
+        }
     }
     std.debug.print("\nTo use: set \"default_provider\": \"openai-codex\" in ~/.nullclaw/config.json\n", .{});
 }
 
-/// Read a token from stdin, handling large pastes by switching to raw terminal mode.
-/// Returns a slice into a static buffer — valid until next call.
-fn readTokenFromStdin() []const u8 {
-    const stdin = std.fs.File.stdin();
-    const fd = stdin.handle;
+/// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
+fn decodeJwtExp(allocator: std.mem.Allocator, token: []const u8) i64 {
+    const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return 0;
+    const rest = token[first_dot + 1 ..];
+    const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse return 0;
+    const payload_b64 = rest[0..second_dot];
+    if (payload_b64.len == 0) return 0;
 
-    // Switch to raw mode to bypass canonical buffer limit (~1KB on macOS).
-    // This lets large pastes (JWT tokens are 1-4KB) come through without hanging.
-    const orig_termios = std.posix.tcgetattr(fd) catch null;
-    if (orig_termios) |orig| {
-        var raw = orig;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        std.posix.tcsetattr(fd, .NOW, raw) catch {};
-    }
-    defer if (orig_termios) |orig| {
-        // Restore terminal before any output
-        std.posix.tcsetattr(fd, .NOW, orig) catch {};
+    const Decoder = std.base64.url_safe_no_pad.Decoder;
+    const decoded_len = Decoder.calcSizeForSlice(payload_b64) catch return 0;
+    const decoded = allocator.alloc(u8, decoded_len) catch return 0;
+    defer allocator.free(decoded);
+    Decoder.decode(decoded, payload_b64) catch return 0;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return 0;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return 0,
     };
 
-    const S = struct {
-        var buf: [65536]u8 = undefined;
-    };
-    var total: usize = 0;
-
-    while (total < S.buf.len) {
-        const n = stdin.read(S.buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-        // Stop on newline or carriage return (Enter key in raw mode)
-        if (std.mem.indexOfScalar(u8, S.buf[total - n .. total], '\n') != null) break;
-        if (std.mem.indexOfScalar(u8, S.buf[total - n .. total], '\r') != null) break;
-    }
-
-    if (total == 0) {
-        std.debug.print("No token provided.\n", .{});
-        std.process.exit(1);
-    }
-
-    // Print newline since echo was off
-    std.debug.print("\n", .{});
-
-    return cleanToken(S.buf[0..total]);
-}
-
-/// Clean up a pasted token — strip Bearer prefix, cookie metadata, whitespace.
-fn cleanToken(input: []const u8) []const u8 {
-    var t = std.mem.trimRight(u8, input, "\r\n \t");
-
-    // Strip "Bearer " prefix
-    if (std.mem.startsWith(u8, t, "Bearer ")) t = t["Bearer ".len..];
-
-    // Strip cookie name prefix (Safari/Chrome Cookies table copy)
-    const cookie_prefixes = [_][]const u8{
-        "__Secure-next-auth.session-token\t",
-        "__Secure-next-auth.session-token    ",
-        "__Secure-next-auth.session-token ",
-    };
-    for (&cookie_prefixes) |prefix| {
-        if (std.mem.startsWith(u8, t, prefix)) {
-            t = t[prefix.len..];
-            break;
+    if (obj.get("exp")) |exp_val| {
+        switch (exp_val) {
+            .integer => |i| return i,
+            .float => |f| return @intFromFloat(f),
+            else => {},
         }
     }
-    t = std.mem.trimLeft(u8, t, " \t");
-
-    // Strip cookie table metadata (tab-separated columns after the value)
-    if (std.mem.indexOf(u8, t, "\t")) |pos| t = t[0..pos];
-    if (std.mem.indexOf(u8, t, "    .")) |pos| t = t[0..pos];
-    return std.mem.trimRight(u8, t, " \t");
+    return 0;
 }
 
 fn saveAndPrintResult(
@@ -1252,7 +1264,7 @@ fn printUsage() void {
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
         \\  models refresh
-        \\  auth <login|status|logout> <provider> [--manual] [--token TOKEN]
+        \\  auth <login|status|logout> <provider> [--import-codex]
         \\
     ;
     std.debug.print("{s}", .{usage});
