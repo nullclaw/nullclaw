@@ -32,8 +32,11 @@ EOF
 
 RUN chown -R 65534:65534 /nullclaw-data
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot AS release
+# ── Stage 3: Production Runtime ──────────────────────────────
+FROM alpine:3.23 AS release
+
+RUN apk add --no-cache ca-certificates tzdata curl \
+    openssh-client git sqlite uv python3 github-cli
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=permissions /nullclaw-data /nullclaw-data
@@ -41,6 +44,8 @@ COPY --from=permissions /nullclaw-data /nullclaw-data
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV HOME=/nullclaw-data
 ENV NULLCLAW_GATEWAY_PORT=3000
+ENV SHELL=/bin/sh
+ENV UV_CACHE_DIR=/tmp
 
 WORKDIR /nullclaw-data
 USER 65534:65534
