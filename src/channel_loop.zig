@@ -60,7 +60,13 @@ pub const ChannelRuntime = struct {
         const holder = try allocator.create(ProviderHolder);
         errdefer allocator.destroy(holder);
 
-        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, config.defaultProviderKey());
+        const api_key = providers.resolveApiKeyFromConfig(
+            allocator,
+            config.default_provider,
+            config.providers,
+            config.allowEnvApiKeys(),
+        ) catch null;
+        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, api_key);
 
         const provider_i = holder.provider();
 

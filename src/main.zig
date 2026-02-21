@@ -813,7 +813,13 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const obs = noop_obs.observer();
 
     // Create provider vtable — concrete struct must stay alive for the loop.
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, config.defaultProviderKey());
+    const api_key = try yc.providers.resolveApiKeyFromConfig(
+        allocator,
+        config.default_provider,
+        config.providers,
+        config.allowEnvApiKeys(),
+    );
+    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, api_key);
     const provider_i: yc.providers.Provider = holder.provider();
 
     std.debug.print("  Tools: {d} loaded\n", .{tools.len});

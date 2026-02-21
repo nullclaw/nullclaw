@@ -649,7 +649,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         }
 
         // Build provider holder from configured provider name.
-        holder_opt = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, cfg.defaultProviderKey());
+        const api_key = providers.resolveApiKeyFromConfig(
+            allocator,
+            cfg.default_provider,
+            cfg.providers,
+            cfg.allowEnvApiKeys(),
+        ) catch null;
+        holder_opt = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, api_key);
 
         // Build provider vtable from the holder.
         if (holder_opt) |*h| {

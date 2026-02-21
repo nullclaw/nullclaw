@@ -70,6 +70,7 @@ pub const Config = struct {
     default_model: ?[]const u8 = "anthropic/claude-sonnet-4",
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
+    allow_env_api_keys: ?bool = null,
 
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
@@ -127,6 +128,11 @@ pub const Config = struct {
     /// Convenience: API key for the default_provider.
     pub fn defaultProviderKey(self: *const Config) ?[]const u8 {
         return self.getProviderKey(self.default_provider);
+    }
+
+    /// Check if reading API keys from environment variables is allowed.
+    pub fn allowEnvApiKeys(self: *const Config) bool {
+        return self.allow_env_api_keys orelse false;
     }
 
     /// Look up a provider's base_url from the providers list.
