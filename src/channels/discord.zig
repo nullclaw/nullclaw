@@ -211,7 +211,7 @@ pub const DiscordChannel = struct {
         const fd = self.ws_fd.load(.acquire);
         if (fd >= 0) {
             if (comptime builtin.os.tag != .windows) {
-                std.posix.close(@intCast(fd)) catch {};
+                std.posix.close(@intCast(fd));
             }
         }
         if (self.gateway_thread) |t| {
@@ -326,10 +326,8 @@ pub const DiscordChannel = struct {
             const text = maybe_text orelse break;
             defer self.allocator.free(text);
             self.handleGatewayMessage(&ws, text) catch |err| {
-                switch (err) {
-                    error.ShouldReconnect => break,
-                    else => log.err("Discord gateway msg error: {}", .{err}),
-                }
+                if (err == error.ShouldReconnect) break;
+                log.err("Discord gateway msg error: {}", .{err});
             };
         }
     }

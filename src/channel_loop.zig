@@ -7,6 +7,8 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const telegram = @import("channels/telegram.zig");
+const discord_mod = @import("channels/discord.zig");
+const bus_mod = @import("bus.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const memory_mod = @import("memory/root.zig");
@@ -38,6 +40,83 @@ pub const TelegramLoopState = struct {
         };
     }
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// DiscordLoopState — shared state between supervisor and Discord gateway thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const DiscordLoopState = struct {
+    last_activity: std.atomic.Value(i64),
+    stop_requested: std.atomic.Value(bool),
+    thread: ?std.Thread = null,
+
+    pub fn init() DiscordLoopState {
+        return .{
+            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
+            .stop_requested = std.atomic.Value(bool).init(false),
+        };
+    }
+};
+
+/// Thread-entry function for the Discord gateway loop.
+/// Connects to Discord WebSocket gateway, receives messages via bus,
+/// and replies using the AI agent session manager.
+pub fn runDiscordLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *DiscordLoopState,
+    event_bus: *bus_mod.Bus,
+) void {
+    const discord_config = config.channels.discord orelse return;
+
+    const dc = allocator.create(discord_mod.DiscordChannel) catch return;
+    defer allocator.destroy(dc);
+    dc.* = discord_mod.DiscordChannel.init(
+        allocator,
+        discord_config.token,
+        discord_config.guild_id,
+        discord_config.allow_bots,
+    );
+    dc.allow_from = discord_config.allow_from;
+    dc.mention_only = discord_config.mention_only;
+    dc.intents = discord_config.intents;
+    dc.bus = event_bus;
+
+    dc.channel().start() catch |err| {
+        log.err("Failed to start Discord gateway: {}", .{err});
+        return;
+    };
+    defer dc.channel().stop();
+
+    loop_state.last_activity.store(std.time.timestamp(), .release);
+    health.markComponentOk("discord");
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        const msg = event_bus.consumeInbound() orelse {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        defer msg.deinit(allocator);
+
+        if (!std.mem.eql(u8, msg.channel, "discord")) continue;
+
+        loop_state.last_activity.store(std.time.timestamp(), .release);
+
+        const reply = runtime.session_mgr.processMessage(msg.session_key, msg.content) catch |err| {
+            log.err("Discord agent error: {}", .{err});
+            dc.sendMessage(msg.chat_id, "An error occurred. Please try again.") catch {};
+            continue;
+        };
+        defer allocator.free(reply);
+
+        dc.sendMessage(msg.chat_id, reply) catch |err| {
+            log.warn("Discord send failed: {}", .{err});
+        };
+
+        health.markComponentOk("discord");
+    }
+}
 
 // Re-export centralized ProviderHolder from providers module.
 pub const ProviderHolder = providers.ProviderHolder;

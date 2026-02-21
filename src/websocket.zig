@@ -136,7 +136,7 @@ pub const WsClient = struct {
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         while (resp_len < resp_buf.len) {
-            const n = tls_state.tls_client.reader.read(resp_buf[resp_len..]) catch
+            const n = std.Io.Reader.readSliceShort(&tls_state.tls_client.reader, resp_buf[resp_len..]) catch
                 return error.WsHandshakeFailed;
             if (n == 0) return error.WsHandshakeFailed;
             resp_len += n;
@@ -179,7 +179,7 @@ pub const WsClient = struct {
     fn readExact(self: *WsClient, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
-            const n = self.tls.tls_client.reader.read(buf[total..]) catch |err| return err;
+            const n = std.Io.Reader.readSliceShort(&self.tls.tls_client.reader, buf[total..]) catch |err| return err;
             if (n == 0) return error.ConnectionClosed;
             total += n;
         }
@@ -343,7 +343,10 @@ pub const WsClient = struct {
                         message.deinit(self.allocator);
                         return error.MessageTooLarge;
                     }
-                    if (frame.fin) return message.toOwnedSlice(self.allocator);
+                    if (frame.fin) {
+                        const owned = try message.toOwnedSlice(self.allocator);
+                        return owned;
+                    }
                 },
                 .ping => {}, // auto-handled inside readFrame
                 .binary => {}, // Discord uses text only

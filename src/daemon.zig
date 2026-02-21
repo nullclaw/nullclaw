@@ -213,6 +213,7 @@ fn channelSupervisorThread(
     state: *DaemonState,
     channel_registry: *dispatch.ChannelRegistry,
     channel_rt: ?*channel_loop.ChannelRuntime,
+    event_bus: *bus_mod.Bus,
 ) void {
     state.markRunning("channels");
     health.markComponentOk("channels");
@@ -271,6 +272,43 @@ fn channelSupervisorThread(
             allocator.destroy(ls);
         }
         if (tg_health_channel) |hc| allocator.destroy(hc);
+    }
+
+    // ── Discord supervision ──
+    var dc_loop_state: ?*channel_loop.DiscordLoopState = null;
+
+    discord_setup: {
+        if (config.channels.discord == null) break :discord_setup;
+        const rt = channel_rt orelse break :discord_setup;
+
+        const ls = allocator.create(channel_loop.DiscordLoopState) catch {
+            log.warn("Failed to alloc discord loop state", .{});
+            health.markComponentError("discord", "alloc failed");
+            break :discord_setup;
+        };
+        ls.* = channel_loop.DiscordLoopState.init();
+        dc_loop_state = ls;
+
+        ls.thread = std.Thread.spawn(
+            .{ .stack_size = 512 * 1024 },
+            channel_loop.runDiscordLoop,
+            .{ allocator, config, rt, ls, event_bus },
+        ) catch |err| blk: {
+            log.err("Failed to spawn Discord thread: {}", .{err});
+            health.markComponentError("discord", "spawn failed");
+            break :blk null;
+        };
+        if (ls.thread != null) {
+            log.info("Discord gateway thread started", .{});
+        }
+    }
+
+    defer {
+        if (dc_loop_state) |ls| {
+            ls.stop_requested.store(true, .release);
+            if (ls.thread) |t| t.join();
+            allocator.destroy(ls);
+        }
     }
 
     // ── Monitoring loop ──
@@ -450,7 +488,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var chan_thread: ?std.Thread = null;
     if (hasSupervisedChannels(config)) {
         if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
-            allocator, config, &state, &channel_registry, channel_rt,
+            allocator, config, &state, &channel_registry, channel_rt, &event_bus,
         })) |thread| {
             chan_thread = thread;
         } else |err| {
