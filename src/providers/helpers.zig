@@ -32,7 +32,7 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer allocator.free(aw.writer.buffer);
+    defer aw.deinit();
 
     const result = try client.fetch(.{
         .location = .{ .url = url },
@@ -67,7 +67,7 @@ pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_pro
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer allocator.free(aw.writer.buffer);
+    defer aw.deinit();
 
     const result = try client.fetch(.{
         .location = .{ .url = url },

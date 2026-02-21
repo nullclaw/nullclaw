@@ -347,6 +347,7 @@ pub fn refreshAccessToken(
     defer allocator.free(payload);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
     const result = try client.fetch(.{
         .location = .{ .url = token_url },
         .method = .POST,
@@ -360,7 +361,6 @@ pub fn refreshAccessToken(
     if (result.status != .ok) return error.TokenRefreshFailed;
 
     const resp_body = aw.writer.buffer[0..aw.writer.end];
-    defer allocator.free(resp_body);
 
     var token = try parseTokenResponse(allocator, resp_body);
 
@@ -475,6 +475,7 @@ pub fn startDeviceCodeFlow(
     defer allocator.free(payload);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
     const result = try client.fetch(.{
         .location = .{ .url = device_auth_url },
         .method = .POST,
@@ -488,7 +489,6 @@ pub fn startDeviceCodeFlow(
     if (result.status != .ok) return error.DeviceCodeRequestFailed;
 
     const resp_body = aw.writer.buffer[0..aw.writer.end];
-    defer allocator.free(resp_body);
 
     return parseDeviceCodeResponse(allocator, resp_body);
 }
@@ -568,6 +568,7 @@ pub fn pollDeviceCode(
         std.Thread.sleep(interval_ns);
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
         const result = client.fetch(.{
             .location = .{ .url = token_url },
             .method = .POST,
@@ -580,7 +581,6 @@ pub fn pollDeviceCode(
         }) catch continue;
 
         const resp_body = aw.writer.buffer[0..aw.writer.end];
-        defer allocator.free(resp_body);
 
         if (result.status == .ok) {
             return parseTokenResponse(allocator, resp_body) catch continue;
