@@ -132,15 +132,17 @@ pub const WsClient = struct {
         try tls_state.tls_client.writer.flush();
         try tls_state.stream_writer.interface.flush();
 
-        // Read HTTP 101 response
+        // Read HTTP 101 response one byte at a time so we stop precisely at the
+        // end of the headers (\r\n\r\n) without consuming any WebSocket frame
+        // data that Discord may send immediately after (e.g. HELLO op=10).
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         while (resp_len < resp_buf.len) {
-            const n = std.Io.Reader.readSliceShort(&tls_state.tls_client.reader, resp_buf[resp_len..]) catch
+            const n = std.Io.Reader.readSliceShort(&tls_state.tls_client.reader, resp_buf[resp_len .. resp_len + 1]) catch
                 return error.WsHandshakeFailed;
             if (n == 0) return error.WsHandshakeFailed;
             resp_len += n;
-            if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n") != null) break;
+            if (resp_len >= 4 and std.mem.eql(u8, resp_buf[resp_len - 4 .. resp_len], "\r\n\r\n")) break;
         }
         const resp = resp_buf[0..resp_len];
         if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {
