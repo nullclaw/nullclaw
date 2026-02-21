@@ -711,10 +711,17 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     else
         telegram_config.allow_from;
 
+    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
+    const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
+        allocator,
+        config.default_provider,
+        config.providers,
+    ) catch null;
+
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    if (config.defaultProviderKey() == null and provider_kind != .openai_codex_provider) {
-        std.debug.print("No API key configured. Add to ~/.nullclaw/config.json:\n", .{});
+    if (resolved_api_key == null and provider_kind != .openai_codex_provider) {
+        std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
         std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
     }
@@ -787,7 +794,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
-        .fallback_api_key = config.defaultProviderKey(),
+        .fallback_api_key = resolved_api_key,
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
@@ -813,7 +820,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const obs = noop_obs.observer();
 
     // Create provider vtable — concrete struct must stay alive for the loop.
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, config.defaultProviderKey());
+    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key);
     const provider_i: yc.providers.Provider = holder.provider();
 
     std.debug.print("  Tools: {d} loaded\n", .{tools.len});

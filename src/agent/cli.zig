@@ -96,13 +96,20 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tracker = &tracker,
     };
 
+    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
+    const resolved_api_key = providers.resolveApiKeyFromConfig(
+        allocator,
+        cfg.default_provider,
+        cfg.providers,
+    ) catch null;
+
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,
         .browser_enabled = cfg.browser.enabled,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
-        .fallback_api_key = cfg.defaultProviderKey(),
+        .fallback_api_key = resolved_api_key,
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
         .policy = &policy,
@@ -118,7 +125,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else |_| {}
 
     // Create provider via centralized ProviderHolder (concrete struct lives on the stack)
-    var holder = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, cfg.defaultProviderKey());
+    var holder = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, resolved_api_key);
     const provider_i: Provider = holder.provider();
 
     const supports_streaming = provider_i.supportsStreaming();

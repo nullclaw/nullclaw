@@ -648,8 +648,15 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             state.whatsapp_app_secret = wa_cfg.app_secret orelse "";
         }
 
+        // Resolve API key: config providers first, then env vars
+        const resolved_api_key = providers.resolveApiKeyFromConfig(
+            allocator,
+            cfg.default_provider,
+            cfg.providers,
+        ) catch null;
+
         // Build provider holder from configured provider name.
-        holder_opt = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, cfg.defaultProviderKey());
+        holder_opt = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, resolved_api_key);
 
         // Build provider vtable from the holder.
         if (holder_opt) |*h| {
@@ -670,7 +677,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 .browser_enabled = cfg.browser.enabled,
                 .screenshot_enabled = true,
                 .agents = cfg.agents,
-                .fallback_api_key = cfg.defaultProviderKey(),
+                .fallback_api_key = resolved_api_key,
             }) catch &.{};
 
             // Noop observer.
