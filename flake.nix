@@ -36,8 +36,14 @@
               homepage = "https://github.com/nullclaw/nullclaw";
               license = licenses.mit;
               maintainers = [
-                { name = "Igor Somov"; github = "DonPrus"; }
-                { name = "psynyde"; github = "psynyde"; }
+                {
+                  name = "Igor Somov";
+                  github = "DonPrus";
+                }
+                {
+                  name = "psynyde";
+                  github = "psynyde";
+                }
               ];
               platforms = platforms.all;
             };
