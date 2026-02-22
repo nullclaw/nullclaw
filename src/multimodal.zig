@@ -321,6 +321,16 @@ pub fn prepareMessagesForProvider(
         }
 
         const max_images = @min(parsed.refs.len, config.max_images);
+        if (parsed.refs.len > max_images) {
+            const dropped = parsed.refs.len - max_images;
+            const note = try std.fmt.allocPrint(
+                arena,
+                "[Only {d} image(s) were processed (max_images={d}); {d} additional image(s) ignored]",
+                .{ max_images, config.max_images, dropped },
+            );
+            try parts.append(arena, .{ .text = note });
+        }
+
         for (parsed.refs[0..max_images]) |ref| {
             // Truncated ref for error messages (avoid leaking huge data URIs)
             const display_ref = if (ref.len > 80) ref[0..80] else ref;
@@ -365,10 +375,6 @@ pub fn prepareMessagesForProvider(
                     .data = b64,
                     .media_type = img.mime_type,
                 } });
-                // Clean up temp file after successful read
-                if (std.mem.indexOf(u8, ref, "nullclaw_photo_") != null) {
-                    std.fs.deleteFileAbsolute(ref) catch {};
-                }
             }
         }
 
@@ -690,6 +696,39 @@ test "prepareMessagesForProvider with URL marker allowed by config" {
     try std.testing.expectEqualStrings("https://example.com/cat.jpg", parts[1].image_url.url);
 }
 
+test "prepareMessagesForProvider adds note when markers exceed max_images" {
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    var msgs = [_]ChatMessage{
+        ChatMessage.user("Compare [IMAGE:https://example.com/a.jpg] [IMAGE:https://example.com/b.jpg]"),
+    };
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{
+        .allow_remote_fetch = true,
+        .max_images = 1,
+    });
+    const parts = result[0].content_parts.?;
+
+    var saw_limit_note = false;
+    var saw_image = false;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                if (std.mem.indexOf(u8, text, "additional image(s) ignored") != null) {
+                    saw_limit_note = true;
+                }
+            },
+            .image_url => saw_image = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_image);
+    try std.testing.expect(saw_limit_note);
+}
+
 test "prepareMessagesForProvider with data URI marker creates base64 image part" {
     const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
     var arena_mut = arena_impl;
@@ -744,6 +783,37 @@ test "readLocalImage rejects when no allowed_dirs" {
 
     const err = readLocalImage(std.testing.allocator, file_path, .{});
     try std.testing.expectError(error.LocalReadNotAllowed, err);
+}
+
+test "prepareMessagesForProvider does not delete nullclaw temp image files" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "nullclaw_photo_123.png",
+        .data = "\x89PNG\x0d\x0a\x1a\x0a",
+    });
+
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "nullclaw_photo_123.png" });
+    defer std.testing.allocator.free(file_path);
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    var msgs = [_]ChatMessage{
+        ChatMessage.user(try std.fmt.allocPrint(std.testing.allocator, "[IMAGE:{s}]", .{file_path})),
+    };
+    defer std.testing.allocator.free(msgs[0].content);
+
+    _ = try prepareMessagesForProvider(arena, &msgs, .{
+        .allowed_dirs = &.{dir_path},
+    });
+
+    try std.fs.accessAbsolute(file_path, .{});
 }
 
 test "parseImageMarkers mixed case markers" {

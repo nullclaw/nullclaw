@@ -312,44 +312,7 @@ pub const Agent = struct {
             const arena = iter_arena.allocator();
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = blk: {
-                const m = try arena.alloc(ChatMessage, self.history.items.len);
-                for (self.history.items, 0..) |*msg, i| {
-                    m[i] = msg.toChatMessage();
-                }
-                const image_marker_count = multimodal.countImageMarkersInLastUser(m);
-                if (image_marker_count > 0 and !self.provider.supportsVision()) {
-                    return error.ProviderDoesNotSupportVision;
-                }
-                // Process [IMAGE:] markers into content_parts for multimodal support
-                // Allow reading from the platform temp dir (where Telegram photos are saved)
-                const tmp_dir = platform.getTempDir(arena) catch null;
-                const allowed: []const []const u8 = if (tmp_dir) |td| blk2: {
-                    const trimmed_tmp = std.mem.trimRight(u8, td, "/\\");
-                    if (trimmed_tmp.len == 0) break :blk2 &.{};
-
-                    const resolved_tmp = std.fs.realpathAlloc(arena, trimmed_tmp) catch null;
-                    if (resolved_tmp) |rt| {
-                        // Include both env TMPDIR and canonical realpath to handle
-                        // /var vs /private/var aliases on macOS.
-                        if (!std.mem.eql(u8, rt, trimmed_tmp)) {
-                            const dirs = try arena.alloc([]const u8, 2);
-                            dirs[0] = trimmed_tmp;
-                            dirs[1] = rt;
-                            break :blk2 dirs;
-                        }
-                    }
-
-                    const dirs = try arena.alloc([]const u8, 1);
-                    // Strip trailing separator so pathStartsWith works correctly
-                    // (TMPDIR on macOS ends with '/')
-                    dirs[0] = trimmed_tmp;
-                    break :blk2 dirs;
-                } else &.{};
-                break :blk try multimodal.prepareMessagesForProvider(arena, m, .{
-                    .allowed_dirs = allowed,
-                });
-            };
+            const messages = try self.buildProviderMessages(arena);
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
@@ -423,8 +386,7 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
-                        const recovery_msgs = self.buildMessageSlice() catch return err;
-                        defer self.allocator.free(recovery_msgs);
+                        const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
@@ -461,8 +423,7 @@ pub const Agent = struct {
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
-                            const recovery_msgs = self.buildMessageSlice() catch return retry_err;
-                            defer self.allocator.free(recovery_msgs);
+                            const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
@@ -809,9 +770,50 @@ pub const Agent = struct {
         };
     }
 
+    /// Build provider-ready ChatMessage slice from owned history.
+    /// Applies multimodal preprocessing and vision capability checks.
+    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
+        const m = try arena.alloc(ChatMessage, self.history.items.len);
+        for (self.history.items, 0..) |*msg, i| {
+            m[i] = msg.toChatMessage();
+        }
+
+        const image_marker_count = multimodal.countImageMarkersInLastUser(m);
+        if (image_marker_count > 0 and !self.provider.supportsVisionForModel(self.model_name)) {
+            return error.ProviderDoesNotSupportVision;
+        }
+
+        // Allow reading from the platform temp dir (where Telegram photos are saved).
+        const tmp_dir = platform.getTempDir(arena) catch null;
+        const allowed: []const []const u8 = if (tmp_dir) |td| blk: {
+            const trimmed_tmp = std.mem.trimRight(u8, td, "/\\");
+            if (trimmed_tmp.len == 0) break :blk &.{};
+
+            const resolved_tmp = std.fs.realpathAlloc(arena, trimmed_tmp) catch null;
+            if (resolved_tmp) |rt| {
+                // Include both env TMPDIR and canonical realpath to handle
+                // /var vs /private/var aliases on macOS.
+                if (!std.mem.eql(u8, rt, trimmed_tmp)) {
+                    const dirs = try arena.alloc([]const u8, 2);
+                    dirs[0] = trimmed_tmp;
+                    dirs[1] = rt;
+                    break :blk dirs;
+                }
+            }
+
+            const dirs = try arena.alloc([]const u8, 1);
+            // Strip trailing separator so pathStartsWith works correctly
+            // (TMPDIR on macOS ends with '/')
+            dirs[0] = trimmed_tmp;
+            break :blk dirs;
+        } else &.{};
+
+        return multimodal.prepareMessagesForProvider(arena, m, .{
+            .allowed_dirs = allowed,
+        });
+    }
+
     /// Build a flat ChatMessage slice from owned history.
-    /// Recovery paths intentionally skip multimodal processing — images were
-    /// already encoded on the main path and temp files may be deleted.
     fn buildMessageSlice(self: *Agent) ![]ChatMessage {
         const messages = try self.allocator.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
@@ -1303,6 +1305,79 @@ test "Agent buildMessageSlice" {
     try std.testing.expect(messages[1].role == .user);
     try std.testing.expectEqualStrings("sys", messages[0].content);
     try std.testing.expectEqualStrings("hello", messages[1].content);
+}
+
+test "Agent buildProviderMessages uses model-aware vision capability" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{};
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn supportsVision(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsVisionForModel(_: *anyopaque, model: []const u8) bool {
+            return std.mem.eql(u8, model, "vision-model");
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .supports_vision = DummyProvider.supportsVision,
+        .supports_vision_for_model = DummyProvider.supportsVisionForModel,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const prov = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = prov,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "text-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "Check [IMAGE:https://example.com/a.jpg]"),
+    });
+
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    try std.testing.expectError(error.ProviderDoesNotSupportVision, agent.buildProviderMessages(arena));
+
+    agent.model_name = "vision-model";
+    const messages = try agent.buildProviderMessages(arena);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(messages[0].content_parts != null);
 }
 
 test "Agent max_tool_iterations default" {

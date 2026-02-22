@@ -112,6 +112,7 @@ pub const RouterProvider = struct {
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
         .supports_vision = supportsVisionImpl,
+        .supports_vision_for_model = supportsVisionForModelImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
     };
@@ -159,8 +160,16 @@ pub const RouterProvider = struct {
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {
         const self: *RouterProvider = @ptrCast(@alignCast(ptr));
-        if (self.default_index >= self.providers.len) return false;
-        return self.providers[self.default_index].supportsVision();
+        return supportsVisionForModelImpl(ptr, self.default_model);
+    }
+
+    fn supportsVisionForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        const resolved = self.resolve(model);
+        const provider_idx = resolved[0];
+        const resolved_model = resolved[1];
+        if (provider_idx >= self.providers.len) return false;
+        return self.providers[provider_idx].supportsVisionForModel(resolved_model);
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
@@ -180,12 +189,22 @@ pub const RouterProvider = struct {
 const MockProvider = struct {
     response: []const u8,
     native_tools: bool,
+    supports_vision: bool = true,
     last_model: []const u8,
 
     fn init(response: []const u8, native_tools: bool) MockProvider {
         return .{
             .response = response,
             .native_tools = native_tools,
+            .last_model = "",
+        };
+    }
+
+    fn initWithVision(response: []const u8, native_tools: bool, supports_vision: bool) MockProvider {
+        return .{
+            .response = response,
+            .native_tools = native_tools,
+            .supports_vision = supports_vision,
             .last_model = "",
         };
     }
@@ -236,8 +255,9 @@ const MockProvider = struct {
         return self.native_tools;
     }
 
-    fn mockSupportsVision(_: *anyopaque) bool {
-        return true;
+    fn mockSupportsVision(ptr: *anyopaque) bool {
+        const self: *MockProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_vision;
     }
 
     fn mockGetName(_: *anyopaque) []const u8 {
@@ -535,6 +555,45 @@ test "vtable supportsNativeTools false when no providers" {
     defer prov.deinit();
 
     try std.testing.expect(!prov.supportsNativeTools());
+}
+
+test "vtable supportsVisionForModel follows hint routing" {
+    const provider_names = [_][]const u8{ "default", "vision" };
+    var mock_default = MockProvider.initWithVision("ok", false, false);
+    var mock_vision = MockProvider.initWithVision("ok", false, true);
+    const providers = [_]Provider{ mock_default.provider(), mock_vision.provider() };
+    const routes = [_]RouterProvider.RouteEntry{
+        .{ .hint = "img", .route = .{ .provider_name = "vision", .model = "vision-model" } },
+    };
+    var router = try RouterProvider.init(
+        std.testing.allocator,
+        &provider_names,
+        &providers,
+        &routes,
+        "default-model",
+    );
+    const prov = router.provider();
+    defer prov.deinit();
+
+    try std.testing.expect(!prov.supportsVisionForModel("default-model"));
+    try std.testing.expect(prov.supportsVisionForModel("hint:img"));
+}
+
+test "vtable supportsVision uses default model resolution" {
+    const provider_names = [_][]const u8{"default"};
+    var mock_default = MockProvider.initWithVision("ok", false, false);
+    const providers = [_]Provider{mock_default.provider()};
+    var router = try RouterProvider.init(
+        std.testing.allocator,
+        &provider_names,
+        &providers,
+        &.{},
+        "default-model",
+    );
+    const prov = router.provider();
+    defer prov.deinit();
+
+    try std.testing.expect(!prov.supportsVision());
 }
 
 test "vtable chatWithSystem returns error with no providers" {

@@ -43,6 +43,10 @@ pub const OpenAiCompatibleProvider = struct {
     /// When false, do not fall back to /v1/responses on chat completions 404.
     /// GLM/Zhipu does not support the responses API.
     supports_responses_fallback: bool = true,
+    /// When true, collect system message content and prepend it to the first
+    /// user message as "[System: …]\n\n…", then skip system-role messages.
+    /// Required by providers like MiniMax that reject the system role.
+    merge_system_into_user: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -57,25 +61,6 @@ pub const OpenAiCompatibleProvider = struct {
             .base_url = trimTrailingSlash(base_url),
             .api_key = api_key,
             .auth_style = auth_style,
-            .allocator = allocator,
-        };
-    }
-
-    /// Same as `init` but skips the /v1/responses fallback on 404.
-    /// Use for providers (e.g. GLM) that only support chat completions.
-    pub fn initNoResponsesFallback(
-        allocator: std.mem.Allocator,
-        name: []const u8,
-        base_url: []const u8,
-        api_key: ?[]const u8,
-        auth_style: AuthStyle,
-    ) OpenAiCompatibleProvider {
-        return .{
-            .name = name,
-            .base_url = trimTrailingSlash(base_url),
-            .api_key = api_key,
-            .auth_style = auth_style,
-            .supports_responses_fallback = false,
             .allocator = allocator,
         };
     }
@@ -425,7 +410,7 @@ pub const OpenAiCompatibleProvider = struct {
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildStreamingChatRequestBody(allocator, request, model, temperature);
+        const body = try buildStreamingChatRequestBody(allocator, request, model, temperature, self.merge_system_into_user);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -459,7 +444,19 @@ pub const OpenAiCompatibleProvider = struct {
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
+        // When merge_system_into_user is set, fold the system prompt into
+        // the user message so providers that reject the system role still work.
+        var eff_system = system_prompt;
+        var merged_msg: ?[]const u8 = null;
+        defer if (merged_msg) |m| allocator.free(m);
+        if (self.merge_system_into_user) {
+            if (system_prompt) |sp| {
+                merged_msg = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sp, message });
+                eff_system = null;
+            }
+        }
+
+        const body = try buildRequestBody(allocator, eff_system, merged_msg orelse message, model, temperature);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -477,7 +474,7 @@ pub const OpenAiCompatibleProvider = struct {
         return parseTextResponse(allocator, resp_body) catch |err| {
             // If chat completions failed and responses fallback is enabled, try the responses API
             if (self.supports_responses_fallback) {
-                return self.chatViaResponses(allocator, system_prompt, message, model) catch {
+                return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, model) catch {
                     return err;
                 };
             }
@@ -497,7 +494,7 @@ pub const OpenAiCompatibleProvider = struct {
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildChatRequestBody(allocator, request, model, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature, self.merge_system_into_user);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -534,12 +531,77 @@ pub const OpenAiCompatibleProvider = struct {
 /// Serialize a single message's content field — delegates to shared helper in providers/helpers.zig.
 const serializeMessageContent = root.serializeMessageContent;
 
+/// Serialize messages into a JSON array, optionally merging system messages
+/// into the first user message (for providers that reject the system role).
+fn serializeMessagesInto(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    messages: []const ChatMessage,
+    merge_system: bool,
+) !void {
+    if (!merge_system) {
+        // Standard path: serialize all messages as-is.
+        for (messages, 0..) |msg, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"role\":\"");
+            try buf.appendSlice(allocator, msg.role.toSlice());
+            try buf.appendSlice(allocator, "\",\"content\":");
+            try serializeMessageContent(buf, allocator, msg);
+            if (msg.tool_call_id) |tc_id| {
+                try buf.appendSlice(allocator, ",\"tool_call_id\":");
+                try root.appendJsonString(buf, allocator, tc_id);
+            }
+            try buf.append(allocator, '}');
+        }
+        return;
+    }
+
+    // Merge path: collect system content, prepend to first user message.
+    var sys_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer sys_buf.deinit(allocator);
+    for (messages) |msg| {
+        if (msg.role == .system) {
+            if (sys_buf.items.len > 0) try sys_buf.appendSlice(allocator, "\n");
+            try sys_buf.appendSlice(allocator, msg.content);
+        }
+    }
+
+    var first_msg = true;
+    var first_user_done = false;
+    for (messages) |msg| {
+        if (msg.role == .system) continue;
+
+        if (!first_msg) try buf.append(allocator, ',');
+        first_msg = false;
+
+        try buf.appendSlice(allocator, "{\"role\":\"");
+        try buf.appendSlice(allocator, msg.role.toSlice());
+        try buf.appendSlice(allocator, "\",\"content\":");
+
+        if (!first_user_done and msg.role == .user and sys_buf.items.len > 0) {
+            first_user_done = true;
+            const merged = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sys_buf.items, msg.content });
+            defer allocator.free(merged);
+            try root.appendJsonString(buf, allocator, merged);
+        } else {
+            try serializeMessageContent(buf, allocator, msg);
+        }
+
+        if (msg.tool_call_id) |tc_id| {
+            try buf.appendSlice(allocator, ",\"tool_call_id\":");
+            try root.appendJsonString(buf, allocator, tc_id);
+        }
+        try buf.append(allocator, '}');
+    }
+}
+
 /// Build a full chat request JSON body from a ChatRequest (OpenAI-compatible format).
 fn buildChatRequestBody(
     allocator: std.mem.Allocator,
     request: ChatRequest,
     model: []const u8,
     temperature: f64,
+    merge_system: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -548,18 +610,7 @@ fn buildChatRequestBody(
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\",\"messages\":[");
 
-    for (request.messages, 0..) |msg, i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, "{\"role\":\"");
-        try buf.appendSlice(allocator, msg.role.toSlice());
-        try buf.appendSlice(allocator, "\",\"content\":");
-        try serializeMessageContent(&buf, allocator, msg);
-        if (msg.tool_call_id) |tc_id| {
-            try buf.appendSlice(allocator, ",\"tool_call_id\":");
-            try root.appendJsonString(&buf, allocator, tc_id);
-        }
-        try buf.append(allocator, '}');
-    }
+    try serializeMessagesInto(&buf, allocator, request.messages, merge_system);
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
@@ -582,6 +633,7 @@ fn buildStreamingChatRequestBody(
     request: ChatRequest,
     model: []const u8,
     temperature: f64,
+    merge_system: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -590,18 +642,7 @@ fn buildStreamingChatRequestBody(
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\",\"messages\":[");
 
-    for (request.messages, 0..) |msg, i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, "{\"role\":\"");
-        try buf.appendSlice(allocator, msg.role.toSlice());
-        try buf.appendSlice(allocator, "\",\"content\":");
-        try serializeMessageContent(&buf, allocator, msg);
-        if (msg.tool_call_id) |tc_id| {
-            try buf.appendSlice(allocator, ",\"tool_call_id\":");
-            try root.appendJsonString(&buf, allocator, tc_id);
-        }
-        try buf.append(allocator, '}');
-    }
+    try serializeMessagesInto(&buf, allocator, request.messages, merge_system);
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
@@ -894,18 +935,6 @@ test "buildResponsesRequestBody without system" {
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
 }
 
-test "initNoResponsesFallback sets field to false" {
-    const p = OpenAiCompatibleProvider.initNoResponsesFallback(
-        std.testing.allocator,
-        "GLM",
-        "https://open.bigmodel.cn/api/paas/v4",
-        "key",
-        .bearer,
-    );
-    try std.testing.expect(!p.supports_responses_fallback);
-    try std.testing.expectEqualStrings("GLM", p.name);
-}
-
 test "AuthStyle custom headerName fallback" {
     try std.testing.expectEqualStrings("authorization", AuthStyle.custom.headerName());
 }
@@ -937,7 +966,7 @@ test "buildStreamingChatRequestBody contains stream true" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "test-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
@@ -960,10 +989,10 @@ test "streaming body has same messages as non-streaming" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test message")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
     defer allocator.free(non_stream);
 
-    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
     defer allocator.free(stream);
 
     // Both should contain the message
@@ -980,7 +1009,7 @@ test "streaming body has model field" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "custom-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5);
+    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "custom-model") != null);
@@ -995,7 +1024,7 @@ test "buildChatRequestBody without content_parts serializes plain string" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -1022,7 +1051,7 @@ test "buildChatRequestBody with image_url content_parts serializes OpenAI array"
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -1060,7 +1089,7 @@ test "buildChatRequestBody with base64 image serializes as data URI" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
     defer allocator.free(body);
 
     // Should contain the data URI
@@ -1079,7 +1108,7 @@ test "buildChatRequestBody with high detail image_url" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1108,7 +1137,7 @@ test "buildChatRequestBody o1 omits temperature" {
         .max_tokens = 100,
     };
 
-    const body = try buildChatRequestBody(allocator, req, "o1", 0.7);
+    const body = try buildChatRequestBody(allocator, req, "o1", 0.7, false);
     defer allocator.free(body);
 
     // Reasoning model: no temperature, uses max_completion_tokens
@@ -1127,10 +1156,153 @@ test "buildStreamingChatRequestBody reasoning model omits temperature" {
         .max_tokens = 200,
     };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5);
+    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":200") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// merge_system_into_user tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "merge_system_into_user merges system into first user message" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.system("Be helpful"),
+        root.ChatMessage.user("hello"),
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
+
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    // System message should be gone, only user message remains
+    try std.testing.expect(messages.items.len == 1);
+    const content = messages.items[0].object.get("content").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be helpful]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "hello") != null);
+    try std.testing.expectEqualStrings("user", messages.items[0].object.get("role").?.string);
+}
+
+test "merge_system_into_user with no system messages passes through" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("hello"),
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
+
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    try std.testing.expect(messages.items.len == 1);
+    try std.testing.expectEqualStrings("hello", messages.items[0].object.get("content").?.string);
+}
+
+test "merge_system_into_user false keeps system messages" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.system("Be helpful"),
+        root.ChatMessage.user("hello"),
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
+
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, false);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    try std.testing.expect(messages.items.len == 2);
+    try std.testing.expectEqualStrings("system", messages.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", messages.items[1].object.get("role").?.string);
+}
+
+test "merge_system_into_user field defaults to false" {
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", null, .bearer);
+    try std.testing.expect(!p.merge_system_into_user);
+}
+
+test "merge_system_into_user with multiple system messages concatenates" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.system("Rule 1"),
+        root.ChatMessage.system("Rule 2"),
+        root.ChatMessage.user("hello"),
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
+
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    try std.testing.expect(messages.items.len == 1);
+    const content = messages.items[0].object.get("content").?.string;
+    // Both system messages should be joined with \n
+    try std.testing.expect(std.mem.indexOf(u8, content, "Rule 1\nRule 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "hello") != null);
+}
+
+test "merge_system_into_user preserves assistant messages" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.system("Be helpful"),
+        root.ChatMessage.user("hello"),
+        root.ChatMessage.assistant("Hi!"),
+        root.ChatMessage.user("bye"),
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
+
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    // system removed, 3 messages remain: merged user, assistant, user
+    try std.testing.expect(messages.items.len == 3);
+    try std.testing.expectEqualStrings("user", messages.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("assistant", messages.items[1].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", messages.items[2].object.get("role").?.string);
+    // Only first user message has the merge prefix
+    const first_content = messages.items[0].object.get("content").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, first_content, "[System:") != null);
+    const last_content = messages.items[2].object.get("content").?.string;
+    try std.testing.expectEqualStrings("bye", last_content);
+}
+
+test "merge_system_into_user streaming body also merges" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.system("Be concise"),
+        root.ChatMessage.user("summarize"),
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
+
+    const body = try buildStreamingChatRequestBody(allocator, req, "test", 0.7, true);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    try std.testing.expect(messages.items.len == 1);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    const content = messages.items[0].object.get("content").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be concise]") != null);
 }
