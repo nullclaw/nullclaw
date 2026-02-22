@@ -125,6 +125,7 @@ pub const LineChannel = struct {
         defer parsed.deinit();
         const val = parsed.value;
 
+        if (val != .object) return result.items;
         const events_val = val.object.get("events") orelse return result.items;
         if (events_val != .array) return result.items;
         const events = events_val.array.items;

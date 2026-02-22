@@ -329,12 +329,14 @@ pub const SignalChannel = struct {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
         defer parsed.deinit();
 
+        if (parsed.value != .object) return null;
         const result = parsed.value.object.get("result") orelse {
             if (parsed.value.object.get("error")) |err_val| {
                 log.warn("Signal fetch attachment error: {}", .{err_val});
             }
             return null;
         };
+        if (result != .object) return null;
         const data_str = result.object.get("data") orelse return null;
         if (data_str != .string) return null;
 
@@ -554,7 +556,7 @@ pub const SignalChannel = struct {
         // Use 10 second timeout - SSE returns when data arrives or timeout
         const resp = root.http_util.curlGetSSE(allocator, url, "10") catch |err| {
             log.warn("Signal SSE poll failed: {}", .{err});
-            return &.{};
+            return err;
         };
         defer allocator.free(resp);
 

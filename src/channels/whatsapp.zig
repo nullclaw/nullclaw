@@ -75,11 +75,20 @@ pub const WhatsAppChannel = struct {
         const val = parsed.value;
 
         // Navigate: entry[] -> changes[] -> value -> messages[]
-        const entries = (val.object.get("entry") orelse return result.items).array.items;
+        if (val != .object) return result.items;
+        const entry_val = val.object.get("entry") orelse return result.items;
+        if (entry_val != .array) return result.items;
+        const entries = entry_val.array.items;
         for (entries) |entry| {
-            const changes = ((entry.object.get("changes")) orelse continue).array.items;
+            if (entry != .object) continue;
+            const changes_val = entry.object.get("changes") orelse continue;
+            if (changes_val != .array) continue;
+            const changes = changes_val.array.items;
             for (changes) |change| {
-                const value_obj = (change.object.get("value") orelse continue).object;
+                if (change != .object) continue;
+                const value_val = change.object.get("value") orelse continue;
+                if (value_val != .object) continue;
+                const value_obj = value_val.object;
                 const messages = ((value_obj.get("messages")) orelse continue).array.items;
 
                 for (messages) |msg| {
@@ -92,6 +101,19 @@ pub const WhatsAppChannel = struct {
 
                     // Check allowlist
                     if (!self.isNumberAllowed(normalized)) continue;
+
+                    // Check group policy
+                    const is_group_msg = if (msg.object.get("context")) |ctx|
+                        if (ctx == .object) (ctx.object.get("group_jid") != null) else false
+                    else
+                        false;
+
+                    if (is_group_msg) {
+                        if (std.mem.eql(u8, self.group_policy, "disabled")) continue;
+                        if (!std.mem.eql(u8, self.group_policy, "open")) {
+                            if (self.group_allow_from.len > 0 and !root.isAllowed(self.group_allow_from, normalized)) continue;
+                        }
+                    }
 
                     // Extract text only
                     const text_obj = msg.object.get("text") orelse continue;
@@ -132,16 +154,27 @@ pub const WhatsAppChannel = struct {
 
         // Navigate to the image ID
         const val = parsed.value;
-        const entries = (val.object.get("entry") orelse return null).array.items;
+        if (val != .object) return null;
+        const entry_raw = val.object.get("entry") orelse return null;
+        if (entry_raw != .array) return null;
+        const entries = entry_raw.array.items;
         if (entries.len == 0) return null;
-        const changes = (entries[0].object.get("changes") orelse return null).array.items;
+        if (entries[0] != .object) return null;
+        const changes_raw = entries[0].object.get("changes") orelse return null;
+        if (changes_raw != .array) return null;
+        const changes = changes_raw.array.items;
         if (changes.len == 0) return null;
-        const value_obj = (changes[0].object.get("value") orelse return null).object;
+        if (changes[0] != .object) return null;
+        const value_raw = changes[0].object.get("value") orelse return null;
+        if (value_raw != .object) return null;
+        const value_obj = value_raw.object;
         const messages = (value_obj.get("messages") orelse return null).array.items;
         if (messages.len == 0) return null;
+        if (messages[0] != .object) return null;
         const msg = messages[0].object;
 
         const img_obj = msg.get("image") orelse return null;
+        if (img_obj != .object) return null;
         const id_val = img_obj.object.get("id") orelse return null;
         if (id_val != .string) return null;
         const media_id = id_val.string;
@@ -159,6 +192,7 @@ pub const WhatsAppChannel = struct {
         var info_parsed = std.json.parseFromSlice(std.json.Value, allocator, info_resp, .{}) catch return null;
         defer info_parsed.deinit();
 
+        if (info_parsed.value != .object) return null;
         const url_val = info_parsed.value.object.get("url") orelse return null;
         if (url_val != .string) return null;
         const media_url = url_val.string;

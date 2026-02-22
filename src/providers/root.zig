@@ -49,6 +49,7 @@ pub const isReasoningModel = helpers.isReasoningModel;
 pub const appendGenerationFields = helpers.appendGenerationFields;
 pub const convertToolsOpenAI = helpers.convertToolsOpenAI;
 pub const serializeMessageContent = helpers.serializeMessageContent;
+pub const serializeContentPart = helpers.serializeContentPart;
 pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const curlPostTimed = helpers.curlPostTimed;
 pub const extractContent = helpers.extractContent;

@@ -580,9 +580,24 @@ fn serializeMessagesInto(
 
         if (!first_user_done and msg.role == .user and sys_buf.items.len > 0) {
             first_user_done = true;
-            const merged = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sys_buf.items, msg.content });
-            defer allocator.free(merged);
-            try root.appendJsonString(buf, allocator, merged);
+            if (msg.content_parts) |parts| {
+                // Prepend system text as a text part, then serialize original parts
+                try buf.append(allocator, '[');
+                try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+                const sys_prefix = try std.fmt.allocPrint(allocator, "[System: {s}]", .{sys_buf.items});
+                defer allocator.free(sys_prefix);
+                try root.appendJsonString(buf, allocator, sys_prefix);
+                try buf.append(allocator, '}');
+                for (parts) |part| {
+                    try buf.append(allocator, ',');
+                    try root.serializeContentPart(buf, allocator, part);
+                }
+                try buf.append(allocator, ']');
+            } else {
+                const merged = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sys_buf.items, msg.content });
+                defer allocator.free(merged);
+                try root.appendJsonString(buf, allocator, merged);
+            }
         } else {
             try serializeMessageContent(buf, allocator, msg);
         }

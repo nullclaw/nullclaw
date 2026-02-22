@@ -698,9 +698,17 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 }
 
 // ── Channel Start ────────────────────────────────────────────────
-// Usage: nullclaw channel start [telegram|signal]
+// Usage: nullclaw channel start [telegram|signal|discord|qq|onebot]
 // If a channel name is given, start that specific channel.
 // Otherwise, start the first available (Telegram first, then Signal).
+
+const supported_channels = std.StaticStringMap(void).initComptime(.{
+    .{ "telegram", {} },
+    .{ "signal", {} },
+    .{ "discord", {} },
+    .{ "qq", {} },
+    .{ "onebot", {} },
+});
 
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Load config
@@ -711,11 +719,13 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     defer config.deinit();
 
     // Check which channels are configured
-    const telegram_config = config.channels.telegram;
-    const signal_config = config.channels.signal;
+    const has_any = config.channels.telegram != null or
+        config.channels.signal != null or
+        config.channels.discord != null or
+        config.channels.qq != null or
+        config.channels.onebot != null;
 
-    // Must have at least one messaging channel configured
-    if (telegram_config == null and signal_config == null) {
+    if (!has_any) {
         std.debug.print("No messaging channel configured. Add to config.json:\n", .{});
         std.debug.print("  Telegram: {{\"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
         std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
@@ -726,30 +736,76 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const requested: ?[]const u8 = if (args.len > 0) args[0] else null;
 
     if (requested) |ch_name| {
-        if (std.mem.eql(u8, ch_name, "signal")) {
-            if (signal_config) |sig_config| {
-                return runSignalChannel(allocator, args[1..], &config, sig_config);
-            }
-            std.debug.print("Signal channel is not configured.\n", .{});
+        if (supported_channels.get(ch_name) == null) {
+            std.debug.print("Unknown channel: {s}\nSupported: telegram, signal, discord, qq, onebot\n", .{ch_name});
             std.process.exit(1);
-        } else if (std.mem.eql(u8, ch_name, "telegram")) {
-            if (telegram_config) |tg_config| {
+        }
+
+        // Telegram and Signal keep existing dedicated runners
+        if (std.mem.eql(u8, ch_name, "telegram")) {
+            if (config.channels.telegram) |tg_config| {
                 return runTelegramChannel(allocator, args[1..], config, tg_config);
             }
             std.debug.print("Telegram channel is not configured.\n", .{});
             std.process.exit(1);
-        } else {
-            std.debug.print("Unknown channel: {s}. Supported: telegram, signal\n", .{ch_name});
+        }
+        if (std.mem.eql(u8, ch_name, "signal")) {
+            if (config.channels.signal) |sig_config| {
+                return runSignalChannel(allocator, args[1..], &config, sig_config);
+            }
+            std.debug.print("Signal channel is not configured.\n", .{});
             std.process.exit(1);
+        }
+
+        // Gateway-loop channels (discord, qq, onebot): use ChannelManager
+        return runGatewayChannel(allocator, &config, ch_name);
+    }
+
+    // No channel specified -- start first available
+    if (config.channels.telegram) |tg_config| {
+        return runTelegramChannel(allocator, args, config, tg_config);
+    }
+    if (config.channels.signal) |sig_config| {
+        return runSignalChannel(allocator, args, &config, sig_config);
+    }
+    if (config.channels.discord != null) return runGatewayChannel(allocator, &config, "discord");
+    if (config.channels.qq != null) return runGatewayChannel(allocator, &config, "qq");
+    if (config.channels.onebot != null) return runGatewayChannel(allocator, &config, "onebot");
+}
+
+/// Start a single gateway-loop channel (discord, qq, onebot) using ChannelManager.
+fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Config, ch_name: []const u8) !void {
+    var registry = yc.channels.dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+
+    const mgr = try yc.channel_manager.ChannelManager.init(allocator, config, &registry);
+    defer mgr.deinit();
+
+    try mgr.collectConfiguredChannels();
+
+    // Find and start only the requested channel
+    var found = false;
+    for (mgr.channelEntries()) |entry| {
+        if (std.mem.eql(u8, entry.name, ch_name)) {
+            entry.channel.start() catch |err| {
+                std.debug.print("{s} channel failed to start: {}\n", .{ ch_name, err });
+                std.process.exit(1);
+            };
+            found = true;
+            break;
         }
     }
 
-    // No channel specified -- start first available (Telegram first, then Signal)
-    if (telegram_config) |tg_config| {
-        return runTelegramChannel(allocator, args, config, tg_config);
+    if (!found) {
+        std.debug.print("{s} channel is not configured.\n", .{ch_name});
+        std.process.exit(1);
     }
-    if (signal_config) |sig_config| {
-        return runSignalChannel(allocator, args, &config, sig_config);
+
+    std.debug.print("{s} channel started. Press Ctrl+C to stop.\n", .{ch_name});
+
+    // Block until Ctrl+C
+    while (!yc.daemon.isShutdownRequested()) {
+        std.Thread.sleep(1 * std.time.ns_per_s);
     }
 }
 
@@ -1013,7 +1069,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         std.debug.print("\n", .{});
     }
 
-    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
+    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, telegram_config.group_allow_from, telegram_config.group_policy);
     tg.proxy = telegram_config.proxy;
 
     // Set up transcription — key comes from providers.{audio_media.provider}

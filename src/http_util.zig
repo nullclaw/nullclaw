@@ -172,7 +172,7 @@ pub fn curlGetSSE(
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "-sf";
     argc += 1;
     argv_buf[argc] = "-N";
     argc += 1;

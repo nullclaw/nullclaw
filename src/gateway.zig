@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -209,6 +209,15 @@ pub const GatewayState = struct {
     whatsapp_app_secret: []const u8,
     whatsapp_access_token: []const u8,
     telegram_bot_token: []const u8,
+    telegram_allow_from: []const []const u8 = &.{},
+    whatsapp_allow_from: []const []const u8 = &.{},
+    line_channel_secret: []const u8 = "",
+    line_access_token: []const u8 = "",
+    line_allow_from: []const []const u8 = &.{},
+    lark_verification_token: []const u8 = "",
+    lark_app_id: []const u8 = "",
+    lark_app_secret: []const u8 = "",
+    lark_allow_from: []const []const u8 = &.{},
     pairing_guard: ?PairingGuard,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
@@ -615,7 +624,7 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /line, POST /lark
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     health.markComponentOk("gateway");
 
@@ -645,11 +654,24 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         );
         if (cfg.channels.telegram) |tg_cfg| {
             state.telegram_bot_token = tg_cfg.bot_token;
+            state.telegram_allow_from = tg_cfg.allow_from;
         }
         if (cfg.channels.whatsapp) |wa_cfg| {
             state.whatsapp_verify_token = wa_cfg.verify_token;
             state.whatsapp_app_secret = wa_cfg.app_secret orelse "";
             state.whatsapp_access_token = wa_cfg.access_token;
+            state.whatsapp_allow_from = wa_cfg.allow_from;
+        }
+        if (cfg.channels.line) |line_cfg| {
+            state.line_channel_secret = line_cfg.channel_secret;
+            state.line_access_token = line_cfg.access_token;
+            state.line_allow_from = line_cfg.allow_from;
+        }
+        if (cfg.channels.lark) |lark_cfg| {
+            state.lark_verification_token = lark_cfg.verification_token orelse "";
+            state.lark_app_id = lark_cfg.app_id;
+            state.lark_app_secret = lark_cfg.app_secret;
+            state.lark_allow_from = lark_cfg.allow_from;
         }
 
         // Resolve API key: config providers first, then env vars
@@ -740,7 +762,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         const target = parts.next() orelse continue;
 
         // Simple routing — extract base path (strip query string) and look up route
-        const Route = enum { health, ready, webhook, pair, telegram, whatsapp };
+        const Route = enum { health, ready, webhook, pair, telegram, whatsapp, line, lark };
         const route_map = std.StaticStringMap(Route).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
@@ -748,6 +770,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             .{ "/pair", .pair },
             .{ "/telegram", .telegram },
             .{ "/whatsapp", .whatsapp },
+            .{ "/line", .line },
+            .{ "/lark", .lark },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
@@ -887,7 +911,20 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                         const msg_text = jsonStringField(b, "text");
                         const chat_id = jsonIntField(b, "chat_id");
 
-                        if (msg_text != null and chat_id != null) {
+                        // Check allow_from for Telegram
+                        var tg_authorized = true;
+                        if (state.telegram_allow_from.len > 0) {
+                            const sender = jsonStringField(b, "username");
+                            if (sender) |s| {
+                                if (!channels.isAllowed(state.telegram_allow_from, s)) {
+                                    tg_authorized = false;
+                                }
+                            }
+                        }
+
+                        if (!tg_authorized) {
+                            response_body = "{\"status\":\"unauthorized\"}";
+                        } else if (msg_text != null and chat_id != null) {
                             // Process the message in-process
                             if (session_mgr_opt) |*sm| {
                                 var kb: [64]u8 = undefined;
@@ -961,8 +998,18 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                         // Signature valid — proceed with message processing
                         const body = if (body_for_sig.len > 0) body_for_sig else null;
                         if (body) |b| {
+                            // Check allow_from for WhatsApp
+                            if (state.whatsapp_allow_from.len > 0) {
+                                const wa_sender = jsonStringField(b, "from");
+                                if (wa_sender) |s| {
+                                    if (!channels.isAllowed(state.whatsapp_allow_from, s)) {
+                                        response_body = "{\"status\":\"unauthorized\"}";
+                                        break :sig_check;
+                                    }
+                                }
+                            }
                             const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
-                                channels.whatsapp.downloadMediaFromPayload(req_allocator, state.whatsapp_access_token, b);
+                                channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(req_allocator, state.whatsapp_access_token, b);
                             if (msg_text) |mt| {
                                 if (session_mgr_opt) |*sm| {
                                     const reply: ?[]const u8 = sm.processMessage("whatsapp", mt) catch |err| blk: {
@@ -986,12 +1033,22 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                         } else {
                             response_body = "{\"status\":\"received\"}";
                         }
-                    } else {
+                    } else wa_nosig: {
                         const body = extractBody(raw);
                         if (body) |b| {
+                            // Check allow_from for WhatsApp
+                            if (state.whatsapp_allow_from.len > 0) {
+                                const wa_sender = jsonStringField(b, "from");
+                                if (wa_sender) |s| {
+                                    if (!channels.isAllowed(state.whatsapp_allow_from, s)) {
+                                        response_body = "{\"status\":\"unauthorized\"}";
+                                        break :wa_nosig;
+                                    }
+                                }
+                            }
                             // Try to extract message text from WhatsApp payload
                             const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
-                                channels.whatsapp.downloadMediaFromPayload(req_allocator, state.whatsapp_access_token, b);
+                                channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(req_allocator, state.whatsapp_access_token, b);
                             if (msg_text) |mt| {
                                 if (session_mgr_opt) |*sm| {
                                     const reply: ?[]const u8 = sm.processMessage("whatsapp", mt) catch |err| blk: {
@@ -1019,6 +1076,137 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 } else {
                     response_status = "405 Method Not Allowed";
                     response_body = "{\"error\":\"method not allowed\"}";
+                }
+            },
+            .line => {
+                if (!is_post) {
+                    response_status = "405 Method Not Allowed";
+                    response_body = "{\"error\":\"method not allowed\"}";
+                } else if (!state.rate_limiter.allowWebhook(state.allocator, "line")) {
+                    response_status = "429 Too Many Requests";
+                    response_body = "{\"error\":\"rate limited\"}";
+                } else line_handler: {
+                    // Verify LINE signature
+                    if (state.line_channel_secret.len > 0) {
+                        const sig_header = extractHeader(raw, "X-Line-Signature") orelse {
+                            response_status = "403 Forbidden";
+                            response_body = "{\"error\":\"missing signature\"}";
+                            break :line_handler;
+                        };
+                        const body_for_sig = extractBody(raw) orelse "";
+                        if (!channels.line.LineChannel.verifySignature(body_for_sig, sig_header, state.line_channel_secret)) {
+                            response_status = "403 Forbidden";
+                            response_body = "{\"error\":\"invalid signature\"}";
+                            break :line_handler;
+                        }
+                    }
+                    const body = extractBody(raw);
+                    if (body) |b| {
+                        const events = channels.line.LineChannel.parseWebhookEvents(req_allocator, b) catch {
+                            response_body = "{\"status\":\"parse_error\"}";
+                            break :line_handler;
+                        };
+                        for (events) |evt| {
+                            // Check allow_from
+                            if (state.line_allow_from.len > 0) {
+                                if (evt.user_id) |uid| {
+                                    if (!channels.isAllowed(state.line_allow_from, uid)) continue;
+                                } else continue;
+                            }
+                            if (evt.message_text) |text| {
+                                if (session_mgr_opt) |*sm| {
+                                    var kb: [128]u8 = undefined;
+                                    const sk = std.fmt.bufPrint(&kb, "line:{s}", .{evt.user_id orelse "unknown"}) catch "line:unknown";
+                                    const reply: ?[]const u8 = sm.processMessage(sk, text) catch null;
+                                    if (reply) |r| {
+                                        defer allocator.free(r);
+                                        // Reply via LINE Reply API if we have a reply token
+                                        if (evt.reply_token) |rt| {
+                                            var line_ch = channels.line.LineChannel.init(req_allocator, .{
+                                                .access_token = state.line_access_token,
+                                                .channel_secret = state.line_channel_secret,
+                                            });
+                                            line_ch.replyMessage(rt, r) catch {};
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        response_body = "{\"status\":\"ok\"}";
+                    } else {
+                        response_body = "{\"status\":\"received\"}";
+                    }
+                }
+            },
+            .lark => {
+                if (!is_post) {
+                    response_status = "405 Method Not Allowed";
+                    response_body = "{\"error\":\"method not allowed\"}";
+                } else if (!state.rate_limiter.allowWebhook(state.allocator, "lark")) {
+                    response_status = "429 Too Many Requests";
+                    response_body = "{\"error\":\"rate limited\"}";
+                } else lark_handler: {
+                    const body = extractBody(raw) orelse {
+                        response_body = "{\"status\":\"received\"}";
+                        break :lark_handler;
+                    };
+                    // Check for URL verification challenge
+                    if (std.mem.indexOf(u8, body, "\"url_verification\"") != null) {
+                        // Lark URL verification: respond with the challenge
+                        const challenge = jsonStringField(body, "challenge");
+                        if (challenge) |c| {
+                            const challenge_resp = std.fmt.allocPrint(req_allocator, "{{\"challenge\":\"{s}\"}}", .{c}) catch null;
+                            response_body = challenge_resp orelse "{\"status\":\"ok\"}";
+                        } else {
+                            response_body = "{\"status\":\"ok\"}";
+                        }
+                        break :lark_handler;
+                    }
+                    // Verify token if configured
+                    if (state.lark_verification_token.len > 0) {
+                        // Extract token from header.token in the payload
+                        const payload_token = blk: {
+                            const parsed = std.json.parseFromSlice(std.json.Value, req_allocator, body, .{}) catch break :blk @as(?[]const u8, null);
+                            defer parsed.deinit();
+                            if (parsed.value != .object) break :blk @as(?[]const u8, null);
+                            const header = parsed.value.object.get("header") orelse break :blk @as(?[]const u8, null);
+                            if (header != .object) break :blk @as(?[]const u8, null);
+                            const token_val = header.object.get("token") orelse break :blk @as(?[]const u8, null);
+                            break :blk if (token_val == .string) req_allocator.dupe(u8, token_val.string) catch null else null;
+                        };
+                        if (payload_token) |pt| {
+                            if (!std.mem.eql(u8, pt, state.lark_verification_token)) {
+                                response_status = "403 Forbidden";
+                                response_body = "{\"error\":\"invalid verification token\"}";
+                                break :lark_handler;
+                            }
+                        }
+                    }
+                    // Parse event using LarkChannel
+                    var lark_ch = channels.lark.LarkChannel.init(
+                        req_allocator,
+                        state.lark_app_id,
+                        state.lark_app_secret,
+                        state.lark_verification_token,
+                        0,
+                        state.lark_allow_from,
+                    );
+                    const messages = lark_ch.parseEventPayload(req_allocator, body) catch {
+                        response_body = "{\"status\":\"parse_error\"}";
+                        break :lark_handler;
+                    };
+                    for (messages) |msg| {
+                        if (session_mgr_opt) |*sm| {
+                            var kb: [128]u8 = undefined;
+                            const sk = std.fmt.bufPrint(&kb, "lark:{s}", .{msg.sender}) catch "lark:unknown";
+                            const reply: ?[]const u8 = sm.processMessage(sk, msg.content) catch null;
+                            if (reply) |r| {
+                                defer allocator.free(r);
+                                lark_ch.sendMessage(msg.sender, r) catch {};
+                            }
+                        }
+                    }
+                    response_body = "{\"status\":\"ok\"}";
                 }
             },
         } else {

@@ -448,12 +448,14 @@ fn deriveHttpBase(ws_url: []const u8) []const u8 {
 
 /// Get a string field from a JSON object value.
 fn getJsonString(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
     const field = val.object.get(key) orelse return null;
     return if (field == .string) field.string else null;
 }
 
 /// Get an integer field from a JSON object value.
 fn getJsonInt(val: std.json.Value, key: []const u8) ?i64 {
+    if (val != .object) return null;
     const field = val.object.get(key) orelse return null;
     return switch (field) {
         .integer => field.integer,

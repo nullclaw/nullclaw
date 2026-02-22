@@ -283,6 +283,7 @@ pub const QQChannel = struct {
         const val = parsed.value;
 
         // Extract opcode
+        if (val != .object) return;
         const op_val = val.object.get("op") orelse return;
         const op_int: i64 = switch (op_val) {
             .integer => op_val.integer,
@@ -301,9 +302,11 @@ pub const QQChannel = struct {
             .hello => {
                 // Extract heartbeat_interval from d.heartbeat_interval
                 if (val.object.get("d")) |d_val| {
-                    if (d_val.object.get("heartbeat_interval")) |hb_val| {
-                        if (hb_val == .integer and hb_val.integer > 0) {
-                            self.heartbeat_interval_ms = @intCast(@min(hb_val.integer, std.math.maxInt(u32)));
+                    if (d_val == .object) {
+                        if (d_val.object.get("heartbeat_interval")) |hb_val| {
+                            if (hb_val == .integer and hb_val.integer > 0) {
+                                self.heartbeat_interval_ms = @intCast(@min(hb_val.integer, std.math.maxInt(u32)));
+                            }
                         }
                     }
                 }
@@ -346,6 +349,7 @@ pub const QQChannel = struct {
 
     fn handleMessageCreate(self: *QQChannel, val: std.json.Value, event_type: []const u8) !void {
         const d = val.object.get("d") orelse return;
+        if (d != .object) return;
 
         // Extract message ID for dedup
         const msg_id_str = getJsonStringFromObj(d, "id") orelse return;
@@ -369,6 +373,9 @@ pub const QQChannel = struct {
         // Extract sender info
         const author = d.object.get("author") orelse return;
         const sender_id = getJsonStringFromObj(author, "id") orelse "unknown";
+
+        // Allowlist check
+        if (self.config.allow_from.len > 0 and !root.isAllowed(self.config.allow_from, sender_id)) return;
 
         // Extract content and strip CQ codes
         const raw_content = getJsonStringFromObj(d, "content") orelse "";
@@ -528,6 +535,7 @@ fn parseTarget(target: []const u8) struct { []const u8, []const u8 } {
 
 /// Get a string field from a JSON object value.
 fn getJsonString(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
     const field = val.object.get(key) orelse return null;
     return if (field == .string) field.string else null;
 }

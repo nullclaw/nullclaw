@@ -81,6 +81,7 @@ pub const Config = struct {
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
     agents: []const NamedAgentConfig = &.{},
+    agent_bindings: []const @import("agent_routing.zig").AgentBinding = &.{},
     mcp_servers: []const McpServerConfig = &.{},
 
     // Nested sub-configs

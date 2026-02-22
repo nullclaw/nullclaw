@@ -16,6 +16,7 @@ const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
+const agent_routing = @import("agent_routing.zig");
 
 const signal = @import("channels/signal.zig");
 
@@ -211,9 +212,19 @@ pub fn runTelegramLoop(
             const use_reply_to = msg.is_group or telegram_config.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
 
-            // Session key
+            // Session key — use agent routing if bindings are configured
             var key_buf: [128]u8 = undefined;
-            const session_key = std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+            const session_key = blk: {
+                if (config.agent_bindings.len > 0) {
+                    const route = agent_routing.resolveRoute(allocator, .{
+                        .channel = "telegram",
+                        .account_id = "default",
+                        .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
+                    }, config.agent_bindings, config.agents) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+                    break :blk route.session_key;
+                }
+                break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+            };
 
             // Typing indicator
             typing.start(msg.sender);
@@ -331,15 +342,28 @@ pub fn runSignalLoop(
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
         for (messages) |msg| {
-            // Session key: include group context for isolation
+            // Session key — use agent routing if bindings are configured
             var key_buf: [128]u8 = undefined;
-            const session_key = if (msg.is_group)
-                std.fmt.bufPrint(&key_buf, "signal:group:{s}:{s}", .{
-                    msg.reply_target orelse "unknown",
-                    msg.sender,
-                }) catch msg.sender
-            else
-                std.fmt.bufPrint(&key_buf, "signal:{s}", .{msg.sender}) catch msg.sender;
+            const session_key = blk: {
+                if (config.agent_bindings.len > 0) {
+                    const route = agent_routing.resolveRoute(allocator, .{
+                        .channel = "signal",
+                        .account_id = "default",
+                        .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
+                    }, config.agent_bindings, config.agents) catch break :blk if (msg.is_group)
+                        std.fmt.bufPrint(&key_buf, "signal:group:{s}:{s}", .{ msg.reply_target orelse "unknown", msg.sender }) catch msg.sender
+                    else
+                        std.fmt.bufPrint(&key_buf, "signal:{s}", .{msg.sender}) catch msg.sender;
+                    break :blk route.session_key;
+                }
+                break :blk if (msg.is_group)
+                    std.fmt.bufPrint(&key_buf, "signal:group:{s}:{s}", .{
+                        msg.reply_target orelse "unknown",
+                        msg.sender,
+                    }) catch msg.sender
+                else
+                    std.fmt.bufPrint(&key_buf, "signal:{s}", .{msg.sender}) catch msg.sender;
+            };
 
             // Send typing indicator (best-effort)
             if (msg.reply_target) |target| {

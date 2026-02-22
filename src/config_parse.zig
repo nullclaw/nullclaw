@@ -784,6 +784,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     var it = accts.object.iterator();
                     const first = it.next() orelse return null;
                     if (first.value_ptr.* != .object) return null;
+                    if (it.next() != null) {
+                        std.log.warn("Multiple accounts configured; only first account used", .{});
+                    }
                     return first.value_ptr.object;
                 }
             }.call;
@@ -806,6 +809,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                             if (acc.get("proxy")) |v| {
                                 if (v == .string) tg_cfg.proxy = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (acc.get("group_allow_from")) |v| {
+                                if (v == .array) tg_cfg.group_allow_from = try parseStringArray(self.allocator, v.array);
+                            }
+                            if (acc.get("group_policy")) |v| {
+                                if (v == .string) tg_cfg.group_policy = try self.allocator.dupe(u8, v.string);
                             }
                         }
                     }
@@ -832,6 +841,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 if (v == .bool) dc.allow_bots = v.bool;
                             }
                             if (acc.get("require_mention")) |v| {
+                                if (v == .bool) dc.require_mention = v.bool;
+                            }
+                            if (acc.get("mention_only")) |v| {
                                 if (v == .bool) dc.require_mention = v.bool;
                             }
                             if (acc.get("intents")) |v| {
@@ -955,6 +967,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             if (acc.get("allow_from")) |v| {
                                 if (v == .array) wc.allow_from = try parseStringArray(self.allocator, v.array);
                             }
+                            if (acc.get("group_allow_from")) |v| {
+                                if (v == .array) wc.group_allow_from = try parseStringArray(self.allocator, v.array);
+                            }
+                            if (acc.get("group_policy")) |v| {
+                                if (v == .string) wc.group_policy = try self.allocator.dupe(u8, v.string);
+                            }
                         }
                     }
                 }
@@ -970,6 +988,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (im.object.get("allow_from")) |v| {
                             if (v == .array) ic.allow_from = try parseStringArray(self.allocator, v.array);
+                        }
+                        if (im.object.get("group_allow_from")) |v| {
+                            if (v == .array) ic.group_allow_from = try parseStringArray(self.allocator, v.array);
+                        }
+                        if (im.object.get("group_policy")) |v| {
+                            if (v == .string) ic.group_policy = try self.allocator.dupe(u8, v.string);
                         }
                     }
                 }
@@ -1171,6 +1195,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                             if (acc.get("group_allow_from")) |v| {
                                 if (v == .array) qc.group_allow_from = try parseStringArray(self.allocator, v.array);
+                            }
+                            if (acc.get("allow_from")) |v| {
+                                if (v == .array) qc.allow_from = try parseStringArray(self.allocator, v.array);
                             }
                         }
                     }
