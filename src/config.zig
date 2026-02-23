@@ -80,6 +80,7 @@ pub const Config = struct {
     audio_media: AudioMediaConfig = .{},
     default_provider: []const u8 = "openrouter",
     default_model: ?[]const u8 = null,
+    legacy_default_model_detected: bool = false,
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
 
@@ -552,6 +553,7 @@ pub const Config = struct {
     // ── Validation ──────────────────────────────────────────────
 
     pub const ValidationError = error{
+        LegacyDefaultModelField,
         NoDefaultModel,
         TemperatureOutOfRange,
         InvalidPort,
@@ -560,6 +562,9 @@ pub const Config = struct {
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
+        if (self.legacy_default_model_detected) {
+            return ValidationError.LegacyDefaultModelField;
+        }
         if (self.default_model == null) {
             return ValidationError.NoDefaultModel;
         }
@@ -580,6 +585,10 @@ pub const Config = struct {
     /// Print a human-readable validation error to stderr.
     pub fn printValidationError(err: ValidationError) void {
         switch (err) {
+            ValidationError.LegacyDefaultModelField => std.debug.print(
+                "Config error: top-level default_model is not supported. Set agents.defaults.model.primary instead.\n",
+                .{},
+            ),
             ValidationError.NoDefaultModel => std.debug.print(
                 "No default_model configured. Set it in ~/.nullclaw/config.json or run `nullclaw onboard`.\n",
                 .{},
@@ -767,11 +776,12 @@ test "json parse top-level default_model" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqualStrings("meta-llama/llama-3.3-70b-instruct:free", cfg.default_model.?);
-    allocator.free(cfg.default_model.?);
+    try std.testing.expect(cfg.legacy_default_model_detected);
+    try std.testing.expect(cfg.default_model == null);
+    try std.testing.expectError(Config.ValidationError.LegacyDefaultModelField, cfg.validate());
 }
 
-test "agents.defaults.model.primary overrides top-level default_model" {
+test "validation rejects top-level default_model even when nested model exists" {
     const allocator = std.testing.allocator;
     // use an arena to match production behavior (both allocs are freed together)
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -781,8 +791,9 @@ test "agents.defaults.model.primary overrides top-level default_model" {
     try cfg.parseJson(
         \\{"default_model": "top-level-model", "agents": {"defaults": {"model": {"primary": "nested-model"}}}}
     );
-    // nested takes precedence since it's parsed after top-level
+    try std.testing.expect(cfg.legacy_default_model_detected);
     try std.testing.expectEqualStrings("nested-model", cfg.default_model.?);
+    try std.testing.expectError(Config.ValidationError.LegacyDefaultModelField, cfg.validate());
 }
 
 test "save includes channels section by default" {
