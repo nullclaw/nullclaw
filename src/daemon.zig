@@ -273,6 +273,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("peer_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.peer_id = v.string;
         }
+        if (pm.value.object.get("message_id")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.message_id = v.string;
+        }
         if (pm.value.object.get("guild_id")) |v| {
             if (v == .string) parsed.fields.guild_id = v.string;
         }
@@ -345,23 +348,87 @@ fn resolveInboundRouteSessionKey(
     return resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, parsed_meta.fields);
 }
 
+const InboundIndicatorMode = enum {
+    none,
+    slack_status,
+};
+
+const SlackStatusTarget = struct {
+    channel_id: []const u8,
+    thread_ts: []const u8,
+};
+
+fn resolveSlackStatusTarget(meta: channel_adapters.InboundMetadata, chat_id: []const u8) ?SlackStatusTarget {
+    var channel_id = meta.channel_id orelse chat_id;
+    if (std.mem.indexOfScalar(u8, channel_id, ':')) |idx| {
+        if (idx > 0) channel_id = channel_id[0..idx];
+    }
+    if (channel_id.len == 0) return null;
+
+    const thread_ts = meta.thread_id orelse meta.message_id orelse return null;
+    if (thread_ts.len == 0) return null;
+
+    return .{
+        .channel_id = channel_id,
+        .thread_ts = thread_ts,
+    };
+}
+
 fn sendInboundProcessingIndicator(
     registry: *const dispatch.ChannelRegistry,
     channel_name: []const u8,
     account_id: ?[]const u8,
     chat_id: []const u8,
-) void {
-    // Keep behavior explicit and narrow: Discord has a native typing endpoint.
-    if (!std.mem.eql(u8, channel_name, "discord")) return;
+    meta: channel_adapters.InboundMetadata,
+) InboundIndicatorMode {
+    const channel_opt = if (account_id) |aid|
+        registry.findByNameAccount(channel_name, aid)
+    else
+        registry.findByName(channel_name);
+    const ch = channel_opt orelse return .none;
 
+    if (std.mem.eql(u8, channel_name, "discord")) {
+        const discord_ch: *channels_mod.discord.DiscordChannel = @ptrCast(@alignCast(ch.ptr));
+        discord_ch.sendTypingIndicator(chat_id);
+        return .none;
+    }
+
+    if (std.mem.eql(u8, channel_name, "mattermost")) {
+        const mm_ch: *channels_mod.mattermost.MattermostChannel = @ptrCast(@alignCast(ch.ptr));
+        mm_ch.sendTypingIndicator(chat_id);
+        return .none;
+    }
+
+    if (std.mem.eql(u8, channel_name, "slack")) {
+        const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return .none;
+        const slack_ch: *channels_mod.slack.SlackChannel = @ptrCast(@alignCast(ch.ptr));
+        slack_ch.setThreadStatus(slack_target.channel_id, slack_target.thread_ts, "is typing...");
+        return .slack_status;
+    }
+
+    return .none;
+}
+
+fn clearInboundProcessingIndicator(
+    registry: *const dispatch.ChannelRegistry,
+    channel_name: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+    meta: channel_adapters.InboundMetadata,
+    mode: InboundIndicatorMode,
+) void {
+    if (mode != .slack_status) return;
+    if (!std.mem.eql(u8, channel_name, "slack")) return;
+
+    const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return;
     const channel_opt = if (account_id) |aid|
         registry.findByNameAccount(channel_name, aid)
     else
         registry.findByName(channel_name);
     const ch = channel_opt orelse return;
 
-    const discord_ch: *channels_mod.discord.DiscordChannel = @ptrCast(@alignCast(ch.ptr));
-    discord_ch.sendTypingIndicator(chat_id);
+    const slack_ch: *channels_mod.slack.SlackChannel = @ptrCast(@alignCast(ch.ptr));
+    slack_ch.setThreadStatus(slack_target.channel_id, slack_target.thread_ts, "");
 }
 
 fn inboundDispatcherThread(
@@ -389,7 +456,21 @@ fn inboundDispatcherThread(
         defer if (routed_session_key) |key| allocator.free(key);
         const session_key = routed_session_key orelse msg.session_key;
 
-        sendInboundProcessingIndicator(registry, msg.channel, outbound_account_id, msg.chat_id);
+        const indicator_mode = sendInboundProcessingIndicator(
+            registry,
+            msg.channel,
+            outbound_account_id,
+            msg.chat_id,
+            parsed_meta.fields,
+        );
+        defer clearInboundProcessingIndicator(
+            registry,
+            msg.channel,
+            outbound_account_id,
+            msg.chat_id,
+            parsed_meta.fields,
+            indicator_mode,
+        );
 
         const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
@@ -1303,6 +1384,37 @@ test "resolveInboundRouteSessionKey supports standardized peer metadata for unkn
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
     try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", routed.?);
+}
+
+test "parseInboundMetadata extracts message_id and thread_id" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"account_id\":\"sl-main\",\"channel_id\":\"C1\",\"message_id\":\"1700.1\",\"thread_id\":\"1700.0\"}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("sl-main", parsed.fields.account_id.?);
+    try std.testing.expectEqualStrings("C1", parsed.fields.channel_id.?);
+    try std.testing.expectEqualStrings("1700.1", parsed.fields.message_id.?);
+    try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
+}
+
+test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
+    const with_thread = resolveSlackStatusTarget(.{
+        .channel_id = "C123",
+        .message_id = "1700.1",
+        .thread_id = "1700.0",
+    }, "C123");
+    try std.testing.expect(with_thread != null);
+    try std.testing.expectEqualStrings("C123", with_thread.?.channel_id);
+    try std.testing.expectEqualStrings("1700.0", with_thread.?.thread_ts);
+
+    const with_message_only = resolveSlackStatusTarget(.{
+        .channel_id = "C123",
+        .message_id = "1700.1",
+    }, "C123");
+    try std.testing.expect(with_message_only != null);
+    try std.testing.expectEqualStrings("1700.1", with_message_only.?.thread_ts);
 }
 
 test "stateFilePath derives from config_path" {

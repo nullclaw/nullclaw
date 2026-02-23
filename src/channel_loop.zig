@@ -558,6 +558,9 @@ pub fn runMatrixLoop(
                 break :blk route.session_key;
             };
 
+            const typing_target = msg.reply_target orelse msg.sender;
+            mx_ptr.sendTypingIndicator(typing_target);
+
             const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
@@ -567,14 +570,12 @@ pub fn runMatrixLoop(
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again.",
                 };
-                const target = msg.reply_target orelse msg.sender;
-                mx_ptr.sendMessage(target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
+                mx_ptr.sendMessage(typing_target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
                 continue;
             };
             defer allocator.free(reply);
 
-            const target = msg.reply_target orelse msg.sender;
-            mx_ptr.sendMessage(target, reply) catch |err| {
+            mx_ptr.sendMessage(typing_target, reply) catch |err| {
                 log.warn("Matrix send error: {}", .{err});
             };
         }

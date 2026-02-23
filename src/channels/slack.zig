@@ -265,6 +265,14 @@ pub const SlackChannel = struct {
         if (text_val != .string) return;
         const text = std.mem.trim(u8, text_val.string, " \t\r\n");
         if (text.len == 0) return;
+        const message_ts = if (msg_obj.get("ts")) |ts_val| switch (ts_val) {
+            .string => |s| if (s.len > 0) s else null,
+            else => null,
+        } else null;
+        const thread_ts = if (msg_obj.get("thread_ts")) |thread_ts_val| switch (thread_ts_val) {
+            .string => |s| if (s.len > 0) s else null,
+            else => null,
+        } else null;
 
         const is_dm = isDirectConversationId(channel_id);
         if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
@@ -285,6 +293,14 @@ pub const SlackChannel = struct {
         try mw.writeAll(if (is_dm) "true" else "false");
         try mw.writeAll(",\"channel_id\":");
         try root.appendJsonStringW(mw, channel_id);
+        if (message_ts) |ts| {
+            try mw.writeAll(",\"message_id\":");
+            try root.appendJsonStringW(mw, ts);
+        }
+        if (thread_ts) |tts| {
+            try mw.writeAll(",\"thread_id\":");
+            try root.appendJsonStringW(mw, tts);
+        }
         try mw.writeByte('}');
 
         const inbound = try bus_mod.makeInboundFull(
@@ -577,6 +593,33 @@ pub const SlackChannel = struct {
             log.err("Slack API POST failed: {}", .{err});
             return error.SlackApiError;
         };
+        self.allocator.free(resp);
+    }
+
+    /// Set Slack Assistant thread status (best-effort, errors ignored).
+    pub fn setThreadStatus(self: *SlackChannel, channel_id: []const u8, thread_ts: []const u8, status: []const u8) void {
+        if (builtin.is_test) return;
+        if (channel_id.len == 0 or thread_ts.len == 0) return;
+
+        const url = API_BASE ++ "/assistant.threads.setStatus";
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+
+        const bw = body_list.writer(self.allocator);
+        bw.writeAll("{\"channel_id\":") catch return;
+        root.appendJsonStringW(bw, channel_id) catch return;
+        bw.writeAll(",\"thread_ts\":") catch return;
+        root.appendJsonStringW(bw, thread_ts) catch return;
+        bw.writeAll(",\"status\":") catch return;
+        root.appendJsonStringW(bw, status) catch return;
+        bw.writeByte('}') catch return;
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        auth_fbs.writer().print("Authorization: Bearer {s}", .{self.bot_token}) catch return;
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch return;
         self.allocator.free(resp);
     }
 
@@ -1013,6 +1056,12 @@ test "parseTarget clears stale thread_ts for non-thread target" {
     try std.testing.expect(ch.thread_ts == null);
 }
 
+test "slack setThreadStatus is no-op in tests" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    ch.setThreadStatus("C12345", "1700000000.100", "is typing...");
+}
+
 test "slack processHistoryMessage publishes inbound message to bus" {
     const alloc = std.testing.allocator;
     var eb = bus_mod.Bus.init();
@@ -1026,7 +1075,7 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
-        \\{"user":"U123","text":"hello from slack"}
+        \\{"user":"U123","text":"hello from slack","ts":"1700000000.100","thread_ts":"1700000000.000"}
     ,
         .{},
     );
@@ -1042,6 +1091,12 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     try std.testing.expectEqualStrings("C12345", msg.chat_id);
     try std.testing.expectEqualStrings("slack:sl-main:channel:C12345", msg.session_key);
     try std.testing.expectEqualStrings("hello from slack", msg.content);
+    try std.testing.expect(msg.metadata_json != null);
+    const meta = try std.json.parseFromSlice(std.json.Value, alloc, msg.metadata_json.?, .{});
+    defer meta.deinit();
+    try std.testing.expect(meta.value == .object);
+    try std.testing.expectEqualStrings("1700000000.100", meta.value.object.get("message_id").?.string);
+    try std.testing.expectEqualStrings("1700000000.000", meta.value.object.get("thread_id").?.string);
 }
 
 test "mrkdwn bold conversion" {

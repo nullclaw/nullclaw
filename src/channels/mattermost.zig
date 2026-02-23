@@ -157,6 +157,53 @@ pub const MattermostChannel = struct {
         }
     }
 
+    /// Send a Mattermost typing indicator (best-effort, errors ignored).
+    pub fn sendTypingIndicator(self: *MattermostChannel, target: []const u8) void {
+        if (builtin.is_test) return;
+
+        const parsed_target = parseTarget(target) catch return;
+        var resolved_channel_id: ?[]u8 = null;
+        defer if (resolved_channel_id) |cid| self.allocator.free(cid);
+
+        const channel_id: []const u8 = switch (parsed_target.kind) {
+            .channel => parsed_target.value,
+            .user => blk: {
+                resolved_channel_id = self.resolveDirectChannelId(parsed_target.value) catch return;
+                break :blk resolved_channel_id.?;
+            },
+            .username => blk: {
+                const user_id = self.resolveUserIdByUsername(parsed_target.value) catch return;
+                defer self.allocator.free(user_id);
+                resolved_channel_id = self.resolveDirectChannelId(user_id) catch return;
+                break :blk resolved_channel_id.?;
+            },
+        };
+        if (channel_id.len == 0) return;
+
+        const url = std.fmt.allocPrint(self.allocator, "{s}/api/v4/users/me/typing", .{self.base_url}) catch return;
+        defer self.allocator.free(url);
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+        const bw = body.writer(self.allocator);
+        bw.writeAll("{\"channel_id\":") catch return;
+        root.appendJsonStringW(bw, channel_id) catch return;
+        if (parsed_target.thread_id) |tid| {
+            if (tid.len > 0) {
+                bw.writeAll(",\"parent_id\":") catch return;
+                root.appendJsonStringW(bw, tid) catch return;
+            }
+        }
+        bw.writeByte('}') catch return;
+
+        const auth_header = std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token}) catch return;
+        defer self.allocator.free(auth_header);
+        const headers = [_][]const u8{auth_header};
+
+        const resp = root.http_util.curlPost(self.allocator, url, body.items, &headers) catch return;
+        self.allocator.free(resp);
+    }
+
     fn sendPost(self: *MattermostChannel, channel_id: []const u8, text: []const u8, thread_id: ?[]const u8) !void {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/api/v4/posts", .{self.base_url});
         defer self.allocator.free(url);
@@ -871,6 +918,11 @@ test "mattermost parseTarget supports prefixes and thread suffix" {
     const f = try parseTarget("#town-square");
     try std.testing.expect(f.kind == .channel);
     try std.testing.expectEqualStrings("town-square", f.value);
+}
+
+test "mattermost sendTypingIndicator is no-op in tests" {
+    var ch = MattermostChannel.init(std.testing.allocator, "tok", "https://chat.example.com");
+    ch.sendTypingIndicator("channel:town:thread:root-9");
 }
 
 test "mattermost normalizeBaseUrl strips trailing slash and api suffix" {

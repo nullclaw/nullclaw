@@ -105,6 +105,17 @@ pub const MatrixChannel = struct {
         return fbs.getWritten();
     }
 
+    fn buildTypingUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8, user_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll(self.homeserver);
+        try w.writeAll("/_matrix/client/v3/rooms/");
+        try appendUrlEncoded(w, room_id);
+        try w.writeAll("/typing/");
+        try appendUrlEncoded(w, user_id);
+        return fbs.getWritten();
+    }
+
     fn nextTxnId(self: *MatrixChannel, buf: []u8) ![]const u8 {
         self.txn_counter += 1;
         return std.fmt.bufPrint(buf, "nullclaw-{s}-{d}-{d}", .{
@@ -164,6 +175,30 @@ pub const MatrixChannel = struct {
             if (trimmed.len == 0) continue;
             try self.sendMessageChunk(room_id, trimmed);
         }
+    }
+
+    /// Send Matrix typing indicator (best-effort, errors ignored).
+    pub fn sendTypingIndicator(self: *MatrixChannel, target: []const u8) void {
+        if (builtin.is_test) return;
+
+        const room_id = self.normalizeTargetRoom(target) orelse return;
+        const uid = self.user_id orelse return;
+        if (uid.len == 0) return;
+
+        var url_buf: [4096]u8 = undefined;
+        const url = self.buildTypingUrl(&url_buf, room_id, uid) catch return;
+
+        const auth_header = self.authHeader(self.allocator) catch return;
+        defer self.allocator.free(auth_header);
+        const headers = [_][]const u8{auth_header};
+
+        const resp = root.http_util.curlPost(
+            self.allocator,
+            url,
+            "{\"typing\":true,\"timeout\":15000}",
+            &headers,
+        ) catch return;
+        self.allocator.free(resp);
     }
 
     pub fn healthCheck(self: *MatrixChannel) bool {
@@ -515,6 +550,36 @@ test "MatrixChannel initFromConfig maps account and policy fields" {
     try std.testing.expectEqualStrings("open", ch.group_policy);
     try std.testing.expectEqual(@as(usize, 1), ch.allow_from.len);
     try std.testing.expectEqual(@as(usize, 1), ch.group_allow_from.len);
+}
+
+test "MatrixChannel buildTypingUrl encodes room and user ids" {
+    var ch = MatrixChannel.init(
+        std.testing.allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+    ch.user_id = "@bot:example";
+
+    var buf: [512]u8 = undefined;
+    const url = try ch.buildTypingUrl(&buf, "!room:example", "@bot:example");
+    try std.testing.expectEqualStrings(
+        "https://matrix.example/_matrix/client/v3/rooms/%21room%3Aexample/typing/%40bot%3Aexample",
+        url,
+    );
+}
+
+test "MatrixChannel sendTypingIndicator is no-op in tests" {
+    var ch = MatrixChannel.init(
+        std.testing.allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+    ch.user_id = "@bot:example";
+    ch.sendTypingIndicator("!room:example");
 }
 
 test "MatrixChannel parseSyncResponse extracts messages and next_batch" {
