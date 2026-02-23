@@ -30,6 +30,8 @@
 
             zigBuildFlags = [ "-Doptimize=${optimize}" ];
 
+            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ];
+
             meta = with pkgs.lib; {
               mainProgram = project;
               description = "Fastest, smallest, and fully autonomous AI assistant infrastructure written in Zig ";
