@@ -24,68 +24,170 @@ pub const ProviderKind = enum {
     unknown,
 };
 
+// ════════════════════════════════════════════════════════════════════════════
+// Single source of truth for all OpenAI-compatible providers.
+// To add a new provider, add ONE entry here.
+// ════════════════════════════════════════════════════════════════════════════
+
+const CompatProvider = struct {
+    name: []const u8,
+    url: []const u8,
+    display: []const u8,
+    /// When true, disable the /v1/responses fallback on 404.
+    no_responses_fallback: bool = false,
+    /// When true, merge system messages into first user message.
+    merge_system_into_user: bool = false,
+    /// Authentication style (default: Bearer token).
+    auth_style: compatible.AuthStyle = .bearer,
+};
+
+const compat_providers = [_]CompatProvider{
+    // ── Major Cloud Providers ─────────────────────────────────────────────
+    .{ .name = "groq", .url = "https://api.groq.com/openai", .display = "Groq" },
+    .{ .name = "mistral", .url = "https://api.mistral.ai/v1", .display = "Mistral" },
+    .{ .name = "deepseek", .url = "https://api.deepseek.com", .display = "DeepSeek" },
+    .{ .name = "xai", .url = "https://api.x.ai", .display = "xAI" },
+    .{ .name = "grok", .url = "https://api.x.ai", .display = "xAI" },
+    .{ .name = "cerebras", .url = "https://api.cerebras.ai/v1", .display = "Cerebras" },
+    .{ .name = "perplexity", .url = "https://api.perplexity.ai", .display = "Perplexity" },
+    .{ .name = "cohere", .url = "https://api.cohere.com/compatibility", .display = "Cohere" },
+
+    // ── Gateways & Aggregators ────────────────────────────────────────────
+    .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
+    .{ .name = "vercel", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
+    .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
+    .{ .name = "together", .url = "https://api.together.xyz", .display = "Together AI" },
+    .{ .name = "together-ai", .url = "https://api.together.xyz", .display = "Together AI" },
+    .{ .name = "fireworks", .url = "https://api.fireworks.ai/inference/v1", .display = "Fireworks AI" },
+    .{ .name = "fireworks-ai", .url = "https://api.fireworks.ai/inference/v1", .display = "Fireworks AI" },
+    .{ .name = "huggingface", .url = "https://router.huggingface.co/v1", .display = "Hugging Face" },
+    .{ .name = "aihubmix", .url = "https://aihubmix.com/v1", .display = "AIHubMix" },
+    .{ .name = "siliconflow", .url = "https://api.siliconflow.cn/v1", .display = "SiliconFlow" },
+    .{ .name = "shengsuanyun", .url = "https://router.shengsuanyun.com/api/v1", .display = "ShengSuanYun" },
+    .{ .name = "chutes", .url = "https://chutes.ai/api/v1", .display = "Chutes" },
+    .{ .name = "synthetic", .url = "https://api.synthetic.new/openai/v1", .display = "Synthetic" },
+    .{ .name = "opencode", .url = "https://opencode.ai/zen/v1", .display = "OpenCode Zen" },
+    .{ .name = "opencode-zen", .url = "https://opencode.ai/zen/v1", .display = "OpenCode Zen" },
+    .{ .name = "astrai", .url = "https://as-trai.com/v1", .display = "Astrai" },
+    .{ .name = "poe", .url = "https://api.poe.com/v1", .display = "Poe" },
+
+    // ── China Providers — general ─────────────────────────────────────────
+    .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
+    .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
+    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
+    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
+    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
+    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
+    .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "qianfan", .url = "https://aip.baidubce.com", .display = "Qianfan" },
+    .{ .name = "baidu", .url = "https://aip.baidubce.com", .display = "Qianfan" },
+    .{ .name = "doubao", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
+    .{ .name = "volcengine", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
+    .{ .name = "ark", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
+
+    // ── China Providers — CN endpoints ────────────────────────────────────
+    .{ .name = "moonshot-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
+    .{ .name = "kimi-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
+    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
+    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
+    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
+    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI" },
+    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI" },
+    .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+
+    // ── International variants ────────────────────────────────────────────
+    .{ .name = "moonshot-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
+    .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
+    .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
+    .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
+    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
+    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
+    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
+    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
+    .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "qwen-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "dashscope-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "qwen-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "dashscope-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "byteplus", .url = "https://ark.ap-southeast.bytepluses.com/api/v3", .display = "BytePlus" },
+
+    // ── Coding-specific endpoints ─────────────────────────────────────────
+    .{ .name = "kimi-code", .url = "https://api.kimi.com/coding/v1", .display = "Kimi Code" },
+    .{ .name = "kimi_coding", .url = "https://api.kimi.com/coding/v1", .display = "Kimi Code" },
+    .{ .name = "volcengine-plan", .url = "https://ark.cn-beijing.volces.com/api/coding/v3", .display = "Doubao" },
+    .{ .name = "byteplus-plan", .url = "https://ark.ap-southeast.bytepluses.com/api/coding/v3", .display = "BytePlus" },
+    .{ .name = "qwen-portal", .url = "https://portal.qwen.ai/v1", .display = "Qwen Portal" },
+
+    // ── Infrastructure & Cloud ────────────────────────────────────────────
+    .{ .name = "bedrock", .url = "https://bedrock-runtime.us-east-1.amazonaws.com", .display = "Amazon Bedrock" },
+    .{ .name = "aws-bedrock", .url = "https://bedrock-runtime.us-east-1.amazonaws.com", .display = "Amazon Bedrock" },
+    .{ .name = "cloudflare", .url = "https://gateway.ai.cloudflare.com/v1", .display = "Cloudflare AI Gateway" },
+    .{ .name = "cloudflare-ai", .url = "https://gateway.ai.cloudflare.com/v1", .display = "Cloudflare AI Gateway" },
+    .{ .name = "copilot", .url = "https://api.githubcopilot.com", .display = "GitHub Copilot" },
+    .{ .name = "github-copilot", .url = "https://api.githubcopilot.com", .display = "GitHub Copilot" },
+    .{ .name = "nvidia", .url = "https://integrate.api.nvidia.com/v1", .display = "NVIDIA NIM" },
+    .{ .name = "nvidia-nim", .url = "https://integrate.api.nvidia.com/v1", .display = "NVIDIA NIM" },
+    .{ .name = "build.nvidia.com", .url = "https://integrate.api.nvidia.com/v1", .display = "NVIDIA NIM" },
+    .{ .name = "ovhcloud", .url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", .display = "OVHcloud" },
+    .{ .name = "ovh", .url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", .display = "OVHcloud" },
+
+    // ── Local Servers ─────────────────────────────────────────────────────
+    .{ .name = "lmstudio", .url = "http://localhost:1234/v1", .display = "LM Studio" },
+    .{ .name = "lm-studio", .url = "http://localhost:1234/v1", .display = "LM Studio" },
+    .{ .name = "vllm", .url = "http://localhost:8000/v1", .display = "vLLM" },
+    .{ .name = "llamacpp", .url = "http://localhost:8080/v1", .display = "llama.cpp" },
+    .{ .name = "llama.cpp", .url = "http://localhost:8080/v1", .display = "llama.cpp" },
+    .{ .name = "sglang", .url = "http://localhost:30000/v1", .display = "SGLang" },
+    .{ .name = "osaurus", .url = "http://localhost:1337/v1", .display = "Osaurus" },
+    .{ .name = "litellm", .url = "http://localhost:4000", .display = "LiteLLM" },
+};
+
+// Comptime check: no duplicate names in the compat_providers table.
+comptime {
+    @setEvalBranchQuota(100_000);
+    for (compat_providers, 0..) |a, i| {
+        for (compat_providers[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a.name, b.name)) {
+                @compileError("duplicate compat_providers name: " ++ a.name);
+            }
+        }
+    }
+}
+
+/// Look up a compatible provider entry by name.
+fn findCompatProvider(name: []const u8) ?CompatProvider {
+    for (&compat_providers) |*p| {
+        if (std.mem.eql(u8, p.name, name)) return p.*;
+    }
+    return null;
+}
+
+/// Core (non-compatible) providers that have their own dedicated implementations.
+const core_providers = std.StaticStringMap(ProviderKind).initComptime(.{
+    .{ "anthropic", .anthropic_provider },
+    .{ "openai", .openai_provider },
+    .{ "openrouter", .openrouter_provider },
+    .{ "ollama", .ollama_provider },
+    .{ "gemini", .gemini_provider },
+    .{ "google", .gemini_provider },
+    .{ "google-gemini", .gemini_provider },
+    .{ "claude-cli", .claude_cli_provider },
+    .{ "codex-cli", .codex_cli_provider },
+    .{ "openai-codex", .openai_codex_provider },
+});
+
 /// Determine which provider to create from a name string.
 pub fn classifyProvider(name: []const u8) ProviderKind {
-    const provider_map = std.StaticStringMap(ProviderKind).initComptime(.{
-        .{ "anthropic", .anthropic_provider },
-        .{ "openai", .openai_provider },
-        .{ "openrouter", .openrouter_provider },
-        .{ "ollama", .ollama_provider },
-        .{ "gemini", .gemini_provider },
-        .{ "google", .gemini_provider },
-        .{ "google-gemini", .gemini_provider },
-        .{ "claude-cli", .claude_cli_provider },
-        .{ "codex-cli", .codex_cli_provider },
-        .{ "openai-codex", .openai_codex_provider },
-        // OpenAI-compatible providers
-        .{ "venice", .compatible_provider },
-        .{ "vercel", .compatible_provider },
-        .{ "vercel-ai", .compatible_provider },
-        .{ "cloudflare", .compatible_provider },
-        .{ "cloudflare-ai", .compatible_provider },
-        .{ "moonshot", .compatible_provider },
-        .{ "kimi", .compatible_provider },
-        .{ "synthetic", .compatible_provider },
-        .{ "opencode", .compatible_provider },
-        .{ "opencode-zen", .compatible_provider },
-        .{ "zai", .compatible_provider },
-        .{ "z.ai", .compatible_provider },
-        .{ "glm", .compatible_provider },
-        .{ "zhipu", .compatible_provider },
-        .{ "minimax", .compatible_provider },
-        .{ "bedrock", .compatible_provider },
-        .{ "aws-bedrock", .compatible_provider },
-        .{ "qianfan", .compatible_provider },
-        .{ "baidu", .compatible_provider },
-        .{ "qwen", .compatible_provider },
-        .{ "dashscope", .compatible_provider },
-        .{ "qwen-intl", .compatible_provider },
-        .{ "dashscope-intl", .compatible_provider },
-        .{ "qwen-us", .compatible_provider },
-        .{ "dashscope-us", .compatible_provider },
-        .{ "groq", .compatible_provider },
-        .{ "mistral", .compatible_provider },
-        .{ "xai", .compatible_provider },
-        .{ "grok", .compatible_provider },
-        .{ "deepseek", .compatible_provider },
-        .{ "together", .compatible_provider },
-        .{ "together-ai", .compatible_provider },
-        .{ "fireworks", .compatible_provider },
-        .{ "fireworks-ai", .compatible_provider },
-        .{ "perplexity", .compatible_provider },
-        .{ "cohere", .compatible_provider },
-        .{ "copilot", .compatible_provider },
-        .{ "github-copilot", .compatible_provider },
-        .{ "lmstudio", .compatible_provider },
-        .{ "lm-studio", .compatible_provider },
-        .{ "nvidia", .compatible_provider },
-        .{ "nvidia-nim", .compatible_provider },
-        .{ "build.nvidia.com", .compatible_provider },
-        .{ "astrai", .compatible_provider },
-        .{ "poe", .compatible_provider },
-    });
+    // Check core (non-compatible) providers first.
+    if (core_providers.get(name)) |kind| return kind;
 
-    if (provider_map.get(name)) |kind| return kind;
+    // Check compatible providers table.
+    if (findCompatProvider(name) != null) return .compatible_provider;
 
     // custom: prefix
     if (std.mem.startsWith(u8, name, "custom:")) return .compatible_provider;
@@ -112,106 +214,14 @@ pub fn detectProviderByApiKey(key: []const u8) ProviderKind {
 
 /// Get the base URL for an OpenAI-compatible provider by name.
 pub fn compatibleProviderUrl(name: []const u8) ?[]const u8 {
-    const map = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "venice", "https://api.venice.ai" },
-        .{ "vercel", "https://api.vercel.ai" },
-        .{ "vercel-ai", "https://api.vercel.ai" },
-        .{ "cloudflare", "https://gateway.ai.cloudflare.com/v1" },
-        .{ "cloudflare-ai", "https://gateway.ai.cloudflare.com/v1" },
-        .{ "moonshot", "https://api.moonshot.cn" },
-        .{ "kimi", "https://api.moonshot.cn" },
-        .{ "synthetic", "https://api.synthetic.com" },
-        .{ "opencode", "https://api.opencode.ai" },
-        .{ "opencode-zen", "https://api.opencode.ai" },
-        .{ "zai", "https://api.z.ai/api/coding/paas/v4" },
-        .{ "z.ai", "https://api.z.ai/api/coding/paas/v4" },
-        .{ "glm", "https://api.z.ai/api/paas/v4" },
-        .{ "zhipu", "https://api.z.ai/api/paas/v4" },
-        .{ "minimax", "https://api.minimaxi.com/v1" },
-        .{ "bedrock", "https://bedrock-runtime.us-east-1.amazonaws.com" },
-        .{ "aws-bedrock", "https://bedrock-runtime.us-east-1.amazonaws.com" },
-        .{ "qianfan", "https://aip.baidubce.com" },
-        .{ "baidu", "https://aip.baidubce.com" },
-        .{ "qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1" },
-        .{ "dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1" },
-        .{ "qwen-intl", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" },
-        .{ "dashscope-intl", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" },
-        .{ "qwen-us", "https://dashscope-us.aliyuncs.com/compatible-mode/v1" },
-        .{ "dashscope-us", "https://dashscope-us.aliyuncs.com/compatible-mode/v1" },
-        .{ "groq", "https://api.groq.com/openai" },
-        .{ "mistral", "https://api.mistral.ai" },
-        .{ "xai", "https://api.x.ai" },
-        .{ "grok", "https://api.x.ai" },
-        .{ "deepseek", "https://api.deepseek.com" },
-        .{ "together", "https://api.together.xyz" },
-        .{ "together-ai", "https://api.together.xyz" },
-        .{ "fireworks", "https://api.fireworks.ai/inference/v1" },
-        .{ "fireworks-ai", "https://api.fireworks.ai/inference/v1" },
-        .{ "perplexity", "https://api.perplexity.ai" },
-        .{ "cohere", "https://api.cohere.com/compatibility" },
-        .{ "copilot", "https://api.githubcopilot.com" },
-        .{ "github-copilot", "https://api.githubcopilot.com" },
-        .{ "lmstudio", "http://localhost:1234/v1" },
-        .{ "lm-studio", "http://localhost:1234/v1" },
-        .{ "nvidia", "https://integrate.api.nvidia.com/v1" },
-        .{ "nvidia-nim", "https://integrate.api.nvidia.com/v1" },
-        .{ "build.nvidia.com", "https://integrate.api.nvidia.com/v1" },
-        .{ "astrai", "https://as-trai.com/v1" },
-        .{ "poe", "https://api.poe.com/v1" },
-    });
-    return map.get(name);
+    if (findCompatProvider(name)) |p| return p.url;
+    return null;
 }
 
 /// Get the display name for an OpenAI-compatible provider.
 pub fn compatibleProviderDisplayName(name: []const u8) []const u8 {
-    const map = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "venice", "Venice" },
-        .{ "vercel", "Vercel AI Gateway" },
-        .{ "vercel-ai", "Vercel AI Gateway" },
-        .{ "cloudflare", "Cloudflare AI Gateway" },
-        .{ "cloudflare-ai", "Cloudflare AI Gateway" },
-        .{ "moonshot", "Moonshot" },
-        .{ "kimi", "Moonshot" },
-        .{ "synthetic", "Synthetic" },
-        .{ "opencode", "OpenCode Zen" },
-        .{ "opencode-zen", "OpenCode Zen" },
-        .{ "zai", "Z.AI" },
-        .{ "z.ai", "Z.AI" },
-        .{ "glm", "GLM" },
-        .{ "zhipu", "GLM" },
-        .{ "minimax", "MiniMax" },
-        .{ "bedrock", "Amazon Bedrock" },
-        .{ "aws-bedrock", "Amazon Bedrock" },
-        .{ "qianfan", "Qianfan" },
-        .{ "baidu", "Qianfan" },
-        .{ "qwen", "Qwen" },
-        .{ "dashscope", "Qwen" },
-        .{ "qwen-intl", "Qwen" },
-        .{ "dashscope-intl", "Qwen" },
-        .{ "qwen-us", "Qwen" },
-        .{ "dashscope-us", "Qwen" },
-        .{ "groq", "Groq" },
-        .{ "mistral", "Mistral" },
-        .{ "xai", "xAI" },
-        .{ "grok", "xAI" },
-        .{ "deepseek", "DeepSeek" },
-        .{ "together", "Together AI" },
-        .{ "together-ai", "Together AI" },
-        .{ "fireworks", "Fireworks AI" },
-        .{ "fireworks-ai", "Fireworks AI" },
-        .{ "perplexity", "Perplexity" },
-        .{ "cohere", "Cohere" },
-        .{ "copilot", "GitHub Copilot" },
-        .{ "github-copilot", "GitHub Copilot" },
-        .{ "lmstudio", "LM Studio" },
-        .{ "lm-studio", "LM Studio" },
-        .{ "nvidia", "NVIDIA NIM" },
-        .{ "nvidia-nim", "NVIDIA NIM" },
-        .{ "build.nvidia.com", "NVIDIA NIM" },
-        .{ "astrai", "Astrai" },
-        .{ "poe", "Poe" },
-    });
-    return map.get(name) orelse "Custom";
+    if (findCompatProvider(name)) |p| return p.display;
+    return "Custom";
 }
 
 /// Tagged union so the concrete provider struct lives alongside the caller
@@ -268,16 +278,30 @@ pub const ProviderHolder = union(enum) {
             .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
             .ollama_provider => .{ .ollama = ollama.OllamaProvider.init(allocator, null) },
             .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
-            .compatible_provider => .{ .compatible = compatible.OpenAiCompatibleProvider.init(
-                allocator,
-                provider_name,
-                if (std.mem.startsWith(u8, provider_name, "custom:"))
+            .compatible_provider => blk: {
+                const url = if (std.mem.startsWith(u8, provider_name, "custom:"))
                     provider_name["custom:".len..]
                 else
-                    compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1",
-                api_key,
-                .bearer,
-            ) },
+                    compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1";
+
+                const cp = findCompatProvider(provider_name);
+
+                var prov = compatible.OpenAiCompatibleProvider.init(
+                    allocator,
+                    provider_name,
+                    url,
+                    api_key,
+                    if (cp) |c| c.auth_style else .bearer,
+                );
+
+                // Apply flags from the compat_providers table.
+                if (cp) |c| {
+                    if (c.no_responses_fallback) prov.supports_responses_fallback = false;
+                    if (c.merge_system_into_user) prov.merge_system_into_user = true;
+                }
+
+                break :blk .{ .compatible = prov };
+            },
             .claude_cli_provider => if (claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
                 .{ .claude_cli = p }
             else |_|
@@ -313,12 +337,79 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("nonexistent") == .unknown);
 }
 
+test "classifyProvider new providers" {
+    try std.testing.expect(classifyProvider("doubao") == .compatible_provider);
+    try std.testing.expect(classifyProvider("volcengine") == .compatible_provider);
+    try std.testing.expect(classifyProvider("ark") == .compatible_provider);
+    try std.testing.expect(classifyProvider("cerebras") == .compatible_provider);
+    try std.testing.expect(classifyProvider("vllm") == .compatible_provider);
+    try std.testing.expect(classifyProvider("llamacpp") == .compatible_provider);
+    try std.testing.expect(classifyProvider("llama.cpp") == .compatible_provider);
+    try std.testing.expect(classifyProvider("sglang") == .compatible_provider);
+    try std.testing.expect(classifyProvider("osaurus") == .compatible_provider);
+    try std.testing.expect(classifyProvider("litellm") == .compatible_provider);
+    try std.testing.expect(classifyProvider("huggingface") == .compatible_provider);
+    try std.testing.expect(classifyProvider("aihubmix") == .compatible_provider);
+    try std.testing.expect(classifyProvider("siliconflow") == .compatible_provider);
+    try std.testing.expect(classifyProvider("shengsuanyun") == .compatible_provider);
+    try std.testing.expect(classifyProvider("ovhcloud") == .compatible_provider);
+    try std.testing.expect(classifyProvider("ovh") == .compatible_provider);
+    try std.testing.expect(classifyProvider("byteplus") == .compatible_provider);
+    try std.testing.expect(classifyProvider("chutes") == .compatible_provider);
+    try std.testing.expect(classifyProvider("kimi-code") == .compatible_provider);
+    try std.testing.expect(classifyProvider("minimax-cn") == .compatible_provider);
+    try std.testing.expect(classifyProvider("minimax-intl") == .compatible_provider);
+    try std.testing.expect(classifyProvider("moonshot-intl") == .compatible_provider);
+    try std.testing.expect(classifyProvider("glm-cn") == .compatible_provider);
+    try std.testing.expect(classifyProvider("bigmodel") == .compatible_provider);
+    try std.testing.expect(classifyProvider("qwen-portal") == .compatible_provider);
+}
+
 test "compatibleProviderUrl returns correct URLs" {
     try std.testing.expectEqualStrings("https://api.venice.ai", compatibleProviderUrl("venice").?);
     try std.testing.expectEqualStrings("https://api.groq.com/openai", compatibleProviderUrl("groq").?);
     try std.testing.expectEqualStrings("https://api.deepseek.com", compatibleProviderUrl("deepseek").?);
     try std.testing.expectEqualStrings("https://api.poe.com/v1", compatibleProviderUrl("poe").?);
     try std.testing.expect(compatibleProviderUrl("nonexistent") == null);
+}
+
+test "compatibleProviderUrl fixed URLs" {
+    // These 5 URLs were corrected from the original values.
+    try std.testing.expectEqualStrings("https://api.moonshot.cn/v1", compatibleProviderUrl("moonshot").?);
+    try std.testing.expectEqualStrings("https://api.moonshot.cn/v1", compatibleProviderUrl("kimi").?);
+    try std.testing.expectEqualStrings("https://api.synthetic.new/openai/v1", compatibleProviderUrl("synthetic").?);
+    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v1", compatibleProviderUrl("vercel").?);
+    try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", compatibleProviderUrl("opencode").?);
+    try std.testing.expectEqualStrings("https://api.mistral.ai/v1", compatibleProviderUrl("mistral").?);
+    try std.testing.expectEqualStrings("https://api.minimax.io/v1", compatibleProviderUrl("minimax").?);
+}
+
+test "compatibleProviderUrl new providers" {
+    try std.testing.expectEqualStrings("https://ark.cn-beijing.volces.com/api/v3", compatibleProviderUrl("doubao").?);
+    try std.testing.expectEqualStrings("https://api.cerebras.ai/v1", compatibleProviderUrl("cerebras").?);
+    try std.testing.expectEqualStrings("http://localhost:8000/v1", compatibleProviderUrl("vllm").?);
+    try std.testing.expectEqualStrings("http://localhost:8080/v1", compatibleProviderUrl("llamacpp").?);
+    try std.testing.expectEqualStrings("http://localhost:30000/v1", compatibleProviderUrl("sglang").?);
+    try std.testing.expectEqualStrings("http://localhost:1337/v1", compatibleProviderUrl("osaurus").?);
+    try std.testing.expectEqualStrings("http://localhost:4000", compatibleProviderUrl("litellm").?);
+    try std.testing.expectEqualStrings("https://router.huggingface.co/v1", compatibleProviderUrl("huggingface").?);
+    try std.testing.expectEqualStrings("https://aihubmix.com/v1", compatibleProviderUrl("aihubmix").?);
+    try std.testing.expectEqualStrings("https://api.siliconflow.cn/v1", compatibleProviderUrl("siliconflow").?);
+    try std.testing.expectEqualStrings("https://router.shengsuanyun.com/api/v1", compatibleProviderUrl("shengsuanyun").?);
+    try std.testing.expectEqualStrings("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", compatibleProviderUrl("ovhcloud").?);
+    try std.testing.expectEqualStrings("https://ark.ap-southeast.bytepluses.com/api/v3", compatibleProviderUrl("byteplus").?);
+    try std.testing.expectEqualStrings("https://chutes.ai/api/v1", compatibleProviderUrl("chutes").?);
+    try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", compatibleProviderUrl("kimi-code").?);
+    try std.testing.expectEqualStrings("https://portal.qwen.ai/v1", compatibleProviderUrl("qwen-portal").?);
+}
+
+test "compatibleProviderUrl CN/intl variants" {
+    try std.testing.expectEqualStrings("https://api.moonshot.cn/v1", compatibleProviderUrl("moonshot-cn").?);
+    try std.testing.expectEqualStrings("https://api.moonshot.ai/v1", compatibleProviderUrl("moonshot-intl").?);
+    try std.testing.expectEqualStrings("https://open.bigmodel.cn/api/paas/v4", compatibleProviderUrl("glm-cn").?);
+    try std.testing.expectEqualStrings("https://api.z.ai/api/paas/v4", compatibleProviderUrl("glm-global").?);
+    try std.testing.expectEqualStrings("https://api.minimaxi.com/v1", compatibleProviderUrl("minimax-cn").?);
+    try std.testing.expectEqualStrings("https://api.minimax.io/v1", compatibleProviderUrl("minimax-intl").?);
 }
 
 test "nvidia resolves to correct URL" {
@@ -344,6 +435,12 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("LM Studio", compatibleProviderDisplayName("lmstudio"));
     try std.testing.expectEqualStrings("LM Studio", compatibleProviderDisplayName("lm-studio"));
     try std.testing.expectEqualStrings("Astrai", compatibleProviderDisplayName("astrai"));
+    try std.testing.expectEqualStrings("Cerebras", compatibleProviderDisplayName("cerebras"));
+    try std.testing.expectEqualStrings("Doubao", compatibleProviderDisplayName("doubao"));
+    try std.testing.expectEqualStrings("Hugging Face", compatibleProviderDisplayName("huggingface"));
+    try std.testing.expectEqualStrings("vLLM", compatibleProviderDisplayName("vllm"));
+    try std.testing.expectEqualStrings("OVHcloud", compatibleProviderDisplayName("ovhcloud"));
+    try std.testing.expectEqualStrings("Custom", compatibleProviderDisplayName("nonexistent"));
 }
 
 test "new providers classify as compatible" {
@@ -353,6 +450,45 @@ test "new providers classify as compatible" {
     try std.testing.expect(classifyProvider("lmstudio") == .compatible_provider);
     try std.testing.expect(classifyProvider("lm-studio") == .compatible_provider);
     try std.testing.expect(classifyProvider("astrai") == .compatible_provider);
+}
+
+test "findCompatProvider returns correct flags" {
+    // GLM has no_responses_fallback
+    const glm = findCompatProvider("glm").?;
+    try std.testing.expect(glm.no_responses_fallback);
+    try std.testing.expect(!glm.merge_system_into_user);
+
+    // MiniMax has both flags
+    const minimax = findCompatProvider("minimax").?;
+    try std.testing.expect(minimax.no_responses_fallback);
+    try std.testing.expect(minimax.merge_system_into_user);
+
+    // Groq has no special flags
+    const groq_p = findCompatProvider("groq").?;
+    try std.testing.expect(!groq_p.no_responses_fallback);
+    try std.testing.expect(!groq_p.merge_system_into_user);
+
+    // minimax-cn also has both flags
+    const minimax_cn = findCompatProvider("minimax-cn").?;
+    try std.testing.expect(minimax_cn.no_responses_fallback);
+    try std.testing.expect(minimax_cn.merge_system_into_user);
+}
+
+test "fromConfig applies no_responses_fallback flag" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "glm", "key");
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expect(!h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig applies merge_system_into_user flag" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key");
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expect(h.compatible.merge_system_into_user);
+    try std.testing.expect(!h.compatible.supports_responses_fallback);
 }
 
 test "detectProviderByApiKey openrouter" {
@@ -445,4 +581,9 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test");
     defer h9.deinit();
     try std.testing.expect(h9 == .anthropic);
+}
+
+test "compat_providers table count" {
+    // Verify we have the expected number of entries (guard against accidental deletions).
+    try std.testing.expect(compat_providers.len >= 88);
 }

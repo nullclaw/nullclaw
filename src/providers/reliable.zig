@@ -269,6 +269,7 @@ pub const ReliableProvider = struct {
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
         .supports_vision = supportsVisionImpl,
+        .supports_vision_for_model = supportsVisionForModelImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .warmup = warmupImpl,
@@ -443,11 +444,12 @@ pub const ReliableProvider = struct {
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        if (self.inner.supportsVision()) return true;
-        for (self.extras) |entry| {
-            if (entry.provider.supportsVision()) return true;
-        }
-        return false;
+        return self.inner.supportsVision();
+    }
+
+    fn supportsVisionForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.supportsVisionForModel(model);
     }
 
     fn getNameImpl(ptr: *anyopaque) []const u8 {
@@ -610,6 +612,7 @@ const MockInnerProvider = struct {
     call_count: u32,
     fail_until: u32,
     supports_tools: bool,
+    supports_vision: bool = true,
     warmed_up: bool = false,
 
     const vtable_mock = Provider.VTable{
@@ -662,8 +665,9 @@ const MockInnerProvider = struct {
         return self.supports_tools;
     }
 
-    fn mockSupportsVision(_: *anyopaque) bool {
-        return true;
+    fn mockSupportsVision(ptr: *anyopaque) bool {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_vision;
     }
 
     fn mockGetName(_: *anyopaque) []const u8 {
@@ -687,6 +691,7 @@ const ModelAwareMock = struct {
     fail_models_len: usize = 0,
     response: []const u8 = "ok",
     supports_tools: bool = false,
+    supports_vision: bool = true,
 
     const vtable_model = Provider.VTable{
         .chatWithSystem = modelChatWithSystem,
@@ -769,8 +774,9 @@ const ModelAwareMock = struct {
         return self.supports_tools;
     }
 
-    fn modelSupportsVision(_: *anyopaque) bool {
-        return true;
+    fn modelSupportsVision(ptr: *anyopaque) bool {
+        const self: *ModelAwareMock = @ptrCast(@alignCast(ptr));
+        return self.supports_vision;
     }
 
     fn modelGetName(_: *anyopaque) []const u8 {
@@ -833,6 +839,29 @@ test "ReliableProvider vtable delegates supportsNativeTools" {
     var mock_no = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
     var reliable_no = ReliableProvider.initWithProvider(mock_no.toProvider(), 0, 50);
     try std.testing.expect(reliable_no.provider().supportsNativeTools() == false);
+}
+
+test "ReliableProvider supportsVision uses inner provider capability" {
+    var inner = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+        .supports_vision = false,
+    };
+    var extra = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+        .supports_vision = true,
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+
+    var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+    try std.testing.expect(!prov.supportsVision());
+    try std.testing.expect(!prov.supportsVisionForModel("any-model"));
 }
 
 test "ReliableProvider vtable delegates getName" {

@@ -1,15 +1,20 @@
 const std = @import("std");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
 
 /// Email channel — IMAP polling for inbound, SMTP for outbound.
 pub const EmailChannel = struct {
     allocator: std.mem.Allocator,
-    config: EmailConfig,
+    config: config_types.EmailConfig,
     /// Tracks last Message-ID per sender for In-Reply-To/References headers.
     reply_message_ids: std.StringHashMapUnmanaged([]const u8) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, config: EmailConfig) EmailChannel {
+    pub fn init(allocator: std.mem.Allocator, config: config_types.EmailConfig) EmailChannel {
         return .{ .allocator = allocator, .config = config, .reply_message_ids = .empty };
+    }
+
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.EmailConfig) EmailChannel {
+        return init(allocator, cfg);
     }
 
     pub fn deinit(self: *EmailChannel) void {
@@ -40,9 +45,9 @@ pub const EmailChannel = struct {
     /// Check if a sender email is in the allowlist.
     /// Supports full addresses, @domain, or bare domain matching.
     pub fn isSenderAllowed(self: *const EmailChannel, email_addr: []const u8) bool {
-        if (self.config.allowed_senders.len == 0) return false;
+        if (self.config.allow_from.len == 0) return false;
 
-        for (self.config.allowed_senders) |allowed| {
+        for (self.config.allow_from) |allowed| {
             if (std.mem.eql(u8, allowed, "*")) return true;
 
             if (allowed.len > 0 and allowed[0] == '@') {
@@ -180,7 +185,7 @@ pub const EmailChannel = struct {
         _ = ptr;
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *EmailChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -206,22 +211,6 @@ pub const EmailChannel = struct {
     pub fn channel(self: *EmailChannel) root.Channel {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
-};
-
-/// Email channel configuration.
-pub const EmailConfig = struct {
-    imap_host: []const u8 = "",
-    imap_port: u16 = 993,
-    imap_folder: []const u8 = "INBOX",
-    smtp_host: []const u8 = "",
-    smtp_port: u16 = 587,
-    smtp_tls: bool = true,
-    username: []const u8 = "",
-    password: []const u8 = "",
-    from_address: []const u8 = "",
-    poll_interval_secs: u64 = 60,
-    allowed_senders: []const []const u8 = &.{},
-    consent_granted: bool = true,
 };
 
 /// Bounded dedup set that evicts oldest entries when capacity is reached.
@@ -516,28 +505,28 @@ test "bounded seen set evicts in fifo order" {
 
 test "email sender allowed case insensitive full address" {
     const senders = [_][]const u8{"User@Example.COM"};
-    const ch = EmailChannel.init(std.testing.allocator, .{ .allowed_senders = &senders });
+    const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
     try std.testing.expect(ch.isSenderAllowed("user@example.com"));
     try std.testing.expect(ch.isSenderAllowed("USER@EXAMPLE.COM"));
 }
 
 test "email sender domain with @ case insensitive" {
     const senders = [_][]const u8{"@Example.Com"};
-    const ch = EmailChannel.init(std.testing.allocator, .{ .allowed_senders = &senders });
+    const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
     try std.testing.expect(ch.isSenderAllowed("anyone@example.com"));
     try std.testing.expect(ch.isSenderAllowed("USER@EXAMPLE.COM"));
 }
 
 test "email sender multiple senders" {
     const senders = [_][]const u8{ "alice@example.com", "bob@test.com" };
-    const ch = EmailChannel.init(std.testing.allocator, .{ .allowed_senders = &senders });
+    const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
     try std.testing.expect(ch.isSenderAllowed("alice@example.com"));
     try std.testing.expect(ch.isSenderAllowed("bob@test.com"));
     try std.testing.expect(!ch.isSenderAllowed("eve@evil.com"));
 }
 
 test "email config defaults" {
-    const config = EmailConfig{};
+    const config = config_types.EmailConfig{};
     try std.testing.expectEqual(@as(u16, 993), config.imap_port);
     try std.testing.expectEqualStrings("INBOX", config.imap_folder);
     try std.testing.expectEqual(@as(u16, 587), config.smtp_port);
@@ -589,14 +578,14 @@ test "bounded seen set large capacity" {
 
 test "email sender wildcard with specific" {
     const senders = [_][]const u8{ "alice@example.com", "*" };
-    const ch = EmailChannel.init(std.testing.allocator, .{ .allowed_senders = &senders });
+    const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
     try std.testing.expect(ch.isSenderAllowed("anyone@anything.com"));
 }
 
 test "email sender short address not domain match" {
     // An address shorter than the domain should not match
     const senders = [_][]const u8{"example.com"};
-    const ch = EmailChannel.init(std.testing.allocator, .{ .allowed_senders = &senders });
+    const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
     try std.testing.expect(!ch.isSenderAllowed("@example.com")); // needs local part > 0
 }
 
@@ -605,7 +594,7 @@ test "email sender short address not domain match" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "consent granted default is true" {
-    const config = EmailConfig{};
+    const config = config_types.EmailConfig{};
     try std.testing.expect(config.consent_granted);
 }
 

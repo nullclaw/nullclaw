@@ -20,12 +20,14 @@ pub const MarkdownMemory = struct {
 
     pub fn init(allocator: std.mem.Allocator, workspace_dir: []const u8) !Self {
         return Self{
-            .workspace_dir = workspace_dir,
+            .workspace_dir = try allocator.dupe(u8, workspace_dir),
             .allocator = allocator,
         };
     }
 
-    pub fn deinit(_: *Self) void {}
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.workspace_dir);
+    }
 
     fn corePath(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{self.workspace_dir});

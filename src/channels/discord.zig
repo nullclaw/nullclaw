@@ -13,10 +13,11 @@ pub const DiscordChannel = struct {
     token: []const u8,
     guild_id: ?[]const u8,
     allow_bots: bool,
+    account_id: []const u8 = "default",
 
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
-    mention_only: bool = false,
+    require_mention: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
 
@@ -29,7 +30,13 @@ pub const DiscordChannel = struct {
     resume_gateway_url: ?[]u8 = null,
     bot_user_id: ?[]u8 = null,
     gateway_thread: ?std.Thread = null,
-    ws_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
+
+    const SocketFd = std.net.Stream.Handle;
+    const invalid_socket: SocketFd = switch (builtin.os.tag) {
+        .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+        else => -1,
+    };
 
     pub const MAX_MESSAGE_LEN: usize = 2000;
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -45,6 +52,20 @@ pub const DiscordChannel = struct {
             .token = token,
             .guild_id = guild_id,
             .allow_bots = allow_bots,
+        };
+    }
+
+    /// Initialize from a full DiscordConfig, passing all fields.
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: @import("../config_types.zig").DiscordConfig) DiscordChannel {
+        return .{
+            .allocator = allocator,
+            .token = cfg.token,
+            .guild_id = cfg.guild_id,
+            .allow_bots = cfg.allow_bots,
+            .account_id = cfg.account_id,
+            .allow_from = cfg.allow_from,
+            .require_mention = cfg.require_mention,
+            .intents = cfg.intents,
         };
     }
 
@@ -70,6 +91,10 @@ pub const DiscordChannel = struct {
 
     pub fn healthCheck(_: *DiscordChannel) bool {
         return true;
+    }
+
+    pub fn setBus(self: *DiscordChannel, b: *bus_mod.Bus) void {
+        self.bus = b;
     }
 
     // ── Pure helper functions ─────────────────────────────────────────────
@@ -209,9 +234,11 @@ pub const DiscordChannel = struct {
         self.heartbeat_stop.store(true, .release);
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
-        if (fd >= 0) {
-            if (comptime builtin.os.tag != .windows) {
-                std.posix.close(@intCast(fd)) catch {};
+        if (fd != invalid_socket) {
+            if (comptime builtin.os.tag == .windows) {
+                _ = std.os.windows.ws2_32.closesocket(fd);
+            } else {
+                std.posix.close(fd);
             }
         }
         if (self.gateway_thread) |t| {
@@ -233,7 +260,7 @@ pub const DiscordChannel = struct {
         }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -304,7 +331,7 @@ pub const DiscordChannel = struct {
         defer {
             self.heartbeat_stop.store(true, .release);
             hbt.join();
-            self.ws_fd.store(-1, .release);
+            self.ws_fd.store(invalid_socket, .release);
             ws.deinit();
         }
 
@@ -326,10 +353,8 @@ pub const DiscordChannel = struct {
             const text = maybe_text orelse break;
             defer self.allocator.free(text);
             self.handleGatewayMessage(&ws, text) catch |err| {
-                switch (err) {
-                    error.ShouldReconnect => break,
-                    else => log.err("Discord gateway msg error: {}", .{err}),
-                }
+                log.err("Discord gateway msg error: {}", .{err});
+                if (err == error.ShouldReconnect) break;
             };
         }
     }
@@ -368,6 +393,7 @@ pub const DiscordChannel = struct {
         defer parsed.deinit();
 
         const root_val = parsed.value;
+        if (root_val != .object) return;
         const d_val = root_val.object.get("d") orelse return;
         switch (d_val) {
             .object => |d_obj| {
@@ -399,6 +425,10 @@ pub const DiscordChannel = struct {
         defer parsed.deinit();
 
         const root_val = parsed.value;
+        if (root_val != .object) {
+            log.warn("Discord: gateway message root is not an object", .{});
+            return;
+        }
 
         // Get op code
         const op_val = root_val.object.get("op") orelse {
@@ -498,6 +528,7 @@ pub const DiscordChannel = struct {
 
     /// Handle READY event: extract session_id, resume_gateway_url, bot_user_id.
     fn handleReady(self: *DiscordChannel, root_val: std.json.Value) !void {
+        if (root_val != .object) return;
         const d_val = root_val.object.get("d") orelse {
             log.warn("Discord READY: missing 'd' field", .{});
             return;
@@ -555,6 +586,7 @@ pub const DiscordChannel = struct {
 
     /// Handle MESSAGE_CREATE event and publish to bus if filters pass.
     fn handleMessageCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
+        if (root_val != .object) return;
         const d_val = root_val.object.get("d") orelse {
             log.warn("Discord MESSAGE_CREATE: missing 'd' field", .{});
             return;
@@ -626,8 +658,8 @@ pub const DiscordChannel = struct {
             return;
         }
 
-        // Filter 2: mention_only for guild (non-DM) messages
-        if (self.mention_only and guild_id != null) {
+        // Filter 2: require_mention for guild (non-DM) messages
+        if (self.require_mention and guild_id != null) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid)) {
                 return;
@@ -641,19 +673,88 @@ pub const DiscordChannel = struct {
             }
         }
 
-        // Build session_key and publish to bus
-        const session_key = try std.fmt.allocPrint(self.allocator, "discord:{s}", .{channel_id});
+        // Process attachments (if any)
+        var content_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer content_buf.deinit(self.allocator);
+
+        if (content.len > 0) {
+            content_buf.appendSlice(self.allocator, content) catch {};
+        }
+
+        if (d_obj.get("attachments")) |att_val| {
+            if (att_val == .array) {
+                var rand = std.crypto.random;
+                for (att_val.array.items) |att_item| {
+                    if (att_item == .object) {
+                        if (att_item.object.get("url")) |url_val| {
+                            if (url_val == .string) {
+                                const attach_url = url_val.string;
+
+                                // Download it
+                                if (root.http_util.curlGet(self.allocator, attach_url, &.{}, "30")) |img_data| {
+                                    defer self.allocator.free(img_data);
+
+                                    // Make temp file
+                                    const rand_id = rand.int(u64);
+                                    var path_buf: [1024]u8 = undefined;
+                                    const local_path = std.fmt.bufPrint(&path_buf, "/tmp/discord_{x}.dat", .{rand_id}) catch continue;
+
+                                    if (std.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
+                                        file.writeAll(img_data) catch {
+                                            file.close();
+                                            continue;
+                                        };
+                                        file.close();
+
+                                        if (content_buf.items.len > 0) content_buf.appendSlice(self.allocator, "\n") catch {};
+                                        content_buf.appendSlice(self.allocator, "[IMAGE:") catch {};
+                                        content_buf.appendSlice(self.allocator, local_path) catch {};
+                                        content_buf.appendSlice(self.allocator, "]") catch {};
+                                    } else |_| {}
+                                } else |err| {
+                                    log.warn("Discord: failed to download attachment: {}", .{err});
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const final_content = content_buf.toOwnedSlice(self.allocator) catch blk: {
+            break :blk try self.allocator.dupe(u8, content);
+        };
+        defer self.allocator.free(final_content);
+
+        // Build account-aware session key fallback to prevent cross-account bleed
+        // when route resolution is unavailable.
+        const session_key = if (guild_id == null)
+            try std.fmt.allocPrint(self.allocator, "discord:{s}:direct:{s}", .{ self.account_id, author_id })
+        else
+            try std.fmt.allocPrint(self.allocator, "discord:{s}:channel:{s}", .{ self.account_id, channel_id });
         defer self.allocator.free(session_key);
+
+        var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer metadata_buf.deinit(self.allocator);
+        const mw = metadata_buf.writer(self.allocator);
+        try mw.print("{{\"is_dm\":{s}", .{if (guild_id == null) "true" else "false"});
+        try mw.writeAll(",\"account_id\":");
+        try root.appendJsonStringW(mw, self.account_id);
+        if (guild_id) |gid| {
+            try mw.writeAll(",\"guild_id\":");
+            try root.appendJsonStringW(mw, gid);
+        }
+        try mw.writeByte('}');
 
         const msg = try bus_mod.makeInboundFull(
             self.allocator,
             "discord",
             author_id,
             channel_id,
-            content,
+            final_content,
             session_key,
             &.{},
-            null,
+            metadata_buf.items,
         );
 
         if (self.bus) |b| {
@@ -819,6 +920,122 @@ test "discord isMentioned with user id" {
 test "discord intents default" {
     const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
     try std.testing.expectEqual(@as(u32, 37377), ch.intents);
+}
+
+test "discord initFromConfig passes all fields" {
+    const config_types = @import("../config_types.zig");
+    const cfg = config_types.DiscordConfig{
+        .account_id = "discord-main",
+        .token = "my-token",
+        .guild_id = "guild-1",
+        .allow_bots = true,
+        .allow_from = &.{ "user1", "user2" },
+        .require_mention = true,
+        .intents = 512,
+    };
+    const ch = DiscordChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("my-token", ch.token);
+    try std.testing.expectEqualStrings("guild-1", ch.guild_id.?);
+    try std.testing.expect(ch.allow_bots);
+    try std.testing.expectEqualStrings("discord-main", ch.account_id);
+    try std.testing.expectEqual(@as(usize, 2), ch.allow_from.len);
+    try std.testing.expect(ch.require_mention);
+    try std.testing.expectEqual(@as(u32, 512), ch.intents);
+}
+
+test "discord handleMessageCreate publishes inbound guild message with metadata" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("u-1", msg.sender_id);
+    try std.testing.expectEqualStrings("c-1", msg.chat_id);
+    try std.testing.expectEqualStrings("hello", msg.content);
+    try std.testing.expectEqualStrings("discord:dc-main:channel:c-1", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+
+    const meta = try std.json.parseFromSlice(std.json.Value, alloc, msg.metadata_json.?, .{});
+    defer meta.deinit();
+    try std.testing.expect(meta.value == .object);
+    try std.testing.expect(meta.value.object.get("account_id") != null);
+    try std.testing.expect(meta.value.object.get("is_dm") != null);
+    try std.testing.expect(meta.value.object.get("guild_id") != null);
+    try std.testing.expectEqualStrings("dc-main", meta.value.object.get("account_id").?.string);
+    try std.testing.expect(!meta.value.object.get("is_dm").?.bool);
+    try std.testing.expectEqualStrings("g-1", meta.value.object.get("guild_id").?.string);
+}
+
+test "discord handleMessageCreate sets is_dm metadata for direct messages" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"channel_id":"dm-7","content":"hi dm","author":{"id":"u-7","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("discord:dc-main:direct:u-7", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+
+    const meta = try std.json.parseFromSlice(std.json.Value, alloc, msg.metadata_json.?, .{});
+    defer meta.deinit();
+    try std.testing.expect(meta.value == .object);
+    try std.testing.expect(meta.value.object.get("is_dm") != null);
+    try std.testing.expect(meta.value.object.get("is_dm").?.bool);
+    try std.testing.expect(meta.value.object.get("guild_id") == null);
+}
+
+test "discord handleMessageCreate require_mention blocks unmentioned guild messages" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-2","guild_id":"g-2","content":"plain text","author":{"id":"u-2","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
 }
 
 test "discord intent bitmask guilds" {

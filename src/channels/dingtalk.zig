@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
 
 /// DingTalk channel — connects via Stream Mode WebSocket for real-time messages.
 /// Replies are sent through per-message session webhook URLs.
@@ -23,6 +24,15 @@ pub const DingTalkChannel = struct {
             .client_secret = client_secret,
             .allow_from = allow_from,
         };
+    }
+
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.DingTalkConfig) DingTalkChannel {
+        return init(
+            allocator,
+            cfg.client_id,
+            cfg.client_secret,
+            cfg.allow_from,
+        );
     }
 
     pub fn channelName(_: *DingTalkChannel) []const u8 {
@@ -78,7 +88,7 @@ pub const DingTalkChannel = struct {
         _ = ptr;
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }

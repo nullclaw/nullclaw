@@ -11,14 +11,52 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
+const channel_catalog = @import("channel_catalog.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
+const builtin = @import("builtin");
 
 /// Staleness thresholds (seconds).
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
+// ── ANSI color support ──────────────────────────────────────────
+
+const Color = struct {
+    const reset = "\x1b[0m";
+    const green = "\x1b[32m";
+    const yellow = "\x1b[33m";
+    const red = "\x1b[31m";
+};
+
+pub fn shouldColorize(file: std.fs.File) bool {
+    // Respect NO_COLOR convention (https://no-color.org/)
+    if (comptime builtin.os.tag != .windows) {
+        if (std.posix.getenv("NO_COLOR")) |_| return false;
+    }
+
+    // Never colorize if stdout is redirected to a file/pipe
+    if (!file.isTty()) return false;
+
+    // On Windows, attempt to enable Virtual Terminal Processing.
+    // If that fails, fall back to no color.
+    if (builtin.os.tag == .windows) {
+        return enableWindowsVT100() catch false;
+    }
+
+    return true;
+}
+
+/// Windows-specific: enable ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout.
+fn enableWindowsVT100() !bool {
+    const windows = std.os.windows;
+    const handle = try windows.GetStdHandle(windows.STD_OUTPUT_HANDLE);
+    var mode: windows.DWORD = 0;
+    if (windows.kernel32.GetConsoleMode(handle, &mode) == 0) return false;
+    mode |= 0x0004; // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    return windows.kernel32.SetConsoleMode(handle, mode) != 0;
+}
 
 // ── Diagnostic types ────────────────────────────────────────────
 
@@ -50,6 +88,14 @@ pub const DiagItem = struct {
             .err => "[ERR]",
         };
     }
+
+    pub fn iconColored(self: DiagItem) []const u8 {
+        return switch (self.severity) {
+            .ok => Color.green ++ "[ok]" ++ Color.reset,
+            .warn => Color.yellow ++ "[warn]" ++ Color.reset,
+            .err => Color.red ++ "[ERR]" ++ Color.reset,
+        };
+    }
 };
 
 /// Legacy diagnostic result (kept for programmatic access).
@@ -66,6 +112,7 @@ pub fn runDoctor(
     allocator: std.mem.Allocator,
     config: *const Config,
     writer: anytype,
+    color: bool,
 ) !void {
     var items: std.ArrayList(DiagItem) = .empty;
     defer items.deinit(allocator);
@@ -94,7 +141,8 @@ pub fn runDoctor(
             current_cat = item.category;
             try writer.print("  [{s}]\n", .{current_cat});
         }
-        try writer.print("    {s} {s}\n", .{ item.icon(), item.message });
+        const ic = if (color) item.iconColored() else item.icon();
+        try writer.print("    {s} {s}\n", .{ ic, item.message });
         switch (item.severity) {
             .ok => ok_count += 1,
             .warn => warn_count += 1,
@@ -110,17 +158,27 @@ pub fn runDoctor(
 
 /// Legacy entry point — uses stdout directly.
 pub fn run(allocator: std.mem.Allocator) !void {
+    const stdout_file = std.fs.File.stdout();
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = stdout_file.writer(&stdout_buf);
     const stdout = &bw.interface;
+    const color = shouldColorize(stdout_file);
 
     var cfg = Config.load(allocator) catch {
-        try stdout.writeAll("[ERR] No config found -- run `nullclaw onboard` first\n");
+        const prefix = if (color)
+            Color.red ++ "[ERR]" ++ Color.reset
+        else
+            "[ERR]";
+        try stdout.print("{s} No config found -- run `nullclaw onboard` first\n", .{prefix});
         try stdout.flush();
         return;
     };
     defer cfg.deinit();
-    try runDoctor(allocator, &cfg, stdout);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try runDoctor(arena.allocator(), &cfg, stdout, color);
     try stdout.flush();
 }
 
@@ -200,18 +258,9 @@ pub fn checkConfigSemantics(
         }
     }
 
-    // Channels: at least one configured
-    const ch = &config.channels;
-    const has_channel = ch.telegram != null or
-        ch.discord != null or
-        ch.slack != null or
-        ch.webhook != null or
-        ch.imessage != null or
-        ch.matrix != null or
-        ch.whatsapp != null or
-        ch.irc != null or
-        ch.lark != null or
-        ch.dingtalk != null;
+    // Channels: at least one non-CLI channel configured.
+    // Use channel_catalog to avoid hardcoding channel lists in doctor checks.
+    const has_channel = channel_catalog.hasAnyConfigured(config, false);
 
     if (has_channel) {
         try items.append(allocator, DiagItem.ok(cat, "at least one channel configured"));
@@ -523,7 +572,7 @@ fn checkCommandAvailable(allocator: std.mem.Allocator, cmd: []const u8) !?[]cons
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ cmd, "--version" },
-        .max_output_bytes = 512,
+        .max_output_bytes = 1024,
     }) catch return null;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -599,18 +648,11 @@ fn checkChannels(allocator: std.mem.Allocator, cfg: *const Config, items: *std.A
     const cat = "channels";
     items.append(allocator, DiagItem.ok(cat, "CLI always available")) catch {};
 
-    if (cfg.channels.telegram != null)
-        items.append(allocator, DiagItem.ok(cat, "Telegram configured")) catch {};
-    if (cfg.channels.discord != null)
-        items.append(allocator, DiagItem.ok(cat, "Discord configured")) catch {};
-    if (cfg.channels.slack != null)
-        items.append(allocator, DiagItem.ok(cat, "Slack configured")) catch {};
-    if (cfg.channels.webhook != null)
-        items.append(allocator, DiagItem.ok(cat, "Webhook configured")) catch {};
-    if (cfg.channels.matrix != null)
-        items.append(allocator, DiagItem.ok(cat, "Matrix configured")) catch {};
-    if (cfg.channels.irc != null)
-        items.append(allocator, DiagItem.ok(cat, "IRC configured")) catch {};
+    for (channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli) continue;
+        if (!channel_catalog.isConfigured(cfg, meta.id)) continue;
+        items.append(allocator, DiagItem.ok(cat, meta.configured_message)) catch {};
+    }
 }
 
 /// Check a specific diagnostic (utility for programmatic access).
@@ -647,6 +689,28 @@ test "DiagItem.icon returns correct string" {
     try std.testing.expectEqualStrings("[ok]", DiagItem.ok("t", "m").icon());
     try std.testing.expectEqualStrings("[warn]", DiagItem.warn("t", "m").icon());
     try std.testing.expectEqualStrings("[ERR]", DiagItem.err("t", "m").icon());
+}
+
+test "DiagItem.iconColored returns ANSI-colored strings" {
+    const ok_icon = DiagItem.ok("t", "m").iconColored();
+    try std.testing.expect(std.mem.indexOf(u8, ok_icon, "\x1b[32m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ok_icon, "[ok]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ok_icon, "\x1b[0m") != null);
+
+    const warn_icon = DiagItem.warn("t", "m").iconColored();
+    try std.testing.expect(std.mem.indexOf(u8, warn_icon, "\x1b[33m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warn_icon, "[warn]") != null);
+
+    const err_icon = DiagItem.err("t", "m").iconColored();
+    try std.testing.expect(std.mem.indexOf(u8, err_icon, "\x1b[31m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_icon, "[ERR]") != null);
+}
+
+test "shouldColorize returns false for non-TTY file" {
+    // Open /dev/null — it's not a TTY, so shouldColorize should return false
+    const devnull = std.fs.openFileAbsolute("/dev/null", .{}) catch return;
+    defer devnull.close();
+    try std.testing.expect(!shouldColorize(devnull));
 }
 
 test "checkConfigSemantics catches temperature out of range" {

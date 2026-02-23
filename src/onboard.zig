@@ -12,6 +12,7 @@ const std = @import("std");
 const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
+const channel_catalog = @import("channel_catalog.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
 
@@ -49,13 +50,53 @@ pub const ProviderInfo = struct {
 };
 
 pub const known_providers = [_]ProviderInfo{
-    .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.5", .env_var = "OPENROUTER_API_KEY" },
-    .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-sonnet-4-20250514", .env_var = "ANTHROPIC_API_KEY" },
+    // --- Tier 1: Major multi-provider gateways ---
+    .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
+    .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
+
+    // --- Tier 2: Major cloud providers (Feb 2026 models) ---
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
-    .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
+    .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-v3.2", .env_var = "DEEPSEEK_API_KEY" },
     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
-    .{ .key = "ollama", .label = "Ollama (local)", .default_model = "llama3.2", .env_var = "API_KEY" },
+
+    // --- Tier 3: OpenAI-compatible specialists ---
+    .{ .key = "z.ai", .label = "Z.AI (Zhipu coding)", .default_model = "glm-5", .env_var = "ZAI_API_KEY" },
+    .{ .key = "glm", .label = "GLM (Zhipu general)", .default_model = "glm-5", .env_var = "ZHIPU_API_KEY" },
+    .{ .key = "together-ai", .label = "Together AI (inference)", .default_model = "meta-llama/Llama-4-70B-Instruct-Turbo", .env_var = "TOGETHER_API_KEY" },
+    .{ .key = "fireworks-ai", .label = "Fireworks AI (fast)", .default_model = "accounts/fireworks/models/llama-v4-70b-instruct", .env_var = "FIREWORKS_API_KEY" },
+    .{ .key = "mistral", .label = "Mistral", .default_model = "mistral-large", .env_var = "MISTRAL_API_KEY" },
+    .{ .key = "xai", .label = "xAI (Grok)", .default_model = "grok-4.1", .env_var = "XAI_API_KEY" },
+
+    // --- Tier 4: AI platform specialists ---
+    .{ .key = "venice", .label = "Venice", .default_model = "llama-4-70b-instruct", .env_var = "VENICE_API_KEY" },
+    .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
+    .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
+    .{ .key = "opencode-zen", .label = "OpenCode Zen", .default_model = "opencode-model", .env_var = "OPENCODE_API_KEY" },
+    .{ .key = "minimax", .label = "MiniMax", .default_model = "minimax-m2.1", .env_var = "MINIMAX_API_KEY" },
+
+    // --- Tier 5: Cloud gateways ---
+    .{ .key = "qwen", .label = "Qwen (Alibaba)", .default_model = "qwen-3-max", .env_var = "DASHSCOPE_API_KEY" },
+    .{ .key = "cohere", .label = "Cohere", .default_model = "command-r-plus", .env_var = "COHERE_API_KEY" },
+    .{ .key = "perplexity", .label = "Perplexity", .default_model = "llama-4-sonar-small-128k-online", .env_var = "PERPLEXITY_API_KEY" },
+
+    // --- Tier 6: Infrastructure providers ---
+    .{ .key = "nvidia", .label = "NVIDIA NIM (enterprise)", .default_model = "meta/llama-4-70b-instruct", .env_var = "NVIDIA_API_KEY" },
+    .{ .key = "cloudflare", .label = "Cloudflare AI Gateway", .default_model = "meta/llama-4-70b-instruct", .env_var = "CLOUDFLARE_API_TOKEN" },
+    .{ .key = "vercel-ai", .label = "Vercel AI Gateway", .default_model = "gpt-5.2", .env_var = "VERCEL_API_KEY" },
+
+    // --- Tier 7: Enterprise clouds ---
+    .{ .key = "bedrock", .label = "Amazon Bedrock", .default_model = "anthropic.claude-opus-4-6", .env_var = "AWS_ACCESS_KEY_ID" },
+    .{ .key = "qianfan", .label = "Qianfan (Baidu)", .default_model = "ernie-bot-5", .env_var = "QIANFAN_ACCESS_KEY" },
+    .{ .key = "copilot", .label = "GitHub Copilot", .default_model = "gpt-5.2", .env_var = "GITHUB_TOKEN" },
+
+    // --- Tier 8: Emerging platforms ---
+    .{ .key = "astrai", .label = "Astrai", .default_model = "astrai-model", .env_var = "ASTRAI_API_KEY" },
+    .{ .key = "poe", .label = "Poe", .default_model = "poe-model", .env_var = "POE_API_KEY" },
+
+    // --- Tier 9: Local/self-hosted ---
+    .{ .key = "ollama", .label = "Ollama (local CLI)", .default_model = "llama4", .env_var = "API_KEY" },
+    .{ .key = "lm-studio", .label = "LM Studio (local GUI)", .default_model = "local-model", .env_var = "API_KEY" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -72,7 +113,7 @@ pub fn defaultModelForProvider(provider: []const u8) []const u8 {
     for (known_providers) |p| {
         if (std.mem.eql(u8, p.key, canonical)) return p.default_model;
     }
-    return "anthropic/claude-sonnet-4.5";
+    return "anthropic/claude-sonnet-4.6";
 }
 
 /// Get the environment variable name for a provider's API key.
@@ -102,16 +143,45 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
+
+    // For providers without a curated fallback list, return a single-item fallback
+    // based on the onboarding default model for that provider.
+    if (providerDefaultFallback(canonical)) |models| return models;
+
     return &anthropic_fallback;
 }
 
+const ProviderFallback = struct {
+    key: []const u8,
+    models: []const []const u8,
+};
+
+const provider_default_fallbacks = blk: {
+    var rows: [known_providers.len]ProviderFallback = undefined;
+    for (known_providers, 0..) |p, i| {
+        rows[i] = .{
+            .key = p.key,
+            .models = &[_][]const u8{p.default_model},
+        };
+    }
+    break :blk rows;
+};
+
+fn providerDefaultFallback(provider: []const u8) ?[]const []const u8 {
+    for (provider_default_fallbacks) |entry| {
+        if (std.mem.eql(u8, entry.key, provider)) return entry.models;
+    }
+    return null;
+}
+
 const openrouter_fallback = [_][]const u8{
-    "anthropic/claude-sonnet-4.5",
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-opus-4-6",
     "anthropic/claude-haiku-4-5",
     "openai/gpt-5.2",
     "google/gemini-2.5-pro",
-    "deepseek/deepseek-chat",
-    "meta-llama/llama-3.3-70b-instruct",
+    "deepseek/deepseek-v3.2",
+    "meta-llama/llama-4-70b-instruct",
 };
 const openai_fallback = [_][]const u8{
     "gpt-5.2",
@@ -137,13 +207,13 @@ const gemini_fallback = [_][]const u8{
     "gemini-2.0-flash",
 };
 const deepseek_fallback = [_][]const u8{
-    "deepseek-chat",
+    "deepseek-v3.2",
     "deepseek-reasoner",
 };
 const ollama_fallback = [_][]const u8{
+    "llama4",
     "llama3.2",
     "mistral",
-    "codellama",
     "phi3",
 };
 
@@ -515,17 +585,11 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     };
     defer cfg.deinit();
 
-    try stdout.print("  CLI:       {s}\n", .{if (cfg.channels.cli) "enabled" else "disabled"});
-    try stdout.print("  Telegram:  {s}\n", .{if (cfg.channels.telegram != null) "configured" else "not configured"});
-    try stdout.print("  Discord:   {s}\n", .{if (cfg.channels.discord != null) "configured" else "not configured"});
-    try stdout.print("  Slack:     {s}\n", .{if (cfg.channels.slack != null) "configured" else "not configured"});
-    try stdout.print("  Webhook:   {s}\n", .{if (cfg.channels.webhook != null) "configured" else "not configured"});
-    try stdout.print("  iMessage:  {s}\n", .{if (cfg.channels.imessage != null) "configured" else "not configured"});
-    try stdout.print("  Matrix:    {s}\n", .{if (cfg.channels.matrix != null) "configured" else "not configured"});
-    try stdout.print("  WhatsApp:  {s}\n", .{if (cfg.channels.whatsapp != null) "configured" else "not configured"});
-    try stdout.print("  IRC:       {s}\n", .{if (cfg.channels.irc != null) "configured" else "not configured"});
-    try stdout.print("  Lark:      {s}\n", .{if (cfg.channels.lark != null) "configured" else "not configured"});
-    try stdout.print("  DingTalk:  {s}\n", .{if (cfg.channels.dingtalk != null) "configured" else "not configured"});
+    for (channel_catalog.known_channels) |meta| {
+        var status_buf: [64]u8 = undefined;
+        const status_text = channel_catalog.statusText(&cfg, meta, &status_buf);
+        try stdout.print("  {s}: {s}\n", .{ meta.label, status_text });
+    }
     try stdout.writeAll("\nTo modify channels, edit your config file:\n");
     try stdout.print("  {s}\n", .{cfg.config_path});
     try stdout.flush();
@@ -1161,14 +1225,14 @@ test "canonicalProviderName handles aliases" {
 }
 
 test "defaultModelForProvider returns known models" {
-    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", defaultModelForProvider("anthropic"));
+    try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
-    try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
-    try std.testing.expectEqualStrings("llama3.2", defaultModelForProvider("ollama"));
+    try std.testing.expectEqualStrings("deepseek-v3.2", defaultModelForProvider("deepseek"));
+    try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
 }
 
 test "defaultModelForProvider falls back for unknown" {
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.5", defaultModelForProvider("unknown-provider"));
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", defaultModelForProvider("unknown-provider"));
 }
 
 test "providerEnvVar known providers" {
@@ -1179,7 +1243,7 @@ test "providerEnvVar known providers" {
 }
 
 test "providerEnvVar grok alias maps to xai" {
-    try std.testing.expectEqualStrings("API_KEY", providerEnvVar("grok"));
+    try std.testing.expectEqualStrings("XAI_API_KEY", providerEnvVar("grok"));
 }
 
 test "providerEnvVar unknown falls back" {
@@ -1265,7 +1329,7 @@ test "defaultModelForProvider groq" {
 }
 
 test "defaultModelForProvider openrouter" {
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.5", defaultModelForProvider("openrouter"));
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", defaultModelForProvider("openrouter"));
 }
 
 test "providerEnvVar gemini aliases" {
@@ -1476,7 +1540,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 7);
+    try std.testing.expect(known_providers.len == 30);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -1590,6 +1654,16 @@ test "fallbackModelsForProvider unknown returns anthropic fallback" {
     const models = fallbackModelsForProvider("some-unknown-provider");
     try std.testing.expect(models.len >= 3);
     try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+}
+
+test "fallbackModelsForProvider uses provider defaults for uncataloged providers" {
+    const qwen_models = fallbackModelsForProvider("qwen");
+    try std.testing.expect(qwen_models.len >= 1);
+    try std.testing.expectEqualStrings("qwen-3-max", qwen_models[0]);
+
+    const z_ai_models = fallbackModelsForProvider("z.ai");
+    try std.testing.expect(z_ai_models.len >= 1);
+    try std.testing.expectEqualStrings("glm-5", z_ai_models[0]);
 }
 
 test "parseModelIds extracts IDs from OpenRouter-style response" {
@@ -1781,7 +1855,7 @@ test "fetchModelsFromApi returns hardcoded for ollama" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("llama3.2", models[0]);
+    try std.testing.expectEqualStrings("llama4", models[0]);
 }
 
 test "fetchModelsFromApi returns error for openai without key" {
@@ -1841,7 +1915,7 @@ test "fetchModels returns models for deepseek (no network)" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len >= 2);
-    try std.testing.expectEqualStrings("deepseek-chat", models[0]);
+    try std.testing.expectEqualStrings("deepseek-v3.2", models[0]);
 }
 
 test "fetchModels returns fallback for openai without key" {

@@ -1,21 +1,9 @@
 const std = @import("std");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
 
 const log = std.log.scoped(.onebot);
-
-// ════════════════════════════════════════════════════════════════════════════
-// Configuration
-// ════════════════════════════════════════════════════════════════════════════
-
-pub const OneBotConfig = struct {
-    /// WebSocket URL of the OneBot v11 implementation (e.g. go-cqhttp).
-    url: []const u8 = "ws://localhost:6700",
-    /// Access token for authentication (sent as Authorization header).
-    access_token: ?[]const u8 = null,
-    /// In group chats, only respond to messages starting with this prefix.
-    group_trigger_prefix: ?[]const u8 = null,
-};
 
 // ════════════════════════════════════════════════════════════════════════════
 // CQ Code Parsing
@@ -191,7 +179,7 @@ pub const DedupRing = struct {
 /// via WebSocket or HTTP API. Receives messages, parses CQ codes, publishes
 /// to the event bus. Sends outgoing messages via HTTP POST to /send_msg.
 pub const OneBotChannel = struct {
-    config: OneBotConfig,
+    config: config_types.OneBotConfig,
     allocator: std.mem.Allocator,
     event_bus: ?*bus.Bus,
     dedup: DedupRing,
@@ -200,7 +188,7 @@ pub const OneBotChannel = struct {
     pub const MAX_MESSAGE_LEN: usize = 4500;
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
 
-    pub fn init(allocator: std.mem.Allocator, config: OneBotConfig) OneBotChannel {
+    pub fn init(allocator: std.mem.Allocator, config: config_types.OneBotConfig) OneBotChannel {
         return .{
             .config = config,
             .allocator = allocator,
@@ -208,6 +196,10 @@ pub const OneBotChannel = struct {
             .dedup = .{},
             .running = false,
         };
+    }
+
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.OneBotConfig) OneBotChannel {
+        return init(allocator, cfg);
     }
 
     pub fn channelName(_: *OneBotChannel) []const u8 {
@@ -257,10 +249,16 @@ pub const OneBotChannel = struct {
         var user_buf: [32]u8 = undefined;
         const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{user_id}) catch return;
 
+        // Allowlist check
+        if (self.config.allow_from.len > 0 and !root.isAllowed(self.config.allow_from, user_str)) return;
+
         // Extract chat_id (group_id for group messages, user_id for private)
         const chat_id_int = if (is_group) getJsonInt(val, "group_id") orelse return else user_id;
-        var chat_buf: [32]u8 = undefined;
-        const chat_str = std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id_int}) catch return;
+        var chat_buf: [48]u8 = undefined;
+        const chat_str = if (is_group)
+            std.fmt.bufPrint(&chat_buf, "group:{d}", .{chat_id_int}) catch return
+        else
+            std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id_int}) catch return;
 
         // Extract raw message text
         const raw_message = getJsonString(val, "raw_message") orelse
@@ -300,6 +298,8 @@ pub const OneBotChannel = struct {
             message_id,
             if (is_group) "true" else "false",
         }) catch return;
+        mw.writeAll(",\"account_id\":") catch return;
+        root.appendJsonStringW(mw, self.config.account_id) catch return;
         if (cq.reply_id) |rid| {
             mw.writeAll(",\"reply_to\":\"") catch return;
             mw.writeAll(rid) catch return;
@@ -402,7 +402,7 @@ pub const OneBotChannel = struct {
         log.info("OneBot channel stopped", .{});
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *OneBotChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -457,12 +457,14 @@ fn deriveHttpBase(ws_url: []const u8) []const u8 {
 
 /// Get a string field from a JSON object value.
 fn getJsonString(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
     const field = val.object.get(key) orelse return null;
     return if (field == .string) field.string else null;
 }
 
 /// Get an integer field from a JSON object value.
 fn getJsonInt(val: std.json.Value, key: []const u8) ?i64 {
+    if (val != .object) return null;
     const field = val.object.get(key) orelse return null;
     return switch (field) {
         .integer => field.integer,
@@ -626,8 +628,8 @@ test "deriveHttpBase http url passthrough" {
     try std.testing.expectEqualStrings("http://localhost:5700", result);
 }
 
-test "OneBotConfig defaults" {
-    const config = OneBotConfig{};
+test "config_types.OneBotConfig defaults" {
+    const config = config_types.OneBotConfig{};
     try std.testing.expectEqualStrings("ws://localhost:6700", config.url);
     try std.testing.expect(config.access_token == null);
     try std.testing.expect(config.group_trigger_prefix == null);
@@ -668,7 +670,7 @@ test "handleEvent private message" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{});
+    var ch = OneBotChannel.init(alloc, .{ .account_id = "onebot-main" });
     ch.setBus(&event_bus_inst);
     ch.running = true;
 
@@ -685,6 +687,8 @@ test "handleEvent private message" {
     try std.testing.expectEqualStrings("12345", msg.chat_id);
     try std.testing.expectEqualStrings("hello onebot", msg.content);
     try std.testing.expectEqualStrings("onebot:12345", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"account_id\":\"onebot-main\"") != null);
 }
 
 test "handleEvent group message with prefix" {
@@ -708,7 +712,8 @@ test "handleEvent group message with prefix" {
     var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("what is Zig?", msg.content);
-    try std.testing.expectEqualStrings("999", msg.chat_id);
+    try std.testing.expectEqualStrings("group:999", msg.chat_id);
+    try std.testing.expectEqualStrings("onebot:group:999", msg.session_key);
 }
 
 test "handleEvent group message without prefix skipped" {
@@ -826,6 +831,69 @@ test "handleEvent group message with mention passes prefix check" {
     var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings(" help me", msg.content);
+}
+
+test "handleEvent allow_from blocks unlisted user" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = OneBotChannel.init(alloc, .{
+        .allow_from = &.{"99999"},
+    });
+    ch.setBus(&event_bus_inst);
+    ch.running = true;
+
+    // user_id=12345 is NOT in allow_from
+    const event_json =
+        \\{"post_type":"message","message_type":"private","message_id":6001,
+        \\"user_id":12345,"raw_message":"blocked user","time":1700000000}
+    ;
+    try ch.handleEvent(event_json);
+
+    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
+}
+
+test "handleEvent allow_from permits listed user" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = OneBotChannel.init(alloc, .{
+        .allow_from = &.{"12345"},
+    });
+    ch.setBus(&event_bus_inst);
+    ch.running = true;
+
+    const event_json =
+        \\{"post_type":"message","message_type":"private","message_id":6002,
+        \\"user_id":12345,"raw_message":"allowed user","time":1700000000}
+    ;
+    try ch.handleEvent(event_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("allowed user", msg.content);
+}
+
+test "handleEvent allow_from empty allows all" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = OneBotChannel.init(alloc, .{});
+    ch.setBus(&event_bus_inst);
+    ch.running = true;
+
+    const event_json =
+        \\{"post_type":"message","message_type":"private","message_id":6003,
+        \\"user_id":12345,"raw_message":"anyone allowed","time":1700000000}
+    ;
+    try ch.handleEvent(event_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("anyone allowed", msg.content);
 }
 
 test "extractParam finds correct values" {

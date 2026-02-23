@@ -13,7 +13,12 @@ const bus = @import("../bus.zig");
 /// synchronously or via thread spawning.
 pub const ChannelRegistry = struct {
     allocator: std.mem.Allocator,
-    channels: std.ArrayListUnmanaged(root.Channel),
+    channels: std.ArrayListUnmanaged(ChannelEntry),
+
+    const ChannelEntry = struct {
+        channel: root.Channel,
+        account_id: []const u8 = "default",
+    };
 
     pub fn init(allocator: std.mem.Allocator) ChannelRegistry {
         return .{
@@ -27,7 +32,14 @@ pub const ChannelRegistry = struct {
     }
 
     pub fn register(self: *ChannelRegistry, ch: root.Channel) !void {
-        try self.channels.append(self.allocator, ch);
+        try self.channels.append(self.allocator, .{ .channel = ch });
+    }
+
+    pub fn registerWithAccount(self: *ChannelRegistry, ch: root.Channel, account_id: []const u8) !void {
+        try self.channels.append(self.allocator, .{
+            .channel = ch,
+            .account_id = account_id,
+        });
     }
 
     pub fn count(self: *const ChannelRegistry) usize {
@@ -36,23 +48,34 @@ pub const ChannelRegistry = struct {
 
     /// Find a channel by name.
     pub fn findByName(self: *const ChannelRegistry, channel_name: []const u8) ?root.Channel {
-        for (self.channels.items) |ch| {
-            if (std.mem.eql(u8, ch.name(), channel_name)) return ch;
+        for (self.channels.items) |entry| {
+            if (std.mem.eql(u8, entry.channel.name(), channel_name)) return entry.channel;
+        }
+        return null;
+    }
+
+    pub fn findByNameAccount(self: *const ChannelRegistry, channel_name: []const u8, account_id: []const u8) ?root.Channel {
+        for (self.channels.items) |entry| {
+            if (std.mem.eql(u8, entry.channel.name(), channel_name) and
+                std.mem.eql(u8, entry.account_id, account_id))
+            {
+                return entry.channel;
+            }
         }
         return null;
     }
 
     /// Start all registered channels.
     pub fn startAll(self: *ChannelRegistry) !void {
-        for (self.channels.items) |ch| {
-            try ch.start();
+        for (self.channels.items) |entry| {
+            try entry.channel.start();
         }
     }
 
     /// Stop all registered channels.
     pub fn stopAll(self: *ChannelRegistry) void {
-        for (self.channels.items) |ch| {
-            ch.stop();
+        for (self.channels.items) |entry| {
+            entry.channel.stop();
         }
     }
 
@@ -60,8 +83,8 @@ pub const ChannelRegistry = struct {
     pub fn healthCheckAll(self: *const ChannelRegistry) HealthReport {
         var healthy: usize = 0;
         var unhealthy: usize = 0;
-        for (self.channels.items) |ch| {
-            if (ch.healthCheck()) {
+        for (self.channels.items) |entry| {
+            if (entry.channel.healthCheck()) {
                 healthy += 1;
             } else {
                 unhealthy += 1;
@@ -74,8 +97,8 @@ pub const ChannelRegistry = struct {
     pub fn channelNames(self: *const ChannelRegistry, allocator: std.mem.Allocator) ![][]const u8 {
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer names.deinit(allocator);
-        for (self.channels.items) |ch| {
-            try names.append(allocator, ch.name());
+        for (self.channels.items) |entry| {
+            try names.append(allocator, entry.channel.name());
         }
         return names.toOwnedSlice(allocator);
     }
@@ -145,8 +168,13 @@ pub fn runOutboundDispatcher(
     while (event_bus.consumeOutbound()) |msg| {
         defer msg.deinit(allocator);
 
-        if (registry.findByName(msg.channel)) |channel| {
-            channel.send(msg.chat_id, msg.content) catch {
+        const channel_opt = if (msg.account_id) |aid|
+            registry.findByNameAccount(msg.channel, aid)
+        else
+            registry.findByName(msg.channel);
+
+        if (channel_opt) |channel| {
+            channel.send(msg.chat_id, msg.content, msg.media) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -339,7 +367,7 @@ const MockChannel = struct {
 
     fn mockStart(_: *anyopaque) anyerror!void {}
     fn mockStop(_: *anyopaque) void {}
-    fn mockSend(ctx: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+    fn mockSend(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
         const self: *MockChannel = @ptrCast(@alignCast(ctx));
         if (self.should_fail) return error.SendFailed;
         _ = self.sent_count.fetchAdd(1, .monotonic);
@@ -382,6 +410,55 @@ test "dispatcher routes message to correct channel" {
     try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
     try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
     try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+}
+
+test "dispatcher routes to matching account when channel has multiple accounts" {
+    const allocator = std.testing.allocator;
+
+    var main_tg = MockChannel{ .name_str = "telegram" };
+    var backup_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.registerWithAccount(main_tg.channel(), "main");
+    try reg.registerWithAccount(backup_tg.channel(), "backup");
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundWithAccount(allocator, "telegram", "backup", "chat1", "hello");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
+    try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
+    try std.testing.expectEqual(@as(u64, 0), main_tg.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), backup_tg.sent_count.load(.monotonic));
+}
+
+test "dispatcher does not fallback to wrong account when account_id is unknown" {
+    const allocator = std.testing.allocator;
+
+    var main_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.registerWithAccount(main_tg.channel(), "main");
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundWithAccount(allocator, "telegram", "missing", "chat1", "hello");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 0), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
+    try std.testing.expectEqual(@as(u64, 1), stats.getChannelNotFound());
+    try std.testing.expectEqual(@as(u64, 0), main_tg.sent_count.load(.monotonic));
 }
 
 test "dispatcher increments channel_not_found for unknown channel" {

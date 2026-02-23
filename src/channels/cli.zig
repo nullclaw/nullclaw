@@ -61,7 +61,7 @@ pub const CliChannel = struct {
         self.running = false;
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *CliChannel = @ptrCast(@alignCast(ptr));
         return self.sendMessage(target, message);
     }

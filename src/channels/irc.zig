@@ -1,5 +1,7 @@
 const std = @import("std");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
+const bus_mod = @import("../bus.zig");
 
 const log = std.log.scoped(.irc);
 
@@ -21,6 +23,7 @@ const SERVICE_BOTS = [_][]const u8{ "NickServ", "ChanServ", "BotServ", "MemoServ
 /// Joins configured channels, forwards PRIVMSG messages.
 pub const IrcChannel = struct {
     allocator: std.mem.Allocator,
+    account_id: []const u8 = "default",
     host: []const u8,
     port: u16,
     nick: []const u8,
@@ -34,6 +37,10 @@ pub const IrcChannel = struct {
     use_tls: bool = false,
     stream: ?std.net.Stream = null,
     tls_state: ?*TlsState = null,
+    bus: ?*bus_mod.Bus = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    reader_thread: ?std.Thread = null,
+    write_mu: std.Thread.Mutex = .{},
 
     /// Heap-allocated TLS state that wraps a TCP stream with encryption.
     /// Must be heap-allocated so that pointers remain stable for the TLS client.
@@ -89,6 +96,24 @@ pub const IrcChannel = struct {
         };
     }
 
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.IrcConfig) IrcChannel {
+        var ch = init(
+            allocator,
+            cfg.host,
+            cfg.port,
+            cfg.nick,
+            cfg.username,
+            cfg.channels,
+            cfg.allow_from,
+            cfg.server_password,
+            cfg.nickserv_password,
+            cfg.sasl_password,
+            cfg.tls,
+        );
+        ch.account_id = cfg.account_id;
+        return ch;
+    }
+
     pub fn channelName(_: *IrcChannel) []const u8 {
         return "irc";
     }
@@ -97,8 +122,12 @@ pub const IrcChannel = struct {
         return root.isAllowed(self.allow_from, nick);
     }
 
-    pub fn healthCheck(_: *IrcChannel) bool {
-        return true;
+    pub fn setBus(self: *IrcChannel, b: *bus_mod.Bus) void {
+        self.bus = b;
+    }
+
+    pub fn healthCheck(self: *IrcChannel) bool {
+        return self.running.load(.acquire) and self.stream != null;
     }
 
     /// Check if a sender nick belongs to an IRC service bot.
@@ -136,6 +165,9 @@ pub const IrcChannel = struct {
     /// Write bytes through TLS or plain TCP depending on connection mode.
     /// Abstracts away the write path so callers do not need to check use_tls.
     pub fn ircWriteAll(self: *IrcChannel, data: []const u8) !void {
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
+
         if (self.tls_state) |tls| {
             try tls.tls_client.writer.writeAll(data);
             try tls.tls_client.writer.flush();
@@ -146,6 +178,137 @@ pub const IrcChannel = struct {
         } else {
             return error.IrcNotConnected;
         }
+    }
+
+    fn readFromConnection(self: *IrcChannel, out: []u8) !usize {
+        if (self.tls_state) |tls| {
+            var rd: [1][]u8 = .{out};
+            return tls.tls_client.reader.readVec(&rd) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => err,
+            };
+        }
+        if (self.stream) |stream| {
+            return stream.read(out);
+        }
+        return error.IrcNotConnected;
+    }
+
+    fn handleInboundLine(self: *IrcChannel, line: []const u8) !void {
+        const parsed = (try IrcMessage.parse(self.allocator, line)) orelse return;
+        defer parsed.deinit(self.allocator);
+
+        if (std.ascii.eqlIgnoreCase(parsed.command, "PING")) {
+            if (parsed.params.len == 0) return;
+            var pong_buf: [MAX_LINE_LEN]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&pong_buf);
+            try fbs.writer().print("PONG :{s}", .{parsed.params[parsed.params.len - 1]});
+            try self.sendRaw(fbs.getWritten());
+            return;
+        }
+
+        if (!std.ascii.eqlIgnoreCase(parsed.command, "PRIVMSG")) return;
+        if (parsed.params.len < 2) return;
+
+        const sender_nick = parsed.nick() orelse return;
+        if (IrcChannel.isServiceBot(sender_nick)) return;
+        if (self.allow_from.len > 0 and !self.isUserAllowed(sender_nick)) return;
+
+        const target = parsed.params[0];
+        const text = std.mem.trim(u8, parsed.params[parsed.params.len - 1], " \t\r\n");
+        if (text.len == 0) return;
+
+        const is_channel = target.len > 0 and (target[0] == '#' or target[0] == '&');
+        const chat_id = if (is_channel) target else sender_nick;
+        const session_key = if (is_channel)
+            try std.fmt.allocPrint(self.allocator, "irc:{s}:group:{s}", .{ self.account_id, chat_id })
+        else
+            try std.fmt.allocPrint(self.allocator, "irc:{s}:direct:{s}", .{ self.account_id, sender_nick });
+        defer self.allocator.free(session_key);
+
+        var content_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer content_buf.deinit(self.allocator);
+        try content_buf.appendSlice(self.allocator, IRC_STYLE_PREFIX);
+        if (is_channel) {
+            try content_buf.appendSlice(self.allocator, sender_nick);
+            try content_buf.appendSlice(self.allocator, ": ");
+        }
+        try content_buf.appendSlice(self.allocator, text);
+        const content = try content_buf.toOwnedSlice(self.allocator);
+        defer self.allocator.free(content);
+
+        var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer metadata_buf.deinit(self.allocator);
+        const mw = metadata_buf.writer(self.allocator);
+        try mw.writeByte('{');
+        try mw.writeAll("\"account_id\":");
+        try root.appendJsonStringW(mw, self.account_id);
+        try mw.writeAll(",\"is_dm\":");
+        try mw.writeAll(if (is_channel) "false" else "true");
+        try mw.writeAll(",\"is_group\":");
+        try mw.writeAll(if (is_channel) "true" else "false");
+        if (is_channel) {
+            try mw.writeAll(",\"channel_id\":");
+            try root.appendJsonStringW(mw, chat_id);
+        }
+        try mw.writeByte('}');
+
+        const msg = try bus_mod.makeInboundFull(
+            self.allocator,
+            "irc",
+            sender_nick,
+            chat_id,
+            content,
+            session_key,
+            &.{},
+            metadata_buf.items,
+        );
+        if (self.bus) |b| {
+            b.publishInbound(msg) catch |err| {
+                log.warn("IRC publishInbound failed: {}", .{err});
+                msg.deinit(self.allocator);
+            };
+        } else {
+            msg.deinit(self.allocator);
+        }
+    }
+
+    fn readerLoop(self: *IrcChannel) void {
+        var recv_buf: [4096]u8 = undefined;
+        var pending: std.ArrayListUnmanaged(u8) = .empty;
+        defer pending.deinit(self.allocator);
+
+        while (self.running.load(.acquire)) {
+            const n = self.readFromConnection(&recv_buf) catch |err| {
+                if (self.running.load(.acquire)) {
+                    log.warn("IRC read error: {}", .{err});
+                }
+                break;
+            };
+            if (n == 0) break;
+
+            pending.appendSlice(self.allocator, recv_buf[0..n]) catch {
+                log.err("IRC pending buffer OOM", .{});
+                break;
+            };
+
+            while (std.mem.indexOfScalar(u8, pending.items, '\n')) |idx| {
+                const line = pending.items[0 .. idx + 1];
+                self.handleInboundLine(line) catch |err| {
+                    log.warn("IRC inbound parse failed: {}", .{err});
+                };
+
+                const rem_start = idx + 1;
+                const rem_len = pending.items.len - rem_start;
+                if (rem_len > 0) {
+                    std.mem.copyForwards(u8, pending.items[0..rem_len], pending.items[rem_start..]);
+                }
+                pending.items = pending.items[0..rem_len];
+            }
+        }
+
+        self.running.store(false, .release);
+        self.disconnect();
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -253,6 +416,11 @@ pub const IrcChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *IrcChannel = @ptrCast(@alignCast(ptr));
+        if (self.running.load(.acquire)) return;
+
+        self.running.store(true, .release);
+        errdefer self.running.store(false, .release);
+        errdefer self.disconnect();
         try self.connect();
 
         // SASL: request capability before registration
@@ -286,14 +454,21 @@ pub const IrcChannel = struct {
             try join_fbs.writer().print("JOIN {s}", .{ch});
             try self.sendRaw(join_fbs.getWritten());
         }
+
+        self.reader_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, readerLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *IrcChannel = @ptrCast(@alignCast(ptr));
+        self.running.store(false, .release);
         self.disconnect();
+        if (self.reader_thread) |t| {
+            t.join();
+            self.reader_thread = null;
+        }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *IrcChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -779,6 +954,42 @@ test "irc ampersand channel reply_target is channel name" {
 test "irc style prefix exists" {
     try std.testing.expect(IRC_STYLE_PREFIX.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, IRC_STYLE_PREFIX, "IRC") != null);
+}
+
+test "irc handleInboundLine publishes allowed group message to bus" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    var ch = IrcChannel.init(alloc, "irc.test", 6667, "mybot", null, &.{}, &.{"alice"}, null, null, null, false);
+    ch.account_id = "irc-main";
+    ch.setBus(&eb);
+
+    try ch.handleInboundLine(":alice!u@h PRIVMSG #general :hello team\r\n");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("irc", msg.channel);
+    try std.testing.expectEqualStrings("alice", msg.sender_id);
+    try std.testing.expectEqualStrings("#general", msg.chat_id);
+    try std.testing.expectEqualStrings("irc:irc-main:group:#general", msg.session_key);
+    try std.testing.expect(std.mem.startsWith(u8, msg.content, IRC_STYLE_PREFIX));
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "alice: hello team") != null);
+    try std.testing.expect(msg.metadata_json != null);
+}
+
+test "irc handleInboundLine drops disallowed sender" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    var ch = IrcChannel.init(alloc, "irc.test", 6667, "mybot", null, &.{}, &.{"alice"}, null, null, null, false);
+    ch.account_id = "irc-main";
+    ch.setBus(&eb);
+
+    try ch.handleInboundLine(":mallory!u@h PRIVMSG #general :hello team\r\n");
+    eb.close();
+    try std.testing.expect(eb.consumeInbound() == null);
 }
 
 test "irc max nick retries constant" {

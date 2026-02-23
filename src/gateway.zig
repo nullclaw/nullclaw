@@ -6,19 +6,23 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
+const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
 const observability = @import("observability.zig");
+const agent_routing = @import("agent_routing.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
+const channels = @import("channels/root.zig");
+const bus_mod = @import("bus.zig");
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -206,8 +210,26 @@ pub const GatewayState = struct {
     idempotency: IdempotencyStore,
     whatsapp_verify_token: []const u8,
     whatsapp_app_secret: []const u8,
+    whatsapp_access_token: []const u8,
+    whatsapp_account_id: []const u8 = "default",
     telegram_bot_token: []const u8,
+    telegram_account_id: []const u8 = "default",
+    telegram_allow_from: []const []const u8 = &.{},
+    whatsapp_allow_from: []const []const u8 = &.{},
+    whatsapp_group_allow_from: []const []const u8 = &.{},
+    whatsapp_groups: []const []const u8 = &.{},
+    whatsapp_group_policy: []const u8 = "allowlist",
+    line_channel_secret: []const u8 = "",
+    line_access_token: []const u8 = "",
+    line_account_id: []const u8 = "default",
+    line_allow_from: []const []const u8 = &.{},
+    lark_verification_token: []const u8 = "",
+    lark_app_id: []const u8 = "",
+    lark_app_secret: []const u8 = "",
+    lark_account_id: []const u8 = "default",
+    lark_allow_from: []const []const u8 = &.{},
     pairing_guard: ?PairingGuard,
+    event_bus: ?*bus_mod.Bus = null,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -220,6 +242,7 @@ pub const GatewayState = struct {
             .idempotency = IdempotencyStore.init(300),
             .whatsapp_verify_token = verify_token,
             .whatsapp_app_secret = "",
+            .whatsapp_access_token = "",
             .telegram_bot_token = "",
             .pairing_guard = null,
         };
@@ -233,6 +256,34 @@ pub const GatewayState = struct {
         }
     }
 };
+
+/// Publish an inbound message to the event bus. Returns true on success.
+fn publishToBus(
+    eb: *bus_mod.Bus,
+    allocator: std.mem.Allocator,
+    channel: []const u8,
+    sender_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    session_key: []const u8,
+    metadata_json: ?[]const u8,
+) bool {
+    const msg = bus_mod.makeInboundFull(
+        allocator,
+        channel,
+        sender_id,
+        chat_id,
+        content,
+        session_key,
+        &.{},
+        metadata_json,
+    ) catch return false;
+    eb.publishInbound(msg) catch {
+        msg.deinit(allocator);
+        return false;
+    };
+    return true;
+}
 
 /// Check if all registered health components are OK.
 fn isHealthOk() bool {
@@ -522,6 +573,566 @@ pub fn jsonIntField(json: []const u8, key: []const u8) ?i64 {
     return if (is_negative) -result else result;
 }
 
+fn findWhatsAppConfigByVerifyToken(cfg: *const Config, verify_token: []const u8) ?*const config_types.WhatsAppConfig {
+    for (cfg.channels.whatsapp) |*wa_cfg| {
+        if (std.mem.eql(u8, wa_cfg.verify_token, verify_token)) return wa_cfg;
+    }
+    return null;
+}
+
+fn findWhatsAppConfigByPhoneNumberId(cfg: *const Config, phone_number_id: []const u8) ?*const config_types.WhatsAppConfig {
+    for (cfg.channels.whatsapp) |*wa_cfg| {
+        if (std.mem.eql(u8, wa_cfg.phone_number_id, phone_number_id)) return wa_cfg;
+    }
+    return null;
+}
+
+fn selectWhatsAppConfig(
+    cfg_opt: ?*const Config,
+    body: ?[]const u8,
+    verify_token: ?[]const u8,
+) ?*const config_types.WhatsAppConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.whatsapp.len == 0) return null;
+
+    if (verify_token) |token| {
+        if (findWhatsAppConfigByVerifyToken(cfg, token)) |wa_cfg| {
+            return wa_cfg;
+        }
+    }
+
+    if (body) |b| {
+        if (jsonStringField(b, "phone_number_id")) |phone_number_id| {
+            if (findWhatsAppConfigByPhoneNumberId(cfg, phone_number_id)) |wa_cfg| {
+                return wa_cfg;
+            }
+        }
+    }
+
+    return &cfg.channels.whatsapp[0];
+}
+
+fn findTelegramConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.TelegramConfig {
+    for (cfg.channels.telegram) |*tg_cfg| {
+        if (std.ascii.eqlIgnoreCase(tg_cfg.account_id, account_id)) return tg_cfg;
+    }
+    return null;
+}
+
+fn selectTelegramConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+) ?*const config_types.TelegramConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.telegram.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findTelegramConfigByAccountId(cfg, account_id)) |tg_cfg| {
+            return tg_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findTelegramConfigByAccountId(cfg, account_id)) |tg_cfg| {
+            return tg_cfg;
+        }
+    }
+
+    if (cfg.channels.telegramPrimary()) |primary| {
+        if (findTelegramConfigByAccountId(cfg, primary.account_id)) |tg_cfg| {
+            return tg_cfg;
+        }
+    }
+    return &cfg.channels.telegram[0];
+}
+
+fn hasLineSecrets(cfg: *const Config) bool {
+    for (cfg.channels.line) |line_cfg| {
+        if (line_cfg.channel_secret.len > 0) return true;
+    }
+    return false;
+}
+
+fn selectLineConfigBySignature(
+    cfg_opt: ?*const Config,
+    body: []const u8,
+    signature: ?[]const u8,
+) ?*const config_types.LineConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.line.len == 0) return null;
+
+    if (signature) |sig| {
+        for (cfg.channels.line) |*line_cfg| {
+            if (channels.line.LineChannel.verifySignature(body, sig, line_cfg.channel_secret)) {
+                return line_cfg;
+            }
+        }
+        return null;
+    }
+
+    return &cfg.channels.line[0];
+}
+
+fn findLarkConfigByVerificationToken(
+    cfg: *const Config,
+    verification_token: []const u8,
+) ?*const config_types.LarkConfig {
+    for (cfg.channels.lark) |*lark_cfg| {
+        if (std.mem.eql(u8, lark_cfg.verification_token orelse "", verification_token)) {
+            return lark_cfg;
+        }
+    }
+    return null;
+}
+
+fn selectLarkConfig(
+    cfg_opt: ?*const Config,
+    body: []const u8,
+) ?*const config_types.LarkConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.lark.len == 0) return null;
+
+    if (jsonStringField(body, "token")) |verification_token| {
+        if (findLarkConfigByVerificationToken(cfg, verification_token)) |lark_cfg| {
+            return lark_cfg;
+        }
+    }
+
+    return &cfg.channels.lark[0];
+}
+
+fn webhookBasePath(target: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, target, '?')) |qi| return target[0..qi];
+    return target;
+}
+
+fn normalizeSlackWebhookPath(path: []const u8) []const u8 {
+    return channels.slack.SlackChannel.normalizeWebhookPath(path);
+}
+
+fn hasSlackHttpEndpoint(cfg_opt: ?*const Config, base_path: []const u8) bool {
+    const cfg = cfg_opt orelse return std.mem.eql(u8, base_path, channels.slack.SlackChannel.DEFAULT_WEBHOOK_PATH);
+    for (cfg.channels.slack) |slack_cfg| {
+        if (slack_cfg.mode != .http) continue;
+        if (std.mem.eql(u8, normalizeSlackWebhookPath(slack_cfg.webhook_path), base_path)) return true;
+    }
+    return false;
+}
+
+fn verifySlackSignature(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    timestamp_header: []const u8,
+    signature_header: []const u8,
+    signing_secret: []const u8,
+) bool {
+    if (signing_secret.len == 0) return false;
+    const ts_trimmed = std.mem.trim(u8, timestamp_header, " \t\r\n");
+    const sig_trimmed = std.mem.trim(u8, signature_header, " \t\r\n");
+    if (!std.mem.startsWith(u8, sig_trimmed, "v0=")) return false;
+
+    const provided_hex = sig_trimmed["v0=".len..];
+    if (provided_hex.len != 64) return false;
+
+    const ts = std.fmt.parseInt(i64, ts_trimmed, 10) catch return false;
+    const now = std.time.timestamp();
+    const delta = if (now >= ts) now - ts else ts - now;
+    if (delta > 300) return false; // 5-minute replay window
+
+    var base_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer base_buf.deinit(allocator);
+    const bw = base_buf.writer(allocator);
+    bw.print("v0:{s}:", .{ts_trimmed}) catch return false;
+    bw.writeAll(body) catch return false;
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, base_buf.items, signing_secret);
+
+    var provided: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        const hi = hexVal(provided_hex[i * 2]) orelse return false;
+        const lo = hexVal(provided_hex[i * 2 + 1]) orelse return false;
+        provided[i] = (hi << 4) | lo;
+    }
+    return constantTimeEql(&mac, &provided);
+}
+
+fn findSlackConfigForRequest(
+    allocator: std.mem.Allocator,
+    cfg_opt: ?*const Config,
+    target: []const u8,
+    body: []const u8,
+    timestamp_header: ?[]const u8,
+    signature_header: ?[]const u8,
+) ?*const config_types.SlackConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.slack.len == 0) return null;
+
+    const base_path = webhookBasePath(target);
+    for (cfg.channels.slack) |*slack_cfg| {
+        if (slack_cfg.mode != .http) continue;
+        if (!std.mem.eql(u8, normalizeSlackWebhookPath(slack_cfg.webhook_path), base_path)) continue;
+
+        const secret = slack_cfg.signing_secret orelse continue;
+        if (timestamp_header == null or signature_header == null) continue;
+        if (verifySlackSignature(
+            allocator,
+            body,
+            timestamp_header.?,
+            signature_header.?,
+            secret,
+        )) return slack_cfg;
+    }
+    return null;
+}
+
+fn slackSessionKey(
+    buf: []u8,
+    account_id: []const u8,
+    sender_id: []const u8,
+    channel_id: []const u8,
+    is_dm: bool,
+) []const u8 {
+    if (is_dm) {
+        return std.fmt.bufPrint(buf, "slack:{s}:direct:{s}", .{ account_id, sender_id }) catch "slack:unknown";
+    }
+    return std.fmt.bufPrint(buf, "slack:{s}:channel:{s}", .{ account_id, channel_id }) catch "slack:unknown";
+}
+
+fn slackSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    account_id: []const u8,
+    sender_id: []const u8,
+    channel_id: []const u8,
+    is_dm: bool,
+    cfg_opt: ?*const Config,
+) []const u8 {
+    const fallback = slackSessionKey(fallback_buf, account_id, sender_id, channel_id, is_dm);
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "slack",
+        account_id,
+        .{
+            .kind = if (is_dm) .direct else .channel,
+            .id = if (is_dm) sender_id else channel_id,
+        },
+        fallback,
+    );
+}
+
+fn slackEnvelopeBotUserId(payload_root: std.json.ObjectMap) ?[]const u8 {
+    const authz = payload_root.get("authorizations") orelse return null;
+    if (authz != .array or authz.array.items.len == 0) return null;
+    const first = authz.array.items[0];
+    if (first != .object) return null;
+    const uid_val = first.object.get("user_id") orelse return null;
+    if (uid_val != .string or uid_val.string.len == 0) return null;
+    return uid_val.string;
+}
+
+fn whatsappSessionKey(buf: []u8, body: []const u8) []const u8 {
+    const sender = jsonStringField(body, "from") orelse "unknown";
+    const group_id = jsonStringField(body, "group_jid") orelse jsonStringField(body, "group_id");
+    if (group_id) |gid| {
+        return std.fmt.bufPrint(buf, "whatsapp:group:{s}:{s}", .{ gid, sender }) catch "whatsapp:unknown";
+    }
+    return std.fmt.bufPrint(buf, "whatsapp:{s}", .{sender}) catch "whatsapp:unknown";
+}
+
+fn whatsappReplyTarget(body: []const u8) []const u8 {
+    // Cloud API delivery is addressed by recipient id ("from" for inbound DMs).
+    // Group IDs are used for routing/session isolation, not outbound target.
+    return jsonStringField(body, "from") orelse "unknown";
+}
+
+fn whatsappIsGroupMessage(body: []const u8) bool {
+    return jsonStringField(body, "group_jid") != null or
+        jsonStringField(body, "group_id") != null;
+}
+
+fn whatsappGroupId(body: []const u8) ?[]const u8 {
+    return jsonStringField(body, "group_jid") orelse
+        jsonStringField(body, "group_id");
+}
+
+fn whatsappSenderAllowed(
+    sender: ?[]const u8,
+    is_group: bool,
+    group_id: ?[]const u8,
+    allow_from: []const []const u8,
+    group_allow_from: []const []const u8,
+    groups: []const []const u8,
+    group_policy: []const u8,
+) bool {
+    const sender_id = sender orelse return false;
+
+    if (!is_group) {
+        if (allow_from.len == 0) return false;
+        return whatsappSenderInAllowlist(allow_from, sender_id);
+    }
+
+    if (std.mem.eql(u8, group_policy, "disabled")) return false;
+
+    const group_allowlist_enabled = std.mem.eql(u8, group_policy, "allowlist") or groups.len > 0;
+    if (group_allowlist_enabled) {
+        const gid = group_id orelse return false;
+        if (!channels.isAllowed(groups, gid)) return false;
+    }
+
+    if (std.mem.eql(u8, group_policy, "open")) return true;
+
+    const effective_allow = if (group_allow_from.len > 0) group_allow_from else allow_from;
+    if (effective_allow.len == 0) return false;
+    return whatsappSenderInAllowlist(effective_allow, sender_id);
+}
+
+fn whatsappSenderInAllowlist(allowlist: []const []const u8, sender_raw: []const u8) bool {
+    if (channels.isAllowed(allowlist, sender_raw)) return true;
+
+    var normalized_buf: [64]u8 = undefined;
+    const sender_normalized = channels.whatsapp.WhatsAppChannel.normalizePhone(&normalized_buf, sender_raw);
+    if (!std.mem.eql(u8, sender_normalized, sender_raw) and channels.isAllowed(allowlist, sender_normalized)) {
+        return true;
+    }
+    if (sender_normalized.len > 0 and sender_normalized[0] == '+' and
+        channels.isAllowed(allowlist, sender_normalized[1..]))
+    {
+        return true;
+    }
+    return false;
+}
+
+fn whatsappSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    body: []const u8,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const sender = jsonStringField(body, "from") orelse "unknown";
+    const group_id = jsonStringField(body, "group_jid") orelse jsonStringField(body, "group_id");
+    const peer_id = if (group_id) |gid|
+        if (gid.len > 0) gid else sender
+    else
+        sender;
+    const peer_kind: agent_routing.ChatType = if (group_id != null) .group else .direct;
+
+    if (cfg_opt) |cfg| {
+        const route = agent_routing.resolveRouteWithSession(allocator, .{
+            .channel = "whatsapp",
+            .account_id = account_id,
+            .peer = .{ .kind = peer_kind, .id = peer_id },
+        }, cfg.agent_bindings, cfg.agents, cfg.session) catch return whatsappSessionKey(fallback_buf, body);
+        allocator.free(route.main_session_key);
+        return route.session_key;
+    }
+
+    return whatsappSessionKey(fallback_buf, body);
+}
+
+fn resolveRouteSessionKey(
+    allocator: std.mem.Allocator,
+    cfg_opt: ?*const Config,
+    channel: []const u8,
+    account_id: []const u8,
+    peer: agent_routing.PeerRef,
+    fallback: []const u8,
+) []const u8 {
+    if (cfg_opt) |cfg| {
+        const route = agent_routing.resolveRouteWithSession(allocator, .{
+            .channel = channel,
+            .account_id = account_id,
+            .peer = peer,
+        }, cfg.agent_bindings, cfg.agents, cfg.session) catch return fallback;
+        allocator.free(route.main_session_key);
+        return route.session_key;
+    }
+    return fallback;
+}
+
+fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return false;
+    if (msg_obj != .object) return false;
+
+    const chat_obj = msg_obj.object.get("chat") orelse return false;
+    if (chat_obj != .object) return false;
+
+    const type_val = chat_obj.object.get("type") orelse return false;
+    if (type_val != .string) return false;
+
+    return std.mem.eql(u8, type_val.string, "group") or
+        std.mem.eql(u8, type_val.string, "supergroup") or
+        std.mem.eql(u8, type_val.string, "channel");
+}
+
+fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []const u8, body: []const u8) bool {
+    if (allow_from.len == 0) return true;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return false;
+    if (msg_obj != .object) return false;
+
+    const from_obj = msg_obj.object.get("from") orelse return false;
+    if (from_obj != .object) return false;
+
+    if (from_obj.object.get("username")) |uname| {
+        if (uname == .string and channels.isAllowed(allow_from, uname.string)) return true;
+    }
+
+    if (from_obj.object.get("id")) |id_val| {
+        if (id_val == .integer) {
+            var id_buf: [32]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id_val.integer}) catch return false;
+            if (channels.isAllowed(allow_from, id_str)) return true;
+        }
+    }
+
+    return false;
+}
+
+fn telegramSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    chat_id: i64,
+    body: []const u8,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = std.fmt.bufPrint(fallback_buf, "telegram:{d}", .{chat_id}) catch "telegram:0";
+    var peer_buf: [64]u8 = undefined;
+    const peer_id = std.fmt.bufPrint(&peer_buf, "{d}", .{chat_id}) catch return fallback;
+    const peer_kind: agent_routing.ChatType = if (telegramChatIsGroup(allocator, body)) .group else .direct;
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "telegram",
+        account_id,
+        .{ .kind = peer_kind, .id = peer_id },
+        fallback,
+    );
+}
+
+fn telegramChatId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return jsonIntField(body, "chat_id");
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return jsonIntField(body, "chat_id");
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return jsonIntField(body, "chat_id");
+    if (msg_obj != .object) return jsonIntField(body, "chat_id");
+
+    const chat_obj = msg_obj.object.get("chat") orelse return jsonIntField(body, "chat_id");
+    if (chat_obj != .object) return jsonIntField(body, "chat_id");
+
+    const id_val = chat_obj.object.get("id") orelse return jsonIntField(body, "chat_id");
+    if (id_val != .integer) return jsonIntField(body, "chat_id");
+    return id_val.integer;
+}
+
+fn telegramSenderIdentity(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    id_buf: []u8,
+) []const u8 {
+    if (jsonStringField(body, "username")) |uname| return uname;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return "unknown";
+    defer parsed.deinit();
+    if (parsed.value != .object) return "unknown";
+
+    const msg_obj = parsed.value.object.get("message") orelse
+        parsed.value.object.get("edited_message") orelse return "unknown";
+    if (msg_obj != .object) return "unknown";
+
+    const from_obj = msg_obj.object.get("from") orelse return "unknown";
+    if (from_obj != .object) return "unknown";
+    if (from_obj.object.get("id")) |id_val| {
+        if (id_val == .integer) {
+            return std.fmt.bufPrint(id_buf, "{d}", .{id_val.integer}) catch "unknown";
+        }
+    }
+    return "unknown";
+}
+
+fn lineSessionKey(buf: []u8, evt: channels.line.LineEvent) []const u8 {
+    return std.fmt.bufPrint(buf, "line:{s}", .{evt.user_id orelse "unknown"}) catch "line:unknown";
+}
+
+fn lineReplyTarget(evt: channels.line.LineEvent) []const u8 {
+    const source_type = evt.source_type orelse "";
+    if (std.mem.eql(u8, source_type, "group")) {
+        return evt.group_id orelse evt.user_id orelse "unknown";
+    }
+    if (std.mem.eql(u8, source_type, "room")) {
+        return evt.room_id orelse evt.user_id orelse "unknown";
+    }
+    return evt.user_id orelse "unknown";
+}
+
+fn lineSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    evt: channels.line.LineEvent,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = lineSessionKey(fallback_buf, evt);
+    const src_type = evt.source_type orelse "";
+    const peer_kind: agent_routing.ChatType = if (std.mem.eql(u8, src_type, "group") or std.mem.eql(u8, src_type, "room")) .group else .direct;
+    var peer_buf: [160]u8 = undefined;
+    const peer_id = if (std.mem.eql(u8, src_type, "group"))
+        std.fmt.bufPrint(&peer_buf, "group:{s}", .{evt.group_id orelse evt.user_id orelse "unknown"}) catch return fallback
+    else if (std.mem.eql(u8, src_type, "room"))
+        std.fmt.bufPrint(&peer_buf, "room:{s}", .{evt.room_id orelse evt.user_id orelse "unknown"}) catch return fallback
+    else
+        evt.user_id orelse "unknown";
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "line",
+        account_id,
+        .{ .kind = peer_kind, .id = peer_id },
+        fallback,
+    );
+}
+
+fn larkSessionKey(buf: []u8, msg: channels.lark.ParsedLarkMessage) []const u8 {
+    return std.fmt.bufPrint(buf, "lark:{s}", .{msg.sender}) catch "lark:unknown";
+}
+
+fn larkSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    msg: channels.lark.ParsedLarkMessage,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = larkSessionKey(fallback_buf, msg);
+    const peer_kind: agent_routing.ChatType = if (msg.is_group) .group else .direct;
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "lark",
+        account_id,
+        .{ .kind = peer_kind, .id = msg.sender },
+        fallback,
+    );
+}
+
 // ── Message Processing ──────────────────────────────────────────
 
 /// Extract the HTTP request body from raw bytes.
@@ -611,17 +1222,775 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
     _ = curl_child.wait() catch {};
 }
 
+fn userFacingAgentError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+        error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+        error.NoResponseContent => "Model returned an empty response. Please try again.",
+        error.OutOfMemory => "Out of memory.",
+        else => "An error occurred. Try again.",
+    };
+}
+
+fn userFacingAgentErrorJson(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError => "{\"error\":\"network error\"}",
+        error.ProviderDoesNotSupportVision => "{\"error\":\"provider does not support image input\"}",
+        error.NoResponseContent => "{\"error\":\"model returned empty response\"}",
+        error.OutOfMemory => "{\"error\":\"out of memory\"}",
+        else => "{\"error\":\"agent failure\"}",
+    };
+}
+
+const WebhookHandlerContext = struct {
+    root_allocator: std.mem.Allocator,
+    req_allocator: std.mem.Allocator,
+    raw_request: []const u8,
+    method: []const u8,
+    target: []const u8,
+    config_opt: ?*const Config,
+    state: *GatewayState,
+    session_mgr_opt: ?*session_mod.SessionManager,
+    response_status: []const u8 = "200 OK",
+    response_body: []const u8 = "",
+};
+
+const WebhookHandlerFn = *const fn (ctx: *WebhookHandlerContext) void;
+
+const WebhookRouteDescriptor = struct {
+    path: []const u8,
+    handler: WebhookHandlerFn,
+};
+
+const webhook_route_descriptors = [_]WebhookRouteDescriptor{
+    .{ .path = "/telegram", .handler = handleTelegramWebhookRoute },
+    .{ .path = "/whatsapp", .handler = handleWhatsAppWebhookRoute },
+    .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
+    .{ .path = "/line", .handler = handleLineWebhookRoute },
+    .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+};
+
+fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
+    for (&webhook_route_descriptors) |*desc| {
+        if (std.mem.eql(u8, desc.path, path)) return desc;
+    }
+    return null;
+}
+
+fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
+    const is_post = std.mem.eql(u8, ctx.method, "POST");
+    if (!is_post) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "telegram")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request);
+    if (body) |b| {
+        var tg_bot_token = ctx.state.telegram_bot_token;
+        var tg_allow_from = ctx.state.telegram_allow_from;
+        var tg_account_id = ctx.state.telegram_account_id;
+        if (selectTelegramConfig(ctx.config_opt, ctx.target)) |tg_cfg| {
+            tg_bot_token = tg_cfg.bot_token;
+            tg_allow_from = tg_cfg.allow_from;
+            tg_account_id = tg_cfg.account_id;
+        }
+
+        const msg_text = jsonStringField(b, "text");
+        const chat_id = telegramChatId(ctx.req_allocator, b);
+        const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
+        if (!tg_authorized) {
+            ctx.response_body = "{\"status\":\"unauthorized\"}";
+            return;
+        }
+
+        if (msg_text != null and chat_id != null) {
+            var sender_buf: [32]u8 = undefined;
+            const sender = telegramSenderIdentity(ctx.req_allocator, b, &sender_buf);
+            var cid_buf: [32]u8 = undefined;
+            const cid_str = std.fmt.bufPrint(&cid_buf, "{d}", .{chat_id.?}) catch "0";
+            const is_group = telegramChatIsGroup(ctx.req_allocator, b);
+            const peer_kind = if (is_group) "group" else "direct";
+
+            if (ctx.state.event_bus) |eb| {
+                var meta_buf: [320]u8 = undefined;
+                const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                    tg_account_id,
+                    peer_kind,
+                    cid_str,
+                }) catch null;
+                var kb: [64]u8 = undefined;
+                const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
+                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
+                _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, cid_str, msg_text.?, sk, meta);
+                ctx.response_body = "{\"status\":\"ok\"}";
+            } else if (ctx.session_mgr_opt) |sm| {
+                var kb: [64]u8 = undefined;
+                const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
+                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
+                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?) catch |err| blk: {
+                    if (tg_bot_token.len > 0) {
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
+                    }
+                    break :blk null;
+                };
+                if (reply) |r| {
+                    defer ctx.root_allocator.free(r);
+                    if (tg_bot_token.len > 0) {
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch {};
+                    }
+                    ctx.response_body = "{\"status\":\"ok\"}";
+                } else {
+                    ctx.response_body = "{\"status\":\"received\"}";
+                }
+            } else {
+                ctx.response_body = "{\"status\":\"received\"}";
+            }
+        } else {
+            ctx.response_body = "{\"status\":\"ok\"}";
+        }
+    } else {
+        ctx.response_body = "{\"status\":\"received\"}";
+    }
+}
+
+fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
+    const is_get = std.mem.eql(u8, ctx.method, "GET");
+    if (is_get) {
+        const mode = parseQueryParam(ctx.target, "hub.mode");
+        const token = parseQueryParam(ctx.target, "hub.verify_token");
+        const challenge = parseQueryParam(ctx.target, "hub.challenge");
+        var wa_verify_token = ctx.state.whatsapp_verify_token;
+        if (selectWhatsAppConfig(ctx.config_opt, null, token)) |wa_cfg| {
+            wa_verify_token = wa_cfg.verify_token;
+        }
+
+        if (mode != null and challenge != null and token != null and
+            std.mem.eql(u8, mode.?, "subscribe") and
+            wa_verify_token.len > 0 and
+            std.mem.eql(u8, token.?, wa_verify_token))
+        {
+            ctx.response_body = challenge.?;
+        } else {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"verification failed\"}";
+        }
+        return;
+    }
+
+    const is_post = std.mem.eql(u8, ctx.method, "POST");
+    if (!is_post) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "whatsapp")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const wa_body = extractBody(ctx.raw_request);
+    var wa_app_secret = ctx.state.whatsapp_app_secret;
+    var wa_access_token = ctx.state.whatsapp_access_token;
+    var wa_allow_from = ctx.state.whatsapp_allow_from;
+    var wa_group_allow_from = ctx.state.whatsapp_group_allow_from;
+    var wa_groups = ctx.state.whatsapp_groups;
+    var wa_group_policy = ctx.state.whatsapp_group_policy;
+    var wa_account_id = ctx.state.whatsapp_account_id;
+    if (selectWhatsAppConfig(ctx.config_opt, wa_body, null)) |wa_cfg| {
+        wa_app_secret = wa_cfg.app_secret orelse "";
+        wa_access_token = wa_cfg.access_token;
+        wa_allow_from = wa_cfg.allow_from;
+        wa_group_allow_from = wa_cfg.group_allow_from;
+        wa_groups = wa_cfg.groups;
+        wa_group_policy = wa_cfg.group_policy;
+        wa_account_id = wa_cfg.account_id;
+    }
+
+    const sig_header = extractHeader(ctx.raw_request, "X-Hub-Signature-256");
+    if (wa_app_secret.len > 0) sig_check: {
+        const sig = sig_header orelse {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"missing signature\"}";
+            break :sig_check;
+        };
+        const body = wa_body orelse {
+            ctx.response_body = "{\"status\":\"received\"}";
+            break :sig_check;
+        };
+        if (!verifyWhatsappSignature(body, sig, wa_app_secret)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid signature\"}";
+            break :sig_check;
+        }
+        const wa_sender = jsonStringField(body, "from");
+        const wa_is_group = whatsappIsGroupMessage(body);
+        const wa_group_id = whatsappGroupId(body);
+        if (!whatsappSenderAllowed(
+            wa_sender,
+            wa_is_group,
+            wa_group_id,
+            wa_allow_from,
+            wa_group_allow_from,
+            wa_groups,
+            wa_group_policy,
+        )) {
+            ctx.response_body = "{\"status\":\"unauthorized\"}";
+            break :sig_check;
+        }
+        const msg_text = jsonStringField(body, "text") orelse jsonStringField(body, "body") orelse
+            channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(ctx.req_allocator, wa_access_token, body);
+        if (msg_text) |mt| {
+            var wa_key_buf: [256]u8 = undefined;
+            const wa_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
+            const wa_session_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, body, wa_cfg_opt, wa_account_id);
+            const wa_sender_id = wa_sender orelse "unknown";
+            const wa_chat_target = whatsappReplyTarget(body);
+            const wa_peer_kind = if (wa_is_group) "group" else "direct";
+            const wa_peer_id = wa_group_id orelse wa_sender_id;
+
+            if (ctx.state.event_bus) |eb| {
+                var meta_buf: [384]u8 = undefined;
+                const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                    wa_account_id,
+                    wa_peer_kind,
+                    wa_peer_id,
+                }) catch null;
+                _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_id, wa_chat_target, mt, wa_session_key, meta);
+                ctx.response_body = "{\"status\":\"received\"}";
+            } else if (ctx.session_mgr_opt) |sm| {
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
+                    ctx.response_body = userFacingAgentErrorJson(err);
+                    break :blk null;
+                };
+                if (reply) |r| {
+                    defer ctx.root_allocator.free(r);
+                    ctx.response_body = ctx.req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
+                } else {
+                    ctx.response_body = "{\"status\":\"received\"}";
+                }
+            } else {
+                ctx.response_body = "{\"status\":\"received\"}";
+            }
+        } else {
+            ctx.response_body = "{\"status\":\"received\"}";
+        }
+        return;
+    }
+
+    if (wa_body) |b| {
+        const wa_sender = jsonStringField(b, "from");
+        const wa_is_group = whatsappIsGroupMessage(b);
+        const wa_group_id = whatsappGroupId(b);
+        if (!whatsappSenderAllowed(
+            wa_sender,
+            wa_is_group,
+            wa_group_id,
+            wa_allow_from,
+            wa_group_allow_from,
+            wa_groups,
+            wa_group_policy,
+        )) {
+            ctx.response_body = "{\"status\":\"unauthorized\"}";
+            return;
+        }
+        const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
+            channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(ctx.req_allocator, wa_access_token, b);
+        if (msg_text) |mt| {
+            var wa_key_buf: [256]u8 = undefined;
+            const wa_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
+            const wa_session_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, b, wa_cfg_opt, wa_account_id);
+            const wa_sender_ns = wa_sender orelse "unknown";
+            const wa_chat_target_ns = whatsappReplyTarget(b);
+            const wa_peer_kind = if (wa_is_group) "group" else "direct";
+            const wa_peer_id = wa_group_id orelse wa_sender_ns;
+
+            if (ctx.state.event_bus) |eb| {
+                var meta_buf: [384]u8 = undefined;
+                const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                    wa_account_id,
+                    wa_peer_kind,
+                    wa_peer_id,
+                }) catch null;
+                _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
+                ctx.response_body = "{\"status\":\"received\"}";
+            } else if (ctx.session_mgr_opt) |sm| {
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
+                    ctx.response_body = userFacingAgentErrorJson(err);
+                    break :blk null;
+                };
+                if (reply) |r| {
+                    defer ctx.root_allocator.free(r);
+                    ctx.response_body = ctx.req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
+                } else {
+                    ctx.response_body = "{\"status\":\"received\"}";
+                }
+            } else {
+                ctx.response_body = "{\"status\":\"received\"}";
+            }
+        } else {
+            ctx.response_body = "{\"status\":\"received\"}";
+        }
+    } else {
+        ctx.response_body = "{\"status\":\"received\"}";
+    }
+}
+
+fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "slack")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const ts_header = extractHeader(ctx.raw_request, "X-Slack-Request-Timestamp");
+    const sig_header = extractHeader(ctx.raw_request, "X-Slack-Signature");
+
+    const slack_cfg = findSlackConfigForRequest(ctx.req_allocator, ctx.config_opt, ctx.target, body, ts_header, sig_header) orelse {
+        if (hasSlackHttpEndpoint(ctx.config_opt, webhookBasePath(ctx.target))) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid signature\"}";
+            return;
+        }
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"slack account not configured\"}";
+        return;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_body = "{\"status\":\"parse_error\"}";
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    const payload_type = if (parsed.value.object.get("type")) |tv|
+        if (tv == .string) tv.string else ""
+    else
+        "";
+
+    if (std.mem.eql(u8, payload_type, "url_verification")) {
+        const challenge = jsonStringField(body, "challenge") orelse "";
+        if (challenge.len == 0) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
+        const challenge_resp = std.fmt.allocPrint(ctx.req_allocator, "{{\"challenge\":\"{s}\"}}", .{challenge}) catch {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        ctx.response_body = challenge_resp;
+        return;
+    }
+
+    if (!std.mem.eql(u8, payload_type, "event_callback")) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    const event_val = parsed.value.object.get("event") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (event_val != .object) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const event_obj = event_val.object;
+
+    const event_type_val = event_obj.get("type") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (event_type_val != .string) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const event_type = event_type_val.string;
+    if (!std.mem.eql(u8, event_type, "message") and !std.mem.eql(u8, event_type, "app_mention")) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    if (event_obj.get("subtype")) |subtype_val| {
+        if (subtype_val == .string and subtype_val.string.len > 0) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
+    }
+
+    const user_val = event_obj.get("user") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (user_val != .string or user_val.string.len == 0) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const sender_id = user_val.string;
+
+    const text_val = event_obj.get("text") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (text_val != .string) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const text = std.mem.trim(u8, text_val.string, " \t\r\n");
+    if (text.len == 0) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    const channel_val = event_obj.get("channel") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (channel_val != .string or channel_val.string.len == 0) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const channel_id = channel_val.string;
+    const is_dm = blk: {
+        if (event_obj.get("channel_type")) |ct| {
+            if (ct == .string and std.mem.eql(u8, ct.string, "im")) break :blk true;
+        }
+        break :blk channel_id.len > 0 and channel_id[0] == 'D';
+    };
+
+    var policy_channel = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+    const envelope_bot_user_id = slackEnvelopeBotUserId(parsed.value.object);
+    var allowed = policy_channel.shouldHandle(sender_id, is_dm, text, envelope_bot_user_id);
+    if (!allowed and std.mem.eql(u8, event_type, "app_mention")) {
+        allowed = channels.checkPolicy(policy_channel.policy, sender_id, is_dm, true);
+    }
+    if (!allowed) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    var key_buf: [256]u8 = undefined;
+    const sk = slackSessionKeyRouted(
+        ctx.req_allocator,
+        &key_buf,
+        slack_cfg.account_id,
+        sender_id,
+        channel_id,
+        is_dm,
+        ctx.config_opt,
+    );
+
+    if (ctx.state.event_bus) |eb| {
+        var meta_buf: [384]u8 = undefined;
+        const peer_kind = if (is_dm) "direct" else "channel";
+        const peer_id = if (is_dm) sender_id else channel_id;
+        const metadata = std.fmt.bufPrint(
+            &meta_buf,
+            "{{\"account_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}",
+            .{
+                slack_cfg.account_id,
+                if (is_dm) "true" else "false",
+                channel_id,
+                peer_kind,
+                peer_id,
+            },
+        ) catch null;
+        _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, sk, metadata);
+    } else if (ctx.session_mgr_opt) |sm| {
+        const reply: ?[]const u8 = sm.processMessage(sk, text) catch |err| blk: {
+            var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+            outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
+            break :blk null;
+        };
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+            outbound_ch.sendMessage(channel_id, r) catch {};
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
+fn linePeerMetadata(evt: channels.line.LineEvent, peer_buf: []u8) struct {
+    kind: []const u8,
+    id: []const u8,
+} {
+    const src_type = evt.source_type orelse "";
+    if (std.mem.eql(u8, src_type, "group")) {
+        return .{
+            .kind = "group",
+            .id = std.fmt.bufPrint(peer_buf, "group:{s}", .{evt.group_id orelse evt.user_id orelse "unknown"}) catch "group:unknown",
+        };
+    }
+    if (std.mem.eql(u8, src_type, "room")) {
+        return .{
+            .kind = "group",
+            .id = std.fmt.bufPrint(peer_buf, "room:{s}", .{evt.room_id orelse evt.user_id orelse "unknown"}) catch "room:unknown",
+        };
+    }
+    return .{
+        .kind = "direct",
+        .id = evt.user_id orelse "unknown",
+    };
+}
+
+fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
+    const is_post = std.mem.eql(u8, ctx.method, "POST");
+    if (!is_post) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "line")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request);
+    if (body) |b| {
+        var line_channel_secret = ctx.state.line_channel_secret;
+        var line_access_token = ctx.state.line_access_token;
+        var line_allow_from = ctx.state.line_allow_from;
+        var line_account_id = ctx.state.line_account_id;
+
+        const sig_header = extractHeader(ctx.raw_request, "X-Line-Signature");
+        if (ctx.config_opt) |cfg| {
+            const needs_signature = hasLineSecrets(cfg);
+            if (needs_signature) {
+                const sig = sig_header orelse {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"missing signature\"}";
+                    return;
+                };
+                const matched_line_cfg = selectLineConfigBySignature(ctx.config_opt, b, sig) orelse {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid signature\"}";
+                    return;
+                };
+                line_channel_secret = matched_line_cfg.channel_secret;
+                line_access_token = matched_line_cfg.access_token;
+                line_allow_from = matched_line_cfg.allow_from;
+                line_account_id = matched_line_cfg.account_id;
+            } else if (cfg.channels.linePrimary()) |line_cfg| {
+                line_channel_secret = line_cfg.channel_secret;
+                line_access_token = line_cfg.access_token;
+                line_allow_from = line_cfg.allow_from;
+                line_account_id = line_cfg.account_id;
+            }
+        } else if (line_channel_secret.len > 0) {
+            const sig = sig_header orelse {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"missing signature\"}";
+                return;
+            };
+            if (!channels.line.LineChannel.verifySignature(b, sig, line_channel_secret)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid signature\"}";
+                return;
+            }
+        }
+
+        const events = channels.line.LineChannel.parseWebhookEvents(ctx.req_allocator, b) catch {
+            ctx.response_body = "{\"status\":\"parse_error\"}";
+            return;
+        };
+        for (events) |evt| {
+            if (line_allow_from.len > 0) {
+                if (evt.user_id) |uid| {
+                    if (!channels.isAllowed(line_allow_from, uid)) continue;
+                } else continue;
+            }
+            if (evt.message_text) |text| {
+                var kb: [128]u8 = undefined;
+                const line_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
+                const sk = lineSessionKeyRouted(ctx.req_allocator, &kb, evt, line_cfg_opt, line_account_id);
+                const uid = evt.user_id orelse "unknown";
+                const line_target = lineReplyTarget(evt);
+                var peer_buf: [160]u8 = undefined;
+                const line_peer = linePeerMetadata(evt, &peer_buf);
+
+                if (ctx.state.event_bus) |eb| {
+                    var meta_buf: [384]u8 = undefined;
+                    const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                        line_account_id,
+                        line_peer.kind,
+                        line_peer.id,
+                    }) catch null;
+                    _ = publishToBus(eb, ctx.state.allocator, "line", uid, line_target, text, sk, meta);
+                } else if (ctx.session_mgr_opt) |sm| {
+                    const reply: ?[]const u8 = sm.processMessage(sk, text) catch |err| blk: {
+                        if (evt.reply_token) |rt| {
+                            var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
+                                .access_token = line_access_token,
+                                .channel_secret = line_channel_secret,
+                            });
+                            line_ch.replyMessage(rt, userFacingAgentError(err)) catch {};
+                        }
+                        break :blk null;
+                    };
+                    if (reply) |r| {
+                        defer ctx.root_allocator.free(r);
+                        if (evt.reply_token) |rt| {
+                            var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
+                                .access_token = line_access_token,
+                                .channel_secret = line_channel_secret,
+                            });
+                            line_ch.replyMessage(rt, r) catch {};
+                        }
+                    }
+                }
+            }
+        }
+        ctx.response_body = "{\"status\":\"ok\"}";
+    } else {
+        ctx.response_body = "{\"status\":\"received\"}";
+    }
+}
+
+fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
+    const is_post = std.mem.eql(u8, ctx.method, "POST");
+    if (!is_post) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "lark")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+    var lark_verification_token = ctx.state.lark_verification_token;
+    var lark_app_id = ctx.state.lark_app_id;
+    var lark_app_secret = ctx.state.lark_app_secret;
+    var lark_allow_from = ctx.state.lark_allow_from;
+    var lark_account_id = ctx.state.lark_account_id;
+    if (selectLarkConfig(ctx.config_opt, body)) |lark_cfg| {
+        lark_verification_token = lark_cfg.verification_token orelse "";
+        lark_app_id = lark_cfg.app_id;
+        lark_app_secret = lark_cfg.app_secret;
+        lark_allow_from = lark_cfg.allow_from;
+        lark_account_id = lark_cfg.account_id;
+    }
+
+    if (std.mem.indexOf(u8, body, "\"url_verification\"") != null) {
+        const challenge = jsonStringField(body, "challenge");
+        if (challenge) |c| {
+            const challenge_resp = std.fmt.allocPrint(ctx.req_allocator, "{{\"challenge\":\"{s}\"}}", .{c}) catch null;
+            ctx.response_body = challenge_resp orelse "{\"status\":\"ok\"}";
+        } else {
+            ctx.response_body = "{\"status\":\"ok\"}";
+        }
+        return;
+    }
+
+    if (lark_verification_token.len > 0) {
+        const payload_token = blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch break :blk @as(?[]const u8, null);
+            defer parsed.deinit();
+            if (parsed.value != .object) break :blk @as(?[]const u8, null);
+            const header = parsed.value.object.get("header") orelse break :blk @as(?[]const u8, null);
+            if (header != .object) break :blk @as(?[]const u8, null);
+            const token_val = header.object.get("token") orelse break :blk @as(?[]const u8, null);
+            break :blk if (token_val == .string) ctx.req_allocator.dupe(u8, token_val.string) catch null else null;
+        };
+        if (payload_token) |pt| {
+            if (!std.mem.eql(u8, pt, lark_verification_token)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid verification token\"}";
+                return;
+            }
+        }
+    }
+
+    var lark_ch = channels.lark.LarkChannel.init(
+        ctx.req_allocator,
+        lark_app_id,
+        lark_app_secret,
+        lark_verification_token,
+        0,
+        lark_allow_from,
+    );
+    const messages = lark_ch.parseEventPayload(ctx.req_allocator, body) catch {
+        ctx.response_body = "{\"status\":\"parse_error\"}";
+        return;
+    };
+    for (messages) |msg| {
+        var kb: [128]u8 = undefined;
+        const lark_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
+        const sk = larkSessionKeyRouted(ctx.req_allocator, &kb, msg, lark_cfg_opt, lark_account_id);
+
+        if (ctx.state.event_bus) |eb| {
+            var meta_buf: [320]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                lark_account_id,
+                if (msg.is_group) "group" else "direct",
+                msg.sender,
+            }) catch null;
+            _ = publishToBus(eb, ctx.state.allocator, "lark", msg.sender, msg.sender, msg.content, sk, meta);
+        } else if (ctx.session_mgr_opt) |sm| {
+            const reply: ?[]const u8 = sm.processMessage(sk, msg.content) catch |err| blk: {
+                lark_ch.sendMessage(msg.sender, userFacingAgentError(err)) catch {};
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                lark_ch.sendMessage(msg.sender, r) catch {};
+            }
+        }
+    }
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram
-pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
+/// If config_ptr is null, loads config internally (for backward compatibility).
+pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
 
     var state = GatewayState.init(allocator);
     defer state.deinit();
+    state.event_bus = event_bus;
 
-    // Load config and set up in-process SessionManager (graceful degradation if no config).
-    var config_opt: ?Config = Config.load(allocator) catch null;
-    defer if (config_opt) |*c| c.deinit();
+    var owned_config: ?Config = null;
+    var config_opt: ?*const Config = null;
+    if (config_ptr) |cfg| {
+        config_opt = cfg;
+    } else {
+        owned_config = Config.load(allocator) catch null;
+        if (owned_config) |*c| {
+            config_opt = c;
+        }
+    }
+    defer if (owned_config) |*c| c.deinit();
 
     // ProviderHolder: concrete provider struct must outlive the accept loop.
     var holder_opt: ?providers.ProviderHolder = null;
@@ -629,7 +1998,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_opt: ?memory_mod.Memory = null;
 
-    if (config_opt) |*cfg| {
+    if (config_opt) |cfg_ptr| {
+        const cfg = cfg_ptr;
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
@@ -640,12 +2010,33 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             cfg.gateway.require_pairing,
             cfg.gateway.paired_tokens,
         );
-        if (cfg.channels.telegram) |tg_cfg| {
+        if (cfg.channels.telegramPrimary()) |tg_cfg| {
             state.telegram_bot_token = tg_cfg.bot_token;
+            state.telegram_allow_from = tg_cfg.allow_from;
+            state.telegram_account_id = tg_cfg.account_id;
         }
-        if (cfg.channels.whatsapp) |wa_cfg| {
+        if (cfg.channels.whatsappPrimary()) |wa_cfg| {
             state.whatsapp_verify_token = wa_cfg.verify_token;
             state.whatsapp_app_secret = wa_cfg.app_secret orelse "";
+            state.whatsapp_access_token = wa_cfg.access_token;
+            state.whatsapp_allow_from = wa_cfg.allow_from;
+            state.whatsapp_group_allow_from = wa_cfg.group_allow_from;
+            state.whatsapp_groups = wa_cfg.groups;
+            state.whatsapp_group_policy = wa_cfg.group_policy;
+            state.whatsapp_account_id = wa_cfg.account_id;
+        }
+        if (cfg.channels.linePrimary()) |line_cfg| {
+            state.line_channel_secret = line_cfg.channel_secret;
+            state.line_access_token = line_cfg.access_token;
+            state.line_allow_from = line_cfg.allow_from;
+            state.line_account_id = line_cfg.account_id;
+        }
+        if (cfg.channels.larkPrimary()) |lark_cfg| {
+            state.lark_verification_token = lark_cfg.verification_token orelse "";
+            state.lark_app_id = lark_cfg.app_id;
+            state.lark_app_secret = lark_cfg.app_secret;
+            state.lark_allow_from = lark_cfg.allow_from;
+            state.lark_account_id = lark_cfg.account_id;
         }
 
         // Resolve API key: config providers first, then env vars
@@ -735,15 +2126,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         const method_str = parts.next() orelse continue;
         const target = parts.next() orelse continue;
 
-        // Simple routing — extract base path (strip query string) and look up route
-        const Route = enum { health, ready, webhook, pair, telegram, whatsapp };
-        const route_map = std.StaticStringMap(Route).initComptime(.{
+        // Simple routing — control endpoints + descriptor-driven channel webhooks.
+        const ControlRoute = enum { health, ready, webhook, pair };
+        const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
             .{ "/webhook", .webhook },
             .{ "/pair", .pair },
-            .{ "/telegram", .telegram },
-            .{ "/whatsapp", .whatsapp },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
@@ -751,7 +2140,35 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         var response_body: []const u8 = "";
         var pair_response_buf: [256]u8 = undefined;
 
-        if (route_map.get(base_path)) |route| switch (route) {
+        if (findWebhookRouteDescriptor(base_path)) |desc| {
+            var webhook_ctx = WebhookHandlerContext{
+                .root_allocator = allocator,
+                .req_allocator = req_allocator,
+                .raw_request = raw,
+                .method = method_str,
+                .target = target,
+                .config_opt = config_opt,
+                .state = &state,
+                .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+            };
+            desc.handler(&webhook_ctx);
+            response_status = webhook_ctx.response_status;
+            response_body = webhook_ctx.response_body;
+        } else if (hasSlackHttpEndpoint(config_opt, base_path)) {
+            var webhook_ctx = WebhookHandlerContext{
+                .root_allocator = allocator,
+                .req_allocator = req_allocator,
+                .raw_request = raw,
+                .method = method_str,
+                .target = target,
+                .config_opt = config_opt,
+                .state = &state,
+                .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+            };
+            handleSlackWebhookRoute(&webhook_ctx);
+            response_status = webhook_ctx.response_status;
+            response_body = webhook_ctx.response_body;
+        } else if (control_route_map.get(base_path)) |route| switch (route) {
             .health => {
                 response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
             },
@@ -776,7 +2193,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                     response_status = "405 Method Not Allowed";
                     response_body = "{\"error\":\"method not allowed\"}";
                 } else {
-                    // Bearer token validation
                     const auth_header = extractHeader(raw, "Authorization");
                     const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
                     const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
@@ -787,18 +2203,18 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                         response_status = "429 Too Many Requests";
                         response_body = "{\"error\":\"rate limited\"}";
                     } else {
-                        // Extract body and process message
                         const body = extractBody(raw);
                         if (body) |b| {
                             const msg_text = jsonStringField(b, "message") orelse jsonStringField(b, "text") orelse b;
-                            if (session_mgr_opt) |*sm| {
-                                // Build session key using bearer token if available
-                                var sk_buf: [128]u8 = undefined;
-                                const session_key = std.fmt.bufPrint(&sk_buf, "webhook:{s}", .{bearer orelse "anon"}) catch "webhook:anon";
+                            var sk_buf: [128]u8 = undefined;
+                            const session_key = std.fmt.bufPrint(&sk_buf, "webhook:{s}", .{bearer orelse "anon"}) catch "webhook:anon";
+
+                            if (state.event_bus) |eb| {
+                                _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
+                                response_body = "{\"status\":\"received\"}";
+                            } else if (session_mgr_opt) |*sm| {
                                 const reply: ?[]const u8 = sm.processMessage(session_key, msg_text) catch |err| blk: {
-                                    if (err == error.ProviderDoesNotSupportVision) {
-                                        response_body = "{\"error\":\"provider does not support image input\"}";
-                                    }
+                                    response_body = userFacingAgentErrorJson(err);
                                     break :blk null;
                                 };
                                 if (reply) |r| {
@@ -866,153 +2282,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                         response_status = "500 Internal Server Error";
                         response_body = "{\"error\":\"pairing unavailable\"}";
                     }
-                }
-            },
-            .telegram => {
-                if (!is_post) {
-                    response_status = "405 Method Not Allowed";
-                    response_body = "{\"error\":\"method not allowed\"}";
-                } else if (!state.rate_limiter.allowWebhook(state.allocator, "telegram")) {
-                    // POST /telegram — Telegram webhook mode
-                    response_status = "429 Too Many Requests";
-                    response_body = "{\"error\":\"rate limited\"}";
-                } else {
-                    const body = extractBody(raw);
-                    if (body) |b| {
-                        // Parse Telegram update: extract message text and chat_id
-                        const msg_text = jsonStringField(b, "text");
-                        const chat_id = jsonIntField(b, "chat_id");
-
-                        if (msg_text != null and chat_id != null) {
-                            // Process the message in-process
-                            if (session_mgr_opt) |*sm| {
-                                var kb: [64]u8 = undefined;
-                                const sk = std.fmt.bufPrint(&kb, "telegram:{d}", .{chat_id.?}) catch "telegram:0";
-                                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?) catch |err| blk: {
-                                    if (err == error.ProviderDoesNotSupportVision) {
-                                        if (state.telegram_bot_token.len > 0) {
-                                            sendTelegramReply(req_allocator, state.telegram_bot_token, chat_id.?, "The current provider does not support image input.") catch {};
-                                        }
-                                    }
-                                    break :blk null;
-                                };
-                                if (reply) |r| {
-                                    defer allocator.free(r);
-                                    // Send reply back to Telegram
-                                    if (state.telegram_bot_token.len > 0) {
-                                        sendTelegramReply(req_allocator, state.telegram_bot_token, chat_id.?, r) catch {};
-                                    }
-                                    response_body = "{\"status\":\"ok\"}";
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
-                            } else {
-                                response_body = "{\"status\":\"received\"}";
-                            }
-                        } else {
-                            // No message text — could be an update_id-only update, just ack
-                            response_body = "{\"status\":\"ok\"}";
-                        }
-                    } else {
-                        response_body = "{\"status\":\"received\"}";
-                    }
-                }
-            },
-            .whatsapp => {
-                const is_get = std.mem.eql(u8, method_str, "GET");
-                if (is_get) {
-                    // GET /whatsapp — Meta webhook verification
-                    const mode = parseQueryParam(target, "hub.mode");
-                    const token = parseQueryParam(target, "hub.verify_token");
-                    const challenge = parseQueryParam(target, "hub.challenge");
-
-                    if (mode != null and challenge != null and token != null and
-                        std.mem.eql(u8, mode.?, "subscribe") and
-                        state.whatsapp_verify_token.len > 0 and
-                        std.mem.eql(u8, token.?, state.whatsapp_verify_token))
-                    {
-                        response_body = challenge.?;
-                    } else {
-                        response_status = "403 Forbidden";
-                        response_body = "{\"error\":\"verification failed\"}";
-                    }
-                } else if (is_post) {
-                    // POST /whatsapp — incoming message from Meta
-                    if (!state.rate_limiter.allowWebhook(state.allocator, "whatsapp")) {
-                        response_status = "429 Too Many Requests";
-                        response_body = "{\"error\":\"rate limited\"}";
-                    } else if (state.whatsapp_app_secret.len > 0) sig_check: {
-                        // HMAC-SHA256 signature verification (when app_secret is configured)
-                        const sig_header = extractHeader(raw, "X-Hub-Signature-256") orelse {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"missing signature\"}";
-                            break :sig_check;
-                        };
-                        const body_for_sig = extractBody(raw) orelse "";
-                        if (!verifyWhatsappSignature(body_for_sig, sig_header, state.whatsapp_app_secret)) {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"invalid signature\"}";
-                            break :sig_check;
-                        }
-                        // Signature valid — proceed with message processing
-                        const body = if (body_for_sig.len > 0) body_for_sig else null;
-                        if (body) |b| {
-                            const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body");
-                            if (msg_text) |mt| {
-                                if (session_mgr_opt) |*sm| {
-                                    const reply: ?[]const u8 = sm.processMessage("whatsapp", mt) catch |err| blk: {
-                                        if (err == error.ProviderDoesNotSupportVision) {
-                                            response_body = "{\"error\":\"provider does not support image input\"}";
-                                        }
-                                        break :blk null;
-                                    };
-                                    if (reply) |r| {
-                                        defer allocator.free(r);
-                                        response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
-                                    } else {
-                                        response_body = "{\"status\":\"received\"}";
-                                    }
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
-                            } else {
-                                response_body = "{\"status\":\"received\"}";
-                            }
-                        } else {
-                            response_body = "{\"status\":\"received\"}";
-                        }
-                    } else {
-                        const body = extractBody(raw);
-                        if (body) |b| {
-                            // Try to extract message text from WhatsApp payload
-                            const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body");
-                            if (msg_text) |mt| {
-                                if (session_mgr_opt) |*sm| {
-                                    const reply: ?[]const u8 = sm.processMessage("whatsapp", mt) catch |err| blk: {
-                                        if (err == error.ProviderDoesNotSupportVision) {
-                                            response_body = "{\"error\":\"provider does not support image input\"}";
-                                        }
-                                        break :blk null;
-                                    };
-                                    if (reply) |r| {
-                                        defer allocator.free(r);
-                                        response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
-                                    } else {
-                                        response_body = "{\"status\":\"received\"}";
-                                    }
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
-                            } else {
-                                response_body = "{\"status\":\"received\"}";
-                            }
-                        } else {
-                            response_body = "{\"status\":\"received\"}";
-                        }
-                    }
-                } else {
-                    response_status = "405 Method Not Allowed";
-                    response_body = "{\"error\":\"method not allowed\"}";
                 }
             },
         } else {
@@ -1092,6 +2361,15 @@ test "idempotency store allows different keys" {
 
 test "gateway module compiles" {
     // Compile-time check only
+}
+
+test "findWebhookRouteDescriptor resolves known webhook paths" {
+    try std.testing.expect(findWebhookRouteDescriptor("/telegram") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/whatsapp") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
 
 // ── Additional gateway tests ────────────────────────────────────
@@ -1406,6 +2684,592 @@ test "jsonIntField returns null for string value" {
     try std.testing.expect(jsonIntField(json, "chat_id") == null);
 }
 
+test "selectWhatsAppConfig picks account by phone_number_id" {
+    const wa_accounts = [_]config_types.WhatsAppConfig{
+        .{
+            .account_id = "main",
+            .access_token = "tok-a",
+            .phone_number_id = "111",
+            .verify_token = "verify-a",
+        },
+        .{
+            .account_id = "backup",
+            .access_token = "tok-b",
+            .phone_number_id = "222",
+            .verify_token = "verify-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .whatsapp = &wa_accounts,
+        },
+    };
+    const body = "{\"entry\":[{\"changes\":[{\"value\":{\"metadata\":{\"phone_number_id\":\"222\"}}}]}]}";
+    const selected = selectWhatsAppConfig(&cfg, body, null);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectTelegramConfig picks account by query account_id" {
+    const tg_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "token-main",
+            .allow_from = &.{"main-user"},
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "token-backup",
+            .allow_from = &.{"backup-user"},
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &tg_accounts,
+        },
+    };
+
+    const selected = selectTelegramConfig(&cfg, "/telegram?account_id=backup");
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectTelegramConfig falls back to preferred primary account" {
+    const tg_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "z-last",
+            .bot_token = "token-z",
+        },
+        .{
+            .account_id = "default",
+            .bot_token = "token-default",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &tg_accounts,
+        },
+    };
+
+    const selected = selectTelegramConfig(&cfg, "/telegram");
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("default", selected.?.account_id);
+}
+
+test "selectWhatsAppConfig picks account by verify_token" {
+    const wa_accounts = [_]config_types.WhatsAppConfig{
+        .{
+            .account_id = "main",
+            .access_token = "tok-a",
+            .phone_number_id = "111",
+            .verify_token = "verify-a",
+        },
+        .{
+            .account_id = "backup",
+            .access_token = "tok-b",
+            .phone_number_id = "222",
+            .verify_token = "verify-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .whatsapp = &wa_accounts,
+        },
+    };
+    const selected = selectWhatsAppConfig(&cfg, null, "verify-b");
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectLineConfigBySignature matches account and rejects bad signature" {
+    const body = "{\"events\":[]}";
+    const line_accounts = [_]config_types.LineConfig{
+        .{
+            .account_id = "main",
+            .access_token = "line-a",
+            .channel_secret = "secret-a",
+        },
+        .{
+            .account_id = "backup",
+            .access_token = "line-b",
+            .channel_secret = "secret-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .line = &line_accounts,
+        },
+    };
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, "secret-b");
+    var sig_buf: [44]u8 = undefined;
+    const signature = std.base64.standard.Encoder.encode(&sig_buf, &mac);
+
+    const selected = selectLineConfigBySignature(&cfg, body, signature);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+    try std.testing.expect(selectLineConfigBySignature(&cfg, body, "invalid-signature") == null);
+}
+
+test "selectLarkConfig picks account by verification token" {
+    const lark_accounts = [_]config_types.LarkConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-a",
+            .app_secret = "secret-a",
+            .verification_token = "token-a",
+        },
+        .{
+            .account_id = "backup",
+            .app_id = "app-b",
+            .app_secret = "secret-b",
+            .verification_token = "token-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .lark = &lark_accounts,
+        },
+    };
+    const body = "{\"header\":{\"token\":\"token-b\"}}";
+    const selected = selectLarkConfig(&cfg, body);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "whatsappSessionKey builds direct key by sender" {
+    const body = "{\"from\":\"15550001111\",\"text\":{\"body\":\"hi\"}}";
+    var key_buf: [256]u8 = undefined;
+    const key = whatsappSessionKey(&key_buf, body);
+    try std.testing.expectEqualStrings("whatsapp:15550001111", key);
+}
+
+test "whatsappSessionKey builds group key when group id exists" {
+    const body = "{\"from\":\"15550001111\",\"context\":{\"group_jid\":\"1203630@g.us\"},\"text\":{\"body\":\"hi\"}}";
+    var key_buf: [256]u8 = undefined;
+    const key = whatsappSessionKey(&key_buf, body);
+    try std.testing.expectEqualStrings("whatsapp:group:1203630@g.us:15550001111", key);
+}
+
+test "telegramSenderAllowed permits when allow_from is empty" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"from":{"id":12345,"username":"alice"}}}
+    ;
+    try std.testing.expect(telegramSenderAllowed(allocator, &.{}, body));
+}
+
+test "telegramChatId extracts nested message.chat.id" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"update_id":1,"message":{"chat":{"id":-100777},"from":{"id":12345},"text":"hi"}}
+    ;
+    try std.testing.expectEqual(@as(i64, -100777), telegramChatId(allocator, body).?);
+}
+
+test "telegramChatId falls back to flat chat_id for backward compatibility" {
+    const allocator = std.testing.allocator;
+    const body = "{\"chat_id\":12345,\"text\":\"hi\"}";
+    try std.testing.expectEqual(@as(i64, 12345), telegramChatId(allocator, body).?);
+}
+
+test "telegramSenderAllowed matches numeric sender id from nested from object" {
+    const allocator = std.testing.allocator;
+    const allow_from = [_][]const u8{"12345"};
+    const body =
+        \\{"message":{"from":{"id":12345},"chat":{"id":-100777}}}
+    ;
+    try std.testing.expect(telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramSenderAllowed does not confuse chat id with sender id" {
+    const allocator = std.testing.allocator;
+    const allow_from = [_][]const u8{"-100777"};
+    const body =
+        \\{"message":{"from":{"id":12345},"chat":{"id":-100777}}}
+    ;
+    try std.testing.expect(!telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramSenderAllowed rejects sender outside allowlist" {
+    const allocator = std.testing.allocator;
+    const allow_from = [_][]const u8{"alice"};
+    const body =
+        \\{"message":{"from":{"id":12345}}}
+    ;
+    try std.testing.expect(!telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramSenderIdentity falls back to numeric id when username is missing" {
+    const allocator = std.testing.allocator;
+    var sender_buf: [32]u8 = undefined;
+    const body =
+        \\{"message":{"from":{"id":12345},"chat":{"id":-100777}}}
+    ;
+    try std.testing.expectEqualStrings("12345", telegramSenderIdentity(allocator, body, &sender_buf));
+}
+
+test "whatsappSenderAllowed direct respects allow_from" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    try std.testing.expect(whatsappSenderAllowed("+1111111111", false, null, &allow_from, &.{}, &.{}, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+2222222222", false, null, &allow_from, &.{}, &.{}, "allowlist"));
+}
+
+test "whatsappSenderAllowed direct denies all when allow_from is empty" {
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", false, null, &.{}, &.{}, &.{}, "allowlist"));
+}
+
+test "whatsappSenderAllowed group open bypasses allow_from" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    try std.testing.expect(whatsappSenderAllowed("+2222222222", true, "1203630@g.us", &allow_from, &.{}, &.{}, "open"));
+}
+
+test "whatsappSenderAllowed open policy still respects explicit groups allowlist" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    const groups = [_][]const u8{"1203630@g.us"};
+    try std.testing.expect(whatsappSenderAllowed("+2222222222", true, "1203630@g.us", &allow_from, &.{}, &groups, "open"));
+    try std.testing.expect(!whatsappSenderAllowed("+2222222222", true, "1203631@g.us", &allow_from, &.{}, &groups, "open"));
+}
+
+test "whatsappSenderAllowed group allowlist uses groups and sender allowlists" {
+    const allow_from = [_][]const u8{"+1111111111"};
+    const group_allow = [_][]const u8{"+3333333333"};
+    const groups = [_][]const u8{"1203630@g.us"};
+
+    try std.testing.expect(whatsappSenderAllowed("+3333333333", true, "1203630@g.us", &allow_from, &group_allow, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", true, "1203630@g.us", &allow_from, &group_allow, &groups, "allowlist"));
+
+    try std.testing.expect(whatsappSenderAllowed("+1111111111", true, "1203630@g.us", &allow_from, &.{}, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", true, "1203631@g.us", &allow_from, &.{}, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+9999999999", true, "1203630@g.us", &.{}, &.{}, &groups, "allowlist"));
+    try std.testing.expect(!whatsappSenderAllowed("+1111111111", true, "1203630@g.us", &allow_from, &.{}, &.{}, "allowlist"));
+}
+
+test "whatsappSenderAllowed matches with and without plus prefix" {
+    const allow_with_plus = [_][]const u8{"+15550001111"};
+    const allow_without_plus = [_][]const u8{"15550001111"};
+
+    try std.testing.expect(whatsappSenderAllowed("15550001111", false, null, &allow_with_plus, &.{}, &.{}, "allowlist"));
+    try std.testing.expect(whatsappSenderAllowed("+15550001111", false, null, &allow_without_plus, &.{}, &.{}, "allowlist"));
+}
+
+test "whatsappSessionKeyRouted falls back without config" {
+    const allocator = std.testing.allocator;
+    const body = "{\"from\":\"15550001111\",\"text\":{\"body\":\"hi\"}}";
+    var key_buf: [256]u8 = undefined;
+    const key = whatsappSessionKeyRouted(allocator, &key_buf, body, null, "default");
+    try std.testing.expectEqualStrings("whatsapp:15550001111", key);
+}
+
+test "whatsappSessionKeyRouted uses route engine when config exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body = "{\"from\":\"15550001111\",\"group_jid\":\"1203630@g.us\",\"text\":{\"body\":\"hi\"}}";
+    var key_buf: [256]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "wa-agent",
+                .match = .{
+                    .channel = "whatsapp",
+                    .account_id = "wa-prod",
+                    .peer = .{ .kind = .group, .id = "1203630@g.us" },
+                },
+            },
+        },
+    };
+
+    const key = whatsappSessionKeyRouted(allocator, &key_buf, body, &cfg, "wa-prod");
+    try std.testing.expectEqualStrings("agent:wa-agent:whatsapp:group:1203630@g.us", key);
+}
+
+test "whatsappSessionKeyRouted uses nested context.group_jid for group routing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body = "{\"from\":\"15550001111\",\"context\":{\"group_jid\":\"1203631@g.us\"},\"text\":{\"body\":\"hi\"}}";
+    var key_buf: [256]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "wa-context-agent",
+                .match = .{
+                    .channel = "whatsapp",
+                    .account_id = "wa-main",
+                    .peer = .{ .kind = .group, .id = "1203631@g.us" },
+                },
+            },
+        },
+    };
+
+    const key = whatsappSessionKeyRouted(allocator, &key_buf, body, &cfg, "wa-main");
+    try std.testing.expectEqualStrings("agent:wa-context-agent:whatsapp:group:1203631@g.us", key);
+}
+
+test "telegramSessionKeyRouted uses group peer for group chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body =
+        \\{"message":{"chat":{"id":-10012345,"type":"supergroup"}}}
+    ;
+    var key_buf: [128]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "tg-group-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .group, .id = "-10012345" },
+                },
+            },
+        },
+    };
+
+    const key = telegramSessionKeyRouted(allocator, &key_buf, -10012345, body, &cfg, "tg-main");
+    try std.testing.expectEqualStrings("agent:tg-group-agent:telegram:group:-10012345", key);
+}
+
+test "telegramSessionKeyRouted uses direct peer for private chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body =
+        \\{"message":{"chat":{"id":4242,"type":"private"}}}
+    ;
+    var key_buf: [128]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "tg-dm-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .direct, .id = "4242" },
+                },
+            },
+        },
+    };
+
+    const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", key);
+}
+
+test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body =
+        \\{"message":{"chat":{"id":4242,"type":"private"}}}
+    ;
+    var key_buf: [128]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "tg-dm-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .direct, .id = "4242" },
+                },
+            },
+        },
+        .session = .{
+            .dm_scope = .per_peer,
+        },
+    };
+
+    const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:direct:4242", key);
+}
+
+test "lineSessionKeyRouted uses group id for group events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .group_id = "G222",
+        .source_type = "group",
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "line-group-agent",
+                .match = .{
+                    .channel = "line",
+                    .account_id = "line-main",
+                    .peer = .{ .kind = .group, .id = "group:G222" },
+                },
+            },
+        },
+    };
+
+    const key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
+    try std.testing.expectEqualStrings("agent:line-group-agent:line:group:group:G222", key);
+}
+
+test "lineSessionKeyRouted falls back to user session key without config" {
+    const allocator = std.testing.allocator;
+    var key_buf: [128]u8 = undefined;
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U777",
+    };
+
+    const key = lineSessionKeyRouted(allocator, &key_buf, evt, null, "default");
+    try std.testing.expectEqualStrings("line:U777", key);
+}
+
+test "lineSessionKeyRouted uses room-prefixed peer id for room events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .room_id = "R333",
+        .source_type = "room",
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "line-room-agent",
+                .match = .{
+                    .channel = "line",
+                    .account_id = "line-main",
+                    .peer = .{ .kind = .group, .id = "room:R333" },
+                },
+            },
+        },
+    };
+
+    const key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
+    try std.testing.expectEqualStrings("agent:line-room-agent:line:group:room:R333", key);
+}
+
+test "lineReplyTarget resolves conversation target for group events" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .group_id = "G222",
+        .source_type = "group",
+    };
+    try std.testing.expectEqualStrings("G222", lineReplyTarget(evt));
+}
+
+test "lineReplyTarget resolves conversation target for room events" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .room_id = "R333",
+        .source_type = "room",
+    };
+    try std.testing.expectEqualStrings("R333", lineReplyTarget(evt));
+}
+
+test "lineReplyTarget falls back to user for direct events" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .source_type = "user",
+    };
+    try std.testing.expectEqualStrings("U111", lineReplyTarget(evt));
+}
+
+test "larkSessionKeyRouted uses route engine when config exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    const msg = channels.lark.ParsedLarkMessage{
+        .sender = "ou_abc123",
+        .content = "hello",
+        .timestamp = 123,
+        .is_group = true,
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "lark-group-agent",
+                .match = .{
+                    .channel = "lark",
+                    .account_id = "lark-main",
+                    .peer = .{ .kind = .group, .id = "ou_abc123" },
+                },
+            },
+        },
+    };
+
+    const key = larkSessionKeyRouted(allocator, &key_buf, msg, &cfg, "lark-main");
+    try std.testing.expectEqualStrings("agent:lark-group-agent:lark:group:ou_abc123", key);
+}
+
 // ── extractBody tests ────────────────────────────────────────────
 
 test "extractBody finds body after headers" {
@@ -1423,6 +3287,41 @@ test "extractBody returns null for no body" {
 test "extractBody returns null for no separator" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
     try std.testing.expect(extractBody(raw) == null);
+}
+
+test "userFacingAgentError maps ProviderDoesNotSupportVision" {
+    try std.testing.expectEqualStrings(
+        "The current provider does not support image input.",
+        userFacingAgentError(error.ProviderDoesNotSupportVision),
+    );
+}
+
+test "userFacingAgentError maps NoResponseContent" {
+    try std.testing.expectEqualStrings(
+        "Model returned an empty response. Please try again.",
+        userFacingAgentError(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentError maps generic error fallback" {
+    try std.testing.expectEqualStrings(
+        "An error occurred. Try again.",
+        userFacingAgentError(error.Unexpected),
+    );
+}
+
+test "userFacingAgentErrorJson maps NoResponseContent" {
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"model returned empty response\"}",
+        userFacingAgentErrorJson(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentErrorJson maps generic error fallback" {
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"agent failure\"}",
+        userFacingAgentErrorJson(error.Unexpected),
+    );
 }
 
 test "GatewayState init has empty telegram_bot_token" {
@@ -1585,6 +3484,149 @@ test "verifyWhatsappSignature uppercase hex accepted" {
     try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
 }
 
+test "verifySlackSignature accepts valid signature" {
+    const body = "{\"type\":\"event_callback\"}";
+    const secret = "slack_signing_secret";
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch unreachable;
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(std.testing.allocator);
+    const sw = signed.writer(std.testing.allocator);
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, signed.items, secret);
+
+    var sig_buf: [67]u8 = undefined; // "v0=" + 64 hex
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    try std.testing.expect(verifySlackSignature(std.testing.allocator, body, ts, &sig_buf, secret));
+}
+
+test "verifySlackSignature rejects stale timestamp" {
+    const body = "{\"type\":\"event_callback\"}";
+    const secret = "slack_signing_secret";
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp() - 900}) catch unreachable;
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(std.testing.allocator);
+    const sw = signed.writer(std.testing.allocator);
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, signed.items, secret);
+
+    var sig_buf: [67]u8 = undefined;
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    try std.testing.expect(!verifySlackSignature(std.testing.allocator, body, ts, &sig_buf, secret));
+}
+
+test "hasSlackHttpEndpoint respects mode and webhook_path" {
+    const slack_accounts = [_]config_types.SlackConfig{
+        .{
+            .account_id = "sl-http",
+            .mode = .http,
+            .bot_token = "xoxb-http",
+            .signing_secret = "sec-http",
+            .webhook_path = "/slack/custom",
+        },
+        .{
+            .account_id = "sl-socket",
+            .mode = .socket,
+            .bot_token = "xoxb-socket",
+            .app_token = "xapp-socket",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .slack = &slack_accounts,
+        },
+    };
+
+    try std.testing.expect(hasSlackHttpEndpoint(&cfg, "/slack/custom"));
+    try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/slack/events"));
+    try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/line"));
+}
+
+test "findSlackConfigForRequest selects account by verified signature" {
+    const body = "{\"type\":\"event_callback\",\"event\":{\"type\":\"message\",\"channel\":\"C1\",\"user\":\"U1\",\"text\":\"hi\"}}";
+    const ts_val = std.time.timestamp();
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{ts_val}) catch unreachable;
+
+    const secret_a = "slack_secret_a";
+    const secret_b = "slack_secret_b";
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(std.testing.allocator);
+    const sw = signed.writer(std.testing.allocator);
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac_b: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac_b, signed.items, secret_b);
+
+    var sig_buf: [67]u8 = undefined;
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac_b[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    const slack_accounts = [_]config_types.SlackConfig{
+        .{
+            .account_id = "a",
+            .mode = .http,
+            .bot_token = "xoxb-a",
+            .signing_secret = secret_a,
+            .webhook_path = "/slack/events",
+        },
+        .{
+            .account_id = "b",
+            .mode = .http,
+            .bot_token = "xoxb-b",
+            .signing_secret = secret_b,
+            .webhook_path = "/slack/events",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .slack = &slack_accounts,
+        },
+    };
+
+    const selected = findSlackConfigForRequest(std.testing.allocator, &cfg, "/slack/events", body, ts, &sig_buf);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("b", selected.?.account_id);
+}
+
 test "GatewayState init has empty whatsapp_app_secret" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
@@ -1672,4 +3714,45 @@ test "handleReady recovered component shows healthy" {
     defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
     try std.testing.expectEqualStrings("200 OK", resp.http_status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"healthy\":true") != null);
+}
+
+test "publishToBus creates inbound message on bus" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const ok = publishToBus(&eb, alloc, "telegram", "user1", "chat42", "hello", "telegram:chat42", null);
+    try std.testing.expect(ok);
+
+    // Consume the message
+    const msg = eb.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("user1", msg.sender_id);
+    try std.testing.expectEqualStrings("chat42", msg.chat_id);
+    try std.testing.expectEqualStrings("hello", msg.content);
+    try std.testing.expectEqualStrings("telegram:chat42", msg.session_key);
+}
+
+test "publishToBus with metadata" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const meta = "{\"account_id\":\"personal\"}";
+    const ok = publishToBus(&eb, alloc, "whatsapp", "sender", "chat1", "hi", "wa:chat1", meta);
+    try std.testing.expect(ok);
+
+    const msg = eb.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("whatsapp", msg.channel);
+    try std.testing.expectEqualStrings("hi", msg.content);
+    try std.testing.expect(msg.metadata_json != null);
+    try std.testing.expectEqualStrings("{\"account_id\":\"personal\"}", msg.metadata_json.?);
+}
+
+test "GatewayState event_bus defaults to null" {
+    var gs = GatewayState.init(std.testing.allocator);
+    defer gs.deinit();
+    try std.testing.expect(gs.event_bus == null);
 }

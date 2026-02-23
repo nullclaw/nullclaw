@@ -5,9 +5,10 @@
 //!   - CLI (built-in stdin/stdout)
 //!   - Telegram (long-polling)
 //!   - Discord (WebSocket gateway)
-//!   - Slack (polling conversations.history)
+//!   - Slack (socket/http event pipeline)
 //!   - WhatsApp (webhook-based)
 //!   - Matrix (long-polling /sync)
+//!   - Mattermost (WebSocket + REST API)
 //!   - IRC (TLS socket)
 //!   - iMessage (AppleScript + SQLite on macOS)
 //!   - Email (IMAP/SMTP)
@@ -58,7 +59,7 @@ pub const Channel = struct {
         /// Stop the channel (disconnect, clean up).
         stop: *const fn (ptr: *anyopaque) void,
         /// Send a message to a target (user, channel, room, etc.).
-        send: *const fn (ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void,
+        send: *const fn (ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void,
         /// Return the channel name (e.g. "telegram", "discord").
         name: *const fn (ptr: *anyopaque) []const u8,
         /// Health check — return true if the channel is operational.
@@ -73,8 +74,8 @@ pub const Channel = struct {
         self.vtable.stop(self.ptr);
     }
 
-    pub fn send(self: Channel, target: []const u8, message: []const u8) !void {
-        return self.vtable.send(self.ptr, target, message);
+    pub fn send(self: Channel, target: []const u8, message: []const u8, media: []const []const u8) !void {
+        return self.vtable.send(self.ptr, target, message, media);
     }
 
     pub fn name(self: Channel) []const u8 {
@@ -96,6 +97,7 @@ pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
 pub const whatsapp = @import("whatsapp.zig");
 pub const matrix = @import("matrix.zig");
+pub const mattermost = @import("mattermost.zig");
 pub const irc = @import("irc.zig");
 pub const imessage = @import("imessage.zig");
 pub const email = @import("email.zig");
@@ -105,6 +107,7 @@ pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");
 pub const maixcam = @import("maixcam.zig");
+pub const signal = @import("signal.zig");
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -281,13 +281,17 @@ const MockProvider = struct {
 
 /// Create a test SessionManager with mock provider.
 fn testSessionManager(allocator: Allocator, mock: *MockProvider, cfg: *const Config) SessionManager {
+    return testSessionManagerWithMemory(allocator, mock, cfg, null);
+}
+
+fn testSessionManagerWithMemory(allocator: Allocator, mock: *MockProvider, cfg: *const Config, mem: ?Memory) SessionManager {
     var noop = observability.NoopObserver{};
     return SessionManager.init(
         allocator,
         cfg,
         mock.provider(),
         &.{},
-        null,
+        mem,
         noop.observer(),
     );
 }
@@ -462,6 +466,35 @@ test "processMessage different keys — independent sessions" {
     try testing.expectEqual(@as(u64, 1), sb.turn_count);
 }
 
+test "processMessage with sqlite memory first turn does not panic" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+    cfg.memory.backend = "sqlite";
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem);
+    defer sm.deinit();
+
+    const resp = try sm.processMessage("signal:session:1", "hello");
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings("ok", resp);
+
+    const entries = try sqlite_mem.loadMessages(testing.allocator, "signal:session:1");
+    defer {
+        for (entries) |entry| {
+            testing.allocator.free(entry.role);
+            testing.allocator.free(entry.content);
+        }
+        testing.allocator.free(entries);
+    }
+    // One user + one assistant message should be persisted.
+    try testing.expect(entries.len >= 2);
+}
+
 // ---------------------------------------------------------------------------
 // 3. evictIdle tests
 // ---------------------------------------------------------------------------
@@ -612,6 +645,48 @@ test "concurrent processMessage different keys — no crash" {
 
     for (handles) |h| h.join();
     try testing.expectEqual(@as(usize, num_threads), sm.sessionCount());
+}
+
+test "concurrent processMessage with sqlite memory does not panic" {
+    var mock = MockProvider{ .response = "concurrent sqlite ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+    cfg.memory.backend = "sqlite";
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem);
+    defer sm.deinit();
+
+    const num_threads = 4;
+    var handles: [num_threads]std.Thread = undefined;
+    var key_bufs: [num_threads][24]u8 = undefined;
+    var keys: [num_threads][]const u8 = undefined;
+    var failed = std.atomic.Value(bool).init(false);
+
+    for (0..num_threads) |t| {
+        keys[t] = std.fmt.bufPrint(&key_bufs[t], "sqlite-conc:{d}", .{t}) catch "?";
+        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+            fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator, failed_flag: *std.atomic.Value(bool)) void {
+                for (0..5) |_| {
+                    const resp = mgr.processMessage(key, "hello sqlite") catch {
+                        failed_flag.store(true, .release);
+                        return;
+                    };
+                    alloc.free(resp);
+                }
+            }
+        }.run, .{ &sm, keys[t], testing.allocator, &failed });
+    }
+
+    for (handles) |h| h.join();
+    try testing.expect(!failed.load(.acquire));
+    try testing.expectEqual(@as(usize, num_threads), sm.sessionCount());
+
+    const count = try mem.count();
+    try testing.expect(count > 0);
 }
 
 // ---------------------------------------------------------------------------

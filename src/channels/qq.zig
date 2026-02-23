@@ -1,34 +1,9 @@
 const std = @import("std");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
 
 const log = std.log.scoped(.qq);
-
-// ════════════════════════════════════════════════════════════════════════════
-// Configuration
-// ════════════════════════════════════════════════════════════════════════════
-
-pub const QQGroupPolicy = enum {
-    /// Allow all group messages.
-    allow,
-    /// Only allow messages from groups in the allowlist.
-    allowlist,
-};
-
-pub const QQConfig = struct {
-    /// QQ Bot AppID.
-    app_id: []const u8 = "",
-    /// QQ Bot AppSecret.
-    app_secret: []const u8 = "",
-    /// QQ Bot Token.
-    bot_token: []const u8 = "",
-    /// Whether to use the sandbox environment.
-    sandbox: bool = false,
-    /// Group message permission policy.
-    group_policy: QQGroupPolicy = .allow,
-    /// Allowed group IDs (used when group_policy == .allowlist).
-    allowlist: []const []const u8 = &.{},
-};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -229,10 +204,10 @@ pub fn buildAuthHeader(buf: []u8, app_id: []const u8, bot_token: []const u8) ![]
 }
 
 /// Check if a group ID is allowed by the given config.
-pub fn isGroupAllowed(config: QQConfig, group_id: []const u8) bool {
+pub fn isGroupAllowed(config: config_types.QQConfig, group_id: []const u8) bool {
     return switch (config.group_policy) {
         .allow => true,
-        .allowlist => root.isAllowedExact(config.allowlist, group_id),
+        .allowlist => root.isAllowedExact(config.allowed_groups, group_id),
     };
 }
 
@@ -258,7 +233,7 @@ pub fn gatewayUrl(sandbox: bool) []const u8 {
 /// Message deduplication via ring buffer of 1024 recent message IDs.
 /// Auto-reconnect with 5s backoff.
 pub const QQChannel = struct {
-    config: QQConfig,
+    config: config_types.QQConfig,
     allocator: std.mem.Allocator,
     event_bus: ?*bus.Bus,
     dedup: DedupRing,
@@ -270,7 +245,7 @@ pub const QQChannel = struct {
     pub const MAX_MESSAGE_LEN: usize = 4096;
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
 
-    pub fn init(allocator: std.mem.Allocator, config: QQConfig) QQChannel {
+    pub fn init(allocator: std.mem.Allocator, config: config_types.QQConfig) QQChannel {
         return .{
             .config = config,
             .allocator = allocator,
@@ -281,6 +256,10 @@ pub const QQChannel = struct {
             .session_id = null,
             .running = false,
         };
+    }
+
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.QQConfig) QQChannel {
+        return init(allocator, cfg);
     }
 
     pub fn channelName(_: *QQChannel) []const u8 {
@@ -308,6 +287,7 @@ pub const QQChannel = struct {
         const val = parsed.value;
 
         // Extract opcode
+        if (val != .object) return;
         const op_val = val.object.get("op") orelse return;
         const op_int: i64 = switch (op_val) {
             .integer => op_val.integer,
@@ -326,9 +306,11 @@ pub const QQChannel = struct {
             .hello => {
                 // Extract heartbeat_interval from d.heartbeat_interval
                 if (val.object.get("d")) |d_val| {
-                    if (d_val.object.get("heartbeat_interval")) |hb_val| {
-                        if (hb_val == .integer and hb_val.integer > 0) {
-                            self.heartbeat_interval_ms = @intCast(@min(hb_val.integer, std.math.maxInt(u32)));
+                    if (d_val == .object) {
+                        if (d_val.object.get("heartbeat_interval")) |hb_val| {
+                            if (hb_val == .integer and hb_val.integer > 0) {
+                                self.heartbeat_interval_ms = @intCast(@min(hb_val.integer, std.math.maxInt(u32)));
+                            }
                         }
                     }
                 }
@@ -371,6 +353,7 @@ pub const QQChannel = struct {
 
     fn handleMessageCreate(self: *QQChannel, val: std.json.Value, event_type: []const u8) !void {
         const d = val.object.get("d") orelse return;
+        if (d != .object) return;
 
         // Extract message ID for dedup
         const msg_id_str = getJsonStringFromObj(d, "id") orelse return;
@@ -395,6 +378,9 @@ pub const QQChannel = struct {
         const author = d.object.get("author") orelse return;
         const sender_id = getJsonStringFromObj(author, "id") orelse "unknown";
 
+        // Allowlist check
+        if (self.config.allow_from.len > 0 and !root.isAllowed(self.config.allow_from, sender_id)) return;
+
         // Extract content and strip CQ codes
         const raw_content = getJsonStringFromObj(d, "content") orelse "";
         const content = stripCqCodes(self.allocator, raw_content) catch return;
@@ -410,11 +396,18 @@ pub const QQChannel = struct {
             if (channel_id.len > 0) channel_id else sender_id,
         }) catch return;
 
-        // Build target for replies
-        const reply_target = if (is_dm)
+        // Build target for replies (prefixed for parseTarget compatibility)
+        const raw_reply_id = if (is_dm)
             getJsonStringFromObj(d, "guild_id") orelse channel_id
         else
             channel_id;
+        if (raw_reply_id.len == 0) return;
+
+        var reply_buf: [160]u8 = undefined;
+        const reply_target = if (is_dm)
+            std.fmt.bufPrint(&reply_buf, "dm:{s}", .{raw_reply_id}) catch return
+        else
+            std.fmt.bufPrint(&reply_buf, "channel:{s}", .{raw_reply_id}) catch return;
 
         // Build metadata JSON
         var meta_buf: [256]u8 = undefined;
@@ -423,8 +416,10 @@ pub const QQChannel = struct {
         mw.print("{{\"msg_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\"", .{
             msg_id_str,
             if (is_dm) "true" else "false",
-            reply_target,
+            raw_reply_id,
         }) catch return;
+        mw.writeAll(",\"account_id\":") catch return;
+        root.appendJsonStringW(mw, self.config.account_id) catch return;
         mw.writeByte('}') catch return;
         const metadata = meta_fbs.getWritten();
 
@@ -508,7 +503,7 @@ pub const QQChannel = struct {
         log.info("QQ channel stopped", .{});
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *QQChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -553,6 +548,7 @@ fn parseTarget(target: []const u8) struct { []const u8, []const u8 } {
 
 /// Get a string field from a JSON object value.
 fn getJsonString(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
     const field = val.object.get(key) orelse return null;
     return if (field == .string) field.string else null;
 }
@@ -567,30 +563,30 @@ fn getJsonStringFromObj(val: std.json.Value, key: []const u8) ?[]const u8 {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "qq config defaults" {
-    const config = QQConfig{};
+    const config = config_types.QQConfig{};
     try std.testing.expectEqualStrings("", config.app_id);
     try std.testing.expectEqualStrings("", config.app_secret);
     try std.testing.expectEqualStrings("", config.bot_token);
     try std.testing.expect(!config.sandbox);
     try std.testing.expect(config.group_policy == .allow);
-    try std.testing.expectEqual(@as(usize, 0), config.allowlist.len);
+    try std.testing.expectEqual(@as(usize, 0), config.allowed_groups.len);
 }
 
 test "qq config custom values" {
     const list = [_][]const u8{ "group1", "group2" };
-    const config = QQConfig{
+    const config = config_types.QQConfig{
         .app_id = "12345",
         .app_secret = "secret",
         .bot_token = "token",
         .sandbox = true,
         .group_policy = .allowlist,
-        .allowlist = &list,
+        .allowed_groups = &list,
     };
     try std.testing.expectEqualStrings("12345", config.app_id);
     try std.testing.expectEqualStrings("secret", config.app_secret);
     try std.testing.expect(config.sandbox);
     try std.testing.expect(config.group_policy == .allowlist);
-    try std.testing.expectEqual(@as(usize, 2), config.allowlist.len);
+    try std.testing.expectEqual(@as(usize, 2), config.allowed_groups.len);
 }
 
 test "qq opcode fromInt" {
@@ -750,20 +746,20 @@ test "qq buildAuthHeader" {
 }
 
 test "qq isGroupAllowed policy allow" {
-    const config = QQConfig{ .group_policy = .allow };
+    const config = config_types.QQConfig{ .group_policy = .allow };
     try std.testing.expect(isGroupAllowed(config, "anygroup"));
 }
 
 test "qq isGroupAllowed policy allowlist" {
     const list = [_][]const u8{ "group1", "group2" };
-    const config = QQConfig{ .group_policy = .allowlist, .allowlist = &list };
+    const config = config_types.QQConfig{ .group_policy = .allowlist, .allowed_groups = &list };
     try std.testing.expect(isGroupAllowed(config, "group1"));
     try std.testing.expect(isGroupAllowed(config, "group2"));
     try std.testing.expect(!isGroupAllowed(config, "group3"));
 }
 
 test "qq isGroupAllowed empty allowlist denies all" {
-    const config = QQConfig{ .group_policy = .allowlist, .allowlist = &.{} };
+    const config = config_types.QQConfig{ .group_policy = .allowlist, .allowed_groups = &.{} };
     try std.testing.expect(!isGroupAllowed(config, "anygroup"));
 }
 
@@ -857,7 +853,7 @@ test "qq handleGatewayEvent MESSAGE_CREATE" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{});
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main" });
     ch.setBus(&event_bus_inst);
     ch.running = true;
 
@@ -870,9 +866,16 @@ test "qq handleGatewayEvent MESSAGE_CREATE" {
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("qq", msg.channel);
     try std.testing.expectEqualStrings("user1", msg.sender_id);
-    try std.testing.expectEqualStrings("ch1", msg.chat_id);
+    try std.testing.expectEqualStrings("channel:ch1", msg.chat_id);
     try std.testing.expectEqualStrings("hello qq", msg.content);
     try std.testing.expectEqualStrings("qq:ch1", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+    const meta_parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg.metadata_json.?, .{});
+    defer meta_parsed.deinit();
+    try std.testing.expect(meta_parsed.value == .object);
+    try std.testing.expect(meta_parsed.value.object.get("account_id") != null);
+    try std.testing.expect(meta_parsed.value.object.get("account_id").? == .string);
+    try std.testing.expectEqualStrings("qq-main", meta_parsed.value.object.get("account_id").?.string);
 }
 
 test "qq handleGatewayEvent DIRECT_MESSAGE_CREATE" {
@@ -893,8 +896,8 @@ test "qq handleGatewayEvent DIRECT_MESSAGE_CREATE" {
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("qq", msg.channel);
     try std.testing.expectEqualStrings("u2", msg.sender_id);
-    // For DMs, chat_id should be guild_id for replying
-    try std.testing.expectEqualStrings("dg1", msg.chat_id);
+    // For DMs, chat_id must include dm: prefix for sendMessage routing.
+    try std.testing.expectEqualStrings("dm:dg1", msg.chat_id);
     try std.testing.expectEqualStrings("dm hello", msg.content);
 }
 
@@ -928,7 +931,7 @@ test "qq handleGatewayEvent group allowlist filters" {
     const list = [_][]const u8{"allowed_guild"};
     var ch = QQChannel.init(alloc, .{
         .group_policy = .allowlist,
-        .allowlist = &list,
+        .allowed_groups = &list,
     });
     ch.setBus(&event_bus_inst);
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const voice = @import("../voice.zig");
 const platform = @import("../platform.zig");
+const config_types = @import("../config_types.zig");
 
 const log = std.log.scoped(.telegram);
 
@@ -224,21 +225,47 @@ pub const SmartSplitIterator = struct {
 pub const TelegramChannel = struct {
     allocator: std.mem.Allocator,
     bot_token: []const u8,
+    account_id: []const u8 = "default",
     allow_from: []const []const u8,
+    group_allow_from: []const []const u8,
+    group_policy: []const u8,
+    reply_in_private: bool = true,
     transcriber: ?voice.Transcriber = null,
     last_update_id: i64,
     proxy: ?[]const u8,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
 
-    pub fn init(allocator: std.mem.Allocator, bot_token: []const u8, allow_from: []const []const u8) TelegramChannel {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        bot_token: []const u8,
+        allow_from: []const []const u8,
+        group_allow_from: []const []const u8,
+        group_policy: []const u8,
+    ) TelegramChannel {
         return .{
             .allocator = allocator,
             .bot_token = bot_token,
             .allow_from = allow_from,
+            .group_allow_from = group_allow_from,
+            .group_policy = group_policy,
             .last_update_id = 0,
             .proxy = null,
         };
+    }
+
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.TelegramConfig) TelegramChannel {
+        var ch = init(
+            allocator,
+            cfg.bot_token,
+            cfg.allow_from,
+            cfg.group_allow_from,
+            cfg.group_policy,
+        );
+        ch.account_id = cfg.account_id;
+        ch.reply_in_private = cfg.reply_in_private;
+        ch.proxy = cfg.proxy;
+        return ch;
     }
 
     pub fn channelName(_: *TelegramChannel) []const u8 {
@@ -280,6 +307,22 @@ pub const TelegramChannel = struct {
     pub fn isAnyIdentityAllowed(self: *const TelegramChannel, identities: []const []const u8) bool {
         for (identities) |id| {
             if (self.isUserAllowed(id)) return true;
+        }
+        return false;
+    }
+
+    pub fn isGroupUserAllowed(self: *const TelegramChannel, sender: []const u8) bool {
+        for (self.group_allow_from) |a| {
+            if (std.mem.eql(u8, a, "*")) return true;
+            const trimmed = if (a.len > 1 and a[0] == '@') a[1..] else a;
+            if (std.ascii.eqlIgnoreCase(trimmed, sender)) return true;
+        }
+        return false;
+    }
+
+    pub fn isAnyGroupIdentityAllowed(self: *const TelegramChannel, identities: []const []const u8) bool {
+        for (identities) |id| {
+            if (self.isGroupUserAllowed(id)) return true;
         }
         return false;
     }
@@ -327,9 +370,13 @@ pub const TelegramChannel = struct {
         // Parse to extract the latest update_id and advance past it
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return;
         defer parsed.deinit();
+        if (parsed.value != .object) return;
 
-        const result_array = (parsed.value.object.get("result") orelse return).array.items;
+        const result_val = parsed.value.object.get("result") orelse return;
+        if (result_val != .array) return;
+        const result_array = result_val.array.items;
         for (result_array) |update| {
+            if (update != .object) continue;
             if (update.object.get("update_id")) |uid| {
                 if (uid == .integer) {
                     self.last_update_id = uid.integer + 1;
@@ -618,13 +665,17 @@ pub const TelegramChannel = struct {
         // Parse JSON response to extract messages
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return &.{};
         defer parsed.deinit();
+        if (parsed.value != .object) return &.{};
 
-        const result_array = (parsed.value.object.get("result") orelse return &.{}).array.items;
+        const result_val = parsed.value.object.get("result") orelse return &.{};
+        if (result_val != .array) return &.{};
+        const result_array = result_val.array.items;
 
         var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
         errdefer messages.deinit(allocator);
 
         for (result_array) |update| {
+            if (update != .object) continue;
             // Advance offset
             if (update.object.get("update_id")) |uid| {
                 if (uid == .integer) {
@@ -633,9 +684,11 @@ pub const TelegramChannel = struct {
             }
 
             const message = update.object.get("message") orelse continue;
+            if (message != .object) continue;
 
             // Get sender info — check both @username and numeric user_id
             const from_obj = message.object.get("from") orelse continue;
+            if (from_obj != .object) continue;
             const username_val = from_obj.object.get("username");
             const username = if (username_val) |uv| (if (uv == .string) uv.string else "unknown") else "unknown";
 
@@ -646,6 +699,23 @@ pub const TelegramChannel = struct {
                 break :blk_uid std.fmt.bufPrint(&user_id_buf, "{d}", .{id_val.integer}) catch null;
             };
 
+            // Get chat_id and chat type
+            const chat_obj = message.object.get("chat") orelse continue;
+            if (chat_obj != .object) continue;
+            const chat_id_val = chat_obj.object.get("id") orelse continue;
+            var chat_id_buf: [32]u8 = undefined;
+            const chat_id_str = blk: {
+                if (chat_id_val == .integer) {
+                    break :blk std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch continue;
+                }
+                continue;
+            };
+            const chat_type_val = chat_obj.object.get("type");
+            const is_group = if (chat_type_val) |tv|
+                (if (tv == .string) (!std.mem.eql(u8, tv.string, "private")) else false)
+            else
+                false;
+
             // Check allowlist against all known identities
             var ids_buf: [2][]const u8 = undefined;
             var ids_len: usize = 0;
@@ -655,7 +725,20 @@ pub const TelegramChannel = struct {
                 ids_buf[ids_len] = uid;
                 ids_len += 1;
             }
-            if (!self.isAnyIdentityAllowed(ids_buf[0..ids_len])) {
+
+            const is_authorized = if (is_group) blk: {
+                if (std.mem.eql(u8, self.group_policy, "open")) break :blk true;
+                if (std.mem.eql(u8, self.group_policy, "disabled")) break :blk false;
+
+                // Allowlist context: check group_allow_from for sender, fall back to allow_from
+                if (self.group_allow_from.len > 0) {
+                    break :blk self.isAnyGroupIdentityAllowed(ids_buf[0..ids_len]);
+                } else {
+                    break :blk self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
+                }
+            } else self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
+
+            if (!is_authorized) {
                 log.warn("ignoring message from unauthorized user: username={s}, user_id={s}", .{
                     username,
                     user_id orelse "unknown",
@@ -677,26 +760,11 @@ pub const TelegramChannel = struct {
             const msg_id_val = message.object.get("message_id");
             const msg_id: ?i64 = if (msg_id_val) |mv| (if (mv == .integer) mv.integer else null) else null;
 
-            // Get chat_id and chat type
-            const chat_obj = message.object.get("chat") orelse continue;
-            const chat_id_val = chat_obj.object.get("id") orelse continue;
-            var chat_id_buf: [32]u8 = undefined;
-            const chat_id_str = blk: {
-                if (chat_id_val == .integer) {
-                    break :blk std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch continue;
-                }
-                continue;
-            };
-            const chat_type_val = chat_obj.object.get("type");
-            const is_group = if (chat_type_val) |tv|
-                (if (tv == .string) (!std.mem.eql(u8, tv.string, "private")) else false)
-            else
-                false;
-
             // Check for voice/audio messages and attempt transcription
             const content = blk_content: {
                 const voice_obj = message.object.get("voice") orelse message.object.get("audio");
                 if (voice_obj) |vobj| {
+                    if (vobj != .object) break :blk_content null;
                     const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
                     const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
 
@@ -797,7 +865,7 @@ pub const TelegramChannel = struct {
         // Nothing to clean up for HTTP polling
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -1097,11 +1165,13 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
         return null;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) return null;
 
     const result_obj = parsed.value.object.get("result") orelse {
         log.warn("downloadTelegramPhoto: no 'result' in response", .{});
         return null;
     };
+    if (result_obj != .object) return null;
     const fp_val = result_obj.object.get("file_path") orelse {
         log.warn("downloadTelegramPhoto: no 'file_path' in result", .{});
         return null;
@@ -1157,7 +1227,7 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
 // ════════════════════════════════════════════════════════════════════════════
 
 test "telegram api url" {
-    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{}, &.{}, "allowlist");
     var buf: [256]u8 = undefined;
     const url = try ch.apiUrl(&buf, "getUpdates");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/getUpdates", url);
@@ -1168,35 +1238,35 @@ test "telegram api url" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "telegram api url sendDocument" {
-    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{}, &.{}, "allowlist");
     var buf: [256]u8 = undefined;
     const url = try ch.apiUrl(&buf, "sendDocument");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/sendDocument", url);
 }
 
 test "telegram api url sendPhoto" {
-    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{}, &.{}, "allowlist");
     var buf: [256]u8 = undefined;
     const url = try ch.apiUrl(&buf, "sendPhoto");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/sendPhoto", url);
 }
 
 test "telegram api url sendVideo" {
-    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{}, &.{}, "allowlist");
     var buf: [256]u8 = undefined;
     const url = try ch.apiUrl(&buf, "sendVideo");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/sendVideo", url);
 }
 
 test "telegram api url sendAudio" {
-    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{}, &.{}, "allowlist");
     var buf: [256]u8 = undefined;
     const url = try ch.apiUrl(&buf, "sendAudio");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/sendAudio", url);
 }
 
 test "telegram api url sendVoice" {
-    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC", &.{}, &.{}, "allowlist");
     var buf: [256]u8 = undefined;
     const url = try ch.apiUrl(&buf, "sendVoice");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/sendVoice", url);
@@ -1214,7 +1284,7 @@ test "telegram build send body" {
 
 test "telegram init stores fields" {
     const users = [_][]const u8{ "alice", "bob" };
-    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC-DEF", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "123:ABC-DEF", &users, &.{}, "allowlist");
     try std.testing.expectEqualStrings("123:ABC-DEF", ch.bot_token);
     try std.testing.expectEqual(@as(i64, 0), ch.last_update_id);
     try std.testing.expectEqual(@as(usize, 2), ch.allow_from.len);
@@ -1222,7 +1292,7 @@ test "telegram init stores fields" {
 }
 
 test "telegram init has null transcriber" {
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
     try std.testing.expect(ch.transcriber == null);
 }
 
@@ -1449,7 +1519,7 @@ test "telegram smartSplitMessage preserves total content" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "telegram sendTypingIndicator does not crash with invalid token" {
-    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{});
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
     ch.sendTypingIndicator("12345");
 }
 
@@ -1458,14 +1528,14 @@ test "telegram sendTypingIndicator does not crash with invalid token" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "telegram allow_from empty denies all" {
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
     try std.testing.expect(!ch.isUserAllowed("anyone"));
     try std.testing.expect(!ch.isUserAllowed("admin"));
 }
 
 test "telegram allow_from non-empty filters correctly" {
     const users = [_][]const u8{ "alice", "bob" };
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     try std.testing.expect(ch.isUserAllowed("alice"));
     try std.testing.expect(ch.isUserAllowed("bob"));
     try std.testing.expect(!ch.isUserAllowed("eve"));
@@ -1474,14 +1544,14 @@ test "telegram allow_from non-empty filters correctly" {
 
 test "telegram allow_from wildcard allows all" {
     const users = [_][]const u8{"*"};
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     try std.testing.expect(ch.isUserAllowed("anyone"));
     try std.testing.expect(ch.isUserAllowed("admin"));
 }
 
 test "telegram allow_from case insensitive" {
     const users = [_][]const u8{"Alice"};
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     try std.testing.expect(ch.isUserAllowed("Alice"));
     try std.testing.expect(ch.isUserAllowed("alice"));
     try std.testing.expect(ch.isUserAllowed("ALICE"));
@@ -1489,7 +1559,7 @@ test "telegram allow_from case insensitive" {
 
 test "telegram allow_from strips @ prefix" {
     const users = [_][]const u8{"@alice"};
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     try std.testing.expect(ch.isUserAllowed("alice"));
     try std.testing.expect(!ch.isUserAllowed("@alice"));
     try std.testing.expect(!ch.isUserAllowed("bob"));
@@ -1497,28 +1567,28 @@ test "telegram allow_from strips @ prefix" {
 
 test "telegram isAnyIdentityAllowed matches username" {
     const users = [_][]const u8{"alice"};
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     const ids = [_][]const u8{ "alice", "123456" };
     try std.testing.expect(ch.isAnyIdentityAllowed(&ids));
 }
 
 test "telegram isAnyIdentityAllowed matches numeric id" {
     const users = [_][]const u8{"123456"};
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     const ids = [_][]const u8{ "unknown", "123456" };
     try std.testing.expect(ch.isAnyIdentityAllowed(&ids));
 }
 
 test "telegram isAnyIdentityAllowed denies when none match" {
     const users = [_][]const u8{ "alice", "987654" };
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     const ids = [_][]const u8{ "unknown", "123456" };
     try std.testing.expect(!ch.isAnyIdentityAllowed(&ids));
 }
 
 test "telegram isAnyIdentityAllowed wildcard allows all" {
     const users = [_][]const u8{ "alice", "*" };
-    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &users, &.{}, "allowlist");
     const ids = [_][]const u8{ "bob", "999" };
     try std.testing.expect(ch.isAnyIdentityAllowed(&ids));
 }
@@ -1624,14 +1694,14 @@ test "telegram markdownToTelegramHtml empty" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "telegram TypingIndicator init" {
-    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
+    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
     var ti = TypingIndicator.init(&ch);
     try std.testing.expect(!ti.running.load(.acquire));
     try std.testing.expect(ti.thread == null);
 }
 
 test "telegram TypingIndicator start and stop" {
-    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{});
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
     var ti = TypingIndicator.init(&ch);
 
     ti.start("12345");
@@ -1646,7 +1716,7 @@ test "telegram TypingIndicator start and stop" {
 }
 
 test "telegram TypingIndicator double start is safe" {
-    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{});
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
     var ti = TypingIndicator.init(&ch);
 
     ti.start("123");
@@ -1656,7 +1726,7 @@ test "telegram TypingIndicator double start is safe" {
 }
 
 test "telegram TypingIndicator stop without start is safe" {
-    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
+    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
     var ti = TypingIndicator.init(&ch);
     ti.stop(); // no-op
 }

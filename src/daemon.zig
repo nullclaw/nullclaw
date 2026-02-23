@@ -14,7 +14,10 @@ const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
-const telegram = @import("channels/telegram.zig");
+const channel_manager = @import("channel_manager.zig");
+const agent_routing = @import("agent_routing.zig");
+const channel_catalog = @import("channel_catalog.zig");
+const channel_adapters = @import("channel_adapters.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -118,12 +121,7 @@ pub fn computeBackoff(current_backoff: u64, max_backoff: u64) u64 {
 
 /// Check if any real-time channels are configured.
 pub fn hasSupervisedChannels(config: *const Config) bool {
-    return config.channels.telegram != null or
-        config.channels.discord != null or
-        config.channels.slack != null or
-        config.channels.imessage != null or
-        config.channels.matrix != null or
-        config.channels.whatsapp != null;
+    return channel_catalog.hasSupervisedChannels(config);
 }
 
 /// Shutdown signal — set to true to stop the daemon.
@@ -140,9 +138,9 @@ pub fn isShutdownRequested() bool {
 }
 
 /// Gateway thread entry point.
-fn gatewayThread(allocator: std.mem.Allocator, host: []const u8, port: u16, state: *DaemonState) void {
+fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
-    gateway.run(allocator, host, port) catch |err| {
+    gateway.run(allocator, host, port, config, event_bus) catch |err| {
         state.markError("gateway", @errorName(err));
         health.markComponentError("gateway", @errorName(err));
         return;
@@ -213,144 +211,210 @@ fn channelSupervisorThread(
     state: *DaemonState,
     channel_registry: *dispatch.ChannelRegistry,
     channel_rt: ?*channel_loop.ChannelRuntime,
+    event_bus: *bus_mod.Bus,
 ) void {
-    state.markRunning("channels");
-    health.markComponentOk("channels");
+    var mgr = channel_manager.ChannelManager.init(allocator, config, channel_registry) catch {
+        state.markError("channels", "init_failed");
+        health.markComponentError("channels", "init_failed");
+        return;
+    };
+    defer mgr.deinit();
 
-    // ── Telegram supervision ──
-    var tg_loop_state: ?*channel_loop.TelegramLoopState = null;
-    var tg_health_channel: ?*telegram.TelegramChannel = null;
-    var supervised: ?dispatch.SupervisedChannel = null;
+    if (channel_rt) |rt| mgr.setRuntime(rt);
+    mgr.setEventBus(event_bus);
 
-    if (config.channels.telegram) |tg_config| {
-        if (channel_rt == null) {
-            state.markError("channels", "runtime init failed");
-            health.markComponentError("channels", "runtime init failed");
-        }
-        if (channel_rt) |rt| {
-            // Heap-alloc loop state
-            const ls = allocator.create(channel_loop.TelegramLoopState) catch {
-                state.markError("channels", "failed to alloc loop state");
-                health.markComponentError("channels", "alloc failed");
-                return;
-            };
-            ls.* = channel_loop.TelegramLoopState.init();
-            tg_loop_state = ls;
+    mgr.collectConfiguredChannels() catch |err| {
+        state.markError("channels", @errorName(err));
+        health.markComponentError("channels", @errorName(err));
+        return;
+    };
 
-            // Separate TelegramChannel for health-check probe (stateless HTTP GET)
-            const hc = allocator.create(telegram.TelegramChannel) catch {
-                state.markError("channels", "failed to alloc health channel");
-                return;
-            };
-            hc.* = telegram.TelegramChannel.init(allocator, tg_config.bot_token, tg_config.allow_from);
-            hc.proxy = tg_config.proxy;
-            tg_health_channel = hc;
+    const started = mgr.startAll() catch |err| {
+        state.markError("channels", @errorName(err));
+        health.markComponentError("channels", @errorName(err));
+        return;
+    };
 
-            // Register in channel registry for outbound dispatch
-            channel_registry.register(hc.channel()) catch |err| {
-                log.warn("Failed to register telegram in channel registry: {}", .{err});
-            };
-
-            // SupervisedChannel wrapper
-            supervised = dispatch.spawnSupervisedChannel(hc.channel(), 5);
-
-            // Spawn the polling thread
-            ls.thread = spawnTelegramThread(allocator, config, rt, ls);
-            if (ls.thread != null) {
-                if (supervised) |*s| s.recordSuccess();
-                log.info("Telegram polling thread started", .{});
-            }
-        }
-    }
-
-    defer {
-        // Shutdown: signal polling thread to stop and join
-        if (tg_loop_state) |ls| {
-            ls.stop_requested.store(true, .release);
-            if (ls.thread) |t| t.join();
-            allocator.destroy(ls);
-        }
-        if (tg_health_channel) |hc| allocator.destroy(hc);
-    }
-
-    // ── Monitoring loop ──
-    while (!isShutdownRequested()) {
-        std.Thread.sleep(CHANNEL_WATCH_INTERVAL_SECS * std.time.ns_per_s);
-        if (isShutdownRequested()) break;
-
-        if (tg_loop_state) |ls| {
-            const now = std.time.timestamp();
-            const last = ls.last_activity.load(.acquire);
-            const stale = (now - last) > STALE_THRESHOLD_SECS;
-
-            // Active HTTP health-check probe
-            const probe_ok = if (tg_health_channel) |hc| hc.healthCheck() else true;
-
-            if (!stale and probe_ok) {
-                health.markComponentOk("telegram");
-                state.markRunning("channels");
-                if (supervised) |*s| {
-                    if (s.state != .running) s.recordSuccess();
-                }
-            } else {
-                // Problem detected
-                const reason = if (stale) "polling thread stale" else "health check failed";
-                log.warn("Telegram issue: {s}", .{reason});
-                health.markComponentError("telegram", reason);
-
-                if (supervised) |*s| {
-                    s.recordFailure();
-
-                    if (s.shouldRestart()) {
-                        log.info("Restarting Telegram polling (attempt {d})", .{s.restart_count});
-                        state.markError("channels", reason);
-
-                        // Stop old thread
-                        ls.stop_requested.store(true, .release);
-                        if (ls.thread) |t| t.join();
-
-                        // Backoff sleep
-                        std.Thread.sleep(s.currentBackoffMs() * std.time.ns_per_ms);
-
-                        // Respawn
-                        ls.stop_requested.store(false, .release);
-                        ls.last_activity.store(std.time.timestamp(), .release);
-                        if (channel_rt) |rt| {
-                            ls.thread = spawnTelegramThread(allocator, config, rt, ls);
-                            if (ls.thread != null) {
-                                s.recordSuccess();
-                                state.markRunning("channels");
-                                health.markComponentOk("telegram");
-                            }
-                        }
-                    } else if (s.state == .gave_up) {
-                        state.markError("channels", "gave up after max restarts");
-                        health.markComponentError("telegram", "gave up after max restarts");
-                    }
-                }
-            }
-        } else {
-            // No telegram configured — just report ok
-            health.markComponentOk("channels");
-        }
+    if (started > 0) {
+        state.markRunning("channels");
+        health.markComponentOk("channels");
+        mgr.supervisionLoop(state); // blocks until shutdown
+    } else {
+        health.markComponentOk("channels");
     }
 }
 
-/// Spawn a Telegram polling thread.
-fn spawnTelegramThread(
+/// Inbound dispatcher thread:
+/// consumes inbound events from channels, runs SessionManager, publishes outbound replies.
+const ParsedInboundMetadata = struct {
+    parsed: ?std.json.Parsed(std.json.Value) = null,
+    fields: channel_adapters.InboundMetadata = .{},
+
+    fn deinit(self: *ParsedInboundMetadata) void {
+        if (self.parsed) |*pm| pm.deinit();
+    }
+};
+
+fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8) ParsedInboundMetadata {
+    var parsed = ParsedInboundMetadata{};
+    const meta_json = metadata_json orelse return parsed;
+
+    parsed.parsed = std.json.parseFromSlice(std.json.Value, allocator, meta_json, .{}) catch null;
+    if (parsed.parsed) |*pm| {
+        if (pm.value != .object) return parsed;
+
+        if (pm.value.object.get("account_id")) |v| {
+            if (v == .string) parsed.fields.account_id = v.string;
+        }
+        if (pm.value.object.get("peer_kind")) |v| {
+            if (v == .string) parsed.fields.peer_kind = channel_adapters.parsePeerKind(v.string);
+        }
+        if (pm.value.object.get("peer_id")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.peer_id = v.string;
+        }
+        if (pm.value.object.get("guild_id")) |v| {
+            if (v == .string) parsed.fields.guild_id = v.string;
+        }
+        if (pm.value.object.get("team_id")) |v| {
+            if (v == .string) parsed.fields.team_id = v.string;
+        }
+        if (pm.value.object.get("channel_id")) |v| {
+            if (v == .string) parsed.fields.channel_id = v.string;
+        }
+        if (pm.value.object.get("thread_id")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.thread_id = v.string;
+        }
+        if (pm.value.object.get("is_dm")) |v| {
+            if (v == .bool) parsed.fields.is_dm = v.bool;
+        }
+        if (pm.value.object.get("is_group")) |v| {
+            if (v == .bool) parsed.fields.is_group = v.bool;
+        }
+    }
+    return parsed;
+}
+
+fn resolveInboundRouteSessionKeyWithMetadata(
     allocator: std.mem.Allocator,
     config: *const Config,
-    runtime: *channel_loop.ChannelRuntime,
-    loop_state: *channel_loop.TelegramLoopState,
-) ?std.Thread {
-    return std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
-        channel_loop.runTelegramLoop,
-        .{ allocator, config, runtime, loop_state },
-    ) catch |err| {
-        log.err("Failed to spawn Telegram thread: {}", .{err});
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?[]const u8 {
+    const route_desc = channel_adapters.findInboundRouteDescriptor(config, msg.channel);
+
+    const account_id = meta.account_id orelse if (route_desc) |desc|
+        desc.default_account_id(config, msg.channel) orelse "default"
+    else
+        "default";
+
+    const peer = if (meta.peer_kind != null and meta.peer_id != null)
+        agent_routing.PeerRef{ .kind = meta.peer_kind.?, .id = meta.peer_id.? }
+    else if (route_desc) |desc|
+        desc.derive_peer(.{
+            .channel_name = msg.channel,
+            .sender_id = msg.sender_id,
+            .chat_id = msg.chat_id,
+        }, meta) orelse return null
+    else
         return null;
-    };
+    const route = agent_routing.resolveRouteWithSession(allocator, .{
+        .channel = msg.channel,
+        .account_id = account_id,
+        .peer = peer,
+        .guild_id = meta.guild_id,
+        .team_id = meta.team_id,
+    }, config.agent_bindings, config.agents, config.session) catch return null;
+    allocator.free(route.main_session_key);
+
+    if (meta.thread_id) |thread_id| {
+        const threaded = agent_routing.buildThreadSessionKey(allocator, route.session_key, thread_id) catch return route.session_key;
+        allocator.free(route.session_key);
+        return threaded;
+    }
+    return route.session_key;
+}
+
+fn resolveInboundRouteSessionKey(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+) ?[]const u8 {
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+    return resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, parsed_meta.fields);
+}
+
+fn inboundDispatcherThread(
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    runtime: *channel_loop.ChannelRuntime,
+    state: *DaemonState,
+) void {
+    var evict_counter: u32 = 0;
+
+    while (event_bus.consumeInbound()) |msg| {
+        defer msg.deinit(allocator);
+
+        var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+        defer parsed_meta.deinit();
+
+        const outbound_account_id = parsed_meta.fields.account_id;
+        const routed_session_key = resolveInboundRouteSessionKeyWithMetadata(
+            allocator,
+            runtime.config,
+            &msg,
+            parsed_meta.fields,
+        );
+        defer if (routed_session_key) |key| allocator.free(key);
+        const session_key = routed_session_key orelse msg.session_key;
+
+        const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            log.warn("inbound dispatch process failed: {}", .{err});
+
+            // Send user-visible error reply back to the originating channel
+            const err_msg: []const u8 = switch (err) {
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+                error.NoResponseContent => "Model returned an empty response. Please try again.",
+                error.OutOfMemory => "Out of memory.",
+                else => "An error occurred. Try again.",
+            };
+            const err_out = if (outbound_account_id) |aid|
+                bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
+            else
+                bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
+            event_bus.publishOutbound(err_out) catch {
+                err_out.deinit(allocator);
+            };
+            continue;
+        };
+        defer allocator.free(reply);
+
+        const out = (if (outbound_account_id) |aid|
+            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reply)
+        else
+            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply)) catch |err| {
+            log.err("inbound dispatch makeOutbound failed: {}", .{err});
+            continue;
+        };
+
+        event_bus.publishOutbound(out) catch |err| {
+            out.deinit(allocator);
+            if (err == error.Closed) break;
+            log.err("inbound dispatch publishOutbound failed: {}", .{err});
+            continue;
+        };
+
+        state.markRunning("inbound_dispatcher");
+        health.markComponentOk("inbound_dispatcher");
+
+        // Periodic session eviction for bus-based channels
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+        }
+    }
 }
 
 /// Run the daemon. This is the main entry point for `nullclaw daemon`.
@@ -360,6 +424,8 @@ fn spawnTelegramThread(
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
     health.markComponentOk("daemon");
     shutdown_requested.store(false, .release);
+    const has_supervised_channels = hasSupervisedChannels(config);
+    const has_runtime_dependent_channels = channel_catalog.hasRuntimeDependentChannels(config);
 
     var state = DaemonState{
         .started = true,
@@ -368,7 +434,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     };
     state.addComponent("gateway");
 
-    if (hasSupervisedChannels(config)) {
+    if (has_supervised_channels) {
         state.addComponent("channels");
     } else {
         health.markComponentOk("channels");
@@ -396,9 +462,12 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
         try stdout.print("Warning: could not write state file: {}\n", .{err});
     };
 
+    // Event bus (created before gateway+scheduler so all threads can publish)
+    var event_bus = bus_mod.Bus.init();
+
     // Spawn gateway thread
     state.markRunning("gateway");
-    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, host, port, &state }) catch |err| {
+    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
         state.markError("gateway", @errorName(err));
         try stdout.print("Failed to spawn gateway: {}\n", .{err});
         return err;
@@ -415,9 +484,6 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
             stdout.print("Warning: heartbeat thread failed: {}\n", .{err}) catch {};
         }
     }
-
-    // Event bus (created before scheduler so cron jobs can deliver via bus)
-    var event_bus = bus_mod.Bus.init();
 
     // Spawn scheduler thread
     var sched_thread: ?std.Thread = null;
@@ -437,20 +503,20 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Channel runtime for supervised polling (provider, tools, sessions)
     var channel_rt: ?*channel_loop.ChannelRuntime = null;
-    if (hasSupervisedChannels(config)) {
-        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
-            stdout.print("Warning: channel runtime init failed: {}\n", .{err}) catch {};
+    if (has_runtime_dependent_channels) {
+        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
             state.markError("channels", @errorName(err));
-            break :blk null;
+            health.markComponentError("channels", "runtime init failed");
+            return err;
         };
     }
     defer if (channel_rt) |rt| rt.deinit();
 
     // Spawn channel supervisor thread (only if channels are configured)
     var chan_thread: ?std.Thread = null;
-    if (hasSupervisedChannels(config)) {
+    if (has_supervised_channels) {
         if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
-            allocator, config, &state, &channel_registry, channel_rt,
+            allocator, config, &state, &channel_registry, channel_rt, &event_bus,
         })) |thread| {
             chan_thread = thread;
         } else |err| {
@@ -458,6 +524,22 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
             stdout.print("Warning: channel supervisor thread failed: {}\n", .{err}) catch {};
         }
     }
+
+    var inbound_thread: ?std.Thread = null;
+    if (channel_rt) |rt| {
+        state.addComponent("inbound_dispatcher");
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundDispatcherThread, .{
+            allocator, &event_bus, rt, &state,
+        })) |thread| {
+            inbound_thread = thread;
+            state.markRunning("inbound_dispatcher");
+            health.markComponentOk("inbound_dispatcher");
+        } else |err| {
+            state.markError("inbound_dispatcher", @errorName(err));
+            stdout.print("Warning: inbound dispatcher thread failed: {}\n", .{err}) catch {};
+        }
+    }
+
     var dispatch_stats = dispatch.DispatchStats{};
 
     state.addComponent("outbound_dispatcher");
@@ -489,6 +571,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     writeStateFile(allocator, state_path, &state) catch {};
 
     // Wait for threads
+    if (inbound_thread) |t| t.join();
     if (dispatcher_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
@@ -539,6 +622,664 @@ test "hasSupervisedChannels false for defaults" {
         .allocator = std.testing.allocator,
     };
     try std.testing.expect(!hasSupervisedChannels(&config));
+}
+
+test "resolveInboundRouteSessionKey falls back to configured account_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "onebot-agent",
+            .match = .{
+                .channel = "onebot",
+                .account_id = "onebot-main",
+                .peer = .{ .kind = .direct, .id = "12345" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .onebot = &[_]@import("config_types.zig").OneBotConfig{.{
+                .account_id = "onebot-main",
+            }},
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "onebot",
+        .sender_id = "12345",
+        .chat_id = "12345",
+        .content = "hello",
+        .session_key = "onebot:12345",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-agent:onebot:direct:12345", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes onebot group messages by group id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "onebot-group-agent",
+            .match = .{
+                .channel = "onebot",
+                .account_id = "onebot-main",
+                .peer = .{ .kind = .group, .id = "777" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .onebot = &[_]@import("config_types.zig").OneBotConfig{.{
+                .account_id = "onebot-main",
+            }},
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "onebot",
+        .sender_id = "12345",
+        .chat_id = "group:777",
+        .content = "hello group",
+        .session_key = "onebot:group:777",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-group-agent:onebot:group:777", routed.?);
+}
+
+test "resolveInboundRouteSessionKey prefers metadata account_id override" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "onebot-main-agent",
+            .match = .{
+                .channel = "onebot",
+                .account_id = "main",
+                .peer = .{ .kind = .direct, .id = "12345" },
+            },
+        },
+        .{
+            .agent_id = "onebot-backup-agent",
+            .match = .{
+                .channel = "onebot",
+                .account_id = "backup",
+                .peer = .{ .kind = .direct, .id = "12345" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .onebot = &[_]@import("config_types.zig").OneBotConfig{
+                .{ .account_id = "main" },
+                .{ .account_id = "backup" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "onebot",
+        .sender_id = "12345",
+        .chat_id = "12345",
+        .content = "hello",
+        .session_key = "onebot:12345",
+        .metadata_json = "{\"account_id\":\"backup\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-backup-agent:onebot:direct:12345", routed.?);
+}
+
+test "resolveInboundRouteSessionKey supports custom maixcam channel name" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "camera-agent",
+            .match = .{
+                .channel = "vision-cam",
+                .account_id = "cam-main",
+                .peer = .{ .kind = .direct, .id = "device-1" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .maixcam = &[_]@import("config_types.zig").MaixCamConfig{.{
+                .name = "vision-cam",
+                .account_id = "cam-main",
+            }},
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "vision-cam",
+        .sender_id = "device-1",
+        .chat_id = "device-1",
+        .content = "person detected",
+        .session_key = "vision-cam:device-1",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:camera-agent:vision-cam:direct:device-1", routed.?);
+}
+
+test "resolveInboundRouteSessionKey matches non-primary maixcam account by channel name" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "lab-camera-agent",
+            .match = .{
+                .channel = "vision-lab",
+                .account_id = "cam-lab",
+                .peer = .{ .kind = .direct, .id = "device-2" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .maixcam = &[_]@import("config_types.zig").MaixCamConfig{
+                .{ .name = "vision-main", .account_id = "cam-main" },
+                .{ .name = "vision-lab", .account_id = "cam-lab" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "vision-lab",
+        .sender_id = "device-2",
+        .chat_id = "device-2",
+        .content = "movement",
+        .session_key = "vision-lab:device-2",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:lab-camera-agent:vision-lab:direct:device-2", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "discord-channel-agent",
+            .match = .{
+                .channel = "discord",
+                .account_id = "discord-main",
+                .peer = .{ .kind = .channel, .id = "778899" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .discord = &[_]@import("config_types.zig").DiscordConfig{
+                .{ .account_id = "discord-main", .token = "token" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-1",
+        .chat_id = "778899",
+        .content = "hello",
+        .session_key = "discord:778899",
+        .metadata_json = "{\"guild_id\":\"guild-1\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:discord-channel-agent:discord:channel:778899", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes discord direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "discord-dm-agent",
+            .match = .{
+                .channel = "discord",
+                .account_id = "discord-main",
+                .peer = .{ .kind = .direct, .id = "user-42" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .discord = &[_]@import("config_types.zig").DiscordConfig{
+                .{ .account_id = "discord-main", .token = "token" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-42",
+        .chat_id = "some-channel",
+        .content = "ping",
+        .session_key = "discord:dm:user-42",
+        .metadata_json = "{\"is_dm\":true}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:discord-dm-agent:discord:direct:user-42", routed.?);
+}
+
+test "resolveInboundRouteSessionKey applies session dm_scope for direct messages" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "discord-dm-agent",
+            .match = .{
+                .channel = "discord",
+                .account_id = "discord-main",
+                .peer = .{ .kind = .direct, .id = "user-42" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .discord = &[_]@import("config_types.zig").DiscordConfig{
+                .{ .account_id = "discord-main", .token = "token" },
+            },
+        },
+        .session = .{
+            .dm_scope = .per_peer,
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-42",
+        .chat_id = "some-channel",
+        .content = "ping",
+        .session_key = "discord:dm:user-42",
+        .metadata_json = "{\"is_dm\":true}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:discord-dm-agent:direct:user-42", routed.?);
+}
+
+test "resolveInboundRouteSessionKey normalizes qq channel prefix for routed peer id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "qq-channel-agent",
+            .match = .{
+                .channel = "qq",
+                .account_id = "qq-main",
+                .peer = .{ .kind = .channel, .id = "998877" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .qq = &[_]@import("config_types.zig").QQConfig{
+                .{ .account_id = "qq-main" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "qq",
+        .sender_id = "qq-user",
+        .chat_id = "channel:998877",
+        .content = "hello",
+        .session_key = "qq:channel:998877",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:qq-channel-agent:qq:channel:998877", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes slack channel messages by chat_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "slack-channel-agent",
+            .match = .{
+                .channel = "slack",
+                .account_id = "sl-main",
+                .peer = .{ .kind = .channel, .id = "C12345" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .slack = &[_]@import("config_types.zig").SlackConfig{
+                .{ .account_id = "sl-main", .bot_token = "xoxb-token", .channel_id = "C12345" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "slack",
+        .sender_id = "U777",
+        .chat_id = "C12345",
+        .content = "hello",
+        .session_key = "slack:sl-main:channel:C12345",
+        .metadata_json = "{\"account_id\":\"sl-main\",\"is_dm\":false}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:slack-channel-agent:slack:channel:C12345", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes slack direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "slack-dm-agent",
+            .match = .{
+                .channel = "slack",
+                .account_id = "sl-main",
+                .peer = .{ .kind = .direct, .id = "U777" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .slack = &[_]@import("config_types.zig").SlackConfig{
+                .{ .account_id = "sl-main", .bot_token = "xoxb-token", .channel_id = "D22222" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "slack",
+        .sender_id = "U777",
+        .chat_id = "D22222",
+        .content = "hi dm",
+        .session_key = "slack:sl-main:direct:U777",
+        .metadata_json = "{\"account_id\":\"sl-main\",\"is_dm\":true}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:slack-dm-agent:slack:direct:U777", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes qq dm messages by sender id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "qq-dm-agent",
+            .match = .{
+                .channel = "qq",
+                .account_id = "qq-main",
+                .peer = .{ .kind = .direct, .id = "qq-user-1" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .qq = &[_]@import("config_types.zig").QQConfig{
+                .{ .account_id = "qq-main" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "qq",
+        .sender_id = "qq-user-1",
+        .chat_id = "dm:session-abc",
+        .content = "hello",
+        .session_key = "qq:dm:session-abc",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:qq-dm-agent:qq:direct:qq-user-1", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes irc channel messages by chat id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "irc-group-agent",
+            .match = .{
+                .channel = "irc",
+                .account_id = "irc-main",
+                .peer = .{ .kind = .group, .id = "#dev" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .irc = &[_]@import("config_types.zig").IrcConfig{
+                .{ .account_id = "irc-main", .host = "irc.example.org", .nick = "bot" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "irc",
+        .sender_id = "alice",
+        .chat_id = "#dev",
+        .content = "hello",
+        .session_key = "irc:irc-main:group:#dev",
+        .metadata_json = "{\"account_id\":\"irc-main\",\"is_group\":true}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:irc-group-agent:irc:group:#dev", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes irc direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "irc-dm-agent",
+            .match = .{
+                .channel = "irc",
+                .account_id = "irc-main",
+                .peer = .{ .kind = .direct, .id = "alice" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .irc = &[_]@import("config_types.zig").IrcConfig{
+                .{ .account_id = "irc-main", .host = "irc.example.org", .nick = "bot" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "irc",
+        .sender_id = "alice",
+        .chat_id = "alice",
+        .content = "hello dm",
+        .session_key = "irc:irc-main:direct:alice",
+        .metadata_json = "{\"account_id\":\"irc-main\",\"is_dm\":true}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:irc-dm-agent:irc:direct:alice", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes mattermost by channel id and team" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "mm-group-agent",
+            .match = .{
+                .channel = "mattermost",
+                .account_id = "mm-main",
+                .team_id = "team-1",
+                .peer = .{ .kind = .group, .id = "chan-g1" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .mattermost = &[_]@import("config_types.zig").MattermostConfig{
+                .{
+                    .account_id = "mm-main",
+                    .bot_token = "token",
+                    .base_url = "https://chat.example.com",
+                },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "mattermost",
+        .sender_id = "user-42",
+        .chat_id = "channel:chan-g1",
+        .content = "hello",
+        .session_key = "mattermost:mm-main:group:chan-g1",
+        .metadata_json = "{\"account_id\":\"mm-main\",\"is_group\":true,\"channel_id\":\"chan-g1\",\"team_id\":\"team-1\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:mm-group-agent:mattermost:group:chan-g1", routed.?);
+}
+
+test "resolveInboundRouteSessionKey appends mattermost thread suffix" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "mm-thread-agent",
+            .match = .{
+                .channel = "mattermost",
+                .account_id = "mm-main",
+                .peer = .{ .kind = .channel, .id = "chan-c1" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .mattermost = &[_]@import("config_types.zig").MattermostConfig{
+                .{
+                    .account_id = "mm-main",
+                    .bot_token = "token",
+                    .base_url = "https://chat.example.com",
+                },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "mattermost",
+        .sender_id = "user-11",
+        .chat_id = "channel:chan-c1:thread:root-99",
+        .content = "threaded",
+        .session_key = "mattermost:mm-main:channel:chan-c1:thread:root-99",
+        .metadata_json = "{\"account_id\":\"mm-main\",\"channel_id\":\"chan-c1\",\"thread_id\":\"root-99\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:mm-thread-agent:mattermost:channel:chan-c1:thread:root-99", routed.?);
+}
+
+test "resolveInboundRouteSessionKey supports standardized peer metadata for unknown channel" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "custom-agent",
+            .match = .{
+                .channel = "custom",
+                .account_id = "custom-main",
+                .peer = .{ .kind = .direct, .id = "user-7" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "custom",
+        .sender_id = "ignored-sender",
+        .chat_id = "ignored-chat",
+        .content = "hello",
+        .session_key = "custom:legacy",
+        .metadata_json = "{\"account_id\":\"custom-main\",\"peer_kind\":\"direct\",\"peer_id\":\"user-7\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", routed.?);
 }
 
 test "stateFilePath derives from config_path" {
@@ -595,9 +1336,10 @@ test "channelSupervisorThread respects shutdown" {
 
     var channel_registry = dispatch.ChannelRegistry.init(std.testing.allocator);
     defer channel_registry.deinit();
+    var event_bus = bus_mod.Bus.init();
 
     const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
-        std.testing.allocator, &config, &state, &channel_registry, null,
+        std.testing.allocator, &config, &state, &channel_registry, null, &event_bus,
     });
     thread.join();
 

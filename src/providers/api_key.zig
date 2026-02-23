@@ -69,24 +69,45 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "groq", .{ "GROQ_API_KEY", "", "" } },
         .{ "mistral", .{ "MISTRAL_API_KEY", "", "" } },
         .{ "deepseek", .{ "DEEPSEEK_API_KEY", "", "" } },
+        .{ "z.ai", .{ "ZAI_API_KEY", "", "" } },
+        .{ "zai", .{ "ZAI_API_KEY", "", "" } },
+        .{ "glm", .{ "ZHIPU_API_KEY", "", "" } },
+        .{ "zhipu", .{ "ZHIPU_API_KEY", "", "" } },
         .{ "xai", .{ "XAI_API_KEY", "", "" } },
         .{ "grok", .{ "XAI_API_KEY", "", "" } },
         .{ "together", .{ "TOGETHER_API_KEY", "", "" } },
         .{ "together-ai", .{ "TOGETHER_API_KEY", "", "" } },
         .{ "fireworks", .{ "FIREWORKS_API_KEY", "", "" } },
         .{ "fireworks-ai", .{ "FIREWORKS_API_KEY", "", "" } },
+        .{ "synthetic", .{ "SYNTHETIC_API_KEY", "", "" } },
+        .{ "opencode", .{ "OPENCODE_API_KEY", "", "" } },
+        .{ "opencode-zen", .{ "OPENCODE_API_KEY", "", "" } },
+        .{ "minimax", .{ "MINIMAX_API_KEY", "", "" } },
+        .{ "qwen", .{ "DASHSCOPE_API_KEY", "", "" } },
+        .{ "dashscope", .{ "DASHSCOPE_API_KEY", "", "" } },
+        .{ "qianfan", .{ "QIANFAN_ACCESS_KEY", "", "" } },
+        .{ "baidu", .{ "QIANFAN_ACCESS_KEY", "", "" } },
         .{ "perplexity", .{ "PERPLEXITY_API_KEY", "", "" } },
         .{ "cohere", .{ "COHERE_API_KEY", "", "" } },
         .{ "venice", .{ "VENICE_API_KEY", "", "" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
+        .{ "bedrock", .{ "AWS_ACCESS_KEY_ID", "", "" } },
+        .{ "aws-bedrock", .{ "AWS_ACCESS_KEY_ID", "", "" } },
+        .{ "cloudflare", .{ "CLOUDFLARE_API_TOKEN", "", "" } },
+        .{ "cloudflare-ai", .{ "CLOUDFLARE_API_TOKEN", "", "" } },
+        .{ "vercel-ai", .{ "VERCEL_API_KEY", "", "" } },
+        .{ "vercel", .{ "VERCEL_API_KEY", "", "" } },
+        .{ "copilot", .{ "GITHUB_TOKEN", "", "" } },
+        .{ "github-copilot", .{ "GITHUB_TOKEN", "", "" } },
         .{ "nvidia", .{ "NVIDIA_API_KEY", "", "" } },
         .{ "nvidia-nim", .{ "NVIDIA_API_KEY", "", "" } },
         .{ "build.nvidia.com", .{ "NVIDIA_API_KEY", "", "" } },
         .{ "astrai", .{ "ASTRAI_API_KEY", "", "" } },
-        .{ "lmstudio", .{ "", "", "" } },
-        .{ "lm-studio", .{ "", "", "" } },
+        .{ "ollama", .{ "API_KEY", "", "" } },
+        .{ "lmstudio", .{ "API_KEY", "", "" } },
+        .{ "lm-studio", .{ "API_KEY", "", "" } },
     });
     return map.get(name) orelse .{ "", "", "" };
 }
@@ -128,6 +149,25 @@ test "NVIDIA_API_KEY env resolves nvidia credential" {
 test "astrai env candidate is ASTRAI_API_KEY" {
     const candidates = providerEnvCandidates("astrai");
     try std.testing.expectEqualStrings("ASTRAI_API_KEY", candidates[0]);
+}
+
+test "providerEnvCandidates includes onboarding env hints" {
+    const onboard = @import("../onboard.zig");
+
+    for (onboard.known_providers) |provider| {
+        const candidates = providerEnvCandidates(provider.key);
+
+        var matched = false;
+        for (candidates) |candidate| {
+            if (candidate.len == 0) break;
+            if (std.mem.eql(u8, candidate, provider.env_var)) {
+                matched = true;
+                break;
+            }
+        }
+
+        try std.testing.expect(matched);
+    }
 }
 
 test "resolveApiKeyFromConfig finds key from providers" {

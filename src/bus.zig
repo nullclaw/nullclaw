@@ -35,6 +35,7 @@ pub const InboundMessage = struct {
 
 pub const OutboundMessage = struct {
     channel: []const u8, // target channel
+    account_id: ?[]const u8 = null, // target account (multi-account channels)
     chat_id: []const u8, // target chat
     content: []const u8, // response text
     media: []const []const u8 = &.{}, // file paths/URLs to send
@@ -43,6 +44,7 @@ pub const OutboundMessage = struct {
         for (self.media) |m| allocator.free(m);
         if (self.media.len > 0) allocator.free(self.media);
         // channel is a string literal or long-lived config pointer — not owned, don't free
+        if (self.account_id) |aid| allocator.free(aid);
         allocator.free(self.chat_id);
         allocator.free(self.content);
     }
@@ -146,6 +148,27 @@ pub fn makeOutbound(
 
     return .{
         .channel = channel,
+        .chat_id = cid,
+        .content = ct,
+    };
+}
+
+pub fn makeOutboundWithAccount(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) Allocator.Error!OutboundMessage {
+    const cid = try allocator.dupe(u8, chat_id);
+    errdefer allocator.free(cid);
+    const ct = try allocator.dupe(u8, content);
+    errdefer allocator.free(ct);
+    const aid = try allocator.dupe(u8, account_id);
+
+    return .{
+        .channel = channel,
+        .account_id = aid,
         .chat_id = cid,
         .content = ct,
     };
@@ -356,6 +379,14 @@ test "makeOutbound produces owned copies" {
 
     src_content[0] = 'Z';
     try testing.expectEqualStrings("reply", msg.content);
+}
+
+test "makeOutboundWithAccount stores account_id" {
+    const alloc = testing.allocator;
+    const msg = try makeOutboundWithAccount(alloc, "telegram", "backup", "c1", "reply");
+    defer msg.deinit(alloc);
+    try testing.expect(msg.account_id != null);
+    try testing.expectEqualStrings("backup", msg.account_id.?);
 }
 
 // ---------------------------------------------------------------------------

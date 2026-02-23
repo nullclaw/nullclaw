@@ -143,8 +143,11 @@ pub const CronConfig = struct {
 // ── Channel configs ─────────────────────────────────────────────
 
 pub const TelegramConfig = struct {
+    account_id: []const u8 = "default",
     bot_token: []const u8,
     allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
     /// Use reply-to in private (1:1) chats. Groups always use reply-to.
     reply_in_private: bool = true,
     /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
@@ -152,20 +155,30 @@ pub const TelegramConfig = struct {
 };
 
 pub const DiscordConfig = struct {
+    account_id: []const u8 = "default",
     token: []const u8,
     guild_id: ?[]const u8 = null,
     allow_bots: bool = false,
     allow_from: []const []const u8 = &.{},
-    mention_only: bool = false,
+    require_mention: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
 
+pub const SlackReceiveMode = enum {
+    socket,
+    http,
+};
+
 pub const SlackConfig = struct {
+    account_id: []const u8 = "default",
+    mode: SlackReceiveMode = .socket,
     bot_token: []const u8,
     app_token: ?[]const u8 = null,
+    signing_secret: ?[]const u8 = null,
+    webhook_path: []const u8 = "/slack/events",
     channel_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
-    dm_policy: []const u8 = "allow",
+    dm_policy: []const u8 = "allowlist",
     group_policy: []const u8 = "mention_only",
 };
 
@@ -175,26 +188,52 @@ pub const WebhookConfig = struct {
 };
 
 pub const IMessageConfig = struct {
+    account_id: []const u8 = "default",
     allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+    db_path: ?[]const u8 = null,
     enabled: bool = false,
 };
 
 pub const MatrixConfig = struct {
+    account_id: []const u8 = "default",
     homeserver: []const u8,
     access_token: []const u8,
     room_id: []const u8,
+    user_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+};
+
+pub const MattermostConfig = struct {
+    account_id: []const u8 = "default",
+    bot_token: []const u8,
+    base_url: []const u8,
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    dm_policy: []const u8 = "allowlist",
+    group_policy: []const u8 = "allowlist",
+    chatmode: []const u8 = "oncall",
+    onchar_prefixes: []const []const u8 = &.{ ">", "!" },
+    require_mention: bool = true,
 };
 
 pub const WhatsAppConfig = struct {
+    account_id: []const u8 = "default",
     access_token: []const u8,
     phone_number_id: []const u8,
     verify_token: []const u8,
     app_secret: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    groups: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
 };
 
 pub const IrcConfig = struct {
+    account_id: []const u8 = "default",
     host: []const u8,
     port: u16 = 6697,
     nick: []const u8,
@@ -213,6 +252,7 @@ pub const LarkReceiveMode = enum {
 };
 
 pub const LarkConfig = struct {
+    account_id: []const u8 = "default",
     app_id: []const u8,
     app_secret: []const u8,
     encrypt_key: ?[]const u8 = null,
@@ -224,23 +264,162 @@ pub const LarkConfig = struct {
 };
 
 pub const DingTalkConfig = struct {
+    account_id: []const u8 = "default",
     client_id: []const u8,
     client_secret: []const u8,
     allow_from: []const []const u8 = &.{},
 };
 
+pub const SignalConfig = struct {
+    account_id: []const u8 = "default",
+    http_url: []const u8,
+    account: []const u8,
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+    ignore_attachments: bool = false,
+    ignore_stories: bool = false,
+};
+
+pub const EmailConfig = struct {
+    account_id: []const u8 = "default",
+    imap_host: []const u8 = "",
+    imap_port: u16 = 993,
+    imap_folder: []const u8 = "INBOX",
+    smtp_host: []const u8 = "",
+    smtp_port: u16 = 587,
+    smtp_tls: bool = true,
+    username: []const u8 = "",
+    password: []const u8 = "",
+    from_address: []const u8 = "",
+    poll_interval_secs: u64 = 60,
+    allow_from: []const []const u8 = &.{},
+    consent_granted: bool = true,
+};
+
+pub const LineConfig = struct {
+    account_id: []const u8 = "default",
+    access_token: []const u8,
+    channel_secret: []const u8,
+    port: u16 = 3000,
+    allow_from: []const []const u8 = &.{},
+};
+
+pub const QQGroupPolicy = enum {
+    allow,
+    allowlist,
+};
+
+pub const QQConfig = struct {
+    account_id: []const u8 = "default",
+    app_id: []const u8 = "",
+    app_secret: []const u8 = "",
+    bot_token: []const u8 = "",
+    sandbox: bool = false,
+    group_policy: QQGroupPolicy = .allow,
+    allowed_groups: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
+};
+
+pub const OneBotConfig = struct {
+    account_id: []const u8 = "default",
+    url: []const u8 = "ws://localhost:6700",
+    access_token: ?[]const u8 = null,
+    group_trigger_prefix: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+};
+
+pub const MaixCamConfig = struct {
+    account_id: []const u8 = "default",
+    port: u16 = 7777,
+    host: []const u8 = "0.0.0.0",
+    allow_from: []const []const u8 = &.{},
+    name: []const u8 = "maixcam",
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
-    telegram: ?TelegramConfig = null,
-    discord: ?DiscordConfig = null,
-    slack: ?SlackConfig = null,
+    telegram: []const TelegramConfig = &.{},
+    discord: []const DiscordConfig = &.{},
+    slack: []const SlackConfig = &.{},
     webhook: ?WebhookConfig = null,
-    imessage: ?IMessageConfig = null,
-    matrix: ?MatrixConfig = null,
-    whatsapp: ?WhatsAppConfig = null,
-    irc: ?IrcConfig = null,
-    lark: ?LarkConfig = null,
-    dingtalk: ?DingTalkConfig = null,
+    imessage: []const IMessageConfig = &.{},
+    matrix: []const MatrixConfig = &.{},
+    mattermost: []const MattermostConfig = &.{},
+    whatsapp: []const WhatsAppConfig = &.{},
+    irc: []const IrcConfig = &.{},
+    lark: []const LarkConfig = &.{},
+    dingtalk: []const DingTalkConfig = &.{},
+    signal: []const SignalConfig = &.{},
+    email: []const EmailConfig = &.{},
+    line: []const LineConfig = &.{},
+    qq: []const QQConfig = &.{},
+    onebot: []const OneBotConfig = &.{},
+    maixcam: []const MaixCamConfig = &.{},
+
+    fn primaryAccount(comptime T: type, items: []const T) ?T {
+        if (items.len == 0) return null;
+        if (comptime @hasField(T, "account_id")) {
+            for (items) |item| {
+                if (std.mem.eql(u8, item.account_id, "default")) return item;
+            }
+            for (items) |item| {
+                if (std.mem.eql(u8, item.account_id, "main")) return item;
+            }
+        }
+        return items[0];
+    }
+
+    /// Get preferred account for a channel, or null if none configured.
+    /// Selection order: `account_id=default`, then `account_id=main`, then first entry.
+    pub fn telegramPrimary(self: *const ChannelsConfig) ?TelegramConfig {
+        return primaryAccount(TelegramConfig, self.telegram);
+    }
+    pub fn discordPrimary(self: *const ChannelsConfig) ?DiscordConfig {
+        return primaryAccount(DiscordConfig, self.discord);
+    }
+    pub fn slackPrimary(self: *const ChannelsConfig) ?SlackConfig {
+        return primaryAccount(SlackConfig, self.slack);
+    }
+    pub fn signalPrimary(self: *const ChannelsConfig) ?SignalConfig {
+        return primaryAccount(SignalConfig, self.signal);
+    }
+    pub fn imessagePrimary(self: *const ChannelsConfig) ?IMessageConfig {
+        return primaryAccount(IMessageConfig, self.imessage);
+    }
+    pub fn matrixPrimary(self: *const ChannelsConfig) ?MatrixConfig {
+        return primaryAccount(MatrixConfig, self.matrix);
+    }
+    pub fn mattermostPrimary(self: *const ChannelsConfig) ?MattermostConfig {
+        return primaryAccount(MattermostConfig, self.mattermost);
+    }
+    pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
+        return primaryAccount(WhatsAppConfig, self.whatsapp);
+    }
+    pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
+        return primaryAccount(IrcConfig, self.irc);
+    }
+    pub fn larkPrimary(self: *const ChannelsConfig) ?LarkConfig {
+        return primaryAccount(LarkConfig, self.lark);
+    }
+    pub fn dingtalkPrimary(self: *const ChannelsConfig) ?DingTalkConfig {
+        return primaryAccount(DingTalkConfig, self.dingtalk);
+    }
+    pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
+        return primaryAccount(EmailConfig, self.email);
+    }
+    pub fn linePrimary(self: *const ChannelsConfig) ?LineConfig {
+        return primaryAccount(LineConfig, self.line);
+    }
+    pub fn qqPrimary(self: *const ChannelsConfig) ?QQConfig {
+        return primaryAccount(QQConfig, self.qq);
+    }
+    pub fn onebotPrimary(self: *const ChannelsConfig) ?OneBotConfig {
+        return primaryAccount(OneBotConfig, self.onebot);
+    }
+    pub fn maixcamPrimary(self: *const ChannelsConfig) ?MaixCamConfig {
+        return primaryAccount(MaixCamConfig, self.maixcam);
+    }
 };
 
 // ── Memory config ───────────────────────────────────────────────
@@ -451,4 +630,29 @@ pub const ModelPricing = struct {
     model: []const u8 = "",
     input_cost_per_1k: f64 = 0.0,
     output_cost_per_1k: f64 = 0.0,
+};
+
+// ── Session Config ──────────────────────────────────────────────
+
+pub const DmScope = enum {
+    /// Single shared session for all DMs.
+    main,
+    /// One session per peer across all channels.
+    per_peer,
+    /// One session per (channel, peer) pair (default).
+    per_channel_peer,
+    /// One session per (account, channel, peer) triple.
+    per_account_channel_peer,
+};
+
+pub const IdentityLink = struct {
+    canonical: []const u8,
+    peers: []const []const u8 = &.{},
+};
+
+pub const SessionConfig = struct {
+    dm_scope: DmScope = .per_channel_peer,
+    idle_minutes: u32 = 60,
+    identity_links: []const IdentityLink = &.{},
+    typing_interval_secs: u32 = 5,
 };

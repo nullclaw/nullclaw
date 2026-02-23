@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("config_types.zig");
+const agent_routing = @import("agent_routing.zig");
 
 // Forward-reference to the Config struct defined in config.zig.
 // Zig handles circular @import lazily, so this works as long as there is
@@ -17,6 +18,249 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
         }
     }
     return try list.toOwnedSlice(allocator);
+}
+
+fn parsePeerKind(kind: []const u8) ?agent_routing.ChatType {
+    if (std.mem.eql(u8, kind, "direct") or std.mem.eql(u8, kind, "dm")) return .direct;
+    if (std.mem.eql(u8, kind, "group")) return .group;
+    if (std.mem.eql(u8, kind, "channel")) return .channel;
+    return null;
+}
+
+fn parseAgentBindingsArray(
+    allocator: std.mem.Allocator,
+    arr: std.json.Array,
+) ![]const agent_routing.AgentBinding {
+    var list: std.ArrayListUnmanaged(agent_routing.AgentBinding) = .empty;
+    try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
+
+    for (arr.items) |item| {
+        if (item != .object) continue;
+
+        const agent_id_val = item.object.get("agent_id") orelse continue;
+        if (agent_id_val != .string) continue;
+
+        var binding = agent_routing.AgentBinding{
+            .agent_id = try allocator.dupe(u8, agent_id_val.string),
+        };
+
+        if (item.object.get("comment")) |comment_val| {
+            if (comment_val == .string) {
+                binding.comment = try allocator.dupe(u8, comment_val.string);
+            }
+        }
+
+        const match_val = item.object.get("match");
+        if (match_val) |mv| {
+            if (mv == .object) {
+                if (mv.object.get("channel")) |v| {
+                    if (v == .string) binding.match.channel = try allocator.dupe(u8, v.string);
+                }
+                if (mv.object.get("account_id")) |v| {
+                    if (v == .string) binding.match.account_id = try allocator.dupe(u8, v.string);
+                }
+                if (mv.object.get("guild_id")) |v| {
+                    if (v == .string) binding.match.guild_id = try allocator.dupe(u8, v.string);
+                }
+                if (mv.object.get("team_id")) |v| {
+                    if (v == .string) binding.match.team_id = try allocator.dupe(u8, v.string);
+                }
+                if (mv.object.get("roles")) |v| {
+                    if (v == .array) binding.match.roles = try parseStringArray(allocator, v.array);
+                }
+                if (mv.object.get("peer")) |peer_val| {
+                    if (peer_val == .object) {
+                        const kind_val = peer_val.object.get("kind");
+                        const id_val = peer_val.object.get("id");
+                        if (kind_val != null and id_val != null and kind_val.? == .string and id_val.? == .string) {
+                            if (parsePeerKind(kind_val.?.string)) |kind| {
+                                binding.match.peer = .{
+                                    .kind = kind,
+                                    .id = try allocator.dupe(u8, id_val.?.string),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        try list.append(allocator, binding);
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
+const SelectedAccount = struct {
+    id: []const u8,
+    value: std.json.Value,
+};
+
+fn countAccounts(accounts: std.json.ObjectMap) usize {
+    var count: usize = 0;
+    var it = accounts.iterator();
+    while (it.next()) |_| {
+        count += 1;
+    }
+    return count;
+}
+
+fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
+    const accts_val = channel_obj.get("accounts") orelse return null;
+    if (accts_val != .object) return null;
+    const accounts = accts_val.object;
+    const has_multiple = countAccounts(accounts) > 1;
+
+    if (accounts.get("default")) |default_acc| {
+        if (default_acc == .object) {
+            if (has_multiple) {
+                std.log.warn("Multiple accounts configured; using accounts.default", .{});
+            }
+            return .{ .id = "default", .value = default_acc };
+        }
+    }
+    if (accounts.get("main")) |main_acc| {
+        if (main_acc == .object) {
+            if (has_multiple) {
+                std.log.warn("Multiple accounts configured; using accounts.main", .{});
+            }
+            return .{ .id = "main", .value = main_acc };
+        }
+    }
+
+    var it = accounts.iterator();
+    const first = it.next() orelse return null;
+    if (first.value_ptr.* != .object) return null;
+    if (has_multiple) {
+        std.log.warn("Multiple accounts configured; only first account used", .{});
+    }
+    return .{
+        .id = first.key_ptr.*,
+        .value = first.value_ptr.*,
+    };
+}
+
+fn getAllAccountsSorted(allocator: std.mem.Allocator, channel_obj: std.json.ObjectMap) ![]const SelectedAccount {
+    const accts_val = channel_obj.get("accounts") orelse return &.{};
+    if (accts_val != .object) return &.{};
+    const accounts = accts_val.object;
+
+    var list: std.ArrayListUnmanaged(SelectedAccount) = .empty;
+    var it = accounts.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .object) {
+            try list.append(allocator, .{
+                .id = entry.key_ptr.*,
+                .value = entry.value_ptr.*,
+            });
+        }
+    }
+
+    if (list.items.len > 1) {
+        std.mem.sort(SelectedAccount, list.items, {}, struct {
+            fn cmp(_: void, a: SelectedAccount, b: SelectedAccount) bool {
+                return std.mem.order(u8, a.id, b.id) == .lt;
+            }
+        }.cmp);
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn parseTypedValue(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value) ?T {
+    return std.json.parseFromValueLeaky(T, allocator, value, .{
+        .ignore_unknown_fields = true,
+    }) catch null;
+}
+
+fn maybeSetAccountId(comptime T: type, allocator: std.mem.Allocator, parsed: *T, account_id: []const u8) !void {
+    if (comptime @hasField(T, "account_id")) {
+        const current = @field(parsed.*, "account_id");
+        if (!std.mem.eql(u8, current, "default")) {
+            allocator.free(current);
+        }
+        @field(parsed.*, "account_id") = try allocator.dupe(u8, account_id);
+    }
+}
+
+fn parseMultiAccountChannel(comptime T: type, allocator: std.mem.Allocator, channel_value: std.json.Value) ![]const T {
+    if (channel_value != .object) return &.{};
+
+    const accounts = try getAllAccountsSorted(allocator, channel_value.object);
+    defer if (accounts.len > 0) allocator.free(accounts);
+    if (accounts.len == 0) {
+        // Accept inline single-account format:
+        // "channel": { "token": "...", ... }
+        const parsed = parseTypedValue(T, allocator, channel_value) orelse return &.{};
+        var list: std.ArrayListUnmanaged(T) = .empty;
+        try list.append(allocator, parsed);
+        return try list.toOwnedSlice(allocator);
+    }
+
+    var list: std.ArrayListUnmanaged(T) = .empty;
+    for (accounts) |acc| {
+        var parsed = parseTypedValue(T, allocator, acc.value) orelse continue;
+        try maybeSetAccountId(T, allocator, &parsed, acc.id);
+        try list.append(allocator, parsed);
+    }
+
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return &.{};
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn parseSingleAccountChannel(comptime T: type, allocator: std.mem.Allocator, channel_value: std.json.Value) !?T {
+    if (channel_value != .object) return null;
+    const selected = getPreferredAccount(channel_value.object) orelse return null;
+
+    var parsed = parseTypedValue(T, allocator, selected.value) orelse return null;
+    try maybeSetAccountId(T, allocator, &parsed, selected.id);
+    return parsed;
+}
+
+fn parseInlineChannel(comptime T: type, allocator: std.mem.Allocator, channel_value: std.json.Value) ?T {
+    if (channel_value != .object) return null;
+    return parseTypedValue(T, allocator, channel_value);
+}
+
+fn parseChannels(self: *Config, channels_value: std.json.Value) !void {
+    if (channels_value != .object) return;
+    const channels_obj = channels_value.object;
+
+    if (channels_obj.get("cli")) |v| {
+        if (v == .bool) self.channels.cli = v.bool;
+    }
+
+    inline for (std.meta.fields(types.ChannelsConfig)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "cli")) continue;
+        if (channels_obj.get(field.name)) |channel_value| {
+            switch (@typeInfo(field.type)) {
+                .pointer => |ptr| {
+                    if (ptr.size == .slice) {
+                        const Elem = ptr.child;
+                        const parsed = try parseMultiAccountChannel(Elem, self.allocator, channel_value);
+                        if (parsed.len > 0) {
+                            @field(self.channels, field.name) = parsed;
+                        }
+                    }
+                },
+                .optional => |opt| {
+                    const Child = opt.child;
+                    if (comptime @hasField(Child, "account_id")) {
+                        if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
+                            @field(self.channels, field.name) = parsed;
+                        }
+                    } else {
+                        if (parseInlineChannel(Child, self.allocator, channel_value)) |parsed| {
+                            @field(self.channels, field.name) = parsed;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
 }
 
 /// Parse JSON content into the given Config.
@@ -171,6 +415,14 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.agents = try list.toOwnedSlice(self.allocator);
                 }
             }
+        }
+    }
+
+    // Agent bindings (OpenClaw-style key, snake_case payload fields).
+    const bindings_src = root.get("bindings");
+    if (bindings_src) |bindings_val| {
+        if (bindings_val == .array) {
+            self.agent_bindings = try parseAgentBindingsArray(self.allocator, bindings_val.array);
         }
     }
 
@@ -769,282 +1021,71 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    // Channels (with accounts wrapper: channels.<type>.accounts.<id>.{fields})
+    // Channels
     if (root.get("channels")) |ch| {
-        if (ch == .object) {
-            if (ch.object.get("cli")) |v| {
-                if (v == .bool) self.channels.cli = v.bool;
-            }
+        try parseChannels(self, ch);
+    }
 
-            // Helper: get first account object from accounts wrapper
-            const getFirstAccount = struct {
-                fn call(obj: std.json.ObjectMap) ?std.json.ObjectMap {
-                    const accts = obj.get("accounts") orelse return null;
-                    if (accts != .object) return null;
-                    var it = accts.object.iterator();
-                    const first = it.next() orelse return null;
-                    if (first.value_ptr.* != .object) return null;
-                    return first.value_ptr.object;
-                }
-            }.call;
-
-            // Telegram
-            if (ch.object.get("telegram")) |tg| {
-                if (tg == .object) {
-                    if (getFirstAccount(tg.object)) |acc| {
-                        if (acc.get("bot_token")) |tok| {
-                            if (tok == .string) {
-                                self.channels.telegram = .{ .bot_token = try self.allocator.dupe(u8, tok.string) };
-                            }
-                        }
-                        if (self.channels.telegram) |*tg_cfg| {
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) tg_cfg.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                            if (acc.get("reply_in_private")) |v| {
-                                if (v == .bool) tg_cfg.reply_in_private = v.bool;
-                            }
-                            if (acc.get("proxy")) |v| {
-                                if (v == .string) tg_cfg.proxy = try self.allocator.dupe(u8, v.string);
-                            }
-                        }
+    // Session config
+    if (root.get("session")) |sess| {
+        if (sess == .object) {
+            const dm_val = sess.object.get("dm_scope");
+            if (dm_val) |v| {
+                if (v == .string) {
+                    const s = v.string;
+                    // Accept both dash and underscore formats
+                    if (std.mem.eql(u8, s, "main")) {
+                        self.session.dm_scope = .main;
+                    } else if (std.mem.eql(u8, s, "per_peer") or std.mem.eql(u8, s, "per-peer")) {
+                        self.session.dm_scope = .per_peer;
+                    } else if (std.mem.eql(u8, s, "per_channel_peer") or std.mem.eql(u8, s, "per-channel-peer")) {
+                        self.session.dm_scope = .per_channel_peer;
+                    } else if (std.mem.eql(u8, s, "per_account_channel_peer") or std.mem.eql(u8, s, "per-account-channel-peer")) {
+                        self.session.dm_scope = .per_account_channel_peer;
                     }
                 }
             }
-
-            // Discord
-            if (ch.object.get("discord")) |disc| {
-                if (disc == .object) {
-                    if (getFirstAccount(disc.object)) |acc| {
-                        if (acc.get("token")) |tok| {
-                            if (tok == .string) {
-                                self.channels.discord = .{ .token = try self.allocator.dupe(u8, tok.string) };
-                            }
-                        }
-                        if (self.channels.discord) |*dc| {
-                            if (acc.get("guild_id")) |v| {
-                                if (v == .string) dc.guild_id = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) dc.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                            if (acc.get("allow_bots")) |v| {
-                                if (v == .bool) dc.allow_bots = v.bool;
-                            }
-                            if (acc.get("mention_only")) |v| {
-                                if (v == .bool) dc.mention_only = v.bool;
-                            }
-                            if (acc.get("intents")) |v| {
-                                if (v == .integer) dc.intents = @intCast(v.integer);
-                            }
-                        }
-                    }
-                }
+            const idle_val = sess.object.get("idle_minutes");
+            if (idle_val) |v| {
+                if (v == .integer) self.session.idle_minutes = @intCast(v.integer);
             }
-
-            // Slack
-            if (ch.object.get("slack")) |sl| {
-                if (sl == .object) {
-                    if (getFirstAccount(sl.object)) |acc| {
-                        if (acc.get("bot_token")) |tok| {
-                            if (tok == .string) {
-                                self.channels.slack = .{ .bot_token = try self.allocator.dupe(u8, tok.string) };
-                            }
-                        }
-                        if (self.channels.slack) |*sc| {
-                            if (acc.get("app_token")) |v| {
-                                if (v == .string) sc.app_token = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("channel_id")) |v| {
-                                if (v == .string) sc.channel_id = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) sc.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                            if (acc.get("dm_policy")) |v| {
-                                if (v == .string) sc.dm_policy = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("group_policy")) |v| {
-                                if (v == .string) sc.group_policy = try self.allocator.dupe(u8, v.string);
-                            }
-                        }
-                    }
-                }
+            const typing_val = sess.object.get("typing_interval_secs");
+            if (typing_val) |v| {
+                if (v == .integer) self.session.typing_interval_secs = @intCast(v.integer);
             }
-
-            // IRC
-            if (ch.object.get("irc")) |irc| {
-                if (irc == .object) {
-                    if (getFirstAccount(irc.object)) |acc| irc_blk: {
-                        const host = acc.get("host") orelse break :irc_blk;
-                        const nick = acc.get("nick") orelse break :irc_blk;
-                        if (host != .string or nick != .string) break :irc_blk;
-                        self.channels.irc = .{
-                            .host = try self.allocator.dupe(u8, host.string),
-                            .nick = try self.allocator.dupe(u8, nick.string),
+            const links_val = sess.object.get("identity_links");
+            if (links_val) |links| {
+                var link_list: std.ArrayListUnmanaged(types.IdentityLink) = .empty;
+                if (links == .array) {
+                    // Array format: [{"canonical": "alice", "peers": ["telegram:111"]}]
+                    for (links.array.items) |item| {
+                        if (item != .object) continue;
+                        const canonical = item.object.get("canonical") orelse continue;
+                        if (canonical != .string) continue;
+                        var link: types.IdentityLink = .{
+                            .canonical = try self.allocator.dupe(u8, canonical.string),
                         };
-                        if (self.channels.irc) |*ic| {
-                            if (acc.get("port")) |v| {
-                                if (v == .integer) ic.port = @intCast(v.integer);
-                            }
-                            if (acc.get("username")) |v| {
-                                if (v == .string) ic.username = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("channels")) |v| {
-                                if (v == .array) ic.channels = try parseStringArray(self.allocator, v.array);
-                            }
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) ic.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                            if (acc.get("server_password")) |v| {
-                                if (v == .string) ic.server_password = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("nickserv_password")) |v| {
-                                if (v == .string) ic.nickserv_password = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("sasl_password")) |v| {
-                                if (v == .string) ic.sasl_password = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("tls")) |v| {
-                                if (v == .bool) ic.tls = v.bool;
+                        if (item.object.get("peers")) |peers| {
+                            if (peers == .array) {
+                                link.peers = try parseStringArray(self.allocator, peers.array);
                             }
                         }
+                        try link_list.append(self.allocator, link);
                     }
-                }
-            }
-
-            // Matrix
-            if (ch.object.get("matrix")) |mx| {
-                if (mx == .object) {
-                    if (getFirstAccount(mx.object)) |acc| mx_blk: {
-                        const hs = acc.get("homeserver") orelse break :mx_blk;
-                        const at = acc.get("access_token") orelse break :mx_blk;
-                        const rid = acc.get("room_id") orelse break :mx_blk;
-                        if (hs != .string or at != .string or rid != .string) break :mx_blk;
-                        self.channels.matrix = .{
-                            .homeserver = try self.allocator.dupe(u8, hs.string),
-                            .access_token = try self.allocator.dupe(u8, at.string),
-                            .room_id = try self.allocator.dupe(u8, rid.string),
+                } else if (links == .object) {
+                    // Map format: {"alice": ["telegram:111", "discord:222"]}
+                    var it = links.object.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.key_ptr.*.len == 0) continue;
+                        if (entry.value_ptr.* != .array) continue;
+                        var link: types.IdentityLink = .{
+                            .canonical = try self.allocator.dupe(u8, entry.key_ptr.*),
                         };
-                        if (self.channels.matrix) |*mc| {
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) mc.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                        }
+                        link.peers = try parseStringArray(self.allocator, entry.value_ptr.array);
+                        try link_list.append(self.allocator, link);
                     }
                 }
-            }
-
-            // WhatsApp
-            if (ch.object.get("whatsapp")) |wa| {
-                if (wa == .object) {
-                    if (getFirstAccount(wa.object)) |acc| wa_blk: {
-                        const at = acc.get("access_token") orelse break :wa_blk;
-                        const pni = acc.get("phone_number_id") orelse break :wa_blk;
-                        const vt = acc.get("verify_token") orelse break :wa_blk;
-                        if (at != .string or pni != .string or vt != .string) break :wa_blk;
-                        self.channels.whatsapp = .{
-                            .access_token = try self.allocator.dupe(u8, at.string),
-                            .phone_number_id = try self.allocator.dupe(u8, pni.string),
-                            .verify_token = try self.allocator.dupe(u8, vt.string),
-                        };
-                        if (self.channels.whatsapp) |*wc| {
-                            if (acc.get("app_secret")) |v| {
-                                if (v == .string) wc.app_secret = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) wc.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // iMessage (no accounts wrapper — simple struct)
-            if (ch.object.get("imessage")) |im| {
-                if (im == .object) {
-                    self.channels.imessage = .{};
-                    if (self.channels.imessage) |*ic| {
-                        if (im.object.get("enabled")) |v| {
-                            if (v == .bool) ic.enabled = v.bool;
-                        }
-                        if (im.object.get("allow_from")) |v| {
-                            if (v == .array) ic.allow_from = try parseStringArray(self.allocator, v.array);
-                        }
-                    }
-                }
-            }
-
-            // Lark
-            if (ch.object.get("lark")) |lk| {
-                if (lk == .object) {
-                    if (getFirstAccount(lk.object)) |acc| lk_blk: {
-                        const aid = acc.get("app_id") orelse break :lk_blk;
-                        const asec = acc.get("app_secret") orelse break :lk_blk;
-                        if (aid != .string or asec != .string) break :lk_blk;
-                        self.channels.lark = .{
-                            .app_id = try self.allocator.dupe(u8, aid.string),
-                            .app_secret = try self.allocator.dupe(u8, asec.string),
-                        };
-                        if (self.channels.lark) |*lc| {
-                            if (acc.get("encrypt_key")) |v| {
-                                if (v == .string) lc.encrypt_key = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("verification_token")) |v| {
-                                if (v == .string) lc.verification_token = try self.allocator.dupe(u8, v.string);
-                            }
-                            if (acc.get("use_feishu")) |v| {
-                                if (v == .bool) lc.use_feishu = v.bool;
-                            }
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) lc.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                            if (acc.get("receive_mode")) |v| {
-                                if (v == .string) {
-                                    if (std.mem.eql(u8, v.string, "webhook")) lc.receive_mode = .webhook;
-                                }
-                            }
-                            if (acc.get("port")) |v| {
-                                if (v == .integer) lc.port = @intCast(v.integer);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // DingTalk
-            if (ch.object.get("dingtalk")) |dt| {
-                if (dt == .object) {
-                    if (getFirstAccount(dt.object)) |acc| dt_blk: {
-                        const cid = acc.get("client_id") orelse break :dt_blk;
-                        const csec = acc.get("client_secret") orelse break :dt_blk;
-                        if (cid != .string or csec != .string) break :dt_blk;
-                        self.channels.dingtalk = .{
-                            .client_id = try self.allocator.dupe(u8, cid.string),
-                            .client_secret = try self.allocator.dupe(u8, csec.string),
-                        };
-                        if (self.channels.dingtalk) |*dc| {
-                            if (acc.get("allow_from")) |v| {
-                                if (v == .array) dc.allow_from = try parseStringArray(self.allocator, v.array);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Webhook (no accounts wrapper)
-            if (ch.object.get("webhook")) |wh| {
-                if (wh == .object) {
-                    self.channels.webhook = .{};
-                    if (self.channels.webhook) |*wc| {
-                        if (wh.object.get("port")) |v| {
-                            if (v == .integer) wc.port = @intCast(v.integer);
-                        }
-                        if (wh.object.get("secret")) |v| {
-                            if (v == .string) wc.secret = try self.allocator.dupe(u8, v.string);
-                        }
-                    }
-                }
+                self.session.identity_links = try link_list.toOwnedSlice(self.allocator);
             }
         }
     }

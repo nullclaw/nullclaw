@@ -255,9 +255,11 @@ fn buildCodexBody(
         }
     }
 
+    try buf.appendSlice(allocator, ",\"instructions\":");
     if (instructions) |inst| {
-        try buf.appendSlice(allocator, ",\"instructions\":");
         try root.appendJsonString(&buf, allocator, inst);
+    } else {
+        try buf.appendSlice(allocator, "\"You are a helpful assistant.\"");
     }
 
     // Build input items array — last user message becomes input, rest are context
@@ -307,9 +309,11 @@ fn buildSimpleCodexBody(
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\"");
 
+    try buf.appendSlice(allocator, ",\"instructions\":");
     if (system) |sys| {
-        try buf.appendSlice(allocator, ",\"instructions\":");
         try root.appendJsonString(&buf, allocator, sys);
+    } else {
+        try buf.appendSlice(allocator, "\"You are a helpful assistant.\"");
     }
 
     try buf.appendSlice(allocator, ",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":");
@@ -416,6 +420,9 @@ fn codexStreamRequest(
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
+    var saw_text_delta = false;
+    var emitted_text_fallback = false;
+    var emitted_tool_payload = false;
 
     outer: while (true) {
         const n = file.read(&read_buf) catch break;
@@ -429,10 +436,51 @@ fn codexStreamRequest(
                 };
                 line_buf.clearRetainingCapacity();
                 switch (result) {
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
+                    .delta => |delta_evt| {
+                        defer allocator.free(delta_evt.text);
+                        const is_tool_payload = std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null;
+                        switch (delta_evt.source) {
+                            .output_text_delta, .refusal_delta => {
+                                saw_text_delta = true;
+                                try accumulated.appendSlice(allocator, delta_evt.text);
+                                callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
+                            },
+                            .output_text_done, .content_part_done => {
+                                // Fallback text only when canonical deltas were absent.
+                                if (saw_text_delta or emitted_text_fallback) continue;
+                                emitted_text_fallback = true;
+                                try accumulated.appendSlice(allocator, delta_evt.text);
+                                callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
+                            },
+                            .output_item_done => {
+                                if (is_tool_payload) {
+                                    emitted_tool_payload = true;
+                                    try accumulated.appendSlice(allocator, delta_evt.text);
+                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
+                                } else {
+                                    // Message snapshot text, fallback-only.
+                                    if (saw_text_delta or emitted_text_fallback) continue;
+                                    emitted_text_fallback = true;
+                                    try accumulated.appendSlice(allocator, delta_evt.text);
+                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
+                                }
+                            },
+                            .response_completed, .response_done => {
+                                if (is_tool_payload) {
+                                    // Completed may repeat tool payloads already emitted from output_item.done.
+                                    if (emitted_tool_payload) continue;
+                                    emitted_tool_payload = true;
+                                    try accumulated.appendSlice(allocator, delta_evt.text);
+                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
+                                } else {
+                                    // Completed text is fallback-only when no deltas were seen.
+                                    if (saw_text_delta or emitted_text_fallback) continue;
+                                    emitted_text_fallback = true;
+                                    try accumulated.appendSlice(allocator, delta_evt.text);
+                                    callback(ctx, root.StreamChunk.textDelta(delta_evt.text));
+                                }
+                            },
+                        }
                     },
                     .done => break :outer,
                     .error_msg => break :outer,
@@ -474,19 +522,200 @@ fn codexStreamRequest(
 // ── SSE Event Parsing ────────────────────────────────────────────────────
 
 /// Result of parsing a single Codex SSE line.
+pub const CodexDeltaSource = enum {
+    output_text_delta,
+    refusal_delta,
+    output_text_done,
+    content_part_done,
+    output_item_done,
+    response_completed,
+    response_done,
+};
+
 pub const CodexSseResult = union(enum) {
-    delta: []const u8,
+    delta: struct {
+        text: []const u8,
+        source: CodexDeltaSource,
+    },
     done: void,
     error_msg: void,
     skip: void,
 };
+
+fn appendSingleContentPartText(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    part_obj: std.json.ObjectMap,
+) !void {
+    const type_val = part_obj.get("type") orelse return;
+    if (type_val != .string) return;
+    if (!std.mem.eql(u8, type_val.string, "output_text") and
+        !std.mem.eql(u8, type_val.string, "text"))
+    {
+        return;
+    }
+    const text_val = part_obj.get("text") orelse return;
+    if (text_val != .string or text_val.string.len == 0) return;
+    try out.appendSlice(allocator, text_val.string);
+}
+
+fn appendResponseContentText(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, content_val: std.json.Value) !void {
+    if (content_val != .array) return;
+    for (content_val.array.items) |part| {
+        if (part != .object) continue;
+        try appendSingleContentPartText(out, allocator, part.object);
+    }
+}
+
+fn firstTextFromContent(content_val: std.json.Value) ?[]const u8 {
+    if (content_val != .array) return null;
+
+    // Prefer explicit output_text blocks first.
+    for (content_val.array.items) |part| {
+        if (part != .object) continue;
+        const part_obj = part.object;
+        const type_val = part_obj.get("type") orelse continue;
+        if (type_val != .string) continue;
+        if (!std.mem.eql(u8, type_val.string, "output_text")) continue;
+        const text_val = part_obj.get("text") orelse continue;
+        if (text_val == .string and text_val.string.len > 0) return text_val.string;
+    }
+
+    // Fallback to any non-empty text-like block.
+    for (content_val.array.items) |part| {
+        if (part != .object) continue;
+        const part_obj = part.object;
+        const text_val = part_obj.get("text") orelse continue;
+        if (text_val == .string and text_val.string.len > 0) return text_val.string;
+    }
+
+    return null;
+}
+
+fn appendToolCallXml(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    arguments_json: []const u8,
+) !void {
+    try out.appendSlice(allocator, "<tool_call>\n{\"name\":");
+    try root.appendJsonString(out, allocator, name);
+    try out.appendSlice(allocator, ",\"arguments\":");
+
+    const trimmed_args = std.mem.trim(u8, arguments_json, " \t\r\n");
+    if (trimmed_args.len == 0) {
+        try out.appendSlice(allocator, "{}");
+    } else if (trimmed_args[0] == '{' or trimmed_args[0] == '[') {
+        try out.appendSlice(allocator, trimmed_args);
+    } else {
+        // Keep shape valid if backend returns non-JSON arguments.
+        try root.appendJsonString(out, allocator, trimmed_args);
+    }
+
+    try out.appendSlice(allocator, "}\n</tool_call>\n");
+}
+
+fn extractOutputItemText(item_obj: std.json.ObjectMap) ?[]const u8 {
+    const item_type = item_obj.get("type") orelse return null;
+    if (item_type != .string) return null;
+
+    if (!std.mem.eql(u8, item_type.string, "message")) return null;
+
+    const content_val = item_obj.get("content") orelse return null;
+    return firstTextFromContent(content_val);
+}
+
+fn extractOutputItemToolCallXml(allocator: std.mem.Allocator, item_obj: std.json.ObjectMap) !?[]u8 {
+    const item_type = item_obj.get("type") orelse return null;
+    if (item_type != .string) return null;
+
+    if (!std.mem.eql(u8, item_type.string, "function_call")) return null;
+
+    const name_val = item_obj.get("name") orelse return null;
+    if (name_val != .string or name_val.string.len == 0) return null;
+
+    var args: []const u8 = "{}";
+    if (item_obj.get("arguments")) |args_val| {
+        if (args_val == .string and args_val.string.len > 0) {
+            args = args_val.string;
+        }
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendToolCallXml(&out, allocator, name_val.string, args);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn extractCompletedText(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap) !?[]u8 {
+    if (root_obj.get("output_text")) |ot| {
+        if (ot == .string and ot.string.len > 0) {
+            return try allocator.dupe(u8, ot.string);
+        }
+    }
+
+    const response_val = root_obj.get("response");
+    if (response_val) |resp| {
+        if (resp == .object) {
+            if (resp.object.get("output_text")) |ot| {
+                if (ot == .string and ot.string.len > 0) {
+                    return try allocator.dupe(u8, ot.string);
+                }
+            }
+        }
+    }
+
+    const output_val: ?std.json.Value = if (response_val) |resp| blk: {
+        if (resp != .object) break :blk null;
+        break :blk resp.object.get("output");
+    } else root_obj.get("output");
+
+    if (output_val) |ov| {
+        if (ov == .array) {
+            for (ov.array.items) |item| {
+                if (item != .object) continue;
+                if (extractOutputItemText(item.object)) |text| {
+                    return try allocator.dupe(u8, text);
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+fn extractCompletedToolCalls(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap) !?[]u8 {
+    const response_val = root_obj.get("response");
+    const output_val: ?std.json.Value = if (response_val) |resp| blk: {
+        if (resp != .object) break :blk null;
+        break :blk resp.object.get("output");
+    } else root_obj.get("output");
+
+    if (output_val == null or output_val.? != .array) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (output_val.?.array.items) |item| {
+        if (item != .object) continue;
+        const maybe_xml = try extractOutputItemToolCallXml(allocator, item.object);
+        if (maybe_xml) |xml| {
+            defer allocator.free(xml);
+            try out.appendSlice(allocator, xml);
+        }
+    }
+
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(allocator);
+}
 
 /// Parse a single Codex SSE event line.
 ///
 /// Codex SSE format: `event: <type>\ndata: {JSON}`
 /// Event types:
 /// - "response.output_text.delta" → extract "delta" field
-/// - "response.output_text.done" → done
+/// - "response.output_text.done" → optional final text chunk
+/// - "response.output_item.done" / "response.content_part.done" → message/tool-call payload
 /// - "response.completed" / "response.done" → done
 /// - "error" / "response.failed" → error
 pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !CodexSseResult {
@@ -497,10 +726,9 @@ pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !Codex
     // Handle event: lines — skip them (we parse data: lines which contain type field)
     if (std.mem.startsWith(u8, trimmed, "event:")) return .skip;
 
-    const prefix = "data: ";
+    const prefix = "data:";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
-
-    const data = trimmed[prefix.len..];
+    const data = std.mem.trimLeft(u8, trimmed[prefix.len..], " ");
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
     // Parse JSON
@@ -527,13 +755,106 @@ pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !Codex
             else => return .skip,
         };
         if (delta_str.len == 0) return .skip;
-        return .{ .delta = try allocator.dupe(u8, delta_str) };
+        return .{ .delta = .{
+            .text = try allocator.dupe(u8, delta_str),
+            .source = .output_text_delta,
+        } };
     }
 
-    if (std.mem.eql(u8, type_str, "response.output_text.done") or
-        std.mem.eql(u8, type_str, "response.completed") or
-        std.mem.eql(u8, type_str, "response.done"))
-    {
+    if (std.mem.eql(u8, type_str, "response.refusal.delta")) {
+        const delta_val = obj.get("delta") orelse return .skip;
+        const delta_str = switch (delta_val) {
+            .string => |s| s,
+            else => return .skip,
+        };
+        if (delta_str.len == 0) return .skip;
+        return .{ .delta = .{
+            .text = try allocator.dupe(u8, delta_str),
+            .source = .refusal_delta,
+        } };
+    }
+
+    if (std.mem.eql(u8, type_str, "response.output_text.done")) {
+        if (obj.get("text")) |text_val| {
+            if (text_val == .string and text_val.string.len > 0) {
+                return .{ .delta = .{
+                    .text = try allocator.dupe(u8, text_val.string),
+                    .source = .output_text_done,
+                } };
+            }
+        }
+        // This marks one text part complete, not the full response.
+        return .skip;
+    }
+
+    if (std.mem.eql(u8, type_str, "response.content_part.done")) {
+        if (obj.get("part")) |part_val| {
+            if (part_val == .object) {
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                defer out.deinit(allocator);
+                try appendSingleContentPartText(&out, allocator, part_val.object);
+                if (out.items.len > 0) {
+                    return .{ .delta = .{
+                        .text = try allocator.dupe(u8, out.items),
+                        .source = .content_part_done,
+                    } };
+                }
+            }
+        }
+        return .skip;
+    }
+
+    if (std.mem.eql(u8, type_str, "response.output_item.done")) {
+        if (obj.get("item")) |item_val| {
+            if (item_val == .object) {
+                if (try extractOutputItemToolCallXml(allocator, item_val.object)) |xml| {
+                    return .{ .delta = .{
+                        .text = xml,
+                        .source = .output_item_done,
+                    } };
+                }
+                if (extractOutputItemText(item_val.object)) |text| {
+                    if (text.len > 0) {
+                        return .{ .delta = .{
+                            .text = try allocator.dupe(u8, text),
+                            .source = .output_item_done,
+                        } };
+                    }
+                }
+            }
+        }
+        return .skip;
+    }
+
+    if (std.mem.eql(u8, type_str, "response.completed")) {
+        if (try extractCompletedToolCalls(allocator, obj)) |xml| {
+            return .{ .delta = .{
+                .text = xml,
+                .source = .response_completed,
+            } };
+        }
+        if (try extractCompletedText(allocator, obj)) |text| {
+            return .{ .delta = .{
+                .text = text,
+                .source = .response_completed,
+            } };
+        }
+        return .done;
+    }
+
+    if (std.mem.eql(u8, type_str, "response.done")) {
+        if (try extractCompletedToolCalls(allocator, obj)) |xml| {
+            return .{ .delta = .{
+                .text = xml,
+                .source = .response_done,
+            } };
+        }
+        if (try extractCompletedText(allocator, obj)) |text| {
+            return .{ .delta = .{
+                .text = text,
+                .source = .response_done,
+            } };
+        }
         return .done;
     }
 
@@ -754,7 +1075,7 @@ test "buildSimpleCodexBody without system prompt" {
     const body = try buildSimpleCodexBody(std.testing.allocator, null, "Hello", "o4-mini");
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are a helpful assistant.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Hello") != null);
 }
 
@@ -842,9 +1163,23 @@ test "parseCodexSseEvent delta event" {
     const line = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}";
     const result = try parseCodexSseEvent(std.testing.allocator, line);
     switch (result) {
-        .delta => |text| {
-            defer std.testing.allocator.free(text);
-            try std.testing.expectEqualStrings("Hello", text);
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expectEqualStrings("Hello", delta_evt.text);
+            try std.testing.expect(delta_evt.source == .output_text_delta);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent accepts data prefix without space" {
+    const line = "data:{\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}";
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expectEqualStrings("Hello", delta_evt.text);
+            try std.testing.expect(delta_evt.source == .output_text_delta);
         },
         else => return error.UnexpectedResult,
     }
@@ -854,6 +1189,117 @@ test "parseCodexSseEvent done event" {
     const line = "data: {\"type\":\"response.completed\"}";
     const result = try parseCodexSseEvent(std.testing.allocator, line);
     try std.testing.expect(result == .done);
+}
+
+test "parseCodexSseEvent output_text.done with text emits delta" {
+    const line = "data: {\"type\":\"response.output_text.done\",\"text\":\"Final answer\"}";
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expectEqualStrings("Final answer", delta_evt.text);
+            try std.testing.expect(delta_evt.source == .output_text_done);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent output_text.done without text does not finish stream" {
+    const line = "data: {\"type\":\"response.output_text.done\"}";
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    try std.testing.expect(result == .skip);
+}
+
+test "parseCodexSseEvent content_part.done emits text delta" {
+    const line =
+        \\data: {"type":"response.content_part.done","part":{"type":"output_text","text":"part text"}}
+    ;
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expectEqualStrings("part text", delta_evt.text);
+            try std.testing.expect(delta_evt.source == .content_part_done);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent output_item.done message emits text delta" {
+    const line =
+        \\data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"item text"}]}}
+    ;
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expectEqualStrings("item text", delta_evt.text);
+            try std.testing.expect(delta_evt.source == .output_item_done);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent output_item.done function_call emits xml tool call" {
+    const line =
+        \\data: {"type":"response.output_item.done","item":{"type":"function_call","name":"screenshot","arguments":"{\"filename\":\"screenshot.png\"}"}}
+    ;
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expect(std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null);
+            try std.testing.expect(std.mem.indexOf(u8, delta_evt.text, "\"name\":\"screenshot\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, delta_evt.text, "\"filename\":\"screenshot.png\"") != null);
+            try std.testing.expect(delta_evt.source == .output_item_done);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent response.completed extracts text from response output" {
+    const line =
+        \\data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from completed"}]}]}}
+    ;
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expectEqualStrings("Hello from completed", delta_evt.text);
+            try std.testing.expect(delta_evt.source == .response_completed);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent response.completed extracts function_call from response output" {
+    const line =
+        \\data: {"type":"response.completed","response":{"output":[{"type":"function_call","name":"screenshot","arguments":"{\"filename\":\"a.png\"}"}]}}
+    ;
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expect(std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null);
+            try std.testing.expect(std.mem.indexOf(u8, delta_evt.text, "\"name\":\"screenshot\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, delta_evt.text, "\"filename\":\"a.png\"") != null);
+            try std.testing.expect(delta_evt.source == .response_completed);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent response.refusal.delta emits delta" {
+    const line = "data: {\"type\":\"response.refusal.delta\",\"delta\":\"Cannot do that\"}";
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |delta_evt| {
+            defer std.testing.allocator.free(delta_evt.text);
+            try std.testing.expectEqualStrings("Cannot do that", delta_evt.text);
+            try std.testing.expect(delta_evt.source == .refusal_delta);
+        },
+        else => return error.UnexpectedResult,
+    }
 }
 
 test "parseCodexSseEvent error event" {
