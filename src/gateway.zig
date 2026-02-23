@@ -1997,6 +1997,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var session_mgr_opt: ?session_mod.SessionManager = null;
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_opt: ?memory_mod.Memory = null;
+    var resolved_api_key: ?[]const u8 = null;
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
@@ -2040,7 +2041,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
 
         // Resolve API key: config providers first, then env vars
-        const resolved_api_key = providers.resolveApiKeyFromConfig(
+        resolved_api_key = providers.resolveApiKeyFromConfig(
             allocator,
             cfg.default_provider,
             cfg.providers,
@@ -2081,8 +2082,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
+    defer if (resolved_api_key) |k| allocator.free(k);
+    defer if (holder_opt) |*h| h.deinit();
+    defer if (mem_opt) |m| m.deinit();
+    defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();
-    defer if (tools_slice.len > 0) allocator.free(tools_slice);
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);

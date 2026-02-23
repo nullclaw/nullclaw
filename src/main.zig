@@ -844,6 +844,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         config.default_provider,
         config.providers,
     ) catch null;
+    defer if (resolved_api_key) |k| allocator.free(k);
 
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
@@ -968,9 +969,11 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             mem_opt = mem;
         } else |_| {}
     }
+    defer if (mem_opt) |m| m.deinit();
 
     // Create provider
     var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key, config.getProviderBaseUrl(config.default_provider));
+    defer holder.deinit();
     const provider_i = holder.provider();
 
     // Create noop observer
@@ -1139,6 +1142,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         config.default_provider,
         config.providers,
     ) catch null;
+    defer if (resolved_api_key) |k| allocator.free(k);
 
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
@@ -1183,6 +1187,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         };
         break :blk wt;
     } else null;
+    defer if (whisper_ptr) |wt| allocator.destroy(wt);
     if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
 
     // Initialize MCP tools from config
@@ -1238,6 +1243,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             mem_opt = mem;
         } else |_| {}
     }
+    defer if (mem_opt) |m| m.deinit();
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};
@@ -1245,6 +1251,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     // Create provider vtable — concrete struct must stay alive for the loop.
     var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key, config.getProviderBaseUrl(config.default_provider));
+    defer holder.deinit();
     const provider_i: yc.providers.Provider = holder.provider();
 
     std.debug.print("  Tools: {d} loaded\n", .{tools.len});

@@ -67,6 +67,7 @@ pub const ProviderHolder = providers.ProviderHolder;
 pub const ChannelRuntime = struct {
     allocator: std.mem.Allocator,
     config: *const Config,
+    resolved_api_key: ?[]const u8,
     session_mgr: session_mod.SessionManager,
     provider_holder: *ProviderHolder,
     tools: []const tools_mod.Tool,
@@ -81,12 +82,14 @@ pub const ChannelRuntime = struct {
             config.default_provider,
             config.providers,
         ) catch null;
+        errdefer if (resolved_key) |k| allocator.free(k);
 
         // Provider — heap-allocated for vtable pointer stability
         const holder = try allocator.create(ProviderHolder);
         errdefer allocator.destroy(holder);
 
         holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, resolved_key, config.getProviderBaseUrl(config.default_provider));
+        errdefer holder.deinit();
 
         const provider_i = holder.provider();
 
@@ -121,6 +124,7 @@ pub const ChannelRuntime = struct {
                 mem_opt = mem;
             } else |_| {}
         }
+        errdefer if (mem_opt) |m| m.deinit();
 
         // Noop observer (heap for vtable stability)
         const noop_obs = try allocator.create(observability.NoopObserver);
@@ -136,6 +140,7 @@ pub const ChannelRuntime = struct {
         self.* = .{
             .allocator = allocator,
             .config = config,
+            .resolved_api_key = resolved_key,
             .session_mgr = session_mgr,
             .provider_holder = holder,
             .tools = tools,
@@ -149,6 +154,9 @@ pub const ChannelRuntime = struct {
         const alloc = self.allocator;
         self.session_mgr.deinit();
         if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
+        if (self.mem) |m| m.deinit();
+        self.provider_holder.deinit();
+        if (self.resolved_api_key) |k| alloc.free(k);
         alloc.destroy(self.noop_obs);
         alloc.destroy(self.provider_holder);
         alloc.destroy(self);
