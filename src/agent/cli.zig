@@ -39,6 +39,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     defer cfg.deinit();
 
+    cfg.validate() catch |err| {
+        Config.printValidationError(err);
+        return;
+    };
+
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
@@ -169,6 +174,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     // Interactive REPL mode
+    cfg.printModelConfig();
     try w.print("nullclaw Agent -- Interactive Mode\n", .{});
     try w.print("Provider: {s} | Model: {s}\n", .{
         cfg.default_provider,

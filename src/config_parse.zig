@@ -30,7 +30,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     if (root.get("default_provider")) |v| {
         if (v == .string) self.default_provider = try self.allocator.dupe(u8, v.string);
     }
-    // default_model parsed below from agents.defaults.model.primary
+    // top-level default_model; agents.defaults.model.primary overrides this below
+    if (root.get("default_model")) |v| {
+        if (v == .string) self.default_model = try self.allocator.dupe(u8, v.string);
+    }
     if (root.get("default_temperature")) |v| {
         if (v == .float) self.default_temperature = v.float;
         if (v == .integer) self.default_temperature = @floatFromInt(v.integer);

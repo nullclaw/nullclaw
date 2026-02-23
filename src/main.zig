@@ -125,6 +125,11 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer cfg.deinit();
 
+    cfg.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
+
     // Config values are the baseline; CLI flags override them.
     var port: u16 = cfg.gateway.port;
     var host: []const u8 = cfg.gateway.host;
@@ -154,6 +159,11 @@ fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.process.exit(1);
     };
     defer cfg.deinit();
+
+    cfg.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
 
     // Config values are the baseline; CLI flags override them.
     var port: u16 = cfg.gateway.port;
@@ -688,6 +698,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     };
     defer config.deinit();
 
+    config.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
+
     const telegram_config = config.channels.telegram orelse {
         std.debug.print("Telegram not configured. Add to config.json:\n", .{});
         std.debug.print("  \"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
@@ -726,12 +741,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         std.process.exit(1);
     }
 
-    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
+    const model = config.default_model.?;
     const temperature = config.default_temperature;
 
     std.debug.print("nullclaw telegram bot starting...\n", .{});
-    std.debug.print("  Provider: {s}\n", .{config.default_provider});
-    std.debug.print("  Model: {s}\n", .{model});
+    config.printModelConfig();
     std.debug.print("  Temperature: {d:.1}\n", .{temperature});
     if (allowed.len == 0) {
         std.debug.print("  Allowed users: (none — all messages will be denied)\n", .{});

@@ -178,7 +178,10 @@ pub fn runTelegramLoop(
     var typing = telegram.TypingIndicator.init(tg_ptr);
     var evict_counter: u32 = 0;
 
-    const model = config.default_model orelse "anthropic/claude-sonnet-4";
+    const model = config.default_model orelse {
+        log.err("No default_model configured. Set it in ~/.nullclaw/config.json or run `nullclaw onboard`.", .{});
+        return;
+    };
 
     // Update activity timestamp at start
     loop_state.last_activity.store(std.time.timestamp(), .release);

@@ -705,6 +705,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     const stdout = &bw.interface;
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
+    if (config_opt) |*cfg| {
+        cfg.printModelConfig();
+    }
     if (state.pairing_guard) |*guard| {
         if (guard.pairingCode()) |code| {
             try stdout.print("Gateway pairing code: {s}\n", .{code});

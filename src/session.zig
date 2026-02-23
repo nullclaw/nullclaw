@@ -296,6 +296,7 @@ fn testConfig() Config {
     return .{
         .workspace_dir = "/tmp/yc_test",
         .config_path = "/tmp/yc_test/config.json",
+        .default_model = "test/mock-model",
         .allocator = testing.allocator,
     };
 }

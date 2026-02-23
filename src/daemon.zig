@@ -386,6 +386,8 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     try stdout.print("nullclaw daemon started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
     try stdout.print("  Components: {d} active\n", .{state.component_count});
+    try stdout.flush();
+    config.printModelConfig();
     try stdout.print("  Ctrl+C to stop\n\n", .{});
     try stdout.flush();
 

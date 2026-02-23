@@ -21,7 +21,7 @@ fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
 pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) ![]const u8 {
     const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
     const url = providerUrl(cfg.default_provider);
-    const model = cfg.default_model orelse "anthropic/claude-sonnet-4-5-20250929";
+    const model = cfg.default_model orelse return error.NoDefaultModel;
     const body_str = try buildRequestBody(allocator, model, prompt, cfg.temperature, cfg.max_tokens orelse 4096);
     defer allocator.free(body_str);
 
@@ -55,7 +55,7 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
 pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_prompt: []const u8, prompt: []const u8) ![]const u8 {
     const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
     const url = providerUrl(cfg.default_provider);
-    const model = cfg.default_model orelse "anthropic/claude-sonnet-4-5-20250929";
+    const model = cfg.default_model orelse return error.NoDefaultModel;
     const max_tok: u32 = if (cfg.max_tokens) |mt| @intCast(@min(mt, std.math.maxInt(u32))) else 4096;
     const body_str = try buildRequestBodyWithSystem(allocator, model, system_prompt, prompt, cfg.temperature, max_tok);
     defer allocator.free(body_str);

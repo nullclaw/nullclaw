@@ -67,7 +67,7 @@ pub const Config = struct {
     providers: []const ProviderEntry = &.{},
     audio_media: AudioMediaConfig = .{},
     default_provider: []const u8 = "openrouter",
-    default_model: ?[]const u8 = "anthropic/claude-sonnet-4",
+    default_model: ?[]const u8 = null,
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
 
@@ -432,6 +432,7 @@ pub const Config = struct {
     // ── Validation ──────────────────────────────────────────────
 
     pub const ValidationError = error{
+        NoDefaultModel,
         TemperatureOutOfRange,
         InvalidPort,
         InvalidRetryCount,
@@ -439,6 +440,9 @@ pub const Config = struct {
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
+        if (self.default_model == null) {
+            return ValidationError.NoDefaultModel;
+        }
         if (self.default_temperature < 0.0 or self.default_temperature > 2.0) {
             return ValidationError.TemperatureOutOfRange;
         }
@@ -450,6 +454,38 @@ pub const Config = struct {
         }
         if (self.reliability.provider_backoff_ms > 600_000) {
             return ValidationError.InvalidBackoffMs;
+        }
+    }
+
+    /// Print a human-readable validation error to stderr.
+    pub fn printValidationError(err: ValidationError) void {
+        switch (err) {
+            ValidationError.NoDefaultModel => std.debug.print(
+                "No default_model configured. Set it in ~/.nullclaw/config.json or run `nullclaw onboard`.\n",
+                .{},
+            ),
+            ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
+            ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
+            ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
+            ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
+        }
+    }
+
+    /// Print configured models summary to stderr (for startup banners).
+    pub fn printModelConfig(self: *const Config) void {
+        std.debug.print("  Model:    {s}\n", .{self.default_model orelse "(not set)"});
+        std.debug.print("  Provider: {s}\n", .{self.default_provider});
+        if (self.model_routes.len > 0) {
+            std.debug.print("  Routes:   {d} configured\n", .{self.model_routes.len});
+            for (self.model_routes) |r| {
+                std.debug.print("            [{s}] {s}/{s}\n", .{ r.hint, r.provider, r.model });
+            }
+        }
+        if (self.agents.len > 0) {
+            std.debug.print("  Agents:   {d} configured\n", .{self.agents.len});
+            for (self.agents) |a| {
+                std.debug.print("            {s} → {s}/{s}\n", .{ a.name, a.provider, a.model });
+            }
         }
     }
 };
@@ -521,6 +557,7 @@ test "validation rejects bad temperature" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .default_temperature = 5.0,
         .allocator = std.testing.allocator,
     };
@@ -531,6 +568,7 @@ test "validation rejects zero port" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .allocator = std.testing.allocator,
     };
     cfg.gateway.port = 0;
@@ -541,9 +579,44 @@ test "validation passes for defaults" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "test/model",
         .allocator = std.testing.allocator,
     };
     try cfg.validate();
+}
+
+test "validation rejects null default_model" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(Config.ValidationError.NoDefaultModel, cfg.validate());
+}
+
+test "json parse top-level default_model" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"default_model": "meta-llama/llama-3.3-70b-instruct:free"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("meta-llama/llama-3.3-70b-instruct:free", cfg.default_model.?);
+    allocator.free(cfg.default_model.?);
+}
+
+test "agents.defaults.model.primary overrides top-level default_model" {
+    const allocator = std.testing.allocator;
+    // use an arena to match production behavior (both allocs are freed together)
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = a };
+    try cfg.parseJson(
+        \\{"default_model": "top-level-model", "agents": {"defaults": {"model": {"primary": "nested-model"}}}}
+    );
+    // nested takes precedence since it's parsed after top-level
+    try std.testing.expectEqualStrings("nested-model", cfg.default_model.?);
 }
 
 test "syncFlatFields propagates nested values" {
@@ -598,6 +671,7 @@ test "validation rejects negative temperature" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .default_temperature = -1.0,
         .allocator = std.testing.allocator,
     };
@@ -608,6 +682,7 @@ test "validation accepts boundary temperatures" {
     const cfg_zero = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .default_temperature = 0.0,
         .allocator = std.testing.allocator,
     };
@@ -616,6 +691,7 @@ test "validation accepts boundary temperatures" {
     const cfg_two = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .default_temperature = 2.0,
         .allocator = std.testing.allocator,
     };
@@ -626,6 +702,7 @@ test "validation rejects excessive retries" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .allocator = std.testing.allocator,
     };
     cfg.reliability.provider_retries = 101;
@@ -636,6 +713,7 @@ test "validation rejects excessive backoff" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .allocator = std.testing.allocator,
     };
     cfg.reliability.provider_backoff_ms = 700_000;
@@ -646,6 +724,7 @@ test "validation accepts max boundary retries" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .allocator = std.testing.allocator,
     };
     cfg.reliability.provider_retries = 100;
@@ -656,6 +735,7 @@ test "validation accepts max boundary backoff" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
         .allocator = std.testing.allocator,
     };
     cfg.reliability.provider_backoff_ms = 600_000;
@@ -1057,7 +1137,7 @@ test "applyEnvOverrides does not crash on default config" {
     cfg.applyEnvOverrides();
     // Default values should remain intact
     try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", cfg.default_model.?);
+    try std.testing.expect(cfg.default_model == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
 }
 
