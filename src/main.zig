@@ -966,7 +966,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
 
     // Create provider
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key);
+    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key, config.getProviderBaseUrl(config.default_provider));
     const provider_i = holder.provider();
 
     // Create noop observer
