@@ -104,6 +104,41 @@ pub fn resolveConnectHost(
     port: u16,
 ) ResolveConnectHostError![]u8 {
     const bare = stripHostBrackets(host);
+    const unscoped = stripIpv6ZoneId(bare);
+
+    // Fast-path literal hosts before DNS resolution to avoid platform-specific
+    // resolver differences for numeric aliases (e.g. 2130706433 on Windows).
+    if (parseIpv4(bare)) |octets| {
+        if (isNonGlobalV4(octets)) return error.LocalAddressBlocked;
+        return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
+            octets[0],
+            octets[1],
+            octets[2],
+            octets[3],
+        });
+    }
+    if (parseIpv4IntegerAlias(bare)) |octets| {
+        if (isNonGlobalV4(octets)) return error.LocalAddressBlocked;
+        return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
+            octets[0],
+            octets[1],
+            octets[2],
+            octets[3],
+        });
+    }
+    if (parseIpv6(unscoped)) |segs| {
+        if (isNonGlobalV6(segs)) return error.LocalAddressBlocked;
+        return std.fmt.allocPrint(allocator, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+            segs[0],
+            segs[1],
+            segs[2],
+            segs[3],
+            segs[4],
+            segs[5],
+            segs[6],
+            segs[7],
+        });
+    }
 
     const addr_list = std.net.getAddressList(allocator, bare, port) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -189,6 +224,11 @@ pub fn resolveConnectHost(
 /// DNS rebinding-style domains that resolve to loopback/private addresses.
 pub fn hostResolvesToLocal(allocator: std.mem.Allocator, host: []const u8, port: u16) bool {
     const bare = stripHostBrackets(host);
+    const unscoped = stripIpv6ZoneId(bare);
+
+    if (parseIpv4(bare)) |octets| return isNonGlobalV4(octets);
+    if (parseIpv4IntegerAlias(bare)) |octets| return isNonGlobalV4(octets);
+    if (parseIpv6(unscoped)) |segs| return isNonGlobalV6(segs);
 
     // Fail closed: if we cannot verify DNS resolution safety, treat host as local.
     const addr_list = std.net.getAddressList(allocator, bare, port) catch return true;
@@ -224,6 +264,11 @@ fn stripHostBrackets(host: []const u8) []const u8 {
     if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]")) {
         return host[1 .. host.len - 1];
     }
+    return host;
+}
+
+fn stripIpv6ZoneId(host: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, host, '%')) |pct| return host[0..pct];
     return host;
 }
 
@@ -313,6 +358,32 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
     if (count != 3) return null;
     octets[3] = std.fmt.parseInt(u8, s[start..], 10) catch return null;
     return octets;
+}
+
+/// Parse single-integer IPv4 aliases into octets.
+/// Supports decimal and 0x-prefixed hex notation.
+fn parseIpv4IntegerAlias(s: []const u8) ?[4]u8 {
+    if (s.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, s, '.') != null) return null;
+    if (std.mem.indexOfScalar(u8, s, ':') != null) return null;
+
+    const value: u32 = blk: {
+        if (std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "0X")) {
+            if (s.len <= 2) return null;
+            break :blk std.fmt.parseInt(u32, s[2..], 16) catch return null;
+        }
+        for (s) |c| {
+            if (c < '0' or c > '9') return null;
+        }
+        break :blk std.fmt.parseInt(u32, s, 10) catch return null;
+    };
+
+    return .{
+        @as(u8, @truncate(value >> 24)),
+        @as(u8, @truncate(value >> 16)),
+        @as(u8, @truncate(value >> 8)),
+        @as(u8, @truncate(value)),
+    };
 }
 
 /// Parse an IPv6 address string into 8 segments.
@@ -649,6 +720,26 @@ test "parseIpv4 rejects invalid" {
     try std.testing.expect(parseIpv4("not-an-ip") == null);
     try std.testing.expect(parseIpv4("256.1.1.1") == null);
     try std.testing.expect(parseIpv4("1.2.3") == null);
+}
+
+test "parseIpv4IntegerAlias parses decimal and hex" {
+    const dec = parseIpv4IntegerAlias("2130706433").?;
+    try std.testing.expectEqual(@as(u8, 127), dec[0]);
+    try std.testing.expectEqual(@as(u8, 0), dec[1]);
+    try std.testing.expectEqual(@as(u8, 0), dec[2]);
+    try std.testing.expectEqual(@as(u8, 1), dec[3]);
+
+    const hex = parseIpv4IntegerAlias("0x7f000001").?;
+    try std.testing.expectEqual(@as(u8, 127), hex[0]);
+    try std.testing.expectEqual(@as(u8, 0), hex[1]);
+    try std.testing.expectEqual(@as(u8, 0), hex[2]);
+    try std.testing.expectEqual(@as(u8, 1), hex[3]);
+}
+
+test "parseIpv4IntegerAlias rejects invalid" {
+    try std.testing.expect(parseIpv4IntegerAlias("example.com") == null);
+    try std.testing.expect(parseIpv4IntegerAlias("0x") == null);
+    try std.testing.expect(parseIpv4IntegerAlias("0xgg") == null);
 }
 
 test "parseIpv6 loopback" {
