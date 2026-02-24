@@ -198,6 +198,9 @@ pub const SseConnection = struct {
     fn waitForReadable(self: *SseConnection, timeout_ms: i32) Error!bool {
         if (self.request == null) return error.NotConnected;
         const conn = self.request.?.connection orelse return error.NotConnected;
+        // For TLS and buffered transports, data may already be decoded and
+        // available even when the socket is not currently poll-readable.
+        if (conn.reader().bufferedLen() > 0) return true;
         const stream = conn.stream_reader.getStream();
 
         var poll_fds = [_]std.posix.pollfd{
