@@ -37,6 +37,8 @@ RUN chown -R 65534:65534 /nullclaw-data
 # ── Stage 3: Runtime Base (shared) ────────────────────────────
 FROM alpine:3.23 AS release-base
 
+LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
+
 RUN apk add --no-cache ca-certificates curl tzdata
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw

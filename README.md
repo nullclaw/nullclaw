@@ -190,10 +190,10 @@ nullclaw enforces security at **every layer**.
 Config: `~/.nullclaw/config.json` (created by `onboard`)
 
 > **OpenClaw compatible:** nullclaw uses the same config structure as [OpenClaw](https://github.com/openclaw/openclaw) (snake_case). Providers live under `models.providers`, the default model under `agents.defaults.model.primary`, and channels use `accounts` wrappers.
+> Top-level `default_provider` / `default_model` keys are not supported.
 
 ```json
 {
-  "default_provider": "openrouter",
   "default_temperature": 0.7,
 
   "models": {
@@ -206,11 +206,11 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 
   "agents": {
     "defaults": {
-      "model": { "primary": "anthropic/claude-sonnet-4" },
+      "model": { "primary": "openrouter/anthropic/claude-sonnet-4" },
       "heartbeat": { "every": "30m" }
     },
     "list": [
-      { "id": "researcher", "model": { "primary": "anthropic/claude-opus-4" }, "system_prompt": "..." }
+      { "id": "researcher", "model": { "primary": "openrouter/anthropic/claude-opus-4" }, "system_prompt": "..." }
     ]
   },
 

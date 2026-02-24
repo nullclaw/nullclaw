@@ -208,7 +208,30 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer cfg.deinit();
 
-    try yc.service.handleCommand(allocator, service_cmd, cfg.config_path);
+    yc.service.handleCommand(allocator, service_cmd, cfg.config_path) catch |err| {
+        const any_err: anyerror = err;
+        switch (any_err) {
+            error.UnsupportedPlatform => {
+                std.debug.print("Service management is not supported on this platform.\n", .{});
+            },
+            error.NoHomeDir => {
+                std.debug.print("Could not resolve home directory for service files.\n", .{});
+            },
+            error.SystemctlUnavailable => {
+                std.debug.print("`systemctl` is not available; Linux service commands require systemd user services.\n", .{});
+                std.debug.print("Run `nullclaw gateway` in the foreground or use another supervisor.\n", .{});
+            },
+            error.SystemdUserUnavailable => {
+                std.debug.print("systemd user services are unavailable (`systemctl --user`).\n", .{});
+                std.debug.print("Verify with `systemctl --user status` or run `nullclaw gateway` in the foreground.\n", .{});
+            },
+            error.CommandFailed => {
+                std.debug.print("Service command failed: {s}\n", .{subcmd});
+            },
+            else => return any_err,
+        }
+        std.process.exit(1);
+    };
 }
 
 // ── Cron ─────────────────────────────────────────────────────────

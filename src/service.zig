@@ -22,6 +22,8 @@ pub const ServiceError = error{
     UnsupportedPlatform,
     NoHomeDir,
     FileCreateFailed,
+    SystemctlUnavailable,
+    SystemdUserUnavailable,
 };
 
 /// Handle a service management command.
@@ -56,6 +58,7 @@ fn startService(allocator: std.mem.Allocator) !void {
         try runChecked(allocator, &.{ "launchctl", "load", "-w", plist });
         try runChecked(allocator, &.{ "launchctl", "start", SERVICE_LABEL });
     } else if (comptime builtin.os.tag == .linux) {
+        try assertLinuxSystemdUserAvailable(allocator);
         try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
         try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullclaw.service" });
     } else {
@@ -70,7 +73,8 @@ fn stopService(allocator: std.mem.Allocator) !void {
         runChecked(allocator, &.{ "launchctl", "stop", SERVICE_LABEL }) catch {};
         runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
     } else if (comptime builtin.os.tag == .linux) {
-        runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" }) catch {};
+        try assertLinuxSystemdUserAvailable(allocator);
+        try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
     } else {
         return error.UnsupportedPlatform;
     }
@@ -91,6 +95,7 @@ fn serviceStatus(allocator: std.mem.Allocator) !void {
         try w.print("Unit: {s}\n", .{plist});
         try w.flush();
     } else if (comptime builtin.os.tag == .linux) {
+        try assertLinuxSystemdUserAvailable(allocator);
         const output = runCapture(allocator, &.{ "systemctl", "--user", "is-active", "nullclaw.service" }) catch try allocator.dupe(u8, "unknown");
         defer allocator.free(output);
         try w.print("Service state: {s}\n", .{std.mem.trim(u8, output, " \t\n\r")});
@@ -104,7 +109,7 @@ fn serviceStatus(allocator: std.mem.Allocator) !void {
 }
 
 fn uninstall(allocator: std.mem.Allocator) !void {
-    stopService(allocator) catch {};
+    try stopService(allocator);
 
     if (comptime builtin.os.tag == .macos) {
         const plist = try macosServiceFile(allocator);
@@ -113,8 +118,12 @@ fn uninstall(allocator: std.mem.Allocator) !void {
     } else if (comptime builtin.os.tag == .linux) {
         const unit = try linuxServiceFile(allocator);
         defer allocator.free(unit);
-        std.fs.deleteFileAbsolute(unit) catch {};
-        runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" }) catch {};
+        std.fs.deleteFileAbsolute(unit) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try assertLinuxSystemdUserAvailable(allocator);
+        try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
     } else {
         return error.UnsupportedPlatform;
     }
@@ -184,11 +193,10 @@ fn installLinux(allocator: std.mem.Allocator) !void {
     const unit = try linuxServiceFile(allocator);
     defer allocator.free(unit);
 
+    try assertLinuxSystemdUserAvailable(allocator);
+
     if (std.mem.lastIndexOfScalar(u8, unit, '/')) |idx| {
-        std.fs.makeDirAbsolute(unit[0..idx]) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try std.fs.cwd().makePath(unit[0..idx]);
     }
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -214,8 +222,8 @@ fn installLinux(allocator: std.mem.Allocator) !void {
     defer file.close();
     try file.writeAll(content);
 
-    runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" }) catch {};
-    runChecked(allocator, &.{ "systemctl", "--user", "enable", "nullclaw.service" }) catch {};
+    try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+    try runChecked(allocator, &.{ "systemctl", "--user", "enable", "nullclaw.service" });
 }
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -238,10 +246,85 @@ fn linuxServiceFile(allocator: std.mem.Allocator) ![]const u8 {
 
 // ── Process helpers ──────────────────────────────────────────────
 
+const CaptureStatus = struct {
+    stdout: []u8,
+    stderr: []u8,
+    success: bool,
+};
+
+fn isSystemdUnavailableDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "systemctl --user unavailable") != null or
+        std.ascii.indexOfIgnoreCase(detail, "systemctl not available") != null or
+        std.ascii.indexOfIgnoreCase(detail, "failed to connect to bus") != null or
+        std.ascii.indexOfIgnoreCase(detail, "not been booted with systemd") != null or
+        std.ascii.indexOfIgnoreCase(detail, "system has not been booted with systemd") != null or
+        std.ascii.indexOfIgnoreCase(detail, "systemd user services are required") != null or
+        std.ascii.indexOfIgnoreCase(detail, "no such file or directory") != null;
+}
+
+fn runCaptureStatus(allocator: std.mem.Allocator, argv: []const []const u8) !CaptureStatus {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => {
+            if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
+            return err;
+        },
+        else => return err,
+    };
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CommandFailed;
+    };
+    errdefer allocator.free(stdout);
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        allocator.free(stdout);
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CommandFailed;
+    };
+    errdefer allocator.free(stderr);
+
+    const result = try child.wait();
+    const success = switch (result) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .success = success,
+    };
+}
+
+fn assertLinuxSystemdUserAvailable(allocator: std.mem.Allocator) !void {
+    const status = try runCaptureStatus(allocator, &.{ "systemctl", "--user", "status" });
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+
+    if (status.success) return;
+
+    const stderr_trimmed = std.mem.trim(u8, status.stderr, " \t\r\n");
+    const stdout_trimmed = std.mem.trim(u8, status.stdout, " \t\r\n");
+    const detail = if (stderr_trimmed.len > 0) stderr_trimmed else stdout_trimmed;
+
+    if (isSystemdUnavailableDetail(detail)) return error.SystemdUserUnavailable;
+    return error.CommandFailed;
+}
+
 fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var child = std.process.Child.init(argv, allocator);
     child.stderr_behavior = .Pipe;
-    try child.spawn();
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => {
+            if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
+            return err;
+        },
+        else => return err,
+    };
     const result = try child.wait();
     switch (result) {
         .Exited => |code| if (code != 0) return error.CommandFailed,
@@ -253,9 +336,22 @@ fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
-    try child.spawn();
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
-    _ = try child.wait();
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => {
+            if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
+            return err;
+        },
+        else => return err,
+    };
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CommandFailed;
+    };
+    errdefer allocator.free(stdout);
+    _ = child.wait() catch {
+        return error.CommandFailed;
+    };
     return stdout;
 }
 
@@ -305,4 +401,14 @@ test "runCapture captures stdout" {
     };
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, output, " \t\n\r"), "hello"));
+}
+
+test "isSystemdUnavailableDetail detects common unavailable errors" {
+    try std.testing.expect(isSystemdUnavailableDetail("systemctl --user unavailable: failed to connect to bus"));
+    try std.testing.expect(isSystemdUnavailableDetail("systemctl not available; systemd user services are required on Linux"));
+    try std.testing.expect(isSystemdUnavailableDetail("Failed to connect to bus: No medium found"));
+    try std.testing.expect(isSystemdUnavailableDetail("System has not been booted with systemd as init system"));
+    try std.testing.expect(isSystemdUnavailableDetail("No such file or directory"));
+    try std.testing.expect(!isSystemdUnavailableDetail("unit nullclaw.service not found"));
+    try std.testing.expect(!isSystemdUnavailableDetail("permission denied"));
 }

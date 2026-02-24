@@ -190,6 +190,196 @@ pub const CronNormalized = struct {
     needs_second_prefix: bool,
 };
 
+const MAX_CRON_LOOKAHEAD_MINUTES: usize = 8 * 366 * 24 * 60;
+
+const ParsedCronExpression = struct {
+    minutes: [60]bool = .{false} ** 60,
+    hours: [24]bool = .{false} ** 24,
+    day_of_month: [32]bool = .{false} ** 32, // 1..31
+    months: [13]bool = .{false} ** 13, // 1..12
+    day_of_week: [7]bool = .{false} ** 7, // 0..6 (0=Sun)
+    day_of_month_any: bool = false,
+    day_of_week_any: bool = false,
+};
+
+fn parseCronRawValue(raw: []const u8, min: u8, max: u8, allow_sunday_7: bool) !u8 {
+    const value = std.fmt.parseInt(u8, std.mem.trim(u8, raw, " \t"), 10) catch return error.InvalidCronExpression;
+    const max_allowed: u8 = if (allow_sunday_7) 7 else max;
+    if (value < min or value > max_allowed) return error.InvalidCronExpression;
+    return value;
+}
+
+fn normalizeCronValue(raw_value: u8, allow_sunday_7: bool) u8 {
+    if (allow_sunday_7 and raw_value == 7) return 0;
+    return raw_value;
+}
+
+fn clearBoolSlice(values: []bool) void {
+    for (values) |*entry| entry.* = false;
+}
+
+fn parseCronField(raw_field: []const u8, min: u8, max: u8, allow_sunday_7: bool, out: []bool) !bool {
+    if (out.len <= max) return error.InvalidCronExpression;
+    clearBoolSlice(out);
+
+    const field = std.mem.trim(u8, raw_field, " \t");
+    if (field.len == 0) return error.InvalidCronExpression;
+    const is_any = std.mem.eql(u8, field, "*");
+
+    var saw_value = false;
+    var parts = std.mem.splitScalar(u8, field, ',');
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t");
+        if (part.len == 0) return error.InvalidCronExpression;
+
+        var range_part = part;
+        var step: u8 = 1;
+        if (std.mem.indexOfScalar(u8, part, '/')) |slash_idx| {
+            range_part = std.mem.trim(u8, part[0..slash_idx], " \t");
+            const step_raw = std.mem.trim(u8, part[slash_idx + 1 ..], " \t");
+            if (range_part.len == 0 or step_raw.len == 0) return error.InvalidCronExpression;
+            step = std.fmt.parseInt(u8, step_raw, 10) catch return error.InvalidCronExpression;
+            if (step == 0) return error.InvalidCronExpression;
+        }
+
+        var start_raw: u8 = min;
+        var end_raw: u8 = max;
+        if (std.mem.eql(u8, range_part, "*")) {
+            // full range
+        } else if (std.mem.indexOfScalar(u8, range_part, '-')) |dash_idx| {
+            const start_part = std.mem.trim(u8, range_part[0..dash_idx], " \t");
+            const end_part = std.mem.trim(u8, range_part[dash_idx + 1 ..], " \t");
+            if (start_part.len == 0 or end_part.len == 0) return error.InvalidCronExpression;
+            start_raw = try parseCronRawValue(start_part, min, max, allow_sunday_7);
+            end_raw = try parseCronRawValue(end_part, min, max, allow_sunday_7);
+            if (start_raw > end_raw) return error.InvalidCronExpression;
+        } else {
+            start_raw = try parseCronRawValue(range_part, min, max, allow_sunday_7);
+            end_raw = start_raw;
+        }
+
+        var raw_value = start_raw;
+        while (raw_value <= end_raw) {
+            const normalized = normalizeCronValue(raw_value, allow_sunday_7);
+            if (normalized < min or normalized > max) return error.InvalidCronExpression;
+            out[normalized] = true;
+            saw_value = true;
+
+            const next = @addWithOverflow(raw_value, step);
+            if (next[1] != 0 or next[0] <= raw_value) break;
+            raw_value = next[0];
+        }
+    }
+
+    if (!saw_value) return error.InvalidCronExpression;
+    return is_any;
+}
+
+fn parseCronExpression(expression: []const u8) !ParsedCronExpression {
+    const trimmed = std.mem.trim(u8, expression, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidCronExpression;
+
+    var fields: [7][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+    while (it.next()) |field| {
+        if (count >= fields.len) return error.InvalidCronExpression;
+        fields[count] = field;
+        count += 1;
+    }
+
+    if (count < 5 or count > 7) return error.InvalidCronExpression;
+
+    const minute_field: []const u8 = switch (count) {
+        5 => fields[0],
+        6, 7 => fields[1],
+        else => unreachable,
+    };
+    const hour_field: []const u8 = switch (count) {
+        5 => fields[1],
+        6, 7 => fields[2],
+        else => unreachable,
+    };
+    const dom_field: []const u8 = switch (count) {
+        5 => fields[2],
+        6, 7 => fields[3],
+        else => unreachable,
+    };
+    const month_field: []const u8 = switch (count) {
+        5 => fields[3],
+        6, 7 => fields[4],
+        else => unreachable,
+    };
+    const dow_field: []const u8 = switch (count) {
+        5 => fields[4],
+        6, 7 => fields[5],
+        else => unreachable,
+    };
+
+    var parsed = ParsedCronExpression{};
+    _ = try parseCronField(minute_field, 0, 59, false, parsed.minutes[0..]);
+    _ = try parseCronField(hour_field, 0, 23, false, parsed.hours[0..]);
+    parsed.day_of_month_any = try parseCronField(dom_field, 1, 31, false, parsed.day_of_month[0..]);
+    _ = try parseCronField(month_field, 1, 12, false, parsed.months[0..]);
+    parsed.day_of_week_any = try parseCronField(dow_field, 0, 6, true, parsed.day_of_week[0..]);
+
+    return parsed;
+}
+
+fn cronExpressionMatches(parsed: *const ParsedCronExpression, ts: i64) bool {
+    if (ts < 0) return false;
+
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    const minute: u8 = day_seconds.getMinutesIntoHour();
+    const hour: u8 = day_seconds.getHoursIntoDay();
+    const day_of_month: u8 = @as(u8, @intCast(month_day.day_index + 1));
+    const month: u8 = month_day.month.numeric();
+    const day_of_week: u8 = @as(u8, @intCast((epoch_day.day + 4) % 7)); // 1970-01-01 was Thursday (4)
+
+    if (!parsed.minutes[minute]) return false;
+    if (!parsed.hours[hour]) return false;
+    if (!parsed.months[month]) return false;
+
+    const dom_match = parsed.day_of_month[day_of_month];
+    const dow_match = parsed.day_of_week[day_of_week];
+
+    const day_match = if (parsed.day_of_month_any and parsed.day_of_week_any)
+        true
+    else if (parsed.day_of_month_any)
+        dow_match
+    else if (parsed.day_of_week_any)
+        dom_match
+    else
+        dom_match or dow_match;
+
+    return day_match;
+}
+
+fn alignToNextMinute(from_secs: i64) i64 {
+    var start = from_secs + 1;
+    if (start < 0) start = 0;
+    const rem = @mod(start, 60);
+    if (rem == 0) return start;
+    return start + (60 - rem);
+}
+
+fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
+    const parsed = try parseCronExpression(expression);
+    var candidate = alignToNextMinute(from_secs);
+
+    var i: usize = 0;
+    while (i < MAX_CRON_LOOKAHEAD_MINUTES) : (i += 1) {
+        if (cronExpressionMatches(&parsed, candidate)) return candidate;
+        candidate += 60;
+    }
+    return error.NoFutureRunFound;
+}
+
 /// In-memory cron job store (no SQLite dependency for the minimal Zig port).
 pub const CronScheduler = struct {
     jobs: std.ArrayListUnmanaged(CronJob),
@@ -215,13 +405,18 @@ pub const CronScheduler = struct {
             if (r.output) |o| self.allocator.free(o);
         }
         self.runs.deinit(self.allocator);
+        self.clearJobs();
+        self.jobs.deinit(self.allocator);
+    }
+
+    fn clearJobs(self: *CronScheduler) void {
         for (self.jobs.items) |job| {
             self.allocator.free(job.id);
             self.allocator.free(job.expression);
             self.allocator.free(job.command);
             if (job.last_output) |o| self.allocator.free(o);
         }
-        self.jobs.deinit(self.allocator);
+        self.jobs.clearRetainingCapacity();
     }
 
     /// Add a recurring cron job.
@@ -230,6 +425,8 @@ pub const CronScheduler = struct {
 
         // Validate expression
         _ = try normalizeExpression(expression);
+        const now = std.time.timestamp();
+        const next_run_secs = try nextRunForCronExpression(expression, now);
 
         // Generate a simple numeric ID
         var id_buf: [32]u8 = undefined;
@@ -239,7 +436,7 @@ pub const CronScheduler = struct {
             .id = try self.allocator.dupe(u8, id),
             .expression = try self.allocator.dupe(u8, expression),
             .command = try self.allocator.dupe(u8, command),
-            .next_run_secs = std.time.timestamp() + 60, // placeholder
+            .next_run_secs = next_run_secs,
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
@@ -294,12 +491,16 @@ pub const CronScheduler = struct {
     pub fn updateJob(self: *CronScheduler, allocator: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
         const job = self.getMutableJob(id) orelse return false;
         if (patch.expression) |expr| {
+            const next_run_secs = nextRunForCronExpression(expr, std.time.timestamp()) catch return false;
+            const new_expr = allocator.dupe(u8, expr) catch return false;
             allocator.free(job.expression);
-            job.expression = allocator.dupe(u8, expr) catch return false;
+            job.expression = new_expr;
+            job.next_run_secs = next_run_secs;
         }
         if (patch.command) |cmd| {
+            const new_cmd = allocator.dupe(u8, cmd) catch return false;
             allocator.free(job.command);
-            job.command = allocator.dupe(u8, cmd) catch return false;
+            job.command = new_cmd;
         }
         if (patch.enabled) |ena| {
             job.enabled = ena;
@@ -418,20 +619,23 @@ pub const CronScheduler = struct {
 
         while (true) {
             const now = std.time.timestamp();
-            self.tick(now, out_bus);
+            _ = self.tick(now, out_bus);
             std.Thread.sleep(poll_ns);
         }
     }
 
     /// Execute one tick of the scheduler: run all due jobs, deliver results, handle one-shots.
     /// Separated from `run` for testability.
-    pub fn tick(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus) void {
+    pub fn tick(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus) bool {
+        var changed = false;
+
         // Collect indices of one-shot jobs to remove after iteration
         var remove_indices: [64]usize = undefined;
         var remove_count: usize = 0;
 
         for (self.jobs.items, 0..) |*job, idx| {
             if (job.paused or job.next_run_secs > now) continue;
+            changed = true;
 
             switch (job.job_type) {
                 .shell => {
@@ -497,8 +701,10 @@ pub const CronScheduler = struct {
                     job.paused = true;
                 }
             } else {
-                // Reschedule: advance by 60s (simple approximation without full cron parser)
-                job.next_run_secs = now + 60;
+                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                    log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
+                    break :blk now + 60;
+                };
             }
         }
 
@@ -516,8 +722,106 @@ pub const CronScheduler = struct {
                 _ = self.jobs.orderedRemove(rm_idx);
             }
         }
+
+        return changed;
     }
 };
+
+const LoadPolicy = enum {
+    best_effort,
+    strict,
+};
+
+fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
+    const path = try cronJsonPath(scheduler.allocator);
+    defer scheduler.allocator.free(path);
+
+    const content = std.fs.cwd().readFileAlloc(scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => switch (policy) {
+            .best_effort => return,
+            .strict => return err,
+        },
+    };
+    defer scheduler.allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, scheduler.allocator, content, .{}) catch |err| switch (policy) {
+        .best_effort => return,
+        .strict => return err,
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .array) switch (policy) {
+        .best_effort => return,
+        .strict => return error.InvalidCronStoreFormat,
+    };
+
+    for (parsed.value.array.items) |item| {
+        if (item != .object) switch (policy) {
+            .best_effort => continue,
+            .strict => return error.InvalidCronStoreFormat,
+        };
+        const obj = item.object;
+
+        const id = blk: {
+            if (obj.get("id")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+        const expression = blk: {
+            if (obj.get("expression")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+        const command = blk: {
+            if (obj.get("command")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+
+        const next_run_secs: i64 = blk: {
+            if (obj.get("next_run_secs")) |v| {
+                if (v == .integer) break :blk v.integer;
+            }
+            break :blk std.time.timestamp() + 60;
+        };
+
+        const paused = blk: {
+            if (obj.get("paused")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
+        const one_shot = blk: {
+            if (obj.get("one_shot")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
+        try scheduler.jobs.append(scheduler.allocator, .{
+            .id = try scheduler.allocator.dupe(u8, id),
+            .expression = try scheduler.allocator.dupe(u8, expression),
+            .command = try scheduler.allocator.dupe(u8, command),
+            .next_run_secs = next_run_secs,
+            .paused = paused,
+            .one_shot = one_shot,
+        });
+    }
+}
 
 // ── Delivery ─────────────────────────────────────────────────────
 
@@ -638,70 +942,21 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
 
 /// Load jobs from ~/.nullclaw/cron.json into the scheduler.
 pub fn loadJobs(scheduler: *CronScheduler) !void {
-    const path = try cronJsonPath(scheduler.allocator);
-    defer scheduler.allocator.free(path);
+    try loadJobsWithPolicy(scheduler, .best_effort);
+}
 
-    const content = std.fs.cwd().readFileAlloc(scheduler.allocator, path, 1024 * 1024) catch return;
-    defer scheduler.allocator.free(content);
+/// Load jobs from ~/.nullclaw/cron.json; unlike loadJobs, this returns
+/// parse/read errors (except missing file/path).
+pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
+    try loadJobsWithPolicy(scheduler, .strict);
+}
 
-    const parsed = std.json.parseFromSlice(std.json.Value, scheduler.allocator, content, .{}) catch return;
-    defer parsed.deinit();
-
-    if (parsed.value != .array) return;
-
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const obj = item.object;
-
-        const id = blk: {
-            if (obj.get("id")) |v| {
-                if (v == .string) break :blk v.string;
-            }
-            continue;
-        };
-        const expression = blk: {
-            if (obj.get("expression")) |v| {
-                if (v == .string) break :blk v.string;
-            }
-            continue;
-        };
-        const command = blk: {
-            if (obj.get("command")) |v| {
-                if (v == .string) break :blk v.string;
-            }
-            continue;
-        };
-
-        const next_run_secs: i64 = blk: {
-            if (obj.get("next_run_secs")) |v| {
-                if (v == .integer) break :blk v.integer;
-            }
-            break :blk std.time.timestamp() + 60;
-        };
-
-        const paused = blk: {
-            if (obj.get("paused")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk false;
-        };
-
-        const one_shot = blk: {
-            if (obj.get("one_shot")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk false;
-        };
-
-        try scheduler.jobs.append(scheduler.allocator, .{
-            .id = try scheduler.allocator.dupe(u8, id),
-            .expression = try scheduler.allocator.dupe(u8, expression),
-            .command = try scheduler.allocator.dupe(u8, command),
-            .next_run_secs = next_run_secs,
-            .paused = paused,
-            .one_shot = one_shot,
-        });
-    }
+/// Replace in-memory jobs with the persisted store content.
+pub fn reloadJobs(scheduler: *CronScheduler) !void {
+    var loaded = CronScheduler.init(scheduler.allocator, scheduler.max_tasks, scheduler.enabled);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+    std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
 }
 
 // ── CLI entry points (called from main.zig) ──────────────────────
@@ -932,6 +1187,28 @@ test "normalizeExpression 4 fields invalid" {
     try std.testing.expectError(error.InvalidCronExpression, normalizeExpression("* * * *"));
 }
 
+test "nextRunForCronExpression supports step minutes" {
+    try std.testing.expectEqual(@as(i64, 300), try nextRunForCronExpression("*/5 * * * *", 0));
+}
+
+test "nextRunForCronExpression supports hourly schedule" {
+    try std.testing.expectEqual(@as(i64, 3600), try nextRunForCronExpression("0 * * * *", 0));
+}
+
+test "nextRunForCronExpression supports fixed time schedule" {
+    try std.testing.expectEqual(@as(i64, 9000), try nextRunForCronExpression("30 2 * * *", 0));
+}
+
+test "nextRunForCronExpression supports sunday aliases 0 and 7" {
+    const next_sun_zero = try nextRunForCronExpression("0 0 * * 0", 0);
+    const next_sun_seven = try nextRunForCronExpression("0 0 * * 7", 0);
+    try std.testing.expectEqual(next_sun_zero, next_sun_seven);
+}
+
+test "nextRunForCronExpression handles leap-day schedules beyond one year" {
+    try std.testing.expectEqual(@as(i64, 68169600), try nextRunForCronExpression("0 0 29 2 *", 0));
+}
+
 test "CronScheduler add and list" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
@@ -1012,6 +1289,34 @@ test "save and load roundtrip" {
     try std.testing.expectEqualStrings("*/10 * * * *", loaded[0].expression);
     try std.testing.expectEqualStrings("echo roundtrip", loaded[0].command);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "reloadJobs keeps existing jobs when store becomes invalid" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("*/10 * * * *", "echo keep");
+    try saveJobs(&scheduler);
+
+    var runtime = CronScheduler.init(std.testing.allocator, 10, true);
+    defer runtime.deinit();
+    try loadJobs(&runtime);
+    try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
+
+    const path = try cronJsonPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const bad_file = try std.fs.createFileAbsolute(path, .{});
+    defer bad_file.close();
+    try bad_file.writeAll("{bad-json");
+
+    var reload_failed = false;
+    reloadJobs(&runtime) catch {
+        reload_failed = true;
+    };
+    try std.testing.expect(reload_failed);
+    try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
+
+    // Restore valid store for subsequent tests.
+    try saveJobs(&runtime);
 }
 
 test "JobType parse and asStr" {
@@ -1285,7 +1590,7 @@ test "one-shot job deleted after tick execution" {
     scheduler.jobs.items[0].next_run_secs = 0;
 
     // Tick without bus — the shell command "echo oneshot" will actually run
-    scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std.time.timestamp(), null);
 
     // One-shot job should have been removed
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
@@ -1310,7 +1615,7 @@ test "shell job delivers stdout via bus" {
     };
     scheduler.jobs.items[0].next_run_secs = 0;
 
-    scheduler.tick(std.time.timestamp(), &test_bus);
+    _ = scheduler.tick(std.time.timestamp(), &test_bus);
 
     // Verify delivery happened
     try std.testing.expect(test_bus.outboundDepth() > 0);
@@ -1345,7 +1650,7 @@ test "agent job delivers result via bus" {
         },
     });
 
-    scheduler.tick(std.time.timestamp(), &test_bus);
+    _ = scheduler.tick(std.time.timestamp(), &test_bus);
 
     // Verify delivery
     try std.testing.expect(test_bus.outboundDepth() > 0);
@@ -1379,11 +1684,23 @@ test "tick without bus still executes jobs" {
     scheduler.jobs.items[0].next_run_secs = 0;
 
     // Tick with null bus — should not crash
-    scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std.time.timestamp(), null);
 
     // Job should have been executed and rescheduled
     try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
     try std.testing.expect(scheduler.jobs.items[0].next_run_secs > 0);
+}
+
+test "tick reschedules recurring job using cron expression" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("*/10 * * * *", "echo periodic");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    _ = scheduler.tick(0, null);
+    try std.testing.expectEqual(@as(i64, 600), scheduler.jobs.items[0].next_run_secs);
 }
 
 test "cron module compiles" {}

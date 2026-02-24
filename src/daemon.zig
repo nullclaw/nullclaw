@@ -160,44 +160,183 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
 }
 
-/// Initial backoff for scheduler restarts (seconds).
-const SCHEDULER_INITIAL_BACKOFF_SECS: u64 = 1;
-
-/// Maximum backoff for scheduler restarts (seconds).
-const SCHEDULER_MAX_BACKOFF_SECS: u64 = 60;
-
 /// How often the channel watcher checks health (seconds).
 const CHANNEL_WATCH_INTERVAL_SECS: u64 = 60;
 
-/// Scheduler supervision thread — loads cron jobs and runs the scheduler loop.
-/// On error (scheduler crash), logs and restarts with exponential backoff.
+/// Initial backoff for scheduler restarts (seconds).
+/// Kept for compatibility with existing tests and supervision semantics.
+const SCHEDULER_INITIAL_BACKOFF_SECS: u64 = 1;
+
+/// Maximum backoff for scheduler restarts (seconds).
+/// Kept for compatibility with existing tests and supervision semantics.
+const SCHEDULER_MAX_BACKOFF_SECS: u64 = 60;
+
+const SchedulerJobSnapshot = struct {
+    next_run_secs: i64,
+    last_run_secs: ?i64,
+    last_status: ?[]const u8,
+    paused: bool,
+    one_shot: bool,
+};
+
+fn schedulerStatusEquals(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn schedulerJobChanged(job: *const cron.CronJob, snapshot: SchedulerJobSnapshot) bool {
+    if (job.next_run_secs != snapshot.next_run_secs) return true;
+    if (job.last_run_secs != snapshot.last_run_secs) return true;
+    if (job.paused != snapshot.paused) return true;
+    if (job.one_shot != snapshot.one_shot) return true;
+    if (!schedulerStatusEquals(job.last_status, snapshot.last_status)) return true;
+    return false;
+}
+
+fn clearSchedulerSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot: *std.StringHashMapUnmanaged(SchedulerJobSnapshot),
+) void {
+    var it = snapshot.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+    }
+    snapshot.clearRetainingCapacity();
+}
+
+fn buildSchedulerSnapshot(
+    allocator: std.mem.Allocator,
+    scheduler: *const CronScheduler,
+    snapshot: *std.StringHashMapUnmanaged(SchedulerJobSnapshot),
+) !void {
+    clearSchedulerSnapshot(allocator, snapshot);
+    for (scheduler.listJobs()) |job| {
+        const key = try allocator.dupe(u8, job.id);
+        snapshot.put(allocator, key, .{
+            .next_run_secs = job.next_run_secs,
+            .last_run_secs = job.last_run_secs,
+            .last_status = job.last_status,
+            .paused = job.paused,
+            .one_shot = job.one_shot,
+        }) catch |err| {
+            allocator.free(key);
+            return err;
+        };
+    }
+}
+
+fn upsertSchedulerRuntimeJob(
+    allocator: std.mem.Allocator,
+    latest: *CronScheduler,
+    runtime_job: *const cron.CronJob,
+) !void {
+    if (latest.getMutableJob(runtime_job.id)) |dst| {
+        dst.next_run_secs = runtime_job.next_run_secs;
+        dst.last_run_secs = runtime_job.last_run_secs;
+        dst.last_status = runtime_job.last_status;
+        dst.paused = runtime_job.paused;
+        dst.one_shot = runtime_job.one_shot;
+        return;
+    }
+
+    try latest.jobs.append(allocator, .{
+        .id = try allocator.dupe(u8, runtime_job.id),
+        .expression = try allocator.dupe(u8, runtime_job.expression),
+        .command = try allocator.dupe(u8, runtime_job.command),
+        .next_run_secs = runtime_job.next_run_secs,
+        .last_run_secs = runtime_job.last_run_secs,
+        .last_status = runtime_job.last_status,
+        .paused = runtime_job.paused,
+        .one_shot = runtime_job.one_shot,
+    });
+}
+
+fn mergeSchedulerTickChangesAndSave(
+    allocator: std.mem.Allocator,
+    runtime: *const CronScheduler,
+    before_tick: *const std.StringHashMapUnmanaged(SchedulerJobSnapshot),
+) !void {
+    var latest = CronScheduler.init(allocator, runtime.max_tasks, runtime.enabled);
+    defer latest.deinit();
+    try cron.loadJobsStrict(&latest);
+
+    var runtime_ids: std.StringHashMapUnmanaged(void) = .empty;
+    defer runtime_ids.deinit(allocator);
+
+    for (runtime.listJobs()) |job| {
+        try runtime_ids.put(allocator, job.id, {});
+        if (before_tick.get(job.id)) |snapshot| {
+            if (!schedulerJobChanged(&job, snapshot)) continue;
+        }
+        try upsertSchedulerRuntimeJob(allocator, &latest, &job);
+    }
+
+    var removed_it = before_tick.iterator();
+    while (removed_it.next()) |entry| {
+        const job_id = entry.key_ptr.*;
+        if (!runtime_ids.contains(job_id)) {
+            _ = latest.removeJob(job_id);
+        }
+    }
+
+    try cron.saveJobs(&latest);
+}
+
+/// Scheduler thread — executes due cron jobs and periodically reloads cron.json
+/// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
-    var backoff_secs: u64 = SCHEDULER_INITIAL_BACKOFF_SECS;
+    var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    defer scheduler.deinit();
+    var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
+    defer {
+        clearSchedulerSnapshot(allocator, &before_tick);
+        before_tick.deinit(allocator);
+    }
+
+    const poll_secs: u64 = @max(@as(u64, 1), config.reliability.scheduler_poll_secs);
+
+    // Initial load from disk (ignore errors — start empty if file missing/corrupt)
+    cron.loadJobs(&scheduler) catch {};
+
+    state.markRunning("scheduler");
+    health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
-        var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
-        defer scheduler.deinit();
+        // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
+        cron.reloadJobs(&scheduler) catch |err| {
+            log.warn("scheduler reload failed: {}", .{err});
+            state.markError("scheduler", @errorName(err));
+            health.markComponentError("scheduler", @errorName(err));
+        };
 
-        // Load persisted jobs (ignore errors — fresh start if file missing)
-        cron.loadJobs(&scheduler) catch {};
+        buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
+            log.warn("scheduler snapshot failed: {}", .{err});
+            state.markError("scheduler", @errorName(err));
+            health.markComponentError("scheduler", @errorName(err));
+            var snapshot_sleep: u64 = 0;
+            while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
+                std.Thread.sleep(std.time.ns_per_s);
+            }
+            continue;
+        };
+
+        const changed = scheduler.tick(std.time.timestamp(), event_bus);
+        if (changed) {
+            mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
+                log.warn("scheduler merge-save failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+            };
+        }
 
         state.markRunning("scheduler");
         health.markComponentOk("scheduler");
 
-        // run() blocks forever (while(true) loop) — if it returns, something went wrong.
-        // Since run() can't actually return an error (it catches internally), we treat
-        // any return from run() as an unexpected exit.
-        scheduler.run(config.reliability.scheduler_poll_secs, event_bus);
-
-        // If we reach here, scheduler exited unexpectedly
-        if (isShutdownRequested()) break;
-
-        state.markError("scheduler", "unexpected exit");
-        health.markComponentError("scheduler", "unexpected exit");
-
-        // Exponential backoff before restart
-        std.Thread.sleep(backoff_secs * std.time.ns_per_s);
-        backoff_secs = computeBackoff(backoff_secs, SCHEDULER_MAX_BACKOFF_SECS);
+        var slept: u64 = 0;
+        while (slept < poll_secs and !isShutdownRequested()) : (slept += 1) {
+            std.Thread.sleep(std.time.ns_per_s);
+        }
     }
 }
 
@@ -1454,6 +1593,52 @@ test "scheduler backoff progression" {
     try std.testing.expectEqual(@as(u64, 60), backoff); // capped at max
     backoff = computeBackoff(backoff, SCHEDULER_MAX_BACKOFF_SECS);
     try std.testing.expectEqual(@as(u64, 60), backoff); // stays at max
+}
+
+test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
+    const allocator = std.testing.allocator;
+    const cmd_runtime = "echo merge_runtime_keep_7d1c";
+    const cmd_external = "echo merge_external_add_9a42";
+
+    var runtime = CronScheduler.init(allocator, 32, true);
+    defer runtime.deinit();
+    _ = try runtime.addJob("* * * * *", cmd_runtime);
+    runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
+    try cron.saveJobs(&runtime);
+
+    var loaded = CronScheduler.init(allocator, 32, true);
+    defer loaded.deinit();
+    try cron.loadJobs(&loaded);
+
+    var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
+    defer {
+        clearSchedulerSnapshot(allocator, &before_tick);
+        before_tick.deinit(allocator);
+    }
+    try buildSchedulerSnapshot(allocator, &loaded, &before_tick);
+
+    // Simulate concurrent writer adding a new job after scheduler reload.
+    var external = CronScheduler.init(allocator, 32, true);
+    defer external.deinit();
+    try cron.loadJobs(&external);
+    _ = try external.addJob("*/5 * * * *", cmd_external);
+    try cron.saveJobs(&external);
+
+    _ = loaded.tick(std.time.timestamp(), null);
+    try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
+
+    var merged = CronScheduler.init(allocator, 64, true);
+    defer merged.deinit();
+    try cron.loadJobs(&merged);
+
+    var found_runtime = false;
+    var found_external = false;
+    for (merged.listJobs()) |job| {
+        if (std.mem.eql(u8, job.command, cmd_runtime)) found_runtime = true;
+        if (std.mem.eql(u8, job.command, cmd_external)) found_external = true;
+    }
+    try std.testing.expect(found_runtime);
+    try std.testing.expect(found_external);
 }
 
 test "channelSupervisorThread respects shutdown" {
