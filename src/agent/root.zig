@@ -727,8 +727,14 @@ pub const Agent = struct {
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
-                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
+                        const pre_compress_len = self.history.items.len;
+                        if (pre_compress_len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
+                            const force_compact_event = ObserverEvent{ .context_compacted = .{
+                                .messages_before = pre_compress_len,
+                                .messages_after = self.history.items.len,
+                            } };
+                            self.observer.recordEvent(&force_compact_event);
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
                             break :retry_blk self.provider.chat(
                                 self.allocator,
@@ -847,7 +853,15 @@ pub const Agent = struct {
                 });
 
                 // Auto-compaction before hard trimming to preserve context
+                const history_before = self.history.items.len;
                 self.last_turn_compacted = self.autoCompactHistory() catch false;
+                if (self.last_turn_compacted) {
+                    const compact_event = ObserverEvent{ .context_compacted = .{
+                        .messages_before = history_before,
+                        .messages_after = self.history.items.len,
+                    } };
+                    self.observer.recordEvent(&compact_event);
+                }
                 self.trimHistory();
 
                 // Auto-save assistant response
@@ -996,7 +1010,15 @@ pub const Agent = struct {
         });
 
         // Compact/trim history so the next turn doesn't start with bloated context
+        const iter_history_before = self.history.items.len;
         self.last_turn_compacted = self.autoCompactHistory() catch false;
+        if (self.last_turn_compacted) {
+            const iter_compact_event = ObserverEvent{ .context_compacted = .{
+                .messages_before = iter_history_before,
+                .messages_after = self.history.items.len,
+            } };
+            self.observer.recordEvent(&iter_compact_event);
+        }
         self.trimHistory();
 
         const complete_event = ObserverEvent{ .turn_complete = {} };

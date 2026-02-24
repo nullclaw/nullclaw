@@ -73,6 +73,9 @@ pub const ChannelRuntime = struct {
     tools: []const tools_mod.Tool,
     mem: ?memory_mod.Memory,
     noop_obs: *observability.NoopObserver,
+    audit_obs: ?*observability.AuditObserver = null,
+    multi_obs: ?*observability.MultiObserver = null,
+    observer_arr: ?[]observability.Observer = null,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -119,10 +122,30 @@ pub const ChannelRuntime = struct {
         const noop_obs = try allocator.create(observability.NoopObserver);
         errdefer allocator.destroy(noop_obs);
         noop_obs.* = .{};
-        const obs = noop_obs.observer();
+
+        // optionally wire audit observer into a multi-observer chain
+        var audit_obs: ?*observability.AuditObserver = null;
+        var multi_obs: ?*observability.MultiObserver = null;
+        var observer_arr: ?[]observability.Observer = null;
+        const obs = if (config.security.audit.enabled and config.security.audit.log_requests) blk: {
+            const ao = try allocator.create(observability.AuditObserver);
+            ao.* = .{ .config = config.security.audit, .allocator = allocator };
+            audit_obs = ao;
+
+            const arr = try allocator.alloc(observability.Observer, 2);
+            arr[0] = noop_obs.observer();
+            arr[1] = ao.observer();
+            observer_arr = arr;
+
+            const mo = try allocator.create(observability.MultiObserver);
+            mo.* = .{ .observers = arr };
+            multi_obs = mo;
+            break :blk mo.observer();
+        } else noop_obs.observer();
 
         // Session manager
-        const session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs);
+        var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs);
+        session_mgr.audit_observer = audit_obs;
 
         // Self — heap-allocated so pointers remain stable
         const self = try allocator.create(ChannelRuntime);
@@ -134,6 +157,9 @@ pub const ChannelRuntime = struct {
             .tools = tools,
             .mem = mem_opt,
             .noop_obs = noop_obs,
+            .audit_obs = audit_obs,
+            .multi_obs = multi_obs,
+            .observer_arr = observer_arr,
         };
         return self;
     }
@@ -144,6 +170,12 @@ pub const ChannelRuntime = struct {
         if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
         if (self.mem) |m| m.deinit();
         self.provider_bundle.deinit();
+        if (self.multi_obs) |mo| alloc.destroy(mo);
+        if (self.observer_arr) |arr| alloc.free(arr);
+        if (self.audit_obs) |ao| {
+            ao.deinit();
+            alloc.destroy(ao);
+        }
         alloc.destroy(self.noop_obs);
         alloc.destroy(self);
     }
@@ -242,7 +274,7 @@ pub fn runTelegramLoop(
             // Typing indicator
             typing.start(msg.sender);
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = runtime.session_mgr.processMessageWithMeta(session_key, msg.content, "telegram", msg.id, msg.sender) catch |err| {
                 typing.stop();
                 log.err("Agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
@@ -365,7 +397,7 @@ pub fn runSignalLoop(
                 sg_ptr.sendTypingIndicator(target);
             }
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = runtime.session_mgr.processMessageWithMeta(session_key, msg.content, "signal", msg.sender, msg.reply_target orelse "") catch |err| {
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
@@ -564,7 +596,7 @@ pub fn runMatrixLoop(
             const typing_target = msg.reply_target orelse msg.sender;
             mx_ptr.sendTypingIndicator(typing_target);
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = runtime.session_mgr.processMessageWithMeta(session_key, msg.content, "matrix", msg.sender, msg.reply_target orelse "") catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",

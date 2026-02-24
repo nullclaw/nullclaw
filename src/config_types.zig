@@ -578,6 +578,9 @@ pub const AuditConfig = struct {
     retention_days: u32 = 90,
     max_size_mb: u32 = 100,
     sign_events: bool = false,
+    log_requests: bool = true,
+    log_full_content: bool = false,
+    content_preview_len: u32 = 200,
 };
 
 pub const SecurityConfig = struct {

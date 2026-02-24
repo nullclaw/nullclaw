@@ -59,7 +59,10 @@
       "backend": "auto"
     },
     "audit": {
-      "enabled": true
+      "enabled": true,
+      "log_requests": true,
+      "log_full_content": false,
+      "content_preview_len": 200
     }
   }
 }

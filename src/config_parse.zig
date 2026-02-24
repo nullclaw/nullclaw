@@ -1044,6 +1044,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (aud.object.get("sign_events")) |v| {
                         if (v == .bool) self.security.audit.sign_events = v.bool;
                     }
+                    if (aud.object.get("log_requests")) |v| {
+                        if (v == .bool) self.security.audit.log_requests = v.bool;
+                    }
+                    if (aud.object.get("log_full_content")) |v| {
+                        if (v == .bool) self.security.audit.log_full_content = v.bool;
+                    }
+                    if (aud.object.get("content_preview_len")) |v| {
+                        if (v == .integer and v.integer >= 0) self.security.audit.content_preview_len = @intCast(v.integer);
+                    }
                 }
             }
         }

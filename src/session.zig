@@ -18,6 +18,8 @@ const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
 const observability = @import("observability.zig");
 const Observer = observability.Observer;
+const ObserverEvent = observability.ObserverEvent;
+const AuditObserver = observability.AuditObserver;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
@@ -52,6 +54,7 @@ pub const SessionManager = struct {
     tools: []const Tool,
     mem: ?Memory,
     observer: Observer,
+    audit_observer: ?*AuditObserver = null,
     policy: ?*const SecurityPolicy = null,
 
     mutex: std.Thread.Mutex,
@@ -142,6 +145,10 @@ pub const SessionManager = struct {
         }
 
         try self.sessions.put(self.allocator, owned_key, session);
+
+        const created_event = ObserverEvent{ .session_created = .{ .session_key = owned_key } };
+        self.observer.recordEvent(&created_event);
+
         return session;
     }
 
@@ -169,10 +176,43 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8) ![]const u8 {
+        return self.processMessageWithMeta(session_key, content, "", "", "");
+    }
+
+    /// Process a message with explicit channel metadata for audit logging.
+    pub fn processMessageWithMeta(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        channel: []const u8,
+        sender_id: []const u8,
+        chat_id: []const u8,
+    ) ![]const u8 {
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
         defer session.mutex.unlock();
+
+        // emit message_received audit event
+        const recv_event = ObserverEvent{ .message_received = .{
+            .channel = channel,
+            .sender_id = sender_id,
+            .chat_id = chat_id,
+            .session_key = session_key,
+            .content_preview = content,
+        } };
+        self.observer.recordEvent(&recv_event);
+
+        // set audit context for enriching events during agent.turn()
+        if (self.audit_observer) |ao| {
+            ao.setContext(.{
+                .session_key = session_key,
+                .channel = channel,
+                .sender_id = sender_id,
+                .chat_id = chat_id,
+            });
+        }
+        defer if (self.audit_observer) |ao| ao.clearContext();
 
         const response = try session.agent.turn(content);
         session.turn_count += 1;
@@ -182,6 +222,14 @@ pub const SessionManager = struct {
         if (session.agent.last_turn_compacted) {
             session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
         }
+
+        // emit message_sent audit event
+        const sent_event = ObserverEvent{ .message_sent = .{
+            .channel = channel,
+            .chat_id = chat_id,
+            .content_preview = response,
+        } };
+        self.observer.recordEvent(&sent_event);
 
         // Persist messages to SQLite
         if (self.mem) |mem| {
@@ -233,6 +281,9 @@ pub const SessionManager = struct {
 
         for (to_remove.items) |key| {
             if (self.sessions.fetchRemove(key)) |kv| {
+                const evict_event = ObserverEvent{ .session_evicted = .{ .session_key = key } };
+                self.observer.recordEvent(&evict_event);
+
                 const session = kv.value;
                 session.deinit(self.allocator);
                 self.allocator.destroy(session);

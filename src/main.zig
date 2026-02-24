@@ -1039,12 +1039,28 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     defer runtime_provider.deinit();
     const provider_i = runtime_provider.provider();
 
-    // Create noop observer
+    // Create observer (audit-aware when configured)
     var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
+    const audit_obs: ?*yc.observability.AuditObserver = if (config.security.audit.enabled and config.security.audit.log_requests) blk: {
+        const ao = try allocator.create(yc.observability.AuditObserver);
+        ao.* = .{ .config = config.security.audit, .allocator = allocator };
+        break :blk ao;
+    } else null;
+    defer if (audit_obs) |ao| {
+        ao.deinit();
+        allocator.destroy(ao);
+    };
+    var sig_observer_arr: [2]yc.observability.Observer = undefined;
+    var sig_multi_obs: yc.observability.MultiObserver = undefined;
+    const obs = if (audit_obs) |ao| blk: {
+        sig_observer_arr = .{ noop_obs.observer(), ao.observer() };
+        sig_multi_obs = .{ .observers = &sig_observer_arr };
+        break :blk sig_multi_obs.observer();
+    } else noop_obs.observer();
 
     // Initialize session manager
     var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs);
+    session_mgr.audit_observer = audit_obs;
     session_mgr.policy = &sec_policy;
     defer session_mgr.deinit();
 
@@ -1093,7 +1109,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
                 break :blk route.session_key;
             };
 
-            const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = session_mgr.processMessageWithMeta(session_key, msg.content, "signal", msg.sender, msg.reply_target orelse "") catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
@@ -1309,9 +1325,24 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     }
     defer if (mem_opt) |m| m.deinit();
 
-    // Create noop observer
+    // Create observer (audit-aware when configured)
     var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
+    const tg_audit_obs: ?*yc.observability.AuditObserver = if (config.security.audit.enabled and config.security.audit.log_requests) blk: {
+        const ao = try allocator.create(yc.observability.AuditObserver);
+        ao.* = .{ .config = config.security.audit, .allocator = allocator };
+        break :blk ao;
+    } else null;
+    defer if (tg_audit_obs) |ao| {
+        ao.deinit();
+        allocator.destroy(ao);
+    };
+    var tg_observer_arr: [2]yc.observability.Observer = undefined;
+    var tg_multi_obs: yc.observability.MultiObserver = undefined;
+    const obs = if (tg_audit_obs) |ao| blk: {
+        tg_observer_arr = .{ noop_obs.observer(), ao.observer() };
+        tg_multi_obs = .{ .observers = &tg_observer_arr };
+        break :blk tg_multi_obs.observer();
+    } else noop_obs.observer();
 
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &config);
@@ -1330,6 +1361,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
     var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs);
+    session_mgr.audit_observer = tg_audit_obs;
     session_mgr.policy = &sec_policy;
     defer session_mgr.deinit();
 
@@ -1388,7 +1420,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             // Start periodic typing indicator while LLM is thinking
             typing.start(msg.sender);
 
-            const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = session_mgr.processMessageWithMeta(session_key, msg.content, "telegram", msg.id, msg.sender) catch |err| {
                 typing.stop();
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {

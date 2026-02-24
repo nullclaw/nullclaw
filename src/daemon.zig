@@ -611,7 +611,7 @@ fn inboundDispatcherThread(
             indicator_mode,
         );
 
-        const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+        const reply = runtime.session_mgr.processMessageWithMeta(session_key, msg.content, msg.channel, msg.sender_id, msg.chat_id) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
             // Send user-visible error reply back to the originating channel

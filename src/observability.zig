@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_types = @import("config_types.zig");
 
 /// Events the observer can record.
 pub const ObserverEvent = union(enum) {
@@ -13,6 +14,12 @@ pub const ObserverEvent = union(enum) {
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
     err: struct { component: []const u8, message: []const u8 },
+    // audit-specific events for LLM reasoning flow
+    message_received: struct { channel: []const u8, sender_id: []const u8, chat_id: []const u8, session_key: []const u8, content_preview: []const u8 },
+    message_sent: struct { channel: []const u8, chat_id: []const u8, content_preview: []const u8 },
+    session_created: struct { session_key: []const u8 },
+    session_evicted: struct { session_key: []const u8 },
+    context_compacted: struct { messages_before: usize, messages_after: usize },
 };
 
 /// Numeric metrics.
@@ -109,6 +116,11 @@ pub const LogObserver = struct {
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
+            .message_received => |e| std.log.info("message.received channel={s} sender={s} session={s}", .{ e.channel, e.sender_id, e.session_key }),
+            .message_sent => |e| std.log.info("message.sent channel={s} chat={s}", .{ e.channel, e.chat_id }),
+            .session_created => |e| std.log.info("session.created key={s}", .{e.session_key}),
+            .session_evicted => |e| std.log.info("session.evicted key={s}", .{e.session_key}),
+            .context_compacted => |e| std.log.info("context.compacted before={d} after={d}", .{ e.messages_before, e.messages_after }),
         }
     }
 
@@ -279,6 +291,11 @@ pub const FileObserver = struct {
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":\"{s}\",\"message\":\"{s}\"}}", .{ e.component, e.message }) catch return,
+            .message_received => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"message_received\",\"channel\":\"{s}\",\"sender_id\":\"{s}\",\"session_key\":\"{s}\"}}", .{ e.channel, e.sender_id, e.session_key }) catch return,
+            .message_sent => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"message_sent\",\"channel\":\"{s}\",\"chat_id\":\"{s}\"}}", .{ e.channel, e.chat_id }) catch return,
+            .session_created => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"session_created\",\"session_key\":\"{s}\"}}", .{e.session_key}) catch return,
+            .session_evicted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"session_evicted\",\"session_key\":\"{s}\"}}", .{e.session_key}) catch return,
+            .context_compacted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"context_compacted\",\"messages_before\":{d},\"messages_after\":{d}}}", .{ e.messages_before, e.messages_after }) catch return,
         };
         self.appendToFile(line);
     }
@@ -515,6 +532,31 @@ pub const OtelObserver = struct {
                     .{ .key = "message", .value = e.message },
                 });
             },
+            // audit events — passthrough as lightweight spans
+            .message_received => |e| {
+                self.addSpan("message.received", now, now, &.{
+                    .{ .key = "channel", .value = e.channel },
+                    .{ .key = "session_key", .value = e.session_key },
+                });
+            },
+            .message_sent => |e| {
+                self.addSpan("message.sent", now, now, &.{
+                    .{ .key = "channel", .value = e.channel },
+                });
+            },
+            .session_created => |e| {
+                self.addSpan("session.created", now, now, &.{
+                    .{ .key = "session_key", .value = e.session_key },
+                });
+            },
+            .session_evicted => |e| {
+                self.addSpan("session.evicted", now, now, &.{
+                    .{ .key = "session_key", .value = e.session_key },
+                });
+            },
+            .context_compacted => {
+                self.addSpan("context.compacted", now, now, &.{});
+            },
         }
     }
 
@@ -629,6 +671,239 @@ pub const OtelObserver = struct {
 
     fn otelName(_: *anyopaque) []const u8 {
         return "otel";
+    }
+};
+
+// ── AuditObserver ────────────────────────────────────────────────────
+
+/// Session context set per-request by the caller (e.g. SessionManager).
+pub const AuditContext = struct {
+    session_key: []const u8 = "",
+    channel: []const u8 = "",
+    sender_id: []const u8 = "",
+    chat_id: []const u8 = "",
+};
+
+/// JSONL audit observer for the full LLM reasoning lifecycle.
+/// Implements Observer.VTable; writes structured JSONL enriched with
+/// per-request session context set via setContext/clearContext.
+/// Context is stored per-thread to support concurrent sessions safely.
+pub const AuditObserver = struct {
+    config: config_types.AuditConfig,
+    // per-thread context map: thread_id -> AuditContext
+    contexts: std.AutoHashMapUnmanaged(std.Thread.Id, AuditContext) = .{},
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+
+    const vtable_impl = Observer.VTable{
+        .record_event = auditRecordEvent,
+        .record_metric = auditRecordMetric,
+        .flush = auditFlush,
+        .name = auditName,
+    };
+
+    pub fn observer(self: *AuditObserver) Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_impl };
+    }
+
+    pub fn deinit(self: *AuditObserver) void {
+        self.contexts.deinit(self.allocator);
+    }
+
+    fn resolve(ptr: *anyopaque) *AuditObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    /// Set session context for the calling thread. Caller should clearContext after.
+    pub fn setContext(self: *AuditObserver, ctx: AuditContext) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.contexts.put(self.allocator, std.Thread.getCurrentId(), ctx) catch {};
+    }
+
+    pub fn clearContext(self: *AuditObserver) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.contexts.remove(std.Thread.getCurrentId());
+    }
+
+    fn getContext(self: *AuditObserver) AuditContext {
+        // mutex already held by caller (auditRecordEvent)
+        return self.contexts.get(std.Thread.getCurrentId()) orelse .{};
+    }
+
+    fn truncatePreview(content: []const u8, max_len: u32) []const u8 {
+        if (max_len == 0 or content.len <= max_len) return content;
+        // don't split a multi-byte UTF-8 codepoint
+        var end: usize = max_len;
+        while (end > 0 and (content[end] & 0xC0) == 0x80) end -= 1;
+        return content[0..end];
+    }
+
+    /// Escape JSON-special characters into a fixed buffer.
+    /// Handles RFC 8259 required escapes for control characters 0x00-0x1F.
+    fn jsonEscape(out: []u8, input: []const u8) []const u8 {
+        var pos: usize = 0;
+        for (input) |c| {
+            switch (c) {
+                '"', '\\' => {
+                    if (pos + 2 > out.len) break;
+                    out[pos] = '\\';
+                    pos += 1;
+                    out[pos] = c;
+                    pos += 1;
+                },
+                '\n' => {
+                    if (pos + 2 > out.len) break;
+                    out[pos] = '\\';
+                    pos += 1;
+                    out[pos] = 'n';
+                    pos += 1;
+                },
+                '\r' => {
+                    if (pos + 2 > out.len) break;
+                    out[pos] = '\\';
+                    pos += 1;
+                    out[pos] = 'r';
+                    pos += 1;
+                },
+                '\t' => {
+                    if (pos + 2 > out.len) break;
+                    out[pos] = '\\';
+                    pos += 1;
+                    out[pos] = 't';
+                    pos += 1;
+                },
+                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
+                    // \uXXXX escape for remaining control chars
+                    if (pos + 6 > out.len) break;
+                    const hex = "0123456789abcdef";
+                    out[pos] = '\\';
+                    out[pos + 1] = 'u';
+                    out[pos + 2] = '0';
+                    out[pos + 3] = '0';
+                    out[pos + 4] = hex[c >> 4];
+                    out[pos + 5] = hex[c & 0x0F];
+                    pos += 6;
+                },
+                else => {
+                    if (pos + 1 > out.len) break;
+                    out[pos] = c;
+                    pos += 1;
+                },
+            }
+        }
+        return out[0..pos];
+    }
+
+    fn appendToFile(self: *AuditObserver, line: []const u8) void {
+        const path = self.config.log_file orelse self.config.log_path;
+        const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch {
+            const new_file = std.fs.cwd().createFile(path, .{ .truncate = false }) catch return;
+            defer new_file.close();
+            new_file.seekFromEnd(0) catch return;
+            new_file.writeAll(line) catch {};
+            new_file.writeAll("\n") catch {};
+            return;
+        };
+        defer file.close();
+        file.seekFromEnd(0) catch return;
+        file.writeAll(line) catch {};
+        file.writeAll("\n") catch {};
+    }
+
+    /// Write a JSONL line with timestamp, event type, context, and event-specific fields.
+    fn writeEntry(self: *AuditObserver, buf: []u8, event_type: []const u8, detail: []const u8) void {
+        const ctx = self.getContext();
+        const ts = std.time.timestamp();
+        const line = std.fmt.bufPrint(buf, "{{\"ts\":{d},\"event\":\"{s}\",\"session_key\":\"{s}\",\"channel\":\"{s}\",\"sender_id\":\"{s}\",\"chat_id\":\"{s}\"{s}}}", .{
+            ts,
+            event_type,
+            ctx.session_key,
+            ctx.channel,
+            ctx.sender_id,
+            ctx.chat_id,
+            detail,
+        }) catch return;
+        self.appendToFile(line);
+    }
+
+    fn auditRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var buf: [4096]u8 = undefined;
+        var detail_buf: [2048]u8 = undefined;
+        var esc_buf: [2048]u8 = undefined;
+
+        switch (event.*) {
+            .message_received => |e| {
+                const preview = if (self.config.log_full_content) e.content_preview else truncatePreview(e.content_preview, self.config.content_preview_len);
+                const escaped = jsonEscape(&esc_buf, preview);
+                const detail = std.fmt.bufPrint(&detail_buf, ",\"content_preview\":\"{s}\"", .{escaped}) catch return;
+                // use event's own fields for context since setContext may not be called yet
+                const ts = std.time.timestamp();
+                const line = std.fmt.bufPrint(&buf, "{{\"ts\":{d},\"event\":\"message_received\",\"session_key\":\"{s}\",\"channel\":\"{s}\",\"sender_id\":\"{s}\",\"chat_id\":\"{s}\"{s}}}", .{
+                    ts, e.session_key, e.channel, e.sender_id, e.chat_id, detail,
+                }) catch return;
+                self.appendToFile(line);
+            },
+            .message_sent => |e| {
+                const ctx = self.getContext();
+                const preview = if (self.config.log_full_content) e.content_preview else truncatePreview(e.content_preview, self.config.content_preview_len);
+                const escaped = jsonEscape(&esc_buf, preview);
+                const detail = std.fmt.bufPrint(&detail_buf, ",\"content_preview\":\"{s}\"", .{escaped}) catch return;
+                const ts = std.time.timestamp();
+                const line = std.fmt.bufPrint(&buf, "{{\"ts\":{d},\"event\":\"message_sent\",\"session_key\":\"{s}\",\"channel\":\"{s}\",\"sender_id\":\"{s}\",\"chat_id\":\"{s}\"{s}}}", .{
+                    ts, ctx.session_key, e.channel, ctx.sender_id, e.chat_id, detail,
+                }) catch return;
+                self.appendToFile(line);
+            },
+            .session_created => |e| {
+                const detail = std.fmt.bufPrint(&detail_buf, ",\"new_session_key\":\"{s}\"", .{e.session_key}) catch return;
+                self.writeEntry(&buf, "session_created", detail);
+            },
+            .session_evicted => |e| {
+                const ts = std.time.timestamp();
+                const line = std.fmt.bufPrint(&buf, "{{\"ts\":{d},\"event\":\"session_evicted\",\"session_key\":\"{s}\"}}", .{ ts, e.session_key }) catch return;
+                self.appendToFile(line);
+            },
+            .llm_request => |e| {
+                const detail = std.fmt.bufPrint(&detail_buf, ",\"provider\":\"{s}\",\"model\":\"{s}\",\"messages_count\":{d}", .{ e.provider, e.model, e.messages_count }) catch return;
+                self.writeEntry(&buf, "llm_request", detail);
+            },
+            .llm_response => |e| {
+                if (e.error_message) |err_msg| {
+                    const escaped_err = jsonEscape(&esc_buf, err_msg);
+                    const detail = std.fmt.bufPrint(&detail_buf, ",\"provider\":\"{s}\",\"model\":\"{s}\",\"duration_ms\":{d},\"success\":{},\"error\":\"{s}\"", .{ e.provider, e.model, e.duration_ms, e.success, escaped_err }) catch return;
+                    self.writeEntry(&buf, "llm_response", detail);
+                } else {
+                    const detail = std.fmt.bufPrint(&detail_buf, ",\"provider\":\"{s}\",\"model\":\"{s}\",\"duration_ms\":{d},\"success\":{}", .{ e.provider, e.model, e.duration_ms, e.success }) catch return;
+                    self.writeEntry(&buf, "llm_response", detail);
+                }
+            },
+            .tool_call => |e| {
+                const detail = std.fmt.bufPrint(&detail_buf, ",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}", .{ e.tool, e.duration_ms, e.success }) catch return;
+                self.writeEntry(&buf, "tool_call", detail);
+            },
+            .tool_iterations_exhausted => |e| {
+                const detail = std.fmt.bufPrint(&detail_buf, ",\"iterations\":{d}", .{e.iterations}) catch return;
+                self.writeEntry(&buf, "tool_iterations_exhausted", detail);
+            },
+            .context_compacted => |e| {
+                const detail = std.fmt.bufPrint(&detail_buf, ",\"messages_before\":{d},\"messages_after\":{d}", .{ e.messages_before, e.messages_after }) catch return;
+                self.writeEntry(&buf, "context_compacted", detail);
+            },
+            // events we don't audit-log
+            .agent_start, .agent_end, .tool_call_start, .turn_complete, .channel_message, .heartbeat_tick, .err => {},
+        }
+    }
+
+    fn auditRecordMetric(_: *anyopaque, _: *const ObserverMetric) void {}
+    fn auditFlush(_: *anyopaque) void {}
+    fn auditName(_: *anyopaque) []const u8 {
+        return "audit";
     }
 };
 
@@ -1275,4 +1550,140 @@ test "OtelObserver counters combined scenario" {
 
     try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 3), otel.errors_total.load(.monotonic)); // 1 failed response + 2 error events
+}
+
+// ── AuditObserver tests ─────────────────────────────────────────
+
+test "AuditObserver name" {
+    var audit = AuditObserver{ .config = .{}, .allocator = std.testing.allocator };
+    const obs = audit.observer();
+    try std.testing.expectEqualStrings("audit", obs.getName());
+}
+
+test "AuditObserver setContext and clearContext" {
+    var audit = AuditObserver{ .config = .{}, .allocator = std.testing.allocator };
+    defer audit.deinit();
+    audit.setContext(.{
+        .session_key = "telegram:chat1",
+        .channel = "telegram",
+        .sender_id = "user42",
+        .chat_id = "chat1",
+    });
+    // verify context stored for current thread
+    audit.mutex.lock();
+    const ctx = audit.contexts.get(std.Thread.getCurrentId()).?;
+    audit.mutex.unlock();
+    try std.testing.expectEqualStrings("telegram:chat1", ctx.session_key);
+    try std.testing.expectEqualStrings("telegram", ctx.channel);
+    try std.testing.expectEqualStrings("user42", ctx.sender_id);
+
+    audit.clearContext();
+    audit.mutex.lock();
+    const cleared = audit.contexts.get(std.Thread.getCurrentId());
+    audit.mutex.unlock();
+    try std.testing.expect(cleared == null);
+}
+
+test "AuditObserver truncatePreview" {
+    try std.testing.expectEqualStrings("hello", AuditObserver.truncatePreview("hello world", 5));
+    try std.testing.expectEqualStrings("hello", AuditObserver.truncatePreview("hello", 10));
+    try std.testing.expectEqualStrings("hello", AuditObserver.truncatePreview("hello", 0));
+    try std.testing.expectEqualStrings("", AuditObserver.truncatePreview("", 200));
+    // utf-8 safety: "héllo" has é as 2 bytes (0xC3 0xA9), cutting at byte 2 should back up
+    try std.testing.expectEqualStrings("h", AuditObserver.truncatePreview("h\xc3\xa9llo", 2));
+}
+
+test "AuditObserver jsonEscape" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("hello", AuditObserver.jsonEscape(&buf, "hello"));
+    try std.testing.expectEqualStrings("say \\\"hi\\\"", AuditObserver.jsonEscape(&buf, "say \"hi\""));
+    try std.testing.expectEqualStrings("a\\nb", AuditObserver.jsonEscape(&buf, "a\nb"));
+    try std.testing.expectEqualStrings("a\\\\b", AuditObserver.jsonEscape(&buf, "a\\b"));
+    try std.testing.expectEqualStrings("a\\tb", AuditObserver.jsonEscape(&buf, "a\tb"));
+    // control characters get \u00XX escapes
+    try std.testing.expectEqualStrings("a\\u0000b", AuditObserver.jsonEscape(&buf, "a\x00b"));
+    try std.testing.expectEqualStrings("\\u0008", AuditObserver.jsonEscape(&buf, "\x08"));
+}
+
+test "AuditObserver does not panic on all event types" {
+    var audit = AuditObserver{ .config = .{ .log_path = "/tmp/nullclaw_audit_test.jsonl" }, .allocator = std.testing.allocator };
+    defer audit.deinit();
+    const obs = audit.observer();
+
+    audit.setContext(.{ .session_key = "test:1", .channel = "test", .sender_id = "u1", .chat_id = "c1" });
+
+    const events = [_]ObserverEvent{
+        .{ .message_received = .{ .channel = "test", .sender_id = "u1", .chat_id = "c1", .session_key = "test:1", .content_preview = "hello" } },
+        .{ .llm_request = .{ .provider = "openrouter", .model = "claude", .messages_count = 3 } },
+        .{ .llm_response = .{ .provider = "openrouter", .model = "claude", .duration_ms = 200, .success = true, .error_message = null } },
+        .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
+        .{ .tool_iterations_exhausted = .{ .iterations = 25 } },
+        .{ .context_compacted = .{ .messages_before = 50, .messages_after = 20 } },
+        .{ .message_sent = .{ .channel = "test", .chat_id = "c1", .content_preview = "response text" } },
+        .{ .session_created = .{ .session_key = "test:1" } },
+        .{ .session_evicted = .{ .session_key = "test:1" } },
+        // events that are silently skipped
+        .{ .agent_start = .{ .provider = "test", .model = "test" } },
+        .{ .agent_end = .{ .duration_ms = 100, .tokens_used = 50 } },
+        .{ .tool_call_start = .{ .tool = "shell" } },
+        .{ .turn_complete = {} },
+        .{ .channel_message = .{ .channel = "test", .direction = "inbound" } },
+        .{ .heartbeat_tick = {} },
+        .{ .err = .{ .component = "test", .message = "error" } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+
+    const metric = ObserverMetric{ .tokens_used = 42 };
+    obs.recordMetric(&metric);
+    obs.flush();
+}
+
+test "AuditObserver llm_response with error message" {
+    var audit = AuditObserver{ .config = .{ .log_path = "/tmp/nullclaw_audit_err_test.jsonl" }, .allocator = std.testing.allocator };
+    const obs = audit.observer();
+    const event = ObserverEvent{ .llm_response = .{
+        .provider = "test",
+        .model = "test",
+        .duration_ms = 0,
+        .success = false,
+        .error_message = "rate_limited",
+    } };
+    obs.recordEvent(&event);
+}
+
+test "AuditObserver through Observer interface" {
+    var audit = AuditObserver{ .config = .{}, .allocator = std.testing.allocator };
+    const obs = audit.observer();
+    try std.testing.expectEqualStrings("audit", obs.getName());
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    obs.flush();
+}
+
+test "ObserverEvent new audit variants" {
+    const e1 = ObserverEvent{ .message_received = .{ .channel = "tg", .sender_id = "u1", .chat_id = "c1", .session_key = "tg:c1", .content_preview = "hi" } };
+    switch (e1) {
+        .message_received => |e| {
+            try std.testing.expectEqualStrings("tg", e.channel);
+            try std.testing.expectEqualStrings("u1", e.sender_id);
+        },
+        else => unreachable,
+    }
+
+    const e2 = ObserverEvent{ .session_created = .{ .session_key = "test:key" } };
+    switch (e2) {
+        .session_created => |e| try std.testing.expectEqualStrings("test:key", e.session_key),
+        else => unreachable,
+    }
+
+    const e3 = ObserverEvent{ .context_compacted = .{ .messages_before = 50, .messages_after = 20 } };
+    switch (e3) {
+        .context_compacted => |e| {
+            try std.testing.expectEqual(@as(usize, 50), e.messages_before);
+            try std.testing.expectEqual(@as(usize, 20), e.messages_after);
+        },
+        else => unreachable,
+    }
 }
