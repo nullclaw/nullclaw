@@ -11,6 +11,7 @@ const VectorStore = store_mod.VectorStore;
 const VectorResult = store_mod.VectorResult;
 const HealthStatus = store_mod.HealthStatus;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
+const net_security = @import("../../net_security.zig");
 
 // ── Config ────────────────────────────────────────────────────────
 
@@ -42,7 +43,23 @@ pub const QdrantVectorStore = struct {
         }
     }
 
+    /// Require a parseable HTTP(S) endpoint. Plain HTTP is only allowed on local hosts.
+    fn validateEndpointUrl(url: []const u8) !void {
+        if (url.len == 0) return error.InvalidQdrantUrl;
+        _ = std.Uri.parse(url) catch return error.InvalidQdrantUrl;
+
+        const is_https = std.mem.startsWith(u8, url, "https://");
+        const is_http = std.mem.startsWith(u8, url, "http://");
+        if (!is_https and !is_http) return error.InvalidQdrantUrl;
+
+        if (is_http) {
+            const host = net_security.extractHost(url) orelse return error.InvalidQdrantUrl;
+            if (!net_security.isLocalHost(host)) return error.InsecureQdrantUrl;
+        }
+    }
+
     pub fn init(allocator: Allocator, config: QdrantConfig) !*Self {
+        try validateEndpointUrl(config.url);
         try validateCollectionName(config.collection_name);
 
         const self = try allocator.create(Self);
@@ -474,6 +491,26 @@ test "QdrantVectorStore init without api_key" {
     q.deinit();
 }
 
+test "QdrantVectorStore rejects insecure remote http url" {
+    const init_result = QdrantVectorStore.init(std.testing.allocator, .{
+        .url = "http://example.com:6333",
+        .api_key = null,
+        .collection_name = "test",
+        .dimensions = 3,
+    });
+    try std.testing.expectError(error.InsecureQdrantUrl, init_result);
+}
+
+test "QdrantVectorStore accepts https remote url" {
+    const q = try QdrantVectorStore.init(std.testing.allocator, .{
+        .url = "https://example.com:6333",
+        .api_key = null,
+        .collection_name = "test",
+        .dimensions = 3,
+    });
+    q.deinit();
+}
+
 test "QdrantVectorStore produces valid VectorStore vtable" {
     var q = try QdrantVectorStore.init(std.testing.allocator, .{
         .url = "http://localhost:6333",
@@ -747,7 +784,7 @@ test "buildUpsertPayload rejects NaN embedding" {
 
 test "buildUpsertPayload rejects Inf embedding" {
     const alloc = std.testing.allocator;
-    const embedding = [_]f32{ std.math.inf(f32) };
+    const embedding = [_]f32{std.math.inf(f32)};
     const result = QdrantVectorStore.buildUpsertPayload(alloc, "key", &embedding);
     try std.testing.expectError(error.InvalidEmbeddingValue, result);
 }

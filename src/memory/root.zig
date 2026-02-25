@@ -568,8 +568,9 @@ pub fn initRuntime(
     };
 
     const pg_cfg: ?config_types.MemoryPostgresConfig = if (std.mem.eql(u8, config.backend, "postgres")) config.postgres else null;
+    const redis_cfg: ?config_types.MemoryRedisConfig = if (std.mem.eql(u8, config.backend, "redis")) config.redis else null;
     const api_cfg: ?config_types.MemoryApiConfig = if (std.mem.eql(u8, config.backend, "api")) config.api else null;
-    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg, api_cfg) catch |err| {
+    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg, redis_cfg, api_cfg) catch |err| {
         log.warn("memory path resolution failed for backend '{s}': {}", .{ config.backend, err });
         return null;
     };
@@ -672,6 +673,7 @@ pub fn initRuntime(
     var cb_inst: ?*circuit_breaker.CircuitBreaker = null;
     var outbox_inst: ?*outbox.VectorOutbox = null;
     var sidecar_db_path: ?[*:0]const u8 = null;
+    var resolved_vector_mode: []const u8 = "none";
     if (!std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled) vec_plane: {
         // 1. Create EmbeddingProvider (with optional fallback via ProviderRouter)
         const primary_ep = embeddings.createEmbeddingProvider(
@@ -686,7 +688,8 @@ pub fn initRuntime(
 
         // Wrap primary + fallback in a ProviderRouter when fallback is configured
         if (!std.mem.eql(u8, config.search.fallback_provider, "none") and
-            config.search.fallback_provider.len > 0) wrap_router: {
+            config.search.fallback_provider.len > 0)
+        wrap_router: {
             const fallback_ep = embeddings.createEmbeddingProvider(
                 allocator,
                 config.search.fallback_provider,
@@ -734,6 +737,7 @@ pub fn initRuntime(
                 break :vec_plane;
             };
             vs_iface = qdrant.store();
+            resolved_vector_mode = "qdrant";
         } else if (std.mem.eql(u8, store_kind, "pgvector")) {
             // pgvector via PostgreSQL
             if (build_options.enable_postgres) {
@@ -752,6 +756,7 @@ pub fn initRuntime(
                     break :vec_plane;
                 };
                 vs_iface = pgvs.store();
+                resolved_vector_mode = "pgvector";
             } else {
                 log.warn("vector store kind 'pgvector' requires build with enable_postgres=true", .{});
                 break :vec_plane;
@@ -767,6 +772,7 @@ pub fn initRuntime(
                     vs.owns_self = true;
                     vs_iface = vs.store();
                     db_handle_for_outbox = db_handle;
+                    resolved_vector_mode = "sqlite_shared";
                 } else if (std.mem.eql(u8, store_kind, "sqlite_shared")) {
                     log.warn("vector store kind 'sqlite_shared' requires a sqlite-based primary backend", .{});
                     break :vec_plane;
@@ -791,6 +797,7 @@ pub fn initRuntime(
                 vs_iface = vs.store();
                 db_handle_for_outbox = vs.db; // sidecar's own db for outbox
                 sidecar_db_path = sidecar_path;
+                resolved_vector_mode = "sqlite_sidecar";
             }
         }
 
@@ -884,16 +891,7 @@ pub fn initRuntime(
 
     // ── Startup diagnostic ──
     const source_count: usize = if (engine) |eng| eng.sources.items.len else 0;
-    const vector_mode: []const u8 = if (vs_iface == null)
-        "none"
-    else if (std.mem.eql(u8, config.search.store.kind, "qdrant"))
-        "qdrant"
-    else if (std.mem.eql(u8, config.search.store.kind, "pgvector"))
-        "pgvector"
-    else if (extractSqliteDb(instance.memory) != null)
-        "sqlite_shared"
-    else
-        "sqlite_sidecar";
+    const vector_mode: []const u8 = if (vs_iface == null) "none" else resolved_vector_mode;
     log.info("memory plan resolved: backend={s} retrieval={s} vector={s} rollout={s} hygiene={} snapshot={} cache={} semantic_cache={} summarizer={} sources={d}", .{
         config.backend,
         if (config.search.query.hybrid.enabled) "hybrid" else "keyword",
@@ -1271,6 +1269,21 @@ test "initRuntime with search.provider=none has no vector store" {
 
     try std.testing.expect(rt._embedding_provider == null);
     try std.testing.expect(rt._vector_store == null);
+}
+
+test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+            .store = .{ .kind = "sqlite_sidecar" },
+        },
+    }, "/tmp") orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._vector_store != null);
+    try std.testing.expectEqualStrings("sqlite_sidecar", rt.resolved.vector_mode);
 }
 
 test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {

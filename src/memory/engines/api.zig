@@ -14,6 +14,7 @@ const MemoryEntry = root.MemoryEntry;
 const MessageEntry = root.MessageEntry;
 const SessionStore = root.SessionStore;
 const config_types = @import("../../config_types.zig");
+const net_security = @import("../../net_security.zig");
 const log = std.log.scoped(.api_memory);
 
 // ── ApiMemory ─────────────────────────────────────────────────────
@@ -35,6 +36,8 @@ pub const ApiMemory = struct {
         if (url.len > 0 and url[url.len - 1] == '/') {
             url = url[0 .. url.len - 1];
         }
+        if (url.len == 0) return error.InvalidApiUrl;
+        try validateBaseUrl(url);
         var ns = config.namespace;
         if (ns.len > 0 and ns[ns.len - 1] == '/') {
             ns = ns[0 .. ns.len - 1];
@@ -59,6 +62,20 @@ pub const ApiMemory = struct {
             .api_key = api_key,
             .timeout_ms = config.timeout_ms,
         };
+    }
+
+    /// Require a parseable HTTP(S) URL. Plain HTTP is only allowed for local hosts.
+    fn validateBaseUrl(url: []const u8) !void {
+        _ = std.Uri.parse(url) catch return error.InvalidApiUrl;
+
+        const is_https = std.mem.startsWith(u8, url, "https://");
+        const is_http = std.mem.startsWith(u8, url, "http://");
+        if (!is_https and !is_http) return error.InvalidApiUrl;
+
+        if (is_http) {
+            const host = net_security.extractHost(url) orelse return error.InvalidApiUrl;
+            if (!net_security.isLocalHost(host)) return error.InsecureApiUrl;
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -246,7 +263,6 @@ pub const ApiMemory = struct {
         try buf.appendSlice(alloc, "\"}");
         return buf.toOwnedSlice(alloc);
     }
-
 
     // ── URL encoding ──────────────────────────────────────────────
 
@@ -676,7 +692,7 @@ pub const ApiMemory = struct {
 // ── Tests ─────────────────────────────────────────────────────────
 
 test "api memory name" {
-    var mem = try ApiMemory.init(std.testing.allocator, .{});
+    var mem = try ApiMemory.init(std.testing.allocator, .{ .url = "http://127.0.0.1:8080" });
     defer mem.deinit();
 
     const m = mem.memory();
@@ -694,9 +710,8 @@ test "api memory health check no server" {
 }
 
 test "api memory init/deinit" {
-    // Empty URL
-    var mem1 = try ApiMemory.init(std.testing.allocator, .{});
-    mem1.deinit();
+    // Empty URL is invalid for API backend
+    try std.testing.expectError(error.InvalidApiUrl, ApiMemory.init(std.testing.allocator, .{}));
 
     // With URL and api_key
     var mem2 = try ApiMemory.init(std.testing.allocator, .{
@@ -710,6 +725,20 @@ test "api memory init/deinit" {
     try std.testing.expectEqualStrings("http://localhost:8080/v1", mem2.base_url);
     try std.testing.expectEqualStrings("test-secret", mem2.api_key.?);
     try std.testing.expectEqual(@as(u32, 5000), mem2.timeout_ms);
+}
+
+test "api init rejects insecure remote http url" {
+    try std.testing.expectError(error.InsecureApiUrl, ApiMemory.init(std.testing.allocator, .{
+        .url = "http://example.com",
+    }));
+}
+
+test "api init accepts https remote url" {
+    var mem = try ApiMemory.init(std.testing.allocator, .{
+        .url = "https://example.com",
+    });
+    defer mem.deinit();
+    try std.testing.expectEqualStrings("https://example.com", mem.base_url);
 }
 
 test "api url building" {
@@ -1015,7 +1044,7 @@ test "api build message payload" {
 }
 
 test "api memory produces vtable" {
-    var mem = try ApiMemory.init(std.testing.allocator, .{});
+    var mem = try ApiMemory.init(std.testing.allocator, .{ .url = "http://127.0.0.1:8080" });
     defer mem.deinit();
 
     const m = mem.memory();
@@ -1031,7 +1060,7 @@ test "api memory produces vtable" {
 }
 
 test "api memory produces session store vtable" {
-    var mem = try ApiMemory.init(std.testing.allocator, .{});
+    var mem = try ApiMemory.init(std.testing.allocator, .{ .url = "http://127.0.0.1:8080" });
     defer mem.deinit();
 
     const ss = mem.sessionStore() orelse return error.TestUnexpectedResult;
@@ -1042,7 +1071,7 @@ test "api memory produces session store vtable" {
 }
 
 test "api memory no session store when disabled" {
-    var mem = try ApiMemory.init(std.testing.allocator, .{});
+    var mem = try ApiMemory.init(std.testing.allocator, .{ .url = "http://127.0.0.1:8080" });
     defer mem.deinit();
 
     mem.has_session_store = false;

@@ -374,10 +374,10 @@ fn readBrainDbEntries(
     const paths = [_][]const u8{ "memory/brain.db", "brain.db" };
     for (&paths) |rel| {
         const db_path = std.fs.path.joinZ(allocator, &.{ source, rel }) catch continue;
-        defer allocator.free(std.mem.span(db_path));
+        defer allocator.free(db_path);
 
         // Check file exists before attempting open
-        const abs_path = std.mem.span(db_path);
+        const abs_path = db_path[0..db_path.len];
         std.fs.cwd().access(abs_path, .{}) catch continue;
 
         const sqlite_entries = migrate_mod.readBrainDb(allocator, db_path) catch |err| {

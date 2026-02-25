@@ -196,6 +196,17 @@ pub const QmdAdapter = struct {
         return candidates.toOwnedSlice(allocator);
     }
 
+    /// Session IDs are used as filenames for exported markdown.
+    /// Reject path traversal and unsafe path bytes.
+    fn isSafeSessionIdForFileName(session_id: []const u8) bool {
+        if (session_id.len == 0) return false;
+        if (std.mem.indexOf(u8, session_id, "..") != null) return false;
+        for (session_id) |ch| {
+            if (ch == '/' or ch == '\\' or ch == ':' or ch < 0x20) return false;
+        }
+        return true;
+    }
+
     // ── Session export ────────────────────────────────────────────
 
     /// Export session conversations as markdown files for QMD indexing.
@@ -224,6 +235,11 @@ pub const QmdAdapter = struct {
         var written: u32 = 0;
 
         for (session_ids) |sid| {
+            if (!isSafeSessionIdForFileName(sid)) {
+                log.warn("skipping unsafe session id in qmd export: '{s}'", .{sid});
+                continue;
+            }
+
             const messages = store.loadMessages(allocator, sid) catch continue;
             defer root.freeMessages(allocator, messages);
             if (messages.len == 0) continue;
@@ -232,9 +248,9 @@ pub const QmdAdapter = struct {
             var content: std.ArrayList(u8) = .empty;
             defer content.deinit(allocator);
 
-            content.appendSlice(allocator,"## Session: ") catch continue;
-            content.appendSlice(allocator,sid) catch continue;
-            content.appendSlice(allocator,"\n\n") catch continue;
+            content.appendSlice(allocator, "## Session: ") catch continue;
+            content.appendSlice(allocator, sid) catch continue;
+            content.appendSlice(allocator, "\n\n") catch continue;
 
             for (messages) |msg| {
                 const label: []const u8 = if (std.mem.eql(u8, msg.role, "user"))
@@ -243,10 +259,10 @@ pub const QmdAdapter = struct {
                     "**Assistant**"
                 else
                     msg.role;
-                content.appendSlice(allocator,label) catch continue;
-                content.appendSlice(allocator,": ") catch continue;
-                content.appendSlice(allocator,msg.content) catch continue;
-                content.appendSlice(allocator,"\n\n") catch continue;
+                content.appendSlice(allocator, label) catch continue;
+                content.appendSlice(allocator, ": ") catch continue;
+                content.appendSlice(allocator, msg.content) catch continue;
+                content.appendSlice(allocator, "\n\n") catch continue;
             }
 
             // Compute hash of new content
@@ -585,6 +601,24 @@ test "exportSessions with disabled config returns 0" {
     }, "/tmp");
 
     const ids = [_][]const u8{"session-x"};
+    const written = try qa.exportSessions(allocator, mock.store(), &ids);
+    try std.testing.expectEqual(@as(u32, 0), written);
+}
+
+test "exportSessions skips unsafe session ids" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var mock = MockSessionStore{};
+    var qa = QmdAdapter.init(allocator, .{
+        .sessions = .{ .enabled = true, .export_dir = tmp_path },
+    }, "/tmp");
+
+    const ids = [_][]const u8{"../escape"};
     const written = try qa.exportSessions(allocator, mock.store(), &ids);
     try std.testing.expectEqual(@as(u32, 0), written);
 }

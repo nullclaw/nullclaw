@@ -39,6 +39,8 @@ pub const BackendConfig = struct {
     postgres_url: ?[*:0]const u8 = null,
     postgres_schema: []const u8 = "public",
     postgres_table: []const u8 = "memories",
+    postgres_connect_timeout_secs: u32 = 30,
+    redis_config: ?config_types.MemoryRedisConfig = null,
     api_config: ?config_types.MemoryApiConfig = null,
 };
 
@@ -152,6 +154,7 @@ pub fn resolvePaths(
     desc: *const BackendDescriptor,
     workspace_dir: []const u8,
     postgres_cfg: ?config_types.MemoryPostgresConfig,
+    redis_cfg: ?config_types.MemoryRedisConfig,
     api_cfg: ?config_types.MemoryApiConfig,
 ) !BackendConfig {
     const db_path: ?[*:0]const u8 = if (desc.needs_db_path)
@@ -163,12 +166,14 @@ pub fn resolvePaths(
     var pg_url: ?[*:0]const u8 = null;
     var pg_schema: []const u8 = "public";
     var pg_table: []const u8 = "memories";
+    var pg_connect_timeout_secs: u32 = 30;
     if (postgres_cfg) |pcfg| {
         if (pcfg.url.len > 0) {
             pg_url = try allocator.dupeZ(u8, pcfg.url);
         }
         pg_schema = pcfg.schema;
         pg_table = pcfg.table;
+        pg_connect_timeout_secs = pcfg.connect_timeout_secs;
     }
 
     return .{
@@ -177,6 +182,8 @@ pub fn resolvePaths(
         .postgres_url = pg_url,
         .postgres_schema = pg_schema,
         .postgres_table = pg_table,
+        .postgres_connect_timeout_secs = pg_connect_timeout_secs,
+        .redis_config = redis_cfg,
         .api_config = api_cfg,
     };
 }
@@ -214,10 +221,18 @@ fn createMemoryLru(allocator: std.mem.Allocator, _: BackendConfig) !BackendInsta
     return .{ .memory = impl_.memory(), .session_store = null };
 }
 
-fn createRedis(allocator: std.mem.Allocator, _: BackendConfig) !BackendInstance {
+fn createRedis(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
+    const rcfg = cfg.redis_config orelse config_types.MemoryRedisConfig{};
     const impl_ = try allocator.create(redis_engine.RedisMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try redis_engine.RedisMemory.init(allocator, .{});
+    impl_.* = try redis_engine.RedisMemory.init(allocator, .{
+        .host = rcfg.host,
+        .port = rcfg.port,
+        .password = if (rcfg.password.len > 0) rcfg.password else null,
+        .db_index = rcfg.db_index,
+        .key_prefix = rcfg.key_prefix,
+        .ttl_seconds = if (rcfg.ttl_seconds > 0) rcfg.ttl_seconds else null,
+    });
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = null };
 }
@@ -249,11 +264,42 @@ fn createNone(allocator: std.mem.Allocator, _: BackendConfig) !BackendInstance {
 fn createPostgres(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     if (!build_options.enable_postgres) return error.PostgresNotEnabled;
     const url = cfg.postgres_url orelse return error.MissingPostgresUrl;
+
+    const effective_url = try applyPostgresConnectTimeout(
+        allocator,
+        std.mem.span(url),
+        cfg.postgres_connect_timeout_secs,
+    );
+    defer allocator.free(effective_url);
+
     const impl_ = try allocator.create(pg.PostgresMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try pg.PostgresMemory.init(allocator, url, cfg.postgres_schema, cfg.postgres_table);
+    impl_.* = try pg.PostgresMemory.init(allocator, effective_url.ptr, cfg.postgres_schema, cfg.postgres_table);
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
+}
+
+fn applyPostgresConnectTimeout(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    timeout_secs: u32,
+) ![:0]u8 {
+    if (base_url.len == 0) return allocator.dupeZ(u8, base_url);
+    if (timeout_secs == 0) return allocator.dupeZ(u8, base_url);
+    if (std.mem.indexOf(u8, base_url, "connect_timeout=") != null) return allocator.dupeZ(u8, base_url);
+
+    // URI form: postgresql://... or postgres://...
+    if (std.mem.indexOf(u8, base_url, "://") != null) {
+        const sep: u8 = if (std.mem.indexOfScalar(u8, base_url, '?') != null) '&' else '?';
+        const out = try std.fmt.allocPrint(allocator, "{s}{c}connect_timeout={d}", .{ base_url, sep, timeout_secs });
+        defer allocator.free(out);
+        return allocator.dupeZ(u8, out);
+    }
+
+    // Keyword/value conninfo form.
+    const out = try std.fmt.allocPrint(allocator, "{s} connect_timeout={d}", .{ base_url, timeout_secs });
+    defer allocator.free(out);
+    return allocator.dupeZ(u8, out);
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -346,7 +392,7 @@ test "findBackend empty returns null" {
 
 test "resolvePaths sqlite has db_path" {
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
     defer if (cfg.db_path) |p| std.testing.allocator.free(std.mem.span(p));
 
     try std.testing.expect(cfg.db_path != null);
@@ -357,7 +403,7 @@ test "resolvePaths sqlite has db_path" {
 
 test "resolvePaths markdown has no db_path" {
     const desc = findBackend("markdown") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -365,7 +411,7 @@ test "resolvePaths markdown has no db_path" {
 
 test "resolvePaths none has no db_path" {
     const desc = findBackend("none") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -391,4 +437,54 @@ test "createNone returns session_store null" {
     defer instance.memory.deinit();
 
     try std.testing.expect(instance.session_store == null);
+}
+
+test "resolvePaths redis config is preserved" {
+    const desc = findBackend("redis") orelse return error.TestUnexpectedResult;
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, .{
+        .host = "10.10.10.10",
+        .port = 6380,
+        .password = "pw",
+        .db_index = 2,
+        .key_prefix = "agent",
+        .ttl_seconds = 120,
+    }, null);
+
+    try std.testing.expect(cfg.redis_config != null);
+    try std.testing.expectEqualStrings("10.10.10.10", cfg.redis_config.?.host);
+    try std.testing.expectEqual(@as(u16, 6380), cfg.redis_config.?.port);
+    try std.testing.expectEqualStrings("pw", cfg.redis_config.?.password);
+    try std.testing.expectEqual(@as(u8, 2), cfg.redis_config.?.db_index);
+    try std.testing.expectEqualStrings("agent", cfg.redis_config.?.key_prefix);
+    try std.testing.expectEqual(@as(u32, 120), cfg.redis_config.?.ttl_seconds);
+}
+
+test "applyPostgresConnectTimeout uri appends query parameter" {
+    const out = try applyPostgresConnectTimeout(
+        std.testing.allocator,
+        "postgresql://db.example.com/memory",
+        9,
+    );
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("postgresql://db.example.com/memory?connect_timeout=9", out);
+}
+
+test "applyPostgresConnectTimeout uri appends with ampersand" {
+    const out = try applyPostgresConnectTimeout(
+        std.testing.allocator,
+        "postgresql://db.example.com/memory?sslmode=require",
+        9,
+    );
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("postgresql://db.example.com/memory?sslmode=require&connect_timeout=9", out);
+}
+
+test "applyPostgresConnectTimeout keeps existing timeout unchanged" {
+    const out = try applyPostgresConnectTimeout(
+        std.testing.allocator,
+        "postgresql://db.example.com/memory?connect_timeout=3",
+        9,
+    );
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("postgresql://db.example.com/memory?connect_timeout=3", out);
 }
