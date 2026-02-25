@@ -246,6 +246,24 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
     allocator.free(entries);
 }
 
+fn trimCandidatesToLimit(allocator: std.mem.Allocator, candidates: []RetrievalCandidate, limit: usize) ![]RetrievalCandidate {
+    if (candidates.len <= limit) return candidates;
+
+    // If allocation fails while trimming, free the original result to avoid leaks.
+    errdefer retrieval.freeCandidates(allocator, candidates);
+
+    var trimmed = try allocator.alloc(RetrievalCandidate, limit);
+    for (candidates[0..limit], 0..) |candidate, i| {
+        trimmed[i] = candidate;
+    }
+    for (candidates[limit..]) |*candidate| {
+        candidate.deinit(allocator);
+    }
+    allocator.free(candidates);
+
+    return trimmed;
+}
+
 // ── Memory vtable interface ────────────────────────────────────────
 
 pub const Memory = struct {
@@ -379,7 +397,8 @@ pub const MemoryRuntime = struct {
             .hybrid => {
                 // Use engine if available, else fall back
                 if (self._engine) |engine| {
-                    return engine.search(allocator, query, session_id);
+                    const candidates = try engine.search(allocator, query, session_id);
+                    return trimCandidatesToLimit(allocator, candidates, limit);
                 }
                 const entries = try self.memory.recall(allocator, query, limit, session_id);
                 defer freeEntries(allocator, entries);
@@ -1335,6 +1354,22 @@ test "MemoryRuntime.search with engine delegates" {
     const results = try rt.search(std.testing.allocator, "query", 5, null);
     defer retrieval.freeCandidates(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "MemoryRuntime.search hybrid path respects caller limit" {
+    var rt = initRuntime(std.testing.allocator, &.{ .backend = "memory" }, "/tmp") orelse
+        return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try rt.memory.store("k1", "alpha one", .core, null);
+    try rt.memory.store("k2", "alpha two", .core, null);
+    try rt.memory.store("k3", "alpha three", .core, null);
+
+    rt._rollout_policy = .{ .mode = .on, .canary_percent = 0, .shadow_percent = 0 };
+
+    const results = try rt.search(std.testing.allocator, "alpha", 1, null);
+    defer retrieval.freeCandidates(std.testing.allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
 }
 
 test "initRuntime with hybrid disabled has no embedding provider" {

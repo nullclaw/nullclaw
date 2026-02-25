@@ -30,8 +30,8 @@
   },
 
   "memory": {
-    "profile": "local_keyword",
-    "backend": "sqlite",
+    "profile": "markdown_only",
+    "backend": "markdown",
     "auto_save": true,
     "citations": "auto",
 

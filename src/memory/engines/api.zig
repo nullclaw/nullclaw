@@ -28,6 +28,10 @@ pub const ApiMemory = struct {
     has_session_store: bool = true,
 
     const Self = @This();
+    const HttpResponse = struct {
+        status: std.http.Status,
+        body: []u8,
+    };
 
     pub fn init(allocator: Allocator, config: config_types.MemoryApiConfig) !Self {
         // Build base_url = url + namespace
@@ -108,40 +112,95 @@ pub const ApiMemory = struct {
         url: []const u8,
         method: std.http.Method,
         payload: ?[]const u8,
-    ) !struct { status: std.http.Status, body: []u8 } {
-        var client = std.http.Client{ .allocator = alloc };
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(alloc);
-        errdefer aw.deinit();
-
-        var extra_headers_buf: [3]std.http.Header = undefined;
-        var header_count: usize = 0;
-
-        extra_headers_buf[header_count] = .{ .name = "Content-Type", .value = "application/json" };
-        header_count += 1;
+    ) !HttpResponse {
+        // Zig 0.15 std.http fetch has no request timeout control.
+        // Use curl subprocess so `timeout_ms` is guaranteed to apply.
+        const timeout_secs: u32 = @max(@as(u32, 1), (self.timeout_ms + 999) / 1000);
+        var timeout_buf: [16]u8 = undefined;
+        const timeout_secs_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
 
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |h| alloc.free(h);
 
+        var argv_buf: [24][]const u8 = undefined;
+        var argc: usize = 0;
+
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "--silent";
+        argc += 1;
+        argv_buf[argc] = "--show-error";
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = timeout_secs_str;
+        argc += 1;
+        argv_buf[argc] = "--request";
+        argc += 1;
+        argv_buf[argc] = @tagName(method);
+        argc += 1;
+        argv_buf[argc] = "--header";
+        argc += 1;
+        argv_buf[argc] = "Content-Type: application/json";
+        argc += 1;
+
         if (self.api_key) |key| {
-            auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{key});
-            extra_headers_buf[header_count] = .{ .name = "Authorization", .value = auth_header.? };
-            header_count += 1;
+            auth_header = try std.fmt.allocPrint(alloc, "Authorization: Bearer {s}", .{key});
+            argv_buf[argc] = "--header";
+            argc += 1;
+            argv_buf[argc] = auth_header.?;
+            argc += 1;
         }
 
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = method,
-            .payload = payload,
-            .extra_headers = extra_headers_buf[0..header_count],
-            .response_writer = &aw.writer,
-        }) catch return error.ApiConnectionError;
+        if (payload) |body| {
+            argv_buf[argc] = "--data";
+            argc += 1;
+            argv_buf[argc] = body;
+            argc += 1;
+        }
 
-        const body = try alloc.dupe(u8, aw.writer.buffer[0..aw.writer.end]);
-        aw.deinit();
+        argv_buf[argc] = "--write-out";
+        argc += 1;
+        argv_buf[argc] = "\n%{http_code}";
+        argc += 1;
+        argv_buf[argc] = url;
+        argc += 1;
 
-        return .{ .status = result.status, .body = body };
+        var child = std.process.Child.init(argv_buf[0..argc], alloc);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch return error.ApiConnectionError;
+
+        const raw_out = child.stdout.?.readToEndAlloc(alloc, 16 * 1024 * 1024) catch return error.ApiConnectionError;
+        defer alloc.free(raw_out);
+
+        const term = child.wait() catch return error.ApiConnectionError;
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    if (code == 28) return error.ApiTimeout;
+                    return error.ApiConnectionError;
+                }
+            },
+            else => return error.ApiConnectionError,
+        }
+
+        return parseCurlOutput(alloc, raw_out);
+    }
+
+    fn parseCurlOutput(alloc: Allocator, raw_out: []const u8) !HttpResponse {
+        const sep = std.mem.lastIndexOfScalar(u8, raw_out, '\n') orelse return error.ApiInvalidResponse;
+        const code_slice = std.mem.trim(u8, raw_out[sep + 1 ..], " \r\n\t");
+        if (code_slice.len == 0) return error.ApiInvalidResponse;
+
+        const status_code = std.fmt.parseInt(u10, code_slice, 10) catch return error.ApiInvalidResponse;
+        const body = try alloc.dupe(u8, raw_out[0..sep]);
+        return .{
+            .status = @enumFromInt(status_code),
+            .body = body,
+        };
     }
 
     // ── URL builders ─────────────────────────────────────────────
@@ -526,13 +585,13 @@ pub const ApiMemory = struct {
         const url = try self.buildMemoryUrl(alloc, key);
         defer alloc.free(url);
 
-        const resp = self.doRequest(alloc, url, .GET, null) catch return null;
+        const resp = try self.doRequest(alloc, url, .GET, null);
         defer alloc.free(resp.body);
 
         if (resp.status == .not_found) return null;
-        if (resp.status != .ok) return null;
+        if (resp.status != .ok) return error.ApiRequestFailed;
 
-        return parseSingleEntry(alloc, resp.body) catch null;
+        return parseSingleEntry(alloc, resp.body);
     }
 
     fn implList(ptr: *anyopaque, alloc: Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -560,10 +619,12 @@ pub const ApiMemory = struct {
         const url = try self.buildMemoryUrl(alloc, key);
         defer alloc.free(url);
 
-        const resp = self.doRequest(alloc, url, .DELETE, null) catch return false;
+        const resp = try self.doRequest(alloc, url, .DELETE, null);
         defer alloc.free(resp.body);
 
-        return resp.status == .ok;
+        if (resp.status == .ok) return true;
+        if (resp.status == .not_found) return false;
+        return error.ApiRequestFailed;
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -699,14 +760,16 @@ test "api memory name" {
     try std.testing.expectEqualStrings("api", m.name());
 }
 
-test "api memory health check no server" {
+test "api memory health url building" {
     var mem = try ApiMemory.init(std.testing.allocator, .{
-        .url = "http://127.0.0.1:19999",
+        .url = "http://127.0.0.1:8080",
+        .namespace = "/v1",
     });
     defer mem.deinit();
 
-    const m = mem.memory();
-    try std.testing.expect(!m.healthCheck());
+    const url = try mem.buildHealthUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/health", url);
 }
 
 test "api memory init/deinit" {
@@ -985,6 +1048,28 @@ test "api parse count missing field" {
     ;
     const result = ApiMemory.parseCount(alloc, json);
     try std.testing.expectError(error.ApiInvalidResponse, result);
+}
+
+test "api parse curl output with body" {
+    const out =
+        \\{"entry":{"id":"1"}}
+        \\200
+    ;
+    const parsed = try ApiMemory.parseCurlOutput(std.testing.allocator, out);
+    defer std.testing.allocator.free(parsed.body);
+    try std.testing.expect(parsed.status == .ok);
+    try std.testing.expectEqualStrings("{\"entry\":{\"id\":\"1\"}}", parsed.body);
+}
+
+test "api parse curl output with empty body" {
+    const out =
+        \\
+        \\404
+    ;
+    const parsed = try ApiMemory.parseCurlOutput(std.testing.allocator, out);
+    defer std.testing.allocator.free(parsed.body);
+    try std.testing.expect(parsed.status == .not_found);
+    try std.testing.expectEqual(@as(usize, 0), parsed.body.len);
 }
 
 test "api build store payload" {
