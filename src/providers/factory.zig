@@ -280,10 +280,12 @@ pub const ProviderHolder = union(enum) {
             .ollama_provider => .{ .ollama = ollama.OllamaProvider.init(allocator, base_url) },
             .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
             .compatible_provider => blk: {
-                const url = if (std.mem.startsWith(u8, provider_name, "custom:"))
-                    provider_name["custom:".len..]
-                else
-                    compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1";
+                // Config base_url overrides built-in URL table and custom: prefix
+                const url = base_url orelse
+                    if (std.mem.startsWith(u8, provider_name, "custom:"))
+                        provider_name["custom:".len..]
+                    else
+                        compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1";
 
                 const cp = findCompatProvider(provider_name);
 
@@ -312,7 +314,18 @@ pub const ProviderHolder = union(enum) {
             else |_|
                 .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
             .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
-            .unknown => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+            // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
+            // otherwise fall back to OpenRouter.
+            .unknown => if (base_url) |url|
+                .{ .compatible = compatible.OpenAiCompatibleProvider.init(
+                    allocator,
+                    provider_name,
+                    url,
+                    api_key,
+                    .bearer,
+                ) }
+            else
+                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
         };
     }
 };
