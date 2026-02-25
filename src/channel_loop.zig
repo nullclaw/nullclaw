@@ -52,7 +52,7 @@ pub const ChannelRuntime = struct {
     provider_holder: *ProviderHolder,
     tools: []const tools_mod.Tool,
     mem: ?memory_mod.Memory,
-    noop_obs: *observability.NoopObserver,
+    obs_handle: ?*observability.ObserverHandle,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -102,11 +102,10 @@ pub const ChannelRuntime = struct {
             } else |_| {}
         }
 
-        // Noop observer (heap for vtable stability)
-        const noop_obs = try allocator.create(observability.NoopObserver);
-        errdefer allocator.destroy(noop_obs);
-        noop_obs.* = .{};
-        const obs = noop_obs.observer();
+        // Observer from diagnostics config (falls back to noop)
+        const obs_handle = observability.createFromConfig(allocator, config.diagnostics) orelse return error.OutOfMemory;
+        errdefer obs_handle.deinit();
+        const obs = obs_handle.observer();
 
         // Session manager
         const session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs);
@@ -119,7 +118,7 @@ pub const ChannelRuntime = struct {
             .provider_holder = holder,
             .tools = tools,
             .mem = mem_opt,
-            .noop_obs = noop_obs,
+            .obs_handle = obs_handle,
         };
         return self;
     }
@@ -128,7 +127,7 @@ pub const ChannelRuntime = struct {
         const alloc = self.allocator;
         self.session_mgr.deinit();
         if (self.tools.len > 0) alloc.free(self.tools);
-        alloc.destroy(self.noop_obs);
+        if (self.obs_handle) |h| h.deinit();
         alloc.destroy(self.provider_holder);
         alloc.destroy(self);
     }

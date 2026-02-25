@@ -80,7 +80,9 @@ pub const NoopObserver = struct {
 
 // ── LogObserver ──────────────────────────────────────────────────────
 
-/// Log-based observer — uses std.log for all output.
+/// Log-based observer — writes structured events to stderr.
+/// Uses direct stderr writes (not std.log) so output is emitted
+/// regardless of build mode (Debug, ReleaseSmall, etc.).
 pub const LogObserver = struct {
     const vtable = Observer.VTable{
         .record_event = logRecordEvent,
@@ -96,28 +98,37 @@ pub const LogObserver = struct {
         };
     }
 
+    // write a formatted line to stderr, best-effort
+    fn emit(comptime fmt: []const u8, args: anytype) void {
+        var buf: [4096]u8 = undefined;
+        var bw = std.fs.File.stderr().writer(&buf);
+        const w = &bw.interface;
+        w.print("obs: " ++ fmt ++ "\n", args) catch {};
+        w.flush() catch {};
+    }
+
     fn logRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
         switch (event.*) {
-            .agent_start => |e| std.log.info("agent.start provider={s} model={s}", .{ e.provider, e.model }),
-            .llm_request => |e| std.log.info("llm.request provider={s} model={s} messages={d}", .{ e.provider, e.model, e.messages_count }),
-            .llm_response => |e| std.log.info("llm.response provider={s} model={s} duration_ms={d} success={}", .{ e.provider, e.model, e.duration_ms, e.success }),
-            .agent_end => |e| std.log.info("agent.end duration_ms={d}", .{e.duration_ms}),
-            .tool_call_start => |e| std.log.info("tool.start tool={s}", .{e.tool}),
-            .tool_call => |e| std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success }),
-            .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
-            .turn_complete => std.log.info("turn.complete", .{}),
-            .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
-            .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
-            .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
+            .agent_start => |e| emit("agent.start provider={s} model={s}", .{ e.provider, e.model }),
+            .llm_request => |e| emit("llm.request provider={s} model={s} messages={d}", .{ e.provider, e.model, e.messages_count }),
+            .llm_response => |e| emit("llm.response provider={s} model={s} duration_ms={d} success={}", .{ e.provider, e.model, e.duration_ms, e.success }),
+            .agent_end => |e| emit("agent.end duration_ms={d}", .{e.duration_ms}),
+            .tool_call_start => |e| emit("tool.start tool={s}", .{e.tool}),
+            .tool_call => |e| emit("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success }),
+            .tool_iterations_exhausted => |e| emit("tool.iterations_exhausted iterations={d}", .{e.iterations}),
+            .turn_complete => emit("turn.complete", .{}),
+            .channel_message => |e| emit("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
+            .heartbeat_tick => emit("heartbeat.tick", .{}),
+            .err => |e| emit("error component={s} message={s}", .{ e.component, e.message }),
         }
     }
 
     fn logRecordMetric(_: *anyopaque, metric: *const ObserverMetric) void {
         switch (metric.*) {
-            .request_latency_ms => |v| std.log.info("metric.request_latency latency_ms={d}", .{v}),
-            .tokens_used => |v| std.log.info("metric.tokens_used tokens={d}", .{v}),
-            .active_sessions => |v| std.log.info("metric.active_sessions sessions={d}", .{v}),
-            .queue_depth => |v| std.log.info("metric.queue_depth depth={d}", .{v}),
+            .request_latency_ms => |v| emit("metric.request_latency latency_ms={d}", .{v}),
+            .tokens_used => |v| emit("metric.tokens_used tokens={d}", .{v}),
+            .active_sessions => |v| emit("metric.active_sessions sessions={d}", .{v}),
+            .queue_depth => |v| emit("metric.queue_depth depth={d}", .{v}),
         }
     }
 
@@ -304,7 +315,114 @@ pub const FileObserver = struct {
     }
 };
 
-/// Factory: create observer from config backend string.
+/// Manages the lifetime of a config-created observer.
+/// Some backends (NoopObserver, LogObserver) are zero-size and stack-allocatable;
+/// OtelObserver requires heap allocation and cleanup.
+pub const ObserverHandle = struct {
+    obs: Observer,
+    _state: State,
+    _allocator: ?std.mem.Allocator,
+    // opaque pointer to the heap-allocated inner observer, for cleanup
+    _inner_ptr: *anyopaque,
+
+    const State = union(enum) {
+        noop: void,
+        log: void,
+        verbose: void,
+        otel: *OtelObserver,
+    };
+
+    pub fn observer(self: *ObserverHandle) Observer {
+        return self.obs;
+    }
+
+    pub fn deinit(self: *ObserverHandle) void {
+        const a = self._allocator orelse return;
+        switch (self._state) {
+            .otel => |otel| {
+                otel.deinit();
+                a.destroy(otel);
+            },
+            .noop => {
+                const p: *NoopObserver = @ptrCast(@alignCast(self._inner_ptr));
+                a.destroy(p);
+            },
+            .log => {
+                const p: *LogObserver = @ptrCast(@alignCast(self._inner_ptr));
+                a.destroy(p);
+            },
+            .verbose => {
+                const p: *VerboseObserver = @ptrCast(@alignCast(self._inner_ptr));
+                a.destroy(p);
+            },
+        }
+        a.destroy(self);
+    }
+};
+
+const config_types = @import("config_types.zig");
+
+/// Create an observer from diagnostics config. The returned handle is
+/// heap-allocated and owns the underlying observer; call deinit() when done.
+/// Falls back to NoopObserver on unknown backend or allocation failure.
+pub fn createFromConfig(allocator: std.mem.Allocator, diag: config_types.DiagnosticsConfig) ?*ObserverHandle {
+    const handle = allocator.create(ObserverHandle) catch return null;
+
+    if (std.mem.eql(u8, diag.backend, "log")) {
+        const inner = allocator.create(LogObserver) catch {
+            allocator.destroy(handle);
+            return null;
+        };
+        inner.* = .{};
+        handle.* = .{
+            .obs = inner.observer(),
+            ._state = .{ .log = {} },
+            ._allocator = allocator,
+            ._inner_ptr = @ptrCast(inner),
+        };
+    } else if (std.mem.eql(u8, diag.backend, "verbose")) {
+        const inner = allocator.create(VerboseObserver) catch {
+            allocator.destroy(handle);
+            return null;
+        };
+        inner.* = .{};
+        handle.* = .{
+            .obs = inner.observer(),
+            ._state = .{ .verbose = {} },
+            ._allocator = allocator,
+            ._inner_ptr = @ptrCast(inner),
+        };
+    } else if (std.mem.eql(u8, diag.backend, "otel") or std.mem.eql(u8, diag.backend, "otlp")) {
+        const inner = allocator.create(OtelObserver) catch {
+            allocator.destroy(handle);
+            return null;
+        };
+        inner.* = OtelObserver.init(allocator, diag.otel_endpoint, diag.otel_service_name);
+        handle.* = .{
+            .obs = inner.observer(),
+            ._state = .{ .otel = inner },
+            ._allocator = allocator,
+            ._inner_ptr = @ptrCast(inner),
+        };
+    } else {
+        // "none", "noop", or unknown -> noop
+        const inner = allocator.create(NoopObserver) catch {
+            allocator.destroy(handle);
+            return null;
+        };
+        inner.* = .{};
+        handle.* = .{
+            .obs = inner.observer(),
+            ._state = .{ .noop = {} },
+            ._allocator = allocator,
+            ._inner_ptr = @ptrCast(inner),
+        };
+    }
+
+    return handle;
+}
+
+/// Legacy stub kept for test compatibility — maps backend string to name.
 fn createObserver(backend: []const u8) []const u8 {
     if (std.mem.eql(u8, backend, "log")) return "log";
     if (std.mem.eql(u8, backend, "verbose")) return "verbose";
@@ -1275,4 +1393,59 @@ test "OtelObserver counters combined scenario" {
 
     try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 3), otel.errors_total.load(.monotonic)); // 1 failed response + 2 error events
+}
+
+// ── createFromConfig tests ──────────────────────────────────────
+
+test "createFromConfig log backend" {
+    const handle = createFromConfig(std.testing.allocator, .{ .backend = "log" }) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    try std.testing.expectEqualStrings("log", handle.observer().getName());
+}
+
+test "createFromConfig verbose backend" {
+    const handle = createFromConfig(std.testing.allocator, .{ .backend = "verbose" }) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    try std.testing.expectEqualStrings("verbose", handle.observer().getName());
+}
+
+test "createFromConfig otel backend" {
+    const handle = createFromConfig(std.testing.allocator, .{ .backend = "otel" }) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    try std.testing.expectEqualStrings("otel", handle.observer().getName());
+}
+
+test "createFromConfig otlp alias" {
+    const handle = createFromConfig(std.testing.allocator, .{ .backend = "otlp" }) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    try std.testing.expectEqualStrings("otel", handle.observer().getName());
+}
+
+test "createFromConfig none backend" {
+    const handle = createFromConfig(std.testing.allocator, .{ .backend = "none" }) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    try std.testing.expectEqualStrings("noop", handle.observer().getName());
+}
+
+test "createFromConfig unknown backend falls back to noop" {
+    const handle = createFromConfig(std.testing.allocator, .{ .backend = "unknown_thing" }) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    try std.testing.expectEqualStrings("noop", handle.observer().getName());
+}
+
+test "createFromConfig default (empty) backend is noop" {
+    const handle = createFromConfig(std.testing.allocator, .{}) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    try std.testing.expectEqualStrings("noop", handle.observer().getName());
+}
+
+test "createFromConfig log backend records events without panic" {
+    const handle = createFromConfig(std.testing.allocator, .{ .backend = "log" }) orelse return error.TestUnexpectedResult;
+    defer handle.deinit();
+    const obs = handle.observer();
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    const metric = ObserverMetric{ .tokens_used = 42 };
+    obs.recordMetric(&metric);
+    obs.flush();
 }

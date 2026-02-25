@@ -628,6 +628,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     var session_mgr_opt: ?session_mod.SessionManager = null;
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_opt: ?memory_mod.Memory = null;
+    var obs_handle: ?*observability.ObserverHandle = null;
 
     if (config_opt) |*cfg| {
         state.rate_limiter = GatewayRateLimiter.init(
@@ -680,9 +681,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 .fallback_api_key = resolved_api_key,
             }) catch &.{};
 
-            // Noop observer.
-            var noop_obs = observability.NoopObserver{};
-            const obs = noop_obs.observer();
+            // Observer from diagnostics config (falls back to noop).
+            var fallback_noop = observability.NoopObserver{};
+            obs_handle = observability.createFromConfig(allocator, cfg.diagnostics);
+            const obs = if (obs_handle) |h| h.observer() else fallback_noop.observer();
 
             session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, obs);
         }
@@ -692,6 +694,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     }
     defer if (session_mgr_opt) |*sm| sm.deinit();
     defer if (tools_slice.len > 0) allocator.free(tools_slice);
+    defer if (obs_handle) |h| h.deinit();
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);

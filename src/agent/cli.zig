@@ -60,9 +60,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    // Create a noop observer
-    var noop = observability.NoopObserver{};
-    const obs = noop.observer();
+    // Create observer from diagnostics config (falls back to noop)
+    var fallback_noop = observability.NoopObserver{};
+    const obs_handle = observability.createFromConfig(allocator, cfg.diagnostics);
+    defer if (obs_handle) |h| h.deinit();
+    const obs = if (obs_handle) |h| h.observer() else fallback_noop.observer();
 
     // Record agent start
     const start_event = ObserverEvent{ .agent_start = .{

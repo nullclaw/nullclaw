@@ -815,9 +815,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         } else |_| {}
     }
 
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
+    // Observer from diagnostics config (falls back to noop)
+    var fallback_noop = yc.observability.NoopObserver{};
+    const obs_handle = yc.observability.createFromConfig(allocator, config.diagnostics);
+    defer if (obs_handle) |h| h.deinit();
+    const obs = if (obs_handle) |h| h.observer() else fallback_noop.observer();
 
     // Create provider vtable — concrete struct must stay alive for the loop.
     var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key);
