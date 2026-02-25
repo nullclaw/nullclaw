@@ -241,7 +241,7 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.23";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.24";
     const channels_raw = b.option(
         []const u8,
         "channels",

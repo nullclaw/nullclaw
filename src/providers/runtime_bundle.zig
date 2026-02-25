@@ -43,6 +43,7 @@ pub const RuntimeProviderBundle = struct {
             cfg.default_provider,
             bundle.primary_key,
             cfg.getProviderBaseUrl(cfg.default_provider),
+            cfg.getProviderNativeTools(cfg.default_provider),
         );
 
         const allows_key_rotation = factory.classifyProvider(cfg.default_provider) != .openai_codex_provider;
@@ -86,6 +87,7 @@ pub const RuntimeProviderBundle = struct {
                     provider_name,
                     fb_key,
                     cfg.getProviderBaseUrl(provider_name),
+                    cfg.getProviderNativeTools(provider_name),
                 );
                 bundle.extra_holders_initialized = extra_i + 1;
                 bundle.reliable_entries.?[extra_i] = .{
@@ -110,6 +112,7 @@ pub const RuntimeProviderBundle = struct {
                         cfg.default_provider,
                         key_copy,
                         cfg.getProviderBaseUrl(cfg.default_provider),
+                        cfg.getProviderNativeTools(cfg.default_provider),
                     );
                     bundle.extra_holders_initialized = extra_i + 1;
                     bundle.reliable_entries.?[extra_i] = .{

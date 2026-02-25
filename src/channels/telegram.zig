@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const voice = @import("../voice.zig");
 const platform = @import("../platform.zig");
@@ -381,7 +382,19 @@ pub const TelegramChannel = struct {
     pending_media_received_at: std.ArrayListUnmanaged(u64) = .empty,
     polls_since_temp_sweep: u32 = 0,
 
+    typing_mu: std.Thread.Mutex = .{},
+    typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+
     pub const MAX_MESSAGE_LEN: usize = 4096;
+    const TYPING_INTERVAL_NS: u64 = 4 * std.time.ns_per_s;
+    const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+
+    const TypingTask = struct {
+        channel: *TelegramChannel,
+        chat_id: []const u8,
+        stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        thread: ?std.Thread = null,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -550,6 +563,9 @@ pub const TelegramChannel = struct {
 
     /// Send a "typing" chat action. Best-effort: errors are ignored.
     pub fn sendTypingIndicator(self: *TelegramChannel, chat_id: []const u8) void {
+        if (builtin.is_test) return;
+        if (chat_id.len == 0) return;
+
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "sendChatAction") catch return;
 
@@ -562,6 +578,80 @@ pub const TelegramChannel = struct {
 
         const resp = root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, null) catch return;
         self.allocator.free(resp);
+    }
+
+    pub fn startTyping(self: *TelegramChannel, chat_id: []const u8) !void {
+        if (chat_id.len == 0) return;
+        try self.stopTyping(chat_id);
+
+        const key_copy = try self.allocator.dupe(u8, chat_id);
+        errdefer self.allocator.free(key_copy);
+
+        const task = try self.allocator.create(TypingTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .channel = self,
+            .chat_id = key_copy,
+        };
+
+        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        errdefer {
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+        }
+
+        self.typing_mu.lock();
+        defer self.typing_mu.unlock();
+        try self.typing_handles.put(self.allocator, key_copy, task);
+    }
+
+    pub fn stopTyping(self: *TelegramChannel, chat_id: []const u8) !void {
+        var removed_key: ?[]u8 = null;
+        var removed_task: ?*TypingTask = null;
+
+        self.typing_mu.lock();
+        if (self.typing_handles.fetchRemove(chat_id)) |entry| {
+            removed_key = @constCast(entry.key);
+            removed_task = entry.value;
+        }
+        self.typing_mu.unlock();
+
+        if (removed_task) |task| {
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+            self.allocator.destroy(task);
+        }
+        if (removed_key) |key| {
+            self.allocator.free(key);
+        }
+    }
+
+    fn stopAllTyping(self: *TelegramChannel) void {
+        self.typing_mu.lock();
+        var handles = self.typing_handles;
+        self.typing_handles = .empty;
+        self.typing_mu.unlock();
+
+        var it = handles.iterator();
+        while (it.next()) |entry| {
+            const task = entry.value_ptr.*;
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+            self.allocator.destroy(task);
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        handles.deinit(self.allocator);
+    }
+
+    fn typingLoop(task: *TypingTask) void {
+        while (!task.stop_requested.load(.acquire)) {
+            task.channel.sendTypingIndicator(task.chat_id);
+            var elapsed: u64 = 0;
+            while (elapsed < TYPING_INTERVAL_NS and !task.stop_requested.load(.acquire)) {
+                std.Thread.sleep(TYPING_SLEEP_STEP_NS);
+                elapsed += TYPING_SLEEP_STEP_NS;
+            }
+        }
     }
 
     // ── HTML fallback ────────────────────────────────────────────────
@@ -1388,6 +1478,7 @@ pub const TelegramChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        self.stopAllTyping();
         // Clean up buffered media group messages to prevent shutdown leaks.
         self.resetPendingMediaBuffers();
         self.pending_media_messages.deinit(self.allocator);
@@ -1410,12 +1501,24 @@ pub const TelegramChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        try self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        try self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *TelegramChannel) root.Channel {
@@ -1609,60 +1712,6 @@ fn appendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
         }
     }
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// Periodic Typing Indicator
-// ════════════════════════════════════════════════════════════════════════════
-
-/// Periodic typing indicator — sends "typing" action every 4 seconds
-/// until stopped. Telegram typing status expires after 5 seconds.
-pub const TypingIndicator = struct {
-    channel: *TelegramChannel,
-    chat_id: [64]u8 = undefined,
-    chat_id_len: usize = 0,
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    thread: ?std.Thread = null,
-
-    /// How often to send the typing indicator (nanoseconds).
-    const INTERVAL_NS: u64 = 4 * std.time.ns_per_s;
-
-    pub fn init(ch: *TelegramChannel) TypingIndicator {
-        return .{ .channel = ch };
-    }
-
-    /// Start the periodic typing indicator for a chat.
-    pub fn start(self: *TypingIndicator, chat_id: []const u8) void {
-        if (self.running.load(.acquire)) return; // already running
-        if (chat_id.len > self.chat_id.len) return;
-
-        @memcpy(self.chat_id[0..chat_id.len], chat_id);
-        self.chat_id_len = chat_id.len;
-        self.running.store(true, .release);
-
-        self.thread = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{self}) catch null;
-    }
-
-    /// Stop the periodic typing indicator.
-    pub fn stop(self: *TypingIndicator) void {
-        self.running.store(false, .release);
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
-        }
-    }
-
-    fn typingLoop(self: *TypingIndicator) void {
-        while (self.running.load(.acquire)) {
-            self.channel.sendTypingIndicator(self.chat_id[0..self.chat_id_len]);
-            // Sleep in small increments to check running flag responsively
-            var elapsed: u64 = 0;
-            while (elapsed < INTERVAL_NS and self.running.load(.acquire)) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
-                elapsed += 100 * std.time.ns_per_ms;
-            }
-        }
-    }
-};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Telegram Photo Download
@@ -2385,46 +2434,26 @@ test "telegram markdownToTelegramHtml empty" {
     try std.testing.expectEqual(@as(usize, 0), html.len);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Periodic Typing Indicator Tests
-// ════════════════════════════════════════════════════════════════════════════
-
-test "telegram TypingIndicator init" {
+test "telegram typing handles start empty" {
     var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
-    var ti = TypingIndicator.init(&ch);
-    try std.testing.expect(!ti.running.load(.acquire));
-    try std.testing.expect(ti.thread == null);
+    try std.testing.expect(ch.typing_handles.get("12345") == null);
 }
 
-test "telegram TypingIndicator start and stop" {
-    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
-    var ti = TypingIndicator.init(&ch);
+test "telegram startTyping stores handle and stopTyping clears it" {
+    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
+    defer ch.stopAllTyping();
 
-    ti.start("12345");
-    try std.testing.expect(ti.running.load(.acquire));
-
-    // Let it run briefly
-    std.Thread.sleep(50 * std.time.ns_per_ms);
-
-    ti.stop();
-    try std.testing.expect(!ti.running.load(.acquire));
-    try std.testing.expect(ti.thread == null);
-}
-
-test "telegram TypingIndicator double start is safe" {
-    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
-    var ti = TypingIndicator.init(&ch);
-
-    ti.start("123");
-    ti.start("456"); // should not spawn second thread
+    try ch.startTyping("12345");
+    try std.testing.expect(ch.typing_handles.get("12345") != null);
     std.Thread.sleep(20 * std.time.ns_per_ms);
-    ti.stop();
+    try ch.stopTyping("12345");
+    try std.testing.expect(ch.typing_handles.get("12345") == null);
 }
 
-test "telegram TypingIndicator stop without start is safe" {
+test "telegram stopTyping is idempotent" {
     var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
-    var ti = TypingIndicator.init(&ch);
-    ti.stop(); // no-op
+    try ch.stopTyping("12345");
+    try ch.stopTyping("12345");
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -3,7 +3,7 @@
 //! Mirrors ZeroClaw's onboard module:
 //!   - Interactive wizard (9-step configuration flow)
 //!   - Quick setup (non-interactive, sensible defaults)
-//!   - Workspace scaffolding (MEMORY.md, PERSONA.md, RULES.md)
+//!   - Workspace scaffolding (MEMORY.md + prompt context files)
 //!   - Channel configuration
 //!   - Memory backend selection
 //!   - Provider/model selection with curated defaults
@@ -990,14 +990,6 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     defer allocator.free(mem_tmpl);
     try writeIfMissing(allocator, workspace_dir, "MEMORY.md", mem_tmpl);
 
-    // PERSONA.md
-    const persona_tmpl = try personaTemplate(allocator, ctx);
-    defer allocator.free(persona_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "PERSONA.md", persona_tmpl);
-
-    // RULES.md
-    try writeIfMissing(allocator, workspace_dir, "RULES.md", rulesTemplate());
-
     // SOUL.md (personality traits — loaded by prompt.zig)
     const soul_tmpl = try soulTemplate(allocator, ctx);
     defer allocator.free(soul_tmpl);
@@ -1061,36 +1053,6 @@ fn memoryTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]c
         \\- Communication style: {s}
         \\
     , .{ ctx.agent_name, ctx.user_name, ctx.timezone, ctx.communication_style });
-}
-
-fn personaTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    return std.fmt.allocPrint(allocator,
-        \\# {s} Persona
-        \\
-        \\You are {s}, a fast and focused AI assistant.
-        \\
-        \\## Core traits
-        \\- Helpful, concise, and direct
-        \\- Prefer code over explanations
-        \\- Ask for clarification when uncertain
-        \\
-    , .{ ctx.agent_name, ctx.agent_name });
-}
-
-fn rulesTemplate() []const u8 {
-    return 
-    \\# Rules
-    \\
-    \\## Workspace
-    \\- Only modify files within the workspace directory
-    \\- Do not access external services without permission
-    \\
-    \\## Communication
-    \\- Be concise and actionable
-    \\- Show relevant code snippets
-    \\- Admit uncertainty rather than guessing
-    \\
-    ;
 }
 
 fn soulTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
@@ -1251,12 +1213,6 @@ test "providerEnvVar unknown falls back" {
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("some-new-provider"));
 }
 
-test "rulesTemplate is non-empty" {
-    const template = rulesTemplate();
-    try std.testing.expect(template.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, template, "Rules") != null);
-}
-
 test "known_providers has entries" {
     try std.testing.expect(known_providers.len >= 5);
     try std.testing.expectEqualStrings("openrouter", known_providers[0].key);
@@ -1372,18 +1328,6 @@ test "ProjectContext default values" {
     try std.testing.expect(ctx.communication_style.len > 0);
 }
 
-test "rulesTemplate contains workspace rules" {
-    const template = rulesTemplate();
-    try std.testing.expect(std.mem.indexOf(u8, template, "Workspace") != null);
-    try std.testing.expect(std.mem.indexOf(u8, template, "Communication") != null);
-}
-
-test "rulesTemplate contains behavioral guidelines" {
-    const template = rulesTemplate();
-    try std.testing.expect(std.mem.indexOf(u8, template, "concise") != null);
-    try std.testing.expect(std.mem.indexOf(u8, template, "uncertainty") != null or std.mem.indexOf(u8, template, "uncertain") != null);
-}
-
 test "memoryTemplate contains expected sections" {
     const tmpl = try memoryTemplate(std.testing.allocator, &ProjectContext{});
     defer std.testing.allocator.free(tmpl);
@@ -1403,54 +1347,6 @@ test "memoryTemplate uses context values" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "Alice") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "PST") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "TestBot") != null);
-}
-
-test "personaTemplate uses agent name" {
-    const ctx = ProjectContext{ .agent_name = "MiniBot" };
-    const tmpl = try personaTemplate(std.testing.allocator, &ctx);
-    defer std.testing.allocator.free(tmpl);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "MiniBot") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Persona") != null);
-}
-
-test "personaTemplate contains core traits" {
-    const tmpl = try personaTemplate(std.testing.allocator, &ProjectContext{});
-    defer std.testing.allocator.free(tmpl);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "concise") != null or std.mem.indexOf(u8, tmpl, "Helpful") != null);
-}
-
-test "scaffoldWorkspace creates PERSONA.md" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(base);
-
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
-
-    const file = try tmp.dir.openFile("PERSONA.md", .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
-    defer std.testing.allocator.free(content);
-    try std.testing.expect(content.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, content, "Persona") != null);
-}
-
-test "scaffoldWorkspace creates RULES.md" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(base);
-
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
-
-    const file = try tmp.dir.openFile("RULES.md", .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
-    defer std.testing.allocator.free(content);
-    try std.testing.expect(content.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, content, "Rules") != null);
 }
 
 test "scaffoldWorkspace creates memory subdirectory" {
@@ -1611,10 +1507,9 @@ test "scaffoldWorkspace creates all prompt.zig files" {
 
     // Verify all files that prompt.zig tries to load exist
     const files = [_][]const u8{
-        "MEMORY.md",    "PERSONA.md", "RULES.md",
-        "SOUL.md",      "AGENTS.md",  "TOOLS.md",
-        "IDENTITY.md",  "USER.md",    "HEARTBEAT.md",
-        "BOOTSTRAP.md",
+        "MEMORY.md",    "SOUL.md",      "AGENTS.md",
+        "TOOLS.md",     "IDENTITY.md",  "USER.md",
+        "HEARTBEAT.md", "BOOTSTRAP.md",
     };
     for (files) |filename| {
         const file = tmp.dir.openFile(filename, .{}) catch |err| {

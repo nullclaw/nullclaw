@@ -496,6 +496,12 @@ pub const SignalChannel = struct {
         self.allocator.free(resp);
     }
 
+    pub fn startTyping(self: *SignalChannel, target: []const u8) !void {
+        self.sendTypingIndicator(target);
+    }
+
+    pub fn stopTyping(_: *SignalChannel, _: []const u8) !void {}
+
     // ── Health Check ────────────────────────────────────────────────
 
     pub fn healthCheck(self: *SignalChannel) bool {
@@ -772,12 +778,24 @@ pub const SignalChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *SignalChannel = @ptrCast(@alignCast(ptr));
+        try self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *SignalChannel = @ptrCast(@alignCast(ptr));
+        try self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *SignalChannel) root.Channel {
@@ -1322,6 +1340,20 @@ test "build rpc body direct without message" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"account\":\"+1234567890\"") != null);
     // No message key should be present.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\"") == null);
+}
+
+test "signal startTyping and stopTyping are safe in tests" {
+    var ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+    try ch.startTyping("+15551234567");
+    try ch.stopTyping("+15551234567");
 }
 
 test "build rpc body group with message" {

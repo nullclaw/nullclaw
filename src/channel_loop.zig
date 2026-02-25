@@ -188,7 +188,6 @@ pub fn runTelegramLoop(
     tg_ptr.setMyCommands();
     tg_ptr.dropPendingUpdates();
 
-    var typing = telegram.TypingIndicator.init(tg_ptr);
     var evict_counter: u32 = 0;
 
     const model = config.default_model orelse {
@@ -240,11 +239,11 @@ pub fn runTelegramLoop(
                 break :blk route.session_key;
             };
 
-            // Typing indicator
-            typing.start(msg.sender);
+            const typing_target = msg.sender;
+            tg_ptr.startTyping(typing_target) catch {};
+            defer tg_ptr.stopTyping(typing_target) catch {};
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
-                typing.stop();
                 log.err("Agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
@@ -257,8 +256,6 @@ pub fn runTelegramLoop(
                 continue;
             };
             defer allocator.free(reply);
-
-            typing.stop();
 
             tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
                 log.warn("Send error: {}", .{err});
@@ -361,10 +358,9 @@ pub fn runSignalLoop(
                 break :blk route.session_key;
             };
 
-            // Send typing indicator (best-effort)
-            if (msg.reply_target) |target| {
-                sg_ptr.sendTypingIndicator(target);
-            }
+            const typing_target = msg.reply_target;
+            if (typing_target) |target| sg_ptr.startTyping(target) catch {};
+            defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
                 log.err("Signal agent error: {}", .{err});
@@ -563,7 +559,8 @@ pub fn runMatrixLoop(
             };
 
             const typing_target = msg.reply_target orelse msg.sender;
-            mx_ptr.sendTypingIndicator(typing_target);
+            mx_ptr.startTyping(typing_target) catch {};
+            defer mx_ptr.stopTyping(typing_target) catch {};
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
                 log.err("Matrix agent error: {}", .{err});

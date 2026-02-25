@@ -21,6 +21,9 @@ pub const DiscordChannel = struct {
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
 
+    typing_mu: std.Thread.Mutex = .{},
+    typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+
     // Gateway state
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     sequence: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
@@ -40,6 +43,15 @@ pub const DiscordChannel = struct {
 
     pub const MAX_MESSAGE_LEN: usize = 2000;
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+    const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
+    const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+
+    const TypingTask = struct {
+        channel: *DiscordChannel,
+        channel_id: []const u8,
+        stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        thread: ?std.Thread = null,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -220,6 +232,82 @@ pub const DiscordChannel = struct {
         self.allocator.free(resp);
     }
 
+    pub fn startTyping(self: *DiscordChannel, channel_id: []const u8) !void {
+        if (!self.running.load(.acquire)) return;
+        if (channel_id.len == 0) return;
+
+        try self.stopTyping(channel_id);
+
+        const key_copy = try self.allocator.dupe(u8, channel_id);
+        errdefer self.allocator.free(key_copy);
+
+        const task = try self.allocator.create(TypingTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .channel = self,
+            .channel_id = key_copy,
+        };
+
+        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        errdefer {
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+        }
+
+        self.typing_mu.lock();
+        defer self.typing_mu.unlock();
+        try self.typing_handles.put(self.allocator, key_copy, task);
+    }
+
+    pub fn stopTyping(self: *DiscordChannel, channel_id: []const u8) !void {
+        var removed_key: ?[]u8 = null;
+        var removed_task: ?*TypingTask = null;
+
+        self.typing_mu.lock();
+        if (self.typing_handles.fetchRemove(channel_id)) |entry| {
+            removed_key = @constCast(entry.key);
+            removed_task = entry.value;
+        }
+        self.typing_mu.unlock();
+
+        if (removed_task) |task| {
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+            self.allocator.destroy(task);
+        }
+        if (removed_key) |key| {
+            self.allocator.free(key);
+        }
+    }
+
+    fn stopAllTyping(self: *DiscordChannel) void {
+        self.typing_mu.lock();
+        var handles = self.typing_handles;
+        self.typing_handles = .empty;
+        self.typing_mu.unlock();
+
+        var it = handles.iterator();
+        while (it.next()) |entry| {
+            const task = entry.value_ptr.*;
+            task.stop_requested.store(true, .release);
+            if (task.thread) |t| t.join();
+            self.allocator.destroy(task);
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        handles.deinit(self.allocator);
+    }
+
+    fn typingLoop(task: *TypingTask) void {
+        while (!task.stop_requested.load(.acquire)) {
+            task.channel.sendTypingIndicator(task.channel_id);
+            var elapsed: u64 = 0;
+            while (elapsed < TYPING_INTERVAL_NS and !task.stop_requested.load(.acquire)) {
+                std.Thread.sleep(TYPING_SLEEP_STEP_NS);
+                elapsed += TYPING_SLEEP_STEP_NS;
+            }
+        }
+    }
+
     fn sendChunk(self: *DiscordChannel, channel_id: []const u8, text: []const u8) !void {
         var url_buf: [256]u8 = undefined;
         const url = try sendUrl(&url_buf, channel_id);
@@ -257,6 +345,7 @@ pub const DiscordChannel = struct {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         self.running.store(false, .release);
         self.heartbeat_stop.store(true, .release);
+        self.stopAllTyping();
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
@@ -300,12 +389,24 @@ pub const DiscordChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        try self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        try self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *DiscordChannel) root.Channel {
@@ -829,6 +930,29 @@ test "discord typing url" {
 test "discord sendTypingIndicator is no-op in tests" {
     var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
     ch.sendTypingIndicator("123456");
+}
+
+test "discord typing handles start empty" {
+    var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
+    try std.testing.expect(ch.typing_handles.get("123456") == null);
+}
+
+test "discord startTyping stores handle and stopTyping clears it" {
+    var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
+    ch.running.store(true, .release);
+    defer ch.stopAllTyping();
+
+    try ch.startTyping("123456");
+    try std.testing.expect(ch.typing_handles.get("123456") != null);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try ch.stopTyping("123456");
+    try std.testing.expect(ch.typing_handles.get("123456") == null);
+}
+
+test "discord stopTyping is idempotent" {
+    var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
+    try ch.stopTyping("123456");
+    try ch.stopTyping("123456");
 }
 
 test "discord extract bot user id" {

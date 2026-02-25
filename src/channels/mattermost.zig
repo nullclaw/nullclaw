@@ -204,6 +204,13 @@ pub const MattermostChannel = struct {
         self.allocator.free(resp);
     }
 
+    pub fn startTyping(self: *MattermostChannel, target: []const u8) !void {
+        if (!self.running.load(.acquire)) return;
+        self.sendTypingIndicator(target);
+    }
+
+    pub fn stopTyping(_: *MattermostChannel, _: []const u8) !void {}
+
     fn sendPost(self: *MattermostChannel, channel_id: []const u8, text: []const u8, thread_id: ?[]const u8) !void {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/api/v4/posts", .{self.base_url});
         defer self.allocator.free(url);
@@ -375,12 +382,24 @@ pub const MattermostChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *MattermostChannel = @ptrCast(@alignCast(ptr));
+        try self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *MattermostChannel = @ptrCast(@alignCast(ptr));
+        try self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *MattermostChannel) root.Channel {
@@ -923,6 +942,13 @@ test "mattermost parseTarget supports prefixes and thread suffix" {
 test "mattermost sendTypingIndicator is no-op in tests" {
     var ch = MattermostChannel.init(std.testing.allocator, "tok", "https://chat.example.com");
     ch.sendTypingIndicator("channel:town:thread:root-9");
+}
+
+test "mattermost startTyping and stopTyping are safe in tests" {
+    var ch = MattermostChannel.init(std.testing.allocator, "tok", "https://chat.example.com");
+    ch.running.store(true, .release);
+    try ch.startTyping("channel:town:thread:root-9");
+    try ch.stopTyping("channel:town:thread:root-9");
 }
 
 test "mattermost normalizeBaseUrl strips trailing slash and api suffix" {

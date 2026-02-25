@@ -31,6 +31,9 @@ pub const ProviderEntry = struct {
     name: []const u8,
     api_key: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
+    /// Whether this provider supports native OpenAI-style tool_calls.
+    /// Set to false to use XML tool format via system prompt instead.
+    native_tools: bool = true,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────

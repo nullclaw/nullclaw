@@ -53,6 +53,9 @@ pub const Channel = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
+    fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
+
     pub const VTable = struct {
         /// Start the channel (connect, begin listening).
         start: *const fn (ptr: *anyopaque) anyerror!void,
@@ -64,6 +67,10 @@ pub const Channel = struct {
         name: *const fn (ptr: *anyopaque) []const u8,
         /// Health check — return true if the channel is operational.
         healthCheck: *const fn (ptr: *anyopaque) bool,
+        /// Start processing indicator for a recipient (e.g., typing status).
+        startTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStartTyping,
+        /// Stop processing indicator for a recipient.
+        stopTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStopTyping,
     };
 
     pub fn start(self: Channel) !void {
@@ -84,6 +91,14 @@ pub const Channel = struct {
 
     pub fn healthCheck(self: Channel) bool {
         return self.vtable.healthCheck(self.ptr);
+    }
+
+    pub fn startTyping(self: Channel, recipient: []const u8) !void {
+        return self.vtable.startTyping(self.ptr, recipient);
+    }
+
+    pub fn stopTyping(self: Channel, recipient: []const u8) !void {
+        return self.vtable.stopTyping(self.ptr, recipient);
     }
 };
 

@@ -692,6 +692,30 @@ pub const SlackChannel = struct {
         self.allocator.free(resp);
     }
 
+    fn parseStatusTarget(target: []const u8) ?struct { channel_id: []const u8, thread_ts: []const u8 } {
+        const idx = std.mem.indexOfScalar(u8, target, ':') orelse return null;
+        if (idx == 0) return null;
+        const channel_id = target[0..idx];
+        const thread_ts = target[idx + 1 ..];
+        if (thread_ts.len == 0) return null;
+        return .{
+            .channel_id = channel_id,
+            .thread_ts = thread_ts,
+        };
+    }
+
+    pub fn startTyping(self: *SlackChannel, target: []const u8) !void {
+        if (!self.running.load(.acquire)) return;
+        const status_target = parseStatusTarget(target) orelse return;
+        self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "is typing...");
+    }
+
+    pub fn stopTyping(self: *SlackChannel, target: []const u8) !void {
+        if (!self.running.load(.acquire)) return;
+        const status_target = parseStatusTarget(target) orelse return;
+        self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "");
+    }
+
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         if (self.running.load(.acquire)) return;
@@ -779,12 +803,24 @@ pub const SlackChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        try self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        try self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *SlackChannel) root.Channel {
@@ -1175,6 +1211,14 @@ test "slack setThreadStatus is no-op in tests" {
     const allowed = [_][]const u8{};
     var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
     ch.setThreadStatus("C12345", "1700000000.100", "is typing...");
+}
+
+test "slack startTyping and stopTyping are safe in tests" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    ch.running.store(true, .release);
+    try ch.startTyping("C12345:1700000000.100");
+    try ch.stopTyping("C12345:1700000000.100");
 }
 
 test "slack processHistoryMessage publishes inbound message to bus" {

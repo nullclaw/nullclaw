@@ -201,6 +201,12 @@ pub const MatrixChannel = struct {
         self.allocator.free(resp);
     }
 
+    pub fn startTyping(self: *MatrixChannel, target: []const u8) !void {
+        self.sendTypingIndicator(target);
+    }
+
+    pub fn stopTyping(_: *MatrixChannel, _: []const u8) !void {}
+
     pub fn healthCheck(self: *MatrixChannel) bool {
         if (builtin.is_test) return true;
 
@@ -482,12 +488,24 @@ pub const MatrixChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *MatrixChannel = @ptrCast(@alignCast(ptr));
+        try self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *MatrixChannel = @ptrCast(@alignCast(ptr));
+        try self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *MatrixChannel) root.Channel {
@@ -580,6 +598,19 @@ test "MatrixChannel sendTypingIndicator is no-op in tests" {
     );
     ch.user_id = "@bot:example";
     ch.sendTypingIndicator("!room:example");
+}
+
+test "MatrixChannel startTyping and stopTyping are safe in tests" {
+    var ch = MatrixChannel.init(
+        std.testing.allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+    ch.user_id = "@bot:example";
+    try ch.startTyping("!room:example");
+    try ch.stopTyping("!room:example");
 }
 
 test "MatrixChannel parseSyncResponse extracts messages and next_batch" {
