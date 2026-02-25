@@ -153,6 +153,15 @@ pub const Config = struct {
         return null;
     }
 
+    /// Look up whether a provider supports native tool calls.
+    /// Returns true (default) if provider is not in the list.
+    pub fn getProviderNativeTools(self: *const Config, name: []const u8) bool {
+        for (self.providers) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.native_tools;
+        }
+        return true;
+    }
+
     /// Sync flat convenience fields from the nested sub-configs.
     pub fn syncFlatFields(self: *Config) void {
         self.temperature = self.default_temperature;
@@ -327,6 +336,34 @@ pub const Config = struct {
         try w.print("  }},\n", .{});
     }
 
+    fn writeMcpServersSection(self: *const Config, w: *std.Io.Writer) !void {
+        try w.print("  \"mcp_servers\": {{\n", .{});
+        for (self.mcp_servers, 0..) |server, i| {
+            try w.print("    {f}: {{\"command\": {f}", .{
+                std.json.fmt(server.name, .{}),
+                std.json.fmt(server.command, .{}),
+            });
+            if (server.args.len > 0) {
+                try w.print(", \"args\": {f}", .{std.json.fmt(server.args, .{})});
+            }
+            if (server.env.len > 0) {
+                try w.print(", \"env\": {{", .{});
+                for (server.env, 0..) |entry, env_i| {
+                    if (env_i > 0) try w.print(", ", .{});
+                    try w.print("{f}: {f}", .{
+                        std.json.fmt(entry.key, .{}),
+                        std.json.fmt(entry.value, .{}),
+                    });
+                }
+                try w.print("}}", .{});
+            }
+            try w.print("}}", .{});
+            if (i + 1 < self.mcp_servers.len) try w.print(",", .{});
+            try w.print("\n", .{});
+        }
+        try w.print("  }},\n", .{});
+    }
+
     /// Apply NULLCLAW_* environment variable overrides.
     pub fn applyEnvOverrides(self: *Config) void {
         // Provider
@@ -395,6 +432,9 @@ pub const Config = struct {
 
         // Top-level fields
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
+        if (self.reasoning_effort) |value| {
+            try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
+        }
 
         // models.providers
         if (self.providers.len > 0) {
@@ -409,6 +449,14 @@ pub const Config = struct {
                 if (entry.base_url) |base| {
                     if (has_field) try w.print(", ", .{});
                     try w.print("\"base_url\": \"{s}\"", .{base});
+                    has_field = true;
+                }
+                if (comptime @hasField(ProviderEntry, "native_tools")) {
+                    if (!entry.native_tools) {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"native_tools\": false", .{});
+                        has_field = true;
+                    }
                 }
                 try w.print("}}", .{});
                 if (i + 1 < self.providers.len) try w.print(",", .{});
@@ -417,12 +465,22 @@ pub const Config = struct {
             try w.print("    }}\n  }},\n", .{});
         }
 
-        // agents.defaults (model + heartbeat)
+        if (self.model_routes.len > 0) {
+            try w.print("  \"model_routes\": {f},\n", .{std.json.fmt(self.model_routes, .{})});
+        }
+
+        // agents.defaults (model + heartbeat) + agents.list
         {
             const has_model = self.default_model != null;
             const has_heartbeat = self.heartbeat.enabled or self.heartbeat.interval_minutes != 30;
-            if (has_model or has_heartbeat) {
-                try w.print("  \"agents\": {{\n    \"defaults\": {{\n", .{});
+            const has_agents = self.agents.len > 0;
+            if (has_model or has_heartbeat or has_agents) {
+                try w.print("  \"agents\": {{\n", .{});
+                var wrote_agent_field = false;
+                if (has_model or has_heartbeat) {
+                    try w.print("    \"defaults\": {{\n", .{});
+                    wrote_agent_field = true;
+                }
                 if (self.default_model) |model| {
                     try w.print("      \"model\": {{\"primary\": \"{s}/{s}\"}}", .{ self.default_provider, model });
                     if (has_heartbeat) try w.print(",", .{});
@@ -442,8 +500,26 @@ pub const Config = struct {
                     }
                     try w.print("}}\n", .{});
                 }
-                try w.print("    }}\n  }},\n", .{});
+                if (has_model or has_heartbeat) {
+                    try w.print("    }}", .{});
+                }
+                if (has_agents) {
+                    if (wrote_agent_field) {
+                        try w.print(",\n", .{});
+                    }
+                    try w.print("    \"list\": {f}\n", .{std.json.fmt(self.agents, .{})});
+                } else {
+                    try w.print("\n", .{});
+                }
+                try w.print("  }},\n", .{});
             }
+        }
+
+        if (self.agent_bindings.len > 0) {
+            try w.print("  \"bindings\": {f},\n", .{std.json.fmt(self.agent_bindings, .{})});
+        }
+        if (self.mcp_servers.len > 0) {
+            try self.writeMcpServersSection(w);
         }
 
         // Diagnostics (with nested otel)
@@ -464,52 +540,80 @@ pub const Config = struct {
         }
         try w.print("\n  }},\n", .{});
 
-        // Autonomy
-        try w.print("  \"autonomy\": {{\n", .{});
-        try w.print("    \"level\": \"{s}\",\n", .{@tagName(self.autonomy.level)});
-        try w.print("    \"workspace_only\": {s},\n", .{if (self.autonomy.workspace_only) "true" else "false"});
-        if (self.autonomy.allowed_paths.len > 0) {
-            try w.print("    \"max_actions_per_hour\": {d},\n", .{self.autonomy.max_actions_per_hour});
-            try w.print("    \"allowed_paths\": [", .{});
-            for (self.autonomy.allowed_paths, 0..) |p, i| {
-                if (i > 0) try w.print(", ", .{});
-                try w.print("\"{s}\"", .{p});
-            }
-            try w.print("]\n", .{});
-        } else {
-            try w.print("    \"max_actions_per_hour\": {d}\n", .{self.autonomy.max_actions_per_hour});
-        }
-        try w.print("  }},\n", .{});
+        try w.print("  \"autonomy\": {f},\n", .{std.json.fmt(self.autonomy, .{})});
+        try w.print("  \"runtime\": {f},\n", .{std.json.fmt(.{
+            .kind = self.runtime.kind,
+            .docker = .{
+                .image = self.runtime.docker.image,
+                .network = self.runtime.docker.network,
+                .memory_limit_mb = self.runtime.docker.memory_limit_mb,
+                .read_only_rootfs = self.runtime.docker.read_only_rootfs,
+                .mount_workspace = self.runtime.docker.mount_workspace,
+            },
+        }, .{})});
 
         // Reliability
         try self.writeReliabilitySection(w);
+        try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
+        try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
+            .compact_context = self.agent.compact_context,
+            .max_tool_iterations = self.agent.max_tool_iterations,
+            .max_history_messages = self.agent.max_history_messages,
+            .parallel_tools = self.agent.parallel_tools,
+            .tool_dispatcher = self.agent.tool_dispatcher,
+            .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
+            .compaction_keep_recent = self.agent.compaction_keep_recent,
+            .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
+            .compaction_max_source_chars = self.agent.compaction_max_source_chars,
+            .message_timeout_secs = self.agent.message_timeout_secs,
+        }, .{})});
 
         // Channels
         try self.writeChannelsSection(w);
 
-        // Memory
-        try w.print("  \"memory\": {{\n", .{});
-        try w.print("    \"backend\": \"{s}\",\n", .{self.memory.backend});
-        try w.print("    \"auto_save\": {s},\n", .{if (self.memory.auto_save) "true" else "false"});
-        try w.print("    \"hygiene_enabled\": {s},\n", .{if (self.memory.hygiene_enabled) "true" else "false"});
-        try w.print("    \"archive_after_days\": {d},\n", .{self.memory.archive_after_days});
-        try w.print("    \"purge_after_days\": {d},\n", .{self.memory.purge_after_days});
-        try w.print("    \"conversation_retention_days\": {d}\n", .{self.memory.conversation_retention_days});
-        try w.print("  }},\n", .{});
-
-        // Gateway
-        try w.print("  \"gateway\": {{\n", .{});
-        try w.print("    \"port\": {d},\n", .{self.gateway.port});
-        try w.print("    \"host\": \"{s}\",\n", .{self.gateway.host});
-        try w.print("    \"require_pairing\": {s}\n", .{if (self.gateway.require_pairing) "true" else "false"});
-        try w.print("  }},\n", .{});
-
-        // Cost
-        try w.print("  \"cost\": {{\n", .{});
-        try w.print("    \"enabled\": {s},\n", .{if (self.cost.enabled) "true" else "false"});
-        try w.print("    \"daily_limit_usd\": {d:.1},\n", .{self.cost.daily_limit_usd});
-        try w.print("    \"monthly_limit_usd\": {d:.1}\n", .{self.cost.monthly_limit_usd});
-        try w.print("  }},\n", .{});
+        try w.print("  \"memory\": {f},\n", .{std.json.fmt(self.memory, .{})});
+        try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
+        try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
+        try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
+        try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
+        try w.print("  \"browser\": {f},\n", .{std.json.fmt(.{
+            .enabled = self.browser.enabled,
+            .session_name = self.browser.session_name,
+            .backend = self.browser.backend,
+            .native_headless = self.browser.native_headless,
+            .native_webdriver_url = self.browser.native_webdriver_url,
+            .native_chrome_path = self.browser.native_chrome_path,
+            .allowed_domains = self.browser.allowed_domains,
+        }, .{})});
+        try w.print("  \"http_request\": {f},\n", .{std.json.fmt(.{
+            .enabled = self.http_request.enabled,
+            .max_response_size = self.http_request.max_response_size,
+            .timeout_secs = self.http_request.timeout_secs,
+        }, .{})});
+        try w.print("  \"identity\": {f},\n", .{std.json.fmt(self.identity, .{})});
+        try w.print("  \"cost\": {f},\n", .{std.json.fmt(self.cost, .{})});
+        try w.print("  \"security\": {f},\n", .{std.json.fmt(.{
+            .sandbox = .{
+                .enabled = self.security.sandbox.enabled,
+                .backend = self.security.sandbox.backend,
+            },
+            .resources = .{
+                .max_memory_mb = self.security.resources.max_memory_mb,
+                .max_cpu_time_seconds = self.security.resources.max_cpu_time_seconds,
+                .max_subprocesses = self.security.resources.max_subprocesses,
+                .memory_monitoring = self.security.resources.memory_monitoring,
+            },
+            .audit = .{
+                .enabled = self.security.audit.enabled,
+                .log_path = self.security.audit.log_path,
+                .max_size_mb = self.security.audit.max_size_mb,
+                .sign_events = self.security.audit.sign_events,
+            },
+        }, .{})});
+        try w.print("  \"peripherals\": {f},\n", .{std.json.fmt(.{
+            .enabled = self.peripherals.enabled,
+            .datasheet_dir = self.peripherals.datasheet_dir,
+        }, .{})});
 
         // Tools (with media.audio)
         try w.print("  \"tools\": {{\n", .{});
@@ -539,12 +643,8 @@ pub const Config = struct {
         }
         try w.print("\n  }},\n", .{});
 
-        // Hardware
-        try w.print("  \"hardware\": {{\n", .{});
-        try w.print("    \"enabled\": {s},\n", .{if (self.hardware.enabled) "true" else "false"});
-        try w.print("    \"transport\": \"{s}\",\n", .{@tagName(self.hardware.transport)});
-        try w.print("    \"baud_rate\": {d}\n", .{self.hardware.baud_rate});
-        try w.print("  }}\n", .{});
+        try w.print("  \"hardware\": {f},\n", .{std.json.fmt(self.hardware, .{})});
+        try w.print("  \"session\": {f}\n", .{std.json.fmt(self.session, .{})});
 
         try w.print("}}\n", .{});
         try w.flush();
@@ -961,6 +1061,294 @@ test "save roundtrip preserves reliability settings" {
     try std.testing.expectEqual(@as(usize, 2), loaded.reliability.model_fallbacks[0].fallbacks.len);
     try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", loaded.reliability.model_fallbacks[0].fallbacks[0]);
     try std.testing.expectEqualStrings("groq/llama-3.3-70b", loaded.reliability.model_fallbacks[0].fallbacks[1]);
+}
+
+test "json parse memory weights accept integer values" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"vector_weight":1,"keyword_weight":0}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(f64, 1.0), cfg.memory.vector_weight);
+    try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.keyword_weight);
+}
+
+test "save roundtrip preserves extended config sections" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.reasoning_effort = "high";
+    cfg.model_routes = &.{
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-70b",
+            .api_key = "gsk_test",
+        },
+    };
+    cfg.agents = &.{
+        .{
+            .name = "helper",
+            .provider = "openrouter",
+            .model = "openai/gpt-4o-mini",
+            .system_prompt = "You are helper.",
+            .api_key = "rk_test",
+            .temperature = 0.2,
+            .max_depth = 5,
+        },
+    };
+    cfg.agent_bindings = &.{
+        .{
+            .agent_id = "helper",
+            .comment = "discord-main",
+            .match = .{
+                .channel = "discord",
+                .account_id = "main",
+            },
+        },
+    };
+    cfg.mcp_servers = &.{
+        .{
+            .name = "context7",
+            .command = "npx",
+            .args = &.{
+                "-y",
+                "@upstash/context7-mcp",
+            },
+            .env = &.{
+                .{
+                    .key = "OPENROUTER_API_KEY",
+                    .value = "sk-test",
+                },
+            },
+        },
+    };
+
+    cfg.runtime.kind = "docker";
+    cfg.runtime.docker.image = "alpine:3.20";
+    cfg.runtime.docker.network = "bridge";
+    cfg.runtime.docker.memory_limit_mb = 768;
+    cfg.runtime.docker.read_only_rootfs = false;
+    cfg.runtime.docker.mount_workspace = false;
+
+    cfg.scheduler.enabled = false;
+    cfg.scheduler.max_tasks = 32;
+    cfg.scheduler.max_concurrent = 2;
+
+    cfg.agent.compact_context = true;
+    cfg.agent.max_tool_iterations = 7;
+    cfg.agent.max_history_messages = 21;
+    cfg.agent.parallel_tools = true;
+    cfg.agent.tool_dispatcher = "parallel";
+    cfg.agent.session_idle_timeout_secs = 90;
+    cfg.agent.compaction_keep_recent = 12;
+    cfg.agent.compaction_max_summary_chars = 3000;
+    cfg.agent.compaction_max_source_chars = 9000;
+    cfg.agent.message_timeout_secs = 60;
+
+    cfg.memory.embedding_provider = "openai";
+    cfg.memory.embedding_model = "text-embedding-3-small";
+    cfg.memory.embedding_dimensions = 1536;
+    cfg.memory.vector_weight = 0.6;
+    cfg.memory.keyword_weight = 0.4;
+    cfg.memory.embedding_cache_size = 333;
+    cfg.memory.chunk_max_tokens = 1024;
+    cfg.memory.response_cache_enabled = true;
+    cfg.memory.response_cache_ttl_minutes = 15;
+    cfg.memory.response_cache_max_entries = 123;
+    cfg.memory.snapshot_enabled = true;
+    cfg.memory.snapshot_on_hygiene = true;
+    cfg.memory.auto_hydrate = false;
+
+    cfg.gateway.allow_public_bind = true;
+    cfg.gateway.pair_rate_limit_per_minute = 20;
+    cfg.gateway.webhook_rate_limit_per_minute = 80;
+    cfg.gateway.idempotency_ttl_secs = 120;
+    cfg.gateway.paired_tokens = &.{ "tok-1", "tok-2" };
+
+    cfg.tunnel.provider = "cloudflare";
+
+    cfg.composio.enabled = true;
+    cfg.composio.api_key = "comp-key";
+    cfg.composio.entity_id = "entity-1";
+
+    cfg.secrets.encrypt = false;
+
+    cfg.browser.enabled = true;
+    cfg.browser.session_name = "demo";
+    cfg.browser.backend = "native";
+    cfg.browser.native_headless = false;
+    cfg.browser.native_webdriver_url = "http://127.0.0.1:9515";
+    cfg.browser.native_chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    cfg.browser.allowed_domains = &.{ "github.com", "docs.rs" };
+
+    cfg.http_request.enabled = true;
+    cfg.http_request.max_response_size = 12345;
+    cfg.http_request.timeout_secs = 8;
+
+    cfg.identity.format = "aieos";
+    cfg.identity.aieos_path = "id.json";
+    cfg.identity.aieos_inline = "inline-id";
+
+    cfg.cost.warn_at_percent = 70;
+    cfg.cost.allow_override = true;
+
+    cfg.security.sandbox.enabled = true;
+    cfg.security.sandbox.backend = .firejail;
+    cfg.security.resources.max_memory_mb = 1024;
+    cfg.security.resources.max_cpu_time_seconds = 120;
+    cfg.security.resources.max_subprocesses = 20;
+    cfg.security.resources.memory_monitoring = false;
+    cfg.security.audit.enabled = false;
+    cfg.security.audit.log_path = "custom.log";
+    cfg.security.audit.max_size_mb = 9;
+    cfg.security.audit.sign_events = true;
+
+    cfg.peripherals.enabled = true;
+    cfg.peripherals.datasheet_dir = "/tmp/ds";
+
+    cfg.hardware.serial_port = "/dev/tty.usbmodem1";
+    cfg.hardware.probe_target = "stm32f401cc";
+    cfg.hardware.workspace_datasheets = true;
+
+    cfg.session.dm_scope = .per_peer;
+    cfg.session.idle_minutes = 45;
+    cfg.session.typing_interval_secs = 2;
+    cfg.session.identity_links = &.{
+        .{
+            .canonical = "alice",
+            .peers = &.{ "telegram:111", "discord:222" },
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 256 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqualStrings("high", loaded.reasoning_effort.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.model_routes.len);
+    try std.testing.expectEqualStrings("fast", loaded.model_routes[0].hint);
+    try std.testing.expectEqualStrings("gsk_test", loaded.model_routes[0].api_key.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.agents.len);
+    try std.testing.expectEqualStrings("helper", loaded.agents[0].name);
+    try std.testing.expectEqual(@as(usize, 1), loaded.agent_bindings.len);
+    try std.testing.expectEqualStrings("discord", loaded.agent_bindings[0].match.channel.?);
+    try std.testing.expectEqualStrings("main", loaded.agent_bindings[0].match.account_id.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
+    try std.testing.expectEqualStrings("context7", loaded.mcp_servers[0].name);
+    try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].args.len);
+    try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
+    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", loaded.mcp_servers[0].env[0].key);
+
+    try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
+    try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
+    try std.testing.expect(loaded.agent.parallel_tools);
+
+    try std.testing.expectEqualStrings("openai", loaded.memory.embedding_provider);
+    try std.testing.expect(loaded.memory.response_cache_enabled);
+    try std.testing.expectEqual(@as(u32, 2), loaded.gateway.paired_tokens.len);
+    try std.testing.expect(loaded.gateway.allow_public_bind);
+    try std.testing.expectEqualStrings("cloudflare", loaded.tunnel.provider);
+    try std.testing.expect(loaded.composio.enabled);
+    try std.testing.expect(!loaded.secrets.encrypt);
+    try std.testing.expect(loaded.browser.enabled);
+    try std.testing.expectEqual(@as(usize, 2), loaded.browser.allowed_domains.len);
+    try std.testing.expect(loaded.http_request.enabled);
+    try std.testing.expectEqualStrings("aieos", loaded.identity.format);
+    try std.testing.expectEqual(@as(u8, 70), loaded.cost.warn_at_percent);
+    try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
+    try std.testing.expect(loaded.peripherals.enabled);
+    try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
+    try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
+    try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
+}
+
+test "save escapes mcp_servers strings safely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.default_model = "gpt-5";
+    cfg.mcp_servers = &.{
+        .{
+            .name = "ctx\"7",
+            .command = "npx \"@scope/pkg\"\nrun",
+            .args = &.{
+                "--path=C:\\tmp\\file",
+                "line\nbreak",
+            },
+            .env = &.{
+                .{
+                    .key = "OPEN\"KEY",
+                    .value = "ab\\cd\"ef\nz",
+                },
+            },
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
+    try std.testing.expectEqualStrings("ctx\"7", loaded.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("npx \"@scope/pkg\"\nrun", loaded.mcp_servers[0].command);
+    try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].args.len);
+    try std.testing.expectEqualStrings("--path=C:\\tmp\\file", loaded.mcp_servers[0].args[0]);
+    try std.testing.expectEqualStrings("line\nbreak", loaded.mcp_servers[0].args[1]);
+    try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
+    try std.testing.expectEqualStrings("OPEN\"KEY", loaded.mcp_servers[0].env[0].key);
+    try std.testing.expectEqualStrings("ab\\cd\"ef\nz", loaded.mcp_servers[0].env[0].value);
 }
 
 test "syncFlatFields propagates nested values" {
@@ -1673,6 +2061,41 @@ test "json parse providers section" {
         if (e.base_url) |b| allocator.free(b);
     }
     allocator.free(cfg.providers);
+}
+
+test "save writes provider native_tools when false" {
+    if (!comptime @hasField(ProviderEntry, "native_tools")) return;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "groq",
+            .api_key = "gsk_test",
+            .native_tools = false,
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"native_tools\": false") != null);
 }
 
 test "json parse tools.media.audio section" {

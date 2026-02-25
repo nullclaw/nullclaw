@@ -48,6 +48,9 @@ pub const OpenAiCompatibleProvider = struct {
     /// user message as "[System: …]\n\n…", then skip system-role messages.
     /// Required by providers like MiniMax that reject the system role.
     merge_system_into_user: bool = false,
+    /// Whether this provider supports native OpenAI-style tool_calls.
+    /// When false, the agent uses XML tool format via system prompt.
+    native_tools: bool = true,
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -536,8 +539,9 @@ pub const OpenAiCompatibleProvider = struct {
         return parseNativeResponse(allocator, resp_body);
     }
 
-    fn supportsNativeToolsImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools;
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
