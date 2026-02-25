@@ -169,7 +169,7 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
         \\  <key>ProgramArguments</key>
         \\  <array>
         \\    <string>{s}</string>
-        \\    <string>daemon</string>
+        \\    <string>gateway</string>
         \\  </array>
         \\  <key>RunAtLoad</key>
         \\  <true/>
@@ -204,12 +204,12 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     const content = try std.fmt.allocPrint(allocator,
         \\[Unit]
-        \\Description=nullclaw daemon
+        \\Description=nullclaw gateway runtime
         \\After=network.target
         \\
         \\[Service]
         \\Type=simple
-        \\ExecStart={s} daemon
+        \\ExecStart={s} gateway
         \\Restart=always
         \\RestartSec=3
         \\

@@ -17,7 +17,6 @@ const log = std.log.scoped(.main);
 const Command = enum {
     agent,
     gateway,
-    daemon,
     service,
     status,
     version,
@@ -39,7 +38,6 @@ fn parseCommand(arg: []const u8) ?Command {
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "agent", .agent },
         .{ "gateway", .gateway },
-        .{ "daemon", .daemon },
         .{ "service", .service },
         .{ "status", .status },
         .{ "version", .version },
@@ -95,7 +93,6 @@ pub fn main() !void {
         .doctor => try yc.doctor.run(allocator),
         .help => printUsage(),
         .gateway => try runGateway(allocator, sub_args),
-        .daemon => try runDaemon(allocator, sub_args),
         .service => try runService(allocator, sub_args),
         .cron => try runCron(allocator, sub_args),
         .channel => try runChannel(allocator, sub_args),
@@ -140,28 +137,6 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    var cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
-    defer cfg.deinit();
-
-    applyGatewayDaemonOverrides(&cfg, sub_args) catch {
-        std.debug.print("Invalid port in CLI args.\n", .{});
-        std.process.exit(1);
-    };
-
-    cfg.validate() catch |err| {
-        yc.config.Config.printValidationError(err);
-        std.process.exit(1);
-    };
-
-    try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
-}
-
-// ── Daemon ───────────────────────────────────────────────────────
-
-fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
@@ -346,7 +321,7 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Commands:
             \\  list                          List configured channels
             \\  start [channel]               Start a channel (default: first available)
-            \\  doctor                        Run health checks
+            \\  status                        Show channel health/status
             \\  add <type> <config_json>      Add a channel
             \\  remove <name>                 Remove a channel
             \\
@@ -371,7 +346,7 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         }
     } else if (std.mem.eql(u8, subcmd, "start")) {
         try runChannelStart(allocator, sub_args[1..]);
-    } else if (std.mem.eql(u8, subcmd, "doctor")) {
+    } else if (std.mem.eql(u8, subcmd, "status")) {
         std.debug.print("Channel health:\n", .{});
         std.debug.print("  CLI: ok\n", .{});
         for (yc.channel_catalog.known_channels) |meta| {
@@ -569,7 +544,7 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Usage: nullclaw migrate <source> [options]
             \\
             \\Sources:
-            \\  openclaw                      Import from OpenClaw workspace
+            \\  openclaw                      Import from OpenClaw workspace (+ config migration)
             \\
             \\Options:
             \\  --dry-run                     Preview without writing
@@ -608,6 +583,13 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             std.debug.print("[DRY RUN] ", .{});
         }
         std.debug.print("Migration complete: {d} imported, {d} skipped\n", .{ stats.imported, stats.skipped_unchanged });
+        if (stats.config_migrated) {
+            if (dry_run) {
+                std.debug.print("[DRY RUN] Config migration preview: ~/.openclaw/config.json -> {s}\n", .{cfg.config_path});
+            } else {
+                std.debug.print("Config migrated: ~/.openclaw/config.json -> {s}\n", .{cfg.config_path});
+            }
+        }
     } else {
         std.debug.print("Unknown migration source: {s}\n", .{sub_args[0]});
         std.process.exit(1);
@@ -2277,7 +2259,6 @@ fn printUsage() void {
         \\  onboard     Initialize workspace and configuration
         \\  agent       Start the AI agent loop
         \\  gateway     Start the gateway server (HTTP/WebSocket)
-        \\  daemon      Start long-running runtime (gateway + channels + heartbeat)
         \\  service     Manage OS service lifecycle (install/start/stop/status/uninstall)
         \\  status      Show system status
         \\  version     Show CLI version
@@ -2297,11 +2278,10 @@ fn printUsage() void {
         \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
-        \\  daemon [--port PORT] [--host HOST]
         \\  version | --version | -V
         \\  service <install|start|stop|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS]
-        \\  channel <list|start|doctor|add|remove> [ARGS]
+        \\  channel <list|start|status|add|remove> [ARGS]
         \\  skills <list|install|remove> [ARGS]
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
@@ -2326,6 +2306,7 @@ test "parse known commands" {
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
     try std.testing.expectEqual(.update, parseCommand("update").?);
+    try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
 }
 

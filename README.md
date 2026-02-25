@@ -89,9 +89,6 @@ nullclaw agent
 nullclaw gateway                # default: 127.0.0.1:3000
 nullclaw gateway --port 8080    # custom port
 
-# Alias (same runtime path)
-nullclaw daemon
-
 # Check status
 nullclaw status
 
@@ -99,7 +96,7 @@ nullclaw status
 nullclaw doctor
 
 # Check channel health
-nullclaw channel doctor
+nullclaw channel status
 
 # Start specific channels
 nullclaw channel start telegram
@@ -334,17 +331,16 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 | `onboard --channels-only` | Reconfigure channels/allowlists only |
 | `agent -m "..."` | Single message mode |
 | `agent` | Interactive chat mode |
-| `gateway` | Start webhook server (default: `127.0.0.1:3000`) |
-| `daemon` | Start long-running autonomous runtime |
+| `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
 | `service install\|start\|stop\|status\|uninstall` | Manage background service |
 | `doctor` | Diagnose system health |
 | `status` | Show full system status |
-| `channel doctor` | Run channel health checks |
+| `channel status` | Show channel health/status |
 | `cron list\|add\|remove\|pause\|resume\|run` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `models list\|info\|benchmark` | Model catalog |
-| `migrate openclaw [--dry-run] [--source PATH]` | Import memory from OpenClaw workspace |
+| `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
 
 ## Development
 
