@@ -8,6 +8,7 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 const telegram = @import("channels/telegram.zig");
 const session_mod = @import("session.zig");
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const memory_mod = @import("memory/root.zig");
 const observability = @import("observability.zig");
@@ -260,7 +261,7 @@ pub fn runTelegramLoop(
             tg_ptr.startTyping(typing_target) catch {};
             defer tg_ptr.stopTyping(typing_target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
                 log.err("Agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -380,7 +381,16 @@ pub fn runSignalLoop(
             if (typing_target) |target| sg_ptr.startTyping(target) catch {};
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            // Build conversation context for Signal
+            const conversation_context: ?ConversationContext = .{
+                .channel = "signal",
+                .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
+                .sender_uuid = msg.sender_uuid,
+                .group_id = msg.group_id,
+                .is_group = msg.is_group,
+            };
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -581,7 +591,7 @@ pub fn runMatrixLoop(
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",

@@ -606,7 +606,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+        const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
             // Send user-visible error reply back to the originating channel

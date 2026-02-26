@@ -36,6 +36,10 @@ pub const ChannelMessage = struct {
     first_name: ?[]const u8 = null,
     /// Whether the message came from a group chat.
     is_group: bool = false,
+    /// Sender UUID (Signal-specific: when user has privacy mode enabled).
+    sender_uuid: ?[]const u8 = null,
+    /// Group ID (Signal-specific: for group chats).
+    group_id: ?[]const u8 = null,
 
     pub fn deinit(self: *const ChannelMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -44,6 +48,8 @@ pub const ChannelMessage = struct {
         // channel is a string literal or long-lived config pointer — not owned, don't free
         if (self.reply_target) |rt| allocator.free(rt);
         if (self.first_name) |fn_| allocator.free(fn_);
+        if (self.sender_uuid) |uuid| allocator.free(uuid);
+        if (self.group_id) |gid| allocator.free(gid);
     }
 };
 

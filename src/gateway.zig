@@ -1414,7 +1414,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
-                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
                     }
@@ -1553,7 +1553,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_id, wa_chat_target, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -1609,7 +1609,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -1811,7 +1811,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         ) catch null;
         _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, sk, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(sk, text) catch |err| blk: {
+        const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
             break :blk null;
@@ -1940,7 +1940,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                     }) catch null;
                     _ = publishToBus(eb, ctx.state.allocator, "line", uid, line_target, text, sk, meta);
                 } else if (ctx.session_mgr_opt) |sm| {
-                    const reply: ?[]const u8 = sm.processMessage(sk, text) catch |err| blk: {
+                    const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
                         if (evt.reply_token) |rt| {
                             var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
                                 .access_token = line_access_token,
@@ -2061,7 +2061,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             }) catch null;
             _ = publishToBus(eb, ctx.state.allocator, "lark", msg.sender, msg.sender, msg.content, sk, meta);
         } else if (ctx.session_mgr_opt) |sm| {
-            const reply: ?[]const u8 = sm.processMessage(sk, msg.content) catch |err| blk: {
+            const reply: ?[]const u8 = sm.processMessage(sk, msg.content, null) catch |err| blk: {
                 lark_ch.sendMessage(msg.sender, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -2329,7 +2329,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {
-                                const reply: ?[]const u8 = sm.processMessage(session_key, msg_text) catch |err| blk: {
+                                const reply: ?[]const u8 = sm.processMessage(session_key, msg_text, null) catch |err| blk: {
                                     response_body = userFacingAgentErrorJson(err);
                                     break :blk null;
                                 };

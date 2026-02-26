@@ -356,6 +356,8 @@ pub const SignalChannel = struct {
             .reply_target = reply_target_str,
             .first_name = if (source_name) |sn| if (sn.len > 0) try allocator.dupe(u8, sn) else null else null,
             .is_group = dm_group_id != null,
+            .sender_uuid = if (source) |src| if (src.len > 0 and !std.mem.eql(u8, src, sender_raw)) try allocator.dupe(u8, src) else null else null,
+            .group_id = if (dm_group_id) |gid| try allocator.dupe(u8, gid) else null,
         };
 
         return msg;

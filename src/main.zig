@@ -1595,7 +1595,18 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
                 break :blk route.session_key;
             };
 
-            const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
+            // Build conversation context for Signal (includes sender UUID and group ID)
+            const conversation_context: ?yc.agent.ConversationContext = if (std.mem.eql(u8, msg.channel, "signal")) blk: {
+                break :blk .{
+                    .channel = "signal",
+                    .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
+                    .sender_uuid = msg.sender_uuid,
+                    .group_id = msg.group_id,
+                    .is_group = msg.is_group,
+                };
+            } else null;
+
+            const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -1907,7 +1918,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             tg.startTyping(typing_target) catch {};
             defer tg.stopTyping(typing_target) catch {};
 
-            const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
+            const reply = session_mgr.processMessage(session_key, msg.content, null) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",

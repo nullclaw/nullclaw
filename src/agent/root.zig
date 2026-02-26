@@ -282,6 +282,8 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Conversation context for the current turn (Signal-specific for now).
+    conversation_context: ?prompt.ConversationContext = null,
 
     /// Conversation history — owned, growable list.
     history: std.ArrayListUnmanaged(OwnedMessage) = .empty,
@@ -642,7 +644,7 @@ pub const Agent = struct {
             self.has_system_prompt = false;
         }
 
-        if (!self.has_system_prompt) {
+        if (!self.has_system_prompt or self.conversation_context != null) {
             var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
             defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
             const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
@@ -659,6 +661,7 @@ pub const Agent = struct {
                 .model_name = self.model_name,
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
+                .conversation_context = self.conversation_context,
             });
             defer self.allocator.free(system_prompt);
 

@@ -11,12 +11,22 @@ const skills_mod = @import("../skills.zig");
 /// Maximum characters to include from a single workspace identity file.
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
+/// Conversation context for the current turn (Signal-specific for now).
+pub const ConversationContext = struct {
+    channel: ?[]const u8 = null,
+    sender_number: ?[]const u8 = null,
+    sender_uuid: ?[]const u8 = null,
+    group_id: ?[]const u8 = null,
+    is_group: ?bool = null,
+};
+
 /// Context passed to prompt sections during construction.
 pub const PromptContext = struct {
     workspace_dir: []const u8,
     model_name: []const u8,
     tools: []const Tool,
     capabilities_section: ?[]const u8 = null,
+    conversation_context: ?ConversationContext = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -89,6 +99,33 @@ pub fn buildSystemPrompt(
 
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
+
+    // Conversation context section (Signal-specific for now)
+    if (ctx.conversation_context) |cc| {
+        try w.writeAll("## Conversation Context\n\n");
+        if (cc.channel) |ch| {
+            try std.fmt.format(w, "- Channel: {s}\n", .{ch});
+        }
+        if (cc.is_group) |ig| {
+            if (ig) {
+                if (cc.group_id) |gid| {
+                    try std.fmt.format(w, "- Chat type: group\n", .{});
+                    try std.fmt.format(w, "- Group ID: {s}\n", .{gid});
+                } else {
+                    try std.fmt.format(w, "- Chat type: group\n", .{});
+                }
+            } else {
+                try std.fmt.format(w, "- Chat type: direct message\n", .{});
+            }
+        }
+        if (cc.sender_number) |num| {
+            try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
+        }
+        if (cc.sender_uuid) |uuid| {
+            try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+        }
+        try w.writeAll("\n");
+    }
 
     if (ctx.capabilities_section) |section| {
         try w.writeAll(section);
