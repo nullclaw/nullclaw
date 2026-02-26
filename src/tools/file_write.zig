@@ -79,12 +79,11 @@ pub const FileWriteTool = struct {
             }
         }
 
-        // Preserve symlink semantics by writing to the resolved target path.
+        // For existing paths, write to canonical target path.
+        // This preserves symlink semantics (updates target, keeps link) and
+        // avoids platform-specific readLink failures on regular files.
         const write_path = if (resolved_target) |resolved|
-            if (isSymlinkPath(full_path))
-                try allocator.dupe(u8, resolved)
-            else
-                try allocator.dupe(u8, full_path)
+            try allocator.dupe(u8, resolved)
         else
             try allocator.dupe(u8, full_path);
         defer allocator.free(write_path);
@@ -211,16 +210,6 @@ fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8
         },
         else => return err,
     };
-}
-
-fn isSymlinkPath(path: []const u8) bool {
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.fs.path.isAbsolute(path)) {
-        _ = std.fs.readLinkAbsolute(path, &link_buf) catch return false;
-        return true;
-    }
-    _ = std.fs.cwd().readLink(path, &link_buf) catch return false;
-    return true;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

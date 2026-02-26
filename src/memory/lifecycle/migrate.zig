@@ -445,11 +445,19 @@ test "memory column detection" {
 
 // ── P5.1: Edge case tests ─────────────────────────────────────────
 
-test "readBrainDb with corrupt file path returns OpenFailed" {
+test "readBrainDb with corrupt file returns no memories table" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
 
-    // A null-terminated path to a non-sqlite file
-    const result = readBrainDb(std.testing.allocator, "/dev/null");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "corrupt.db", .data = "not a sqlite database" });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "corrupt.db");
+    defer std.testing.allocator.free(path);
+    const pathZ = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(pathZ);
+
+    const result = readBrainDb(std.testing.allocator, pathZ.ptr);
     try std.testing.expectError(error.NoMemoriesTable, result);
 }
 
