@@ -1865,11 +1865,14 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     std.debug.print("  Tools: {d} loaded\n", .{tools.len});
     std.debug.print("  Memory: {s}\n", .{if (mem_opt != null) "enabled" else "disabled"});
 
+    if (yc.channel_loop.loadTelegramUpdateOffset(allocator, &config, tg.account_id, tg.bot_token)) |saved_update_id| {
+        tg.last_update_id = saved_update_id;
+    }
+
+    tg.deleteWebhookKeepPending();
+
     // Register bot commands in Telegram's "/" menu
     tg.setMyCommands();
-
-    // Skip messages accumulated while bot was offline
-    tg.dropPendingUpdates();
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
@@ -1881,6 +1884,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     defer session_mgr.deinit();
 
     var evict_counter: u32 = 0;
+    var persisted_update_id: i64 = tg.last_update_id;
 
     // Bot loop: poll → full agent loop (tool calling) → reply
     while (true) {
@@ -1965,6 +1969,17 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
                 msg.deinit(allocator);
             }
             allocator.free(messages);
+        }
+
+        if (tg.persistableUpdateOffset()) |persistable_update_id| {
+            yc.channel_loop.persistTelegramUpdateOffsetIfAdvanced(
+                allocator,
+                &config,
+                tg.account_id,
+                tg.bot_token,
+                &persisted_update_id,
+                persistable_update_id,
+            );
         }
 
         // Periodically evict sessions idle longer than the configured timeout

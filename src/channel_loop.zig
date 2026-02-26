@@ -26,6 +26,146 @@ const matrix = @import("channels/matrix.zig");
 const channels_mod = @import("channels/root.zig");
 
 const log = std.log.scoped(.channel_loop);
+const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
+
+fn extractTelegramBotId(bot_token: []const u8) ?[]const u8 {
+    const colon_pos = std.mem.indexOfScalar(u8, bot_token, ':') orelse return null;
+    if (colon_pos == 0) return null;
+    const raw = std.mem.trim(u8, bot_token[0..colon_pos], " \t\r\n");
+    if (raw.len == 0) return null;
+    for (raw) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+    }
+    return raw;
+}
+
+fn normalizeTelegramAccountId(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, account_id, " \t\r\n");
+    const source = if (trimmed.len == 0) "default" else trimmed;
+    var normalized = try allocator.alloc(u8, source.len);
+    for (source, 0..) |c, i| {
+        normalized[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-') c else '_';
+    }
+    return normalized;
+}
+
+fn telegramUpdateOffsetPath(allocator: std.mem.Allocator, config: *const Config, account_id: []const u8) ![]u8 {
+    const config_dir = std.fs.path.dirname(config.config_path) orelse ".";
+    const normalized_account_id = try normalizeTelegramAccountId(allocator, account_id);
+    defer allocator.free(normalized_account_id);
+
+    const file_name = try std.fmt.allocPrint(allocator, "update-offset-{s}.json", .{normalized_account_id});
+    defer allocator.free(file_name);
+
+    return std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+}
+
+/// Load persisted Telegram update offset. Returns null when missing/invalid/stale.
+pub fn loadTelegramUpdateOffset(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    bot_token: []const u8,
+) ?i64 {
+    const path = telegramUpdateOffsetPath(allocator, config, account_id) catch return null;
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 16 * 1024) catch return null;
+    defer allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+
+    if (obj.get("version")) |version_val| {
+        if (version_val != .integer or version_val.integer != TELEGRAM_OFFSET_STORE_VERSION) return null;
+    }
+
+    const last_update_id_val = obj.get("last_update_id") orelse return null;
+    if (last_update_id_val != .integer) return null;
+
+    const expected_bot_id = extractTelegramBotId(bot_token);
+    if (expected_bot_id) |expected| {
+        const stored_bot_id_val = obj.get("bot_id") orelse return null;
+        if (stored_bot_id_val != .string) return null;
+        if (!std.mem.eql(u8, stored_bot_id_val.string, expected)) return null;
+    } else if (obj.get("bot_id")) |stored_bot_id_val| {
+        if (stored_bot_id_val != .null and stored_bot_id_val != .string) return null;
+    }
+
+    return last_update_id_val.integer;
+}
+
+/// Persist Telegram update offset with bot identity (atomic write).
+pub fn saveTelegramUpdateOffset(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    bot_token: []const u8,
+    update_id: i64,
+) !void {
+    const path = try telegramUpdateOffsetPath(allocator, config, account_id);
+    defer allocator.free(path);
+
+    if (std.fs.path.dirname(path)) |dir| {
+        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => try std.fs.cwd().makePath(dir),
+        };
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\n");
+    try std.fmt.format(buf.writer(allocator), "  \"version\": {d},\n", .{TELEGRAM_OFFSET_STORE_VERSION});
+    try std.fmt.format(buf.writer(allocator), "  \"last_update_id\": {d},\n", .{update_id});
+    if (extractTelegramBotId(bot_token)) |bot_id| {
+        try std.fmt.format(buf.writer(allocator), "  \"bot_id\": \"{s}\"\n", .{bot_id});
+    } else {
+        try buf.appendSlice(allocator, "  \"bot_id\": null\n");
+    }
+    try buf.appendSlice(allocator, "}\n");
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    {
+        var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+        defer tmp_file.close();
+        try tmp_file.writeAll(buf.items);
+    }
+
+    std.fs.renameAbsolute(tmp_path, path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(buf.items);
+    };
+}
+
+/// Persist candidate Telegram offset only when it advanced beyond the last
+/// persisted value. On write failure, keeps watermark unchanged so the caller
+/// retries on the next loop iteration.
+pub fn persistTelegramUpdateOffsetIfAdvanced(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    bot_token: []const u8,
+    persisted_update_id: *i64,
+    candidate_update_id: i64,
+) void {
+    if (candidate_update_id <= persisted_update_id.*) return;
+    saveTelegramUpdateOffset(allocator, config, account_id, bot_token, candidate_update_id) catch |err| {
+        log.warn("failed to persist telegram update offset: {}", .{err});
+        return;
+    };
+    persisted_update_id.* = candidate_update_id;
+}
 
 fn signalGroupPeerId(reply_target: ?[]const u8) []const u8 {
     const target = reply_target orelse "unknown";
@@ -202,9 +342,17 @@ pub fn runTelegramLoop(
         tg_ptr.transcriber = wt.transcriber();
     }
 
-    // Register bot commands and skip stale messages
+    // Restore persisted Telegram offset (OpenClaw parity).
+    if (loadTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token)) |saved_update_id| {
+        tg_ptr.last_update_id = saved_update_id;
+    }
+
+    // Ensure polling mode is active without dropping queued updates.
+    tg_ptr.deleteWebhookKeepPending();
+
+    // Register bot commands
     tg_ptr.setMyCommands();
-    tg_ptr.dropPendingUpdates();
+    var persisted_update_id: i64 = tg_ptr.last_update_id;
 
     var evict_counter: u32 = 0;
 
@@ -286,6 +434,17 @@ pub fn runTelegramLoop(
                 msg.deinit(allocator);
             }
             allocator.free(messages);
+        }
+
+        if (tg_ptr.persistableUpdateOffset()) |persistable_update_id| {
+            persistTelegramUpdateOffsetIfAdvanced(
+                allocator,
+                config,
+                tg_ptr.account_id,
+                tg_ptr.bot_token,
+                &persisted_update_id,
+                persistable_update_id,
+            );
         }
 
         // Periodic session eviction
@@ -726,4 +885,138 @@ test "signalGroupPeerId falls back when reply target is missing or malformed" {
 test "matrixRoomPeerId falls back when reply target is missing" {
     try std.testing.expectEqualStrings("unknown", matrixRoomPeerId(null));
     try std.testing.expectEqualStrings("!room:example", matrixRoomPeerId("!room:example"));
+}
+
+test "telegram update offset store roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    try saveTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token", 777);
+    const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
+    try std.testing.expectEqual(@as(?i64, 777), restored);
+}
+
+test "telegram update offset store returns null for mismatched bot id" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    try saveTelegramUpdateOffset(allocator, &cfg, "main", "11111:test-token-a", 123);
+    const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "22222:test-token-b");
+    try std.testing.expect(restored == null);
+}
+
+test "telegram update offset store treats legacy payload without bot_id as stale" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    const offset_path = try telegramUpdateOffsetPath(allocator, &cfg, "default");
+    defer allocator.free(offset_path);
+    const offset_dir = std.fs.path.dirname(offset_path).?;
+    std.fs.makeDirAbsolute(offset_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => try std.fs.cwd().makePath(offset_dir),
+    };
+    const file = try std.fs.createFileAbsolute(offset_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\{
+        \\  "version": 1,
+        \\  "last_update_id": 456
+        \\}
+        \\
+    );
+
+    const restored = loadTelegramUpdateOffset(allocator, &cfg, "default", "33333:test-token-c");
+    try std.testing.expect(restored == null);
+}
+
+test "telegram offset persistence helper retries after write failure" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    const blocked_state_path = try std.fs.path.join(allocator, &.{ base, "state" });
+    defer allocator.free(blocked_state_path);
+
+    {
+        const blocked_state_file = try std.fs.createFileAbsolute(blocked_state_path, .{});
+        blocked_state_file.close();
+    }
+
+    var persisted_update_id: i64 = 100;
+    persistTelegramUpdateOffsetIfAdvanced(
+        allocator,
+        &cfg,
+        "main",
+        "12345:test-token",
+        &persisted_update_id,
+        101,
+    );
+    try std.testing.expectEqual(@as(i64, 100), persisted_update_id);
+    try std.testing.expect(loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token") == null);
+
+    try std.fs.deleteFileAbsolute(blocked_state_path);
+
+    persistTelegramUpdateOffsetIfAdvanced(
+        allocator,
+        &cfg,
+        "main",
+        "12345:test-token",
+        &persisted_update_id,
+        101,
+    );
+    try std.testing.expectEqual(@as(i64, 101), persisted_update_id);
+    const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
+    try std.testing.expectEqual(@as(?i64, 101), restored);
 }

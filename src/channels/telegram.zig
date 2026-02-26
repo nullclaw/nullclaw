@@ -528,7 +528,7 @@ pub const TelegramChannel = struct {
     pub fn healthCheck(self: *TelegramChannel) bool {
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "getMe") catch return false;
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, null) catch return false;
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10") catch return false;
         defer self.allocator.free(resp);
         return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
     }
@@ -538,8 +538,21 @@ pub const TelegramChannel = struct {
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "setMyCommands") catch return;
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, TELEGRAM_BOT_COMMANDS_JSON, &.{}, self.proxy, null) catch |err| {
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, TELEGRAM_BOT_COMMANDS_JSON, &.{}, self.proxy, "10") catch |err| {
             log.warn("setMyCommands failed: {}", .{err});
+            return;
+        };
+        self.allocator.free(resp);
+    }
+
+    /// Disable webhook mode before polling, preserving queued updates.
+    pub fn deleteWebhookKeepPending(self: *TelegramChannel) void {
+        var url_buf: [512]u8 = undefined;
+        const url = self.apiUrl(&url_buf, "deleteWebhook") catch return;
+
+        const body = "{\"drop_pending_updates\":false}";
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, "10") catch |err| {
+            log.warn("deleteWebhook failed: {}", .{err});
             return;
         };
         self.allocator.free(resp);
@@ -552,7 +565,7 @@ pub const TelegramChannel = struct {
         const url = self.apiUrl(&url_buf, "getUpdates") catch return;
 
         const body = "{\"offset\":-1,\"timeout\":0}";
-        const resp_body = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, null) catch return;
+        const resp_body = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, "10") catch return;
         defer self.allocator.free(resp_body);
 
         // Parse to extract the latest update_id and advance past it
@@ -573,6 +586,16 @@ pub const TelegramChannel = struct {
         }
     }
 
+    /// Return an offset safe to persist across restarts.
+    /// If media-group updates are still buffered in-memory, persisting a newer
+    /// offset can skip those updates after restart, so return null until flushed.
+    pub fn persistableUpdateOffset(self: *const TelegramChannel) ?i64 {
+        if (self.pending_media_messages.items.len == 0) {
+            return self.last_update_id;
+        }
+        return null;
+    }
+
     // ── Typing indicator ────────────────────────────────────────────
 
     /// Send a "typing" chat action. Best-effort: errors are ignored.
@@ -590,7 +613,7 @@ pub const TelegramChannel = struct {
         body_list.appendSlice(self.allocator, chat_id) catch return;
         body_list.appendSlice(self.allocator, ",\"action\":\"typing\"}") catch return;
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, null) catch return;
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "10") catch return;
         self.allocator.free(resp);
     }
 
@@ -701,7 +724,7 @@ pub const TelegramChannel = struct {
         }
         try html_body.appendSlice(self.allocator, "}");
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, html_body.items, &.{}, self.proxy, null) catch {
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, html_body.items, &.{}, self.proxy, "30") catch {
             // Network error — fall through to plain send
             try self.sendChunkPlain(chat_id, text, reply_to);
             return;
@@ -736,7 +759,7 @@ pub const TelegramChannel = struct {
         }
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, null);
+        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "30");
         self.allocator.free(resp);
     }
 
@@ -818,12 +841,24 @@ pub const TelegramChannel = struct {
         const chatid_arg = chatid_fbs.getWritten();
 
         // Build argv
-        var argv_buf: [16][]const u8 = undefined;
+        var argv_buf: [24][]const u8 = undefined;
         var argc: usize = 0;
         argv_buf[argc] = "curl";
         argc += 1;
         argv_buf[argc] = "-s";
         argc += 1;
+        argv_buf[argc] = "-m";
+        argc += 1;
+        argv_buf[argc] = "120";
+        argc += 1;
+
+        if (self.proxy) |p| {
+            argv_buf[argc] = "-x";
+            argc += 1;
+            argv_buf[argc] = p;
+            argc += 1;
+        }
+
         argv_buf[argc] = "-F";
         argc += 1;
         argv_buf[argc] = chatid_arg;
@@ -941,7 +976,7 @@ pub const TelegramChannel = struct {
         try root.json_util.appendJsonString(&body_list, self.allocator, text);
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, null);
+        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "30");
         self.allocator.free(resp);
     }
 
@@ -1124,7 +1159,10 @@ pub const TelegramChannel = struct {
         try fbs.writer().print("{{\"offset\":{d},\"timeout\":{d},\"allowed_updates\":[\"message\"]}}", .{ self.last_update_id, poll_timeout });
         const body = fbs.getWritten();
 
-        const resp_body = try root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, null);
+        var timeout_buf: [16]u8 = undefined;
+        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{poll_timeout + 15}) catch "45";
+
+        const resp_body = try root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, timeout_str);
         defer allocator.free(resp_body);
 
         // Parse JSON response to extract messages
@@ -1516,12 +1554,10 @@ pub const TelegramChannel = struct {
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "getMe") catch return;
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
+        if (root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10")) |resp| {
+            self.allocator.free(resp);
+        } else |_| {}
 
-        _ = client.fetch(.{
-            .location = .{ .url = url },
-        }) catch return;
         // Keep slash-command menu in sync when channel is started via manager/daemon.
         self.setMyCommands();
         // If getMe fails, we still start — healthCheck will report issues.
@@ -1868,7 +1904,7 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
     body_list.appendSlice(allocator, "}") catch return null;
 
-    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, null) catch |err| {
+    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, "15") catch |err| {
         log.warn("downloadTelegramPhoto: getFile API failed: {}", .{err});
         return null;
     };
@@ -1947,7 +1983,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, fil
     root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
     body_list.appendSlice(allocator, "}") catch return null;
 
-    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, null) catch |err| {
+    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, "15") catch |err| {
         log.warn("downloadTelegramFile: getFile API failed: {}", .{err});
         return null;
     };
@@ -2858,6 +2894,32 @@ test "telegram flushMaturedPendingMediaGroups flushes only mature groups" {
     try std.testing.expectEqual(@as(usize, 1), ch.pending_media_messages.items.len);
     try std.testing.expectEqualStrings("group-b", ch.pending_media_group_ids.items[0].?);
     try std.testing.expectEqual(@as(u64, now), ch.pending_media_received_at.items[0]);
+
+    ch.resetPendingMediaBuffers();
+    ch.pending_media_messages.deinit(alloc);
+    ch.pending_media_group_ids.deinit(alloc);
+    ch.pending_media_received_at.deinit(alloc);
+}
+
+test "telegram persistableUpdateOffset waits until pending media flushes" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    ch.last_update_id = 42;
+    try std.testing.expectEqual(@as(?i64, 42), ch.persistableUpdateOffset());
+
+    const now = root.nowEpochSecs();
+    try ch.pending_media_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "[FILE:/tmp/a.pdf]"),
+        .channel = "telegram",
+        .timestamp = now,
+    });
+    try ch.pending_media_group_ids.append(alloc, try alloc.dupe(u8, "group-a"));
+    try ch.pending_media_received_at.append(alloc, now);
+
+    try std.testing.expect(ch.persistableUpdateOffset() == null);
 
     ch.resetPendingMediaBuffers();
     ch.pending_media_messages.deinit(alloc);
