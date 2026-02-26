@@ -573,6 +573,16 @@ pub const TelegramChannel = struct {
         }
     }
 
+    /// Return an offset safe to persist across restarts.
+    /// If media-group updates are still buffered in-memory, persisting a newer
+    /// offset can skip those updates after restart, so return null until flushed.
+    pub fn persistableUpdateOffset(self: *const TelegramChannel) ?i64 {
+        if (self.pending_media_messages.items.len == 0) {
+            return self.last_update_id;
+        }
+        return null;
+    }
+
     // ── Typing indicator ────────────────────────────────────────────
 
     /// Send a "typing" chat action. Best-effort: errors are ignored.
@@ -2871,6 +2881,32 @@ test "telegram flushMaturedPendingMediaGroups flushes only mature groups" {
     try std.testing.expectEqual(@as(usize, 1), ch.pending_media_messages.items.len);
     try std.testing.expectEqualStrings("group-b", ch.pending_media_group_ids.items[0].?);
     try std.testing.expectEqual(@as(u64, now), ch.pending_media_received_at.items[0]);
+
+    ch.resetPendingMediaBuffers();
+    ch.pending_media_messages.deinit(alloc);
+    ch.pending_media_group_ids.deinit(alloc);
+    ch.pending_media_received_at.deinit(alloc);
+}
+
+test "telegram persistableUpdateOffset waits until pending media flushes" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    ch.last_update_id = 42;
+    try std.testing.expectEqual(@as(?i64, 42), ch.persistableUpdateOffset());
+
+    const now = root.nowEpochSecs();
+    try ch.pending_media_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "[FILE:/tmp/a.pdf]"),
+        .channel = "telegram",
+        .timestamp = now,
+    });
+    try ch.pending_media_group_ids.append(alloc, try alloc.dupe(u8, "group-a"));
+    try ch.pending_media_received_at.append(alloc, now);
+
+    try std.testing.expect(ch.persistableUpdateOffset() == null);
 
     ch.resetPendingMediaBuffers();
     ch.pending_media_messages.deinit(alloc);
