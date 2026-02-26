@@ -416,10 +416,16 @@ pub fn runTelegramLoop(
 
         if (tg_ptr.persistableUpdateOffset()) |persistable_update_id| {
             if (persistable_update_id > persisted_update_id) {
-                saveTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token, persistable_update_id) catch |err| {
-                    log.warn("failed to persist telegram update offset: {}", .{err});
+                const save_ok = blk: {
+                    saveTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token, persistable_update_id) catch |err| {
+                        log.warn("failed to persist telegram update offset: {}", .{err});
+                        break :blk false;
+                    };
+                    break :blk true;
                 };
-                persisted_update_id = persistable_update_id;
+                if (save_ok) {
+                    persisted_update_id = persistable_update_id;
+                }
             }
         }
 
