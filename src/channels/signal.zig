@@ -1,8 +1,8 @@
-//! Signal channel via signal-cli daemon HTTP/JSON-RPC.
+//! Signal channel via signal-cli REST API.
 //!
-//! Connects to a running `signal-cli daemon --http <host:port>`.
-//! Receives messages via SSE at `/api/v1/events` and sends via
-//! JSON-RPC at `/api/v1/rpc`.
+//! Connects to a running `signal-cli-rest-api` container (MODE=normal).
+//! Receives messages via WebSocket at `/v1/receive/{number}` and sends via
+//! REST POST to `/v2/send`.
 //!
 //! Config example (in config.json):
 //! ```json
@@ -36,7 +36,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
-const sse_client = @import("../sse_client.zig");
 const platform = @import("../platform.zig");
 
 const log = std.log.scoped(.signal);
@@ -64,13 +63,13 @@ pub fn signalGroupPeerId(reply_target: ?[]const u8) []const u8 {
 }
 
 /// Health check endpoint for the signal-cli daemon.
-const SIGNAL_HEALTH_ENDPOINT = "/api/v1/check";
+const SIGNAL_HEALTH_ENDPOINT = "/v1/health";
 
-/// JSON-RPC endpoint for sending messages.
-const SIGNAL_RPC_ENDPOINT = "/api/v1/rpc";
+/// REST endpoint for sending messages.
+const SIGNAL_SEND_ENDPOINT = "/v2/send";
 
-/// SSE endpoint for receiving messages.
-const SIGNAL_SSE_ENDPOINT = "/api/v1/events";
+/// WebSocket endpoint prefix for receiving messages.
+const SIGNAL_RECEIVE_ENDPOINT = "/v1/receive/";
 
 /// Maximum message length for Signal messages (signal-cli has no hard limit,
 /// but we chunk at 4096 to match typical messenger UX).
@@ -92,11 +91,10 @@ pub const RecipientTarget = union(enum) {
 // Signal Channel
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Signal channel — uses signal-cli daemon's native JSON-RPC + SSE API.
+/// Signal channel — uses signal-cli REST API.
 ///
-/// Sends messages via JSON-RPC POST to `/api/v1/rpc`.
-/// The SSE listener (for incoming messages) uses streaming HTTP for
-/// real-time message delivery.
+/// Sends messages via REST POST to `/v2/send`.
+/// Incoming messages are consumed over WebSocket at `/v1/receive/{number}`.
 pub const SignalChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
@@ -116,15 +114,13 @@ pub const SignalChannel = struct {
     ignore_attachments: bool,
     /// Skip story messages.
     ignore_stories: bool,
-    /// Persistent SSE connection for streaming message delivery.
+    /// Persistent WS connection for streaming message delivery.
     /// Initialized on first poll, maintained across polls for real-time delivery.
-    sse_conn: ?sse_client.SseConnection = null,
-    /// Buffer for accumulating SSE data between reads.
-    sse_buffer: std.ArrayListUnmanaged(u8) = .empty,
-    /// Backoff for reconnect attempts after SSE connect failures.
-    sse_retry_delay_secs: u64 = 2,
+    ws_conn: ?WsConnection = null,
+    /// Backoff for reconnect attempts after WS connect failures.
+    ws_retry_delay_secs: u64 = 2,
     /// Earliest wall-clock timestamp (seconds) for the next reconnect attempt.
-    sse_next_retry_at: i64 = 0,
+    ws_next_retry_at: i64 = 0,
 
     /// Typing indicator management (mirrors Discord implementation).
     typing_mu: std.Thread.Mutex = .{},
@@ -135,6 +131,217 @@ pub const SignalChannel = struct {
         target: []const u8,
         stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         thread: ?std.Thread = null,
+    };
+
+    const WS_READ_TIMEOUT_MS: i32 = 1000;
+    const WS_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+    const WsConnection = struct {
+        allocator: std.mem.Allocator,
+        stream: std.net.Stream,
+
+        fn connect(allocator: std.mem.Allocator, ws_url: []const u8) !WsConnection {
+            var host_buf: [512]u8 = undefined;
+            var path_buf: [1024]u8 = undefined;
+            const parts = try wsConnectParts(ws_url, &host_buf, &path_buf);
+
+            const addr_list = try std.net.getAddressList(allocator, parts.host, parts.port);
+            defer addr_list.deinit();
+            if (addr_list.addrs.len == 0) return error.WsConnectFailed;
+            const stream = try std.net.tcpConnectToAddress(addr_list.addrs[0]);
+            errdefer stream.close();
+
+            var key_raw: [16]u8 = undefined;
+            std.crypto.random.bytes(&key_raw);
+            var key_b64: [24]u8 = undefined;
+            _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
+
+            var req_buf: [4096]u8 = undefined;
+            var req_fbs = std.io.fixedBufferStream(&req_buf);
+            const req_w = req_fbs.writer();
+            try req_w.print("GET {s} HTTP/1.1\r\n", .{parts.path});
+            try req_w.print("Host: {s}:{d}\r\n", .{ parts.host, parts.port });
+            try req_w.writeAll("Upgrade: websocket\r\n");
+            try req_w.writeAll("Connection: Upgrade\r\n");
+            try req_w.print("Sec-WebSocket-Key: {s}\r\n", .{key_b64});
+            try req_w.writeAll("Sec-WebSocket-Version: 13\r\n");
+            try req_w.writeAll("\r\n");
+            try stream.writeAll(req_fbs.getWritten());
+
+            var resp_buf: [4096]u8 = undefined;
+            var resp_len: usize = 0;
+            while (resp_len < resp_buf.len) {
+                const n = stream.read(resp_buf[resp_len..]) catch return error.WsHandshakeFailed;
+                if (n == 0) return error.WsHandshakeFailed;
+                resp_len += n;
+                if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n") != null) break;
+            }
+            const resp = resp_buf[0..resp_len];
+            if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {
+                return error.WsHandshakeFailed;
+            }
+
+            const expected_accept = computeWsAcceptKey(&key_b64);
+            if (std.mem.indexOf(u8, resp, &expected_accept) == null) {
+                return error.WsHandshakeFailed;
+            }
+
+            return .{
+                .allocator = allocator,
+                .stream = stream,
+            };
+        }
+
+        fn deinit(self: *WsConnection) void {
+            self.stream.close();
+        }
+
+        fn waitReadable(self: *WsConnection, timeout_ms: i32) !bool {
+            var poll_fds = [_]std.posix.pollfd{
+                .{
+                    .fd = self.stream.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = undefined,
+                },
+            };
+            const events = std.posix.poll(&poll_fds, timeout_ms) catch return error.WsReadFailed;
+            if (events == 0) return false;
+            const revents = poll_fds[0].revents;
+            if (revents & std.posix.POLL.IN != 0) return true;
+            if (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+                return error.ConnectionClosed;
+            }
+            return false;
+        }
+
+        fn readExact(self: *WsConnection, out: []u8) !void {
+            var offset: usize = 0;
+            while (offset < out.len) {
+                const n = self.stream.read(out[offset..]) catch return error.WsReadFailed;
+                if (n == 0) return error.ConnectionClosed;
+                offset += n;
+            }
+        }
+
+        fn writeMaskedFrame(self: *WsConnection, opcode: u8, payload: []const u8) !void {
+            var header: [14]u8 = undefined;
+            var hlen: usize = 0;
+            header[0] = 0x80 | (opcode & 0x0F);
+            hlen += 1;
+
+            const plen = payload.len;
+            if (plen <= 125) {
+                header[1] = 0x80 | @as(u8, @intCast(plen));
+                hlen += 1;
+            } else if (plen <= 65535) {
+                header[1] = 0x80 | 126;
+                header[2] = @as(u8, @intCast((plen >> 8) & 0xFF));
+                header[3] = @as(u8, @intCast(plen & 0xFF));
+                hlen += 3;
+            } else {
+                header[1] = 0x80 | 127;
+                const p64: u64 = plen;
+                header[2] = @as(u8, @intCast((p64 >> 56) & 0xFF));
+                header[3] = @as(u8, @intCast((p64 >> 48) & 0xFF));
+                header[4] = @as(u8, @intCast((p64 >> 40) & 0xFF));
+                header[5] = @as(u8, @intCast((p64 >> 32) & 0xFF));
+                header[6] = @as(u8, @intCast((p64 >> 24) & 0xFF));
+                header[7] = @as(u8, @intCast((p64 >> 16) & 0xFF));
+                header[8] = @as(u8, @intCast((p64 >> 8) & 0xFF));
+                header[9] = @as(u8, @intCast(p64 & 0xFF));
+                hlen += 9;
+            }
+
+            var mask: [4]u8 = undefined;
+            std.crypto.random.bytes(&mask);
+            @memcpy(header[hlen..][0..4], &mask);
+            hlen += 4;
+
+            try self.stream.writeAll(header[0..hlen]);
+
+            var scratch: [1024]u8 = undefined;
+            var written: usize = 0;
+            while (written < plen) {
+                const chunk_len = @min(plen - written, scratch.len);
+                for (0..chunk_len) |i| {
+                    scratch[i] = payload[written + i] ^ mask[(written + i) % 4];
+                }
+                try self.stream.writeAll(scratch[0..chunk_len]);
+                written += chunk_len;
+            }
+        }
+
+        fn sendPong(self: *WsConnection, payload: []const u8) !void {
+            try self.writeMaskedFrame(0xA, payload);
+        }
+
+        /// Reads one complete text message.
+        /// Returns null when no bytes are currently available.
+        fn readTextMessage(self: *WsConnection, allocator: std.mem.Allocator, timeout_ms: i32) !?[]u8 {
+            if (!(try self.waitReadable(timeout_ms))) return null;
+
+            var message: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer message.deinit(allocator);
+            var started: bool = false;
+
+            while (true) {
+                var header: [2]u8 = undefined;
+                try self.readExact(&header);
+                const fin = (header[0] & 0x80) != 0;
+                const opcode = header[0] & 0x0F;
+                const masked = (header[1] & 0x80) != 0;
+                var payload_len: u64 = @as(u64, header[1] & 0x7F);
+
+                if (payload_len == 126) {
+                    var ext: [2]u8 = undefined;
+                    try self.readExact(&ext);
+                    payload_len = (@as(u64, ext[0]) << 8) | ext[1];
+                } else if (payload_len == 127) {
+                    var ext: [8]u8 = undefined;
+                    try self.readExact(&ext);
+                    payload_len = 0;
+                    for (ext) |b| payload_len = (payload_len << 8) | b;
+                }
+
+                if (payload_len > WS_MAX_MESSAGE_SIZE) return error.WsFrameTooLarge;
+
+                var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
+                if (masked) try self.readExact(&mask_key);
+
+                const plen: usize = @intCast(payload_len);
+                const payload = try allocator.alloc(u8, plen);
+                defer allocator.free(payload);
+                if (plen > 0) try self.readExact(payload);
+                if (masked and plen > 0) {
+                    for (payload, 0..) |*b, i| {
+                        b.* ^= mask_key[i % 4];
+                    }
+                }
+
+                switch (opcode) {
+                    0x8 => return error.ConnectionClosed,
+                    0x9 => {
+                        try self.sendPong(payload);
+                        continue;
+                    },
+                    0x1 => {
+                        started = true;
+                        try message.appendSlice(allocator, payload);
+                        if (message.items.len > WS_MAX_MESSAGE_SIZE) return error.WsFrameTooLarge;
+                        if (fin) return try message.toOwnedSlice(allocator);
+                    },
+                    0x0 => {
+                        if (!started) continue;
+                        try message.appendSlice(allocator, payload);
+                        if (message.items.len > WS_MAX_MESSAGE_SIZE) return error.WsFrameTooLarge;
+                        if (fin) return try message.toOwnedSlice(allocator);
+                    },
+                    else => {
+                        if (started and fin) return try message.toOwnedSlice(allocator);
+                    },
+                }
+            }
+        }
     };
 
     pub fn init(
@@ -179,30 +386,82 @@ pub const SignalChannel = struct {
 
     // ── URL Builders ────────────────────────────────────────────────
 
-    /// Build the JSON-RPC URL.
-    pub fn rpcUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
+    /// Build the REST send URL.
+    pub fn sendUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
         try w.writeAll(self.http_url);
-        try w.writeAll(SIGNAL_RPC_ENDPOINT);
+        try w.writeAll(SIGNAL_SEND_ENDPOINT);
         return fbs.getWritten();
     }
 
-    /// Build the SSE events URL (with account query param).
-    pub fn sseUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
+    /// Build the WebSocket receive URL.
+    pub fn receiveWsUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
-        try w.writeAll(self.http_url);
-        try w.writeAll(SIGNAL_SSE_ENDPOINT);
-        try w.writeAll("?account=");
-        for (self.account) |c| {
-            if (c == '+') {
-                try w.writeAll("%2B");
-            } else {
-                try w.writeByte(c);
-            }
-        }
+        const scheme = if (std.mem.startsWith(u8, self.http_url, "https://")) "wss://" else "ws://";
+        try w.writeAll(scheme);
+        const host_with_port = if (std.mem.startsWith(u8, self.http_url, "https://"))
+            self.http_url["https://".len..]
+        else if (std.mem.startsWith(u8, self.http_url, "http://"))
+            self.http_url["http://".len..]
+        else
+            self.http_url;
+        try w.writeAll(host_with_port);
+        try w.writeAll(SIGNAL_RECEIVE_ENDPOINT);
+        try w.writeAll(self.account);
         return fbs.getWritten();
+    }
+
+    fn uriComponentAsSlice(component: std.Uri.Component) []const u8 {
+        return switch (component) {
+            .raw => |v| v,
+            .percent_encoded => |v| v,
+        };
+    }
+
+    fn wsConnectParts(
+        ws_url: []const u8,
+        host_buf: []u8,
+        path_buf: []u8,
+    ) !struct { host: []const u8, port: u16, path: []const u8 } {
+        const uri = std.Uri.parse(ws_url) catch return error.InvalidSignalWsUrl;
+        const is_secure = std.ascii.eqlIgnoreCase(uri.scheme, "wss");
+        if (!is_secure and !std.ascii.eqlIgnoreCase(uri.scheme, "ws")) return error.InvalidSignalWsUrl;
+
+        const host = uri.getHost(host_buf) catch return error.InvalidSignalWsUrl;
+        const port: u16 = uri.port orelse (if (is_secure) @as(u16, 443) else @as(u16, 80));
+        const raw_path = uriComponentAsSlice(uri.path);
+        const query = if (uri.query) |q| uriComponentAsSlice(q) else "";
+
+        var fbs = std.io.fixedBufferStream(path_buf);
+        const w = fbs.writer();
+        if (raw_path.len == 0) {
+            try w.writeByte('/');
+        } else {
+            if (raw_path[0] != '/') try w.writeByte('/');
+            try w.writeAll(raw_path);
+        }
+        if (query.len > 0) {
+            try w.writeByte('?');
+            try w.writeAll(query);
+        }
+        return .{
+            .host = host,
+            .port = port,
+            .path = fbs.getWritten(),
+        };
+    }
+
+    fn computeWsAcceptKey(key_b64: []const u8) [28]u8 {
+        var sha1 = std.crypto.hash.Sha1.init(.{});
+        sha1.update(key_b64);
+        sha1.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+        sha1.final(&digest);
+        var result: [28]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&result, &digest);
+        return result;
     }
 
     /// Build the health check URL.
@@ -363,126 +622,94 @@ pub const SignalChannel = struct {
         return msg;
     }
 
-    // ── JSON-RPC Attachment Fetch ───────────────────────────────────
+    // ── REST Attachment Fetch ────────────────────────────────────────
 
-    /// Fetch an attachment from the signal-cli daemon via JSON-RPC.
+    /// Fetch an attachment from the signal-cli daemon via REST GET.
     /// Returns absolute path to a saved temp file.
     pub fn fetchAttachmentLocally(self: *const SignalChannel, allocator: std.mem.Allocator, attachment_id: []const u8, is_group: bool, target_id: []const u8) !?[]const u8 {
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer body.deinit(allocator);
+        _ = is_group;
+        _ = target_id;
 
-        try body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"getAttachment\",\"params\":{\"id\":");
-        try root.json_util.appendJsonString(&body, allocator, attachment_id);
+        // Build URL: <base>/v1/attachments/<id>
+        var url_body: std.ArrayListUnmanaged(u8) = .empty;
+        defer url_body.deinit(allocator);
+        try url_body.appendSlice(allocator, self.http_url);
+        try url_body.appendSlice(allocator, "/v1/attachments/");
+        try url_body.appendSlice(allocator, attachment_id);
 
-        if (is_group) {
-            try body.appendSlice(allocator, ",\"groupId\":");
-            try root.json_util.appendJsonString(&body, allocator, target_id);
-        } else {
-            try body.appendSlice(allocator, ",\"recipient\":");
-            try root.json_util.appendJsonString(&body, allocator, target_id);
-        }
+        const url = try allocator.dupe(u8, url_body.items);
+        defer allocator.free(url);
 
-        try body.appendSlice(allocator, ",\"account\":");
-        try root.json_util.appendJsonString(&body, allocator, self.account);
-        try body.appendSlice(allocator, "},\"id\":\"2\"}");
-
-        var url_buf: [1024]u8 = undefined;
-        const url = try self.rpcUrl(&url_buf);
-
-        const rpc_body = try body.toOwnedSlice(allocator);
-        defer allocator.free(rpc_body);
-
-        const resp = root.http_util.curlPost(allocator, url, rpc_body, &.{}) catch |err| {
+        const resp = root.http_util.curlGet(allocator, url, &.{}, "30") catch |err| {
             log.warn("Signal fetch attachment {s} failed: {}", .{ attachment_id, err });
             return null;
         };
         defer allocator.free(resp);
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
-        defer parsed.deinit();
-
-        if (parsed.value != .object) return null;
-        const result = parsed.value.object.get("result") orelse {
-            if (parsed.value.object.get("error")) |err_val| {
-                log.warn("Signal fetch attachment error: {}", .{err_val});
-            }
-            return null;
-        };
-        if (result != .object) return null;
-        const data_str = result.object.get("data") orelse return null;
-        if (data_str != .string) return null;
-
-        const base64_data = data_str.string;
-        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(base64_data);
-        const decoded = try allocator.alloc(u8, decoded_len);
-        defer allocator.free(decoded);
-        try std.base64.standard.Decoder.decode(decoded, base64_data);
-
         // Generate temp file
-        var rand = std.crypto.random;
+        const rand = std.crypto.random;
         const rand_id = rand.int(u64);
         var path_buf: [1024]u8 = undefined;
         const local_path = try std.fmt.bufPrint(&path_buf, "/tmp/signal_{x}.dat", .{rand_id});
 
         var file = std.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
         defer file.close();
-        try file.writeAll(decoded);
+        try file.writeAll(resp);
 
         return try allocator.dupe(u8, local_path);
     }
 
-    // ── JSON-RPC Send ───────────────────────────────────────────────
+    // ── REST Send ───────────────────────────────────────────────────
 
-    /// Build JSON-RPC body for a send or sendTyping call.
+    /// Build REST JSON body for the `/v2/send` endpoint.
     ///
     /// Returns caller-owned JSON body string.
-    /// If attachments is non-empty, includes them in the JSON-RPC params.
-    pub fn buildRpcBody(
+    /// For direct targets: `"recipients":["+number"]`
+    /// For group targets: `"recipients":["group.<id>"]`
+    /// Attachments are passed as base64 strings in `"base64_attachments"`.
+    pub fn buildRestBody(
         self: *const SignalChannel,
         allocator: std.mem.Allocator,
-        method: []const u8,
         target: RecipientTarget,
         message: ?[]const u8,
-        attachments: []const []const u8,
+        base64_attachments: []const []const u8,
     ) ![]u8 {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         errdefer body.deinit(allocator);
 
-        try body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"method\":");
-        try root.json_util.appendJsonString(&body, allocator, method);
+        try body.appendSlice(allocator, "{\"number\":");
+        try root.json_util.appendJsonString(&body, allocator, self.account);
 
-        try body.appendSlice(allocator, ",\"params\":{");
-
+        try body.appendSlice(allocator, ",\"recipients\":[");
         switch (target) {
             .direct => |id| {
-                try body.appendSlice(allocator, "\"recipient\":[");
                 try root.json_util.appendJsonString(&body, allocator, id);
-                try body.appendSlice(allocator, "]");
             },
             .group => |group_id| {
-                try body.appendSlice(allocator, "\"groupId\":");
-                try root.json_util.appendJsonString(&body, allocator, group_id);
+                // REST API uses "group.<id>" prefix for group recipients
+                try body.appendSlice(allocator, "\"group.");
+                // Append group_id chars (already safe base64/hex), then close quote
+                try body.appendSlice(allocator, group_id);
+                try body.appendSlice(allocator, "\"");
             },
         }
-
-        try body.appendSlice(allocator, ",\"account\":");
-        try root.json_util.appendJsonString(&body, allocator, self.account);
+        try body.appendSlice(allocator, "]");
 
         if (message) |msg| {
             try body.appendSlice(allocator, ",\"message\":");
             try root.json_util.appendJsonString(&body, allocator, msg);
         }
 
-        if (attachments.len > 0) {
-            try body.appendSlice(allocator, ",\"attachments\":[");
-            for (attachments, 0..) |att, i| {
+        if (base64_attachments.len > 0) {
+            try body.appendSlice(allocator, ",\"base64_attachments\":[");
+            for (base64_attachments, 0..) |att, i| {
                 if (i > 0) try body.appendSlice(allocator, ",");
                 try root.json_util.appendJsonString(&body, allocator, att);
             }
             try body.appendSlice(allocator, "]");
         }
 
-        try body.appendSlice(allocator, "},\"id\":\"1\"}");
+        try body.appendSlice(allocator, "}");
 
         return try body.toOwnedSlice(allocator);
     }
@@ -667,26 +894,47 @@ pub const SignalChannel = struct {
         return try payloads.toOwnedSlice(allocator);
     }
 
-    fn sendRpcPayload(
+    fn sendRestPayload(
         self: *SignalChannel,
         target: RecipientTarget,
         message: ?[]const u8,
         attachments: []const []const u8,
     ) !void {
-        const rpc_body = try self.buildRpcBody(self.allocator, "send", target, message, attachments);
-        defer self.allocator.free(rpc_body);
+        // Read attachment files from disk and base64-encode them.
+        var b64_attachments: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (b64_attachments.items) |b| self.allocator.free(b);
+            b64_attachments.deinit(self.allocator);
+        }
+
+        for (attachments) |path| {
+            const file_data = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch |err| {
+                log.warn("Signal: failed to read attachment {s}: {}", .{ path, err });
+                continue;
+            };
+            defer self.allocator.free(file_data);
+
+            const encoded_len = std.base64.standard.Encoder.calcSize(file_data.len);
+            const encoded = try self.allocator.alloc(u8, encoded_len);
+            errdefer self.allocator.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, file_data);
+            try b64_attachments.append(self.allocator, encoded);
+        }
+
+        const rest_body = try self.buildRestBody(self.allocator, target, message, b64_attachments.items);
+        defer self.allocator.free(rest_body);
 
         var url_buf: [1024]u8 = undefined;
-        const url = try self.rpcUrl(&url_buf);
+        const url = try self.sendUrl(&url_buf);
 
-        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
-            log.warn("Signal RPC send failed: {}", .{err});
+        const resp = root.http_util.curlPost(self.allocator, url, rest_body, &.{}) catch |err| {
+            log.warn("Signal REST send failed: {}", .{err});
             return err;
         };
         self.allocator.free(resp);
     }
 
-    /// Send a message via JSON-RPC to the signal-cli daemon.
+    /// Send a message via REST POST to the signal-cli daemon.
     /// Parses [IMAGE:path] markers from message text and sends as attachments.
     pub fn sendMessage(self: *SignalChannel, target_str: []const u8, message: []const u8, media: []const []const u8) !void {
         if (builtin.is_test) return;
@@ -703,23 +951,14 @@ pub const SignalChannel = struct {
                 prepared.attachments[idx .. idx + 1]
             else
                 &.{};
-            try self.sendRpcPayload(target, payload.message, attachments);
+            try self.sendRestPayload(target, payload.message, attachments);
         }
     }
 
-    /// Send a typing indicator (best-effort, errors ignored).
+    /// Send a typing indicator (no-op — REST API has no typing endpoint).
     pub fn sendTypingIndicator(self: *SignalChannel, target_str: []const u8) void {
-        if (builtin.is_test) return;
-
-        const target = parseRecipientTarget(target_str);
-        const rpc_body = self.buildRpcBody(self.allocator, "sendTyping", target, null, &.{}) catch return;
-        defer self.allocator.free(rpc_body);
-
-        var url_buf: [1024]u8 = undefined;
-        const url = self.rpcUrl(&url_buf) catch return;
-
-        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch return;
-        self.allocator.free(resp);
+        _ = self;
+        _ = target_str;
     }
 
     pub fn startTyping(self: *SignalChannel, target: []const u8) !void {
@@ -811,30 +1050,7 @@ pub const SignalChannel = struct {
         return true;
     }
 
-    // ── SSE Message Polling ─────────────────────────────────────────
-
-    const EventBoundary = struct {
-        end: usize,
-        next: usize,
-    };
-
-    fn nextEventBoundary(buffer: []const u8, start: usize) ?EventBoundary {
-        const lf_idx = std.mem.indexOfPos(u8, buffer, start, "\n\n");
-        const crlf_idx = std.mem.indexOfPos(u8, buffer, start, "\r\n\r\n");
-        if (lf_idx == null and crlf_idx == null) return null;
-
-        if (crlf_idx != null and (lf_idx == null or crlf_idx.? < lf_idx.?)) {
-            return .{
-                .end = crlf_idx.?,
-                .next = crlf_idx.? + 4,
-            };
-        }
-
-        return .{
-            .end = lf_idx.?,
-            .next = lf_idx.? + 2,
-        };
-    }
+    // ── WebSocket Message Polling ───────────────────────────────────
 
     fn parseSSEEnvelope(self: *const SignalChannel, allocator: std.mem.Allocator, envelope_json: []const u8) !?root.ChannelMessage {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, envelope_json, .{}) catch return null;
@@ -918,65 +1134,49 @@ pub const SignalChannel = struct {
         );
     }
 
-    /// Poll for messages using SSE (Server-Sent Events).
-    /// Uses persistent streaming HTTP connection for real-time delivery.
+    fn appendReceivedEnvelope(
+        self: *SignalChannel,
+        allocator: std.mem.Allocator,
+        messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+        envelope_json: []const u8,
+    ) !void {
+        if (self.parseSSEEnvelope(allocator, envelope_json)) |msg_opt| {
+            if (msg_opt) |msg| {
+                log.debug("Received message from {s} on signal ({d} chars) timestamp={d}", .{ msg.sender, msg.content.len, msg.timestamp });
+                try messages.append(allocator, msg);
+            }
+        } else |_| {}
+    }
+
+    /// Poll for messages using a persistent WebSocket connection.
     /// Returns a slice of ChannelMessages allocated on the given allocator.
     pub fn pollMessages(self: *SignalChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
         if (builtin.is_test) return &.{};
 
-        // Initialize SSE connection on first poll.
+        // Initialize WS connection on first poll.
         // Retry is rate-limited with backoff, but each poll call stays bounded.
-        if (self.sse_conn == null) {
+        if (self.ws_conn == null) {
             const now = std.time.timestamp();
-            if (now < self.sse_next_retry_at) return &.{};
+            if (now < self.ws_next_retry_at) return &.{};
 
             var url_buf: [1024]u8 = undefined;
-            const url = try self.sseUrl(&url_buf);
+            const url = try self.receiveWsUrl(&url_buf);
 
-            self.sse_conn = sse_client.SseConnection.init(self.allocator, url);
-            const status = self.sse_conn.?.connect() catch |err| {
-                log.warn("SSE connect failed: {}, retrying in {}s", .{ err, self.sse_retry_delay_secs });
-                if (self.sse_conn) |*conn| {
-                    conn.deinit();
-                    self.sse_conn = null;
-                }
-                self.sse_next_retry_at = now + @as(i64, @intCast(self.sse_retry_delay_secs));
-                self.sse_retry_delay_secs = @min(self.sse_retry_delay_secs * 2, 60);
+            self.ws_conn = WsConnection.connect(self.allocator, url) catch |err| {
+                log.warn("Signal WS connect failed: {}, retrying in {}s", .{ err, self.ws_retry_delay_secs });
+                self.ws_next_retry_at = now + @as(i64, @intCast(self.ws_retry_delay_secs));
+                self.ws_retry_delay_secs = @min(self.ws_retry_delay_secs * 2, 60);
                 return &.{};
             };
-            self.sse_retry_delay_secs = 2;
-            self.sse_next_retry_at = 0;
-            log.info("Signal SSE connected (status: {d})", .{status});
+            self.ws_retry_delay_secs = 2;
+            self.ws_next_retry_at = 0;
+            log.info("Signal WS connected ({s})", .{url});
         }
 
-        if (self.sse_conn == null) {
+        if (self.ws_conn == null) {
             return &.{};
         }
 
-        // Read from the streaming connection.
-        var read_buf: [8192]u8 = undefined;
-        const bytes_read = self.sse_conn.?.read(&read_buf) catch |err| {
-            // Connection lost or read error, reset and return empty to trigger reconnect.
-            log.warn("SSE read error: {}, reconnecting...", .{err});
-            if (self.sse_conn) |*conn| {
-                conn.deinit();
-                self.sse_conn = null;
-            }
-            self.sse_next_retry_at = 0;
-            self.sse_buffer.clearRetainingCapacity();
-            return &.{};
-        };
-
-        if (bytes_read == 0) {
-            // No data available right now - this is normal for streaming SSE
-            // Don't close the connection, just return empty and poll again later
-            return &.{};
-        }
-
-        // Append new data to buffer.
-        try self.sse_buffer.appendSlice(self.allocator, read_buf[0..bytes_read]);
-
-        // Parse SSE events from buffer
         var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
         errdefer {
             for (messages.items) |*msg| {
@@ -985,44 +1185,34 @@ pub const SignalChannel = struct {
             messages.deinit(allocator);
         }
 
-        // Parse SSE format: events separated by LF-LF or CRLF-CRLF.
-        var event_start: usize = 0;
-        while (event_start < self.sse_buffer.items.len) {
-            const boundary = nextEventBoundary(self.sse_buffer.items, event_start) orelse break;
-            const event_data = self.sse_buffer.items[event_start..boundary.end];
-
-            // Parse all data: lines in the event (supports multiline JSON payloads).
-            {
-                const events = try sse_client.parseEvents(self.allocator, event_data);
-                defer {
-                    for (events) |*event| event.deinit(self.allocator);
-                    self.allocator.free(events);
-                }
-
-                for (events) |event| {
-                    if (self.parseSSEEnvelope(allocator, event.data)) |msg_opt| {
-                        if (msg_opt) |msg| {
-                            log.debug("Received message from {s} on signal ({d} chars) timestamp={d}", .{ msg.sender, msg.content.len, msg.timestamp });
-                            try messages.append(allocator, msg);
-                        }
-                    } else |_| {}
-                }
+        const first_payload = self.ws_conn.?.readTextMessage(self.allocator, WS_READ_TIMEOUT_MS) catch |err| {
+            log.warn("Signal WS read error: {}, reconnecting...", .{err});
+            if (self.ws_conn) |*conn| {
+                conn.deinit();
+                self.ws_conn = null;
             }
+            self.ws_next_retry_at = 0;
+            return &.{};
+        };
+        if (first_payload == null) return &.{};
 
-            // Move past this event delimiter.
-            event_start = boundary.next;
-        }
+        try self.appendReceivedEnvelope(allocator, &messages, first_payload.?);
+        self.allocator.free(first_payload.?);
 
-        // Remove processed data from buffer.
-        if (event_start > 0) {
-            const remaining = self.sse_buffer.items[event_start..];
-            std.mem.copyForwards(u8, self.sse_buffer.items[0..remaining.len], remaining);
-            self.sse_buffer.items.len = remaining.len;
-        }
-
-        // Prevent unbounded growth if the stream keeps sending malformed/incomplete frames.
-        if (messages.items.len == 0 and self.sse_buffer.items.len > 65536) {
-            self.sse_buffer.clearRetainingCapacity();
+        // Drain additional queued frames without blocking.
+        while (true) {
+            const maybe_payload = self.ws_conn.?.readTextMessage(self.allocator, 0) catch |err| {
+                log.warn("Signal WS drain error: {}, reconnecting...", .{err});
+                if (self.ws_conn) |*conn| {
+                    conn.deinit();
+                    self.ws_conn = null;
+                }
+                self.ws_next_retry_at = 0;
+                break;
+            };
+            if (maybe_payload == null) break;
+            defer self.allocator.free(maybe_payload.?);
+            try self.appendReceivedEnvelope(allocator, &messages, maybe_payload.?);
         }
 
         return try messages.toOwnedSlice(allocator);
@@ -1046,16 +1236,14 @@ pub const SignalChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *SignalChannel = @ptrCast(@alignCast(ptr));
-        // Clean up SSE connection
-        if (self.sse_conn) |*conn| {
+        // Clean up WS connection
+        if (self.ws_conn) |*conn| {
             conn.deinit();
-            self.sse_conn = null;
+            self.ws_conn = null;
         }
         // Reset retry state.
-        self.sse_retry_delay_secs = 2;
-        self.sse_next_retry_at = 0;
-        // Clean up SSE buffer
-        self.sse_buffer.deinit(self.allocator);
+        self.ws_retry_delay_secs = 2;
+        self.ws_next_retry_at = 0;
         // Clean up typing indicator threads
         self.stopAllTyping();
     }
@@ -1552,7 +1740,7 @@ test "reply target group" {
 
 // ── URL Builder Tests ───────────────────────────────────────────────
 
-test "rpc url built correctly" {
+test "send url built correctly" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1563,11 +1751,11 @@ test "rpc url built correctly" {
         true,
     );
     var buf: [1024]u8 = undefined;
-    const url = try ch.rpcUrl(&buf);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8686/api/v1/rpc", url);
+    const url = try ch.sendUrl(&buf);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8686/v2/send", url);
 }
 
-test "sse url built correctly" {
+test "receive websocket url built correctly" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1578,8 +1766,8 @@ test "sse url built correctly" {
         true,
     );
     var buf: [1024]u8 = undefined;
-    const url = try ch.sseUrl(&buf);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8686/api/v1/events?account=%2B1234567890", url);
+    const url = try ch.receiveWsUrl(&buf);
+    try std.testing.expectEqualStrings("ws://127.0.0.1:8686/v1/receive/+1234567890", url);
 }
 
 test "health url built correctly" {
@@ -1594,12 +1782,12 @@ test "health url built correctly" {
     );
     var buf: [1024]u8 = undefined;
     const url = try ch.healthUrl(&buf);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8686/api/v1/check", url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8686/v1/health", url);
 }
 
-// ── JSON-RPC Body Tests ─────────────────────────────────────────────
+// ── REST Body Tests ─────────────────────────────────────────────────
 
-test "build rpc body direct with message" {
+test "build rest body direct with message" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1609,19 +1797,19 @@ test "build rpc body direct with message" {
         true,
         true,
     );
-    const body = try ch.buildRpcBody(std.testing.allocator, "send", .{ .direct = "+5555555555" }, "Hello!", &.{});
+    const body = try ch.buildRestBody(std.testing.allocator, .{ .direct = "+5555555555" }, "Hello!", &.{});
     defer std.testing.allocator.free(body);
-    // Verify key fields are present.
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"jsonrpc\":\"2.0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"method\":\"send\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipient\":[\"+5555555555\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"account\":\"+1234567890\"") != null);
+    // Verify REST fields are present.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"+5555555555\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\":\"Hello!\"") != null);
-    // Direct targets must NOT include groupId.
+    // Must NOT contain JSON-RPC fields.
+    try std.testing.expect(std.mem.indexOf(u8, body, "jsonrpc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"method\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "groupId") == null);
 }
 
-test "build rpc body direct without message" {
+test "build rest body direct without message" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1631,10 +1819,10 @@ test "build rpc body direct without message" {
         true,
         true,
     );
-    const body = try ch.buildRpcBody(std.testing.allocator, "sendTyping", .{ .direct = "+5555555555" }, null, &.{});
+    const body = try ch.buildRestBody(std.testing.allocator, .{ .direct = "+5555555555" }, null, &.{});
     defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipient\":[\"+5555555555\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"account\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"+5555555555\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
     // No message key should be present.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\"") == null);
 }
@@ -1654,7 +1842,7 @@ test "signal startTyping and stopTyping are safe in tests" {
     try ch.stopTyping("+15551234567");
 }
 
-test "build rpc body group with message" {
+test "build rest body group with message" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1664,16 +1852,14 @@ test "build rpc body group with message" {
         true,
         true,
     );
-    const body = try ch.buildRpcBody(std.testing.allocator, "send", .{ .group = "abc123" }, "Group msg", &.{});
+    const body = try ch.buildRestBody(std.testing.allocator, .{ .group = "abc123" }, "Group msg", &.{});
     defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"groupId\":\"abc123\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"account\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"group.abc123\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\":\"Group msg\"") != null);
-    // Group targets must NOT include recipient.
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipient\"") == null);
 }
 
-test "build rpc body group without message" {
+test "build rest body group without message" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1683,14 +1869,14 @@ test "build rpc body group without message" {
         true,
         true,
     );
-    const body = try ch.buildRpcBody(std.testing.allocator, "sendTyping", .{ .group = "abc123" }, null, &.{});
+    const body = try ch.buildRestBody(std.testing.allocator, .{ .group = "abc123" }, null, &.{});
     defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"groupId\":\"abc123\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"account\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"group.abc123\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\"") == null);
 }
 
-test "build rpc body uuid direct target" {
+test "build rest body uuid direct target" {
     const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
     const ch = SignalChannel.init(
         std.testing.allocator,
@@ -1701,14 +1887,14 @@ test "build rpc body uuid direct target" {
         true,
         true,
     );
-    const body = try ch.buildRpcBody(std.testing.allocator, "send", .{ .direct = uuid }, "hi", &.{});
+    const body = try ch.buildRestBody(std.testing.allocator, .{ .direct = uuid }, "hi", &.{});
     defer std.testing.allocator.free(body);
-    // Verify UUID is in recipient array.
-    const expected = "\"recipient\":[\"" ++ uuid ++ "\"]";
+    // Verify UUID is in recipients array.
+    const expected = "\"recipients\":[\"" ++ uuid ++ "\"]";
     try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
 }
 
-test "build rpc body with attachments" {
+test "build rest body with base64 attachments" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1718,18 +1904,18 @@ test "build rpc body with attachments" {
         true,
         true,
     );
-    const attachments = &[_][]const u8{ "/path/to/image.png", "/path/to/doc.pdf" };
-    const body = try ch.buildRpcBody(std.testing.allocator, "send", .{ .direct = "+5555555555" }, "Check this!", attachments);
+    const attachments = &[_][]const u8{ "aGVsbG8=", "d29ybGQ=" };
+    const body = try ch.buildRestBody(std.testing.allocator, .{ .direct = "+5555555555" }, "Check this!", attachments);
     defer std.testing.allocator.free(body);
-    // Verify attachments array is present.
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"attachments\":[\"/path/to/image.png\",\"/path/to/doc.pdf\"]") != null);
+    // Verify base64_attachments array is present.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"base64_attachments\":[\"aGVsbG8=\",\"d29ybGQ=\"]") != null);
     // Verify message is still present.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\":\"Check this!\"") != null);
-    // Verify recipient is present.
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipient\":[\"+5555555555\"]") != null);
+    // Verify recipients is present.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"+5555555555\"]") != null);
 }
 
-test "build rpc body with single attachment" {
+test "build rest body with single base64 attachment" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -1739,10 +1925,10 @@ test "build rpc body with single attachment" {
         true,
         true,
     );
-    const attachments = &[_][]const u8{"/tmp/photo.jpg"};
-    const body = try ch.buildRpcBody(std.testing.allocator, "send", .{ .direct = "+5555555555" }, "Photo!", attachments);
+    const attachments = &[_][]const u8{"cGhvdG8="};
+    const body = try ch.buildRestBody(std.testing.allocator, .{ .direct = "+5555555555" }, "Photo!", attachments);
     defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"attachments\":[\"/tmp/photo.jpg\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"base64_attachments\":[\"cGhvdG8=\"]") != null);
 }
 
 test "parse image markers extracts paths and strips markers from text" {
@@ -2800,7 +2986,7 @@ test "parseSSEEnvelope returns owned message content" {
         \\    "sourceNumber": "+1111111111",
         \\    "timestamp": 1700000000,
         \\    "dataMessage": {
-        \\      "message": "hello from sse",
+        \\      "message": "hello from signal ws",
         \\      "timestamp": 1700000001
         \\    }
         \\  }
@@ -2819,54 +3005,36 @@ test "parseSSEEnvelope returns owned message content" {
     defer std.testing.allocator.free(churn);
     @memset(churn, 'z');
 
-    try std.testing.expectEqualStrings("hello from sse", msg.content);
+    try std.testing.expectEqualStrings("hello from signal ws", msg.content);
     try std.testing.expectEqualStrings("+1111111111", msg.sender);
 }
 
-test "nextEventBoundary handles lf and crlf delimiters" {
-    const lf_data = "data: one\n\nrest";
-    const lf_boundary = SignalChannel.nextEventBoundary(lf_data, 0).?;
-    try std.testing.expectEqual(@as(usize, 9), lf_boundary.end);
-    try std.testing.expectEqual(@as(usize, 11), lf_boundary.next);
-
-    const crlf_data = "data: two\r\n\r\nrest";
-    const crlf_boundary = SignalChannel.nextEventBoundary(crlf_data, 0).?;
-    try std.testing.expectEqual(@as(usize, 9), crlf_boundary.end);
-    try std.testing.expectEqual(@as(usize, 13), crlf_boundary.next);
-}
-
-test "parseSSEEnvelope accepts multiline SSE data payload" {
-    const users = [_][]const u8{"*"};
+test "receive websocket url uses wss for https base" {
     const ch = SignalChannel.init(
         std.testing.allocator,
-        "http://127.0.0.1:8686",
+        "https://signal.example.com:8443",
         "+1234567890",
-        &users,
+        &.{},
         &.{},
         true,
         true,
     );
+    var buf: [1024]u8 = undefined;
+    const url = try ch.receiveWsUrl(&buf);
+    try std.testing.expectEqualStrings("wss://signal.example.com:8443/v1/receive/+1234567890", url);
+}
 
-    const event_payload =
-        \\event: message
-        \\data: {"envelope":{"source":"+1111111111","sourceNumber":"+1111111111","timestamp":1700000000,
-        \\data: "dataMessage":{"message":"hello multiline","timestamp":1700000001}}}
-        \\
-    ;
-
-    const events = try sse_client.parseEvents(std.testing.allocator, event_payload);
-    defer {
-        for (events) |*event| event.deinit(std.testing.allocator);
-        std.testing.allocator.free(events);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), events.len);
-    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, events[0].data);
-    try std.testing.expect(msg_opt != null);
-    const msg = msg_opt.?;
-    defer msg.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("hello multiline", msg.content);
-    try std.testing.expectEqualStrings("+1111111111", msg.sender);
+test "ws connect parts parses host port and path" {
+    var host_buf: [256]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    const parts = try SignalChannel.wsConnectParts(
+        "ws://127.0.0.1:8080/v1/receive/+1234567890",
+        &host_buf,
+        &path_buf,
+    );
+    try std.testing.expectEqualStrings("127.0.0.1", parts.host);
+    try std.testing.expectEqual(@as(u16, 8080), parts.port);
+    try std.testing.expectEqualStrings("/v1/receive/+1234567890", parts.path);
 }
 
 // ── Vtable Tests ────────────────────────────────────────────────────
