@@ -129,7 +129,20 @@ pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");
 pub const maixcam = @import("maixcam.zig");
 pub const signal = @import("signal.zig");
-pub const web = @import("web.zig");
+pub const web = if (@import("build_options").enable_channel_web)
+    @import("web.zig")
+else
+    struct {
+        pub const WebChannel = struct {
+            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
+                return .{};
+            }
+            pub fn channel(_: *@This()) Channel {
+                unreachable;
+            }
+            pub fn setBus(_: *@This(), _: anytype) void {}
+        };
+    };
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
