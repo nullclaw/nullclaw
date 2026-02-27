@@ -1118,6 +1118,12 @@ pub const WebChannel = struct {
             };
 
             if (e2e_obj) |encrypted_obj| {
+                if (eventStringField(encrypted_obj, "alg")) |alg| {
+                    if (!std.mem.eql(u8, alg, E2E_ALG)) {
+                        self.sendRelayError(session_id, request_id, "unsupported_e2e_alg", "payload.e2e.alg is not supported");
+                        return;
+                    }
+                }
                 const e2e_session = self.e2eSessionByClient(verified.sub) orelse {
                     self.sendRelayError(session_id, request_id, "e2e_not_initialized", "no e2e session is bound to this UI token");
                     return;
