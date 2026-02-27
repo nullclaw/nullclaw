@@ -923,7 +923,7 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
     {
         const f = try tmp.dir.createFile("HEARTBEAT.md", .{ .truncate = true });
         defer f.close();
-        try f.writeAll("- check-2");
+        try f.writeAll("- check-2-updated");
     }
 
     const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
@@ -948,7 +948,7 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
     {
         const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
         defer f.close();
-        try f.writeAll("- **Name:** v2");
+        try f.writeAll("- **Name:** v2-updated");
     }
 
     const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
@@ -998,7 +998,7 @@ test "workspacePromptFingerprint changes when USER.md changes" {
     {
         const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
         defer f.close();
-        try f.writeAll("- **Name:** v2");
+        try f.writeAll("- **Name:** v2-updated");
     }
 
     const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
