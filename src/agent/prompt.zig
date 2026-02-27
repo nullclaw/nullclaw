@@ -165,6 +165,7 @@ fn buildIdentitySection(
 ) !void {
     try w.writeAll("## Project Context\n\n");
     try w.writeAll("The following workspace files define your identity, behavior, and context.\n\n");
+    try w.writeAll("If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.\n\n");
 
     const identity_files = [_][]const u8{
         "AGENTS.md",
@@ -182,6 +183,30 @@ fn buildIdentitySection(
 
     // Inject MEMORY.md if present, otherwise fallback to memory.md.
     try injectPreferredMemoryFile(allocator, w, workspace_dir);
+}
+
+test "buildSystemPrompt includes SOUL persona guidance" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll("Persona baseline");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.") != null);
 }
 
 fn buildToolsSection(w: anytype, tools: []const Tool) !void {
