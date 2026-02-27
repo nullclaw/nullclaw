@@ -127,7 +127,7 @@ pub const Config = struct {
     gateway_host: []const u8 = "127.0.0.1",
     gateway_port: u16 = 3000,
     workspace_only: bool = true,
-    max_actions_per_hour: u32 = 20,
+    max_actions_per_hour: u32 = 1000,
 
     allocator: std.mem.Allocator,
     arena: ?*std.heap.ArenaAllocator = null,
