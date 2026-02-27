@@ -4,6 +4,7 @@
 //! passed by the caller; no dependency on the Agent struct.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
@@ -446,18 +447,40 @@ fn extractSections(
     return try combined.toOwnedSlice(allocator);
 }
 
+fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    if (path.len == prefix.len) return true;
+    if (prefix.len > 0 and (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\')) return true;
+    const c = path[prefix.len];
+    return c == '/' or c == '\\';
+}
+
+fn openWorkspaceAgentsFileGuarded(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) ?std.fs.File {
+    const workspace_root = std.fs.cwd().realpathAlloc(allocator, workspace_dir) catch return null;
+    defer allocator.free(workspace_root);
+
+    const agents_candidate = std.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
+    defer allocator.free(agents_candidate);
+
+    const agents_canonical = std.fs.cwd().realpathAlloc(allocator, agents_candidate) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return null,
+    };
+    defer allocator.free(agents_canonical);
+
+    if (!pathStartsWith(agents_canonical, workspace_root)) return null;
+    return std.fs.openFileAbsolute(agents_canonical, .{}) catch null;
+}
+
 fn readWorkspaceContextForSummary(
     allocator: std.mem.Allocator,
     workspace_dir: ?[]const u8,
 ) ![]u8 {
     const dir = workspace_dir orelse return try allocator.dupe(u8, "");
-    const agents_path = std.fs.path.join(allocator, &.{ dir, "AGENTS.md" }) catch return try allocator.dupe(u8, "");
-    defer allocator.free(agents_path);
-
-    const file = if (std.fs.path.isAbsolute(agents_path))
-        std.fs.openFileAbsolute(agents_path, .{}) catch return try allocator.dupe(u8, "")
-    else
-        std.fs.cwd().openFile(agents_path, .{}) catch return try allocator.dupe(u8, "");
+    const file = openWorkspaceAgentsFileGuarded(allocator, dir) orelse return try allocator.dupe(u8, "");
     defer file.close();
 
     const content = file.readToEndAlloc(allocator, MAX_AGENTS_FILE_BYTES) catch return try allocator.dupe(u8, "");
@@ -721,6 +744,41 @@ test "readWorkspaceContextForSummary returns empty when AGENTS missing" {
     defer tmp.cleanup();
 
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expectEqual(@as(usize, 0), context.len);
+}
+
+test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+
+    try outside_tmp.dir.writeFile(.{
+        .sub_path = "outside-agents.md",
+        .data =
+        \\## Session Startup
+        \\- outside
+        \\
+        \\## Red Lines
+        \\- outside
+        ,
+    });
+
+    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(outside_path);
+    const outside_agents = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
+    defer std.testing.allocator.free(outside_agents);
+
+    try ws_tmp.dir.symLink(outside_agents, "AGENTS.md", .{});
+
+    const workspace = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);

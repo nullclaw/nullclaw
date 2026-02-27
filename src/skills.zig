@@ -1091,9 +1091,7 @@ fn pathIsSymlink(path: []const u8) !bool {
     _ = dir.readLink(entry_name, &link_buf) catch |err| switch (err) {
         error.NotLink => return false,
         error.FileNotFound => return false,
-        // On Windows some regular paths can surface unexpected NTSTATUS values
-        // through readLink(); treat them as "not a symlink" to avoid false failures.
-        else => return false,
+        else => return err,
     };
     return true;
 }
@@ -1231,7 +1229,11 @@ fn hasSkillMarkers(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
 
     const toml = try std.fmt.allocPrint(allocator, "{s}/SKILL.toml", .{dir_path});
     defer allocator.free(toml);
-    return pathExists(toml);
+    if (pathExists(toml)) return true;
+
+    const json = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{dir_path});
+    defer allocator.free(json);
+    return pathExists(json);
 }
 
 fn hasInstallableSkillContent(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
@@ -2745,7 +2747,7 @@ test "auditSkillDirectory rejects malformed TOML string literals" {
     try std.testing.expectError(error.SkillSecurityAuditFailed, auditSkillDirectory(allocator, source));
 }
 
-test "auditSkillDirectory rejects root without SKILL markers" {
+test "auditSkillDirectory accepts root with legacy skill.json marker" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2756,6 +2758,21 @@ test "auditSkillDirectory rejects root without SKILL markers" {
         defer f.close();
         try f.writeAll("{\"name\":\"legacy-only\"}");
     }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try auditSkillDirectory(allocator, source);
+}
+
+test "auditSkillDirectory rejects root without any skill markers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("source");
 
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
@@ -2883,6 +2900,33 @@ test "installSkillFromPath supports markdown-only source directory" {
     const content = try std.fs.cwd().readFileAlloc(allocator, installed_path, 1024);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("# Markdown only install", content);
+}
+
+test "installSkillFromPath supports legacy skill.json-only source directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("source-json");
+    {
+        const f = try tmp.dir.createFile("source-json/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"legacy-json\", \"version\": \"1.0.0\"}");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const source = try std.fs.path.join(allocator, &.{ base, "source-json" });
+    defer allocator.free(source);
+
+    try installSkillFromPath(allocator, source, workspace);
+
+    const installed_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-json", "skill.json" });
+    defer allocator.free(installed_manifest);
+    try std.testing.expect(pathExists(installed_manifest));
 }
 
 test "installSkillFromPath supports relative source path" {
