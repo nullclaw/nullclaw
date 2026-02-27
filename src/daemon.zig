@@ -18,6 +18,7 @@ const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
+const heartbeat_mod = @import("heartbeat.zig");
 const onboard = @import("onboard.zig");
 
 const log = std.log.scoped(.daemon);
@@ -148,14 +149,41 @@ fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []co
     };
 }
 
-/// Heartbeat thread — periodically writes state file and checks health.
+/// Heartbeat thread — periodically writes state file, checks health, and
+/// runs HEARTBEAT.md polling ticks on the configured heartbeat interval.
 fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
+    const heartbeat_engine = heartbeat_mod.HeartbeatEngine.init(
+        config.heartbeat.enabled,
+        config.heartbeat.interval_minutes,
+        config.workspace_dir,
+        null,
+    );
+    const heartbeat_interval_ns: i128 = @as(i128, @intCast(heartbeat_engine.interval_minutes)) * 60 * std.time.ns_per_s;
+    var next_heartbeat_tick_at_ns: i128 = std.time.nanoTimestamp() + heartbeat_interval_ns;
+
     while (!isShutdownRequested()) {
         writeStateFile(allocator, state_path, state) catch {};
         health.markComponentOk("heartbeat");
+
+        const now_ns = std.time.nanoTimestamp();
+        if (heartbeat_engine.enabled and now_ns >= next_heartbeat_tick_at_ns) {
+            const tick_result = heartbeat_engine.tick(allocator) catch |err| {
+                log.warn("heartbeat tick failed: {s}", .{@errorName(err)});
+                next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+                std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                continue;
+            };
+            switch (tick_result.outcome) {
+                .processed => log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count}),
+                .skipped_empty_file => log.debug("heartbeat tick skipped: HEARTBEAT.md has no actionable content", .{}),
+                .skipped_missing_file => log.debug("heartbeat tick skipped: HEARTBEAT.md is missing", .{}),
+            }
+            next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+        }
+
         std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
     }
 }

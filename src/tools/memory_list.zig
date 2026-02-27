@@ -89,27 +89,8 @@ pub const MemoryListTool = struct {
         return ToolResult{ .success = true, .output = try out.toOwnedSlice(allocator) };
     }
 
-    fn isInternalMemoryKey(key: []const u8) bool {
-        return std.mem.startsWith(u8, key, "autosave_user_") or
-            std.mem.startsWith(u8, key, "autosave_assistant_") or
-            std.mem.eql(u8, key, "last_hygiene_at");
-    }
-
-    fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
-        const trimmed = std.mem.trim(u8, content, " \t");
-        if (!std.mem.startsWith(u8, trimmed, "**")) return null;
-        const rest = trimmed[2..];
-        const suffix = std.mem.indexOf(u8, rest, "**:") orelse return null;
-        if (suffix == 0) return null;
-        return rest[0..suffix];
-    }
-
     fn isInternalEntry(entry: MemoryEntry) bool {
-        if (isInternalMemoryKey(entry.key)) return true;
-        if (extractMarkdownMemoryKey(entry.content)) |extracted| {
-            if (isInternalMemoryKey(extracted)) return true;
-        }
-        return false;
+        return mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content);
     }
 
     fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
@@ -198,4 +179,26 @@ test "memory_list filters markdown-encoded internal keys in content" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "last_hygiene_at") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "**Name**: User") != null);
+}
+
+test "memory_list filters bootstrap internal keys by default" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("__bootstrap.prompt.AGENTS.md", "internal-agents", .core, null);
+    try mem.store("user_topic", "shipping", .core, null);
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_topic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.AGENTS.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-agents") == null);
 }

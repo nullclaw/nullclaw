@@ -411,6 +411,7 @@ pub const Agent = struct {
             .max_source_chars = self.compaction_max_source_chars,
             .token_limit = self.token_limit,
             .max_history_messages = self.max_history_messages,
+            .workspace_dir = self.workspace_dir,
         });
     }
 
@@ -639,13 +640,25 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
-        // Handle slash commands before sending to LLM (saves tokens)
-        if (try self.handleSlashCommand(user_message)) |response| {
-            return response;
-        }
+        const effective_user_message = blk: {
+            if (commands.bareSessionResetPrompt(user_message)) |fresh_prompt| {
+                // Preserve slash side-effects (/new|/reset session clear), but route bare command
+                // through a fresh-session prompt instead of returning command text.
+                if (try self.handleSlashCommand(user_message)) |slash_response| {
+                    self.allocator.free(slash_response);
+                }
+                break :blk fresh_prompt;
+            }
+
+            // Handle regular slash commands before sending to LLM (saves tokens).
+            if (try self.handleSlashCommand(user_message)) |response| {
+                return response;
+            }
+            break :blk user_message;
+        };
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
         }
@@ -714,10 +727,10 @@ pub const Agent = struct {
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
-                    if (mem.store(key, user_message, .conversation, self.memory_session_id)) |_| {
+                    if (mem.store(key, effective_user_message, .conversation, self.memory_session_id)) |_| {
                         // Vector sync after auto-save
                         if (self.mem_rt) |rt| {
-                            rt.syncVectorAfterStore(self.allocator, key, user_message);
+                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message);
                         }
                     } else |_| {}
                 }
@@ -727,9 +740,9 @@ pub const Agent = struct {
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
         const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id)
+            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id)
         else
-            try self.allocator.dupe(u8, user_message);
+            try self.allocator.dupe(u8, effective_user_message);
         errdefer self.allocator.free(enriched);
 
         try self.history.append(self.allocator, .{
@@ -744,7 +757,7 @@ pub const Agent = struct {
                 self.history.items[0].content
             else
                 null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, user_message);
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
@@ -1086,7 +1099,7 @@ pub const Agent = struct {
                         self.history.items[0].content
                     else
                         null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, user_message);
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, effective_user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
                     rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch {};
                 }
@@ -1124,6 +1137,7 @@ pub const Agent = struct {
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
+            const batch_updates_tools_md = tool_call_batch_updates_tools_md(arena, parsed_calls);
 
             const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
             if (self.log_tool_calls) {
@@ -1142,7 +1156,15 @@ pub const Agent = struct {
                 self.observer.recordEvent(&tool_start_event);
 
                 const tool_timer = std.time.milliTimestamp();
-                const result = self.executeTool(arena, call);
+                const result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                    ToolExecutionResult{
+                        .name = call.name,
+                        .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
+                        .success = true,
+                        .tool_call_id = call.tool_call_id,
+                    }
+                else
+                    self.executeTool(arena, call);
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
@@ -1252,6 +1274,87 @@ pub const Agent = struct {
 
     /// Execute a tool by name lookup.
     /// Parses arguments_json once into a std.json.ObjectMap and passes it to the tool.
+    fn tool_call_batch_updates_tools_md(allocator: std.mem.Allocator, calls: []const ParsedToolCall) bool {
+        for (calls) |call| {
+            if (tool_call_updates_tools_md(allocator, call)) return true;
+        }
+        return false;
+    }
+
+    fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
+        if (!std.mem.eql(u8, call.name, "file_write") and !std.mem.eql(u8, call.name, "file_edit")) return false;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+
+        const path_value = parsed.value.object.get("path") orelse return false;
+        const path = switch (path_value) {
+            .string => |s| s,
+            else => return false,
+        };
+        return is_tools_markdown_path(path);
+    }
+
+    fn should_skip_tools_memory_store_duplicate(
+        allocator: std.mem.Allocator,
+        batch_updates_tools_md: bool,
+        call: ParsedToolCall,
+    ) bool {
+        if (!batch_updates_tools_md) return false;
+        if (!std.mem.eql(u8, call.name, "memory_store")) return false;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+
+        if (parsed.value.object.get("key")) |key_value| {
+            const key = switch (key_value) {
+                .string => |s| s,
+                else => "",
+            };
+            if (is_tools_memory_key(key)) return true;
+        }
+
+        if (parsed.value.object.get("content")) |content_value| {
+            const content = switch (content_value) {
+                .string => |s| s,
+                else => "",
+            };
+            if (std.ascii.indexOfIgnoreCase(content, "tools.md") != null) return true;
+        }
+
+        return false;
+    }
+
+    fn is_tools_markdown_path(path: []const u8) bool {
+        const basename = path_basename_any_separator(path);
+        if (basename.len == 0) return false;
+        return std.ascii.eqlIgnoreCase(basename, "TOOLS.md");
+    }
+
+    fn path_basename_any_separator(path: []const u8) []const u8 {
+        const slash_idx = std.mem.lastIndexOfScalar(u8, path, '/');
+        const backslash_idx = std.mem.lastIndexOfScalar(u8, path, '\\');
+        const sep_idx = switch (slash_idx != null and backslash_idx != null) {
+            true => if (slash_idx.? > backslash_idx.?) slash_idx.? else backslash_idx.?,
+            false => slash_idx orelse backslash_idx orelse return path,
+        };
+        if (sep_idx + 1 >= path.len) return "";
+        return path[sep_idx + 1 ..];
+    }
+
+    fn starts_with_ascii_ignore_case(value: []const u8, prefix: []const u8) bool {
+        if (value.len < prefix.len) return false;
+        return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+    }
+
+    fn is_tools_memory_key(key: []const u8) bool {
+        return starts_with_ascii_ignore_case(key, "pref.tools.") or
+            starts_with_ascii_ignore_case(key, "preference.tools.") or
+            std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
+    }
+
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
@@ -2414,6 +2517,158 @@ test "slash /reset clears history and switches model" {
     try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
 }
 
+test "turn bare /new routes through fresh-session prompt" {
+    const EchoProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, req: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            var last_user: []const u8 = "";
+            for (req.messages) |msg| {
+                if (msg.role == .user) last_user = msg.content;
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, last_user),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "echo-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = EchoProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = EchoProvider.chatWithSystem,
+        .chat = EchoProvider.chat,
+        .supportsNativeTools = EchoProvider.supportsNativeTools,
+        .getName = EchoProvider.getName,
+        .deinit = EchoProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "old-before-reset"),
+    });
+
+    const response = try agent.turn("/new");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Execute your Session Startup sequence now") != null);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+
+    for (agent.history.items) |msg| {
+        try std.testing.expect(std.mem.indexOf(u8, msg.content, "old-before-reset") == null);
+    }
+}
+
+test "turn /reset with argument stays slash-only command" {
+    const NoCallProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.UnexpectedProviderCall;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "nocall-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = NoCallProvider.chatWithSystem,
+        .chat = NoCallProvider.chat,
+        .supportsNativeTools = NoCallProvider.supportsNativeTools,
+        .getName = NoCallProvider.getName,
+        .deinit = NoCallProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("/reset gpt-4o-mini");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Session cleared.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o-mini") != null);
+    try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
+}
+
 test "slash /help returns help text" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -3055,6 +3310,180 @@ test "turn refreshes system prompt after workspace markdown change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V2-UPDATED") != null);
 }
 
+test "turn refreshes system prompt after TOOLS.md change" {
+    const ReloadProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reload-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("TOOLS.md", .{});
+        defer f.close();
+        try f.writeAll("TOOLS-V1");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReloadProvider.chatWithSystem,
+        .chat = ReloadProvider.chat,
+        .supportsNativeTools = ReloadProvider.supportsNativeTools,
+        .getName = ReloadProvider.getName,
+        .deinit = ReloadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace,
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const first = try agent.turn("first");
+    defer allocator.free(first);
+    try std.testing.expect(agent.history.items.len > 0);
+    try std.testing.expectEqual(providers.Role.system, agent.history.items[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "TOOLS-V1") != null);
+
+    {
+        const f = try tmp.dir.createFile("TOOLS.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("TOOLS-V2-UPDATED");
+    }
+
+    const second = try agent.turn("second");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "TOOLS-V2-UPDATED") != null);
+}
+
+test "turn refreshes system prompt after USER.md change" {
+    const ReloadProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reload-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("USER.md", .{});
+        defer f.close();
+        try f.writeAll("- **Name:** USER-V1");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReloadProvider.chatWithSystem,
+        .chat = ReloadProvider.chat,
+        .supportsNativeTools = ReloadProvider.supportsNativeTools,
+        .getName = ReloadProvider.getName,
+        .deinit = ReloadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace,
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const first = try agent.turn("first");
+    defer allocator.free(first);
+    try std.testing.expect(agent.history.items.len > 0);
+    try std.testing.expectEqual(providers.Role.system, agent.history.items[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "USER-V1") != null);
+
+    {
+        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("- **Name:** USER-V2-UPDATED");
+    }
+
+    const second = try agent.turn("second");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "USER-V2-UPDATED") != null);
+}
+
 test "exec security deny blocks shell tool execution" {
     const allocator = std.testing.allocator;
     const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
@@ -3234,6 +3663,191 @@ test "milliTimestamp negative difference clamps to zero" {
     const clamped = @max(0, diff);
     const duration: u64 = @as(u64, @intCast(clamped));
     try std.testing.expectEqual(@as(u64, 0), duration);
+}
+
+test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
+    const allocator = std.testing.allocator;
+
+    const calls_match = [_]ParsedToolCall{
+        .{ .name = "file_write", .arguments_json = "{\"path\":\"TOOLS.md\",\"content\":\"x\"}" },
+        .{ .name = "file_edit", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"old_text\":\"a\",\"new_text\":\"b\"}" },
+    };
+    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
+
+    const calls_no_match = [_]ParsedToolCall{
+        .{ .name = "file_write", .arguments_json = "{\"path\":\"README.md\",\"content\":\"x\"}" },
+        .{ .name = "memory_store", .arguments_json = "{\"key\":\"pref.tools.file_read_over_cat\",\"content\":\"rule\"}" },
+    };
+    try std.testing.expect(!Agent.tool_call_batch_updates_tools_md(allocator, &calls_no_match));
+}
+
+test "should_skip_tools_memory_store_duplicate skips only tools-related memory_store entries" {
+    const allocator = std.testing.allocator;
+
+    const calls = [_]ParsedToolCall{
+        .{ .name = "file_edit", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"old_text\":\"old\",\"new_text\":\"new\"}" },
+        .{ .name = "memory_store", .arguments_json = "{\"key\":\"pref.tools.file_read_over_cat\",\"content\":\"Always use file_read\"}" },
+        .{ .name = "memory_store", .arguments_json = "{\"key\":\"user.nickname\",\"content\":\"DonPrus\"}" },
+        .{ .name = "memory_store", .arguments_json = "{\"key\":\"session.note\",\"content\":\"Rule is documented in TOOLS.md\"}" },
+    };
+
+    const batch_updates_tools_md = Agent.tool_call_batch_updates_tools_md(allocator, &calls);
+    try std.testing.expect(batch_updates_tools_md);
+    try std.testing.expect(Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[1]));
+    try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[2]));
+    try std.testing.expect(Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[3]));
+    try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, false, calls[1]));
+}
+
+test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same batch" {
+    const FileWriteProbeTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "file_write";
+        pub const tool_description = "probe";
+        pub const tool_params =
+            \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
+        ;
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "file_write probe ok" };
+        }
+    };
+
+    const MemoryStoreProbeTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "memory_store";
+        pub const tool_description = "probe";
+        pub const tool_params =
+            \\{"type":"object","properties":{"key":{"type":"string"},"content":{"type":"string"}},"required":["key","content"]}
+        ;
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "memory_store probe ok" };
+        }
+    };
+
+    const StepProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-file"),
+                    .name = try allocator.dupe(u8, "file_write"),
+                    .arguments = try allocator.dupe(u8, "{\"path\":\"TOOLS.md\",\"content\":\"Use file_read\"}"),
+                };
+                tool_calls[1] = .{
+                    .id = try allocator.dupe(u8, "call-memory"),
+                    .name = try allocator.dupe(u8, "memory_store"),
+                    .arguments = try allocator.dupe(u8, "{\"key\":\"pref.tools.file_read_over_cat\",\"content\":\"Use file_read\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "applying"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "step-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = StepProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StepProvider.chatWithSystem,
+        .chat = StepProvider.chat,
+        .supportsNativeTools = StepProvider.supportsNativeTools,
+        .getName = StepProvider.getName,
+        .deinit = StepProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var file_write_count: usize = 0;
+    var memory_store_count: usize = 0;
+    var file_write_tool_impl = FileWriteProbeTool{ .count = &file_write_count };
+    var memory_store_tool_impl = MemoryStoreProbeTool{ .count = &memory_store_count };
+    const tool_list = [_]Tool{ file_write_tool_impl.tool(), memory_store_tool_impl.tool() };
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("update tools guidance");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 1), file_write_count);
+    try std.testing.expectEqual(@as(usize, 0), memory_store_count);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
 test "bindMemoryTools wires memory tools to sqlite backend" {

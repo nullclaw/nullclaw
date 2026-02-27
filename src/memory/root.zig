@@ -250,6 +250,62 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
     allocator.free(entries);
 }
 
+pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
+
+pub const PromptBootstrapDoc = struct {
+    filename: []const u8,
+    memory_key: []const u8,
+};
+
+pub const prompt_bootstrap_docs = [_]PromptBootstrapDoc{
+    .{ .filename = "AGENTS.md", .memory_key = "__bootstrap.prompt.AGENTS.md" },
+    .{ .filename = "SOUL.md", .memory_key = "__bootstrap.prompt.SOUL.md" },
+    .{ .filename = "TOOLS.md", .memory_key = "__bootstrap.prompt.TOOLS.md" },
+    .{ .filename = "IDENTITY.md", .memory_key = "__bootstrap.prompt.IDENTITY.md" },
+    .{ .filename = "USER.md", .memory_key = "__bootstrap.prompt.USER.md" },
+    .{ .filename = "HEARTBEAT.md", .memory_key = "__bootstrap.prompt.HEARTBEAT.md" },
+    .{ .filename = "BOOTSTRAP.md", .memory_key = "__bootstrap.prompt.BOOTSTRAP.md" },
+    .{ .filename = "MEMORY.md", .memory_key = "__bootstrap.prompt.MEMORY.md" },
+};
+
+pub fn promptBootstrapMemoryKey(filename: []const u8) ?[]const u8 {
+    for (prompt_bootstrap_docs) |doc| {
+        if (std.mem.eql(u8, doc.filename, filename)) return doc.memory_key;
+    }
+    return null;
+}
+
+/// markdown backend keeps bootstrap identity in workspace files;
+/// all other backends use backend-native key/value entries.
+pub fn usesWorkspaceBootstrapFiles(memory_backend: ?[]const u8) bool {
+    const backend = memory_backend orelse return true;
+    return std.mem.eql(u8, backend, "markdown");
+}
+
+pub fn isInternalMemoryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "autosave_user_") or
+        std.mem.startsWith(u8, key, "autosave_assistant_") or
+        std.mem.eql(u8, key, "last_hygiene_at") or
+        std.mem.startsWith(u8, key, PromptBootstrapKeyPrefix);
+}
+
+pub fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, content, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "**")) return null;
+    const rest = trimmed[2..];
+    const suffix = std.mem.indexOf(u8, rest, "**:") orelse return null;
+    if (suffix == 0) return null;
+    return rest[0..suffix];
+}
+
+pub fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
+    if (isInternalMemoryKey(key)) return true;
+    if (extractMarkdownMemoryKey(content)) |extracted| {
+        if (isInternalMemoryKey(extracted)) return true;
+    }
+    return false;
+}
+
 fn trimCandidatesToLimit(allocator: std.mem.Allocator, candidates: []RetrievalCandidate, limit: usize) ![]RetrievalCandidate {
     if (candidates.len <= limit) return candidates;
 

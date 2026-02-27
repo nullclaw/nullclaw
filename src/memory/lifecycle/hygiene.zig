@@ -43,7 +43,7 @@ pub const HygieneConfig = struct {
 pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memory) HygieneReport {
     if (!config.hygiene_enabled) return .{};
 
-    if (!shouldRunNow(config, mem)) return .{};
+    if (!shouldRunNow(allocator, config, mem)) return .{};
 
     var report = HygieneReport{};
 
@@ -76,27 +76,33 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
 }
 
 /// Check if enough time has elapsed since the last hygiene run.
-fn shouldRunNow(config: HygieneConfig, mem: ?Memory) bool {
+fn shouldRunNow(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memory) bool {
     _ = config;
 
     const m = mem orelse return true;
 
     // Check if we have a last_hygiene_at record
-    // We use a stack allocator for the temporary entry
-    var buf: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const fba_allocator = fba.allocator();
-
-    const entry = m.get(fba_allocator, LAST_HYGIENE_KEY) catch return true;
+    const entry = m.get(allocator, LAST_HYGIENE_KEY) catch return true;
     if (entry) |e| {
-        defer e.deinit(fba_allocator);
-        // Parse the timestamp from content
-        const last_ts = std.fmt.parseInt(i64, e.content, 10) catch return true;
+        defer e.deinit(allocator);
+        // Parse raw timestamps (sqlite-like) and markdown-encoded entries
+        // (markdown backend stores as "**key**: value").
+        const last_ts = parseLastHygieneTimestamp(e.content) orelse return true;
         const now = std.time.timestamp();
         return (now - last_ts) >= HYGIENE_INTERVAL_SECS;
     }
 
     return true; // Never run before
+}
+
+fn parseLastHygieneTimestamp(content: []const u8) ?i64 {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    return std.fmt.parseInt(i64, trimmed, 10) catch {
+        const marker = "**" ++ LAST_HYGIENE_KEY ++ "**:";
+        if (!std.mem.startsWith(u8, trimmed, marker)) return null;
+        const value = std.mem.trim(u8, trimmed[marker.len..], " \t");
+        return std.fmt.parseInt(i64, value, 10) catch null;
+    };
 }
 
 /// Archive old daily memory .md files from memory/ to memory/archive/.
@@ -246,7 +252,42 @@ test "runIfDue no memory first run" {
 
 test "shouldRunNow returns true with no memory" {
     const config = HygieneConfig{};
-    try std.testing.expect(shouldRunNow(config, null));
+    try std.testing.expect(shouldRunNow(std.testing.allocator, config, null));
+}
+
+test "parseLastHygieneTimestamp supports markdown format" {
+    const ts = parseLastHygieneTimestamp("**last_hygiene_at**: 1772051598") orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(i64, 1772051598), ts);
+}
+
+test "runIfDue with markdown backend does not append hygiene marker twice inside interval" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var markdown_memory = try root.MarkdownMemory.init(std.testing.allocator, base);
+    defer markdown_memory.deinit();
+    const mem = markdown_memory.memory();
+
+    try mem.store(LAST_HYGIENE_KEY, "1772051598", .core, null);
+    const before = try mem.count();
+
+    const cfg = HygieneConfig{
+        .hygiene_enabled = true,
+        .archive_after_days = 0,
+        .purge_after_days = 0,
+        .conversation_retention_days = 0,
+        .workspace_dir = base,
+    };
+
+    _ = runIfDue(std.testing.allocator, cfg, mem);
+    const after_first = try mem.count();
+    try std.testing.expectEqual(before + 1, after_first);
+
+    _ = runIfDue(std.testing.allocator, cfg, mem);
+    const after_second = try mem.count();
+    try std.testing.expectEqual(after_first, after_second);
 }
 
 test "parseConversationTimestamp valid key" {

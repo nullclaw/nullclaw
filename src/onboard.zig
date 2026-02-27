@@ -3,7 +3,7 @@
 //! Mirrors ZeroClaw's onboard module:
 //!   - Interactive wizard (9-step configuration flow)
 //!   - Quick setup (non-interactive, sensible defaults)
-//!   - Workspace scaffolding (MEMORY.md + prompt context files)
+//!   - Workspace scaffolding (prompt context files + bootstrap lifecycle)
 //!   - Channel configuration
 //!   - Memory backend selection
 //!   - Provider/model selection with curated defaults
@@ -1542,10 +1542,7 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
         else => return err,
     };
 
-    // MEMORY.md
-    const mem_tmpl = try memoryTemplate(allocator, ctx);
-    defer allocator.free(mem_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "MEMORY.md", mem_tmpl);
+    const had_legacy_user_content = try hasLegacyUserContentIndicators(allocator, workspace_dir);
 
     // SOUL.md (personality traits — loaded by prompt.zig)
     const soul_tmpl = try soulTemplate(allocator, ctx);
@@ -1573,15 +1570,118 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
-    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl);
+    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content);
+}
 
-    // Ensure memory/ subdirectory
-    const mem_dir = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
-    defer allocator.free(mem_dir);
-    std.fs.makeDirAbsolute(mem_dir) catch |err| switch (err) {
+pub const ResetWorkspacePromptFilesOptions = struct {
+    include_bootstrap: bool = false,
+    clear_memory_markdown: bool = false,
+    dry_run: bool = false,
+};
+
+pub const ResetWorkspacePromptFilesReport = struct {
+    rewritten_files: usize = 0,
+    removed_files: usize = 0,
+};
+
+/// Reset workspace prompt markdown files to bundled defaults.
+/// This intentionally overwrites existing files.
+pub fn resetWorkspacePromptFiles(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    ctx: *const ProjectContext,
+    options: ResetWorkspacePromptFilesOptions,
+) !ResetWorkspacePromptFilesReport {
+    if (std.fs.path.dirname(workspace_dir)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
+
+    var report = ResetWorkspacePromptFilesReport{};
+
+    const soul_tmpl = try soulTemplate(allocator, ctx);
+    defer allocator.free(soul_tmpl);
+    const identity_tmpl = try identityTemplate(allocator, ctx);
+    defer allocator.free(identity_tmpl);
+    const user_tmpl = try userTemplate(allocator, ctx);
+    defer allocator.free(user_tmpl);
+
+    const files = [_]struct {
+        filename: []const u8,
+        content: []const u8,
+    }{
+        .{ .filename = "SOUL.md", .content = soul_tmpl },
+        .{ .filename = "AGENTS.md", .content = agentsTemplate() },
+        .{ .filename = "TOOLS.md", .content = toolsTemplate() },
+        .{ .filename = "IDENTITY.md", .content = identity_tmpl },
+        .{ .filename = "USER.md", .content = user_tmpl },
+        .{ .filename = "HEARTBEAT.md", .content = heartbeatTemplate() },
+    };
+
+    for (files) |entry| {
+        _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
+        report.rewritten_files += 1;
+    }
+
+    if (options.include_bootstrap) {
+        _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
+        report.rewritten_files += 1;
+    }
+
+    if (options.clear_memory_markdown) {
+        if (try removeWorkspaceFileIfExists(allocator, workspace_dir, "MEMORY.md", options.dry_run)) {
+            report.removed_files += 1;
+        }
+        if (try removeWorkspaceFileIfExists(allocator, workspace_dir, "memory.md", options.dry_run)) {
+            report.removed_files += 1;
+        }
+    }
+
+    return report;
+}
+
+fn overwriteWorkspaceFile(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+    content: []const u8,
+    dry_run: bool,
+) !bool {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    defer allocator.free(path);
+
+    if (dry_run) return true;
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
+    return true;
+}
+
+fn removeWorkspaceFileIfExists(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+    dry_run: bool,
+) !bool {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    defer allocator.free(path);
+
+    if (dry_run) {
+        return fileExistsAbsolute(path);
+    }
+
+    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
@@ -1610,6 +1710,7 @@ fn ensureBootstrapLifecycle(
     workspace_dir: []const u8,
     identity_template: []const u8,
     user_template: []const u8,
+    had_legacy_user_content: bool,
 ) !void {
     const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
     defer allocator.free(bootstrap_path);
@@ -1635,6 +1736,7 @@ fn ensureBootstrapLifecycle(
             workspace_dir,
             identity_template,
             user_template,
+            had_legacy_user_content,
         );
         if (legacy_completed) {
             try markOnboardingCompletedAt(allocator, &state);
@@ -1659,19 +1761,27 @@ fn isLegacyOnboardingCompleted(
     workspace_dir: []const u8,
     identity_template: []const u8,
     user_template: []const u8,
+    had_legacy_user_content: bool,
 ) !bool {
     const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
     defer allocator.free(identity_path);
     const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
     defer allocator.free(user_path);
 
-    const identity_content = try readFileIfPresent(allocator, identity_path, 1024 * 1024) orelse return false;
-    defer allocator.free(identity_content);
-    const user_content = try readFileIfPresent(allocator, user_path, 1024 * 1024) orelse return false;
-    defer allocator.free(user_content);
-
-    return !std.mem.eql(u8, identity_content, identity_template) or
-        !std.mem.eql(u8, user_content, user_template);
+    var templates_diverged = false;
+    if (try readFileIfPresent(allocator, identity_path, 1024 * 1024)) |identity_content| {
+        defer allocator.free(identity_content);
+        if (!std.mem.eql(u8, identity_content, identity_template)) {
+            templates_diverged = true;
+        }
+    }
+    if (try readFileIfPresent(allocator, user_path, 1024 * 1024)) |user_content| {
+        defer allocator.free(user_content);
+        if (!std.mem.eql(u8, user_content, user_template)) {
+            templates_diverged = true;
+        }
+    }
+    return templates_diverged or had_legacy_user_content;
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
@@ -1806,6 +1916,24 @@ fn fileExistsAbsolute(path: []const u8) bool {
     const file = std.fs.openFileAbsolute(path, .{}) catch return false;
     file.close();
     return true;
+}
+
+fn pathExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
+    const memory_dir_path = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
+    defer allocator.free(memory_dir_path);
+    const memory_file_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace_dir});
+    defer allocator.free(memory_file_path);
+    const git_dir_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{workspace_dir});
+    defer allocator.free(git_dir_path);
+
+    return pathExistsAbsolute(memory_dir_path) or
+        pathExistsAbsolute(memory_file_path) or
+        pathExistsAbsolute(git_dir_path);
 }
 
 fn makeIsoTimestamp(allocator: std.mem.Allocator) ![]u8 {
@@ -2058,7 +2186,7 @@ test "BANNER contains descriptive text" {
     try std.testing.expect(std.mem.indexOf(u8, BANNER, "smallest AI assistant") != null);
 }
 
-test "scaffoldWorkspace creates files in temp dir" {
+test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2068,19 +2196,15 @@ test "scaffoldWorkspace creates files in temp dir" {
     const ctx = ProjectContext{};
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
 
-    // Verify files were created
-    const file = try tmp.dir.openFile("MEMORY.md", .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
-    defer std.testing.allocator.free(content);
-    try std.testing.expect(content.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, content, "Memory") != null);
-
+    // Verify core files were created
     const agents = try tmp.dir.openFile("AGENTS.md", .{});
     defer agents.close();
     const agents_content = try agents.readToEndAlloc(std.testing.allocator, 16 * 1024);
     defer std.testing.allocator.free(agents_content);
     try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+
+    // OpenClaw-style scaffold keeps MEMORY.md optional (created on demand by memory writes).
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
 }
 
 test "scaffoldWorkspace is idempotent" {
@@ -2094,6 +2218,103 @@ test "scaffoldWorkspace is idempotent" {
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
     // Running again should not fail
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+}
+
+test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        defer f.close();
+        try f.writeAll("custom-agents-content");
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{});
+        defer f.close();
+        try f.writeAll("custom-user-content");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{});
+    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 0), report.removed_files);
+
+    const agents_content = try tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 64 * 1024);
+    defer std.testing.allocator.free(agents_content);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "custom-agents-content") == null);
+
+    const user_content = try tmp.dir.readFileAlloc(std.testing.allocator, "USER.md", 64 * 1024);
+    defer std.testing.allocator.free(user_content);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "USER.md - About Your Human") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "custom-user-content") == null);
+}
+
+test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        defer f.close();
+        try f.writeAll("custom-memory");
+    }
+
+    var has_distinct_case_memory_file = true;
+    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => blk: {
+            has_distinct_case_memory_file = false;
+            break :blk null;
+        },
+        else => return err,
+    };
+    if (alt) |f| {
+        defer f.close();
+        try f.writeAll("custom-memory-lower");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const dry_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
+        .clear_memory_markdown = true,
+        .dry_run = true,
+    });
+    try std.testing.expectEqual(@as(usize, 6), dry_report.rewritten_files);
+    try std.testing.expect(dry_report.removed_files >= 1);
+    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    memory_file.close();
+
+    const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
+        .clear_memory_markdown = true,
+    });
+    try std.testing.expectEqual(@as(usize, 6), reset_report.rewritten_files);
+    try std.testing.expect(reset_report.removed_files >= 1);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
+    if (has_distinct_case_memory_file) {
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("memory.md", .{}));
+    }
+}
+
+test "resetWorkspacePromptFiles creates missing workspace directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/workspace", .{base});
+    defer std.testing.allocator.free(nested);
+
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{});
+    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+
+    const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
+    defer std.testing.allocator.free(agents_path);
+    const agents_file = try std.fs.openFileAbsolute(agents_path, .{});
+    agents_file.close();
 }
 
 test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
@@ -2173,6 +2394,64 @@ test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
     defer state.deinit(std.testing.allocator);
     try std.testing.expect(state.bootstrap_seeded_at == null);
+    try std.testing.expect(state.onboarding_completed_at != null);
+}
+
+test "scaffoldWorkspace treats memory-backed workspace as existing and skips BOOTSTRAP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("memory");
+    try tmp.dir.writeFile(.{
+        .sub_path = "memory/2026-02-25.md",
+        .data = "# Daily log\nSome notes",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "MEMORY.md",
+        .data = "# Long-term memory\nImportant stuff",
+    });
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    identity_file.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    defer memory_file.close();
+    const memory_content = try memory_file.readToEndAlloc(std.testing.allocator, 4 * 1024);
+    defer std.testing.allocator.free(memory_content);
+    try std.testing.expectEqualStrings("# Long-term memory\nImportant stuff", memory_content);
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.onboarding_completed_at != null);
+}
+
+test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTSTRAP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".git");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".git/HEAD",
+        .data = "ref: refs/heads/main\n",
+    });
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    identity_file.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
     try std.testing.expect(state.onboarding_completed_at != null);
 }
 
@@ -2308,7 +2587,7 @@ test "memoryTemplate uses context values" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "TestBot") != null);
 }
 
-test "scaffoldWorkspace creates memory subdirectory" {
+test "scaffoldWorkspace does not create memory subdirectory by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2316,10 +2595,7 @@ test "scaffoldWorkspace creates memory subdirectory" {
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
-
-    // Verify memory/ subdirectory exists
-    var d = try tmp.dir.openDir("memory", .{});
-    d.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("memory", .{}));
 }
 
 test "BANNER is non-empty and contains nullclaw branding" {
@@ -2466,7 +2742,7 @@ test "bootstrapTemplate is non-empty" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "BOOTSTRAP.md - Hello, World") != null);
 }
 
-test "scaffoldWorkspace creates all prompt.zig files" {
+test "scaffoldWorkspace creates core prompt.zig files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2475,11 +2751,12 @@ test "scaffoldWorkspace creates all prompt.zig files" {
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
 
-    // Verify all files that prompt.zig tries to load exist
+    // Verify core files that prompt.zig always loads exist.
     const files = [_][]const u8{
-        "MEMORY.md",    "SOUL.md",      "AGENTS.md",
-        "TOOLS.md",     "IDENTITY.md",  "USER.md",
-        "HEARTBEAT.md", "BOOTSTRAP.md",
+        "SOUL.md",      "AGENTS.md",
+        "TOOLS.md",     "IDENTITY.md",
+        "USER.md",      "HEARTBEAT.md",
+        "BOOTSTRAP.md",
     };
     for (files) |filename| {
         const file = tmp.dir.openFile(filename, .{}) catch |err| {

@@ -18,6 +18,9 @@ const SlashCommand = struct {
     arg: []const u8,
 };
 
+pub const BARE_SESSION_RESET_PROMPT =
+    "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
+
 fn parseSlashCommand(message: []const u8) ?SlashCommand {
     const trimmed = std.mem.trim(u8, message, " \t\r\n");
     if (trimmed.len <= 1 or trimmed[0] != '/') return null;
@@ -51,6 +54,13 @@ fn isSlashName(cmd: SlashCommand, expected: []const u8) bool {
     return std.ascii.eqlIgnoreCase(cmd.name, expected);
 }
 
+pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
+    const cmd = parseSlashCommand(message) orelse return null;
+    if (!(isSlashName(cmd, "new") or isSlashName(cmd, "reset"))) return null;
+    if (cmd.arg.len != 0) return null;
+    return BARE_SESSION_RESET_PROMPT;
+}
+
 fn firstToken(arg: []const u8) []const u8 {
     var it = std.mem.tokenizeAny(u8, arg, " \t");
     return it.next() orelse "";
@@ -62,27 +72,8 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
     return n;
 }
 
-fn isInternalMemoryKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, "autosave_user_") or
-        std.mem.startsWith(u8, key, "autosave_assistant_") or
-        std.mem.eql(u8, key, "last_hygiene_at");
-}
-
-fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, content, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "**")) return null;
-    const rest = trimmed[2..];
-    const suffix = std.mem.indexOf(u8, rest, "**:") orelse return null;
-    if (suffix == 0) return null;
-    return rest[0..suffix];
-}
-
 fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
-    if (isInternalMemoryKey(key)) return true;
-    if (extractMarkdownMemoryKey(content)) |extracted| {
-        if (isInternalMemoryKey(extracted)) return true;
-    }
-    return false;
+    return memory_mod.isInternalMemoryEntryKeyOrContent(key, content);
 }
 
 fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
@@ -272,6 +263,20 @@ test "parseSlashCommand strips bot mention with colon separator" {
     const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("model", parsed.name);
     try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
+}
+
+test "bareSessionResetPrompt returns prompt for bare /new" {
+    const prompt = bareSessionResetPrompt("/new") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Execute your Session Startup sequence now") != null);
+}
+
+test "bareSessionResetPrompt returns prompt for bare /reset with mention" {
+    const prompt = bareSessionResetPrompt("/reset@nullclaw_bot:") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "A new session was started via /new or /reset") != null);
+}
+
+test "bareSessionResetPrompt ignores /reset with argument" {
+    try std.testing.expect(bareSessionResetPrompt("/reset gpt-4o-mini") == null);
 }
 
 test "hotApplyConfigChange updates model primary as provider plus model" {

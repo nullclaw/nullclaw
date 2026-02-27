@@ -4,6 +4,7 @@
 //! passed by the caller; no dependency on the Agent struct.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
@@ -22,6 +23,10 @@ pub const DEFAULT_COMPACTION_KEEP_RECENT: u32 = 20;
 
 /// Default: max characters retained in stored compaction summary.
 pub const DEFAULT_COMPACTION_MAX_SUMMARY_CHARS: u32 = 2_000;
+/// Maximum characters appended from workspace critical rules.
+const MAX_WORKSPACE_CONTEXT_CHARS: usize = 2_000;
+/// Maximum AGENTS.md bytes read for critical rules extraction.
+const MAX_AGENTS_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default: max characters in source transcript passed to the summarizer.
 pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 12_000;
@@ -45,6 +50,7 @@ pub const CompactionConfig = struct {
     max_source_chars: u32 = DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     token_limit: u64 = DEFAULT_TOKEN_LIMIT,
     max_history_messages: u32 = 50,
+    workspace_dir: ?[]const u8 = null,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -121,8 +127,17 @@ pub fn autoCompactHistory(
     } else try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config);
     defer allocator.free(summary);
 
+    const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir);
+    defer allocator.free(workspace_context);
+
+    const summary_with_context = if (workspace_context.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ summary, workspace_context })
+    else
+        try allocator.dupe(u8, summary);
+    defer allocator.free(summary_with_context);
+
     // Create the compaction summary message
-    const summary_content = try std.fmt.allocPrint(allocator, "[Compaction summary]\n{s}", .{summary});
+    const summary_content = try std.fmt.allocPrint(allocator, "[Compaction summary]\n{s}", .{summary_with_context});
 
     // Free old messages being compacted
     for (history.items[start..compact_end]) |*msg| {
@@ -304,6 +319,190 @@ fn summarizeSlice(
     return try allocator.dupe(u8, raw_summary[0..max_len]);
 }
 
+const HeadingInfo = struct {
+    level: u8,
+    text: []const u8,
+};
+
+fn parseHeadingLine(line: []const u8) ?HeadingInfo {
+    const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+    if (trimmed_left.len < 4) return null;
+
+    var level: u8 = 0;
+    var idx: usize = 0;
+    while (idx < trimmed_left.len and trimmed_left[idx] == '#') : (idx += 1) {
+        level += 1;
+    }
+    if (level < 2 or level > 3) return null;
+    if (idx >= trimmed_left.len) return null;
+    if (trimmed_left[idx] != ' ' and trimmed_left[idx] != '\t') return null;
+    const heading_text = std.mem.trim(u8, trimmed_left[idx + 1 ..], " \t");
+    if (heading_text.len == 0) return null;
+    return .{
+        .level = level,
+        .text = heading_text,
+    };
+}
+
+fn appendSectionLine(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    has_any: *bool,
+    line: []const u8,
+) !void {
+    if (has_any.*) {
+        try out.append(allocator, '\n');
+    }
+    try out.appendSlice(allocator, line);
+    has_any.* = true;
+}
+
+fn extractNamedSection(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    section_name: []const u8,
+) !?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var in_section = false;
+    var section_level: u8 = 0;
+    var in_code_block = false;
+    var has_any = false;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const left_trimmed = std.mem.trimLeft(u8, line, " \t");
+        if (std.mem.startsWith(u8, left_trimmed, "```")) {
+            in_code_block = !in_code_block;
+            if (in_section) {
+                try appendSectionLine(allocator, &out, &has_any, line);
+            }
+            continue;
+        }
+
+        if (!in_code_block) {
+            if (parseHeadingLine(line)) |heading| {
+                if (!in_section) {
+                    if (std.ascii.eqlIgnoreCase(heading.text, section_name)) {
+                        in_section = true;
+                        section_level = heading.level;
+                        try appendSectionLine(allocator, &out, &has_any, line);
+                        continue;
+                    }
+                } else {
+                    if (heading.level <= section_level) {
+                        break;
+                    }
+                    try appendSectionLine(allocator, &out, &has_any, line);
+                    continue;
+                }
+            }
+        }
+
+        if (in_section) {
+            try appendSectionLine(allocator, &out, &has_any, line);
+        }
+    }
+
+    if (out.items.len == 0) {
+        out.deinit(allocator);
+        return null;
+    }
+
+    const raw = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(raw);
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+    if (trimmed.len == raw.len) return raw;
+
+    const duped = try allocator.dupe(u8, trimmed);
+    allocator.free(raw);
+    return duped;
+}
+
+fn extractSections(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    section_names: []const []const u8,
+) ![]u8 {
+    var combined: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer combined.deinit(allocator);
+
+    for (section_names) |section_name| {
+        const maybe_section = try extractNamedSection(allocator, content, section_name);
+        if (maybe_section) |section| {
+            defer allocator.free(section);
+            if (combined.items.len > 0) {
+                try combined.appendSlice(allocator, "\n\n");
+            }
+            try combined.appendSlice(allocator, section);
+        }
+    }
+
+    return try combined.toOwnedSlice(allocator);
+}
+
+fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    if (path.len == prefix.len) return true;
+    if (prefix.len > 0 and (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\')) return true;
+    const c = path[prefix.len];
+    return c == '/' or c == '\\';
+}
+
+fn openWorkspaceAgentsFileGuarded(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) ?std.fs.File {
+    const workspace_root = std.fs.cwd().realpathAlloc(allocator, workspace_dir) catch return null;
+    defer allocator.free(workspace_root);
+
+    const agents_candidate = std.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
+    defer allocator.free(agents_candidate);
+
+    const agents_canonical = std.fs.cwd().realpathAlloc(allocator, agents_candidate) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return null,
+    };
+    defer allocator.free(agents_canonical);
+
+    if (!pathStartsWith(agents_canonical, workspace_root)) return null;
+    return std.fs.openFileAbsolute(agents_canonical, .{}) catch null;
+}
+
+fn readWorkspaceContextForSummary(
+    allocator: std.mem.Allocator,
+    workspace_dir: ?[]const u8,
+) ![]u8 {
+    const dir = workspace_dir orelse return try allocator.dupe(u8, "");
+    const file = openWorkspaceAgentsFileGuarded(allocator, dir) orelse return try allocator.dupe(u8, "");
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, MAX_AGENTS_FILE_BYTES) catch return try allocator.dupe(u8, "");
+    defer allocator.free(content);
+
+    const sections = try extractSections(allocator, content, &.{ "Session Startup", "Red Lines" });
+    defer allocator.free(sections);
+    if (sections.len == 0) return try allocator.dupe(u8, "");
+
+    const safe_content = if (sections.len > MAX_WORKSPACE_CONTEXT_CHARS)
+        try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{sections[0..MAX_WORKSPACE_CONTEXT_CHARS]})
+    else
+        try allocator.dupe(u8, sections);
+    defer allocator.free(safe_content);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "\n\n<workspace-critical-rules>\n{s}\n</workspace-critical-rules>",
+        .{safe_content},
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -478,4 +677,112 @@ test "forceCompressHistory no-op when history is small" {
 test "CONTEXT_RECOVERY constants" {
     try std.testing.expectEqual(@as(usize, 6), CONTEXT_RECOVERY_MIN_HISTORY);
     try std.testing.expectEqual(@as(usize, 4), CONTEXT_RECOVERY_KEEP);
+}
+
+test "extractSections captures Session Startup and Red Lines, ignoring code fences" {
+    const content =
+        \\## Intro
+        \\hello
+        \\
+        \\```md
+        \\## Session Startup
+        \\this must be ignored
+        \\```
+        \\
+        \\## Session Startup
+        \\- read SOUL.md
+        \\
+        \\### Nested detail
+        \\- keep this too
+        \\
+        \\## Red Lines
+        \\- do not leak secrets
+        \\
+        \\## Other
+        \\ignored
+    ;
+
+    const sections = try extractSections(std.testing.allocator, content, &.{ "Session Startup", "Red Lines" });
+    defer std.testing.allocator.free(sections);
+
+    try std.testing.expect(std.mem.indexOf(u8, sections, "## Session Startup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sections, "### Nested detail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sections, "## Red Lines") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sections, "this must be ignored") == null);
+}
+
+test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        defer f.close();
+        try f.writeAll(
+            \\## Session Startup
+            \\- read AGENTS.md
+            \\- read SOUL.md
+            \\
+            \\## Red Lines
+            \\- never leak tokens
+        );
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "<workspace-critical-rules>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "Session Startup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "Red Lines") != null);
+}
+
+test "readWorkspaceContextForSummary returns empty when AGENTS missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expectEqual(@as(usize, 0), context.len);
+}
+
+test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+
+    try outside_tmp.dir.writeFile(.{
+        .sub_path = "outside-agents.md",
+        .data =
+        \\## Session Startup
+        \\- outside
+        \\
+        \\## Red Lines
+        \\- outside
+        ,
+    });
+
+    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(outside_path);
+    const outside_agents = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
+    defer std.testing.allocator.free(outside_agents);
+
+    try ws_tmp.dir.symLink(outside_agents, "AGENTS.md", .{});
+
+    const workspace = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);
+    defer std.testing.allocator.free(context);
+
+    try std.testing.expectEqual(@as(usize, 0), context.len);
 }

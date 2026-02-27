@@ -52,12 +52,13 @@ pub const MemoryRecallTool = struct {
             };
             defer mem_root.retrieval.freeCandidates(allocator, candidates);
 
-            if (candidates.len == 0) {
+            const visible_candidates = countVisibleCandidates(candidates);
+            if (visible_candidates == 0) {
                 const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
                 return ToolResult{ .success = true, .output = msg };
             }
 
-            return formatCandidates(allocator, candidates);
+            return formatCandidates(allocator, candidates, visible_candidates);
         }
 
         const entries = m.recall(allocator, query, limit, null) catch |err| {
@@ -66,27 +67,50 @@ pub const MemoryRecallTool = struct {
         };
         defer mem_root.freeEntries(allocator, entries);
 
-        if (entries.len == 0) {
+        const visible_entries = countVisibleEntries(entries);
+        if (visible_entries == 0) {
             const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
             return ToolResult{ .success = true, .output = msg };
         }
 
-        return formatEntries(allocator, entries);
+        return formatEntries(allocator, entries, visible_entries);
     }
 
-    fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry) !ToolResult {
+    fn countVisibleEntries(entries: []const MemoryEntry) usize {
+        var count: usize = 0;
+        for (entries) |entry| {
+            if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn countVisibleCandidates(candidates: []const mem_root.RetrievalCandidate) usize {
+        var count: usize = 0;
+        for (candidates) |cand| {
+            if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize) !ToolResult {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.appendSlice(allocator, "Found ");
         var count_buf: [20]u8 = undefined;
-        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{entries.len}) catch "?";
+        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{visible_count}) catch "?";
         try buf.appendSlice(allocator, count_str);
-        try buf.appendSlice(allocator, if (entries.len == 1) " memory:\n" else " memories:\n");
+        try buf.appendSlice(allocator, if (visible_count == 1) " memory:\n" else " memories:\n");
 
+        var shown_idx: usize = 0;
         for (entries, 0..) |entry, i| {
+            _ = i;
+            if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
             var idx_buf: [20]u8 = undefined;
-            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i + 1}) catch "?";
+            shown_idx += 1;
+            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
             try buf.appendSlice(allocator, idx_str);
             try buf.appendSlice(allocator, ". [");
             try buf.appendSlice(allocator, entry.key);
@@ -100,19 +124,27 @@ pub const MemoryRecallTool = struct {
         return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 
-    fn formatCandidates(allocator: std.mem.Allocator, candidates: []const mem_root.RetrievalCandidate) !ToolResult {
+    fn formatCandidates(
+        allocator: std.mem.Allocator,
+        candidates: []const mem_root.RetrievalCandidate,
+        visible_count: usize,
+    ) !ToolResult {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.appendSlice(allocator, "Found ");
         var count_buf: [20]u8 = undefined;
-        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{candidates.len}) catch "?";
+        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{visible_count}) catch "?";
         try buf.appendSlice(allocator, count_str);
-        try buf.appendSlice(allocator, if (candidates.len == 1) " memory:\n" else " memories:\n");
+        try buf.appendSlice(allocator, if (visible_count == 1) " memory:\n" else " memories:\n");
 
+        var shown_idx: usize = 0;
         for (candidates, 0..) |cand, i| {
+            _ = i;
+            if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
             var idx_buf: [20]u8 = undefined;
-            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i + 1}) catch "?";
+            shown_idx += 1;
+            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
             try buf.appendSlice(allocator, idx_str);
             try buf.appendSlice(allocator, ". [");
             try buf.appendSlice(allocator, cand.key);
@@ -192,4 +224,26 @@ test "memory_recall with custom limit" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
+}
+
+test "memory_recall filters internal bootstrap keys" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("__bootstrap.prompt.SOUL.md", "internal-soul", .core, null);
+    try mem.store("user_pref", "loves zig", .core, null);
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\": \"zig\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_pref") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.SOUL.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-soul") == null);
 }

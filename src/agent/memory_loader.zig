@@ -35,26 +35,15 @@ fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
 }
 
 fn isInternalMemoryKey(key: []const u8) bool {
-    return std.mem.startsWith(u8, key, "autosave_user_") or
-        std.mem.startsWith(u8, key, "autosave_assistant_") or
-        std.mem.eql(u8, key, "last_hygiene_at");
+    return memory_mod.isInternalMemoryKey(key);
 }
 
 fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, content, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "**")) return null;
-    const rest = trimmed[2..];
-    const suffix = std.mem.indexOf(u8, rest, "**:") orelse return null;
-    if (suffix == 0) return null;
-    return rest[0..suffix];
+    return memory_mod.extractMarkdownMemoryKey(content);
 }
 
 fn isInternalMemoryEntry(entry: MemoryEntry) bool {
-    if (isInternalMemoryKey(entry.key)) return true;
-    if (extractMarkdownMemoryKey(entry.content)) |extracted| {
-        if (isInternalMemoryKey(extracted)) return true;
-    }
-    return false;
+    return memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content);
 }
 
 fn sanitizeMemoryText(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -371,6 +360,24 @@ test "loadContext filters markdown-encoded internal entries" {
 
     try std.testing.expect(std.mem.indexOf(u8, context, "last_hygiene_at") == null);
     try std.testing.expect(std.mem.indexOf(u8, context, "**Name**: User") != null);
+}
+
+test "loadContext filters bootstrap prompt internal keys" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("__bootstrap.prompt.SOUL.md", "persona-internal", .core, null);
+    try mem.store("user_goal", "ship reliable builds", .core, null);
+
+    const context = try loadContext(allocator, mem, "ship", null);
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "user_goal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "__bootstrap.prompt.SOUL.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "persona-internal") == null);
 }
 
 test "loadContextWithRuntime returns empty when only internal entries match" {
