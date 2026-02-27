@@ -76,6 +76,7 @@ pub const Config = struct {
     config_path: []const u8,
 
     // Top-level fields
+    workspace_dir_override: ?[]const u8 = null, // User-specified workspace path (if set, overrides default)
     providers: []const ProviderEntry = &.{},
     audio_media: AudioMediaConfig = .{},
     default_provider: []const u8 = "openrouter",
@@ -173,6 +174,10 @@ pub const Config = struct {
         self.gateway_port = self.gateway.port;
         self.workspace_only = self.autonomy.workspace_only;
         self.max_actions_per_hour = self.autonomy.max_actions_per_hour;
+        // apply workspace override if the JSON parsed one
+        if (self.workspace_dir_override != null) {
+            self.workspace_dir = self.workspace_dir_override.?;
+        }
     }
 
     pub fn load(backing_allocator: std.mem.Allocator) !Config {
@@ -189,10 +194,10 @@ pub const Config = struct {
 
         const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
-        const workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+        const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
         var cfg = Config{
-            .workspace_dir = workspace_dir,
+            .workspace_dir = default_workspace_dir, // temporarily set to default
             .config_path = config_path,
             .allocator = allocator,
             .arena = arena_ptr,
@@ -204,10 +209,21 @@ pub const Config = struct {
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
             cfg.parseJson(content) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => {}, // malformed JSON — use defaults for unparsed fields
+                else => {
+                    // Log parse errors so users can diagnose corrupted or
+                    // invalid configuration files. We still fall back to
+                    // defaults so the CLI remains usable, but the warning
+                    // makes the problem visible during debugging.
+                    std.debug.print("Warning: failed to parse config.json: {s}\n", .{@errorName(err)});
+                },
             };
         } else |_| {
             // Config file doesn't exist yet — use defaults
+        }
+
+        // Use workspace_dir_override if set, otherwise use default
+        if (cfg.workspace_dir_override != null) {
+            cfg.workspace_dir = cfg.workspace_dir_override.?;
         }
 
         // Environment variable overrides
@@ -462,6 +478,16 @@ pub const Config = struct {
         try w.print("{{\n", .{});
 
         // Top-level fields
+        if (self.workspace_dir_override) |workspace| {
+            // JSON-escape the workspace string so backslashes, quotes etc. are
+            // handled correctly. Previously we just printed with "{s}" which
+            // could produce invalid JSON when the path contained a backslash or
+            // other special character. Use our helper to stringify any value
+            // inline instead.
+            try w.print("  \"workspace\": ", .{});
+            try writePrettyJsonInline(self.allocator, w, workspace, "");
+            try w.print(",\n", .{});
+        }
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
@@ -777,6 +803,7 @@ test "json parse roundtrip" {
 
     const json =
         \\{
+        \\  "workspace": "/custom/path",
         \\  "default_temperature": 0.5,
         \\  "models": {"providers": {"anthropic": {"api_key": "sk-test"}}},
         \\  "agents": {"defaults": {"model": {"primary": "anthropic/claude-opus-4"}, "heartbeat": {"every": "15m"}}},
@@ -796,6 +823,9 @@ test "json parse roundtrip" {
     try cfg.parseJson(json);
     cfg.syncFlatFields();
 
+    try std.testing.expectEqualStrings("/custom/path", cfg.workspace_dir_override.?);
+    try std.testing.expectEqualStrings("/custom/path", cfg.workspace_dir);
+
     try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
@@ -809,6 +839,7 @@ test "json parse roundtrip" {
     try std.testing.expect(!cfg.memory.auto_save);
     try std.testing.expect(!cfg.memory_auto_save);
     try std.testing.expectEqual(@as(u16, 9090), cfg.gateway.port);
+
     try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);
     try std.testing.expectEqual(AutonomyLevel.full, cfg.autonomy.level);
     try std.testing.expect(!cfg.autonomy.workspace_only);
@@ -818,16 +849,8 @@ test "json parse roundtrip" {
     try std.testing.expect(cfg.cost.enabled);
     try std.testing.expectEqual(@as(f64, 25.0), cfg.cost.daily_limit_usd);
 
-    // Clean up allocated strings
-    allocator.free(cfg.default_provider);
-    allocator.free(cfg.default_model.?);
-    for (cfg.providers) |e| {
-        allocator.free(e.name);
-        if (e.api_key) |k| allocator.free(k);
-        if (e.base_url) |b| allocator.free(b);
-    }
-    allocator.free(cfg.providers);
-    allocator.free(cfg.memory.backend);
+    // cleanup
+    cfg.deinit();
     allocator.free(cfg.gateway.host);
     allocator.free(cfg.runtime.kind);
 }
@@ -1920,6 +1943,60 @@ test "parse agents.defaults.model.primary" {
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     allocator.free(cfg.default_provider);
     allocator.free(cfg.default_model.?);
+}
+
+// verify that workspace override field (with backslashes) does not
+// crash parsing and the default model is still picked up.
+test "parse with workspace override" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "workspace": "C:\\\\Users\\\\menger\\\\Desktop\\\\myspace",
+        \\  "agents": {"defaults": {"model": {"primary": "glm/glm-4.7"}}}
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("glm", cfg.default_provider);
+    try std.testing.expectEqualStrings("glm-4.7", cfg.default_model.?);
+    try std.testing.expectEqualStrings("C:\\Users\\menger\\Desktop\\myspace", cfg.workspace_dir_override.?);
+}
+
+// roundtrip save/load should retain model and workspace override
+// and produce valid JSON that can be parsed back.
+test "save and load roundtrip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    // some settings
+    cfg.default_provider = try allocator.dupe(u8, "glm");
+    cfg.default_model = try allocator.dupe(u8, "glm-4.7");
+    cfg.workspace_dir_override = try allocator.dupe(u8, "C:\\Users\\menger\\Desktop\\myspace");
+
+    try cfg.save();
+
+    // load back
+    var cfg2 = Config.load(allocator) catch {
+        // should not fail for a valid file
+        try std.testing.expect(false);
+        unreachable;
+    };
+    defer cfg2.deinit();
+
+    try std.testing.expectEqualStrings("glm", cfg2.default_provider);
+    try std.testing.expectEqualStrings("glm-4.7", cfg2.default_model.?);
+    try std.testing.expectEqualStrings("C:\\Users\\menger\\Desktop\\myspace", cfg2.workspace_dir_override.?);
 }
 
 test "parse agents.list with model object" {
