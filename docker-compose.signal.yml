@@ -1,12 +1,12 @@
-# Signal channel + Cloudflare tunnel overlay.
+# Signal channel overlay for dockerized signal-cli.
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.signal.yml --profile gateway up -d
 #
 # Prerequisites:
-#   1. Copy .env.signal.example → .env.signal and fill in secrets
+#   1. Create .env.signal and fill in secrets
 #   2. Link signal-cli device (signal-cli link, then scan QR with Signal app)
-#   3. Reconfigure Cloudflare tunnel to route to localhost:3000
+#   3. Optional: set SIGNAL_USE_REST_API=1 and SIGNAL_CLI_MODE=normal
 
 services:
   signal-cli:
@@ -16,7 +16,7 @@ services:
     volumes:
       - ${HOME}/.local/share/signal-cli:/home/.local/share/signal-cli
     environment:
-      - MODE=json-rpc
+      - MODE=${SIGNAL_CLI_MODE:-json-rpc}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/health"]
@@ -39,6 +39,7 @@ services:
       - ./config.signal.json:/nullclaw-data/.nullclaw/config.json:ro
     environment:
       - NULLCLAW_CONFIG=/nullclaw-data/.nullclaw/config.json
+      - SIGNAL_USE_REST_API=${SIGNAL_USE_REST_API:-0}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 30s
