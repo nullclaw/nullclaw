@@ -174,10 +174,6 @@ pub const Config = struct {
         self.gateway_port = self.gateway.port;
         self.workspace_only = self.autonomy.workspace_only;
         self.max_actions_per_hour = self.autonomy.max_actions_per_hour;
-        // apply workspace override if the JSON parsed one
-        if (self.workspace_dir_override != null) {
-            self.workspace_dir = self.workspace_dir_override.?;
-        }
     }
 
     pub fn load(backing_allocator: std.mem.Allocator) !Config {
@@ -807,7 +803,6 @@ fn normalizePathSeparators(allocator: std.mem.Allocator, path: []const u8) ![]co
     }
     return dup;
 }
-
 
 test "json parse roundtrip" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1545,6 +1540,20 @@ test "syncFlatFields propagates nested values" {
     try std.testing.expectEqual(@as(u16, 9999), cfg.gateway_port);
     try std.testing.expect(!cfg.workspace_only);
     try std.testing.expectEqual(@as(u32, 999), cfg.max_actions_per_hour);
+}
+
+test "syncFlatFields keeps explicit workspace_dir" {
+    var cfg = Config{
+        .workspace_dir = "/workspace/from-env",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.workspace_dir_override = "/workspace/from-json";
+
+    cfg.syncFlatFields();
+
+    try std.testing.expectEqualStrings("/workspace/from-env", cfg.workspace_dir);
+    try std.testing.expectEqualStrings("/workspace/from-json", cfg.workspace_dir_override.?);
 }
 
 // ── Security-critical defaults ───────────────────────────────────
