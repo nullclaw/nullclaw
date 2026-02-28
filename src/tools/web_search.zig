@@ -229,8 +229,8 @@ fn executeWithProvider(
             return search_providers.exa.execute(allocator, query, count, api_key, self.timeout_secs);
         },
         .jina => {
-            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "JINA_API_KEY", "WEB_SEARCH_API_KEY" });
-            defer if (api_key) |key| allocator.free(key);
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "JINA_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
             return search_providers.jina.execute(allocator, query, api_key, self.timeout_secs);
         },
     }
