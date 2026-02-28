@@ -276,25 +276,14 @@ pub const SessionManager = struct {
     /// Each session is reloaded under its own lock to avoid in-flight turn races.
     pub fn reloadSkillsAll(self: *SessionManager) ReloadSkillsResult {
         self.mutex.lock();
-        const count = self.sessions.count();
-        var sessions_snapshot = self.allocator.alloc(*Session, count) catch {
-            self.mutex.unlock();
-            return .{ .sessions_seen = count, .failures = count };
-        };
-        var idx: usize = 0;
+        defer self.mutex.unlock();
+
+        var result = ReloadSkillsResult{};
+
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
-            sessions_snapshot[idx] = entry.value_ptr.*;
-            idx += 1;
-        }
-        self.mutex.unlock();
-        defer self.allocator.free(sessions_snapshot);
-
-        var result = ReloadSkillsResult{
-            .sessions_seen = sessions_snapshot.len,
-        };
-
-        for (sessions_snapshot) |session| {
+            const session = entry.value_ptr.*;
+            result.sessions_seen += 1;
             session.mutex.lock();
             session.agent.has_system_prompt = false;
             session.mutex.unlock();
