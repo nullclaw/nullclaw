@@ -18,7 +18,7 @@
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
 ```
-678 KB binary · <2 ms startup · 3,230+ tests · 22+ providers · 17 channels · Pluggable everything
+678 KB binary · <2 ms startup · 3,230+ tests · 22+ providers · 18 channels · Pluggable everything
 ```
 
 ### Features
@@ -27,7 +27,7 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 22+ providers, 17 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 22+ providers, 18 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
 ### Why nullclaw
 
@@ -129,7 +129,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
 | **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, WhatsApp, Line, Lark/Feishu, OneBot, QQ, Matrix, IRC, iMessage, Email, DingTalk, MaixCam, Webhook | Any messaging API |
+| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, and more | Any capability |
 | **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
@@ -189,6 +189,30 @@ nullclaw enforces security at **every layer**.
 - Empty allowlist = **deny all inbound messages**
 - `"*"` = **allow all** (explicit opt-in)
 - Otherwise = exact-match allowlist
+
+Nostr additionally: the `owner_pubkey` is **always** allowed regardless of `dm_allowed_pubkeys`. Private keys are encrypted at rest via SecretStore (`enc2:` prefix) and only decrypted into memory while the channel is running; zeroed on channel stop.
+
+### Nostr Channel Setup
+
+`nullclaw` speaks Nostr natively via NIP-17 (gift-wrapped private DMs) and NIP-04 (legacy DMs), using [`nak`](https://github.com/fiatjaf/nak).
+
+**Prerequisites:** Install `nak` and ensure it's in your `$PATH`.
+
+**Setup via onboarding wizard:**
+
+```bash
+nullclaw onboard --interactive   # Step 7 configures Nostr
+```
+
+The wizard will:
+1. Generate a new keypair for your bot and encrypt it with ChaCha20-Poly1305
+2. Ask for your (owner) pubkey (npub or hex) — always allowed through DM policy
+3. Configure relays and DM relays (kind:10050 inbox)
+4. Display the bot's pubkey
+
+Or configure manually in the [config](#configuration).
+
+**How it works:** On startup, nullclaw announces its DM inbox relays (kind:10050), then listens for incoming NIP-17 gift wraps and NIP-04 encrypted DMs. Outbound messages mirror the sender's protocol. Multi-relay rumor deduplication prevents duplicate responses when the same message is delivered via multiple relays.
 
 ## Configuration
 
@@ -260,6 +284,16 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
           "allow_from": ["user1"]
         }
       }
+    },
+    "nostr": {
+      "private_key": "enc2:...",
+      "owner_pubkey": "hex-pubkey-of-owner",
+      "relays": ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"],
+      "dm_allowed_pubkeys": ["*"],
+      "display_name": "NullClaw",
+      "about": "AI assistant on Nostr",
+      "nip05": "nullclaw@yourdomain.com",
+      "lnurl": "lnurl1..."
     }
   },
 
@@ -393,7 +427,7 @@ src/
   agent.zig             Agent loop, auto-compaction, tool dispatch
   daemon.zig            Daemon supervisor with exponential backoff
   gateway.zig           HTTP gateway (rate limiting, idempotency, pairing)
-  channels/             18 channel implementations (telegram, signal, matrix, mattermost, discord, slack, whatsapp, line, lark, onebot, qq, ...)
+  channels/             19 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
   providers/            22+ AI provider implementations
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
   tools/                18 tool implementations

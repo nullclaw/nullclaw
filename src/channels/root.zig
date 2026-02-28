@@ -124,6 +124,7 @@ pub const imessage = @import("imessage.zig");
 pub const email = @import("email.zig");
 pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
+pub const nostr = @import("nostr.zig");
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");
