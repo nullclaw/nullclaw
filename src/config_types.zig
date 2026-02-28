@@ -167,6 +167,13 @@ pub const CronConfig = struct {
 
 // ── Channel configs ─────────────────────────────────────────────
 
+pub const TelegramInteractiveConfig = struct {
+    enabled: bool = false,
+    ttl_secs: u64 = 900,
+    owner_only: bool = true,
+    remove_on_click: bool = true,
+};
+
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
@@ -177,6 +184,7 @@ pub const TelegramConfig = struct {
     reply_in_private: bool = true,
     /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
     proxy: ?[]const u8 = null,
+    interactive: TelegramInteractiveConfig = .{},
 };
 
 pub const DiscordConfig = struct {

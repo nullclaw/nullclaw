@@ -458,7 +458,7 @@ pub fn runTelegramLoop(
             };
             defer allocator.free(reply);
 
-            tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
+            tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
                 log.warn("Send error: {}", .{err});
             };
         }

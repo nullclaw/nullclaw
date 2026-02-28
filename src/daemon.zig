@@ -315,6 +315,7 @@ fn mergeSchedulerTickChangesAndSave(
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    scheduler.setShellCwd(config.workspace_dir);
     defer scheduler.deinit();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {

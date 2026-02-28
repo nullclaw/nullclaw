@@ -1847,6 +1847,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, telegram_config.group_allow_from, telegram_config.group_policy);
     tg.proxy = telegram_config.proxy;
     tg.account_id = telegram_config.account_id;
+    tg.interactive = telegram_config.interactive;
 
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
@@ -2026,7 +2027,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             std.debug.print("  -> {s}\n", .{reply});
 
             // Reply on telegram; handles [IMAGE:path] markers + split
-            tg.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
+            tg.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
                 std.debug.print("  Send error: {}\n", .{err});
             };
         }
