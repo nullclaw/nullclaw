@@ -7,7 +7,7 @@ pub const ObserverEvent = union(enum) {
     llm_response: struct { provider: []const u8, model: []const u8, duration_ms: u64, success: bool, error_message: ?[]const u8 },
     agent_end: struct { duration_ms: u64, tokens_used: ?u64 },
     tool_call_start: struct { tool: []const u8 },
-    tool_call: struct { tool: []const u8, duration_ms: u64, success: bool },
+    tool_call: struct { tool: []const u8, duration_ms: u64, success: bool, detail: ?[]const u8 = null },
     tool_iterations_exhausted: struct { iterations: u32 },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
@@ -51,6 +51,15 @@ pub const Observer = struct {
         return self.vtable.name(self.ptr);
     }
 };
+
+const MAX_TOOL_CALL_DETAIL_LEN: usize = 256;
+
+fn detailForObserver(detail: ?[]const u8) ?[]const u8 {
+    const raw = detail orelse return null;
+    if (raw.len == 0) return null;
+    if (raw.len <= MAX_TOOL_CALL_DETAIL_LEN) return raw;
+    return raw[0..MAX_TOOL_CALL_DETAIL_LEN];
+}
 
 // ── NoopObserver ─────────────────────────────────────────────────────
 
@@ -103,7 +112,13 @@ pub const LogObserver = struct {
             .llm_response => |e| std.log.info("llm.response provider={s} model={s} duration_ms={d} success={}", .{ e.provider, e.model, e.duration_ms, e.success }),
             .agent_end => |e| std.log.info("agent.end duration_ms={d}", .{e.duration_ms}),
             .tool_call_start => |e| std.log.info("tool.start tool={s}", .{e.tool}),
-            .tool_call => |e| std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success }),
+            .tool_call => |e| {
+                if (detailForObserver(e.detail)) |detail| {
+                    std.log.info("tool.call tool={s} duration_ms={d} success={} detail={s}", .{ e.tool, e.duration_ms, e.success, detail });
+                } else {
+                    std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success });
+                }
+            },
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
             .turn_complete => std.log.info("turn.complete", .{}),
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
@@ -161,7 +176,11 @@ pub const VerboseObserver = struct {
                 stderr.print("> Tool {s}\n", .{e.tool}) catch {};
             },
             .tool_call => |e| {
-                stderr.print("< Tool {s} (success={}, duration_ms={d})\n", .{ e.tool, e.success, e.duration_ms }) catch {};
+                if (detailForObserver(e.detail)) |detail| {
+                    stderr.print("< Tool {s} (success={}, duration_ms={d}, detail={s})\n", .{ e.tool, e.success, e.duration_ms, detail }) catch {};
+                } else {
+                    stderr.print("< Tool {s} (success={}, duration_ms={d})\n", .{ e.tool, e.success, e.duration_ms }) catch {};
+                }
             },
             .turn_complete => {
                 stderr.print("< Complete\n", .{}) catch {};
@@ -273,7 +292,16 @@ pub const FileObserver = struct {
             .llm_response => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"llm_response\",\"provider\":\"{s}\",\"model\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.provider, e.model, e.duration_ms, e.success }) catch return,
             .agent_end => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"agent_end\",\"duration_ms\":{d}}}", .{e.duration_ms}) catch return,
             .tool_call_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call_start\",\"tool\":\"{s}\"}}", .{e.tool}) catch return,
-            .tool_call => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return,
+            .tool_call => |e| blk: {
+                if (detailForObserver(e.detail)) |detail| {
+                    break :blk std.fmt.bufPrint(
+                        &buf,
+                        "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{},\"detail\":{f}}}",
+                        .{ e.tool, e.duration_ms, e.success, std.json.fmt(detail, .{}) },
+                    ) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return;
+            },
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
@@ -333,6 +361,10 @@ pub const OtelSpan = struct {
     attributes: std.ArrayListUnmanaged(OtelAttribute),
 
     pub fn deinit(self: *OtelSpan, allocator: std.mem.Allocator) void {
+        for (self.attributes.items) |attr| {
+            allocator.free(attr.key);
+            allocator.free(attr.value);
+        }
         self.attributes.deinit(allocator);
     }
 };
@@ -414,7 +446,19 @@ pub const OtelObserver = struct {
 
         var attributes: std.ArrayListUnmanaged(OtelAttribute) = .empty;
         for (attrs) |attr| {
-            attributes.append(self.allocator, attr) catch break;
+            const key_owned = self.allocator.dupe(u8, attr.key) catch break;
+            const value_owned = self.allocator.dupe(u8, attr.value) catch {
+                self.allocator.free(key_owned);
+                break;
+            };
+            attributes.append(self.allocator, .{
+                .key = key_owned,
+                .value = value_owned,
+            }) catch {
+                self.allocator.free(value_owned);
+                self.allocator.free(key_owned);
+                break;
+            };
         }
 
         self.spans.append(self.allocator, .{
@@ -424,7 +468,14 @@ pub const OtelObserver = struct {
             .start_ns = start_ns,
             .end_ns = end_ns,
             .attributes = attributes,
-        }) catch return;
+        }) catch {
+            for (attributes.items) |attr| {
+                self.allocator.free(attr.key);
+                self.allocator.free(attr.value);
+            }
+            attributes.deinit(self.allocator);
+            return;
+        };
 
         if (self.spans.items.len >= max_batch_size) {
             self.flushLocked();
@@ -483,11 +534,20 @@ pub const OtelObserver = struct {
             .tool_call => |e| {
                 var dur_buf: [20]u8 = undefined;
                 const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
-                self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, &.{
-                    .{ .key = "tool", .value = e.tool },
-                    .{ .key = "duration_ms", .value = dur_str },
-                    .{ .key = "success", .value = if (e.success) "true" else "false" },
-                });
+                if (detailForObserver(e.detail)) |detail| {
+                    self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, &.{
+                        .{ .key = "tool", .value = e.tool },
+                        .{ .key = "duration_ms", .value = dur_str },
+                        .{ .key = "success", .value = if (e.success) "true" else "false" },
+                        .{ .key = "detail", .value = detail },
+                    });
+                } else {
+                    self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, &.{
+                        .{ .key = "tool", .value = e.tool },
+                        .{ .key = "duration_ms", .value = dur_str },
+                        .{ .key = "success", .value = if (e.success) "true" else "false" },
+                    });
+                }
             },
             .tool_iterations_exhausted => |e| {
                 var iter_buf: [20]u8 = undefined;
@@ -583,11 +643,10 @@ pub const OtelObserver = struct {
 
             for (span.attributes.items, 0..) |attr, j| {
                 if (j > 0) try w.writeByte(',');
-                try w.writeAll("{\"key\":\"");
-                try w.writeAll(attr.key);
-                try w.writeAll("\",\"value\":{\"stringValue\":\"");
-                try w.writeAll(attr.value);
-                try w.writeAll("\"}}");
+                try w.print(
+                    "{{\"key\":{f},\"value\":{{\"stringValue\":{f}}}}}",
+                    .{ std.json.fmt(attr.key, .{}), std.json.fmt(attr.value, .{}) },
+                );
             }
 
             try w.writeAll("],\"status\":{\"code\":1}}");
@@ -773,6 +832,35 @@ test "FileObserver handles all event types" {
     }
 }
 
+test "FileObserver tool_call detail is persisted as JSON string" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/obs_tool_detail.jsonl", .{base});
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 7,
+        .success = false,
+        .detail = "exit code 1: \"permission denied\"",
+    } };
+    obs.recordEvent(&event);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"detail\":\"exit code 1: \\\"permission denied\\\"\"") != null);
+}
+
 // ── Additional observability tests ──────────────────────────────
 
 test "VerboseObserver does not panic on events" {
@@ -858,6 +946,30 @@ test "ObserverEvent err fields" {
         .err => |e| {
             try std.testing.expectEqualStrings("gateway", e.component);
             try std.testing.expectEqualStrings("connection refused", e.message);
+        },
+        else => unreachable,
+    }
+}
+
+test "ObserverEvent tool_call detail defaults to null" {
+    const event = ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 42, .success = true } };
+    switch (event) {
+        .tool_call => |e| {
+            try std.testing.expectEqualStrings("shell", e.tool);
+            try std.testing.expectEqual(@as(u64, 42), e.duration_ms);
+            try std.testing.expect(e.success);
+            try std.testing.expect(e.detail == null);
+        },
+        else => unreachable,
+    }
+}
+
+test "ObserverEvent tool_call detail carries failure context" {
+    const event = ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = false, .detail = "exit code 1" } };
+    switch (event) {
+        .tool_call => |e| {
+            try std.testing.expect(!e.success);
+            try std.testing.expectEqualStrings("exit code 1", e.detail.?);
         },
         else => unreachable,
     }
@@ -1044,6 +1156,107 @@ test "OtelObserver span attributes" {
     try std.testing.expectEqualStrings("openrouter", span.attributes.items[0].value);
     try std.testing.expectEqualStrings("model", span.attributes.items[1].key);
     try std.testing.expectEqualStrings("claude", span.attributes.items[1].value);
+}
+
+test "OtelObserver tool_call includes detail attribute" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 12,
+        .success = false,
+        .detail = "permission denied",
+    } };
+    obs.recordEvent(&event);
+
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    const span = otel.spans.items[0];
+    try std.testing.expectEqualStrings("tool.call", span.name);
+
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("permission denied", attr.value);
+        }
+    }
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver spans keep independent attribute values" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const first = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 111,
+        .success = false,
+        .detail = "first detail",
+    } };
+    const second = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 222,
+        .success = false,
+        .detail = "second detail",
+    } };
+    obs.recordEvent(&first);
+    obs.recordEvent(&second);
+
+    try std.testing.expectEqual(@as(usize, 2), otel.spans.items.len);
+
+    const first_span = otel.spans.items[0];
+    const second_span = otel.spans.items[1];
+
+    var first_duration: ?[]const u8 = null;
+    var second_duration: ?[]const u8 = null;
+    var first_detail: ?[]const u8 = null;
+    var second_detail: ?[]const u8 = null;
+
+    for (first_span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "duration_ms")) first_duration = attr.value;
+        if (std.mem.eql(u8, attr.key, "detail")) first_detail = attr.value;
+    }
+    for (second_span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "duration_ms")) second_duration = attr.value;
+        if (std.mem.eql(u8, attr.key, "detail")) second_detail = attr.value;
+    }
+
+    try std.testing.expect(first_duration != null);
+    try std.testing.expect(second_duration != null);
+    try std.testing.expect(first_detail != null);
+    try std.testing.expect(second_detail != null);
+    try std.testing.expectEqualStrings("111", first_duration.?);
+    try std.testing.expectEqualStrings("222", second_duration.?);
+    try std.testing.expectEqualStrings("first detail", first_detail.?);
+    try std.testing.expectEqualStrings("second detail", second_detail.?);
+}
+
+test "OtelObserver JSON serialization escapes tool_call detail" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude" } };
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 5,
+        .success = false,
+        .detail = "exit code 1: \"denied\"\nline2",
+    } };
+    obs.recordEvent(&start);
+    obs.recordEvent(&event);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\"denied\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\nline2") != null);
 }
 
 test "OtelObserver JSON serialization" {

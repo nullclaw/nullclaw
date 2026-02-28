@@ -112,14 +112,15 @@ pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
 /// `timeout_secs` sets --max-time. Returns the response body. Caller owns returned memory.
-pub fn curlGetWithProxy(
+fn curlGetWithProxyAndResolve(
     allocator: Allocator,
     url: []const u8,
     headers: []const []const u8,
     timeout_secs: []const u8,
     proxy: ?[]const u8,
+    resolve_entry: ?[]const u8,
 ) ![]u8 {
-    var argv_buf: [40][]const u8 = undefined;
+    var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -135,6 +136,13 @@ pub fn curlGetWithProxy(
         argv_buf[argc] = "--proxy";
         argc += 1;
         argv_buf[argc] = p;
+        argc += 1;
+    }
+
+    if (resolve_entry) |entry| {
+        argv_buf[argc] = "--resolve";
+        argc += 1;
+        argv_buf[argc] = entry;
         argc += 1;
     }
 
@@ -170,6 +178,33 @@ pub fn curlGetWithProxy(
     }
 
     return stdout;
+}
+
+/// HTTP GET via curl subprocess with optional proxy.
+///
+/// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
+/// `timeout_secs` sets --max-time. Returns the response body. Caller owns returned memory.
+pub fn curlGetWithProxy(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    proxy: ?[]const u8,
+) ![]u8 {
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null);
+}
+
+/// HTTP GET via curl subprocess with a pinned host mapping.
+///
+/// `resolve_entry` must be in curl `--resolve` format: `host:port:address`.
+pub fn curlGetWithResolve(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    resolve_entry: []const u8,
+) ![]u8 {
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry);
 }
 
 /// HTTP GET via curl subprocess (no proxy).
@@ -255,5 +290,9 @@ test "curlPost builds correct argv structure" {
 }
 
 test "curlGet compiles and is callable" {
+    try std.testing.expect(true);
+}
+
+test "curlGetWithResolve compiles and is callable" {
     try std.testing.expect(true);
 }

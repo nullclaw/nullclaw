@@ -1,0 +1,4 @@
+zig build -Doptimize=ReleaseSmall
+zig-out/bin/nullclaw service stop
+zig-out/bin/nullclaw service start
+journalctl --user -u nullclaw -f

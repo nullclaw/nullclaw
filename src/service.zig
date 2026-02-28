@@ -229,6 +229,11 @@ fn installLinux(allocator: std.mem.Allocator) !void {
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
 
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+    const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    defer allocator.free(config_dir);
+
     const content = try std.fmt.allocPrint(allocator,
         \\[Unit]
         \\Description=nullclaw gateway runtime
@@ -239,10 +244,11 @@ fn installLinux(allocator: std.mem.Allocator) !void {
         \\ExecStart={s} gateway
         \\Restart=always
         \\RestartSec=3
+        \\EnvironmentFile=-{s}/.env
         \\
         \\[Install]
         \\WantedBy=default.target
-    , .{exe_path});
+    , .{ exe_path, config_dir });
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(unit, .{});

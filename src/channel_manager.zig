@@ -348,7 +348,7 @@ pub const ChannelManager = struct {
     /// Monitoring loop: check health, restart failed channels with backoff.
     /// Blocks until shutdown.
     pub fn supervisionLoop(self: *ChannelManager, state: *daemon.DaemonState) void {
-        const STALE_THRESHOLD_SECS: i64 = 90;
+        const STALE_THRESHOLD_SECS: i64 = 600;
         const WATCH_INTERVAL_SECS: u64 = 10;
 
         while (!daemon.isShutdownRequested()) {

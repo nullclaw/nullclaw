@@ -1178,6 +1178,7 @@ pub const Agent = struct {
                     .tool = call.name,
                     .duration_ms = tool_duration,
                     .success = result.success,
+                    .detail = if (result.success) null else result.output,
                 } };
                 self.observer.recordEvent(&tool_event);
 
@@ -1377,8 +1378,10 @@ pub const Agent = struct {
             }
         }
 
+        const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
+
         for (self.tools) |t| {
-            if (std.mem.eql(u8, t.name(), call.name)) {
+            if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
                     std.json.Value,
