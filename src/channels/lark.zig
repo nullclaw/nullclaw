@@ -1,23 +1,39 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const bus = @import("../bus.zig");
+const websocket = @import("../websocket.zig");
 
-/// Lark/Feishu channel — receives events via HTTP callback, sends via Open API.
+const log = std.log.scoped(.lark);
+
+const SocketFd = std.net.Stream.Handle;
+const invalid_socket: SocketFd = switch (builtin.os.tag) {
+    .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+    else => -1,
+};
+
+/// Lark/Feishu channel — receives events via WebSocket or HTTP callback, sends via Open API.
 ///
 /// Supports two regional endpoints (configured via `use_feishu`):
 /// - **Feishu** (default): CN endpoints at `open.feishu.cn`
 /// - **Lark**: International endpoints at `open.larksuite.com`
-///
-/// TODO: WebSocket long-connection mode (too complex for now, use HTTP webhook).
 pub const LarkChannel = struct {
     allocator: std.mem.Allocator,
+    account_id: []const u8 = "default",
     app_id: []const u8,
     app_secret: []const u8,
     verification_token: []const u8,
     port: u16,
     allow_from: []const []const u8,
+    receive_mode: config_types.LarkReceiveMode = .websocket,
     /// When true, use Feishu (CN) endpoints; when false, use Lark (international).
     use_feishu: bool = true,
+    event_bus: ?*bus.Bus = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ws_thread: ?std.Thread = null,
+    ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     /// Cached tenant access token (heap-allocated, owned by allocator).
     cached_token: ?[]const u8 = null,
     /// Epoch seconds when cached_token expires.
@@ -53,6 +69,8 @@ pub const LarkChannel = struct {
             cfg.port orelse 9000,
             cfg.allow_from,
         );
+        ch.account_id = cfg.account_id;
+        ch.receive_mode = cfg.receive_mode;
         ch.use_feishu = cfg.use_feishu;
         return ch;
     }
@@ -68,6 +86,10 @@ pub const LarkChannel = struct {
 
     pub fn isUserAllowed(self: *const LarkChannel, open_id: []const u8) bool {
         return root.isAllowedExact(self.allow_from, open_id);
+    }
+
+    pub fn setBus(self: *LarkChannel, b: *bus.Bus) void {
+        self.event_bus = b;
     }
 
     /// Parse a Lark event callback payload and extract text messages.
@@ -179,8 +201,11 @@ pub const LarkChannel = struct {
         return result.toOwnedSlice(allocator);
     }
 
-    pub fn healthCheck(_: *LarkChannel) bool {
-        return true;
+    pub fn healthCheck(self: *LarkChannel) bool {
+        return switch (self.receive_mode) {
+            .webhook => self.running.load(.acquire),
+            .websocket => self.running.load(.acquire) and self.connected.load(.acquire),
+        };
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -355,14 +380,266 @@ pub const LarkChannel = struct {
         }
     }
 
+    fn websocketHost(self: *const LarkChannel) []const u8 {
+        return if (self.use_feishu) "open.feishu.cn" else "open.larksuite.com";
+    }
+
+    fn appendUrlQueryEscaped(writer: anytype, input: []const u8) !void {
+        for (input) |c| {
+            const is_unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+            if (is_unreserved) {
+                try writer.writeByte(c);
+            } else {
+                try writer.print("%{X:0>2}", .{c});
+            }
+        }
+    }
+
+    fn buildWebsocketPath(buf: []u8, app_id: []const u8, app_access_token: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll("/ws/v2?app_id=");
+        try appendUrlQueryEscaped(w, app_id);
+        try w.writeAll("&access_token=");
+        try appendUrlQueryEscaped(w, app_access_token);
+        return fbs.getWritten();
+    }
+
+    fn buildWebsocketPong(buf: []u8, ts: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll("{\"type\":\"pong\",\"ts\":");
+        try root.appendJsonStringW(w, ts);
+        try w.writeAll("}");
+        return fbs.getWritten();
+    }
+
+    fn buildWebsocketAck(buf: []u8, uuid: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll("{\"uuid\":");
+        try root.appendJsonStringW(w, uuid);
+        try w.writeAll("}");
+        return fbs.getWritten();
+    }
+
+    fn fetchAppAccessToken(self: *LarkChannel) ![]const u8 {
+        const base = self.apiBase();
+
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/auth/v3/app_access_token/internal", .{base});
+        const url = url_fbs.getWritten();
+
+        var body_buf: [512]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        try body_fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
+        const body = body_fbs.getWritten();
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+            },
+            .response_writer = &aw.writer,
+        }) catch return error.LarkApiError;
+
+        if (result.status != .ok) return error.LarkApiError;
+
+        const resp_body = aw.writer.buffer[0..aw.writer.end];
+        if (resp_body.len == 0) return error.LarkApiError;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.LarkApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.LarkApiError;
+
+        const token_val = parsed.value.object.get("app_access_token") orelse return error.LarkApiError;
+        if (token_val != .string) return error.LarkApiError;
+        return self.allocator.dupe(u8, token_val.string);
+    }
+
+    fn publishInboundMessage(self: *LarkChannel, msg: ParsedLarkMessage) void {
+        var key_buf: [256]u8 = undefined;
+        const session_key = std.fmt.bufPrint(&key_buf, "lark:{s}", .{msg.sender}) catch "lark:unknown";
+
+        var meta_buf: [384]u8 = undefined;
+        var meta_fbs = std.io.fixedBufferStream(&meta_buf);
+        const mw = meta_fbs.writer();
+        mw.writeAll("{\"account_id\":") catch return;
+        root.appendJsonStringW(mw, self.account_id) catch return;
+        mw.writeAll(",\"peer_kind\":") catch return;
+        root.appendJsonStringW(mw, if (msg.is_group) "group" else "direct") catch return;
+        mw.writeAll(",\"peer_id\":") catch return;
+        root.appendJsonStringW(mw, msg.sender) catch return;
+        mw.writeAll("}") catch return;
+        const metadata = meta_fbs.getWritten();
+
+        const inbound = bus.makeInboundFull(
+            self.allocator,
+            "lark",
+            msg.sender,
+            msg.sender,
+            msg.content,
+            session_key,
+            &.{},
+            metadata,
+        ) catch |err| {
+            log.warn("lark makeInboundFull failed: {}", .{err});
+            return;
+        };
+
+        if (self.event_bus) |eb| {
+            eb.publishInbound(inbound) catch |err| {
+                log.warn("lark publishInbound failed: {}", .{err});
+                inbound.deinit(self.allocator);
+            };
+        } else {
+            inbound.deinit(self.allocator);
+        }
+    }
+
+    fn handleWebsocketPayload(self: *LarkChannel, ws: *websocket.WsClient, payload: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch null;
+        if (parsed) |pp| {
+            var p = pp;
+            defer p.deinit();
+            if (p.value == .object) {
+                if (p.value.object.get("type")) |type_val| {
+                    if (type_val == .string and std.mem.eql(u8, type_val.string, "ping")) {
+                        const ts = if (p.value.object.get("ts")) |ts_val|
+                            (if (ts_val == .string) ts_val.string else "0")
+                        else
+                            "0";
+                        var pong_buf: [128]u8 = undefined;
+                        const pong = buildWebsocketPong(&pong_buf, ts) catch return;
+                        ws.writeText(pong) catch |err| {
+                            log.warn("lark websocket pong failed: {}", .{err});
+                        };
+                        return;
+                    }
+                }
+
+                if (p.value.object.get("uuid")) |uuid_val| {
+                    if (uuid_val == .string) {
+                        var ack_buf: [160]u8 = undefined;
+                        const ack = buildWebsocketAck(&ack_buf, uuid_val.string) catch return;
+                        ws.writeText(ack) catch |err| {
+                            log.warn("lark websocket ack failed: {}", .{err});
+                        };
+                    }
+                }
+            }
+        }
+
+        const messages = try self.parseEventPayload(self.allocator, payload);
+        defer if (messages.len > 0) {
+            for (messages) |*m| m.deinit(self.allocator);
+            self.allocator.free(messages);
+        };
+
+        for (messages) |m| {
+            self.publishInboundMessage(m);
+        }
+    }
+
+    fn runWebsocketOnce(self: *LarkChannel) !void {
+        const app_access_token = try self.fetchAppAccessToken();
+        defer self.allocator.free(app_access_token);
+
+        var path_buf: [1024]u8 = undefined;
+        const path = try buildWebsocketPath(&path_buf, self.app_id, app_access_token);
+
+        var ws = try websocket.WsClient.connect(
+            self.allocator,
+            self.websocketHost(),
+            443,
+            path,
+            &.{},
+        );
+
+        self.ws_fd.store(ws.stream.handle, .release);
+        self.connected.store(true, .release);
+        defer {
+            self.connected.store(false, .release);
+            self.ws_fd.store(invalid_socket, .release);
+            ws.deinit();
+        }
+
+        while (self.running.load(.acquire)) {
+            const maybe_text = ws.readTextMessage() catch |err| {
+                log.warn("lark websocket read failed: {}", .{err});
+                break;
+            };
+            const text = maybe_text orelse break;
+            defer self.allocator.free(text);
+
+            self.handleWebsocketPayload(&ws, text) catch |err| {
+                log.warn("lark websocket payload handling failed: {}", .{err});
+            };
+        }
+    }
+
+    fn websocketLoop(self: *LarkChannel) void {
+        while (self.running.load(.acquire)) {
+            self.runWebsocketOnce() catch |err| {
+                if (self.running.load(.acquire)) {
+                    log.warn("lark websocket cycle failed: {}", .{err});
+                }
+            };
+
+            if (!self.running.load(.acquire)) break;
+
+            var slept_ms: u64 = 0;
+            while (slept_ms < 5000 and self.running.load(.acquire)) {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                slept_ms += 100;
+            }
+        }
+    }
+
     fn vtableStart(ptr: *anyopaque) anyerror!void {
-        _ = ptr;
-        // Lark: receives events via HTTP callback; no persistent connection.
-        // TODO: WebSocket long-connection mode
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        if (self.running.load(.acquire)) return;
+        self.running.store(true, .release);
+
+        if (self.receive_mode == .webhook) {
+            self.connected.store(true, .release);
+            return;
+        }
+
+        self.connected.store(false, .release);
+        self.ws_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, websocketLoop, .{self}) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
     }
 
     fn vtableStop(ptr: *anyopaque) void {
-        _ = ptr;
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        self.running.store(false, .release);
+        self.connected.store(false, .release);
+
+        const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
+        if (fd != invalid_socket) {
+            if (comptime builtin.os.tag == .windows) {
+                _ = std.os.windows.ws2_32.closesocket(fd);
+            } else {
+                std.posix.close(fd);
+            }
+        }
+
+        if (self.ws_thread) |t| {
+            t.join();
+            self.ws_thread = null;
+        }
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
@@ -778,6 +1055,59 @@ test "lark apiBase returns larksuite URL when use_feishu is false" {
     try std.testing.expectEqualStrings("https://open.larksuite.com/open-apis", ch.apiBase());
 }
 
+test "lark websocketHost follows region" {
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    ch.use_feishu = true;
+    try std.testing.expectEqualStrings("open.feishu.cn", ch.websocketHost());
+    ch.use_feishu = false;
+    try std.testing.expectEqualStrings("open.larksuite.com", ch.websocketHost());
+}
+
+test "lark buildWebsocketPath formats query parameters" {
+    var buf: [256]u8 = undefined;
+    const path = try LarkChannel.buildWebsocketPath(&buf, "cli_app", "tok_123");
+    try std.testing.expectEqualStrings("/ws/v2?app_id=cli_app&access_token=tok_123", path);
+}
+
+test "lark websocket pong and ack payload format" {
+    var pong_buf: [128]u8 = undefined;
+    const pong = try LarkChannel.buildWebsocketPong(&pong_buf, "123456");
+    try std.testing.expectEqualStrings("{\"type\":\"pong\",\"ts\":\"123456\"}", pong);
+
+    var ack_buf: [128]u8 = undefined;
+    const ack = try LarkChannel.buildWebsocketAck(&ack_buf, "uuid-1");
+    try std.testing.expectEqualStrings("{\"uuid\":\"uuid-1\"}", ack);
+}
+
+test "lark initFromConfig stores account and receive mode" {
+    const cfg = config_types.LarkConfig{
+        .account_id = "lark-main",
+        .app_id = "cli_abc",
+        .app_secret = "sec_xyz",
+        .receive_mode = .webhook,
+        .use_feishu = true,
+    };
+    const ch = LarkChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("lark-main", ch.account_id);
+    try std.testing.expect(ch.receive_mode == .webhook);
+    try std.testing.expect(ch.use_feishu);
+}
+
+test "lark healthCheck reflects receive mode state" {
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    ch.receive_mode = .websocket;
+    ch.running.store(true, .release);
+    ch.connected.store(false, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.connected.store(true, .release);
+    try std.testing.expect(ch.healthCheck());
+
+    ch.receive_mode = .webhook;
+    ch.connected.store(false, .release);
+    try std.testing.expect(ch.healthCheck());
+}
+
 test "lark parsePostContent extracts text from single tag" {
     const allocator = std.testing.allocator;
     const post_json =
@@ -931,4 +1261,208 @@ test "lark stripAtPlaceholders preserves normal @ mentions" {
     const result = try stripAtPlaceholders(allocator, "Hello @john how are you?");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Hello @john how are you?", result);
+}
+// ════════════════════════════════════════════════════════════════════════════
+// WebSocket Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "lark receive_mode defaults to websocket" {
+    const ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    try std.testing.expect(ch.receive_mode == .websocket);
+}
+
+test "lark healthCheck webhook mode only checks running" {
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    ch.receive_mode = .webhook;
+
+    // In webhook mode, only running state matters
+    ch.running.store(false, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(ch.healthCheck());
+}
+
+test "lark healthCheck websocket mode requires both running and connected" {
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    ch.receive_mode = .websocket;
+
+    // Test all combinations
+    ch.running.store(false, .release);
+    ch.connected.store(false, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(false, .release);
+    ch.connected.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    ch.connected.store(false, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    ch.connected.store(true, .release);
+    try std.testing.expect(ch.healthCheck());
+}
+
+test "lark buildWebsocketPath handles special characters in token" {
+    var buf: [512]u8 = undefined;
+    const path = try LarkChannel.buildWebsocketPath(&buf, "app_id_with_special_chars", "token+with/special=chars");
+    try std.testing.expectEqualStrings(
+        "/ws/v2?app_id=app_id_with_special_chars&access_token=token%2Bwith%2Fspecial%3Dchars",
+        path,
+    );
+}
+
+test "lark buildWebsocketPong handles empty timestamp" {
+    var pong_buf: [128]u8 = undefined;
+    const pong = try LarkChannel.buildWebsocketPong(&pong_buf, "");
+    try std.testing.expectEqualStrings("{\"type\":\"pong\",\"ts\":\"\"}", pong);
+}
+
+test "lark buildWebsocketAck handles empty uuid" {
+    var ack_buf: [128]u8 = undefined;
+    const ack = try LarkChannel.buildWebsocketAck(&ack_buf, "");
+    try std.testing.expectEqualStrings("{\"uuid\":\"\"}", ack);
+}
+
+test "lark buildWebsocketPong handles unicode timestamp" {
+    var pong_buf: [128]u8 = undefined;
+    const pong = try LarkChannel.buildWebsocketPong(&pong_buf, "1234567890");
+    try std.testing.expectEqualStrings("{\"type\":\"pong\",\"ts\":\"1234567890\"}", pong);
+}
+
+test "lark parseEventPayload handles websocket message format" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    // WebSocket payload format includes uuid field
+    const payload =
+        \\{"uuid":"uuid-123-456","header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"text","content":"{\"text\":\"websocket message\"}","chat_id":"oc_chat","create_time":"1700000000000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expectEqualStrings("websocket message", msgs[0].content);
+    try std.testing.expectEqualStrings("oc_chat", msgs[0].sender);
+    try std.testing.expectEqual(@as(u64, 1_700_000_000), msgs[0].timestamp);
+}
+
+test "lark parseEventPayload handles websocket message with mentions" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    // WebSocket payload with mentions array
+    const payload =
+        \\{"uuid":"msg-uuid-789","header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_group_user"}},"message":{"message_type":"text","content":"{\"text\":\"@_user_1 Hello everyone\"}","chat_type":"group","mentions":[{"key":"@_user_1","id":{"open_id":"ou_bot"}}],"chat_id":"oc_group_chat","create_time":"1000000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(msgs[0].is_group);
+    // Should strip @_user_1 placeholder
+    try std.testing.expectEqualStrings("Hello everyone", msgs[0].content);
+}
+
+test "lark websocketHost returns correct host for feishu" {
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    ch.use_feishu = true;
+    const host = ch.websocketHost();
+    try std.testing.expectEqualStrings("open.feishu.cn", host);
+}
+
+test "lark websocketHost returns correct host for lark" {
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    ch.use_feishu = false;
+    const host = ch.websocketHost();
+    try std.testing.expectEqualStrings("open.larksuite.com", host);
+}
+
+test "lark initFromConfig with websocket mode" {
+    const cfg = config_types.LarkConfig{
+        .account_id = "lark-websocket-test",
+        .app_id = "cli_abc",
+        .app_secret = "sec_xyz",
+        .receive_mode = .websocket,
+        .use_feishu = true,
+    };
+    const ch = LarkChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("lark-websocket-test", ch.account_id);
+    try std.testing.expect(ch.receive_mode == .websocket);
+    try std.testing.expect(ch.use_feishu);
+}
+
+test "lark initFromConfig with webhook mode" {
+    const cfg = config_types.LarkConfig{
+        .account_id = "lark-webhook-test",
+        .app_id = "cli_def",
+        .app_secret = "sec_123",
+        .receive_mode = .webhook,
+        .use_feishu = false,
+    };
+    const ch = LarkChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("lark-webhook-test", ch.account_id);
+    try std.testing.expect(ch.receive_mode == .webhook);
+    try std.testing.expect(!ch.use_feishu);
+}
+
+test "lark running and connected defaults" {
+    const ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    try std.testing.expect(!ch.running.load(.acquire));
+    try std.testing.expect(!ch.connected.load(.acquire));
+    try std.testing.expect(ch.cached_token == null);
+    try std.testing.expectEqual(@as(i64, 0), ch.token_expires_at);
+}
+
+test "lark invalidateToken clears cached token" {
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+
+    // Setup a cached token
+    ch.cached_token = try std.testing.allocator.dupe(u8, "cached_tok_123");
+    ch.token_expires_at = std.time.timestamp() + 7200;
+
+    // Invalidate should clear everything
+    ch.invalidateToken();
+
+    try std.testing.expect(ch.cached_token == null);
+    try std.testing.expectEqual(@as(i64, 0), ch.token_expires_at);
+}
+
+test "lark parseEventPayload websocket payload with post message" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    // WebSocket payload with post message type
+    const payload =
+        \\{"uuid":"post-msg-uuid","header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"post","content":"{\"zh_cn\":{\"title\":\"WebSocket Post\",\"content\":[[{\"tag\":\"text\",\"text\":\"Hello from websocket\"}]]}}","chat_id":"oc_chat","create_time":"1700000000000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "Hello from websocket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "WebSocket Post") != null);
 }
