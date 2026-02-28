@@ -318,6 +318,19 @@ pub const WebChannel = struct {
         return age > @as(i64, @intCast(self.relay_pairing_code_ttl_secs));
     }
 
+    fn rotateRelayPairingCode(self: *WebChannel, reason: []const u8) void {
+        if (self.relay_pairing_guard) |*guard| {
+            if (guard.regeneratePairingCode()) |code| {
+                self.relay_pairing_issued_at = std.time.timestamp();
+                log.warn("Web relay pairing code rotated ({s}, one-time, {d}s TTL): {s}", .{
+                    reason,
+                    self.relay_pairing_code_ttl_secs,
+                    code,
+                });
+            }
+        }
+    }
+
     /// Generate a random auth token (64 hex chars from 32 random bytes).
     pub fn generateToken(self: *WebChannel) void {
         var random_bytes: [32]u8 = undefined;
@@ -615,7 +628,8 @@ pub const WebChannel = struct {
             return;
         }
         if (self.relayPairingCodeExpired()) {
-            self.sendRelayError(session_id, request_id, "pairing_code_expired", "pairing code expired; restart relay connection to get a new code");
+            self.rotateRelayPairingCode("expired");
+            self.sendRelayError(session_id, request_id, "pairing_code_expired", "pairing code expired; a new code was issued");
             return;
         }
 
@@ -654,6 +668,7 @@ pub const WebChannel = struct {
             return;
         };
         defer self.allocator.free(pair_token);
+        defer self.rotateRelayPairingCode("consumed");
 
         const client_sub = self.deriveClientSubjectFromPairToken(pair_token) catch {
             self.sendRelayError(session_id, request_id, "pairing_internal_error", "failed to derive client identity");
@@ -1778,7 +1793,7 @@ test "WebChannel relay e2e payload helpers roundtrip" {
     try std.testing.expectEqualStrings(plain, decrypted);
 }
 
-test "WebChannel relay pairing request consumes one-time code and initializes e2e" {
+test "WebChannel relay pairing request rotates one-time code and initializes e2e" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .transport = "relay",
         .account_id = "relay-main",
@@ -1805,7 +1820,8 @@ test "WebChannel relay pairing request consumes one-time code and initializes e2
 
     ch.handleInboundEvent(event_buf.items, null);
     try std.testing.expect(ch.relay_pairing_guard.?.isPaired());
-    try std.testing.expect(ch.relay_pairing_guard.?.pairingCode() == null);
+    const next_code = ch.relay_pairing_guard.?.pairingCode() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!std.mem.eql(u8, code_copy, next_code));
     try std.testing.expectEqual(@as(usize, 1), ch.e2e_sessions.count());
 }
 

@@ -86,6 +86,18 @@ pub const PairingGuard = struct {
         return null;
     }
 
+    /// Regenerate one-time pairing code for the next pairing attempt.
+    pub fn regeneratePairingCode(self: *PairingGuard) ?[]const u8 {
+        if (!self.require_pairing_flag) {
+            self.pairing_code = null;
+            return null;
+        }
+        self.pairing_code = generateCode();
+        self.failed_count = 0;
+        self.lockout_time = null;
+        return self.pairingCode();
+    }
+
     /// Whether pairing is required at all.
     pub fn requirePairing(self: *const PairingGuard) bool {
         return self.require_pairing_flag;
@@ -459,6 +471,24 @@ test "pairing code is 6 chars" {
     defer guard.deinit();
     const code = guard.pairingCode().?;
     try std.testing.expectEqual(@as(usize, 6), code.len);
+}
+
+test "regenerate pairing code creates new code and resets lockout counters" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    const first = guard.pairingCode() orelse return error.TestUnexpectedResult;
+    var first_copy: [6]u8 = undefined;
+    @memcpy(&first_copy, first);
+
+    guard.failed_count = 5;
+    guard.lockout_time = std.time.nanoTimestamp();
+
+    const second = guard.regeneratePairingCode() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(second.len == 6);
+    try std.testing.expect(!std.mem.eql(u8, &first_copy, second));
+    try std.testing.expectEqual(@as(u32, 0), guard.failed_count);
+    try std.testing.expect(guard.lockout_time == null);
 }
 
 test "is public bind empty string" {
