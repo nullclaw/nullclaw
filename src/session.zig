@@ -22,6 +22,7 @@ const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const streaming = @import("streaming.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 
@@ -69,8 +70,6 @@ pub const SessionManager = struct {
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
-
-    pub const StreamDeltaCallback = *const fn (ctx: *anyopaque, delta: []const u8) void;
 
     pub fn init(
         allocator: Allocator,
@@ -189,20 +188,18 @@ pub const SessionManager = struct {
     }
 
     const StreamAdapterCtx = struct {
-        callback: StreamDeltaCallback,
-        ctx: *anyopaque,
+        sink: streaming.Sink,
     };
 
     fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
-        if (chunk.is_final or chunk.delta.len == 0) return;
         const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
-        adapter.callback(adapter.ctx, chunk.delta);
+        streaming.forwardProviderChunk(adapter.sink, chunk);
     }
 
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
-        return self.processMessageStreaming(session_key, content, conversation_context, null, null);
+        return self.processMessageStreaming(session_key, content, conversation_context, null);
     }
 
     /// Process a message within a session context and optionally forward text deltas.
@@ -212,8 +209,7 @@ pub const SessionManager = struct {
         session_key: []const u8,
         content: []const u8,
         conversation_context: ?ConversationContext,
-        stream_callback: ?StreamDeltaCallback,
-        stream_ctx: ?*anyopaque,
+        stream_sink: ?streaming.Sink,
     ) ![]const u8 {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
@@ -252,18 +248,10 @@ pub const SessionManager = struct {
         }
 
         var stream_adapter: StreamAdapterCtx = undefined;
-        if (stream_callback) |cb| {
-            if (stream_ctx) |ctx| {
-                stream_adapter = .{
-                    .callback = cb,
-                    .ctx = ctx,
-                };
-                session.agent.stream_callback = streamChunkForwarder;
-                session.agent.stream_ctx = @ptrCast(&stream_adapter);
-            } else {
-                session.agent.stream_callback = null;
-                session.agent.stream_ctx = null;
-            }
+        if (stream_sink) |sink| {
+            stream_adapter = .{ .sink = sink };
+            session.agent.stream_callback = streamChunkForwarder;
+            session.agent.stream_ctx = @ptrCast(&stream_adapter);
         } else {
             session.agent.stream_callback = null;
             session.agent.stream_ctx = null;
@@ -516,9 +504,10 @@ const DeltaCollector = struct {
     allocator: Allocator,
     data: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn onDelta(ctx_ptr: *anyopaque, delta: []const u8) void {
+    fn onEvent(ctx_ptr: *anyopaque, event: streaming.Event) void {
+        if (event.stage != .chunk or event.text.len == 0) return;
         const self: *DeltaCollector = @ptrCast(@alignCast(ctx_ptr));
-        self.data.appendSlice(self.allocator, delta) catch {};
+        self.data.appendSlice(self.allocator, event.text) catch {};
     }
 
     fn deinit(self: *DeltaCollector) void {
@@ -663,8 +652,10 @@ test "processMessageStreaming forwards provider deltas" {
         "stream:1",
         "hi",
         null,
-        DeltaCollector.onDelta,
-        @ptrCast(&collector),
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
     );
     defer testing.allocator.free(resp);
 

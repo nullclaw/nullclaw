@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const streaming = @import("streaming.zig");
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -34,17 +35,12 @@ pub const InboundMessage = struct {
 };
 
 pub const OutboundMessage = struct {
-    pub const OutboundStage = enum {
-        chunk,
-        final,
-    };
-
     channel: []const u8, // target channel
     account_id: ?[]const u8 = null, // target account (multi-account channels)
     chat_id: []const u8, // target chat
     content: []const u8, // response text
     media: []const []const u8 = &.{}, // file paths/URLs to send
-    stage: OutboundStage = .final,
+    stage: streaming.OutboundStage = .final,
 
     pub fn deinit(self: *const OutboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);
@@ -164,7 +160,7 @@ fn makeOutboundWithStage(
     channel: []const u8,
     chat_id: []const u8,
     content: []const u8,
-    stage: OutboundMessage.OutboundStage,
+    stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
     // channel is not duped — must be a literal or long-lived config pointer
     const cid = try allocator.dupe(u8, chat_id);
@@ -205,7 +201,7 @@ fn makeOutboundWithAccountStage(
     account_id: []const u8,
     chat_id: []const u8,
     content: []const u8,
-    stage: OutboundMessage.OutboundStage,
+    stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);

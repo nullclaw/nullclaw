@@ -20,6 +20,7 @@ const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
 const onboard = @import("onboard.zig");
+const streaming = @import("streaming.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -599,14 +600,14 @@ const StreamingOutboundCtx = struct {
     chat_id: []const u8,
 };
 
-fn publishStreamingChunk(ctx_ptr: *anyopaque, delta: []const u8) void {
-    if (delta.len == 0) return;
+fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
+    if (event.stage != .chunk or event.text.len == 0) return;
     const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
 
     const out = if (ctx.account_id) |aid|
-        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, delta)
+        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
     else
-        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, delta);
+        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
 
     var message = out catch |err| {
         log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
@@ -674,8 +675,13 @@ fn inboundDispatcherThread(
             session_key,
             msg.content,
             null,
-            if (use_streaming_outbound) publishStreamingChunk else null,
-            if (use_streaming_outbound) @ptrCast(&streaming_ctx) else null,
+            if (use_streaming_outbound)
+                streaming.Sink{
+                    .callback = publishStreamingChunk,
+                    .ctx = @ptrCast(&streaming_ctx),
+                }
+            else
+                null,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 

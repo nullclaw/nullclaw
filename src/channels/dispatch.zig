@@ -174,11 +174,7 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            const stage: root.Channel.OutboundStage = switch (msg.stage) {
-                .chunk => .chunk,
-                .final => .final,
-            };
-            channel.sendEvent(msg.chat_id, msg.content, msg.media, stage) catch {
+            channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };

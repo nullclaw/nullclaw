@@ -16,6 +16,7 @@
 //!   - DingTalk (WebSocket stream mode)
 
 const std = @import("std");
+const streaming = @import("../streaming.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // Shared Types
@@ -59,10 +60,7 @@ pub const Channel = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const OutboundStage = enum {
-        chunk,
-        final,
-    };
+    pub const OutboundStage = streaming.OutboundStage;
 
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
