@@ -1,0 +1,138 @@
+{
+  "name": "webchannel_v1",
+  "version": 1,
+  "envelope": {
+    "required": [
+      "v",
+      "type",
+      "session_id"
+    ],
+    "optional": [
+      "agent_id",
+      "request_id",
+      "payload",
+      "access_token"
+    ],
+    "fields": {
+      "v": "integer (must be 1)",
+      "type": "string event name",
+      "session_id": "string conversation/session id",
+      "agent_id": "string logical agent id",
+      "request_id": "string request correlation id",
+      "payload": "object event-specific payload",
+      "access_token": "string UI JWT (relay mode)"
+    }
+  },
+  "events": {
+    "pairing_request": {
+      "direction": "ui_to_core",
+      "payload": {
+        "pairing_code": "string required (one-time code)",
+        "client_pub": "string optional base64url X25519 public key",
+        "client_public_key": "string optional alias for client_pub"
+      }
+    },
+    "pairing_result": {
+      "direction": "core_to_ui",
+      "payload": {
+        "ok": "boolean required",
+        "client_id": "string required UI identity",
+        "access_token": "string required JWT for subsequent relay events",
+        "token_type": "string required (Bearer)",
+        "expires_in": "integer required seconds",
+        "set_cookie": "string optional cookie value for relay HTTP layer",
+        "e2e_required": "boolean required",
+        "e2e": {
+          "alg": "string optional (x25519-chacha20poly1305-v1)",
+          "agent_pub": "string optional base64url X25519 public key"
+        }
+      }
+    },
+    "user_message": {
+      "direction": "ui_to_core",
+      "payload": {
+        "content": "string required unless payload.e2e is used",
+        "sender_id": "string optional",
+        "access_token": "string required (can be top-level access_token)",
+        "e2e": {
+          "alg": "string optional (x25519-chacha20poly1305-v1)",
+          "nonce": "string required when e2e is used (base64url)",
+          "ciphertext": "string required when e2e is used (base64url)"
+        }
+      }
+    },
+    "assistant_chunk": {
+      "direction": "core_to_ui",
+      "payload": {
+        "content": "string required unless payload.e2e is used",
+        "e2e": {
+          "alg": "string optional (x25519-chacha20poly1305-v1)",
+          "nonce": "string required when e2e is used (base64url)",
+          "ciphertext": "string required when e2e is used (base64url)"
+        }
+      }
+    },
+    "assistant_final": {
+      "direction": "core_to_ui",
+      "payload": {
+        "content": "string required unless payload.e2e is used",
+        "e2e": {
+          "alg": "string optional (x25519-chacha20poly1305-v1)",
+          "nonce": "string required when e2e is used (base64url)",
+          "ciphertext": "string required when e2e is used (base64url)"
+        }
+      }
+    },
+    "tool_call": {
+      "direction": "core_to_ui",
+      "payload": {
+        "name": "string required",
+        "arguments": "object required"
+      }
+    },
+    "tool_result": {
+      "direction": "core_to_ui",
+      "payload": {
+        "ok": "boolean required",
+        "result": "any optional",
+        "error": "string optional"
+      }
+    },
+    "approval_request": {
+      "direction": "core_to_ui",
+      "payload": {
+        "action": "string required",
+        "reason": "string optional"
+      }
+    },
+    "approval_response": {
+      "direction": "ui_to_core",
+      "payload": {
+        "approved": "boolean required",
+        "reason": "string optional"
+      }
+    },
+    "error": {
+      "direction": "both",
+      "payload": {
+        "code": "string optional",
+        "message": "string required"
+      }
+    }
+  },
+  "relay_security": {
+    "pairing_code": {
+      "description": "One-time code printed by nullclaw relay connection",
+      "ttl_seconds": "configurable via relay_pairing_code_ttl_secs (60..300)"
+    },
+    "ui_access_token": {
+      "description": "JWT used by browser UI for relay user_message",
+      "ttl_seconds": "configurable via relay_ui_token_ttl_secs (300..2592000)"
+    },
+    "relay_agent_token": {
+      "description": "Dedicated relay credential for nullclaw <-> relay transport auth",
+      "lifecycle": "config relay_token -> env NULLCLAW_RELAY_TOKEN -> persisted auth credential -> generated token",
+      "ttl_seconds": "configurable via relay_token_ttl_secs (3600..31536000)"
+    }
+  }
+}

@@ -58,6 +58,11 @@ pub const PairingGuard = struct {
         internal_error,
     };
 
+    pub const PairingCodeError = error{
+        PairingDisabled,
+        InvalidPairingCode,
+    };
+
     pub fn attemptPair(self: *PairingGuard, pairing_code: ?[]const u8) PairAttemptResult {
         if (!self.require_pairing_flag) return .disabled;
         if (self.pairingCode() == null) return .already_paired;
@@ -84,6 +89,36 @@ pub const PairingGuard = struct {
             return code;
         }
         return null;
+    }
+
+    /// Regenerate one-time pairing code for the next pairing attempt.
+    pub fn regeneratePairingCode(self: *PairingGuard) ?[]const u8 {
+        if (!self.require_pairing_flag) {
+            self.pairing_code = null;
+            return null;
+        }
+        self.pairing_code = generateCode();
+        self.failed_count = 0;
+        self.lockout_time = null;
+        return self.pairingCode();
+    }
+
+    /// Force pairing code to a specific 6-digit value.
+    pub fn setPairingCode(self: *PairingGuard, code: []const u8) PairingCodeError![]const u8 {
+        if (!self.require_pairing_flag) return error.PairingDisabled;
+        const trimmed = std.mem.trim(u8, code, " \t\r\n");
+        if (trimmed.len != 6) return error.InvalidPairingCode;
+
+        var normalized: [6]u8 = undefined;
+        for (trimmed, 0..) |ch, i| {
+            if (!std.ascii.isDigit(ch)) return error.InvalidPairingCode;
+            normalized[i] = ch;
+        }
+
+        self.pairing_code = normalized;
+        self.failed_count = 0;
+        self.lockout_time = null;
+        return self.pairingCode().?;
     }
 
     /// Whether pairing is required at all.
@@ -459,6 +494,45 @@ test "pairing code is 6 chars" {
     defer guard.deinit();
     const code = guard.pairingCode().?;
     try std.testing.expectEqual(@as(usize, 6), code.len);
+}
+
+test "regenerate pairing code creates new code and resets lockout counters" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    const first = guard.pairingCode() orelse return error.TestUnexpectedResult;
+    var first_copy: [6]u8 = undefined;
+    @memcpy(&first_copy, first);
+
+    guard.failed_count = 5;
+    guard.lockout_time = std.time.nanoTimestamp();
+
+    const second = guard.regeneratePairingCode() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(second.len == 6);
+    try std.testing.expect(!std.mem.eql(u8, &first_copy, second));
+    try std.testing.expectEqual(@as(u32, 0), guard.failed_count);
+    try std.testing.expect(guard.lockout_time == null);
+}
+
+test "set pairing code enforces provided 6-digit value" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    guard.failed_count = 3;
+    guard.lockout_time = std.time.nanoTimestamp();
+
+    const fixed = try guard.setPairingCode("123456");
+    try std.testing.expectEqualStrings("123456", fixed);
+    try std.testing.expectEqualStrings("123456", guard.pairingCode().?);
+    try std.testing.expectEqual(@as(u32, 0), guard.failed_count);
+    try std.testing.expect(guard.lockout_time == null);
+}
+
+test "set pairing code rejects invalid format" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expectError(error.InvalidPairingCode, guard.setPairingCode("abc"));
+    try std.testing.expectError(error.InvalidPairingCode, guard.setPairingCode("12a456"));
 }
 
 test "is public bind empty string" {

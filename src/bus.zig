@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const streaming = @import("streaming.zig");
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -39,6 +40,7 @@ pub const OutboundMessage = struct {
     chat_id: []const u8, // target chat
     content: []const u8, // response text
     media: []const []const u8 = &.{}, // file paths/URLs to send
+    stage: streaming.OutboundStage = .final,
 
     pub fn deinit(self: *const OutboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);
@@ -141,6 +143,25 @@ pub fn makeOutbound(
     chat_id: []const u8,
     content: []const u8,
 ) Allocator.Error!OutboundMessage {
+    return makeOutboundWithStage(allocator, channel, chat_id, content, .final);
+}
+
+pub fn makeOutboundChunk(
+    allocator: Allocator,
+    channel: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithStage(allocator, channel, chat_id, content, .chunk);
+}
+
+fn makeOutboundWithStage(
+    allocator: Allocator,
+    channel: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    stage: streaming.OutboundStage,
+) Allocator.Error!OutboundMessage {
     // channel is not duped — must be a literal or long-lived config pointer
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
@@ -150,6 +171,7 @@ pub fn makeOutbound(
         .channel = channel,
         .chat_id = cid,
         .content = ct,
+        .stage = stage,
     };
 }
 
@@ -159,6 +181,27 @@ pub fn makeOutboundWithAccount(
     account_id: []const u8,
     chat_id: []const u8,
     content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithAccountStage(allocator, channel, account_id, chat_id, content, .final);
+}
+
+pub fn makeOutboundChunkWithAccount(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithAccountStage(allocator, channel, account_id, chat_id, content, .chunk);
+}
+
+fn makeOutboundWithAccountStage(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
@@ -171,6 +214,7 @@ pub fn makeOutboundWithAccount(
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
+        .stage = stage,
     };
 }
 
@@ -379,6 +423,7 @@ test "makeOutbound produces owned copies" {
 
     src_content[0] = 'Z';
     try testing.expectEqualStrings("reply", msg.content);
+    try testing.expect(msg.stage == .final);
 }
 
 test "makeOutboundWithAccount stores account_id" {
@@ -387,6 +432,22 @@ test "makeOutboundWithAccount stores account_id" {
     defer msg.deinit(alloc);
     try testing.expect(msg.account_id != null);
     try testing.expectEqualStrings("backup", msg.account_id.?);
+    try testing.expect(msg.stage == .final);
+}
+
+test "makeOutboundChunk marks chunk stage" {
+    const alloc = testing.allocator;
+    const msg = try makeOutboundChunk(alloc, "web", "c1", "delta");
+    defer msg.deinit(alloc);
+    try testing.expect(msg.stage == .chunk);
+}
+
+test "makeOutboundChunkWithAccount marks chunk stage" {
+    const alloc = testing.allocator;
+    const msg = try makeOutboundChunkWithAccount(alloc, "web", "main", "c1", "delta");
+    defer msg.deinit(alloc);
+    try testing.expect(msg.stage == .chunk);
+    try testing.expectEqualStrings("main", msg.account_id.?);
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ const onebot = channels_mod.onebot;
 const maixcam = channels_mod.maixcam;
 const slack = channels_mod.slack;
 const irc = channels_mod.irc;
+const web = channels_mod.web;
 const Channel = channels_mod.Channel;
 
 const log = std.log.scoped(.channel_manager);
@@ -251,9 +252,17 @@ pub const ChannelManager = struct {
                         try self.appendChannelFromConfig(field.name, cfg);
                     }
                 },
-                .optional => {
+                .optional => |opt| {
                     if (@field(self.config.channels, field.name)) |cfg| {
-                        try self.appendChannelFromConfig(field.name, cfg);
+                        const inner = comptime blk: {
+                            const info = @typeInfo(opt.child);
+                            break :blk info == .pointer and info.pointer.size == .one;
+                        };
+                        if (inner) {
+                            try self.appendChannelFromConfig(field.name, cfg.*);
+                        } else {
+                            try self.appendChannelFromConfig(field.name, cfg);
+                        }
                     }
                 },
                 else => {},
@@ -348,7 +357,7 @@ pub const ChannelManager = struct {
     /// Monitoring loop: check health, restart failed channels with backoff.
     /// Blocks until shutdown.
     pub fn supervisionLoop(self: *ChannelManager, state: *daemon.DaemonState) void {
-        const STALE_THRESHOLD_SECS: i64 = 90;
+        const STALE_THRESHOLD_SECS: i64 = 600;
         const WATCH_INTERVAL_SECS: u64 = 10;
 
         while (!daemon.isShutdownRequested()) {
@@ -1013,4 +1022,52 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         try std.testing.expectEqual(@as(usize, 1), slack_ptr.policy.allowlist.len);
         try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
     }
+}
+
+test "ChannelManager collects web channel from config" {
+    if (!channel_catalog.isBuildEnabled(.web)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const web_accounts = [_]config_types.WebConfig{
+        .{
+            .account_id = "local",
+            .port = 32123,
+            .path = "/relay/",
+            .auth_token = "relay-token-0123456789",
+        },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    var event_bus = bus_mod.Bus.init();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+    mgr.setEventBus(&event_bus);
+
+    try mgr.collectConfiguredChannels();
+
+    try expectEntryPresence(mgr.channelEntries(), "web", "local", true);
+
+    // Verify it was registered with correct listener type
+    const web_entry = findEntryByNameAccount(mgr.channelEntries(), "web", "local").?;
+    try std.testing.expectEqual(ListenerType.gateway_loop, web_entry.listener_type);
+
+    const web_ptr: *web.WebChannel = @ptrCast(@alignCast(web_entry.channel.ptr));
+    try std.testing.expect(web_ptr.bus == &event_bus);
+    try std.testing.expectEqualStrings("/relay", web_ptr.ws_path);
+    try std.testing.expectEqualStrings("relay-token-0123456789", web_ptr.configured_auth_token.?);
 }

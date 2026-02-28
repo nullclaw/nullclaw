@@ -19,17 +19,27 @@ const subagent_mod = @import("../subagent.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
 const onboard = @import("../onboard.zig");
+const streaming = @import("../streaming.zig");
 
 const Agent = @import("root.zig").Agent;
 
-/// Streaming callback that writes chunks directly to stdout.
-fn cliStreamCallback(_: *anyopaque, chunk: providers.StreamChunk) void {
-    if (chunk.delta.len == 0) return;
+const CliStreamCtx = struct {
+    sink: streaming.Sink,
+};
+
+fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
+    if (event.stage != .chunk or event.text.len == 0) return;
     var buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&buf);
     const wr = &bw.interface;
-    wr.print("{s}", .{chunk.delta}) catch {};
+    wr.print("{s}", .{event.text}) catch {};
     wr.flush() catch {};
+}
+
+/// Streaming callback that forwards provider chunks into unified stream sink events.
+fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
+    const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    streaming.forwardProviderChunk(stream_ctx.sink, chunk);
 }
 
 /// Run the agent in single-message or interactive REPL mode.
@@ -167,7 +177,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         defer agent.deinit();
 
         // Enable streaming if provider supports it
-        var stream_ctx: u8 = 0;
+        var stream_sink_ctx: u8 = 0;
+        var stream_ctx = CliStreamCtx{
+            .sink = .{
+                .callback = cliStreamSinkCallback,
+                .ctx = @ptrCast(&stream_sink_ctx),
+            },
+        };
         if (supports_streaming) {
             agent.stream_callback = cliStreamCallback;
             agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -251,7 +267,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer agent.deinit();
 
     // Enable streaming if provider supports it
-    var stream_ctx: u8 = 0;
+    var stream_sink_ctx: u8 = 0;
+    var stream_ctx = CliStreamCtx{
+        .sink = .{
+            .callback = cliStreamSinkCallback,
+            .ctx = @ptrCast(&stream_sink_ctx),
+        },
+    };
     if (supports_streaming) {
         agent.stream_callback = cliStreamCallback;
         agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -304,9 +326,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn noopSinkEvent(_: *anyopaque, _: streaming.Event) void {}
+
 test "cliStreamCallback handles empty delta" {
+    var sink_ctx: u8 = 0;
+    var ctx = CliStreamCtx{
+        .sink = .{
+            .callback = noopSinkEvent,
+            .ctx = @ptrCast(&sink_ctx),
+        },
+    };
     const chunk = providers.StreamChunk.finalChunk();
-    cliStreamCallback(undefined, chunk);
+    cliStreamCallback(@ptrCast(&ctx), chunk);
 }
 
 test "cliStreamCallback text delta chunk" {

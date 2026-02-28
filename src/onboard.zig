@@ -793,7 +793,7 @@ fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
         else => false,
     };
 }
@@ -908,6 +908,7 @@ fn configureSingleChannel(
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
+        .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
         else => blk: {
             try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
             break :blk false;
@@ -1153,6 +1154,166 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
     return true;
 }
 
+fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    const nak_path = "nak";
+
+    // ── Bot keypair ──────────────────────────────────────────────
+    try out.print("{s}  Bot keypair:\n", .{prefix});
+    try out.print("{s}    [Y] Generate new keypair (first-time setup)\n", .{prefix});
+    try out.print("{s}    [n] Import existing nsec1\n", .{prefix});
+    try out.print("{s}  Generate new? [Y/n]: ", .{prefix});
+    const gen_input = prompt(out, input_buf, "", "y") orelse return false;
+    const generate_new = gen_input.len == 0 or gen_input[0] == 'y' or gen_input[0] == 'Y';
+
+    var bot_privkey_hex: ?[]u8 = null;
+    defer if (bot_privkey_hex) |k| cfg.allocator.free(k);
+    var bot_pubkey_hex: ?[]u8 = null;
+    defer if (bot_pubkey_hex) |k| cfg.allocator.free(k);
+
+    if (generate_new) {
+        const argv_gen = [_][]const u8{ nak_path, "key", "generate" };
+        const hex = nakRun(cfg.allocator, &argv_gen) orelse {
+            try out.print("{s}  -> Failed to generate keypair (is nak in PATH?)\n\n", .{prefix});
+            return false;
+        };
+        if (hex.len != 64) {
+            cfg.allocator.free(hex);
+            try out.print("{s}  -> nak key generate returned unexpected output\n\n", .{prefix});
+            return false;
+        }
+        bot_privkey_hex = hex;
+        const argv_pub = [_][]const u8{ nak_path, "key", "public", bot_privkey_hex.? };
+        if (nakRun(cfg.allocator, &argv_pub)) |bph| {
+            bot_pubkey_hex = bph;
+            const argv_enc = [_][]const u8{ nak_path, "encode", "npub", bph };
+            if (nakRun(cfg.allocator, &argv_enc)) |bot_npub| {
+                defer cfg.allocator.free(bot_npub);
+                try out.print("{s}  -> Bot npub: {s}\n", .{ prefix, bot_npub });
+            } else {
+                try out.print("{s}  -> Bot pubkey (hex): {s}\n", .{ prefix, bph });
+            }
+        }
+    } else {
+        try out.print("{s}  Bot nsec1 (paste existing bot identity key): ", .{prefix});
+        const key_input = prompt(out, input_buf, "", "") orelse return false;
+        if (key_input.len == 0) {
+            try out.print("{s}  -> Skipped (no key provided)\n\n", .{prefix});
+            return false;
+        }
+        if (std.mem.startsWith(u8, key_input, "nsec1")) {
+            const argv_dec = [_][]const u8{ nak_path, "decode", key_input };
+            const hex = nakRun(cfg.allocator, &argv_dec) orelse {
+                try out.print("{s}  -> Failed to decode nsec (invalid key?)\n\n", .{prefix});
+                return false;
+            };
+            bot_privkey_hex = hex;
+        } else {
+            bot_privkey_hex = try cfg.allocator.dupe(u8, key_input);
+        }
+        if (bot_privkey_hex) |privhex| {
+            const argv_pub = [_][]const u8{ nak_path, "key", "public", privhex };
+            bot_pubkey_hex = nakRun(cfg.allocator, &argv_pub);
+        }
+    }
+
+    const nostr_mod = @import("channels/nostr.zig");
+    if (bot_pubkey_hex == null or !nostr_mod.NostrChannel.isValidHexKey(bot_pubkey_hex.?)) {
+        try out.print("{s}  -> Failed to derive a valid bot pubkey from the provided key\n\n", .{prefix});
+        return false;
+    }
+
+    // ── Owner pubkey ─────────────────────────────────────────────
+    try out.print("{s}  Your owner pubkey (npub or 64-char hex): ", .{prefix});
+    const owner_input = prompt(out, input_buf, "", "") orelse return false;
+    if (owner_input.len == 0) {
+        try out.print("{s}  -> Skipped (no owner pubkey)\n\n", .{prefix});
+        return false;
+    }
+
+    var owner_hex: ?[]u8 = null;
+    defer if (owner_hex) |k| cfg.allocator.free(k);
+
+    if (std.mem.startsWith(u8, owner_input, "npub1")) {
+        const argv_dec = [_][]const u8{ nak_path, "decode", owner_input };
+        const hex = nakRun(cfg.allocator, &argv_dec) orelse {
+            try out.print("{s}  -> Failed to decode npub (invalid pubkey?)\n\n", .{prefix});
+            return false;
+        };
+        owner_hex = hex;
+    } else {
+        owner_hex = try cfg.allocator.dupe(u8, owner_input);
+    }
+
+    if (!nostr_mod.NostrChannel.isValidHexKey(owner_hex.?)) {
+        try out.print("{s}  -> owner pubkey must be 64-char hex or a valid npub\n\n", .{prefix});
+        return false;
+    }
+
+    const secrets = @import("security/secrets.zig");
+    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const store = secrets.SecretStore.init(config_dir, cfg.secrets.encrypt);
+    const encrypted_key = try store.encryptSecret(cfg.allocator, bot_privkey_hex.?);
+
+    const ns = try cfg.allocator.create(@import("config_types.zig").NostrConfig);
+    ns.* = .{
+        .private_key = encrypted_key,
+        .owner_pubkey = try cfg.allocator.dupe(u8, owner_hex.?),
+        .bot_pubkey = try cfg.allocator.dupe(u8, bot_pubkey_hex.?),
+        .config_dir = config_dir,
+    };
+    cfg.channels.nostr = ns;
+    if (generate_new) {
+        try out.print("{s}  -> Keypair generated and encrypted at rest\n", .{prefix});
+    } else {
+        try out.print("{s}  -> Key encrypted at rest\n", .{prefix});
+    }
+    try out.print("{s}  -> Default relays: relay.damus.io, nos.lol, relay.nostr.band, auth.nostr1.com, relay.primal.net\n", .{prefix});
+    try out.print("{s}  -> Edit config to add: display_name, nip05, lnurl, dm_allowed_pubkeys\n\n", .{prefix});
+    return true;
+}
+
+/// Run a nak subprocess, capture stdout, trim whitespace, return owned slice or null on failure.
+fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return null;
+    const stdout = child.stdout orelse {
+        _ = child.wait() catch {};
+        return null;
+    };
+    var out = std.ArrayListUnmanaged(u8).empty;
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = stdout.read(&buf) catch break;
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch {
+            out.deinit(allocator);
+            _ = child.wait() catch {};
+            return null;
+        };
+    }
+    const term = child.wait() catch {
+        out.deinit(allocator);
+        return null;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            out.deinit(allocator);
+            return null;
+        },
+        else => {
+            out.deinit(allocator);
+            return null;
+        },
+    }
+    const raw = out.toOwnedSlice(allocator) catch return null;
+    const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
+    if (trimmed.len == raw.len) return raw;
+    defer allocator.free(raw);
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -1236,12 +1397,18 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (model_input.len == 0) {
         // Default: use first model from the list (or provider default)
-        cfg.default_model = if (live_models.len > 0) live_models[0] else selected_provider.default_model;
+        // Must dupe because live_models will be freed in defer block
+        cfg.default_model = if (live_models.len > 0)
+            try cfg.allocator.dupe(u8, live_models[0])
+        else
+            try cfg.allocator.dupe(u8, selected_provider.default_model);
     } else if (std.fmt.parseInt(usize, model_input, 10)) |num| {
         if (num >= 1 and num <= display_max) {
-            cfg.default_model = live_models[num - 1];
+            // Must dupe because live_models will be freed in defer block
+            cfg.default_model = try cfg.allocator.dupe(u8, live_models[num - 1]);
         } else {
-            cfg.default_model = selected_provider.default_model;
+            // Must dupe because selected_provider.default_model is from const static data
+            cfg.default_model = try cfg.allocator.dupe(u8, selected_provider.default_model);
         }
     } else |_| {
         // Free-form model name typed by user
@@ -1338,6 +1505,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (ws_input.len > 0) {
         cfg.workspace_dir = try cfg.allocator.dupe(u8, ws_input);
+        cfg.workspace_dir_override = cfg.workspace_dir;
     }
     try out.print("  -> {s}\n\n", .{cfg.workspace_dir});
 
@@ -2120,6 +2288,7 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.slack));
     try std.testing.expect(isWizardInteractiveChannel(.matrix));
     try std.testing.expect(isWizardInteractiveChannel(.signal));
+    try std.testing.expect(isWizardInteractiveChannel(.nostr));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
 }
 

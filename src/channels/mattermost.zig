@@ -332,7 +332,7 @@ pub const MattermostChannel = struct {
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         self.connected.store(false, .release);
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayLoop, .{self});
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -431,6 +431,8 @@ pub const MattermostChannel = struct {
         var path_buf: [1024]u8 = undefined;
         const parts = try self.websocketConnectParts(&host_buf, &path_buf);
 
+        log.info("mattermost: connecting to wss://{s}:{d}{s}", .{ parts.host, parts.port, parts.path });
+
         var ws = try websocket.WsClient.connect(
             self.allocator,
             parts.host,
@@ -459,6 +461,7 @@ pub const MattermostChannel = struct {
         try auth_list.appendSlice(self.allocator, "}}");
 
         try ws.writeText(auth_list.items);
+        log.info("mattermost: websocket authenticated", .{});
 
         while (self.running.load(.acquire)) {
             const maybe_text = ws.readTextMessage() catch |err| switch (err) {

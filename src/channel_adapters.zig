@@ -215,6 +215,17 @@ fn deriveMaixcamPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routin
     return .{ .kind = .direct, .id = input.chat_id };
 }
 
+fn defaultWebAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.webPrimary()) |wc| return wc.account_id;
+    return null;
+}
+
+fn deriveWebPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routing.PeerRef {
+    // Web sessions are keyed by chat/session id to avoid cross-session collisions
+    // when sender_id is unset or reused by clients.
+    return .{ .kind = .direct, .id = input.chat_id };
+}
+
 pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
     .{
         .channel_name = "discord",
@@ -256,6 +267,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .default_account_id = defaultMaixcamAccount,
         .derive_peer = deriveMaixcamPeer,
     },
+    .{
+        .channel_name = "web",
+        .default_account_id = defaultWebAccount,
+        .derive_peer = deriveWebPeer,
+    },
 };
 
 pub fn findInboundRouteDescriptor(config: *const Config, channel_name: []const u8) ?*const InboundRouteDescriptor {
@@ -281,6 +297,45 @@ test "parsePeerKind handles supported values" {
     try std.testing.expectEqual(agent_routing.ChatType.group, parsePeerKind("group").?);
     try std.testing.expectEqual(agent_routing.ChatType.channel, parsePeerKind("channel").?);
     try std.testing.expect(parsePeerKind("invalid") == null);
+}
+
+test "findInboundRouteDescriptor finds web channel" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &[_]@import("config_types.zig").WebConfig{
+                .{ .account_id = "local" },
+            },
+        },
+    };
+    if (@import("channel_catalog.zig").isBuildEnabled(.web)) {
+        try std.testing.expect(findInboundRouteDescriptor(&cfg, "web") != null);
+    }
+}
+
+test "web inbound routing uses chat session id for peer" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &[_]@import("config_types.zig").WebConfig{
+                .{ .account_id = "local" },
+            },
+        },
+    };
+
+    const desc = findInboundRouteDescriptor(&cfg, "web") orelse return error.TestUnexpectedResult;
+    const peer = desc.derive_peer(.{
+        .channel_name = "web",
+        .sender_id = "sender-1",
+        .chat_id = "session-42",
+    }, .{}) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(agent_routing.ChatType.direct, peer.kind);
+    try std.testing.expectEqualStrings("session-42", peer.id);
 }
 
 test "findInboundRouteDescriptor supports custom maixcam names" {

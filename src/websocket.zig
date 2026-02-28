@@ -95,16 +95,29 @@ pub const WsClient = struct {
         tls_state.stream_reader = stream.reader(read_buf);
         tls_state.stream_writer = stream.writer(write_buf);
 
+        var ca_bundle = std.crypto.Certificate.Bundle{};
+        var has_ca_bundle = false;
+        if (ca_bundle.rescan(allocator)) |_| {
+            has_ca_bundle = true;
+        } else |err| {
+            // Preserve current behavior on platforms/environments where system CAs
+            // are unavailable, but prefer verified TLS whenever possible.
+            log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
+        }
+        defer if (has_ca_bundle) ca_bundle.deinit(allocator);
+
+        const tls_options: std.crypto.tls.Client.Options = .{
+            .host = .{ .explicit = host },
+            .ca = if (has_ca_bundle) .{ .bundle = ca_bundle } else .no_verification,
+            .read_buffer = tls_read_buf,
+            .write_buffer = tls_write_buf,
+            .allow_truncation_attacks = true,
+        };
+
         tls_state.tls_client = std.crypto.tls.Client.init(
             tls_state.stream_reader.interface(),
             &tls_state.stream_writer.interface,
-            .{
-                .host = .{ .explicit = host },
-                .ca = .no_verification,
-                .read_buffer = tls_read_buf,
-                .write_buffer = tls_write_buf,
-                .allow_truncation_attacks = true,
-            },
+            tls_options,
         ) catch return error.TlsInitializationFailed;
 
         // HTTP Upgrade handshake
@@ -132,15 +145,28 @@ pub const WsClient = struct {
         try tls_state.tls_client.writer.flush();
         try tls_state.stream_writer.interface.flush();
 
-        // Read HTTP 101 response
+        // Read HTTP 101 response headers byte-by-byte to avoid consuming
+        // any WebSocket frame data that follows the headers in the same TLS
+        // record. Servers like Mattermost (behind Caddy) may send the first
+        // WS frame immediately after the 101 response.
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         while (resp_len < resp_buf.len) {
-            var rd: [1][]u8 = .{resp_buf[resp_len..]};
-            const n = tls_state.tls_client.reader.readVec(&rd) catch
+            // Use take(1) which always fills the internal buffer first,
+            // then returns a pointer into it — consuming exactly one byte.
+            const byte_ptr = tls_state.tls_client.reader.take(1) catch
                 return error.WsHandshakeFailed;
-            resp_len += n;
-            if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n") != null) break;
+            resp_buf[resp_len] = byte_ptr[0];
+            resp_len += 1;
+            // Check for end-of-headers marker
+            if (resp_len >= 4 and
+                resp_buf[resp_len - 4] == '\r' and
+                resp_buf[resp_len - 3] == '\n' and
+                resp_buf[resp_len - 2] == '\r' and
+                resp_buf[resp_len - 1] == '\n')
+            {
+                break;
+            }
         }
         const resp = resp_buf[0..resp_len];
         if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {
