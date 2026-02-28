@@ -369,9 +369,6 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
 }
 
-/// Stale detection threshold: 3x the Telegram long-poll timeout (30s).
-const STALE_THRESHOLD_SECS: i64 = 90;
-
 /// Channel supervisor thread — spawns polling threads for configured channels,
 /// monitors their health, and restarts on failure using SupervisedChannel.
 fn channelSupervisorThread(
@@ -805,7 +802,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var inbound_thread: ?std.Thread = null;
     if (channel_rt) |rt| {
         state.addComponent("inbound_dispatcher");
-        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundDispatcherThread, .{
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, inboundDispatcherThread, .{
             allocator, &event_bus, &channel_registry, rt, &state,
         })) |thread| {
             inbound_thread = thread;
@@ -822,7 +819,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     state.addComponent("outbound_dispatcher");
 
     var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, dispatch.runOutboundDispatcher, .{
+    if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, dispatch.runOutboundDispatcher, .{
         allocator, &event_bus, &channel_registry, &dispatch_stats,
     })) |thread| {
         dispatcher_thread = thread;

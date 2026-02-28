@@ -5,6 +5,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
 
+const log = std.log.scoped(.http_request);
+
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods with
 /// domain allowlisting, SSRF protection, and header redaction.
@@ -115,6 +117,7 @@ pub const HttpRequestTool = struct {
             .proxied_host = authority_host,
             .proxied_port = resolved_port,
         }) catch |err| {
+            log.err("HTTP request connection failed for {s}: {}", .{ url, err });
             const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };

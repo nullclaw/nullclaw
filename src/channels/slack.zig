@@ -42,11 +42,8 @@ pub const SlackChannel = struct {
     pub const DEFAULT_WEBHOOK_PATH = "/slack/events";
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
     pub const POLL_INTERVAL_SECS: u64 = 3;
-    pub const POLL_THREAD_STACK_SIZE: usize = 256 * 1024;
-    pub const SOCKET_THREAD_STACK_SIZE: usize = switch (builtin.cpu.arch) {
-        .aarch64, .arm => 1024 * 1024,
-        else => 256 * 1024,
-    };
+    pub const POLL_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
+    pub const SOCKET_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
     pub const SOCKET_FAILURE_FALLBACK_THRESHOLD: u32 = 3;
 
     pub fn init(
@@ -1081,12 +1078,8 @@ test "slack channel health check" {
     try std.testing.expect(ch.healthCheck());
 }
 
-test "slack socket thread stack size is architecture-aware" {
-    if (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .arm) {
-        try std.testing.expectEqual(@as(usize, 1024 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
-    } else {
-        try std.testing.expectEqual(@as(usize, 256 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
-    }
+test "slack socket thread stack size is 2MB" {
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
 }
 
 test "slack fallback to polling when app token is missing and polling targets exist" {

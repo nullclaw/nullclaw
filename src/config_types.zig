@@ -124,8 +124,8 @@ pub const SchedulerConfig = struct {
 
 pub const AgentConfig = struct {
     compact_context: bool = false,
-    max_tool_iterations: u32 = 25,
-    max_history_messages: u32 = 50,
+    max_tool_iterations: u32 = 1000,
+    max_history_messages: u32 = 100,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
@@ -137,14 +137,14 @@ pub const AgentConfig = struct {
     compaction_max_summary_chars: u32 = 2_000,
     compaction_max_source_chars: u32 = 12_000,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
-    message_timeout_secs: u64 = 300,
+    message_timeout_secs: u64 = 600,
 };
 
 pub const ToolsConfig = struct {
     shell_timeout_secs: u64 = 60,
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
-    web_fetch_max_chars: u32 = 50_000,
+    web_fetch_max_chars: u32 = 100_000,
 };
 
 pub const ModelRouteConfig = struct {
