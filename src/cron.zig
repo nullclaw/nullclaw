@@ -2,6 +2,7 @@ const std = @import("std");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
 const json_util = @import("json_util.zig");
+const Config = @import("config.zig").Config;
 
 const log = std.log.scoped(.cron);
 
@@ -1120,8 +1121,12 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
 }
 
 pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    var cfg_opt: ?Config = Config.load(allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
+    if (cfg_opt) |cfg| scheduler.setShellCwd(cfg.workspace_dir);
     try loadJobs(&scheduler);
 
     if (scheduler.getJob(id)) |job| {
