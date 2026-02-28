@@ -198,6 +198,7 @@ pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "curl", "-sf", "--max-time", "30", url },
+        .max_output_bytes = 1024 * 1024,
     }) catch |err| {
         log.err("curl failed: {}", .{err});
         return error.CurlFailed;
