@@ -38,6 +38,142 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// How often the rate limiter sweeps stale IP entries (5 min).
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300;
+const MAX_OBSERVED_TOOL_EVENTS: usize = 512;
+
+const GatewayObservedToolEventKind = enum { start, result };
+
+const GatewayObservedToolEvent = struct {
+    seq: u64,
+    kind: GatewayObservedToolEventKind,
+    tool: []u8,
+    success: bool = false,
+};
+
+const GatewayTurnToolEvent = struct {
+    kind: GatewayObservedToolEventKind,
+    tool: []const u8,
+    success: bool = false,
+};
+
+/// Thread-safe observer that records tool call events within the gateway.
+/// Used to enrich webhook responses with tool execution summaries.
+const GatewayThreadObserver = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    next_seq: u64 = 0,
+    events: std.ArrayListUnmanaged(GatewayObservedToolEvent) = .empty,
+
+    const vtable = observability.Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) GatewayThreadObserver {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *GatewayThreadObserver) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.events.items) |event| {
+            self.allocator.free(event.tool);
+        }
+        self.events.deinit(self.allocator);
+    }
+
+    pub fn observer(self: *GatewayThreadObserver) observability.Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn currentSeq(self: *GatewayThreadObserver) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.next_seq;
+    }
+
+    pub fn collectSince(
+        self: *GatewayThreadObserver,
+        allocator: std.mem.Allocator,
+        seq: u64,
+    ) ![]GatewayTurnToolEvent {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var count: usize = 0;
+        for (self.events.items) |event| {
+            if (event.seq > seq) count += 1;
+        }
+
+        const out = try allocator.alloc(GatewayTurnToolEvent, count);
+        errdefer allocator.free(out);
+        var out_idx: usize = 0;
+        errdefer {
+            for (out[0..out_idx]) |event| {
+                allocator.free(event.tool);
+            }
+        }
+        for (self.events.items) |event| {
+            if (event.seq <= seq) continue;
+
+            out[out_idx] = .{
+                .kind = event.kind,
+                .tool = try allocator.dupe(u8, event.tool),
+                .success = event.success,
+            };
+            out_idx += 1;
+        }
+
+        return out;
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *GatewayThreadObserver = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .tool_call_start => |e| self.appendEvent(.start, e.tool, false),
+            .tool_call => |e| self.appendEvent(.result, e.tool, e.success),
+            else => {},
+        }
+    }
+
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "gateway_thread";
+    }
+
+    fn appendEvent(
+        self: *GatewayThreadObserver,
+        kind: GatewayObservedToolEventKind,
+        tool: []const u8,
+        success: bool,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const owned_tool = self.allocator.dupe(u8, tool) catch return;
+
+        self.next_seq += 1;
+        self.events.append(self.allocator, .{
+            .seq = self.next_seq,
+            .kind = kind,
+            .tool = owned_tool,
+            .success = success,
+        }) catch {
+            self.allocator.free(owned_tool);
+            return;
+        };
+
+        while (self.events.items.len > MAX_OBSERVED_TOOL_EVENTS) {
+            const oldest = self.events.orderedRemove(0);
+            self.allocator.free(oldest.tool);
+        }
+    }
+};
 
 // ── Rate Limiter ─────────────────────────────────────────────────
 
@@ -564,6 +700,55 @@ pub fn jsonWrapResponse(allocator: std.mem.Allocator, response: []const u8) ![]u
     try w.writeAll("{\"status\":\"ok\",\"response\":\"");
     try jsonEscapeInto(w, response);
     try w.writeAll("\"}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON array summarizing tool events from a turn.
+fn buildThreadEventsJson(
+    allocator: std.mem.Allocator,
+    tool_events: []const GatewayTurnToolEvent,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeByte('[');
+
+    var tool_results: usize = 0;
+    var failed_results: usize = 0;
+    for (tool_events) |event| {
+        if (event.kind != .result) continue;
+        tool_results += 1;
+        if (!event.success) failed_results += 1;
+    }
+
+    if (tool_results > 0) {
+        try w.writeAll("{\"type\":\"tool_summary\",\"total\":");
+        try w.print("{d}", .{tool_results});
+        try w.writeAll(",\"failed\":");
+        try w.print("{d}", .{failed_results});
+        try w.writeByte('}');
+    }
+
+    try w.writeByte(']');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a webhook success response with tool events:
+/// `{"status":"ok","response":"<escaped>","thread_events":[...]}`.
+fn buildWebhookSuccessResponse(
+    allocator: std.mem.Allocator,
+    response_text: []const u8,
+    thread_events_json: []const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"status\":\"ok\",\"response\":\"");
+    try jsonEscapeInto(w, response_text);
+    try w.writeAll("\",\"thread_events\":");
+    try w.writeAll(thread_events_json);
+    try w.writeByte('}');
     return buf.toOwnedSlice(allocator);
 }
 
@@ -2105,7 +2290,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
-    var noop_obs_gateway = observability.NoopObserver{};
+    var gateway_thread_observer = GatewayThreadObserver.init(allocator);
+    defer gateway_thread_observer.deinit();
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
@@ -2192,7 +2378,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 }) catch &.{};
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_thread_observer.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
@@ -2350,13 +2536,16 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {
+                                const start_seq = gateway_thread_observer.currentSeq();
                                 const reply: ?[]const u8 = sm.processMessage(session_key, msg_text, null) catch |err| blk: {
                                     response_body = userFacingAgentErrorJson(err);
                                     break :blk null;
                                 };
                                 if (reply) |r| {
                                     defer allocator.free(r);
-                                    const json_resp = jsonWrapResponse(req_allocator, r) catch null;
+                                    const tool_events = gateway_thread_observer.collectSince(req_allocator, start_seq) catch &.{};
+                                    const thread_events_json = buildThreadEventsJson(req_allocator, tool_events) catch "[]";
+                                    const json_resp = buildWebhookSuccessResponse(req_allocator, r, thread_events_json) catch null;
                                     response_body = json_resp orelse "{\"status\":\"received\"}";
                                 } else {
                                     response_body = "{\"status\":\"received\"}";
@@ -4057,6 +4246,111 @@ test "jsonWrapResponse with clean input" {
     const result = try jsonWrapResponse(std.testing.allocator, "simple reply");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("{\"status\":\"ok\",\"response\":\"simple reply\"}", result);
+}
+
+// ── GatewayThreadObserver tests ─────────────────────────────────
+
+test "GatewayThreadObserver init/deinit no leaks" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    obs.deinit();
+}
+
+test "GatewayThreadObserver records tool events and collectSince works" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const seq_before = obs.currentSeq();
+    const start_event = observability.ObserverEvent{ .tool_call_start = .{ .tool = "shell" } };
+    obs.observer().recordEvent(&start_event);
+
+    const done_event = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } };
+    obs.observer().recordEvent(&done_event);
+
+    const events = try obs.collectSince(std.testing.allocator, seq_before);
+    defer {
+        for (events) |e| std.testing.allocator.free(e.tool);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expectEqualStrings("shell", events[0].tool);
+    try std.testing.expect(events[0].kind == .start);
+    try std.testing.expect(events[1].kind == .result);
+    try std.testing.expect(events[1].success);
+}
+
+test "GatewayThreadObserver collectSince filters by sequence" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const event1 = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = true } };
+    obs.observer().recordEvent(&event1);
+    const mid_seq = obs.currentSeq();
+
+    const event2 = observability.ObserverEvent{ .tool_call = .{ .tool = "web_fetch", .duration_ms = 20, .success = false } };
+    obs.observer().recordEvent(&event2);
+
+    const events = try obs.collectSince(std.testing.allocator, mid_seq);
+    defer {
+        for (events) |e| std.testing.allocator.free(e.tool);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("web_fetch", events[0].tool);
+    try std.testing.expect(!events[0].success);
+}
+
+test "GatewayThreadObserver collectSince OOM frees partial output" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const event1 = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = true } };
+    obs.observer().recordEvent(&event1);
+    const event2 = observability.ObserverEvent{ .tool_call = .{ .tool = "web_fetch", .duration_ms = 20, .success = false } };
+    obs.observer().recordEvent(&event2);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    // collectSince allocations: out array + first tool dupe + second tool dupe
+    failing.fail_index = failing.alloc_index + 2;
+    try std.testing.expectError(error.OutOfMemory, obs.collectSince(failing.allocator(), 0));
+}
+
+// ── buildThreadEventsJson / buildWebhookSuccessResponse tests ───
+
+test "buildThreadEventsJson empty events" {
+    const result = try buildThreadEventsJson(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "buildThreadEventsJson with tool results" {
+    const events = [_]GatewayTurnToolEvent{
+        .{ .kind = .start, .tool = "shell", .success = false },
+        .{ .kind = .result, .tool = "shell", .success = true },
+        .{ .kind = .result, .tool = "web_fetch", .success = false },
+    };
+    const result = try buildThreadEventsJson(std.testing.allocator, &events);
+    defer std.testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    const summary = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("tool_summary", summary.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("failed").?.integer);
+}
+
+test "buildWebhookSuccessResponse includes thread_events" {
+    const result = try buildWebhookSuccessResponse(std.testing.allocator, "hello", "[]");
+    defer std.testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("ok", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("hello", parsed.value.object.get("response").?.string);
+    try std.testing.expect(parsed.value.object.get("thread_events").? == .array);
 }
 
 // ── jsonWrapChallenge tests ─────────────────────────────────────

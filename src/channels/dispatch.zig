@@ -760,3 +760,4 @@ test "startAllSupervised wraps channel array" {
     try std.testing.expectEqualStrings("telegram", supervised[0].channel.name());
     try std.testing.expectEqualStrings("discord", supervised[1].channel.name());
 }
+

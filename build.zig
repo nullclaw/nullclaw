@@ -1,6 +1,71 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const VendoredFileHash = struct {
+    path: []const u8,
+    sha256_hex: []const u8,
+};
+
+const VENDORED_SQLITE_HASHES = [_]VendoredFileHash{
+    .{
+        .path = "vendor/sqlite3/sqlite3.c",
+        .sha256_hex = "dc58f0b5b74e8416cc29b49163a00d6b8bf08a24dd4127652beaaae307bd1839",
+    },
+    .{
+        .path = "vendor/sqlite3/sqlite3.h",
+        .sha256_hex = "05c48cbf0a0d7bda2b6d0145ac4f2d3a5e9e1cb98b5d4fa9d88ef620e1940046",
+    },
+    .{
+        .path = "vendor/sqlite3/sqlite3ext.h",
+        .sha256_hex = "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48",
+    },
+};
+
+fn hashWithCanonicalLineEndings(bytes: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var chunk_start: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') {
+            if (i > chunk_start) hasher.update(bytes[chunk_start..i]);
+            hasher.update("\n");
+            i += 1;
+            chunk_start = i + 1;
+        }
+    }
+    if (chunk_start < bytes.len) hasher.update(bytes[chunk_start..]);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn verifyVendoredSqliteHashes(b: *std.Build) !void {
+    const max_vendor_file_size = 16 * 1024 * 1024;
+    for (VENDORED_SQLITE_HASHES) |entry| {
+        const file_path = b.pathFromRoot(entry.path);
+        defer b.allocator.free(file_path);
+
+        const bytes = std.fs.cwd().readFileAlloc(b.allocator, file_path, max_vendor_file_size) catch |err| {
+            std.log.err("failed to read {s}: {s}", .{ file_path, @errorName(err) });
+            return err;
+        };
+        defer b.allocator.free(bytes);
+
+        const digest = hashWithCanonicalLineEndings(bytes);
+
+        const actual_hex_buf = std.fmt.bytesToHex(digest, .lower);
+        const actual_hex = actual_hex_buf[0..];
+
+        if (!std.mem.eql(u8, actual_hex, entry.sha256_hex)) {
+            std.log.err("vendored sqlite checksum mismatch for {s}", .{entry.path});
+            std.log.err("expected: {s}", .{entry.sha256_hex});
+            std.log.err("actual:   {s}", .{actual_hex});
+            return error.VendoredSqliteChecksumMismatch;
+        }
+    }
+}
+
 const ChannelSelection = struct {
     enable_channel_cli: bool = false,
     enable_channel_telegram: bool = false,
@@ -19,6 +84,7 @@ const ChannelSelection = struct {
     enable_channel_qq: bool = false,
     enable_channel_maixcam: bool = false,
     enable_channel_signal: bool = false,
+    enable_channel_nostr: bool = false,
     enable_channel_web: bool = false,
 
     fn enableAll(self: *ChannelSelection) void {
@@ -39,6 +105,7 @@ const ChannelSelection = struct {
         self.enable_channel_qq = true;
         self.enable_channel_maixcam = true;
         self.enable_channel_signal = true;
+        self.enable_channel_nostr = true;
         self.enable_channel_web = true;
     }
 };
@@ -107,6 +174,8 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_maixcam = true;
         } else if (std.mem.eql(u8, token, "signal")) {
             selection.enable_channel_signal = true;
+        } else if (std.mem.eql(u8, token, "nostr")) {
+            selection.enable_channel_nostr = true;
         } else if (std.mem.eql(u8, token, "web")) {
             selection.enable_channel_web = true;
         } else {
@@ -250,7 +319,7 @@ pub fn build(b: *std.Build) void {
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|web (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -298,11 +367,19 @@ pub fn build(b: *std.Build) void {
     const enable_channel_qq = channels.enable_channel_qq;
     const enable_channel_maixcam = channels.enable_channel_maixcam;
     const enable_channel_signal = channels.enable_channel_signal;
+    const enable_channel_nostr = channels.enable_channel_nostr;
     const enable_channel_web = channels.enable_channel_web;
 
     const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
     const effective_enable_memory_lucid = enable_sqlite and enable_memory_lucid;
     const effective_enable_memory_lancedb = enable_sqlite and enable_memory_lancedb;
+
+    if (enable_sqlite) {
+        verifyVendoredSqliteHashes(b) catch {
+            std.log.err("vendored sqlite integrity check failed", .{});
+            std.process.exit(1);
+        };
+    }
 
     const sqlite3 = if (enable_sqlite) blk: {
         const sqlite3_dep = b.dependency("sqlite3", .{
@@ -343,6 +420,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_qq", enable_channel_qq);
     build_options.addOption(bool, "enable_channel_maixcam", enable_channel_maixcam);
     build_options.addOption(bool, "enable_channel_signal", enable_channel_signal);
+    build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
     const build_options_module = build_options.createModule();
 

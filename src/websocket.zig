@@ -145,15 +145,28 @@ pub const WsClient = struct {
         try tls_state.tls_client.writer.flush();
         try tls_state.stream_writer.interface.flush();
 
-        // Read HTTP 101 response
+        // Read HTTP 101 response headers byte-by-byte to avoid consuming
+        // any WebSocket frame data that follows the headers in the same TLS
+        // record. Servers like Mattermost (behind Caddy) may send the first
+        // WS frame immediately after the 101 response.
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         while (resp_len < resp_buf.len) {
-            var rd: [1][]u8 = .{resp_buf[resp_len..]};
-            const n = tls_state.tls_client.reader.readVec(&rd) catch
+            // Use take(1) which always fills the internal buffer first,
+            // then returns a pointer into it — consuming exactly one byte.
+            const byte_ptr = tls_state.tls_client.reader.take(1) catch
                 return error.WsHandshakeFailed;
-            resp_len += n;
-            if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n") != null) break;
+            resp_buf[resp_len] = byte_ptr[0];
+            resp_len += 1;
+            // Check for end-of-headers marker
+            if (resp_len >= 4 and
+                resp_buf[resp_len - 4] == '\r' and
+                resp_buf[resp_len - 3] == '\n' and
+                resp_buf[resp_len - 2] == '\r' and
+                resp_buf[resp_len - 1] == '\n')
+            {
+                break;
+            }
         }
         const resp = resp_buf[0..resp_len];
         if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {

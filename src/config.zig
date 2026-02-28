@@ -2,6 +2,30 @@ const std = @import("std");
 const platform = @import("platform.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
+/// Write a JSON-escaped string (with enclosing quotes) to any writer.
+/// Mirrors json_util.appendJsonString but works with writer-based output.
+fn writeJsonStr(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    var esc: [6]u8 = undefined;
+                    const escape = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try w.writeAll(escape);
+                } else {
+                    try w.writeByte(c);
+                }
+            },
+        }
+    }
+    try w.writeByte('"');
+}
 
 // ── Re-export all types so downstream `@import("config.zig").Foo` still works ──
 
@@ -68,6 +92,7 @@ pub const AudioMediaConfig = config_types.AudioMediaConfig;
 pub const DmScope = config_types.DmScope;
 pub const IdentityLink = config_types.IdentityLink;
 pub const SessionConfig = config_types.SessionConfig;
+pub const NostrConfig = config_types.NostrConfig;
 
 // ── Top-level Config ────────────────────────────────────────────
 
@@ -77,6 +102,7 @@ pub const Config = struct {
     config_path: []const u8,
 
     // Top-level fields
+    workspace_dir_override: ?[]const u8 = null, // User-specified workspace path (if set, overrides default)
     providers: []const ProviderEntry = &.{},
     audio_media: AudioMediaConfig = .{},
     default_provider: []const u8 = "openrouter",
@@ -190,10 +216,10 @@ pub const Config = struct {
 
         const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
-        const workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+        const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
         var cfg = Config{
-            .workspace_dir = workspace_dir,
+            .workspace_dir = default_workspace_dir, // temporarily set to default
             .config_path = config_path,
             .allocator = allocator,
             .arena = arena_ptr,
@@ -205,10 +231,26 @@ pub const Config = struct {
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
             cfg.parseJson(content) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => {}, // malformed JSON — use defaults for unparsed fields
+                else => {
+                    // Log parse errors so users can diagnose corrupted or
+                    // invalid configuration files. We still fall back to
+                    // defaults so the CLI remains usable, but the warning
+                    // makes the problem visible during debugging.
+                    std.debug.print("Warning: failed to parse config.json: {s}\n", .{@errorName(err)});
+                },
             };
         } else |_| {
             // Config file doesn't exist yet — use defaults
+        }
+
+        // Use workspace_dir_override if set, otherwise use default
+        if (cfg.workspace_dir_override != null) {
+            cfg.workspace_dir = cfg.workspace_dir_override.?;
+        }
+
+        // Backfill runtime-derived fields not present in JSON
+        if (cfg.channels.nostr) |ns| {
+            ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
         }
 
         // Environment variable overrides
@@ -302,6 +344,7 @@ pub const Config = struct {
 
         inline for (std.meta.fields(ChannelsConfig)) |field| {
             if (comptime std.mem.eql(u8, field.name, "cli")) continue;
+            if (comptime std.mem.eql(u8, field.name, "nostr")) continue;
 
             const channel_value = @field(self.channels, field.name);
             switch (@typeInfo(field.type)) {
@@ -324,11 +367,57 @@ pub const Config = struct {
             }
         }
 
+        if (self.channels.nostr) |ns| {
+            try writeChannelFieldSeparator(w, wrote_any);
+            try w.print("    \"nostr\": ", .{});
+            try writeNostrChannel(w, ns.*);
+            wrote_any = true;
+        }
+
         if (wrote_any) {
             try w.print("\n  }},\n", .{});
         } else {
             try w.print("  }},\n", .{});
         }
+    }
+
+    fn writeNostrChannel(w: *std.Io.Writer, ns: NostrConfig) !void {
+        try w.print("{{\n", .{});
+        try w.print("      \"private_key\": ", .{});
+        try writeJsonStr(w, ns.private_key);
+        try w.print(",\n      \"owner_pubkey\": ", .{});
+        try writeJsonStr(w, ns.owner_pubkey);
+        try w.print(",\n      \"bot_pubkey\": ", .{});
+        try writeJsonStr(w, ns.bot_pubkey);
+        try w.print(",\n      \"relays\": ", .{});
+        try writeStringArray(w, ns.relays);
+        try w.print(",\n      \"dm_relays\": ", .{});
+        try writeStringArray(w, ns.dm_relays);
+        try w.print(",\n      \"dm_allowed_pubkeys\": ", .{});
+        try writeStringArray(w, ns.dm_allowed_pubkeys);
+        try w.print(",\n      \"display_name\": ", .{});
+        try writeJsonStr(w, ns.display_name);
+        try w.print(",\n      \"about\": ", .{});
+        try writeJsonStr(w, ns.about);
+        if (ns.display_pic) |dp| {
+            try w.print(",\n      \"display_pic\": ", .{});
+            try writeJsonStr(w, dp);
+        }
+        if (ns.lnurl) |lnurl| {
+            try w.print(",\n      \"lnurl\": ", .{});
+            try writeJsonStr(w, lnurl);
+        }
+        if (ns.nip05) |nip05| {
+            try w.print(",\n      \"nip05\": ", .{});
+            try writeJsonStr(w, nip05);
+        }
+        try w.print(",\n      \"nak_path\": ", .{});
+        try writeJsonStr(w, ns.nak_path);
+        if (ns.bunker_uri) |bu| {
+            try w.print(",\n      \"bunker_uri\": ", .{});
+            try writeJsonStr(w, bu);
+        }
+        try w.print("\n    }}", .{});
     }
 
     fn writeStringArray(w: *std.Io.Writer, values: []const []const u8) !void {
@@ -463,6 +552,16 @@ pub const Config = struct {
         try w.print("{{\n", .{});
 
         // Top-level fields
+        if (self.workspace_dir_override) |workspace| {
+            // JSON-escape the workspace string so backslashes, quotes etc. are
+            // handled correctly. Previously we just printed with "{s}" which
+            // could produce invalid JSON when the path contained a backslash or
+            // other special character. Use our helper to stringify any value
+            // inline instead.
+            try w.print("  \"workspace\": ", .{});
+            try writePrettyJsonInline(self.allocator, w, workspace, "");
+            try w.print(",\n", .{});
+        }
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
@@ -836,11 +935,24 @@ pub const Config = struct {
 
 // ── Tests ───────────────────────────────────────────────────────
 
+/// Helper used by tests to compare paths on Windows without worrying about
+/// JSON escaping or backslashes vs. forward slashes. Converts all '\\' to '/'.
+fn normalizePathSeparators(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const dup = try allocator.dupe(u8, path);
+    for (dup) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return dup;
+}
+
 test "json parse roundtrip" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const json =
         \\{
+        \\  "workspace": "/custom/path",
         \\  "default_temperature": 0.5,
         \\  "models": {"providers": {"anthropic": {"api_key": "sk-test"}}},
         \\  "agents": {"defaults": {"model": {"primary": "anthropic/claude-opus-4"}, "heartbeat": {"every": "15m"}}},
@@ -860,6 +972,9 @@ test "json parse roundtrip" {
     try cfg.parseJson(json);
     cfg.syncFlatFields();
 
+    try std.testing.expectEqualStrings("/custom/path", cfg.workspace_dir_override.?);
+    try std.testing.expectEqualStrings("/custom/path", cfg.workspace_dir);
+
     try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
@@ -873,6 +988,7 @@ test "json parse roundtrip" {
     try std.testing.expect(!cfg.memory.auto_save);
     try std.testing.expect(!cfg.memory_auto_save);
     try std.testing.expectEqual(@as(u16, 9090), cfg.gateway.port);
+
     try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);
     try std.testing.expectEqual(AutonomyLevel.full, cfg.autonomy.level);
     try std.testing.expect(!cfg.autonomy.workspace_only);
@@ -881,19 +997,6 @@ test "json parse roundtrip" {
     try std.testing.expectEqualStrings("docker", cfg.runtime.kind);
     try std.testing.expect(cfg.cost.enabled);
     try std.testing.expectEqual(@as(f64, 25.0), cfg.cost.daily_limit_usd);
-
-    // Clean up allocated strings
-    allocator.free(cfg.default_provider);
-    allocator.free(cfg.default_model.?);
-    for (cfg.providers) |e| {
-        allocator.free(e.name);
-        if (e.api_key) |k| allocator.free(k);
-        if (e.base_url) |b| allocator.free(b);
-    }
-    allocator.free(cfg.providers);
-    allocator.free(cfg.memory.backend);
-    allocator.free(cfg.gateway.host);
-    allocator.free(cfg.runtime.kind);
 }
 
 test "validation rejects bad temperature" {
@@ -1077,6 +1180,12 @@ test "save writes configured telegram channel account" {
             .account_id = "main",
             .bot_token = "123:ABC",
             .allow_from = &.{"user1"},
+            .interactive = .{
+                .enabled = true,
+                .ttl_secs = 120,
+                .owner_only = true,
+                .remove_on_click = false,
+            },
         },
     };
     try cfg.save();
@@ -1091,6 +1200,59 @@ test "save writes configured telegram channel account" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"main\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"account_id\": \"main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_token\": \"123:ABC\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"interactive\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"enabled\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"ttl_secs\": 120") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"remove_on_click\": false") != null);
+}
+
+test "save roundtrip preserves telegram interactive settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.channels.telegram = &.{
+        .{
+            .account_id = "main",
+            .bot_token = "123:ABC",
+            .interactive = .{
+                .enabled = true,
+                .ttl_secs = 321,
+                .owner_only = false,
+                .remove_on_click = false,
+            },
+        },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expectEqual(@as(usize, 1), loaded.channels.telegram.len);
+    try std.testing.expect(loaded.channels.telegram[0].interactive.enabled);
+    try std.testing.expectEqual(@as(u64, 321), loaded.channels.telegram[0].interactive.ttl_secs);
+    try std.testing.expect(!loaded.channels.telegram[0].interactive.owner_only);
+    try std.testing.expect(!loaded.channels.telegram[0].interactive.remove_on_click);
 }
 
 test "save roundtrip preserves diagnostics logging flags" {
@@ -1519,6 +1681,20 @@ test "syncFlatFields propagates nested values" {
     try std.testing.expectEqual(@as(u16, 9999), cfg.gateway_port);
     try std.testing.expect(!cfg.workspace_only);
     try std.testing.expectEqual(@as(u32, 999), cfg.max_actions_per_hour);
+}
+
+test "syncFlatFields keeps explicit workspace_dir" {
+    var cfg = Config{
+        .workspace_dir = "/workspace/from-env",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.workspace_dir_override = "/workspace/from-json";
+
+    cfg.syncFlatFields();
+
+    try std.testing.expectEqualStrings("/workspace/from-env", cfg.workspace_dir);
+    try std.testing.expectEqualStrings("/workspace/from-json", cfg.workspace_dir_override.?);
 }
 
 // ── Security-critical defaults ───────────────────────────────────
@@ -2241,6 +2417,69 @@ test "parse agents.defaults.model.primary" {
     allocator.free(cfg.default_model.?);
 }
 
+// verify that workspace override field (with backslashes) does not
+// crash parsing and the default model is still picked up.
+test "parse with workspace override" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "workspace": "C:\\Users\\menger\\Desktop\\myspace",
+        \\  "agents": {"defaults": {"model": {"primary": "glm/glm-4.7"}}}
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("glm", cfg.default_provider);
+    try std.testing.expectEqualStrings("glm-4.7", cfg.default_model.?);
+    // workspace_dir_override should be preserved as-is from JSON
+    try std.testing.expect(cfg.workspace_dir_override != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.workspace_dir_override.?, "Users") != null);
+}
+
+// roundtrip save/load should retain model and workspace override
+// and produce valid JSON that can be parsed back.
+test "save and load roundtrip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    // some settings
+    cfg.default_provider = try allocator.dupe(u8, "glm");
+    cfg.default_model = try allocator.dupe(u8, "glm-4.7");
+    cfg.workspace_dir_override = try allocator.dupe(u8, "C:\\Users\\menger\\Desktop\\myspace");
+
+    try cfg.save();
+
+    // load back by reading and parsing the saved file
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 64);
+
+    var cfg2 = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try cfg2.parseJson(content);
+
+    try std.testing.expectEqualStrings("glm", cfg2.default_provider);
+    try std.testing.expectEqualStrings("glm-4.7", cfg2.default_model.?);
+    try std.testing.expect(cfg2.workspace_dir_override != null);
+}
+
 test "parse agents.list with model object" {
     const allocator = std.testing.allocator;
     const json =
@@ -2642,7 +2881,7 @@ test "tools.media.audio disabled" {
 test "parse telegram accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080"}}}}}
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2654,11 +2893,33 @@ test "parse telegram accounts" {
     try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
     try std.testing.expect(!tg.reply_in_private);
     try std.testing.expectEqualStrings("socks5://host:1080", tg.proxy.?);
+    try std.testing.expect(tg.interactive.enabled);
+    try std.testing.expectEqual(@as(u64, 42), tg.interactive.ttl_secs);
+    try std.testing.expect(!tg.interactive.owner_only);
+    try std.testing.expect(!tg.interactive.remove_on_click);
     allocator.free(tg.account_id);
     allocator.free(tg.bot_token);
     for (tg.allow_from) |u| allocator.free(u);
     allocator.free(tg.allow_from);
     allocator.free(tg.proxy.?);
+    allocator.free(cfg.channels.telegram);
+}
+
+test "parse telegram accounts interactive defaults when omitted" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
+    const tg = cfg.channels.telegram[0];
+    try std.testing.expect(!tg.interactive.enabled);
+    try std.testing.expectEqual(@as(u64, 900), tg.interactive.ttl_secs);
+    try std.testing.expect(tg.interactive.owner_only);
+    try std.testing.expect(tg.interactive.remove_on_click);
+    allocator.free(tg.account_id);
+    allocator.free(tg.bot_token);
     allocator.free(cfg.channels.telegram);
 }
 
@@ -3437,4 +3698,254 @@ test "session config: all dm_scope values accepted" {
         try cfg.parseJson(json);
         try std.testing.expectEqual(c[1], cfg.session.dm_scope);
     }
+}
+
+test "save includes nostr channel when configured" {
+    const allocator = std.testing.allocator;
+
+    const tmp_path = "/tmp/nullclaw_test_nostr_save.json";
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = tmp_path,
+        .allocator = allocator,
+    };
+
+    const owner_pubkey = "a" ** 64;
+    var ns_cfg = NostrConfig{
+        .private_key = "enc2:abc",
+        .owner_pubkey = owner_pubkey,
+        .nak_path = "nak",
+        // display_pic, lnurl, nip05, bunker_uri intentionally null
+    };
+    cfg.channels.nostr = &ns_cfg;
+
+    try cfg.save();
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    const file = try std.fs.openFileAbsolute(tmp_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    // Must contain nostr channel fields
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"nostr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"private_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"owner_pubkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_pubkey\"") != null);
+
+    // Relays array must contain at least the first default relay
+    try std.testing.expect(std.mem.indexOf(u8, content, "wss://relay.damus.io") != null);
+
+    // Optional fields that are null in this config must NOT appear in output
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"display_pic\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"lnurl\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "nip05") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "bunker_uri") == null);
+
+    // Must NOT contain the runtime-only config_dir field
+    try std.testing.expect(std.mem.indexOf(u8, content, "config_dir") == null);
+}
+
+test "save includes dm_relays in nostr section" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_dm_relays_save.json";
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = tmp_path,
+        .allocator = allocator,
+    };
+    var ns_cfg = config_types.NostrConfig{
+        .private_key = "enc2:abc",
+        .owner_pubkey = "a" ** 64,
+        .dm_relays = &.{ "wss://auth.nostr1.com", "wss://relay.damus.io" },
+    };
+    cfg.channels.nostr = &ns_cfg;
+
+    try cfg.save();
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    const file = try std.fs.openFileAbsolute(tmp_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"dm_relays\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "auth.nostr1.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "config_dir") == null);
+}
+
+test "dm_relays round-trips through save and load" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_dm_relays_roundtrip.json";
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = tmp_path,
+        .allocator = allocator,
+    };
+    var ns_cfg = config_types.NostrConfig{
+        .private_key = "enc2:abc",
+        .owner_pubkey = "a" ** 64,
+        .dm_relays = &.{ "wss://auth.nostr1.com", "wss://relay.damus.io" },
+    };
+    cfg.channels.nostr = &ns_cfg;
+
+    try cfg.save();
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    const file = try std.fs.openFileAbsolute(tmp_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    // Use an arena so all allocations made by parseJson are freed in bulk.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = "/tmp",
+        .config_path = tmp_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    const ns = loaded.channels.nostr.?;
+    try std.testing.expectEqual(@as(usize, 2), ns.dm_relays.len);
+    try std.testing.expectEqualStrings("wss://auth.nostr1.com", ns.dm_relays[0]);
+    try std.testing.expectEqualStrings("wss://relay.damus.io", ns.dm_relays[1]);
+}
+
+test "nostr display_name with special chars round-trips correctly" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_nostr_escape.json";
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = tmp_path,
+        .allocator = allocator,
+    };
+    var ns_cfg = config_types.NostrConfig{
+        .private_key = "enc2:abc",
+        .owner_pubkey = "a" ** 64,
+        .display_name = "Bot \"NullClaw\" v1",
+        .about = "Line1\nLine2",
+    };
+    cfg.channels.nostr = &ns_cfg;
+
+    try cfg.save();
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    const file_content = try std.fs.openFileAbsolute(tmp_path, .{});
+    defer file_content.close();
+    const raw = try file_content.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(raw);
+
+    // Verify the escaping is present in the raw JSON
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\\\"NullClaw\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\\n") != null);
+
+    // Round-trip: parse back and verify the original strings are recovered
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = "/tmp",
+        .config_path = tmp_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(raw);
+
+    const ns = loaded.channels.nostr.?;
+    try std.testing.expectEqualStrings("Bot \"NullClaw\" v1", ns.display_name);
+    try std.testing.expectEqualStrings("Line1\nLine2", ns.about);
+}
+
+test "parse nostr channel from JSON" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"nostr": {
+        \\  "private_key": "enc2:deadbeef",
+        \\  "owner_pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "relays": ["wss://relay.damus.io", "wss://nos.lol"],
+        \\  "dm_allowed_pubkeys": ["*"],
+        \\  "display_name": "TestBot",
+        \\  "about": "A test bot",
+        \\  "nak_path": "/usr/local/bin/nak",
+        \\  "bunker_uri": null,
+        \\  "display_pic": null,
+        \\  "lnurl": null,
+        \\  "nip05": null
+        \\}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.nostr != null);
+    const ns = cfg.channels.nostr.?;
+    defer allocator.destroy(ns);
+    defer allocator.free(ns.private_key);
+    defer allocator.free(ns.owner_pubkey);
+    defer {
+        for (ns.relays) |r| allocator.free(r);
+        allocator.free(ns.relays);
+    }
+    defer {
+        for (ns.dm_allowed_pubkeys) |p| allocator.free(p);
+        allocator.free(ns.dm_allowed_pubkeys);
+    }
+    defer allocator.free(ns.display_name);
+    defer allocator.free(ns.about);
+    defer allocator.free(ns.nak_path);
+    try std.testing.expectEqualStrings("enc2:deadbeef", ns.private_key);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ns.owner_pubkey);
+    try std.testing.expectEqual(@as(usize, 2), ns.relays.len);
+    try std.testing.expectEqualStrings("wss://relay.damus.io", ns.relays[0]);
+    try std.testing.expectEqualStrings("wss://nos.lol", ns.relays[1]);
+    try std.testing.expectEqual(@as(usize, 1), ns.dm_allowed_pubkeys.len);
+    try std.testing.expectEqualStrings("*", ns.dm_allowed_pubkeys[0]);
+    try std.testing.expectEqualStrings("TestBot", ns.display_name);
+    try std.testing.expectEqualStrings("/usr/local/bin/nak", ns.nak_path);
+    // config_dir defaults to "." when not loaded via load() (no config_path dirname backfill in tests)
+    try std.testing.expectEqualStrings(".", ns.config_dir);
+}
+
+test "parse nostr channel missing required fields yields null" {
+    const allocator = std.testing.allocator;
+
+    // Required fields are JSON null (not strings) — no allocation occurs, result must be null
+    const json_null_fields =
+        \\{"channels": {"nostr": {"private_key": null, "owner_pubkey": null}}}
+    ;
+    var cfg1 = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg1.parseJson(json_null_fields);
+    try std.testing.expect(cfg1.channels.nostr == null);
+
+    // Both required fields absent from the JSON object entirely — result must also be null
+    const json_absent =
+        \\{"channels": {"nostr": {}}}
+    ;
+    var cfg2 = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg2.parseJson(json_absent);
+    try std.testing.expect(cfg2.channels.nostr == null);
+
+    // Asymmetric: private_key present as string, owner_pubkey absent.
+    // The parser allocates private_key then discards the local struct when the guard fails.
+    // Use an arena so the partial allocation is freed in bulk rather than leaking
+    // under std.testing.allocator (same pattern as production Config.load()).
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const json_one_field =
+        \\{"channels": {"nostr": {"private_key": "enc2:abc"}}}
+    ;
+    var cfg3 = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg3.parseJson(json_one_field);
+    try std.testing.expect(cfg3.channels.nostr == null);
+}
+
+test "NostrConfig dm_relays default is auth.nostr1.com" {
+    const cfg = config_types.NostrConfig{
+        .private_key = "enc2:x",
+        .owner_pubkey = "a" ** 64,
+    };
+    try std.testing.expectEqual(@as(usize, 1), cfg.dm_relays.len);
+    try std.testing.expectEqualStrings("wss://auth.nostr1.com", cfg.dm_relays[0]);
 }

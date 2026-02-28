@@ -266,6 +266,33 @@ pub const SessionManager = struct {
         return self.sessions.count();
     }
 
+    pub const ReloadSkillsResult = struct {
+        sessions_seen: usize = 0,
+        sessions_reloaded: usize = 0,
+        failures: usize = 0,
+    };
+
+    /// Reload skill-backed system prompts for all active sessions.
+    /// Each session is reloaded under its own lock to avoid in-flight turn races.
+    pub fn reloadSkillsAll(self: *SessionManager) ReloadSkillsResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var result = ReloadSkillsResult{};
+
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            result.sessions_seen += 1;
+            session.mutex.lock();
+            session.agent.has_system_prompt = false;
+            session.mutex.unlock();
+            result.sessions_reloaded += 1;
+        }
+
+        return result;
+    }
+
     /// Evict sessions idle longer than max_idle_secs. Returns number evicted.
     pub fn evictIdle(self: *SessionManager, max_idle_secs: u64) usize {
         self.mutex.lock();
@@ -983,4 +1010,52 @@ test "session initial state includes last_consolidated" {
     try testing.expectEqual(@as(u64, 0), s.turn_count);
     try testing.expect(s.created_at > 0);
     try testing.expect(s.last_active > 0);
+}
+
+// ---------------------------------------------------------------------------
+// 6. reloadSkillsAll tests
+// ---------------------------------------------------------------------------
+
+test "reloadSkillsAll with no sessions returns zero counts" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const result = sm.reloadSkillsAll();
+    try testing.expectEqual(@as(usize, 0), result.sessions_seen);
+    try testing.expectEqual(@as(usize, 0), result.sessions_reloaded);
+    try testing.expectEqual(@as(usize, 0), result.failures);
+}
+
+test "reloadSkillsAll invalidates system prompt on all sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s1 = try sm.getOrCreate("reload:a");
+    const s2 = try sm.getOrCreate("reload:b");
+    s1.agent.has_system_prompt = true;
+    s2.agent.has_system_prompt = true;
+
+    const result = sm.reloadSkillsAll();
+    try testing.expectEqual(@as(usize, 2), result.sessions_seen);
+    try testing.expectEqual(@as(usize, 2), result.sessions_reloaded);
+    try testing.expect(!s1.agent.has_system_prompt);
+    try testing.expect(!s2.agent.has_system_prompt);
+}
+
+test "reloadSkillsAll does not affect session count" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("reload:c");
+    _ = try sm.getOrCreate("reload:d");
+    try testing.expectEqual(@as(usize, 2), sm.sessionCount());
+
+    _ = sm.reloadSkillsAll();
+    try testing.expectEqual(@as(usize, 2), sm.sessionCount());
 }

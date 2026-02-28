@@ -315,6 +315,7 @@ fn mergeSchedulerTickChangesAndSave(
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    scheduler.setShellCwd(config.workspace_dir);
     defer scheduler.deinit();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
@@ -367,9 +368,6 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         }
     }
 }
-
-/// Stale detection threshold: 3x the Telegram long-poll timeout (30s).
-const STALE_THRESHOLD_SECS: i64 = 90;
 
 /// Channel supervisor thread — spawns polling threads for configured channels,
 /// monitors their health, and restarts on failure using SupervisedChannel.
@@ -804,7 +802,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var inbound_thread: ?std.Thread = null;
     if (channel_rt) |rt| {
         state.addComponent("inbound_dispatcher");
-        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundDispatcherThread, .{
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, inboundDispatcherThread, .{
             allocator, &event_bus, &channel_registry, rt, &state,
         })) |thread| {
             inbound_thread = thread;
@@ -821,7 +819,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     state.addComponent("outbound_dispatcher");
 
     var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, dispatch.runOutboundDispatcher, .{
+    if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, dispatch.runOutboundDispatcher, .{
         allocator, &event_bus, &channel_registry, &dispatch_stats,
     })) |thread| {
         dispatcher_thread = thread;
@@ -1587,6 +1585,21 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
     }, "C123");
     try std.testing.expect(with_message_only != null);
     try std.testing.expectEqualStrings("1700.1", with_message_only.?.thread_ts);
+}
+
+test "hasSupervisedChannels true for nostr" {
+    const config_types = @import("config_types.zig");
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var ns_cfg = config_types.NostrConfig{
+        .private_key = "enc2:abc",
+        .owner_pubkey = "a" ** 64,
+    };
+    config.channels.nostr = &ns_cfg;
+    try std.testing.expect(hasSupervisedChannels(&config));
 }
 
 test "stateFilePath derives from config_path" {

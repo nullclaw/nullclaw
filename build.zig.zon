@@ -5,8 +5,7 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .sqlite3 = .{
-            .url = "git+https://github.com/allyourcodebase/sqlite3#8f840560eae88ab66668c6827c64ffbd0d74ef37",
-            .hash = "sqlite3-3.51.0-DMxLWssOAABZ8cAvU_LfBIbp0kZjm824PU8sSLXpEDdr",
+            .path = "vendor/sqlite3",
         },
         .websocket = .{
             .url = "git+https://github.com/karlseguin/websocket.zig#97fefafa59cc78ce177cff540b8685cd7f699276",
@@ -17,6 +16,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
         "LICENSE",
     },
 }

@@ -419,14 +419,20 @@ pub const WebChannel = struct {
         }
     }
 
-    fn relayPairingCodeExpired(self: *const WebChannel) bool {
+    fn relayPairingCodeExpiredLocked(self: *const WebChannel) bool {
         if (self.transport == .local) return false;
         if (self.relay_pairing_issued_at == 0) return true;
         const age = std.time.timestamp() - self.relay_pairing_issued_at;
         return age > @as(i64, @intCast(self.relay_pairing_code_ttl_secs));
     }
 
-    fn rotateRelayPairingCode(self: *WebChannel, reason: []const u8) void {
+    fn relayPairingCodeExpired(self: *WebChannel) bool {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+        return self.relayPairingCodeExpiredLocked();
+    }
+
+    fn rotateRelayPairingCodeLocked(self: *WebChannel, reason: []const u8) void {
         if (self.transport == .local) {
             if (self.relay_pairing_guard) |*guard| {
                 const code = guard.setPairingCode(LOCAL_FIXED_PAIRING_CODE) catch |err| {
@@ -451,6 +457,12 @@ pub const WebChannel = struct {
                 });
             }
         }
+    }
+
+    fn rotateRelayPairingCode(self: *WebChannel, reason: []const u8) void {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+        self.rotateRelayPairingCodeLocked(reason);
     }
 
     /// Generate a random auth token (64 hex chars from 32 random bytes).
@@ -762,52 +774,97 @@ pub const WebChannel = struct {
 
     fn handleRelayPairingRequest(self: *WebChannel, session_id: []const u8, request_id: ?[]const u8, payload_obj: ?std.json.ObjectMap) void {
         const pairing_code = payloadStringField(payload_obj, "pairing_code");
-        if (self.relay_pairing_guard == null) {
-            self.sendRelayError(session_id, request_id, "pairing_unavailable", "pairing flow is not initialized");
-            return;
-        }
-        if (self.relayPairingCodeExpired()) {
-            self.rotateRelayPairingCode("expired");
-            self.sendRelayError(session_id, request_id, "pairing_code_expired", "pairing code expired; a new code was issued");
-            return;
-        }
+        const PairingAttempt = union(enum) {
+            paired: []const u8,
+            failed: struct {
+                code: []const u8,
+                message: []const u8,
+            },
+        };
 
-        const pair_token = blk: {
+        const pair_attempt = blk: {
+            self.relay_security_mu.lock();
+            defer self.relay_security_mu.unlock();
+
+            if (self.relay_pairing_guard == null) {
+                break :blk PairingAttempt{
+                    .failed = .{
+                        .code = "pairing_unavailable",
+                        .message = "pairing flow is not initialized",
+                    },
+                };
+            }
+            if (self.relayPairingCodeExpiredLocked()) {
+                self.rotateRelayPairingCodeLocked("expired");
+                break :blk PairingAttempt{
+                    .failed = .{
+                        .code = "pairing_code_expired",
+                        .message = "pairing code expired; a new code was issued",
+                    },
+                };
+            }
+
             if (self.relay_pairing_guard) |*guard| {
                 const attempt = guard.attemptPair(pairing_code);
                 switch (attempt) {
-                    .paired => |token| break :blk token,
-                    .missing_code => {
-                        self.sendRelayError(session_id, request_id, "pairing_missing_code", "pairing_code is required");
-                        return;
+                    .paired => |token| {
+                        self.rotateRelayPairingCodeLocked("consumed");
+                        break :blk PairingAttempt{ .paired = token };
                     },
-                    .invalid_code => {
-                        self.sendRelayError(session_id, request_id, "pairing_invalid_code", "pairing code is invalid");
-                        return;
+                    .missing_code => break :blk PairingAttempt{
+                        .failed = .{
+                            .code = "pairing_missing_code",
+                            .message = "pairing_code is required",
+                        },
                     },
-                    .already_paired => {
-                        self.sendRelayError(session_id, request_id, "pairing_already_used", "pairing code already consumed");
-                        return;
+                    .invalid_code => break :blk PairingAttempt{
+                        .failed = .{
+                            .code = "pairing_invalid_code",
+                            .message = "pairing code is invalid",
+                        },
                     },
-                    .disabled => {
-                        self.sendRelayError(session_id, request_id, "pairing_disabled", "pairing is disabled");
-                        return;
+                    .already_paired => break :blk PairingAttempt{
+                        .failed = .{
+                            .code = "pairing_already_used",
+                            .message = "pairing code already consumed",
+                        },
                     },
-                    .locked_out => {
-                        self.sendRelayError(session_id, request_id, "pairing_locked_out", "too many failed pairing attempts; retry later");
-                        return;
+                    .disabled => break :blk PairingAttempt{
+                        .failed = .{
+                            .code = "pairing_disabled",
+                            .message = "pairing is disabled",
+                        },
                     },
-                    .internal_error => {
-                        self.sendRelayError(session_id, request_id, "pairing_internal_error", "pairing failed");
-                        return;
+                    .locked_out => break :blk PairingAttempt{
+                        .failed = .{
+                            .code = "pairing_locked_out",
+                            .message = "too many failed pairing attempts; retry later",
+                        },
+                    },
+                    .internal_error => break :blk PairingAttempt{
+                        .failed = .{
+                            .code = "pairing_internal_error",
+                            .message = "pairing failed",
+                        },
                     },
                 }
             }
-            self.sendRelayError(session_id, request_id, "pairing_internal_error", "pairing flow is not initialized");
-            return;
+
+            break :blk PairingAttempt{
+                .failed = .{
+                    .code = "pairing_internal_error",
+                    .message = "pairing flow is not initialized",
+                },
+            };
+        };
+        const pair_token = switch (pair_attempt) {
+            .paired => |token| token,
+            .failed => |failure| {
+                self.sendRelayError(session_id, request_id, failure.code, failure.message);
+                return;
+            },
         };
         defer self.allocator.free(pair_token);
-        defer self.rotateRelayPairingCode("consumed");
 
         const client_sub = self.deriveClientSubjectFromPairToken(pair_token) catch {
             self.sendRelayError(session_id, request_id, "pairing_internal_error", "failed to derive client identity");
