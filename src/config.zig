@@ -236,7 +236,7 @@ pub const Config = struct {
         }
 
         // Backfill runtime-derived fields not present in JSON
-        if (cfg.channels.nostr) |*ns| {
+        if (cfg.channels.nostr) |ns| {
             ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
         }
 
@@ -357,7 +357,7 @@ pub const Config = struct {
         if (self.channels.nostr) |ns| {
             try writeChannelFieldSeparator(w, wrote_any);
             try w.print("    \"nostr\": ", .{});
-            try writeNostrChannel(w, ns);
+            try writeNostrChannel(w, ns.*);
             wrote_any = true;
         }
 
@@ -3153,12 +3153,13 @@ test "save includes nostr channel when configured" {
     };
 
     const owner_pubkey = "a" ** 64;
-    cfg.channels.nostr = NostrConfig{
+    var ns_cfg = NostrConfig{
         .private_key = "enc2:abc",
         .owner_pubkey = owner_pubkey,
         .nak_path = "nak",
         // display_pic, lnurl, nip05, bunker_uri intentionally null
     };
+    cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
     defer std.fs.deleteFileAbsolute(tmp_path) catch {};
@@ -3196,11 +3197,12 @@ test "save includes dm_relays in nostr section" {
         .config_path = tmp_path,
         .allocator = allocator,
     };
-    cfg.channels.nostr = config_types.NostrConfig{
+    var ns_cfg = config_types.NostrConfig{
         .private_key = "enc2:abc",
         .owner_pubkey = "a" ** 64,
         .dm_relays = &.{ "wss://auth.nostr1.com", "wss://relay.damus.io" },
     };
+    cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
     defer std.fs.deleteFileAbsolute(tmp_path) catch {};
@@ -3224,11 +3226,12 @@ test "dm_relays round-trips through save and load" {
         .config_path = tmp_path,
         .allocator = allocator,
     };
-    cfg.channels.nostr = config_types.NostrConfig{
+    var ns_cfg = config_types.NostrConfig{
         .private_key = "enc2:abc",
         .owner_pubkey = "a" ** 64,
         .dm_relays = &.{ "wss://auth.nostr1.com", "wss://relay.damus.io" },
     };
+    cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
     defer std.fs.deleteFileAbsolute(tmp_path) catch {};
@@ -3263,12 +3266,13 @@ test "nostr display_name with special chars round-trips correctly" {
         .config_path = tmp_path,
         .allocator = allocator,
     };
-    cfg.channels.nostr = config_types.NostrConfig{
+    var ns_cfg = config_types.NostrConfig{
         .private_key = "enc2:abc",
         .owner_pubkey = "a" ** 64,
         .display_name = "Bot \"NullClaw\" v1",
         .about = "Line1\nLine2",
     };
+    cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
     defer std.fs.deleteFileAbsolute(tmp_path) catch {};
@@ -3318,6 +3322,7 @@ test "parse nostr channel from JSON" {
     try cfg.parseJson(json);
     try std.testing.expect(cfg.channels.nostr != null);
     const ns = cfg.channels.nostr.?;
+    defer allocator.destroy(ns);
     defer allocator.free(ns.private_key);
     defer allocator.free(ns.owner_pubkey);
     defer {

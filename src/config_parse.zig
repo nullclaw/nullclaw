@@ -256,7 +256,16 @@ fn parseChannels(self: *Config, channels_value: std.json.Value) !void {
                 },
                 .optional => |opt| {
                     const Child = opt.child;
-                    if (comptime @hasField(Child, "account_id")) {
+                    const info = @typeInfo(Child);
+                    if (info == .pointer and info.pointer.size == .one) {
+                        // ?*T — heap-allocated single config (e.g. NostrConfig)
+                        const Pointee = info.pointer.child;
+                        if (parseInlineChannel(Pointee, self.allocator, channel_value)) |parsed| {
+                            const ptr = try self.allocator.create(Pointee);
+                            ptr.* = parsed;
+                            @field(self.channels, field.name) = ptr;
+                        }
+                    } else if (comptime @hasField(Child, "account_id")) {
                         if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
                             @field(self.channels, field.name) = parsed;
                         }

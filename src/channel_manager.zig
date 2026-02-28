@@ -251,9 +251,17 @@ pub const ChannelManager = struct {
                         try self.appendChannelFromConfig(field.name, cfg);
                     }
                 },
-                .optional => {
+                .optional => |opt| {
                     if (@field(self.config.channels, field.name)) |cfg| {
-                        try self.appendChannelFromConfig(field.name, cfg);
+                        const inner = comptime blk: {
+                            const info = @typeInfo(opt.child);
+                            break :blk info == .pointer and info.pointer.size == .one;
+                        };
+                        if (inner) {
+                            try self.appendChannelFromConfig(field.name, cfg.*);
+                        } else {
+                            try self.appendChannelFromConfig(field.name, cfg);
+                        }
                     }
                 },
                 else => {},

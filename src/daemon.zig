@@ -1596,10 +1596,11 @@ test "hasSupervisedChannels true for nostr" {
         .config_path = "/tmp/config.json",
         .allocator = std.testing.allocator,
     };
-    config.channels.nostr = config_types.NostrConfig{
+    var ns_cfg = config_types.NostrConfig{
         .private_key = "enc2:abc",
         .owner_pubkey = "a" ** 64,
     };
+    config.channels.nostr = &ns_cfg;
     try std.testing.expect(hasSupervisedChannels(&config));
 }
 

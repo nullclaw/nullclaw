@@ -1249,12 +1249,14 @@ fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pre
     const store = secrets.SecretStore.init(config_dir, cfg.secrets.encrypt);
     const encrypted_key = try store.encryptSecret(cfg.allocator, bot_privkey_hex.?);
 
-    cfg.channels.nostr = .{
+    const ns = try cfg.allocator.create(@import("config_types.zig").NostrConfig);
+    ns.* = .{
         .private_key = encrypted_key,
         .owner_pubkey = try cfg.allocator.dupe(u8, owner_hex.?),
         .bot_pubkey = if (bot_pubkey_hex) |bph| try cfg.allocator.dupe(u8, bph) else "",
         .config_dir = config_dir,
     };
+    cfg.channels.nostr = ns;
     if (generate_new) {
         try out.print("{s}  -> Keypair generated and encrypted at rest\n", .{prefix});
     } else {

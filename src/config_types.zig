@@ -427,7 +427,7 @@ pub const ChannelsConfig = struct {
     qq: []const QQConfig = &.{},
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
-    nostr: ?NostrConfig = null,
+    nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
         if (items.len == 0) return null;
