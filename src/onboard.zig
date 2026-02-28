@@ -1236,12 +1236,18 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (model_input.len == 0) {
         // Default: use first model from the list (or provider default)
-        cfg.default_model = if (live_models.len > 0) live_models[0] else selected_provider.default_model;
+        // Must dupe because live_models will be freed in defer block
+        cfg.default_model = if (live_models.len > 0)
+            try cfg.allocator.dupe(u8, live_models[0])
+        else
+            try cfg.allocator.dupe(u8, selected_provider.default_model);
     } else if (std.fmt.parseInt(usize, model_input, 10)) |num| {
         if (num >= 1 and num <= display_max) {
-            cfg.default_model = live_models[num - 1];
+            // Must dupe because live_models will be freed in defer block
+            cfg.default_model = try cfg.allocator.dupe(u8, live_models[num - 1]);
         } else {
-            cfg.default_model = selected_provider.default_model;
+            // Must dupe because selected_provider.default_model is from const static data
+            cfg.default_model = try cfg.allocator.dupe(u8, selected_provider.default_model);
         }
     } else |_| {
         // Free-form model name typed by user
@@ -1338,6 +1344,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (ws_input.len > 0) {
         cfg.workspace_dir = try cfg.allocator.dupe(u8, ws_input);
+        cfg.workspace_dir_override = cfg.workspace_dir;
     }
     try out.print("  -> {s}\n\n", .{cfg.workspace_dir});
 
