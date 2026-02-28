@@ -42,6 +42,35 @@ fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     streaming.forwardProviderChunk(stream_ctx.sink, chunk);
 }
 
+const ParsedAgentArgs = struct {
+    message_arg: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    provider_override: ?[]const u8 = null,
+    model_override: ?[]const u8 = null,
+};
+
+fn parseAgentArgs(args: []const []const u8) ParsedAgentArgs {
+    var parsed = ParsedAgentArgs{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if ((std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) and i + 1 < args.len) {
+            i += 1;
+            parsed.message_arg = args[i];
+        } else if ((std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) and i + 1 < args.len) {
+            i += 1;
+            parsed.session_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--provider") and i + 1 < args.len) {
+            i += 1;
+            parsed.provider_override = args[i];
+        } else if (std.mem.eql(u8, arg, "--model") and i + 1 < args.len) {
+            i += 1;
+            parsed.model_override = args[i];
+        }
+    }
+    return parsed;
+}
+
 /// Run the agent in single-message or interactive REPL mode.
 /// This is the main entry point called by `nullclaw agent`.
 pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -60,26 +89,20 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // so prompts always have the expected bootstrap context.
     try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{});
 
+    const parsed_args = parseAgentArgs(args);
+    if (parsed_args.provider_override) |provider| {
+        cfg.default_provider = provider;
+    }
+    if (parsed_args.model_override) |model| {
+        cfg.default_model = model;
+    }
+
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
 
-    // Parse agent-specific flags
-    var message_arg: ?[]const u8 = null;
-    var session_id: ?[]const u8 = null;
-    {
-        var i: usize = 0;
-        while (i < args.len) : (i += 1) {
-            const arg: []const u8 = args[i];
-            if ((std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) and i + 1 < args.len) {
-                i += 1;
-                message_arg = args[i];
-            } else if ((std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) and i + 1 < args.len) {
-                i += 1;
-                session_id = args[i];
-            }
-        }
-    }
+    const message_arg = parsed_args.message_arg;
+    const session_id = parsed_args.session_id;
 
     // Create a noop observer
     var noop = observability.NoopObserver{};
@@ -345,4 +368,35 @@ test "cliStreamCallback text delta chunk" {
     try std.testing.expectEqualStrings("hello", chunk.delta);
     try std.testing.expect(!chunk.is_final);
     try std.testing.expectEqual(@as(u32, 2), chunk.token_count);
+}
+
+test "parseAgentArgs parses provider and model overrides" {
+    const args = [_][]const u8{
+        "-m",
+        "hi",
+        "--provider",
+        "ollama",
+        "--model",
+        "llama3.2:latest",
+    };
+    const parsed = parseAgentArgs(&args);
+    try std.testing.expectEqualStrings("hi", parsed.message_arg.?);
+    try std.testing.expectEqualStrings("ollama", parsed.provider_override.?);
+    try std.testing.expectEqualStrings("llama3.2:latest", parsed.model_override.?);
+}
+
+test "parseAgentArgs keeps the last override value" {
+    const args = [_][]const u8{
+        "--provider",
+        "openrouter",
+        "--provider",
+        "anthropic",
+        "--model",
+        "first",
+        "--model",
+        "second",
+    };
+    const parsed = parseAgentArgs(&args);
+    try std.testing.expectEqualStrings("anthropic", parsed.provider_override.?);
+    try std.testing.expectEqualStrings("second", parsed.model_override.?);
 }
