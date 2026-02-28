@@ -362,6 +362,52 @@ pub const MaixCamConfig = struct {
     name: []const u8 = "maixcam",
 };
 
+pub const NostrConfig = struct {
+    /// Private key: must be enc2:-encrypted via SecretStore (use onboarding wizard or SecretStore.encryptSecret).
+    /// Not required when bunker_uri is set (external bunker handles signing).
+    private_key: []const u8,
+    /// Owner's public key — must be 64-char lowercase hex (not npub). Always allowed through DM policy.
+    owner_pubkey: []const u8,
+    /// Bot's own public key — must be 64-char lowercase hex. Derived from private_key during onboarding.
+    /// Used as the -p filter for the listener so incoming gift wraps reach the bot, not the owner.
+    /// Empty string means not set (old config — re-run onboarding to populate).
+    bot_pubkey: []const u8 = "",
+    /// Relay URLs for publishing and subscribing.
+    relays: []const []const u8 = &.{
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.nostr.band",
+        "wss://auth.nostr1.com",
+        "wss://relay.primal.net",
+    },
+    /// Relay URLs announced in kind:10050 (NIP-17 DM inbox).
+    /// Senders look up this event to know where to address gift-wrapped DMs.
+    /// The listener subscribes here in addition to `relays`, so the bot
+    /// receives DMs on whichever relay the sender used.
+    dm_relays: []const []const u8 = &.{"wss://auth.nostr1.com"},
+    /// Pubkeys allowed to send DMs. Empty = deny all. ["*"] = allow all.
+    /// Owner is always implicitly allowed regardless of this list.
+    dm_allowed_pubkeys: []const []const u8 = &.{},
+    /// Display name for kind:0 metadata.
+    display_name: []const u8 = "NullClaw",
+    /// About text for kind:0 metadata.
+    about: []const u8 = "AI assistant",
+    /// Path to profile picture file. Published in kind:0 metadata as "picture" field.
+    display_pic: ?[]const u8 = null,
+    /// LNURL for Lightning Network & Cashu zaps (NIP-57). Published in kind:0 metadata as "lud16" field.
+    lnurl: ?[]const u8 = null,
+    /// NIP-05 identifier (e.g. "user@domain.com"). Published in kind:0 metadata as "nip05" field.
+    nip05: ?[]const u8 = null,
+    /// Path to the nak binary.
+    nak_path: []const u8 = "nak",
+    /// Bunker URI (auto-populated at first start, or manually set for external bunker).
+    bunker_uri: ?[]const u8 = null,
+    /// Directory containing the config file and .secret_key.
+    /// Set at construction time by the config loader or onboarding wizard.
+    /// Used by vtableStart to instantiate SecretStore for key decryption.
+    config_dir: []const u8 = ".",
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
     telegram: []const TelegramConfig = &.{},
@@ -381,6 +427,7 @@ pub const ChannelsConfig = struct {
     qq: []const QQConfig = &.{},
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
+    nostr: ?NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
         if (items.len == 0) return null;

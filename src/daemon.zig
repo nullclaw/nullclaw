@@ -1589,6 +1589,20 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
     try std.testing.expectEqualStrings("1700.1", with_message_only.?.thread_ts);
 }
 
+test "hasSupervisedChannels true for nostr" {
+    const config_types = @import("config_types.zig");
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    config.channels.nostr = config_types.NostrConfig{
+        .private_key = "enc2:abc",
+        .owner_pubkey = "a" ** 64,
+    };
+    try std.testing.expect(hasSupervisedChannels(&config));
+}
+
 test "stateFilePath derives from config_path" {
     const config = Config{
         .workspace_dir = "/tmp/workspace",
