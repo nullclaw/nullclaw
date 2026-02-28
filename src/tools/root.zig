@@ -265,6 +265,10 @@ pub fn allTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
+        http_timeout_secs: u64 = 30,
+        web_search_base_url: ?[]const u8 = null,
         browser_enabled: bool = false,
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
@@ -359,11 +363,18 @@ pub fn allTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = opts.http_allowed_domains,
+            .max_response_size = opts.http_max_response_size,
+            .timeout_secs = opts.http_timeout_secs,
+        };
         try list.append(allocator, ht.tool());
 
         const wst = try allocator.create(web_search.WebSearchTool);
-        wst.* = .{};
+        wst.* = .{
+            .searxng_base_url = opts.web_search_base_url,
+            .timeout_secs = opts.http_timeout_secs,
+        };
         try list.append(allocator, wst.tool());
 
         const wft = try allocator.create(web_fetch.WebFetchTool);
@@ -676,6 +687,43 @@ test "all tools excludes extras when disabled" {
     //        memory_store, memory_recall, memory_list, memory_forget,
     //        delegate, schedule, spawn = 13
     try std.testing.expectEqual(@as(usize, 13), tools.len);
+}
+
+test "all tools wires http and web_search config into tool instances" {
+    const domains = [_][]const u8{ "example.com", "api.example.com" };
+    const search_url = "https://searx.example.com";
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .http_enabled = true,
+        .http_allowed_domains = &domains,
+        .http_max_response_size = 321_000,
+        .http_timeout_secs = 12,
+        .web_search_base_url = search_url,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_http = false;
+    var saw_search = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "http_request")) {
+            const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 2), ht.allowed_domains.len);
+            try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+            try std.testing.expectEqual(@as(u32, 321_000), ht.max_response_size);
+            try std.testing.expectEqual(@as(u64, 12), ht.timeout_secs);
+            saw_http = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "web_search")) {
+            const wst: *web_search.WebSearchTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqualStrings(search_url, wst.searxng_base_url.?);
+            try std.testing.expectEqual(@as(u64, 12), wst.timeout_secs);
+            saw_search = true;
+        }
+    }
+
+    try std.testing.expect(saw_http);
+    try std.testing.expect(saw_search);
 }
 
 test "all tools wires subagent manager into spawn tool" {

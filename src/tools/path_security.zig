@@ -66,6 +66,7 @@ pub fn isResolvedPathAllowed(
     if (pathStartsWith(resolved, ws_resolved)) return true;
     // 3. Allowed paths (resolve each to handle symlinks)
     for (allowed_paths) |ap| {
+        if (std.mem.eql(u8, ap, "*")) return true;
         const ap_resolved = std.fs.cwd().realpathAlloc(allocator, ap) catch continue;
         defer allocator.free(ap_resolved);
         if (pathStartsWith(resolved, ap_resolved)) return true;
@@ -221,6 +222,33 @@ test "isResolvedPathAllowed allows via allowed_paths" {
         "/nonexistent-workspace",
         &.{tmp_path},
     ));
+}
+
+test "isResolvedPathAllowed wildcard allows non-system paths" {
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/home/user/random/path.txt",
+        "/nonexistent-workspace",
+        &.{"*"},
+    ));
+}
+
+test "isResolvedPathAllowed wildcard does not bypass system blocklist" {
+    if (comptime @import("builtin").os.tag == .windows) {
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "C:\\Windows\\System32\\cmd.exe",
+            "C:\\Users\\workspace",
+            &.{"*"},
+        ));
+    } else {
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "/etc/passwd",
+            "/home/user/workspace",
+            &.{"*"},
+        ));
+    }
 }
 
 test "pathStartsWith exact match" {

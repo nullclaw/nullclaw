@@ -12,6 +12,8 @@ const log = std.log.scoped(.http_request);
 /// domain allowlisting, SSRF protection, and header redaction.
 pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
+    max_response_size: u32 = 1_000_000,
+    timeout_secs: u64 = 30,
 
     pub const tool_name = "http_request";
     pub const tool_description = "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
@@ -167,7 +169,7 @@ pub const HttpRequestTool = struct {
         // Read response body (limit to 1MB)
         var transfer_buf: [8192]u8 = undefined;
         const reader = response.reader(&transfer_buf);
-        const response_body = reader.readAlloc(allocator, 1_048_576) catch |err| {
+        const response_body = reader.readAlloc(allocator, @intCast(self.max_response_size)) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to read response body: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };

@@ -209,7 +209,7 @@ pub const SecurityPolicy = struct {
 
             var found = false;
             for (self.allowed_commands) |allowed| {
-                if (std.mem.eql(u8, allowed, base_cmd)) {
+                if (std.mem.eql(u8, allowed, "*") or std.mem.eql(u8, allowed, base_cmd)) {
                     found = true;
                     break;
                 }
@@ -888,6 +888,22 @@ test "allows double ampersand and-and" {
     p.allowed_commands = &.{ "ls", "echo" };
     // && should still be allowed (it's safe chaining)
     try std.testing.expect(p.isCommandAllowed("ls && echo done"));
+}
+
+test "wildcard allowlist permits arbitrary base commands" {
+    var p = SecurityPolicy{ .autonomy = .full };
+    p.allowed_commands = &.{"*"};
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com"));
+    try std.testing.expect(p.isCommandAllowed("python3 --version"));
+}
+
+test "wildcard allowlist still honors high-risk runtime gate" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = true,
+    };
+    try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("curl https://example.com", false));
 }
 
 test "containsSingleAmpersand detects correctly" {

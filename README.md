@@ -354,6 +354,30 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 }
 ```
 
+### Full Web Search + Shell Access
+
+Use this when you want web search without Brave (via SearXNG) and unrestricted shell command allowlist behavior:
+
+```json
+{
+  "http_request": {
+    "enabled": true,
+    "search_base_url": "https://searx.example.com"
+  },
+  "autonomy": {
+    "level": "full",
+    "allowed_commands": ["*"],
+    "allowed_paths": ["*"],
+    "require_approval_for_medium_risk": false,
+    "block_high_risk_commands": false
+  }
+}
+```
+
+- `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`).
+- `allowed_commands: ["*"]` enables wildcard command allowlist matching.
+- `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
+
 ### Web UI / Browser Relay
 
 Use `channels.web` for browser UI events (WebChannel v1):

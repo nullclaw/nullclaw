@@ -981,6 +981,12 @@ pub const HttpRequestConfig = struct {
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
     allowed_domains: []const []const u8 = &.{},
+    /// Optional SearXNG instance URL used by web_search as a fallback when
+    /// BRAVE_API_KEY is not available.
+    /// Examples:
+    ///   - "https://searx.example.com"
+    ///   - "https://searx.example.com/search"
+    search_base_url: ?[]const u8 = null,
 };
 
 // ── Identity config ─────────────────────────────────────────────
@@ -1159,6 +1165,7 @@ test "security defaults stay least-privilege" {
 
     const http_request = HttpRequestConfig{};
     try std.testing.expect(!http_request.enabled);
+    try std.testing.expect(http_request.search_base_url == null);
 }
 
 test "WebConfig normalizePath trims and normalizes" {

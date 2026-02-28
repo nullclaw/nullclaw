@@ -724,6 +724,8 @@ pub const Config = struct {
             .enabled = self.http_request.enabled,
             .max_response_size = self.http_request.max_response_size,
             .timeout_secs = self.http_request.timeout_secs,
+            .allowed_domains = self.http_request.allowed_domains,
+            .search_base_url = self.http_request.search_base_url,
         }, .{})});
         try w.print("  \"identity\": {f},\n", .{std.json.fmt(self.identity, .{})});
         try w.print("  \"cost\": {f},\n", .{std.json.fmt(self.cost, .{})});
@@ -1504,6 +1506,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.http_request.enabled = true;
     cfg.http_request.max_response_size = 12345;
     cfg.http_request.timeout_secs = 8;
+    cfg.http_request.search_base_url = "https://searx.example.com";
 
     cfg.identity.format = "aieos";
     cfg.identity.aieos_path = "id.json";
@@ -1585,6 +1588,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.browser.enabled);
     try std.testing.expectEqual(@as(usize, 2), loaded.browser.allowed_domains.len);
     try std.testing.expect(loaded.http_request.enabled);
+    try std.testing.expectEqualStrings("https://searx.example.com", loaded.http_request.search_base_url.?);
     try std.testing.expectEqualStrings("aieos", loaded.identity.format);
     try std.testing.expectEqual(@as(u8, 70), loaded.cost.warn_at_percent);
     try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
@@ -2264,6 +2268,18 @@ test "json parse browser allowed domains" {
     try std.testing.expectEqualStrings("docs.rs", cfg.browser.allowed_domains[1]);
     for (cfg.browser.allowed_domains) |d| allocator.free(d);
     allocator.free(cfg.browser.allowed_domains);
+}
+
+test "json parse http_request search_base_url" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"http_request": {"enabled": true, "search_base_url": "https://searx.example.com"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expectEqualStrings("https://searx.example.com", cfg.http_request.search_base_url.?);
+    allocator.free(cfg.http_request.search_base_url.?);
 }
 
 test "json parse model routes" {
