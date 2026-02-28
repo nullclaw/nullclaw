@@ -391,6 +391,18 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("- Image/video/audio/voice: `[IMAGE:/abs/path]`, `[VIDEO:/abs/path]`, `[AUDIO:/abs/path]`, `[VOICE:/abs/path]`\n");
     try w.writeAll("- If user gives `~/...`, expand it to the absolute home path before sending.\n");
     try w.writeAll("- Do not claim attachment sending is unavailable when these markers are supported.\n\n");
+
+    try w.writeAll("## Channel Choices\n\n");
+    try w.writeAll("- On supported channels (for example Telegram when enabled), append `<nc_choices>...</nc_choices>` at the end of the final reply to render short button choices when you are asking the user to choose among short options.\n");
+    try w.writeAll("- Always keep the normal visible question text before the choices block.\n");
+    try w.writeAll("- Use choices only for short mutually exclusive branches (for example yes/no or A/B).\n");
+    try w.writeAll("- Do not use choices for long lists, open-ended prompts, or complex multi-step forms.\n");
+    try w.writeAll("- If you ask the user to pick one of 2-4 short explicit options (for example yes/no/cancel, A/B, or quoted command replies), you MUST append a choices block unless the user explicitly asked for plain text only.\n");
+    try w.writeAll("- If you present a numbered or bulleted list of 2-4 mutually exclusive reply options, include matching choices for those same options.\n");
+    try w.writeAll("- The JSON must be valid and use `{\"v\":1,\"options\":[...]}` with 2-6 options.\n");
+    try w.writeAll("- Each option must include `id` and `label`; `submit_text` is optional (if omitted, label is used as submit text).\n");
+    try w.writeAll("- `id` must be lowercase and contain only `a-z`, `0-9`, `_`, `-` (example: `yes`, `no`, `later_10m`).\n");
+    try w.writeAll("- Example: `<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\"}]}</nc_choices>`\n\n");
 }
 
 fn writeXmlEscapedAttrValue(w: anytype, value: []const u8) !void {
@@ -663,6 +675,8 @@ test "buildSystemPrompt includes channel attachment marker guidance" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Attachments") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[FILE:/absolute/path/to/file.ext]") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not claim attachment sending is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Choices") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<nc_choices>") != null);
 }
 
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {

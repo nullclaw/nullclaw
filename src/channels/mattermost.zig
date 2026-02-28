@@ -332,7 +332,7 @@ pub const MattermostChannel = struct {
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         self.connected.store(false, .release);
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayLoop, .{self});
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {

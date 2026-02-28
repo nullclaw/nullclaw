@@ -371,6 +371,10 @@ pub fn runTelegramLoop(
         };
         tg_ptr.transcriber = wt.transcriber();
     }
+    defer if (tg_ptr.transcriber) |t| {
+        allocator.destroy(@as(*voice.WhisperTranscriber, @ptrCast(@alignCast(t.ptr))));
+        tg_ptr.transcriber = null;
+    };
 
     // Restore persisted Telegram offset (OpenClaw parity).
     if (loadTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token)) |saved_update_id| {
@@ -454,7 +458,7 @@ pub fn runTelegramLoop(
             };
             defer allocator.free(reply);
 
-            tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
+            tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
                 log.warn("Send error: {}", .{err});
             };
         }
@@ -665,7 +669,7 @@ pub fn spawnTelegramPolling(
 
     const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
+        .{ .stack_size = 2 * 1024 * 1024 },
         runTelegramLoop,
         .{ allocator, config, runtime, tg_ls, tg_ptr },
     );
@@ -689,7 +693,7 @@ pub fn spawnSignalPolling(
 
     const sg_ptr: *signal.SignalChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
+        .{ .stack_size = 2 * 1024 * 1024 },
         runSignalLoop,
         .{ allocator, config, runtime, sg_ls, sg_ptr },
     );
@@ -713,7 +717,7 @@ pub fn spawnMatrixPolling(
 
     const mx_ptr: *matrix.MatrixChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
+        .{ .stack_size = 2 * 1024 * 1024 },
         runMatrixLoop,
         .{ allocator, config, runtime, mx_ls, mx_ptr },
     );

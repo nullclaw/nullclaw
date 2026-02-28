@@ -39,6 +39,8 @@ const CompatProvider = struct {
     merge_system_into_user: bool = false,
     /// Authentication style (default: Bearer token).
     auth_style: compatible.AuthStyle = .bearer,
+    /// Whether this provider supports native OpenAI-style tool_calls.
+    native_tools: bool = true,
 };
 
 const compat_providers = [_]CompatProvider{
@@ -74,11 +76,11 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — general ─────────────────────────────────────────
     .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
     .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "qianfan", .url = "https://aip.baidubce.com", .display = "Qianfan" },
@@ -90,26 +92,26 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — CN endpoints ────────────────────────────────────
     .{ .name = "moonshot-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
-    .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
+    .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
 
     // ── International variants ────────────────────────────────────────────
     .{ .name = "moonshot-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
-    .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
-    .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
+    .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
+    .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
     .{ .name = "qwen-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "dashscope-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "qwen-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
@@ -302,10 +304,11 @@ pub const ProviderHolder = union(enum) {
                 if (cp) |c| {
                     if (c.no_responses_fallback) prov.supports_responses_fallback = false;
                     if (c.merge_system_into_user) prov.merge_system_into_user = true;
+                    if (!c.native_tools) prov.native_tools = false;
                 }
 
-                // Apply config-level native_tools override.
-                prov.native_tools = native_tools;
+                // Apply config-level native_tools override (can only force to false).
+                if (!native_tools) prov.native_tools = false;
 
                 break :blk .{ .compatible = prov };
             },
@@ -508,6 +511,15 @@ test "fromConfig applies merge_system_into_user flag" {
     try std.testing.expect(h == .compatible);
     try std.testing.expect(h.compatible.merge_system_into_user);
     try std.testing.expect(!h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig inherits native_tools=false from table" {
+    const alloc = std.testing.allocator;
+    // minimax has native_tools = false in table
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expect(!h.compatible.native_tools);
 }
 
 test "detectProviderByApiKey openrouter" {
