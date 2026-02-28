@@ -47,28 +47,44 @@ const ParsedAgentArgs = struct {
     session_id: ?[]const u8 = null,
     provider_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
+    temperature_override: ?f64 = null,
 };
 
-fn parseAgentArgs(args: []const []const u8) ParsedAgentArgs {
+const AgentArgParseResult = union(enum) {
+    ok: ParsedAgentArgs,
+    missing_value: []const u8,
+    invalid_temperature: []const u8,
+};
+
+fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
     var parsed = ParsedAgentArgs{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if ((std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) and i + 1 < args.len) {
+        if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.message_arg = args[i];
-        } else if ((std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--session")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.session_id = args[i];
-        } else if (std.mem.eql(u8, arg, "--provider") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.provider_override = args[i];
-        } else if (std.mem.eql(u8, arg, "--model") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.model_override = args[i];
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            const temp = std.fmt.parseFloat(f64, args[i]) catch return .{ .invalid_temperature = args[i] };
+            parsed.temperature_override = temp;
         }
     }
-    return parsed;
+    return .{ .ok = parsed };
 }
 
 /// Run the agent in single-message or interactive REPL mode.
@@ -80,6 +96,28 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     defer cfg.deinit();
 
+    const parsed_args = switch (parseAgentArgs(args)) {
+        .ok => |parsed| parsed,
+        .missing_value => |opt| {
+            log.err("Missing value for {s}", .{opt});
+            return;
+        },
+        .invalid_temperature => |value| {
+            log.err("Invalid --temperature value: {s}", .{value});
+            return;
+        },
+    };
+    if (parsed_args.provider_override) |provider| {
+        cfg.default_provider = provider;
+    }
+    if (parsed_args.model_override) |model| {
+        cfg.default_model = model;
+    }
+    if (parsed_args.temperature_override) |temp| {
+        cfg.default_temperature = temp;
+        cfg.temperature = temp;
+    }
+
     cfg.validate() catch |err| {
         Config.printValidationError(err);
         return;
@@ -88,14 +126,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Ensure lifecycle parity: seed workspace files on first agent run
     // so prompts always have the expected bootstrap context.
     try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{});
-
-    const parsed_args = parseAgentArgs(args);
-    if (parsed_args.provider_override) |provider| {
-        cfg.default_provider = provider;
-    }
-    if (parsed_args.model_override) |model| {
-        cfg.default_model = model;
-    }
 
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
@@ -378,11 +408,17 @@ test "parseAgentArgs parses provider and model overrides" {
         "ollama",
         "--model",
         "llama3.2:latest",
+        "--temperature",
+        "0.25",
     };
-    const parsed = parseAgentArgs(&args);
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
     try std.testing.expectEqualStrings("hi", parsed.message_arg.?);
     try std.testing.expectEqualStrings("ollama", parsed.provider_override.?);
     try std.testing.expectEqualStrings("llama3.2:latest", parsed.model_override.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
 }
 
 test "parseAgentArgs keeps the last override value" {
@@ -395,8 +431,35 @@ test "parseAgentArgs keeps the last override value" {
         "first",
         "--model",
         "second",
+        "--temperature",
+        "0.1",
+        "--temperature",
+        "0.7",
     };
-    const parsed = parseAgentArgs(&args);
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
     try std.testing.expectEqualStrings("anthropic", parsed.provider_override.?);
     try std.testing.expectEqualStrings("second", parsed.model_override.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.7), parsed.temperature_override.?, 0.000001);
+}
+
+test "parseAgentArgs returns error for missing option value" {
+    const args = [_][]const u8{"--provider"};
+    switch (parseAgentArgs(&args)) {
+        .missing_value => |opt| try std.testing.expectEqualStrings("--provider", opt),
+        else => unreachable,
+    }
+}
+
+test "parseAgentArgs returns error for invalid temperature value" {
+    const args = [_][]const u8{
+        "--temperature",
+        "hot",
+    };
+    switch (parseAgentArgs(&args)) {
+        .invalid_temperature => |value| try std.testing.expectEqualStrings("hot", value),
+        else => unreachable,
+    }
 }
