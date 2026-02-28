@@ -175,7 +175,7 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            channel.send(msg.chat_id, msg.content, msg.media) catch {
+            channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -352,12 +352,14 @@ test "build system prompt" {
 const MockChannel = struct {
     name_str: []const u8,
     sent_count: Atomic(u64) = Atomic(u64).init(0),
+    chunk_count: Atomic(u64) = Atomic(u64).init(0),
     should_fail: bool = false,
 
     const vtable = root.Channel.VTable{
         .start = mockStart,
         .stop = mockStop,
         .send = mockSend,
+        .sendEvent = mockSendEvent,
         .name = mockName,
         .healthCheck = mockHealthCheck,
     };
@@ -372,6 +374,20 @@ const MockChannel = struct {
         const self: *MockChannel = @ptrCast(@alignCast(ctx));
         if (self.should_fail) return error.SendFailed;
         _ = self.sent_count.fetchAdd(1, .monotonic);
+    }
+    fn mockSendEvent(
+        ctx: *anyopaque,
+        _: []const u8,
+        _: []const u8,
+        _: []const []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        const self: *MockChannel = @ptrCast(@alignCast(ctx));
+        if (self.should_fail) return error.SendFailed;
+        switch (stage) {
+            .chunk => _ = self.chunk_count.fetchAdd(1, .monotonic),
+            .final => _ = self.sent_count.fetchAdd(1, .monotonic),
+        }
     }
     fn mockName(ctx: *anyopaque) []const u8 {
         const self: *const MockChannel = @ptrCast(@alignCast(ctx));
@@ -411,6 +427,28 @@ test "dispatcher routes message to correct channel" {
     try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
     try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
     try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+}
+
+test "dispatcher routes chunk stage via sendEvent" {
+    const allocator = std.testing.allocator;
+
+    var mock_web = MockChannel{ .name_str = "web" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_web.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundChunk(allocator, "web", "chat1", "hel");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 1), mock_web.chunk_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_web.sent_count.load(.monotonic));
 }
 
 test "dispatcher routes to matching account when channel has multiple accounts" {
@@ -761,4 +799,3 @@ test "startAllSupervised wraps channel array" {
     try std.testing.expectEqualStrings("telegram", supervised[0].channel.name());
     try std.testing.expectEqualStrings("discord", supervised[1].channel.name());
 }
-

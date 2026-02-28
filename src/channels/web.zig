@@ -103,6 +103,7 @@ pub const WebChannel = struct {
         .start = wsStart,
         .stop = wsStop,
         .send = wsSend,
+        .sendEvent = wsSendEvent,
         .name = wsName,
         .healthCheck = wsHealthCheck,
     };
@@ -1184,8 +1185,13 @@ pub const WebChannel = struct {
         self.deinitRelaySecurityState();
     }
 
-    fn wsSend(ctx: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
-        const self: *WebChannel = @ptrCast(@alignCast(ctx));
+    fn sendAssistantEvent(
+        self: *WebChannel,
+        target: []const u8,
+        message: []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        if (stage == .chunk and message.len == 0) return;
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -1196,7 +1202,14 @@ pub const WebChannel = struct {
             return error.E2eRequired;
         }
 
-        try w.writeAll("{\"v\":1,\"type\":\"assistant_final\",\"session_id\":");
+        const event_type = switch (stage) {
+            .chunk => "assistant_chunk",
+            .final => "assistant_final",
+        };
+
+        try w.writeAll("{\"v\":1,\"type\":");
+        try root.appendJsonStringW(w, event_type);
+        try w.writeAll(",\"session_id\":");
         try root.appendJsonStringW(w, target);
         try w.writeAll(",\"agent_id\":");
         try root.appendJsonStringW(w, self.account_id);
@@ -1231,6 +1244,22 @@ pub const WebChannel = struct {
 
         try w.writeByte('}');
         self.sendOutboundEvent(target, buf.items);
+    }
+
+    fn wsSend(ctx: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+        const self: *WebChannel = @ptrCast(@alignCast(ctx));
+        return self.sendAssistantEvent(target, message, .final);
+    }
+
+    fn wsSendEvent(
+        ctx: *anyopaque,
+        target: []const u8,
+        message: []const u8,
+        _: []const []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        const self: *WebChannel = @ptrCast(@alignCast(ctx));
+        return self.sendAssistantEvent(target, message, stage);
     }
 
     fn wsName(_: *anyopaque) []const u8 {

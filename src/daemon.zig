@@ -20,6 +20,7 @@ const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
 const onboard = @import("onboard.zig");
+const streaming = @import("streaming.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -591,6 +592,35 @@ fn clearInboundProcessingIndicator(
     ch.stopTyping(target) catch {};
 }
 
+const StreamingOutboundCtx = struct {
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+};
+
+fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
+    if (event.stage != .chunk or event.text.len == 0) return;
+    const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
+
+    const out = if (ctx.account_id) |aid|
+        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
+    else
+        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
+
+    var message = out catch |err| {
+        log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
+        return;
+    };
+    ctx.event_bus.publishOutbound(message) catch |err| {
+        message.deinit(ctx.allocator);
+        if (err != error.Closed) {
+            log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
+        }
+    };
+}
+
 fn inboundDispatcherThread(
     allocator: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
@@ -632,7 +662,27 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web");
+        var streaming_ctx = StreamingOutboundCtx{
+            .allocator = allocator,
+            .event_bus = event_bus,
+            .channel = msg.channel,
+            .account_id = outbound_account_id,
+            .chat_id = msg.chat_id,
+        };
+
+        const reply = runtime.session_mgr.processMessageStreaming(
+            session_key,
+            msg.content,
+            null,
+            if (use_streaming_outbound)
+                streaming.Sink{
+                    .callback = publishStreamingChunk,
+                    .ctx = @ptrCast(&streaming_ctx),
+                }
+            else
+                null,
+        ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
             // Send user-visible error reply back to the originating channel

@@ -22,6 +22,7 @@ const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const streaming = @import("streaming.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 
@@ -186,9 +187,30 @@ pub const SessionManager = struct {
             std.ascii.eqlIgnoreCase(cmd, "restart");
     }
 
+    const StreamAdapterCtx = struct {
+        sink: streaming.Sink,
+    };
+
+    fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
+        const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
+        streaming.forwardProviderChunk(adapter.sink, chunk);
+    }
+
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
+        return self.processMessageStreaming(session_key, content, conversation_context, null);
+    }
+
+    /// Process a message within a session context and optionally forward text deltas.
+    /// Deltas are only emitted when provider streaming is active.
+    pub fn processMessageStreaming(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+        stream_sink: ?streaming.Sink,
+    ) ![]const u8 {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
@@ -217,6 +239,23 @@ pub const SessionManager = struct {
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
+
+        const prev_stream_callback = session.agent.stream_callback;
+        const prev_stream_ctx = session.agent.stream_ctx;
+        defer {
+            session.agent.stream_callback = prev_stream_callback;
+            session.agent.stream_ctx = prev_stream_ctx;
+        }
+
+        var stream_adapter: StreamAdapterCtx = undefined;
+        if (stream_sink) |sink| {
+            stream_adapter = .{ .sink = sink };
+            session.agent.stream_callback = streamChunkForwarder;
+            session.agent.stream_ctx = @ptrCast(&stream_adapter);
+        } else {
+            session.agent.stream_callback = null;
+            session.agent.stream_ctx = null;
+        }
 
         const response = try session.agent.turn(content);
         session.turn_count += 1;
@@ -386,6 +425,96 @@ const MockProvider = struct {
     fn mockDeinit(_: *anyopaque) void {}
 };
 
+const MockStreamingProvider = struct {
+    response: []const u8,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = mockChatWithSystem,
+        .chat = mockChat,
+        .supportsNativeTools = mockSupportsNativeTools,
+        .getName = mockGetName,
+        .deinit = mockDeinit,
+        .supports_streaming = mockSupportsStreaming,
+        .stream_chat = mockStreamChat,
+    };
+
+    fn provider(self: *MockStreamingProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn mockChatWithSystem(
+        ptr: *anyopaque,
+        _: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *MockStreamingProvider = @ptrCast(@alignCast(ptr));
+        return self.response;
+    }
+
+    fn mockChat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *MockStreamingProvider = @ptrCast(@alignCast(ptr));
+        return .{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn mockSupportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn mockGetName(_: *anyopaque) []const u8 {
+        return "mock_stream";
+    }
+
+    fn mockDeinit(_: *anyopaque) void {}
+
+    fn mockSupportsStreaming(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn mockStreamChat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!providers.StreamChatResult {
+        const self: *MockStreamingProvider = @ptrCast(@alignCast(ptr));
+        const mid = self.response.len / 2;
+        if (mid > 0) callback(callback_ctx, providers.StreamChunk.textDelta(self.response[0..mid]));
+        callback(callback_ctx, providers.StreamChunk.textDelta(self.response[mid..]));
+        callback(callback_ctx, providers.StreamChunk.finalChunk());
+        return .{
+            .content = try allocator.dupe(u8, self.response),
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+};
+
+const DeltaCollector = struct {
+    allocator: Allocator,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn onEvent(ctx_ptr: *anyopaque, event: streaming.Event) void {
+        if (event.stage != .chunk or event.text.len == 0) return;
+        const self: *DeltaCollector = @ptrCast(@alignCast(ctx_ptr));
+        self.data.appendSlice(self.allocator, event.text) catch {};
+    }
+
+    fn deinit(self: *DeltaCollector) void {
+        self.data.deinit(self.allocator);
+    }
+};
+
 /// Create a test SessionManager with mock provider.
 fn testSessionManager(allocator: Allocator, mock: *MockProvider, cfg: *const Config) SessionManager {
     return testSessionManagerWithMemory(allocator, mock, cfg, null, null);
@@ -498,6 +627,40 @@ test "processMessage returns mock response" {
     const resp = try sm.processMessage("user:1", "hi", null);
     defer testing.allocator.free(resp);
     try testing.expectEqualStrings("Hello from mock", resp);
+}
+
+test "processMessageStreaming forwards provider deltas" {
+    var mock = MockStreamingProvider{ .response = "streaming reply" };
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = DeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const resp = try sm.processMessageStreaming(
+        "stream:1",
+        "hi",
+        null,
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+    );
+    defer testing.allocator.free(resp);
+
+    try testing.expectEqualStrings("streaming reply", resp);
+    try testing.expectEqualStrings("streaming reply", collector.data.items);
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {

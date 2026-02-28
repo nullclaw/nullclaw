@@ -16,6 +16,7 @@
 //!   - DingTalk (WebSocket stream mode)
 
 const std = @import("std");
+const streaming = @import("../streaming.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // Shared Types
@@ -59,6 +60,8 @@ pub const Channel = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    pub const OutboundStage = streaming.OutboundStage;
+
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
 
@@ -73,6 +76,15 @@ pub const Channel = struct {
         name: *const fn (ptr: *anyopaque) []const u8,
         /// Health check — return true if the channel is operational.
         healthCheck: *const fn (ptr: *anyopaque) bool,
+        /// Optional staged outbound event delivery (chunk/final).
+        /// If null, runtime falls back to send() for `.final` and ignores `.chunk`.
+        sendEvent: ?*const fn (
+            ptr: *anyopaque,
+            target: []const u8,
+            message: []const u8,
+            media: []const []const u8,
+            stage: OutboundStage,
+        ) anyerror!void = null,
         /// Start processing indicator for a recipient (e.g., typing status).
         startTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStartTyping,
         /// Stop processing indicator for a recipient.
@@ -89,6 +101,13 @@ pub const Channel = struct {
 
     pub fn send(self: Channel, target: []const u8, message: []const u8, media: []const []const u8) !void {
         return self.vtable.send(self.ptr, target, message, media);
+    }
+
+    pub fn sendEvent(self: Channel, target: []const u8, message: []const u8, media: []const []const u8, stage: OutboundStage) !void {
+        if (self.vtable.sendEvent) |fn_send_event| {
+            return fn_send_event(self.ptr, target, message, media, stage);
+        }
+        if (stage == .final) return self.send(target, message, media);
     }
 
     pub fn name(self: Channel) []const u8 {
