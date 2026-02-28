@@ -53,7 +53,7 @@
       "payload": {
         "content": "string required unless payload.e2e is used",
         "sender_id": "string optional",
-        "access_token": "string optional (can be top-level access_token)",
+        "access_token": "string required (can be top-level access_token)",
         "e2e": {
           "alg": "string optional (x25519-chacha20poly1305-v1)",
           "nonce": "string required when e2e is used (base64url)",

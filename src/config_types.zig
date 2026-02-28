@@ -383,7 +383,9 @@ pub const WebConfig = struct {
     listen: []const u8 = "127.0.0.1",
     path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
-    /// Static auth token for browser/extension clients.
+    /// Optional WebSocket-upgrade auth token for browser/extension clients.
+    /// Used as an additional hardening control; pairing/JWT remains required
+    /// for user_message events.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
     /// then to an ephemeral runtime token.
     auth_token: ?[]const u8 = null,
