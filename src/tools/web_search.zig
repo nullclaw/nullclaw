@@ -10,6 +10,8 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 
+const log = std.log.scoped(.web_search);
+
 /// Maximum number of search results.
 const MAX_RESULTS: usize = 10;
 /// Default number of search results.
@@ -61,46 +63,22 @@ pub const WebSearchTool = struct {
         );
         defer allocator.free(url_str);
 
-        // Make HTTP request
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
+        // Make HTTP request via curl subprocess
+        const auth_header = try std.fmt.allocPrint(allocator, "X-Subscription-Token: {s}", .{api_key});
+        defer allocator.free(auth_header);
+        const headers = [_][]const u8{
+            auth_header,
+            "Accept: application/json",
+        };
 
-        const uri = std.Uri.parse(url_str) catch
-            return ToolResult.fail("Failed to parse search URL");
-
-        var req = client.request(.GET, uri, .{
-            .extra_headers = &.{
-                .{ .name = "X-Subscription-Token", .value = api_key },
-                .{ .name = "Accept", .value = "application/json" },
-            },
-        }) catch |err| {
+        const body = @import("../http_util.zig").curlGet(
+            allocator,
+            url_str,
+            &headers,
+            "30",
+        ) catch |err| {
+            log.err("web_search request failed for '{s}': {}", .{ query, err });
             const msg = try std.fmt.allocPrint(allocator, "Search request failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer req.deinit();
-
-        req.sendBodiless() catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to send search request: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        var redirect_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to receive response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        const status_code = @intFromEnum(response.head.status);
-        if (status_code != 200) {
-            const msg = try std.fmt.allocPrint(allocator, "Brave Search API returned HTTP {d}", .{status_code});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        }
-
-        // Read response body
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        const body = reader.readAlloc(allocator, 512 * 1024) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to read response: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(body);

@@ -280,6 +280,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     const root = parsed.value.object;
 
     // Top-level fields
+    if (root.get("workspace")) |v| {
+        if (v == .string) {
+            self.workspace_dir_override = try self.allocator.dupe(u8, v.string);
+            self.workspace_dir = self.workspace_dir_override.?;
+        }
+    }
     if (root.get("default_provider")) |v| {
         if (v == .string) self.legacy_default_provider_detected = true;
     }
