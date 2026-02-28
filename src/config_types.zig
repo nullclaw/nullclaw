@@ -987,6 +987,12 @@ pub const HttpRequestConfig = struct {
     ///   - "https://searx.example.com"
     ///   - "https://searx.example.com/search"
     search_base_url: ?[]const u8 = null,
+    /// Search provider for web_search.
+    /// Supported: auto, searxng, duckduckgo (ddg), brave, firecrawl,
+    /// tavily, perplexity, exa, jina.
+    search_provider: []const u8 = "auto",
+    /// Optional fallback provider chain used when the primary provider fails.
+    search_fallback_providers: []const []const u8 = &.{},
 
     /// Validate optional SearXNG base URL accepted by web_search.
     /// Allowed forms:
@@ -1016,6 +1022,26 @@ pub const HttpRequestConfig = struct {
             if (!std.mem.eql(u8, path, "/search")) return false;
         }
         return true;
+    }
+
+    pub fn isValidSearchProviderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "auto") or
+            std.mem.eql(u8, trimmed, "searxng") or
+            std.mem.eql(u8, trimmed, "duckduckgo") or
+            std.mem.eql(u8, trimmed, "ddg") or
+            std.mem.eql(u8, trimmed, "brave") or
+            std.mem.eql(u8, trimmed, "firecrawl") or
+            std.mem.eql(u8, trimmed, "tavily") or
+            std.mem.eql(u8, trimmed, "perplexity") or
+            std.mem.eql(u8, trimmed, "exa") or
+            std.mem.eql(u8, trimmed, "jina");
+    }
+
+    pub fn isValidSearchFallbackProviderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "auto")) return false;
+        return isValidSearchProviderName(trimmed);
     }
 };
 
@@ -1196,6 +1222,7 @@ test "security defaults stay least-privilege" {
     const http_request = HttpRequestConfig{};
     try std.testing.expect(!http_request.enabled);
     try std.testing.expect(http_request.search_base_url == null);
+    try std.testing.expectEqualStrings("auto", http_request.search_provider);
 }
 
 test "WebConfig normalizePath trims and normalizes" {
@@ -1274,4 +1301,24 @@ test "HttpRequestConfig search base URL validation" {
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com?x=1"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com#frag"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/custom"));
+}
+
+test "HttpRequestConfig search provider validation" {
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("auto"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("searxng"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("duckduckgo"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("ddg"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("brave"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("firecrawl"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("tavily"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("perplexity"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("exa"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("jina"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchProviderName("google"));
+}
+
+test "HttpRequestConfig fallback provider validation disallows auto" {
+    try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("brave"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("ddg"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
 }

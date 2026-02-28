@@ -269,6 +269,8 @@ pub fn allTools(
         http_max_response_size: u32 = 1_000_000,
         http_timeout_secs: u64 = 30,
         web_search_base_url: ?[]const u8 = null,
+        web_search_provider: []const u8 = "auto",
+        web_search_fallback_providers: []const []const u8 = &.{},
         browser_enabled: bool = false,
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
@@ -372,6 +374,8 @@ pub fn allTools(
         const wst = try allocator.create(web_search.WebSearchTool);
         wst.* = .{
             .searxng_base_url = opts.web_search_base_url,
+            .provider = opts.web_search_provider,
+            .fallback_providers = opts.web_search_fallback_providers,
             .timeout_secs = opts.http_timeout_secs,
         };
         try list.append(allocator, wst.tool());
@@ -691,6 +695,7 @@ test "all tools excludes extras when disabled" {
 test "all tools wires http and web_search config into tool instances" {
     const domains = [_][]const u8{ "example.com", "api.example.com" };
     const search_url = "https://searx.example.com";
+    const search_fallbacks = [_][]const u8{ "jina", "duckduckgo" };
 
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .http_enabled = true,
@@ -698,6 +703,8 @@ test "all tools wires http and web_search config into tool instances" {
         .http_max_response_size = 321_000,
         .http_timeout_secs = 12,
         .web_search_base_url = search_url,
+        .web_search_provider = "brave",
+        .web_search_fallback_providers = &search_fallbacks,
     });
     defer deinitTools(std.testing.allocator, tools);
 
@@ -715,6 +722,9 @@ test "all tools wires http and web_search config into tool instances" {
         if (std.mem.eql(u8, t.name(), "web_search")) {
             const wst: *web_search.WebSearchTool = @ptrCast(@alignCast(t.ptr));
             try std.testing.expectEqualStrings(search_url, wst.searxng_base_url.?);
+            try std.testing.expectEqualStrings("brave", wst.provider);
+            try std.testing.expectEqual(@as(usize, 2), wst.fallback_providers.len);
+            try std.testing.expectEqualStrings("jina", wst.fallback_providers[0]);
             try std.testing.expectEqual(@as(u64, 12), wst.timeout_secs);
             saw_search = true;
         }

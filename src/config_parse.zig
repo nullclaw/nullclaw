@@ -1423,6 +1423,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (hr.object.get("search_base_url")) |v| {
                 if (v == .string) self.http_request.search_base_url = try self.allocator.dupe(u8, v.string);
             }
+            if (hr.object.get("search_provider")) |v| {
+                if (v == .string) self.http_request.search_provider = try self.allocator.dupe(u8, v.string);
+            }
+            if (hr.object.get("search_fallback_providers")) |v| {
+                if (v == .array) self.http_request.search_fallback_providers = try parseStringArray(self.allocator, v.array);
+            }
         }
     }
 

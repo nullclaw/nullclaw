@@ -356,13 +356,15 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 
 ### Full Web Search + Shell Access
 
-Use this when you want web search without Brave (via SearXNG) and unrestricted shell command allowlist behavior:
+Use this when you want full web-search provider control plus unrestricted shell command allowlist behavior:
 
 ```json
 {
   "http_request": {
     "enabled": true,
-    "search_base_url": "https://searx.example.com"
+    "search_base_url": "https://searx.example.com",
+    "search_provider": "auto",
+    "search_fallback_providers": ["jina", "duckduckgo"]
   },
   "autonomy": {
     "level": "full",
@@ -376,6 +378,9 @@ Use this when you want web search without Brave (via SearXNG) and unrestricted s
 
 - `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`).
 - Invalid `http_request.search_base_url` now fails config validation at startup (no automatic fallback for malformed URL).
+- `http_request.search_provider` supports: `auto`, `searxng`, `duckduckgo` (`ddg`), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina`.
+- `http_request.search_fallback_providers` is optional and is tried in order when the primary provider fails.
+- Provider env vars: `BRAVE_API_KEY`, `FIRECRAWL_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY` (or shared `WEB_SEARCH_API_KEY` where supported). DuckDuckGo and SearXNG do not require API keys.
 - `allowed_commands: ["*"]` enables wildcard command allowlist matching.
 - `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
 

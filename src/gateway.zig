@@ -2372,6 +2372,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .http_max_response_size = cfg.http_request.max_response_size,
                     .http_timeout_secs = cfg.http_request.timeout_secs,
                     .web_search_base_url = cfg.http_request.search_base_url,
+                    .web_search_provider = cfg.http_request.search_provider,
+                    .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
                     .agents = cfg.agents,
