@@ -229,7 +229,11 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  list                          List all scheduled tasks
             \\  add <expression> <command>    Add a recurring cron job
+            \\  add-agent <expression> <prompt> [--model <model>]
+            \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
+            \\  once-agent <delay> <prompt> [--model <model>]
+            \\                                Add a one-shot delayed agent task
             \\  remove <id>                   Remove a scheduled task
             \\  pause <id>                    Pause a scheduled task
             \\  resume <id>                   Resume a paused task
@@ -251,12 +255,40 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
+    } else if (std.mem.eql(u8, subcmd, "add-agent")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>]\n", .{});
+            std.process.exit(1);
+        }
+        var model: ?[]const u8 = null;
+        var i: usize = 3;
+        while (i < sub_args.len) : (i += 1) {
+            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
+                model = sub_args[i + 1];
+                i += 1;
+            }
+        }
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
             std.process.exit(1);
         }
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
+    } else if (std.mem.eql(u8, subcmd, "once-agent")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>]\n", .{});
+            std.process.exit(1);
+        }
+        var model: ?[]const u8 = null;
+        var i: usize = 3;
+        while (i < sub_args.len) : (i += 1) {
+            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
+                model = sub_args[i + 1];
+                i += 1;
+            }
+        }
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], model);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});

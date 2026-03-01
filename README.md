@@ -465,7 +465,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `doctor` | Diagnose system health |
 | `status` | Show full system status |
 | `channel status` | Show channel health/status |
-| `cron list\|add\|remove\|pause\|resume\|run` | Manage scheduled tasks |
+| `cron list\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `models list\|info\|benchmark` | Model catalog |
