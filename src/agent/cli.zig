@@ -18,6 +18,7 @@ const ObserverEvent = observability.ObserverEvent;
 const subagent_mod = @import("../subagent.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
+const auth_mod = @import("../auth.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 
@@ -40,6 +41,33 @@ fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
 fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
     streaming.forwardProviderChunk(stream_ctx.sink, chunk);
+}
+
+fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
+    const token = auth_mod.loadCredential(allocator, providers.openai_codex.CREDENTIAL_KEY) catch return false;
+    if (token) |tok| {
+        allocator.free(tok.access_token);
+        if (tok.refresh_token) |rt| allocator.free(rt);
+        allocator.free(tok.token_type);
+        return true;
+    }
+    return false;
+}
+
+fn shouldPrintOpenAiCodexHint(default_provider: []const u8, has_codex_credential: bool) bool {
+    return has_codex_credential and !std.mem.eql(u8, default_provider, "openai-codex");
+}
+
+fn maybePrintAllProvidersFailedHint(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    default_provider: []const u8,
+) !void {
+    if (!shouldPrintOpenAiCodexHint(default_provider, hasOpenAiCodexCredential(allocator))) return;
+    try w.print(
+        "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" or run with --provider openai-codex --model gpt-5.3-codex.\n",
+        .{default_provider},
+    );
 }
 
 const ParsedAgentArgs = struct {
@@ -254,6 +282,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 try w.flush();
                 return;
             }
+            if (err == error.AllProvidersFailed) {
+                try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
+                try w.flush();
+            }
             return err;
         };
         defer allocator.free(response);
@@ -364,6 +396,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const response = agent.turn(line) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
+            } else if (err == error.AllProvidersFailed) {
+                try w.print("Error: {}\n", .{err});
+                try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
             } else {
                 try w.print("Error: {}\n", .{err});
             }
@@ -468,4 +503,16 @@ test "parseAgentArgs returns error for invalid temperature value" {
         .invalid_temperature => |value| try std.testing.expectEqualStrings("hot", value),
         else => unreachable,
     }
+}
+
+test "shouldPrintOpenAiCodexHint true when codex auth exists and provider differs" {
+    try std.testing.expect(shouldPrintOpenAiCodexHint("openai", true));
+}
+
+test "shouldPrintOpenAiCodexHint false when provider is openai-codex" {
+    try std.testing.expect(!shouldPrintOpenAiCodexHint("openai-codex", true));
+}
+
+test "shouldPrintOpenAiCodexHint false when codex auth is missing" {
+    try std.testing.expect(!shouldPrintOpenAiCodexHint("openai", false));
 }
