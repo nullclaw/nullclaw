@@ -76,6 +76,7 @@ pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]
     if (explicit_endpoint) |ep| return ep;
     if (std.mem.eql(u8, provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
     if (std.mem.eql(u8, provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
+    if (std.mem.eql(u8, provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
     // For unknown providers, try OpenAI-compatible endpoint
     return "https://api.groq.com/openai/v1/audio/transcriptions";
 }
@@ -591,5 +592,54 @@ test "voice resolveTranscriptionEndpoint unknown falls back to groq" {
     try std.testing.expectEqualStrings(
         "https://api.groq.com/openai/v1/audio/transcriptions",
         resolveTranscriptionEndpoint("some-unknown-provider", null),
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Telnyx Transcriber (OpenAI-compatible Whisper STT)
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const TelnyxTranscriber = struct {
+    endpoint: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    language: ?[]const u8,
+
+    fn vtableTranscribe(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8) TranscribeError!?[]const u8 {
+        const self: *TelnyxTranscriber = @ptrCast(@alignCast(ptr));
+        const result = try transcribeFile(alloc, self.api_key, self.endpoint, path, .{
+            .model = self.model,
+            .language = self.language,
+        });
+        return result;
+    }
+
+    pub const vtable = Transcriber.VTable{
+        .transcribe = &vtableTranscribe,
+    };
+
+    pub fn transcriber(self: *TelnyxTranscriber) Transcriber {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
+test "voice TelnyxTranscriber stores fields" {
+    var tt = TelnyxTranscriber{
+        .endpoint = "https://api.telnyx.com/v2/ai/audio/transcriptions",
+        .api_key = "test-telnyx-key",
+        .model = "whisper-1",
+        .language = "en",
+    };
+    try std.testing.expectEqualStrings("test-telnyx-key", tt.api_key);
+    try std.testing.expectEqualStrings("en", tt.language.?);
+    // Vtable dispatches
+    const t = tt.transcriber();
+    try std.testing.expect(t.vtable == &TelnyxTranscriber.vtable);
+}
+
+test "voice resolveTranscriptionEndpoint telnyx" {
+    try std.testing.expectEqualStrings(
+        "https://api.telnyx.com/v2/ai/audio/transcriptions",
+        resolveTranscriptionEndpoint("telnyx", null),
     );
 }

@@ -53,6 +53,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "cerebras", .url = "https://api.cerebras.ai/v1", .display = "Cerebras" },
     .{ .name = "perplexity", .url = "https://api.perplexity.ai", .display = "Perplexity" },
     .{ .name = "cohere", .url = "https://api.cohere.com/compatibility", .display = "Cohere" },
+    .{ .name = "telnyx", .url = "https://api.telnyx.com/v2/ai", .display = "Telnyx" },
 
     // ── Gateways & Aggregators ────────────────────────────────────────────
     .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
@@ -423,6 +424,7 @@ test "compatibleProviderUrl new providers" {
     try std.testing.expectEqualStrings("https://chutes.ai/api/v1", compatibleProviderUrl("chutes").?);
     try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", compatibleProviderUrl("kimi-code").?);
     try std.testing.expectEqualStrings("https://portal.qwen.ai/v1", compatibleProviderUrl("qwen-portal").?);
+    try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", compatibleProviderUrl("telnyx").?);
 }
 
 test "compatibleProviderUrl CN/intl variants" {
@@ -463,6 +465,7 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("vLLM", compatibleProviderDisplayName("vllm"));
     try std.testing.expectEqualStrings("OVHcloud", compatibleProviderDisplayName("ovhcloud"));
     try std.testing.expectEqualStrings("Custom", compatibleProviderDisplayName("nonexistent"));
+    try std.testing.expectEqualStrings("Telnyx", compatibleProviderDisplayName("telnyx"));
 }
 
 test "new providers classify as compatible" {
@@ -472,6 +475,7 @@ test "new providers classify as compatible" {
     try std.testing.expect(classifyProvider("lmstudio") == .compatible_provider);
     try std.testing.expect(classifyProvider("lm-studio") == .compatible_provider);
     try std.testing.expect(classifyProvider("astrai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("telnyx") == .compatible_provider);
 }
 
 test "findCompatProvider returns correct flags" {
@@ -616,5 +620,5 @@ test "ProviderHolder.fromConfig routes to correct variant" {
 
 test "compat_providers table count" {
     // Verify we have the expected number of entries (guard against accidental deletions).
-    try std.testing.expect(compat_providers.len >= 88);
+    try std.testing.expect(compat_providers.len >= 89);
 }
