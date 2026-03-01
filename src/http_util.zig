@@ -22,6 +22,18 @@ pub fn curlPostWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
+    return curlRequestWithProxy(allocator, "POST", url, body, headers, proxy, max_time);
+}
+
+fn curlRequestWithProxy(
+    allocator: Allocator,
+    method: []const u8,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+    max_time: ?[]const u8,
+) ![]u8 {
     var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -31,7 +43,7 @@ pub fn curlPostWithProxy(
     argc += 1;
     argv_buf[argc] = "-X";
     argc += 1;
-    argv_buf[argc] = "POST";
+    argv_buf[argc] = method;
     argc += 1;
     argv_buf[argc] = "-H";
     argc += 1;
@@ -106,6 +118,11 @@ pub fn curlPostWithProxy(
 /// HTTP POST via curl subprocess (no proxy, no timeout).
 pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
     return curlPostWithProxy(allocator, url, body, headers, null, null);
+}
+
+/// HTTP PUT via curl subprocess (no proxy, no timeout).
+pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
+    return curlRequestWithProxy(allocator, "PUT", url, body, headers, null, null);
 }
 
 /// HTTP GET via curl subprocess with optional proxy.
