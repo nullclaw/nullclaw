@@ -1,0 +1,89 @@
+{
+  "default_temperature": 0.7,
+
+  "models": {
+    "providers": {
+      "openrouter": {}
+    }
+  },
+  "diagnostics": {
+    "log_llm_io": true,
+    "log_message_receipts": true,
+    "log_message_payloads": true
+  },
+
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/qwen/qwen3.5-35b-a3b"
+      }
+    },
+    "list": [
+      {
+        "id": "planner",
+        "provider": "openrouter",
+        "model": "openrouter/qwen/qwen3.5-35b-a3b",
+        "system_prompt": "You are a planner agent. You break down high-level goals into concrete steps, delegate implementation to the builder, and synthesize results.\n\nRules: Break goals into clear subtasks. Delegate via delegate(agent=\"builder\", prompt=\"...\") with self-contained instructions. When the builder returns, decide: continue delegating, refine the plan, or report completion. Stay focused on the mission. IMPORTANT: Do not perform filesystem mutations (writing files, creating directories, etc.) yourself—always delegate such tasks to the builder."
+      },
+      {
+        "id": "builder",
+        "provider": "openrouter",
+        "model": "openrouter/qwen/qwen3.5-35b-a3b",
+        "system_prompt": "You are a builder agent. You execute tasks delegated by the planner: write code, run commands, analyze data, and produce deliverables.\n\nRules: Execute only what you're asked. Be concise and factual. Report success with the deliverable; report failure with the reason. If a task is ambiguous, ask a short clarifying question. Do not initiate new work—wait for the next delegation."
+      }
+    ]
+  },
+
+  "channels": {
+    "matrix": {
+      "accounts": {
+        "planner-account": {
+          "homeserver": "https://matrix.org",
+          "access_token": "",
+          "room_id": "!YOUR_ROOM_ID:matrix.org",
+          "user_id": "@your-planner-bot:matrix.org",
+          "allow_from": ["@your-username:matrix.org", "@your-builder-bot:matrix.org"]
+        },
+        "builder-account": {
+          "homeserver": "https://matrix.org",
+          "access_token": "",
+          "room_id": "!YOUR_ROOM_ID:matrix.org",
+          "user_id": "@your-builder-bot:matrix.org",
+          "allow_from": ["@your-planner-bot:matrix.org"]
+        }
+      }
+    }
+  },
+
+  "agent_bindings": [
+    { "agent_id": "planner", "match": { "channel": "matrix", "account_id": "planner-account" } },
+    { "agent_id": "builder", "match": { "channel": "matrix", "account_id": "builder-account" } }
+  ],
+
+  "gateway": {
+    "port": 3000,
+    "host": "::",
+    "allow_public_bind": true,
+    "require_pairing": false
+  },
+
+  "memory": {
+    "backend": "sqlite",
+    "auto_save": true
+  },
+  "autonomy": {
+    "level": "full",
+    "workspace_only": false,
+    "max_actions_per_hour": 200,
+    "require_approval_for_medium_risk": false,
+    "block_high_risk_commands": false,
+    "allowed_commands": [
+      "git", "jj", "npm", "cargo", "ls", "cat", "grep", "find",
+      "echo", "pwd", "wc", "head", "tail",
+      "python", "python3", "node", "pip", "make", "mkdir", "touch",
+      "mv", "cp", "rm", "curl", "wget", "ssh", "chmod", "sed", "awk",
+      "tar", "unzip", "zip", "diff", "sort", "cut", "tr", "xargs",
+      "date", "env", "which", "whoami", "df", "du", "uname"
+    ]
+  }
+}
