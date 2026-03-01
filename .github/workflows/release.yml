@@ -16,7 +16,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
-            zig_target: ""
+            zig_target: x86_64-linux-musl
             ext: ""
           - os: ubuntu-latest
             target: linux-aarch64
@@ -28,7 +28,7 @@ jobs:
             ext: ""
           - os: macos-latest
             target: macos-aarch64
-            zig_target: ""
+            zig_target: aarch64-macos
             ext: ""
           - os: macos-latest
             target: macos-x86_64
@@ -36,7 +36,7 @@ jobs:
             ext: ""
           - os: windows-latest
             target: windows-x86_64
-            zig_target: ""
+            zig_target: x86_64-windows
             ext: ".exe"
           - os: windows-latest
             target: windows-aarch64

@@ -19,10 +19,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
+            zig_target: x86_64-linux-musl
           - os: macos-latest
             target: macos-aarch64
+            zig_target: aarch64-macos
           - os: windows-latest
             target: windows-x86_64
+            zig_target: x86_64-windows
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +46,7 @@ jobs:
         run: zig build test --summary all 2>&1 | tee test-output.txt
 
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSmall
 
       - name: Cross-compile linux-aarch64 (Termux/ARM)
         if: runner.os == 'Linux'

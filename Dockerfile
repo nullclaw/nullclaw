@@ -9,7 +9,22 @@ WORKDIR /app
 COPY build.zig build.zig.zon ./
 COPY src/ src/
 
-RUN zig build -Doptimize=ReleaseSmall
+ARG TARGETARCH
+RUN set -eu; \
+    arch="${TARGETARCH:-}"; \
+    if [ -z "${arch}" ]; then \
+      case "$(uname -m)" in \
+        x86_64) arch="amd64" ;; \
+        aarch64|arm64) arch="arm64" ;; \
+        *) echo "Unsupported host arch: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    case "${arch}" in \
+      amd64) zig_target="x86_64-linux-musl" ;; \
+      arm64) zig_target="aarch64-linux-musl" ;; \
+      *) echo "Unsupported TARGETARCH: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
 FROM busybox:1.37 AS config
