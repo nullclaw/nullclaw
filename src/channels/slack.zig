@@ -225,10 +225,26 @@ pub const SlackChannel = struct {
         return std.fmt.parseFloat(f64, ts) catch 0.0;
     }
 
-    fn slackErrorCode(obj: std.json.ObjectMap) ?[]const u8 {
+    const SlackApiErrorInfo = struct {
+        code: []const u8,
+        needed: ?[]const u8 = null,
+        provided: ?[]const u8 = null,
+    };
+
+    fn slackApiErrorInfo(obj: std.json.ObjectMap) ?SlackApiErrorInfo {
         const err_val = obj.get("error") orelse return null;
         if (err_val != .string or err_val.string.len == 0) return null;
-        return err_val.string;
+
+        var info = SlackApiErrorInfo{
+            .code = err_val.string,
+        };
+        if (obj.get("needed")) |needed_val| {
+            if (needed_val == .string and needed_val.string.len > 0) info.needed = needed_val.string;
+        }
+        if (obj.get("provided")) |provided_val| {
+            if (provided_val == .string and provided_val.string.len > 0) info.provided = provided_val.string;
+        }
+        return info;
     }
 
     fn isAuthFailureCode(code: []const u8) bool {
@@ -239,6 +255,46 @@ pub const SlackChannel = struct {
             std.mem.eql(u8, code, "missing_scope") or
             std.mem.eql(u8, code, "not_allowed_token_type") or
             std.mem.eql(u8, code, "no_permission");
+    }
+
+    fn logSlackApiError(endpoint: []const u8, context: ?[]const u8, info: SlackApiErrorInfo) void {
+        if (context) |ctx| {
+            if (info.needed) |needed| {
+                if (info.provided) |provided| {
+                    log.warn("Slack {s} API error ({s}): {s} (needed={s}, provided={s})", .{ endpoint, ctx, info.code, needed, provided });
+                } else {
+                    log.warn("Slack {s} API error ({s}): {s} (needed={s})", .{ endpoint, ctx, info.code, needed });
+                }
+            } else {
+                log.warn("Slack {s} API error ({s}): {s}", .{ endpoint, ctx, info.code });
+            }
+            return;
+        }
+
+        if (info.needed) |needed| {
+            if (info.provided) |provided| {
+                log.warn("Slack {s} API error: {s} (needed={s}, provided={s})", .{ endpoint, info.code, needed, provided });
+            } else {
+                log.warn("Slack {s} API error: {s} (needed={s})", .{ endpoint, info.code, needed });
+            }
+        } else {
+            log.warn("Slack {s} API error: {s}", .{ endpoint, info.code });
+        }
+    }
+
+    fn ensureSlackApiOk(obj: std.json.ObjectMap, endpoint: []const u8, context: ?[]const u8) !void {
+        const ok_val = obj.get("ok") orelse return error.SlackApiError;
+        if (ok_val == .bool and ok_val.bool) return;
+
+        if (slackApiErrorInfo(obj)) |info| {
+            logSlackApiError(endpoint, context, info);
+            if (isAuthFailureCode(info.code)) return error.SlackAuthFailed;
+        }
+        return error.SlackApiError;
+    }
+
+    fn hasValidBotToken(self: *const SlackChannel) bool {
+        return std.mem.trim(u8, self.bot_token, " \t\r\n").len > 0;
     }
 
     fn isDirectConversationId(channel_id: []const u8) bool {
@@ -256,14 +312,7 @@ pub const SlackChannel = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
         defer parsed.deinit();
         if (parsed.value != .object) return error.SlackApiError;
-        const ok_val = parsed.value.object.get("ok") orelse return error.SlackApiError;
-        if (ok_val != .bool or !ok_val.bool) {
-            if (slackErrorCode(parsed.value.object)) |code| {
-                if (isAuthFailureCode(code)) return error.SlackAuthFailed;
-                log.warn("Slack auth.test API error: {s}", .{code});
-            }
-            return error.SlackApiError;
-        }
+        try ensureSlackApiOk(parsed.value.object, "auth.test", null);
         const uid_val = parsed.value.object.get("user_id") orelse return error.SlackApiError;
         if (uid_val != .string or uid_val.string.len == 0) return error.SlackApiError;
 
@@ -366,15 +415,7 @@ pub const SlackChannel = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
         defer parsed.deinit();
         if (parsed.value != .object) return error.SlackApiError;
-
-        const ok_val = parsed.value.object.get("ok") orelse return error.SlackApiError;
-        if (ok_val != .bool or !ok_val.bool) {
-            if (slackErrorCode(parsed.value.object)) |code| {
-                if (isAuthFailureCode(code)) return error.SlackAuthFailed;
-                log.warn("Slack conversations.history API error channel={s}: {s}", .{ channel_id, code });
-            }
-            return error.SlackApiError;
-        }
+        try ensureSlackApiOk(parsed.value.object, "conversations.history", channel_id);
 
         const messages_val = parsed.value.object.get("messages") orelse return;
         if (messages_val != .array) return;
@@ -539,14 +580,7 @@ pub const SlackChannel = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
         defer parsed.deinit();
         if (parsed.value != .object) return error.SlackApiError;
-        const ok_val = parsed.value.object.get("ok") orelse return error.SlackApiError;
-        if (ok_val != .bool or !ok_val.bool) {
-            if (slackErrorCode(parsed.value.object)) |code| {
-                if (isAuthFailureCode(code)) return error.SlackAuthFailed;
-                log.warn("Slack apps.connections.open API error: {s}", .{code});
-            }
-            return error.SlackApiError;
-        }
+        try ensureSlackApiOk(parsed.value.object, "apps.connections.open", null);
         const ws_url = parsed.value.object.get("url") orelse return error.SlackApiError;
         if (ws_url != .string or ws_url.string.len == 0) return error.SlackApiError;
         return self.allocator.dupe(u8, ws_url.string);
@@ -705,7 +739,12 @@ pub const SlackChannel = struct {
             log.err("Slack API POST failed: {}", .{err});
             return error.SlackApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
     }
 
     /// Set Slack Assistant thread status (best-effort, errors ignored).
@@ -762,6 +801,7 @@ pub const SlackChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         if (self.running.load(.acquire)) return;
+        if (!self.hasValidBotToken()) return error.SlackBotTokenRequired;
 
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
@@ -1165,6 +1205,35 @@ test "slack auth failure code classification" {
     try std.testing.expect(SlackChannel.isAuthFailureCode("missing_scope"));
     try std.testing.expect(SlackChannel.isAuthFailureCode("not_allowed_token_type"));
     try std.testing.expect(!SlackChannel.isAuthFailureCode("rate_limited"));
+}
+
+test "ensureSlackApiOk maps auth failures to SlackAuthFailed" {
+    const payload =
+        \\{"ok":false,"error":"missing_scope","needed":"chat:write","provided":"commands"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.SlackAuthFailed,
+        SlackChannel.ensureSlackApiOk(parsed.value.object, "chat.postMessage", "C123"),
+    );
+}
+
+test "ensureSlackApiOk maps non-auth failures to SlackApiError" {
+    const payload =
+        \\{"ok":false,"error":"channel_not_found"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.SlackApiError,
+        SlackChannel.ensureSlackApiOk(parsed.value.object, "chat.postMessage", "C123"),
+    );
+}
+
+test "hasValidBotToken rejects blank token" {
+    var ch = SlackChannel.init(std.testing.allocator, "   ", null, null, &.{});
+    try std.testing.expect(!ch.hasValidBotToken());
 }
 
 test "slack channel user allowed wildcard" {
