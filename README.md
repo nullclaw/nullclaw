@@ -273,6 +273,15 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
           "channel": "#nullclaw",
           "tls": true,
           "allow_from": ["user1"]
+        },
+        "meshrelay": {
+          "host": "irc.meshrelay.xyz",
+          "port": 6697,
+          "nick": "nullclaw",
+          "channels": ["#agents"],
+          "tls": true,
+          "nickserv_password": "YOUR_NICKSERV_PASSWORD",
+          "allow_from": ["*"]
         }
       }
     },

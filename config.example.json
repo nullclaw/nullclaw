@@ -26,6 +26,19 @@
           "allow_from": ["YOUR_TELEGRAM_USER_ID"]
         }
       }
+    },
+    "irc": {
+      "accounts": {
+        "meshrelay": {
+          "host": "irc.meshrelay.xyz",
+          "port": 6697,
+          "nick": "YOUR_AGENT_NICK",
+          "channels": ["#agents"],
+          "tls": true,
+          "nickserv_password": "YOUR_NICKSERV_PASSWORD",
+          "allow_from": ["*"]
+        }
+      }
     }
   },
 
