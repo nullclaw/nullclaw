@@ -208,7 +208,9 @@ pub const SecurityPolicy = struct {
             has_cmd = true;
 
             var found = false;
-            for (self.allowed_commands) |allowed| {
+            for (self.allowed_commands) |raw_allowed| {
+                const allowed = std.mem.trim(u8, raw_allowed, " \t\r\n");
+                if (allowed.len == 0) continue;
                 if (std.mem.eql(u8, allowed, "*") or std.mem.eql(u8, allowed, base_cmd)) {
                     found = true;
                     break;
@@ -904,6 +906,19 @@ test "wildcard allowlist still honors high-risk runtime gate" {
         .block_high_risk_commands = true,
     };
     try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("curl https://example.com", false));
+}
+
+test "wildcard allowlist with surrounding whitespace permits arbitrary commands" {
+    var p = SecurityPolicy{ .autonomy = .full };
+    p.allowed_commands = &.{"  *  "};
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com"));
+}
+
+test "allowed command entries are trimmed before matching" {
+    var p = SecurityPolicy{ .autonomy = .supervised };
+    p.allowed_commands = &.{ "  ls  ", "\techo\t" };
+    try std.testing.expect(p.isCommandAllowed("ls -la"));
+    try std.testing.expect(p.isCommandAllowed("echo ok"));
 }
 
 test "containsSingleAmpersand detects correctly" {

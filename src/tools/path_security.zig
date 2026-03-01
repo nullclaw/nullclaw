@@ -96,7 +96,9 @@ pub fn isResolvedPathAllowed(
     // 2. Workspace
     if (pathStartsWith(resolved, ws_resolved)) return true;
     // 3. Allowed paths (resolve each to handle symlinks)
-    for (allowed_paths) |ap| {
+    for (allowed_paths) |raw_allowed_path| {
+        const ap = std.mem.trim(u8, raw_allowed_path, " \t\r\n");
+        if (ap.len == 0) continue;
         if (std.mem.eql(u8, ap, "*")) return true;
         const ap_resolved = std.fs.cwd().realpathAlloc(allocator, ap) catch continue;
         defer allocator.free(ap_resolved);
@@ -261,6 +263,36 @@ test "isResolvedPathAllowed wildcard allows non-system paths" {
         "/home/user/random/path.txt",
         "/nonexistent-workspace",
         &.{"*"},
+    ));
+}
+
+test "isResolvedPathAllowed wildcard with whitespace allows non-system paths" {
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/home/user/random/path.txt",
+        "/nonexistent-workspace",
+        &.{"  *  "},
+    ));
+}
+
+test "isResolvedPathAllowed trims allowed path entries before resolving" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "" });
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "test.txt" });
+    defer std.testing.allocator.free(file_path);
+
+    const spaced_allowed = try std.fmt.allocPrint(std.testing.allocator, "  {s}  ", .{tmp_path});
+    defer std.testing.allocator.free(spaced_allowed);
+
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        file_path,
+        "/nonexistent-workspace",
+        &.{spaced_allowed},
     ));
 }
 
