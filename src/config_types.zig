@@ -371,11 +371,20 @@ pub const LarkConfig = struct {
     port: ?u16 = null,
 };
 
+pub const DingTalkSubscription = struct {
+    topic: []const u8,
+    subscription_type: []const u8 = "CALLBACK",
+};
+
 pub const DingTalkConfig = struct {
     account_id: []const u8 = "default",
     client_id: []const u8,
     client_secret: []const u8,
     allow_from: []const []const u8 = &.{},
+    subscribe_events: bool = false,
+    subscriptions: []const DingTalkSubscription = &.{},
+    ua: ?[]const u8 = null,
+    local_ip: ?[]const u8 = null,
 };
 
 pub const SignalConfig = struct {
