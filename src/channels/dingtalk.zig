@@ -4,11 +4,91 @@ const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 const config_types = @import("../config_types.zig");
+const http_util = @import("../http_util.zig");
 
 const log = std.log.scoped(.dingtalk);
 
-/// DingTalk channel — connects via Stream Mode WebSocket for real-time messages.
-/// Replies are sent through per-message session webhook URLs.
+/// Environment variable to force native Zig WebSocket on Linux (avoids Python dependency).
+/// Set to "1" to enable native WebSocket even on Linux.
+/// Default: use Python on Linux (to avoid Zig 0.15 TLS segfault in subthreads), native on Windows.
+const ENV_FORCE_NATIVE_WS = "NULLCLAW_DINGTALK_USE_NATIVE_WS";
+
+/// Global atomic flag for verbose logging - set when --verbose flag is present.
+var verbose_logging_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Set the verbose logging flag (called from main.zig when --verbose is present).
+pub fn setVerboseLogging(enabled: bool) void {
+    verbose_logging_enabled.store(enabled, .release);
+}
+
+/// Check if verbose logging is enabled.
+fn isVerboseLog() bool {
+    const enabled = verbose_logging_enabled.load(.acquire);
+    return enabled;
+}
+
+/// Check if we should use native Zig WebSocket instead of Python.
+fn useNativeWebSocket() bool {
+    if (builtin.os.tag == .windows) return true;
+    var env_map = std.process.getEnvMap(std.heap.c_allocator) catch return false;
+    defer env_map.deinit();
+    if (env_map.get(ENV_FORCE_NATIVE_WS)) |val| {
+        return val.len > 0 and val[0] == '1';
+    }
+    return false;
+}
+
+/// Python script for WebSocket client (embedded to avoid external dependencies).
+/// Handles WebSocket connection and ACK responses to work around Zig 0.15 TLS segfault.
+const PYTHON_WS_SCRIPT =
+    "import sys,os,json,ssl,traceback\n" ++
+    "try:\n" ++
+    "    import websocket\n" ++
+    "except ImportError:\n" ++
+    "    print('ERROR: websocket-client not installed',file=sys.stderr)\n" ++
+    "    sys.exit(1)\n" ++
+    "url=sys.argv[1]\n" ++
+    "sys.stderr.write('CONNECTING\\n')\n" ++
+    "sys.stderr.flush()\n" ++
+    "try:\n" ++
+    "    ws=websocket.WebSocket(sslopt={'cert_reqs':ssl.CERT_NONE},timeout=30)\n" ++
+    "    ws.connect(url)\n" ++
+    "    print('CONNECTED',flush=True)\n" ++
+    "except Exception as e:\n" ++
+    "    print(f'CONNECT_ERROR:{e}',file=sys.stderr,flush=True)\n" ++
+    "    sys.exit(1)\n" ++
+    "print('READY',flush=True)\n" ++
+    "while True:\n" ++
+    "    try:\n" ++
+    "        msg=ws.recv()\n" ++
+    "        if not msg:\n" ++
+    "            continue\n" ++
+    "        print(msg,flush=True)\n" ++
+    "        # Parse and send ACK\n" ++
+    "        try:\n" ++
+    "            p=json.loads(msg)\n" ++
+    "            mt=p.get('type','')\n" ++
+    "            h=p.get('headers',{})\n" ++
+    "            mid=h.get('messageId','')\n" ++
+    "            topic=h.get('topic','')\n" ++
+    "            data=p.get('data','')\n" ++
+    "            if mt=='SYSTEM':\n" ++
+    "                ack=json.dumps({'opaque':json.loads(data).get('opaque','')}) if topic=='ping' and data else '{}'\n" ++
+    "            elif mt=='EVENT':\n" ++
+    "                ack=json.dumps({'status':'SUCCESS','message':'success'})\n" ++
+    "            else:\n" ++
+    "                ack='{}'\n" ++
+    "            if mid:\n" ++
+    "                ws.send(json.dumps({'code':200,'headers':{'messageId':mid,'contentType':'application/json'},'message':'OK','data':ack}))\n" ++
+    "        except Exception:\n" ++
+    "            pass\n" ++
+    "    except websocket.WebSocketTimeoutException:\n" ++
+    "        continue\n" ++
+    "    except Exception as e:\n" ++
+    "        print(f'ERR:{e}',file=sys.stderr,flush=True)\n" ++
+    "        break\n" ++
+    "ws.close()\n";
+
 pub const DingTalkChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8,
@@ -95,7 +175,8 @@ pub const DingTalkChannel = struct {
     /// Send a message via DingTalk session webhook URL.
     /// The target is expected to be the per-session webhook URL provided by the DingTalk Stream API.
     pub fn sendMessage(self: *DingTalkChannel, webhook_url: []const u8, text: []const u8) !void {
-        // Build JSON body: {"msgtype":"markdown","markdown":{"title":"nullclaw","text":"..."}}
+        if (isVerboseLog()) log.info("[DingTalk SEND] {s}", .{text});
+
         var body_buf: [8192]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&body_buf);
         const w = fbs.writer();
@@ -104,27 +185,18 @@ pub const DingTalkChannel = struct {
         try w.writeAll("}}");
         const body = fbs.getWritten();
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        const result = client.fetch(.{
-            .location = .{ .url = webhook_url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-        }) catch return error.DingTalkApiError;
-
-        if (result.status != .ok) {
+        // Use curl to avoid Zig 0.15 std.http.Client segfaults
+        const resp = http_util.curlPostWithProxy(self.allocator, webhook_url, body, &.{}, null, null) catch |err| {
+            log.err("DingTalk sendMessage failed: {}", .{err});
             return error.DingTalkApiError;
-        }
+        };
+        defer self.allocator.free(resp);
     }
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
         self.running.store(true, .release);
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayLoop, .{self});
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, gatewayLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -188,6 +260,7 @@ pub const DingTalkChannel = struct {
 
     fn runGatewayOnce(self: *DingTalkChannel) !void {
         const conn = try self.openConnection();
+        log.info("DingTalk opened connection: endpoint={s}", .{conn.endpoint});
         defer {
             self.allocator.free(conn.endpoint);
             self.allocator.free(conn.ticket);
@@ -197,26 +270,15 @@ pub const DingTalkChannel = struct {
         const path = try buildTicketPath(self.allocator, parts.path, conn.ticket);
         defer self.allocator.free(path);
 
-        var ws = try websocket.WsClient.connect(
-            self.allocator,
-            parts.host,
-            parts.port,
-            path,
-            &.{},
-        );
-        defer ws.deinit();
-        self.ws_fd.store(ws.stream.handle, .release);
-        defer self.ws_fd.store(invalid_socket, .release);
-
-        while (self.running.load(.acquire)) {
-            const msg = ws.readTextMessage() catch |err| {
-                log.warn("DingTalk read error: {}", .{err});
-                break;
-            };
-            if (msg == null) break;
-            const text = msg.?;
-            defer self.allocator.free(text);
-            if (!self.handleMessage(&ws, text)) break;
+        // Choose WebSocket implementation based on platform/environment
+        if (useNativeWebSocket()) {
+            log.info("DingTalk using native Zig WebSocket", .{});
+            try self.runNativeWsLoop(parts.host, parts.port, path);
+        } else {
+            log.info("DingTalk using Python WebSocket (to avoid Zig 0.15 TLS segfault on Linux)", .{});
+            const ws_url = try std.fmt.allocPrint(self.allocator, "wss://{s}:{d}{s}", .{ parts.host, parts.port, path });
+            defer self.allocator.free(ws_url);
+            try self.runPythonWsLoop(ws_url);
         }
     }
 
@@ -224,26 +286,20 @@ pub const DingTalkChannel = struct {
         const body = try self.buildOpenBody();
         defer self.allocator.free(body);
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        const result = client.fetch(.{
-            .location = .{ .url = GATEWAY_URL },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                .{ .name = "Accept", .value = "application/json" },
+        // Use curl to avoid Zig 0.15 std.http.Client segfaults
+        const resp_body = http_util.curlPostWithProxy(
+            self.allocator,
+            GATEWAY_URL,
+            body,
+            &.{
+                "Content-Type: application/json; charset=utf-8",
+                "Accept: application/json",
             },
-            .response_writer = &aw.writer,
-        }) catch return error.DingTalkApiError;
+            null,
+            null,
+        ) catch return error.DingTalkApiError;
+        defer self.allocator.free(resp_body);
 
-        if (result.status != .ok) return error.DingTalkApiError;
-
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
         if (resp_body.len == 0) return error.DingTalkApiError;
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.DingTalkApiError;
@@ -364,76 +420,52 @@ pub const DingTalkChannel = struct {
         return buf.toOwnedSlice(allocator);
     }
 
-    fn handleMessage(self: *DingTalkChannel, ws: *websocket.WsClient, text: []const u8) bool {
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, text, .{}) catch {
-            return true;
+    fn handleBotMessage(self: *DingTalkChannel, data_str: []const u8) void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data_str, .{}) catch {
+            log.err("DingTalk handleBotMessage failed to parse JSON", .{});
+            return;
         };
         defer parsed.deinit();
-        if (parsed.value != .object) return true;
-
-        const msg_obj = parsed.value.object;
-        const type_val = msg_obj.get("type") orelse return true;
-        if (type_val != .string) return true;
-        const msg_type = type_val.string;
-
-        const headers_val = msg_obj.get("headers") orelse return true;
-        if (headers_val != .object) return true;
-        const headers = headers_val.object;
-        const message_id = getJsonStringObj(headers, "messageId") orelse return true;
-        const topic = getJsonStringObj(headers, "topic") orelse "";
-
-        const data_val = msg_obj.get("data") orelse return true;
-        if (data_val != .string) return true;
-        const data_str = data_val.string;
-
-        if (std.mem.eql(u8, msg_type, "SYSTEM")) {
-            if (std.mem.eql(u8, topic, "ping")) {
-                const ping_data = self.buildPingData(data_str);
-                const data_payload = ping_data orelse "{\"opaque\":\"\"}";
-                defer if (ping_data) |pd| self.allocator.free(pd);
-                _ = self.sendAck(ws, message_id, data_payload) catch {};
-            }
-            if (std.mem.eql(u8, topic, "disconnect")) {
-                return false;
-            }
-            return true;
+        if (parsed.value != .object) {
+            log.warn("DingTalk handleBotMessage parsed value is not an object", .{});
+            return;
         }
-
-        if (std.mem.eql(u8, msg_type, "EVENT")) {
-            _ = self.sendAck(ws, message_id, "{\"status\":\"SUCCESS\",\"message\":\"success\"}") catch {};
-            return true;
-        }
-
-        if (std.mem.eql(u8, msg_type, "CALLBACK")) {
-            if (std.mem.eql(u8, topic, BOT_MESSAGE_TOPIC)) {
-                self.handleBotMessage(data_str);
-            }
-            _ = self.sendAck(ws, message_id, "{\"response\":null}") catch {};
-        }
-        return true;
-    }
-
-    fn handleBotMessage(self: *DingTalkChannel, data_str: []const u8) void {
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data_str, .{}) catch return;
-        defer parsed.deinit();
-        if (parsed.value != .object) return;
         const obj = parsed.value.object;
 
-        const sender_id = getJsonStringObj(obj, "senderId") orelse getJsonStringObj(obj, "senderStaffId") orelse return;
-        if (!self.isUserAllowed(sender_id)) return;
+        const sender_id = getJsonStringObj(obj, "senderId") orelse getJsonStringObj(obj, "senderStaffId") orelse {
+            log.warn("DingTalk handleBotMessage missing senderId", .{});
+            return;
+        };
+        if (!self.isUserAllowed(sender_id)) {
+            log.warn("DingTalk handleBotMessage sender not allowed: {s}", .{sender_id});
+            return;
+        }
 
         const msg_type = getJsonStringObj(obj, "msgtype") orelse "";
-        if (!std.mem.eql(u8, msg_type, "text")) return;
+        if (!std.mem.eql(u8, msg_type, "text")) {
+            return;
+        }
 
-        const text_obj_val = obj.get("text") orelse return;
+        const text_obj_val = obj.get("text") orelse {
+            log.warn("DingTalk handleBotMessage missing text field", .{});
+            return;
+        };
         if (text_obj_val != .object) return;
         const text_obj = text_obj_val.object;
         const content = getJsonStringObj(text_obj, "content") orelse return;
         const trimmed = std.mem.trim(u8, content, " \t\r\n");
         if (trimmed.len == 0) return;
 
-        const session_webhook = getJsonStringObj(obj, "sessionWebhook") orelse return;
-        if (session_webhook.len == 0) return;
+        if (isVerboseLog()) log.info("[DingTalk RECV] from={s} {s}", .{sender_id, trimmed});
+
+        const session_webhook = getJsonStringObj(obj, "sessionWebhook") orelse {
+            log.warn("DingTalk handleBotMessage missing sessionWebhook", .{});
+            return;
+        };
+        if (session_webhook.len == 0) {
+            log.warn("DingTalk handleBotMessage empty sessionWebhook", .{});
+            return;
+        }
 
         const conversation_type = getJsonStringObj(obj, "conversationType") orelse "";
         const is_group = std.mem.eql(u8, conversation_type, "2");
@@ -493,6 +525,7 @@ pub const DingTalkChannel = struct {
                 msg.deinit(self.allocator);
             };
         } else {
+            log.err("DingTalk handleBotMessage: self.bus is null, message dropped!", .{});
             msg.deinit(self.allocator);
         }
     }
@@ -528,6 +561,220 @@ pub const DingTalkChannel = struct {
         const val = obj.get(key) orelse return null;
         if (val != .string) return null;
         return val.string;
+    }
+
+    /// Run WebSocket connection via Python subprocess (avoids Zig 0.15 TLS segfault)
+    fn runPythonWsLoop(self: *DingTalkChannel, ws_url: []const u8) !void {
+        const script_path = "/tmp/dingtalk_ws.py";
+        {
+            const script_file = try std.fs.cwd().createFile(script_path, .{ .truncate = true });
+            defer script_file.close();
+            try script_file.writeAll(PYTHON_WS_SCRIPT);
+        }
+        defer std.fs.cwd().deleteFile(script_path) catch {};
+
+        const argv = &[_][]const u8{ "python3", script_path, ws_url };
+        var child = std.process.Child.init(argv, self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Inherit;
+
+        try child.spawn();
+        errdefer {
+            _ = child.kill() catch {};
+        }
+
+        const stdout = child.stdout.?;
+
+        // Wait for CONNECTED signal
+        var conn_buf: [256]u8 = undefined;
+        var conn_offset: usize = 0;
+        var connected = false;
+        const start_time = std.time.milliTimestamp();
+        while (std.time.milliTimestamp() - start_time < 10000) {
+            const n = stdout.read(conn_buf[conn_offset..]) catch break;
+            if (n == 0) break;
+            conn_offset += n;
+            if (std.mem.indexOf(u8, conn_buf[0..conn_offset], "CONNECTED")) |_| {
+                connected = true;
+                break;
+            }
+            if (std.mem.indexOf(u8, conn_buf[0..conn_offset], "READY")) |_| {
+                connected = true;
+                break;
+            }
+        }
+        if (!connected) {
+            log.err("DingTalk Python WebSocket failed to connect, stdout: {s}", .{conn_buf[0..conn_offset]});
+            _ = child.kill() catch {};
+            return error.WebSocketConnectFailed;
+        }
+        log.info("DingTalk WebSocket connected via Python, waiting for messages...", .{});
+
+        // Find the position of the connection signal in conn_buf
+        var signal_end: usize = 0;
+        if (std.mem.indexOf(u8, conn_buf[0..conn_offset], "CONNECTED")) |pos| {
+            signal_end = pos + "CONNECTED".len;
+        } else if (std.mem.indexOf(u8, conn_buf[0..conn_offset], "READY")) |pos| {
+            signal_end = pos + "READY".len;
+        }
+        // Append any data after the signal to line_buf
+        var line_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer line_buf.deinit(self.allocator);
+        if (signal_end < conn_offset) {
+            try line_buf.appendSlice(self.allocator, conn_buf[signal_end..conn_offset]);
+        }
+
+        // Set non-blocking mode for stdout
+        if (builtin.os.tag == .linux) {
+            const stdout_flags = std.posix.fcntl(stdout.handle, std.posix.F.GETFL, 0) catch 0;
+            _ = std.posix.fcntl(stdout.handle, std.posix.F.SETFL, stdout_flags | 0o4000) catch {};
+        }
+
+        var read_buf: [8192]u8 = undefined;
+
+        while (self.running.load(.acquire)) {
+            const n = stdout.read(&read_buf) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+
+            if (n == 0) {
+                log.info("DingTalk WebSocket (Python) closed", .{});
+                return error.ConnectionClosed;
+            }
+
+            try line_buf.appendSlice(self.allocator, read_buf[0..n]);
+
+            while (true) {
+                const newline_idx = std.mem.indexOfScalar(u8, line_buf.items, '\n');
+                if (newline_idx == null) break;
+
+                const line = std.mem.trimRight(u8, line_buf.items[0..newline_idx.?], "\r");
+                if (line.len > 0) {
+                    // Skip log lines from Python script
+                    if (std.mem.startsWith(u8, line, "RX:") or
+                        std.mem.startsWith(u8, line, "ACK") or
+                        std.mem.startsWith(u8, line, "CONNECTED") or
+                        std.mem.startsWith(u8, line, "READY") or
+                        std.mem.startsWith(u8, line, "ERR:") or
+                        std.mem.startsWith(u8, line, "CONNECT_ERROR:") or
+                        std.mem.startsWith(u8, line, "CONNECT_TRACE:"))
+                    {
+                        // log line, ignore
+                    } else {
+                        if (!self.handleWsMessage(line, null)) {
+                            return error.ConnectionClosed;
+                        }
+                    }
+                }
+
+                const remove_len = newline_idx.? + 1;
+                std.mem.copyForwards(u8, line_buf.items[0..], line_buf.items[remove_len..]);
+                line_buf.items.len -= remove_len;
+            }
+        }
+    }
+
+    /// Run WebSocket connection using native Zig implementation
+    fn runNativeWsLoop(self: *DingTalkChannel, host: []const u8, port: u16, path: []const u8) !void {
+        var ws = try websocket.WsClient.connect(self.allocator, host, port, path, &.{});
+        defer ws.deinit();
+
+        log.info("DingTalk native WebSocket connected, waiting for messages...", .{});
+
+        while (self.running.load(.acquire)) {
+            const message = ws.readTextMessage() catch |err| {
+                log.warn("DingTalk native WS read error: {}", .{err});
+                return err;
+            };
+
+            if (message == null) {
+                log.info("DingTalk native WebSocket closed by server", .{});
+                return error.ConnectionClosed;
+            }
+            const msg = message.?;
+            defer self.allocator.free(msg);
+
+            if (!self.handleWsMessage(msg, &ws)) {
+                return error.ConnectionClosed;
+            }
+        }
+    }
+
+    /// Handle a message from WebSocket
+    fn handleWsMessage(self: *DingTalkChannel, text: []const u8, ws: ?*websocket.WsClient) bool {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, text, .{}) catch {
+            log.warn("DingTalk failed to parse message as JSON", .{});
+            return true;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) {
+            log.warn("DingTalk message is not an object", .{});
+            return true;
+        }
+
+        const msg_obj = parsed.value.object;
+
+        const type_val = msg_obj.get("type") orelse {
+            log.warn("DingTalk message has no 'type' field", .{});
+            return true;
+        };
+        if (type_val != .string) return true;
+        const msg_type = type_val.string;
+
+        const headers_val = msg_obj.get("headers");
+        if (headers_val == null) {
+            log.warn("DingTalk message has no 'headers' field", .{});
+            return true;
+        }
+        if (headers_val.? != .object) return true;
+        const headers = headers_val.?.object;
+        const message_id = getJsonStringObj(headers, "messageId") orelse "";
+        const topic = getJsonStringObj(headers, "topic") orelse "";
+
+        const data_val = msg_obj.get("data") orelse return true;
+        const data_str: []const u8 = if (data_val == .string) data_val.string else "";
+
+        // Send ACK if we have a WebSocket connection
+        if (ws) |w| {
+            if (std.mem.eql(u8, msg_type, "SYSTEM")) {
+                if (std.mem.eql(u8, topic, "ping")) {
+                    const ping_data = self.buildPingData(data_str);
+                    const data_payload = ping_data orelse "{\"opaque\":\"\"}";
+                    defer if (ping_data) |pd| self.allocator.free(pd);
+                    _ = self.sendAck(w, message_id, data_payload) catch {};
+                } else {
+                    _ = self.sendAck(w, message_id, "{\"response\":null}") catch {};
+                }
+            } else if (std.mem.eql(u8, msg_type, "EVENT")) {
+                _ = self.sendAck(w, message_id, "{\"status\":\"SUCCESS\",\"message\":\"success\"}") catch {};
+            } else if (std.mem.eql(u8, msg_type, "CALLBACK")) {
+                _ = self.sendAck(w, message_id, "{\"response\":null}") catch {};
+            }
+        }
+
+        if (std.mem.eql(u8, msg_type, "SYSTEM")) {
+            if (std.mem.eql(u8, topic, "disconnect")) {
+                return false;
+            }
+            return true;
+        }
+
+        if (std.mem.eql(u8, msg_type, "EVENT")) {
+            return true;
+        }
+
+        if (std.mem.eql(u8, msg_type, "CALLBACK")) {
+            if (std.mem.eql(u8, topic, BOT_MESSAGE_TOPIC)) {
+                self.handleBotMessage(data_str);
+            }
+        }
+        return true;
     }
 };
 

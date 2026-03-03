@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 const memory_root = @import("memory/root.zig");
+const util = @import("util.zig");
 
 /// Staleness thresholds (seconds).
 const DAEMON_STALE_SECONDS: i64 = 30;
@@ -607,6 +608,13 @@ pub fn checkEnvironment(
         try items.append(allocator, DiagItem.ok(cat, "home directory env set"));
     } else |_| {
         try items.append(allocator, DiagItem.err(cat, "home directory is not set"));
+    }
+
+    // Python websocket-client (required for DingTalk)
+    if (util.checkPythonModule(allocator, "websocket")) {
+        try items.append(allocator, DiagItem.ok(cat, "python websocket-client: installed"));
+    } else {
+        try items.append(allocator, DiagItem.warn(cat, "python websocket-client: not installed (required for DingTalk). Run: pip install websocket-client"));
     }
 }
 

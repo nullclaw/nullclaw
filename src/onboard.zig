@@ -1259,6 +1259,18 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
 }
 
 fn configureDingTalkChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    // Check for websocket-client dependency
+    if (!util.checkPythonModule(cfg.allocator, "websocket")) {
+        try out.print("{s}  ⚠️  DingTalk requires Python 'websocket-client' package.\n", .{prefix});
+        try out.print("{s}     Install with: pip install websocket-client\n", .{prefix});
+        try out.print("{s}  Continue anyway? [y/N]: ", .{prefix});
+        const cont = prompt(out, input_buf, "", "n") orelse return false;
+        if (cont.len == 0 or (cont[0] != 'y' and cont[0] != 'Y')) {
+            try out.print("{s}  -> DingTalk skipped\n", .{prefix});
+            return false;
+        }
+    }
+
     var client_id_buf: [512]u8 = undefined;
     var client_secret_buf: [512]u8 = undefined;
     try out.print("{s}  DingTalk client_id (required, Enter to skip): ", .{prefix});

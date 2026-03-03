@@ -88,6 +88,7 @@ fn processTelegramMessage(
             error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
             error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
             error.OutOfMemory => "Out of memory.",
+            error.InvalidToolCallFormat => "I had trouble understanding the tool format. Please try rephrasing your request.",
             else => "An error occurred. Try again or /new for a fresh session.",
         };
         if (sink != null) {

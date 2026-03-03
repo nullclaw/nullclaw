@@ -747,6 +747,7 @@ fn inboundDispatcherThread(
                 error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                 error.NoResponseContent => "Model returned an empty response. Please try again.",
                 error.OutOfMemory => "Out of memory.",
+                error.InvalidToolCallFormat => "I had trouble understanding the tool format. Please try rephrasing your request.",
                 else => "An error occurred. Try again.",
             };
             const err_out = if (outbound_account_id) |aid|

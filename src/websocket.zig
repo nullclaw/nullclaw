@@ -3,8 +3,27 @@
 //! All connections are TLS-only (wss://).
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const log = std.log.scoped(.websocket);
+
+/// Fill buffer with random bytes using OS-level getrandom.
+/// This avoids Zig 0.15's std.crypto.random issue in subthreads.
+fn fillRandomBytes(buf: []u8) !void {
+    if (builtin.os.tag == .linux) {
+        // Linux getrandom syscall works reliably in subthreads
+        var offset: usize = 0;
+        while (offset < buf.len) {
+            const rc = std.os.linux.getrandom(buf.ptr + offset, buf.len - offset, 0);
+            if (rc < 0) {
+                return error.RandomError;
+            }
+            offset += @intCast(rc);
+        }
+    } else {
+        std.crypto.random.bytes(buf);
+    }
+}
 
 /// RFC 6455 handshake magic string.
 pub const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -40,15 +59,12 @@ pub const TlsState = struct {
     tls_read_buf: []u8,
     tls_write_buf: []u8,
     scratch: [4096]u8 = undefined,
-    ca_bundle: ?std.crypto.Certificate.Bundle,
-    ca_has_bundle: bool,
 
     pub fn deinit(self: *TlsState, allocator: std.mem.Allocator) void {
         allocator.free(self.read_buf);
         allocator.free(self.write_buf);
         allocator.free(self.tls_read_buf);
         allocator.free(self.tls_write_buf);
-        if (self.ca_bundle) |*bundle| bundle.deinit(allocator);
         allocator.destroy(self);
     }
 };
@@ -71,11 +87,14 @@ pub const WsClient = struct {
         extra_headers: []const []const u8,
     ) !WsClient {
         // DNS + TCP
+        log.debug("WS: resolving {s}:{}", .{ host, port });
         const addr_list = try std.net.getAddressList(allocator, host, port);
         defer addr_list.deinit();
         if (addr_list.addrs.len == 0) return error.DnsResolutionFailed;
+        log.debug("WS: resolved {} addresses, connecting to first", .{addr_list.addrs.len});
         const stream = try std.net.tcpConnectToAddress(addr_list.addrs[0]);
         errdefer stream.close();
+        log.debug("WS: TCP connected", .{});
 
         // Allocate TLS buffers (pattern from irc.zig)
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
@@ -91,40 +110,35 @@ pub const WsClient = struct {
         const tls_state = try allocator.create(TlsState);
         errdefer allocator.destroy(tls_state);
 
+        // Initialize fields one by one (IRC pattern)
         tls_state.read_buf = read_buf;
         tls_state.write_buf = write_buf;
         tls_state.tls_read_buf = tls_read_buf;
         tls_state.tls_write_buf = tls_write_buf;
         tls_state.stream_reader = stream.reader(read_buf);
         tls_state.stream_writer = stream.writer(write_buf);
-        tls_state.ca_bundle = std.crypto.Certificate.Bundle{};
-        tls_state.ca_has_bundle = false;
 
-        if (tls_state.ca_bundle.?.rescan(allocator)) |_| {
-            tls_state.ca_has_bundle = true;
-        } else |err| {
-            // Preserve current behavior on platforms/environments where system CAs
-            // are unavailable, but prefer verified TLS whenever possible.
-            log.warn("WS TLS: system CA bundle unavailable, fallback to no_verification: {}", .{err});
-        }
-
+        log.debug("WS: TLS init starting", .{});
         const tls_options: std.crypto.tls.Client.Options = .{
-            .host = .{ .explicit = host },
-            .ca = if (tls_state.ca_has_bundle) .{ .bundle = tls_state.ca_bundle.? } else .no_verification,
+            .host = .no_verification,
+            .ca = .no_verification,
             .read_buffer = tls_read_buf,
             .write_buffer = tls_write_buf,
             .allow_truncation_attacks = true,
         };
 
+        log.debug("WS: TLS options ready, calling init", .{});
         tls_state.tls_client = std.crypto.tls.Client.init(
             tls_state.stream_reader.interface(),
             &tls_state.stream_writer.interface,
             tls_options,
         ) catch return error.TlsInitializationFailed;
+        log.debug("WS: TLS init done", .{});
+        log.debug("WS: TLS init done", .{});
 
         // HTTP Upgrade handshake
         var key_raw: [16]u8 = undefined;
-        std.crypto.random.bytes(&key_raw);
+        try fillRandomBytes(&key_raw);
         var key_b64: [24]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
 
@@ -319,7 +333,7 @@ pub const WsClient = struct {
 
         // Random 4-byte masking key (RFC 6455 §5.3: client→server MUST mask)
         var mask: [4]u8 = undefined;
-        std.crypto.random.bytes(&mask);
+        try fillRandomBytes(&mask);
         @memcpy(header[hlen..][0..4], &mask);
         hlen += 4;
 
