@@ -1,5 +1,5 @@
 .{
-    .name = .nullclaw,
+    .name = "nullclaw",
     .version = "2026.3.2",
     .fingerprint = 0xe73e13d1c95956c2,
     .minimum_zig_version = "0.15.2",
@@ -9,7 +9,7 @@
         },
         .websocket = .{
             .url = "git+https://github.com/karlseguin/websocket.zig#97fefafa59cc78ce177cff540b8685cd7f699276",
-            .hash = "websocket-0.1.0-ZPISdRlzAwBB_Bz2UMMqxYqF6YEVTIBoFsbzwPUJTHIc",
+            
         },
     },
     .paths = .{

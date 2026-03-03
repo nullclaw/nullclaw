@@ -6,6 +6,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const audit_mod = @import("../security/audit.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
 
 /// Default maximum shell command execution time (nanoseconds).
@@ -24,6 +25,8 @@ pub const ShellTool = struct {
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
     policy: ?*const SecurityPolicy = null,
+    audit_logger: ?*const audit_mod.AuditLogger = null,
+    audit_channel: []const u8 = "runtime",
 
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
@@ -41,13 +44,20 @@ pub const ShellTool = struct {
     }
 
     pub fn execute(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const started_ms = std.time.milliTimestamp();
         // Parse the command from the pre-parsed JSON object
         const command = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
 
+        var risk_level: []const u8 = "none";
+
         // Validate command against security policy
         if (self.policy) |pol| {
             _ = pol.validateCommandExecution(command, false) catch |err| {
+                const elapsed_ms = elapsedMillis(started_ms);
+                risk_level = pol.commandRiskLevel(command).toString();
+                self.logCommandEvent(command, risk_level, false, false, false, elapsed_ms);
+                self.logPolicyViolationEvent(command, risk_level, elapsed_ms, @errorName(err));
                 return switch (err) {
                     error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
@@ -57,6 +67,7 @@ pub const ShellTool = struct {
                     },
                 };
             };
+            risk_level = pol.commandRiskLevel(command).toString();
         }
 
         // Determine working directory
@@ -101,18 +112,64 @@ pub const ShellTool = struct {
             .max_output_bytes = self.max_output_bytes,
         });
         defer allocator.free(result.stderr);
+        const elapsed_ms = elapsedMillis(started_ms);
 
         if (result.success) {
+            self.logCommandEvent(command, risk_level, false, true, true, elapsed_ms);
             if (result.stdout.len > 0) return ToolResult{ .success = true, .output = result.stdout };
             allocator.free(result.stdout);
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(no output)") };
         }
+        self.logCommandEvent(command, risk_level, false, true, false, elapsed_ms);
         defer allocator.free(result.stdout);
         if (result.exit_code != null) {
             const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
             return ToolResult{ .success = false, .output = "", .error_msg = err_out };
         }
         return ToolResult{ .success = false, .output = "", .error_msg = "Command terminated by signal" };
+    }
+
+    fn elapsedMillis(started_ms: i64) u64 {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms <= started_ms) return 0;
+        return @intCast(now_ms - started_ms);
+    }
+
+    fn logCommandEvent(
+        self: *const ShellTool,
+        command: []const u8,
+        risk_level: []const u8,
+        approved: bool,
+        allowed: bool,
+        success: bool,
+        duration_ms: u64,
+    ) void {
+        const logger = self.audit_logger orelse return;
+        logger.logCommand(.{
+            .channel = self.audit_channel,
+            .command = command,
+            .risk_level = risk_level,
+            .approved = approved,
+            .allowed = allowed,
+            .success = success,
+            .duration_ms = duration_ms,
+        }) catch {};
+    }
+
+    fn logPolicyViolationEvent(
+        self: *const ShellTool,
+        command: []const u8,
+        risk_level: []const u8,
+        duration_ms: u64,
+        err_msg: []const u8,
+    ) void {
+        const logger = self.audit_logger orelse return;
+        var event = audit_mod.AuditEvent.init(.policy_violation)
+            .withActor(self.audit_channel, null, null)
+            .withAction(command, risk_level, false, false)
+            .withResult(false, null, duration_ms, err_msg);
+        event.security.policy_violation = true;
+        logger.log(&event) catch {};
     }
 };
 
@@ -455,4 +512,79 @@ test "shell without policy executes command" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
+}
+
+test "shell audit logger writes command execution events" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var logger = try audit_mod.AuditLogger.init(std.testing.allocator, .{
+        .enabled = true,
+        .log_path = "shell_audit.log",
+        .max_size_mb = 10,
+    }, tmp_path);
+    defer logger.deinit();
+
+    var st = ShellTool{
+        .workspace_dir = tmp_path,
+        .audit_logger = &logger,
+        .audit_channel = "runtime",
+    };
+    const parsed = try root.parseTestArgs("{\"command\": \"echo audit-test\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+
+    const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "shell_audit.log", 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event_type\":\"command_execution\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "audit-test") != null);
+}
+
+test "shell audit logger writes policy violation events" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var logger = try audit_mod.AuditLogger.init(std.testing.allocator, .{
+        .enabled = true,
+        .log_path = "policy_audit.log",
+        .max_size_mb = 10,
+    }, tmp_path);
+    defer logger.deinit();
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = tmp_path,
+        .allowed_commands = &policy_mod.default_allowed_commands,
+        .block_high_risk_commands = true,
+        .require_approval_for_medium_risk = true,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{
+        .workspace_dir = tmp_path,
+        .policy = &policy,
+        .audit_logger = &logger,
+        .audit_channel = "runtime",
+    };
+    const parsed = try root.parseTestArgs("{\"command\": \"rm -rf /tmp/never\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(!result.success);
+
+    const content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "policy_audit.log", 8192);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event_type\":\"command_execution\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event_type\":\"policy_violation\"") != null);
 }

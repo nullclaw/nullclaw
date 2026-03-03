@@ -1,5 +1,5 @@
 .{
-    .name = .sqlite3,
+    .name = "sqlite3",
     .version = "3.51.0",
     .minimum_zig_version = "0.15.2",
     .paths = .{

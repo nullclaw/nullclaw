@@ -18,6 +18,7 @@ const ObserverEvent = observability.ObserverEvent;
 const subagent_mod = @import("../subagent.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
+const security_audit = @import("../security/audit.zig");
 const auth_mod = @import("../auth.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
@@ -199,6 +200,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tracker = &tracker,
     };
 
+    var audit_logger_opt: ?security_audit.AuditLogger = null;
+    if (cfg.security.audit.enabled) {
+        audit_logger_opt = security_audit.AuditLogger.init(allocator, .{
+            .enabled = cfg.security.audit.enabled,
+            .log_path = cfg.security.audit.log_path,
+            .max_size_mb = cfg.security.audit.max_size_mb,
+        }, cfg.workspace_dir) catch |err| blk: {
+            log.warn("audit logger init failed: {}", .{err});
+            break :blk null;
+        };
+    }
+    defer if (audit_logger_opt) |*logger| logger.deinit();
+
     // Provider runtime bundle (primary provider + reliability wrapper).
     var runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
     defer runtime_provider.deinit();
@@ -223,6 +237,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
         .policy = &policy,
+        .audit_logger = if (audit_logger_opt) |*logger| logger else null,
+        .audit_channel = "cli",
         .subagent_manager = &subagent_manager,
     });
     defer tools_mod.deinitTools(allocator, tools);
