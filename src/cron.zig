@@ -861,6 +861,8 @@ const AgentRunResult = struct {
 
 const AGENT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 const AGENT_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
+const LINUX_SELF_EXE_PATH = "/proc/self/exe";
+const DELETED_EXE_SUFFIX = " (deleted)";
 
 fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
     if (timeout_secs == 0) return false;
@@ -962,6 +964,15 @@ fn buildAgentOutput(
     return allocator.dupe(u8, output_source);
 }
 
+fn preferAgentExecPath(self_exe_path: []const u8) []const u8 {
+    if (comptime builtin.os.tag == .linux) {
+        if (std.mem.endsWith(u8, self_exe_path, DELETED_EXE_SUFFIX)) {
+            return LINUX_SELF_EXE_PATH;
+        }
+    }
+    return self_exe_path;
+}
+
 fn runAgentJob(
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
@@ -972,25 +983,60 @@ fn runAgentJob(
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
+    var exec_path = preferAgentExecPath(exe_path);
+    var exec_cwd = cwd;
+    var tried_no_cwd = false;
+    var tried_proc_self_exe = std.mem.eql(u8, exec_path, LINUX_SELF_EXE_PATH);
+
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
-    try argv.append(allocator, exe_path);
-    try argv.append(allocator, "agent");
-    if (model) |m| {
-        try argv.append(allocator, "--model");
-        try argv.append(allocator, m);
+    var child: std.process.Child = undefined;
+    spawn_loop: while (true) {
+        argv.clearRetainingCapacity();
+        try argv.append(allocator, exec_path);
+        try argv.append(allocator, "agent");
+        if (model) |m| {
+            try argv.append(allocator, "--model");
+            try argv.append(allocator, m);
+        }
+        try argv.append(allocator, "-m");
+        try argv.append(allocator, prompt);
+
+        child = std.process.Child.init(argv.items, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        child.cwd = exec_cwd;
+
+        child.spawn() catch |err| switch (err) {
+            error.FileNotFound => {
+                // If cwd disappeared, retry from process cwd.
+                if (exec_cwd != null and !tried_no_cwd) {
+                    exec_cwd = null;
+                    tried_no_cwd = true;
+                    continue :spawn_loop;
+                }
+
+                // If current binary path became stale after in-place rebuild,
+                // Linux can still re-exec through /proc/self/exe.
+                if (comptime builtin.os.tag == .linux) {
+                    if (!tried_proc_self_exe and !std.mem.eql(u8, exec_path, LINUX_SELF_EXE_PATH)) {
+                        exec_path = LINUX_SELF_EXE_PATH;
+                        exec_cwd = cwd;
+                        tried_no_cwd = false;
+                        tried_proc_self_exe = true;
+                        continue :spawn_loop;
+                    }
+                }
+
+                return err;
+            },
+            else => return err,
+        };
+        break :spawn_loop;
     }
-    try argv.append(allocator, "-m");
-    try argv.append(allocator, prompt);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.cwd = cwd;
-
-    try child.spawn();
     errdefer {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
@@ -2410,6 +2456,16 @@ test "collectChildOutputWithTimeout kills process after deadline" {
         else => false,
     };
     try std.testing.expect(!completed_ok);
+}
+
+test "preferAgentExecPath keeps regular executable path" {
+    const input = "/home/user/bin/nullclaw";
+    try std.testing.expectEqualStrings(input, preferAgentExecPath(input));
+}
+
+test "preferAgentExecPath uses proc self exe for deleted linux path" {
+    if (comptime builtin.os.tag != .linux) return;
+    try std.testing.expectEqualStrings(LINUX_SELF_EXE_PATH, preferAgentExecPath("/tmp/nullclaw (deleted)"));
 }
 
 test "DeliveryMode parse and asStr" {
