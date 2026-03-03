@@ -1042,8 +1042,16 @@ pub const Agent = struct {
                 assistant_history_content = response_text;
             }
 
-            // Determine display text
-            const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+            // Determine display text.
+            // When tool calls are present, only show parsed plain text (if any).
+            // Never fall back to raw response_text here, otherwise markup like
+            // <tool_call>...</tool_call> can leak to users.
+            const display_text = if (parsed_calls.len > 0)
+                parsed_text
+            else if (parsed_text.len > 0)
+                parsed_text
+            else
+                response_text;
 
             if (parsed_calls.len == 0) {
                 // Guardrail: if the model promises "I'll try/check now" but emits no

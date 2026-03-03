@@ -17,6 +17,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const subagent_mod = @import("../subagent.zig");
+const subagent_runner = @import("../subagent_runner.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
 const auth_mod = @import("../auth.zig");
@@ -215,6 +216,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const resolved_api_key = runtime_provider.primaryApiKey();
 
     var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+    subagent_manager.task_runner = subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
     // Create tools (with agents config for delegate depth enforcement)

@@ -15,7 +15,7 @@ pub const SpawnTool = struct {
     pub const tool_name = "spawn";
     pub const tool_description = "Spawn a background subagent to work on a task asynchronously. Returns a task ID immediately. Results are delivered as system messages when complete.";
     pub const tool_params =
-        \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"description":"The task/prompt for the subagent"},"label":{"type":"string","description":"Optional human-readable label for tracking"}},"required":["task"]}
+        \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"description":"The task/prompt for the subagent"},"label":{"type":"string","description":"Optional human-readable label for tracking"},"agent":{"type":"string","description":"Optional named agent profile from agents.list for provider/model override"}},"required":["task"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -37,6 +37,13 @@ pub const SpawnTool = struct {
         }
 
         const label = root.getString(args, "label") orelse "subagent";
+        const agent_name = if (root.getString(args, "agent")) |raw| blk: {
+            const trimmed = std.mem.trim(u8, raw, " \t\n");
+            if (trimmed.len == 0) {
+                return ToolResult.fail("'agent' must not be empty");
+            }
+            break :blk trimmed;
+        } else null;
 
         const manager = self.manager orelse
             return ToolResult.fail("Spawn tool not connected to SubagentManager");
@@ -44,9 +51,10 @@ pub const SpawnTool = struct {
         const channel = self.default_channel orelse "system";
         const chat_id = self.default_chat_id orelse "agent";
 
-        const task_id = manager.spawn(trimmed_task, label, channel, chat_id) catch |err| {
+        const task_id = manager.spawnWithAgent(trimmed_task, label, channel, chat_id, agent_name) catch |err| {
             return switch (err) {
                 error.TooManyConcurrentSubagents => ToolResult.fail("Too many concurrent subagents. Wait for some to complete."),
+                error.UnknownAgent => ToolResult.fail("Unknown named agent profile"),
                 else => ToolResult.fail("Failed to spawn subagent"),
             };
         };
@@ -81,6 +89,7 @@ test "spawn tool schema has task" {
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "task") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "label") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "agent") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "required") != null);
 }
 
@@ -104,6 +113,16 @@ test "spawn empty task rejected" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "empty") != null);
 }
 
+test "spawn blank agent rejected" {
+    var st = SpawnTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"task\": \"do something\", \"agent\": \"   \"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "must not be empty") != null);
+}
+
 test "spawn without manager fails" {
     var st = SpawnTool{};
     const t = st.tool();
@@ -121,4 +140,25 @@ test "spawn empty JSON rejected" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
+}
+
+test "spawn with unknown named agent fails" {
+    const subagent = @import("../subagent.zig");
+    const config = @import("../config.zig");
+
+    const cfg = config.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    var st = SpawnTool{ .manager = &manager };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"task\": \"do something\", \"agent\": \"missing\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unknown") != null);
 }

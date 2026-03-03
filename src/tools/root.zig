@@ -500,8 +500,11 @@ pub fn subagentTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        tools_config: @import("../config.zig").ToolsConfig = .{},
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -512,12 +515,24 @@ pub fn subagentTools(
         list.deinit(allocator);
     }
 
+    const tc = opts.tools_config;
+
     const st = try allocator.create(shell.ShellTool);
-    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .policy = opts.policy };
+    st.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
+        .max_output_bytes = tc.shell_max_output_bytes,
+        .policy = opts.policy,
+    };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    ft.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
@@ -525,7 +540,11 @@ pub fn subagentTools(
     try list.append(allocator, wt.tool());
 
     const et = try allocator.create(file_edit.FileEditTool);
-    et.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    et.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
     try list.append(allocator, et.tool());
 
     const gt = try allocator.create(git.GitTool);
@@ -534,7 +553,10 @@ pub fn subagentTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = opts.http_allowed_domains,
+            .max_response_size = opts.http_max_response_size,
+        };
         try list.append(allocator, ht.tool());
     }
 
@@ -773,6 +795,68 @@ test "all tools wires subagent manager into spawn tool" {
         break;
     }
     try std.testing.expect(checked_spawn);
+}
+
+test "subagent tools use configured shell and file limits" {
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{
+            .shell_timeout_secs = 7,
+            .shell_max_output_bytes = 2048,
+            .max_file_size_bytes = 4096,
+        },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_shell = false;
+    var saw_file_read = false;
+    var saw_file_edit = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), st.timeout_ns);
+            try std.testing.expectEqual(@as(usize, 2048), st.max_output_bytes);
+            saw_shell = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_read")) {
+            const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(u64, 4096), ft.max_file_size);
+            saw_file_read = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_edit")) {
+            const et: *file_edit.FileEditTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 4096), et.max_file_size);
+            saw_file_edit = true;
+        }
+    }
+
+    try std.testing.expect(saw_shell);
+    try std.testing.expect(saw_file_read);
+    try std.testing.expect(saw_file_edit);
+}
+
+test "subagent tools wire http allowlist and response limit" {
+    const domains = [_][]const u8{"example.com"};
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .http_enabled = true,
+        .http_allowed_domains = &domains,
+        .http_max_response_size = 2222,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_http = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "http_request")) continue;
+        const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expectEqual(@as(usize, 1), ht.allowed_domains.len);
+        try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+        try std.testing.expectEqual(@as(u32, 2222), ht.max_response_size);
+        saw_http = true;
+        break;
+    }
+
+    try std.testing.expect(saw_http);
 }
 
 test "bindMemoryTools matches by vtable, not by colliding tool name" {

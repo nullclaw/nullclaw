@@ -505,6 +505,186 @@ fn splitFirstToken(arg: []const u8) struct { head: []const u8, tail: []const u8 
     };
 }
 
+const SUBAGENTS_SPAWN_USAGE = "Usage: /subagents spawn [--agent <name>|--agent=<name>] <task>";
+
+const SubagentSpawnRequest = struct {
+    task: []const u8,
+    agent_name: ?[]const u8 = null,
+};
+
+fn parseSubagentSpawnRequest(arg: []const u8) ?SubagentSpawnRequest {
+    const trimmed = std.mem.trim(u8, arg, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "--agent")) {
+        var i: usize = "--agent".len;
+        if (std.mem.startsWith(u8, trimmed, "--agent=")) {
+            i = "--agent=".len;
+        } else if (trimmed.len == "--agent".len or std.ascii.isWhitespace(trimmed[i])) {
+            while (i < trimmed.len and std.ascii.isWhitespace(trimmed[i])) : (i += 1) {}
+        } else {
+            return .{ .task = trimmed };
+        }
+
+        if (i >= trimmed.len) return null;
+
+        const agent_start = i;
+        while (i < trimmed.len and !std.ascii.isWhitespace(trimmed[i])) : (i += 1) {}
+        const agent_name = trimmed[agent_start..i];
+        if (agent_name.len == 0) return null;
+
+        while (i < trimmed.len and std.ascii.isWhitespace(trimmed[i])) : (i += 1) {}
+        if (i >= trimmed.len) return null;
+
+        const task = std.mem.trim(u8, trimmed[i..], " \t\r\n");
+        if (task.len == 0) return null;
+        return .{ .task = task, .agent_name = agent_name };
+    }
+
+    return .{ .task = trimmed };
+}
+
+test "parseSubagentSpawnRequest parses plain task" {
+    const parsed = parseSubagentSpawnRequest("run quick check") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("run quick check", parsed.task);
+    try std.testing.expect(parsed.agent_name == null);
+}
+
+test "parseSubagentSpawnRequest parses --agent form" {
+    const parsed = parseSubagentSpawnRequest("--agent researcher gather references") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("researcher", parsed.agent_name.?);
+    try std.testing.expectEqualStrings("gather references", parsed.task);
+}
+
+test "parseSubagentSpawnRequest parses --agent= form" {
+    const parsed = parseSubagentSpawnRequest("--agent=researcher gather references") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("researcher", parsed.agent_name.?);
+    try std.testing.expectEqualStrings("gather references", parsed.task);
+}
+
+test "parseSubagentSpawnRequest rejects invalid input" {
+    try std.testing.expect(parseSubagentSpawnRequest("") == null);
+    try std.testing.expect(parseSubagentSpawnRequest("--agent researcher") == null);
+    try std.testing.expect(parseSubagentSpawnRequest("--agent=") == null);
+}
+
+test "parseSubagentSpawnRequest parses newline-separated agent and task" {
+    const parsed = parseSubagentSpawnRequest("--agent researcher\ncheck logs") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("researcher", parsed.agent_name.?);
+    try std.testing.expectEqualStrings("check logs", parsed.task);
+}
+
+fn testSubagentRunnerEcho(allocator: std.mem.Allocator, request: subagent_mod.TaskRunRequest) ![]const u8 {
+    _ = request;
+    return allocator.dupe(u8, "ok");
+}
+
+test "handleSubagentsCommand spawn with named agent reports profile usage" {
+    const agents = [_]config_module.NamedAgentConfig{.{
+        .name = "researcher",
+        .provider = "openrouter",
+        .model = "anthropic/claude-sonnet-4",
+    }};
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .agents = &agents,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    manager.task_runner = testSubagentRunnerEcho;
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = null,
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    const response = try handleSubagentsCommand(&harness, "spawn --agent researcher gather references");
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Spawned subagent task #") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "using agent 'researcher'") != null);
+}
+
+test "handleSubagentsCommand spawn with unknown named agent reports clear error" {
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = null,
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    const response = try handleSubagentsCommand(&harness, "spawn --agent missing do task");
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Unknown named agent profile: missing") != null);
+}
+
+test "handleSubagentsCommand spawn supports multiline task after --agent" {
+    const agents = [_]config_module.NamedAgentConfig{.{
+        .name = "researcher",
+        .provider = "openrouter",
+        .model = "anthropic/claude-sonnet-4",
+    }};
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .agents = &agents,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    manager.task_runner = testSubagentRunnerEcho;
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = null,
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    const response = try handleSubagentsCommand(&harness, "spawn --agent researcher\ncheck logs");
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "using agent 'researcher'") != null);
+}
+
+test "handleSubagentsCommand help documents both agent flag forms" {
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = null,
+    }{
+        .allocator = std.testing.allocator,
+        .tools = &.{},
+    };
+
+    const response = try handleSubagentsCommand(&harness, "help");
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "--agent <name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "--agent=<name>") != null);
+}
+
 fn parseTaskId(raw: []const u8) ?u64 {
     if (raw.len == 0) return null;
     return std.fmt.parseInt(u64, raw, 10) catch null;
@@ -1382,22 +1562,34 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
     return try out.toOwnedSlice(self.allocator);
 }
 
-fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8) ![]const u8 {
+fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8, agent_name: ?[]const u8) ![]const u8 {
     const trimmed_task = std.mem.trim(u8, task, " \t");
     if (trimmed_task.len == 0) {
-        return try self.allocator.dupe(u8, "Usage: /subagents spawn <task>");
+        return try self.allocator.dupe(u8, SUBAGENTS_SPAWN_USAGE);
     }
 
     const manager = findSubagentManager(self) orelse
         return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
 
     const origin_chat = self.memory_session_id orelse "agent";
-    const task_id = manager.spawn(trimmed_task, label, "agent", origin_chat) catch |err| {
+    const task_id = manager.spawnWithAgent(trimmed_task, label, "agent", origin_chat, agent_name) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
+            error.UnknownAgent => if (agent_name) |name|
+                try std.fmt.allocPrint(self.allocator, "Unknown named agent profile: {s}", .{name})
+            else
+                try self.allocator.dupe(u8, "Unknown named agent profile"),
             else => try std.fmt.allocPrint(self.allocator, "Failed to spawn subagent: {s}", .{@errorName(err)}),
         };
     };
+
+    if (agent_name) |name| {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Spawned subagent task #{d} ({s}) using agent '{s}'.",
+            .{ task_id, label, name },
+        );
+    }
 
     return try std.fmt.allocPrint(
         self.allocator,
@@ -1515,13 +1707,15 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
             \\Usage:
             \\  /subagents
             \\  /subagents list
-            \\  /subagents spawn <task>
+            \\  /subagents spawn [--agent <name>|--agent=<name>] <task>
             \\  /subagents info <id>
             \\  /subagents kill <id|all>
         );
     }
     if (std.ascii.eqlIgnoreCase(action, "spawn")) {
-        return try spawnSubagentTask(self, parsed.tail, "subagent");
+        const spawn_req = parseSubagentSpawnRequest(parsed.tail) orelse
+            return try self.allocator.dupe(u8, SUBAGENTS_SPAWN_USAGE);
+        return try spawnSubagentTask(self, spawn_req.task, "subagent", spawn_req.agent_name);
     }
     if (std.ascii.eqlIgnoreCase(action, "info")) {
         const id_text = firstToken(parsed.tail);
@@ -1598,7 +1792,7 @@ fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {
     );
     defer self.allocator.free(follow_up);
 
-    const spawned = try spawnSubagentTask(self, follow_up, "steer");
+    const spawned = try spawnSubagentTask(self, follow_up, "steer", null);
     defer self.allocator.free(spawned);
     return try std.fmt.allocPrint(
         self.allocator,
@@ -1608,7 +1802,7 @@ fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {
 }
 
 fn handleTellCommand(self: anytype, arg: []const u8) ![]const u8 {
-    return try spawnSubagentTask(self, arg, "tell");
+    return try spawnSubagentTask(self, arg, "tell", null);
 }
 
 fn handlePollCommand(self: anytype) ![]const u8 {
@@ -2088,7 +2282,7 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
     defer self.allocator.free(composed);
 
     if (findSubagentManager(self) != null) {
-        return try spawnSubagentTask(self, composed, skill.name);
+        return try spawnSubagentTask(self, composed, skill.name, null);
     }
     return try std.fmt.allocPrint(
         self.allocator,

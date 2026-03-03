@@ -19,6 +19,7 @@ const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
+const subagent_runner = @import("subagent_runner.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 
@@ -356,6 +357,7 @@ pub const ChannelRuntime = struct {
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
         if (subagent_manager) |mgr| {
             mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, .{});
+            mgr.task_runner = subagent_runner.runTaskWithTools;
             errdefer {
                 mgr.deinit();
             }

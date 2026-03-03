@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
+const config_types = @import("config_types.zig");
 const providers = @import("providers/root.zig");
 
 const log = std.log.scoped(.subagent);
@@ -36,6 +37,31 @@ pub const SubagentConfig = struct {
     max_concurrent: u32 = 4,
 };
 
+pub const TaskRunRequest = struct {
+    task: []const u8,
+    system_prompt: []const u8,
+    api_key: ?[]const u8,
+    default_provider: []const u8,
+    default_model: ?[]const u8,
+    temperature: f64,
+    workspace_dir: []const u8,
+    allowed_paths: []const []const u8,
+    http_enabled: bool,
+    http_allowed_domains: []const []const u8,
+    http_max_response_size: u32,
+    tools_config: config_types.ToolsConfig,
+    max_tool_iterations: u32,
+    autonomy: config_types.AutonomyLevel,
+    workspace_only: bool,
+    allowed_commands: []const []const u8,
+    max_actions_per_hour: u32,
+    require_approval_for_medium_risk: bool,
+    block_high_risk_commands: bool,
+    configured_providers: []const config_types.ProviderEntry,
+};
+
+pub const TaskRunnerFn = *const fn (allocator: Allocator, request: TaskRunRequest) anyerror![]const u8;
+
 // ── ThreadContext — passed to each spawned thread ────────────────
 
 const ThreadContext = struct {
@@ -45,6 +71,7 @@ const ThreadContext = struct {
     label: []const u8,
     origin_channel: []const u8,
     origin_chat_id: []const u8,
+    agent_name: ?[]const u8 = null,
 };
 
 // ── SubagentManager ─────────────────────────────────────────────
@@ -62,8 +89,20 @@ pub const SubagentManager = struct {
     default_provider: []const u8,
     default_model: ?[]const u8,
     workspace_dir: []const u8,
+    allowed_paths: []const []const u8,
     agents: []const config_mod.NamedAgentConfig,
+    autonomy: config_types.AutonomyLevel,
+    workspace_only: bool,
+    allowed_commands: []const []const u8,
+    max_actions_per_hour: u32,
+    require_approval_for_medium_risk: bool,
+    block_high_risk_commands: bool,
+    configured_providers: []const config_types.ProviderEntry,
     http_enabled: bool,
+    http_allowed_domains: []const []const u8,
+    http_max_response_size: u32,
+    tools_config: config_types.ToolsConfig,
+    task_runner: ?TaskRunnerFn = null,
 
     pub fn init(
         allocator: Allocator,
@@ -82,8 +121,19 @@ pub const SubagentManager = struct {
             .default_provider = cfg.default_provider,
             .default_model = cfg.default_model,
             .workspace_dir = cfg.workspace_dir,
+            .allowed_paths = cfg.autonomy.allowed_paths,
             .agents = cfg.agents,
+            .autonomy = cfg.autonomy.level,
+            .workspace_only = cfg.autonomy.workspace_only,
+            .allowed_commands = cfg.autonomy.allowed_commands,
+            .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+            .configured_providers = cfg.providers,
             .http_enabled = cfg.http_request.enabled,
+            .http_allowed_domains = cfg.http_request.allowed_domains,
+            .http_max_response_size = cfg.http_request.max_response_size,
+            .tools_config = cfg.tools,
         };
     }
 
@@ -112,8 +162,25 @@ pub const SubagentManager = struct {
         origin_channel: []const u8,
         origin_chat_id: []const u8,
     ) !u64 {
+        return self.spawnWithAgent(task, label, origin_channel, origin_chat_id, null);
+    }
+
+    /// Spawn a background subagent using an optional named agent profile.
+    /// When `agent_name` is set, provider/model/prompt are resolved from `agents.list`.
+    pub fn spawnWithAgent(
+        self: *SubagentManager,
+        task: []const u8,
+        label: []const u8,
+        origin_channel: []const u8,
+        origin_chat_id: []const u8,
+        agent_name: ?[]const u8,
+    ) !u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (agent_name) |name| {
+            if (self.findAgent(name) == null) return error.UnknownAgent;
+        }
 
         if (self.getRunningCountLocked() >= self.config.max_concurrent)
             return error.TooManyConcurrentSubagents;
@@ -145,6 +212,8 @@ pub const SubagentManager = struct {
         errdefer self.allocator.free(origin_channel_copy);
         const origin_chat_copy = try self.allocator.dupe(u8, origin_chat_id);
         errdefer self.allocator.free(origin_chat_copy);
+        const agent_name_copy = if (agent_name) |name| try self.allocator.dupe(u8, name) else null;
+        errdefer if (agent_name_copy) |name| self.allocator.free(name);
 
         // Build thread context
         const ctx = try self.allocator.create(ThreadContext);
@@ -156,11 +225,19 @@ pub const SubagentManager = struct {
             .label = label_copy,
             .origin_channel = origin_channel_copy,
             .origin_chat_id = origin_chat_copy,
+            .agent_name = agent_name_copy,
         };
 
         state.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, subagentThreadFn, .{ctx});
 
         return task_id;
+    }
+
+    fn findAgent(self: *const SubagentManager, name: []const u8) ?config_mod.NamedAgentConfig {
+        for (self.agents) |agent| {
+            if (std.mem.eql(u8, agent.name, name)) return agent;
+        }
+        return null;
     }
 
     pub fn getTaskStatus(self: *SubagentManager, task_id: u64) ?TaskStatus {
@@ -253,23 +330,77 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.free(ctx.label);
         ctx.manager.allocator.free(ctx.origin_channel);
         ctx.manager.allocator.free(ctx.origin_chat_id);
+        if (ctx.agent_name) |agent_name| ctx.manager.allocator.free(agent_name);
         ctx.manager.allocator.destroy(ctx);
     }
 
-    // Use the legacy complete path — simple, works with any provider,
-    // no need to replicate the full ProviderHolder pattern.
-    // Build a config-like struct for providers.completeWithSystem().
-    const system_prompt = "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
+    // Default prompt differs based on execution mode:
+    // - tool-loop mode can use restricted tools
+    // - legacy fallback has no tool access
+    var system_prompt: []const u8 = if (ctx.manager.task_runner != null)
+        "You are a background subagent. Complete the assigned task concisely and accurately. Use available tools when they materially improve correctness."
+    else
+        "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
+    var api_key = ctx.manager.api_key;
+    var default_provider = ctx.manager.default_provider;
+    var default_model = ctx.manager.default_model;
+    var temperature: f64 = 0.7;
+
+    if (ctx.agent_name) |agent_name| {
+        const agent_cfg = ctx.manager.findAgent(agent_name) orelse {
+            ctx.manager.completeTask(ctx.task_id, null, "UnknownAgent");
+            return;
+        };
+
+        default_provider = agent_cfg.provider;
+        default_model = agent_cfg.model;
+        api_key = agent_cfg.api_key orelse ctx.manager.api_key;
+        if (agent_cfg.system_prompt) |sp| system_prompt = sp;
+        if (agent_cfg.temperature) |t| temperature = t;
+    }
+
+    if (ctx.manager.task_runner) |runner| {
+        const request = TaskRunRequest{
+            .task = ctx.task,
+            .system_prompt = system_prompt,
+            .api_key = api_key,
+            .default_provider = default_provider,
+            .default_model = default_model,
+            .temperature = temperature,
+            .workspace_dir = ctx.manager.workspace_dir,
+            .allowed_paths = ctx.manager.allowed_paths,
+            .http_enabled = ctx.manager.http_enabled,
+            .http_allowed_domains = ctx.manager.http_allowed_domains,
+            .http_max_response_size = ctx.manager.http_max_response_size,
+            .tools_config = ctx.manager.tools_config,
+            .max_tool_iterations = ctx.manager.config.max_iterations,
+            .autonomy = ctx.manager.autonomy,
+            .workspace_only = ctx.manager.workspace_only,
+            .allowed_commands = ctx.manager.allowed_commands,
+            .max_actions_per_hour = ctx.manager.max_actions_per_hour,
+            .require_approval_for_medium_risk = ctx.manager.require_approval_for_medium_risk,
+            .block_high_risk_commands = ctx.manager.block_high_risk_commands,
+            .configured_providers = ctx.manager.configured_providers,
+        };
+
+        const result = runner(ctx.manager.allocator, request) catch |err| {
+            ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
+            return;
+        };
+        defer ctx.manager.allocator.free(result);
+        ctx.manager.completeTask(ctx.task_id, result, null);
+        return;
+    }
 
     var cfg_arena = std.heap.ArenaAllocator.init(ctx.manager.allocator);
     defer cfg_arena.deinit();
 
     // Build a config-like struct that providers.completeWithSystem() accepts
     const cfg = .{
-        .api_key = ctx.manager.api_key,
-        .default_provider = ctx.manager.default_provider,
-        .default_model = ctx.manager.default_model,
-        .temperature = @as(f64, 0.7),
+        .api_key = api_key,
+        .default_provider = default_provider,
+        .default_model = default_model,
+        .temperature = temperature,
         .max_tokens = @as(?u64, null),
     };
 
@@ -287,6 +418,25 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
 }
 
 // ── Tests ───────────────────────────────────────────────────────
+
+fn waitTaskTerminalStatus(manager: *SubagentManager, task_id: u64) !TaskStatus {
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        const status = manager.getTaskStatus(task_id) orelse return error.TestUnexpectedResult;
+        if (status != .running) return status;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn testTaskRunnerOk(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
+    _ = request;
+    return allocator.dupe(u8, "runner-ok");
+}
+
+fn testTaskRunnerFail(_: Allocator, _: TaskRunRequest) ![]const u8 {
+    return error.TestTaskRunnerFailure;
+}
 
 test "SubagentManager init and deinit" {
     const cfg = config_mod.Config{
@@ -450,6 +600,77 @@ test "SubagentManager spawn stores session key" {
     const state = mgr.tasks.get(task_id) orelse return error.TestUnexpectedResult;
     try std.testing.expect(state.session_key != null);
     try std.testing.expectEqualStrings("session:42", state.session_key.?);
+}
+
+test "SubagentManager spawnWithAgent rejects unknown agent" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    try std.testing.expectError(
+        error.UnknownAgent,
+        mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", "missing-agent"),
+    );
+}
+
+test "SubagentManager spawnWithAgent accepts configured agent" {
+    const agents = [_]config_mod.NamedAgentConfig{.{
+        .name = "researcher",
+        .provider = "openrouter",
+        .model = "anthropic/claude-sonnet-4",
+    }};
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .agents = &agents,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", "researcher");
+    try std.testing.expect(task_id > 0);
+}
+
+test "SubagentManager uses task runner callback result" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.task_runner = testTaskRunnerOk;
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("quick task", "runner-ok", "agent", "session:42");
+    const status = try waitTaskTerminalStatus(&mgr, task_id);
+    try std.testing.expectEqual(TaskStatus.completed, status);
+    try std.testing.expectEqualStrings("runner-ok", mgr.getTaskResult(task_id).?);
+}
+
+test "SubagentManager stores runner callback error" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.task_runner = testTaskRunnerFail;
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("quick task", "runner-fail", "agent", "session:42");
+    const status = try waitTaskTerminalStatus(&mgr, task_id);
+    try std.testing.expectEqual(TaskStatus.failed, status);
+
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    const state = mgr.tasks.get(task_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.error_msg.?, "TestTaskRunnerFailure") != null);
 }
 
 test "SubagentManager spawn rollback removes task on out-of-memory" {
