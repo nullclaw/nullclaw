@@ -896,7 +896,7 @@ pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .dingtalk => true,
         else => false,
     };
 }
@@ -1012,6 +1012,7 @@ fn configureSingleChannel(
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
         .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
+        .dingtalk => configureDingTalkChannel(cfg, out, input_buf, prefix),
         else => blk: {
             try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
             break :blk false;
@@ -1254,6 +1255,43 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
         .secret = if (secret_input.len > 0) try cfg.allocator.dupe(u8, secret_input) else null,
     };
     try out.print("{s}  -> Webhook configured\n", .{prefix});
+    return true;
+}
+
+fn configureDingTalkChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    var client_id_buf: [512]u8 = undefined;
+    var client_secret_buf: [512]u8 = undefined;
+    try out.print("{s}  DingTalk client_id (required, Enter to skip): ", .{prefix});
+    const client_id = prompt(out, &client_id_buf, "", "") orelse return false;
+    if (client_id.len == 0) {
+        try out.print("{s}  -> DingTalk skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  DingTalk client_secret (required, Enter to skip): ", .{prefix});
+    const client_secret = prompt(out, &client_secret_buf, "", "") orelse return false;
+    if (client_secret.len == 0) {
+        try out.print("{s}  -> DingTalk skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  DingTalk allow_from (user_id, comma-separated) [*]: ", .{prefix});
+    const allow_input = prompt(out, input_buf, "", "") orelse return false;
+    const allow_from = try parseTelegramAllowFrom(cfg.allocator, allow_input);
+
+    const accounts = try cfg.allocator.alloc(config_mod.DingTalkConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .client_id = try cfg.allocator.dupe(u8, client_id),
+        .client_secret = try cfg.allocator.dupe(u8, client_secret),
+        .allow_from = allow_from,
+    };
+    cfg.channels.dingtalk = accounts;
+    if (allow_from.len == 1 and std.mem.eql(u8, allow_from[0], "*")) {
+        try out.print("{s}  -> DingTalk configured (allow_from=*)\n", .{prefix});
+    } else {
+        try out.print("{s}  -> DingTalk configured ({d} allow_from entries)\n", .{ prefix, allow_from.len });
+    }
     return true;
 }
 
