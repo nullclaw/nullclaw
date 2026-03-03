@@ -40,12 +40,15 @@ pub const TlsState = struct {
     tls_read_buf: []u8,
     tls_write_buf: []u8,
     scratch: [4096]u8 = undefined,
+    ca_bundle: ?std.crypto.Certificate.Bundle,
+    ca_has_bundle: bool,
 
     pub fn deinit(self: *TlsState, allocator: std.mem.Allocator) void {
         allocator.free(self.read_buf);
         allocator.free(self.write_buf);
         allocator.free(self.tls_read_buf);
         allocator.free(self.tls_write_buf);
+        if (self.ca_bundle) |*bundle| bundle.deinit(allocator);
         allocator.destroy(self);
     }
 };
@@ -94,21 +97,20 @@ pub const WsClient = struct {
         tls_state.tls_write_buf = tls_write_buf;
         tls_state.stream_reader = stream.reader(read_buf);
         tls_state.stream_writer = stream.writer(write_buf);
+        tls_state.ca_bundle = null;
+        tls_state.ca_has_bundle = false;
 
-        var ca_bundle = std.crypto.Certificate.Bundle{};
-        var has_ca_bundle = false;
-        if (ca_bundle.rescan(allocator)) |_| {
-            has_ca_bundle = true;
+        if (tls_state.ca_bundle.?.rescan(allocator)) |_| {
+            tls_state.ca_has_bundle = true;
         } else |err| {
             // Preserve current behavior on platforms/environments where system CAs
             // are unavailable, but prefer verified TLS whenever possible.
             log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
         }
-        defer if (has_ca_bundle) ca_bundle.deinit(allocator);
 
         const tls_options: std.crypto.tls.Client.Options = .{
             .host = .{ .explicit = host },
-            .ca = if (has_ca_bundle) .{ .bundle = ca_bundle } else .no_verification,
+            .ca = if (tls_state.ca_has_bundle) .{ .bundle = tls_state.ca_bundle.? } else .no_verification,
             .read_buffer = tls_read_buf,
             .write_buffer = tls_write_buf,
             .allow_truncation_attacks = true,
