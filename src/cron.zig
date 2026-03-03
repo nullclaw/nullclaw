@@ -864,6 +864,10 @@ const AGENT_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
 const LINUX_SELF_EXE_PATH = "/proc/self/exe";
 const DELETED_EXE_SUFFIX = " (deleted)";
 
+fn pathAgentExecutableName() []const u8 {
+    return if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
+}
+
 fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
     if (timeout_secs == 0) return false;
     const timeout_ns = @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s;
@@ -987,6 +991,7 @@ fn runAgentJob(
     var exec_cwd = cwd;
     var tried_no_cwd = false;
     var tried_proc_self_exe = std.mem.eql(u8, exec_path, LINUX_SELF_EXE_PATH);
+    var tried_path_exec = false;
 
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -1028,6 +1033,16 @@ fn runAgentJob(
                         tried_proc_self_exe = true;
                         continue :spawn_loop;
                     }
+                }
+
+                // Cross-platform fallback: try resolving `nullclaw` from PATH.
+                // Useful when self-exe path is stale or inaccessible outside Linux.
+                if (!tried_path_exec) {
+                    exec_path = pathAgentExecutableName();
+                    exec_cwd = null;
+                    tried_no_cwd = true;
+                    tried_path_exec = true;
+                    continue :spawn_loop;
                 }
 
                 return err;
@@ -2466,6 +2481,11 @@ test "preferAgentExecPath keeps regular executable path" {
 test "preferAgentExecPath uses proc self exe for deleted linux path" {
     if (comptime builtin.os.tag != .linux) return;
     try std.testing.expectEqualStrings(LINUX_SELF_EXE_PATH, preferAgentExecPath("/tmp/nullclaw (deleted)"));
+}
+
+test "pathAgentExecutableName returns platform command name" {
+    const expected = if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
+    try std.testing.expectEqualStrings(expected, pathAgentExecutableName());
 }
 
 test "DeliveryMode parse and asStr" {
