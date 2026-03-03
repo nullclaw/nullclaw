@@ -97,7 +97,7 @@ pub const WsClient = struct {
         tls_state.tls_write_buf = tls_write_buf;
         tls_state.stream_reader = stream.reader(read_buf);
         tls_state.stream_writer = stream.writer(write_buf);
-        tls_state.ca_bundle = null;
+        tls_state.ca_bundle = std.crypto.Certificate.Bundle{};
         tls_state.ca_has_bundle = false;
 
         if (tls_state.ca_bundle.?.rescan(allocator)) |_| {
@@ -105,7 +105,7 @@ pub const WsClient = struct {
         } else |err| {
             // Preserve current behavior on platforms/environments where system CAs
             // are unavailable, but prefer verified TLS whenever possible.
-            log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
+            log.warn("WS TLS: system CA bundle unavailable, fallback to no_verification: {}", .{err});
         }
 
         const tls_options: std.crypto.tls.Client.Options = .{
