@@ -1,0 +1,17 @@
+[Unit]
+Description=nullclaw whatsmeow bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nullclaw-whatsmeow-bridge
+Environment=NULLCLAW_ACCOUNT_ID=default
+Environment=NULLCLAW_BRIDGE_ADDR=127.0.0.1:3301
+Environment=NULLCLAW_WHATSMEOW_DB=%h/.local/state/nullclaw/whatsmeow.db
+# Optional for local self-message testing only:
+# Environment=NULLCLAW_WHATSAPP_WEB_ALLOW_FROM_ME=1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
