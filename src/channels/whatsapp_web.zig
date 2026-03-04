@@ -4,6 +4,7 @@ const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
 
 const log = std.log.scoped(.whatsapp_web);
+const CURSOR_STORE_VERSION: i64 = 1;
 
 const HttpGetFn = *const fn (
     allocator: std.mem.Allocator,
@@ -33,6 +34,7 @@ pub const WhatsAppWebChannel = struct {
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
     cursor: ?[]u8 = null,
+    state_root: ?[]u8 = null,
 
     http_get: HttpGetFn = root.http_util.curlGet,
     http_post: HttpPostFn = root.http_util.curlPost,
@@ -58,6 +60,10 @@ pub const WhatsAppWebChannel = struct {
         if (self.cursor) |cursor| {
             self.allocator.free(cursor);
             self.cursor = null;
+        }
+        if (self.state_root) |state_root| {
+            self.allocator.free(state_root);
+            self.state_root = null;
         }
     }
 
@@ -125,9 +131,126 @@ pub const WhatsAppWebChannel = struct {
         return value.bool;
     }
 
-    fn replaceCursor(self: *WhatsAppWebChannel, next_cursor: []const u8) !void {
-        if (self.cursor) |cursor| self.allocator.free(cursor);
+    fn normalizeAccountId(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
+        const trimmed = std.mem.trim(u8, account_id, " \t\r\n");
+        const source = if (trimmed.len == 0) "default" else trimmed;
+        var normalized = try allocator.alloc(u8, source.len);
+        for (source, 0..) |c, i| {
+            normalized[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-') c else '_';
+        }
+        return normalized;
+    }
+
+    fn cursorStatePath(self: *const WhatsAppWebChannel) ![]u8 {
+        const state_root = self.state_root orelse return error.StateRootNotConfigured;
+        const normalized_account_id = try normalizeAccountId(self.allocator, self.config.account_id);
+        defer self.allocator.free(normalized_account_id);
+
+        const file_name = try std.fmt.allocPrint(self.allocator, "cursor-{s}.json", .{normalized_account_id});
+        defer self.allocator.free(file_name);
+
+        return std.fs.path.join(self.allocator, &.{ state_root, "state", "whatsapp_web", file_name });
+    }
+
+    fn replaceCursor(self: *WhatsAppWebChannel, next_cursor: []const u8) !bool {
+        if (self.cursor) |cursor| {
+            if (std.mem.eql(u8, cursor, next_cursor)) return false;
+            self.allocator.free(cursor);
+        }
         self.cursor = try self.allocator.dupe(u8, next_cursor);
+        return true;
+    }
+
+    fn restorePersistedCursor(self: *WhatsAppWebChannel) !void {
+        const path = self.cursorStatePath() catch |err| switch (err) {
+            error.StateRootNotConfigured => return,
+            else => return err,
+        };
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 16 * 1024);
+        defer self.allocator.free(content);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, content, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const obj = parsed.value.object;
+
+        if (obj.get("version")) |version_val| {
+            if (version_val != .integer or version_val.integer != CURSOR_STORE_VERSION) return;
+        }
+
+        const account_id_val = obj.get("account_id") orelse return;
+        if (account_id_val != .string) return;
+        if (!std.mem.eql(u8, account_id_val.string, self.config.account_id)) return;
+
+        const bridge_url_val = obj.get("bridge_url") orelse return;
+        if (bridge_url_val != .string) return;
+        if (!std.mem.eql(u8, trimTrailingSlash(bridge_url_val.string), trimTrailingSlash(self.config.bridge_url))) return;
+
+        const cursor_val = obj.get("cursor") orelse return;
+        if (cursor_val != .string or cursor_val.string.len == 0) return;
+        _ = try self.replaceCursor(cursor_val.string);
+    }
+
+    fn persistCursor(self: *WhatsAppWebChannel) !void {
+        const cursor = self.cursor orelse return;
+        const path = self.cursorStatePath() catch |err| switch (err) {
+            error.StateRootNotConfigured => return,
+            else => return err,
+        };
+        defer self.allocator.free(path);
+
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => try std.fs.cwd().makePath(dir),
+            };
+        }
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const bw = buf.writer(self.allocator);
+        try bw.writeAll("{\n  \"version\": ");
+        try std.fmt.format(bw, "{d}", .{CURSOR_STORE_VERSION});
+        try bw.writeAll(",\n  \"account_id\": ");
+        try root.appendJsonStringW(bw, self.config.account_id);
+        try bw.writeAll(",\n  \"bridge_url\": ");
+        try root.appendJsonStringW(bw, trimTrailingSlash(self.config.bridge_url));
+        try bw.writeAll(",\n  \"cursor\": ");
+        try root.appendJsonStringW(bw, cursor);
+        try bw.writeAll("\n}\n");
+
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+        defer self.allocator.free(tmp_path);
+
+        {
+            var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+            defer tmp_file.close();
+            try tmp_file.writeAll(buf.items);
+        }
+
+        std.fs.renameAbsolute(tmp_path, path) catch {
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = try std.fs.createFileAbsolute(path, .{});
+            defer file.close();
+            try file.writeAll(buf.items);
+        };
+    }
+
+    pub fn setStateRootFromConfigPath(self: *WhatsAppWebChannel, config_path: []const u8) !void {
+        const config_dir = std.fs.path.dirname(config_path) orelse ".";
+        if (self.state_root) |state_root| self.allocator.free(state_root);
+        self.state_root = try self.allocator.dupe(u8, config_dir);
+        self.restorePersistedCursor() catch |err| {
+            log.warn("failed to restore whatsapp_web cursor (account_id={s}): {}", .{ self.config.account_id, err });
+        };
     }
 
     fn publishParsedMessage(self: *WhatsAppWebChannel, obj: std.json.ObjectMap) !bool {
@@ -204,7 +327,11 @@ pub const WhatsAppWebChannel = struct {
         const root_obj = parsed.value.object;
 
         if (getObjString(root_obj, "next_cursor")) |next_cursor| {
-            try self.replaceCursor(next_cursor);
+            if (try self.replaceCursor(next_cursor)) {
+                self.persistCursor() catch |err| {
+                    log.warn("failed to persist whatsapp_web cursor (account_id={s}): {}", .{ self.config.account_id, err });
+                };
+            }
         }
 
         const messages_val = root_obj.get("messages") orelse return 0;
@@ -377,6 +504,13 @@ fn mockSendPost(allocator: std.mem.Allocator, _: []const u8, _: []const u8, _: [
     return allocator.dupe(u8, "{}");
 }
 
+fn mockPollPostExpectPersistedCursor(allocator: std.mem.Allocator, _: []const u8, body: []const u8, _: []const []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, body, "\"cursor\":\"persisted-cursor-1\"") == null) {
+        return error.TestUnexpectedResult;
+    }
+    return allocator.dupe(u8, "{\"messages\":[]}");
+}
+
 test "whatsapp_web ingest poll payload publishes metadata and session key" {
     var event_bus = bus.Bus.init();
     defer event_bus.close();
@@ -496,4 +630,39 @@ test "whatsapp_web channel interface and lifecycle" {
     iface.stop();
     try std.testing.expect(!ch.healthCheck());
     ch.deinit();
+}
+
+test "whatsapp_web persists cursor across restart when state root is configured" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+
+    var first = WhatsAppWebChannel.init(allocator, .{
+        .account_id = "wa-web-main",
+        .bridge_url = "http://127.0.0.1:3301",
+        .allow_from = &.{"*"},
+    });
+    defer first.deinit();
+    try first.setStateRootFromConfigPath(config_path);
+    _ = try first.ingestPollPayload("{\"next_cursor\":\"persisted-cursor-1\",\"messages\":[]}");
+
+    var second = WhatsAppWebChannel.init(allocator, .{
+        .account_id = "wa-web-main",
+        .bridge_url = "http://127.0.0.1:3301",
+        .allow_from = &.{"*"},
+    });
+    defer second.deinit();
+    try second.setStateRootFromConfigPath(config_path);
+    try std.testing.expect(second.cursor != null);
+    try std.testing.expectEqualStrings("persisted-cursor-1", second.cursor.?);
+
+    second.http_post = mockPollPostExpectPersistedCursor;
+    const published = try second.pollOnce();
+    try std.testing.expectEqual(@as(usize, 0), published);
 }

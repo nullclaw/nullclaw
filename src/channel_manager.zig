@@ -197,12 +197,22 @@ pub const ChannelManager = struct {
         }
     }
 
+    fn maybeConfigureStateRoot(self: *ChannelManager, channel_ptr: anytype) void {
+        const ChannelType = @TypeOf(channel_ptr.*);
+        if (comptime @hasDecl(ChannelType, "setStateRootFromConfigPath")) {
+            channel_ptr.setStateRootFromConfigPath(self.config.config_path) catch |err| {
+                log.warn("failed to configure state root for {s}: {}", .{ @typeName(ChannelType), err });
+            };
+        }
+    }
+
     fn appendChannelFromConfig(self: *ChannelManager, comptime field_name: []const u8, cfg: anytype) !void {
         const channel_module = @field(channels_mod, field_name);
         const ChannelType = channelTypeForModule(channel_module, field_name);
 
         const ch_ptr = try self.allocator.create(ChannelType);
         ch_ptr.* = ChannelType.initFromConfig(self.allocator, cfg);
+        self.maybeConfigureStateRoot(ch_ptr);
         self.maybeAttachBus(ch_ptr);
 
         const ch = ch_ptr.channel();
@@ -1045,6 +1055,8 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
             return error.TestUnexpectedResult;
         const wa_web_ptr: *whatsapp_web.WhatsAppWebChannel = @ptrCast(@alignCast(wa_web_entry.channel.ptr));
         try std.testing.expect(wa_web_ptr.event_bus == &event_bus);
+        try std.testing.expect(wa_web_ptr.state_root != null);
+        try std.testing.expectEqualStrings("/tmp", wa_web_ptr.state_root.?);
     }
 }
 
