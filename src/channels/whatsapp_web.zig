@@ -306,7 +306,13 @@ pub const WhatsAppWebChannel = struct {
     pub fn setStateRootFromConfigPath(self: *WhatsAppWebChannel, config_path: []const u8) !void {
         const config_dir = std.fs.path.dirname(config_path) orelse ".";
         if (self.state_root) |state_root| self.allocator.free(state_root);
-        self.state_root = try self.allocator.dupe(u8, config_dir);
+        if (std.fs.path.isAbsolute(config_dir)) {
+            self.state_root = try self.allocator.dupe(u8, config_dir);
+        } else {
+            const cwd_abs = try std.fs.cwd().realpathAlloc(self.allocator, ".");
+            defer self.allocator.free(cwd_abs);
+            self.state_root = try std.fs.path.join(self.allocator, &.{ cwd_abs, config_dir });
+        }
         self.restorePersistedCursor() catch |err| {
             log.warn("failed to restore whatsapp_web cursor (account_id={s}): {}", .{ self.config.account_id, err });
         };
@@ -813,4 +819,40 @@ test "whatsapp_web does not republish seen message ids after restart" {
     const replay_published = try second.ingestPollPayload(replay_payload);
     try std.testing.expectEqual(@as(usize, 0), replay_published);
     try std.testing.expectEqual(@as(usize, 0), event_bus_second.inboundDepth());
+}
+
+test "whatsapp_web persists state when config_path is relative" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path_abs = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path_abs);
+
+    const cwd_abs = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_abs);
+    const config_path_rel = try std.fs.path.relative(allocator, cwd_abs, config_path_abs);
+    defer allocator.free(config_path_rel);
+
+    var first = WhatsAppWebChannel.init(allocator, .{
+        .account_id = "wa-web-main",
+        .bridge_url = "http://127.0.0.1:3301",
+        .allow_from = &.{"*"},
+    });
+    defer first.deinit();
+    try first.setStateRootFromConfigPath(config_path_rel);
+    _ = try first.ingestPollPayload("{\"next_cursor\":\"relative-cursor-1\",\"messages\":[]}");
+
+    var second = WhatsAppWebChannel.init(allocator, .{
+        .account_id = "wa-web-main",
+        .bridge_url = "http://127.0.0.1:3301",
+        .allow_from = &.{"*"},
+    });
+    defer second.deinit();
+    try second.setStateRootFromConfigPath(config_path_rel);
+    try std.testing.expect(second.cursor != null);
+    try std.testing.expectEqualStrings("relative-cursor-1", second.cursor.?);
 }
