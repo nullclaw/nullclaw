@@ -176,7 +176,8 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage) catch {
+            // Pass metadata to sendEventWithMeta for channel-specific operations like DingTalk typing recall
+            channel.sendEventWithMeta(msg.chat_id, msg.content, msg.media, msg.stage, msg.metadata_json) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };
