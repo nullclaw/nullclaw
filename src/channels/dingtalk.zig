@@ -99,6 +99,7 @@ pub const DingTalkChannel = struct {
     subscriptions: []const config_types.DingTalkSubscription = &.{},
     ua: ?[]const u8 = null,
     local_ip: ?[]const u8 = null,
+    typing_message: []const u8 = DEFAULT_TYPING_MESSAGE,
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     gateway_thread: ?std.Thread = null,
@@ -112,29 +113,13 @@ pub const DingTalkChannel = struct {
 
     pub const GATEWAY_URL = "https://api.dingtalk.com/v1.0/gateway/connections/open";
     pub const BOT_MESSAGE_TOPIC = "/v1.0/im/bot/messages/get";
-    /// DingTalk Bot Message API endpoint for sending messages that support recall.
-    /// This endpoint uses OAuth2 authentication and returns a processQueryKey for message recall.
-    /// Motivation: The webhook endpoint doesn't support message recall, so we use the Bot Message API
-    /// to send typing indicators that can be automatically withdrawn when the actual response is sent.
     pub const BOT_SEND_API_URL = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
+    pub const DEFAULT_TYPING_MESSAGE = "⏳ Thinking ...";
     
-    /// DingTalk OAuth2 token endpoint for obtaining access tokens.
-    /// Motivation: Bot Message API requires OAuth2 authentication with access tokens.
     pub const OAUTH2_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken";
-    
-    /// DingTalk message recall API endpoint for withdrawing previously sent messages.
-    /// Motivation: Allows automatic withdrawal of typing indicators when the actual response is sent.
     pub const RECALL_API_URL = "https://api.dingtalk.com/v1.0/robot/otoMessages/batchRecall";
-    
-    /// Typing indicator message text shown to users while the AI is processing.
-    /// Motivation: Provides immediate feedback to users that their message is being processed.
-    pub const TYPING_MESSAGE = "思考中...";
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
 
-    /// Extract typing message ID and robot code from metadata JSON.
-    /// Returns null if not found in metadata.
-    /// Motivation: This function retrieves the typing indicator message ID and robot code
-    /// from the metadata so that the typing message can be recalled when the actual response is sent.
     pub fn extractTypingInfo(allocator: std.mem.Allocator, metadata_json: []const u8) !struct { msg_id: ?[]const u8, robot_code: ?[]const u8 } {
         if (metadata_json.len == 0) return .{ .msg_id = null, .robot_code = null };
 
@@ -196,6 +181,7 @@ pub const DingTalkChannel = struct {
             .subscriptions = cfg.subscriptions,
             .ua = cfg.ua,
             .local_ip = cfg.local_ip,
+            .typing_message = cfg.typing_message orelse DEFAULT_TYPING_MESSAGE,
         };
     }
 
@@ -219,17 +205,17 @@ pub const DingTalkChannel = struct {
     /// This is used to give the user immediate feedback while the AI is thinking.
     /// Returns null if sending fails or no message ID is returned.
     fn sendImmediateResponse(self: *DingTalkChannel, webhook_url: []const u8) ?[]const u8 {
-        log.info("DingTalk sendImmediateResponse: starting for webhook: {s}", .{webhook_url});
+        if (isVerboseLog()) log.info("DingTalk sendImmediateResponse: starting for webhook: {s}", .{webhook_url});
         
         var body_buf: [8192]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&body_buf);
         const w = fbs.writer();
         w.writeAll("{\"msgtype\":\"text\",\"text\":{\"content\":") catch return null;
-        root.appendJsonStringW(w, TYPING_MESSAGE) catch return null;
+        root.appendJsonStringW(w, self.typing_message) catch return null;
         w.writeAll("}}") catch return null;
         const body = fbs.getWritten();
 
-        log.info("DingTalk sendImmediateResponse: request body: {s}", .{body});
+        if (isVerboseLog()) log.info("DingTalk sendImmediateResponse: request body: {s}", .{body});
 
         const resp = http_util.curlPostWithProxy(self.allocator, webhook_url, body, &.{}, null, null) catch |err| {
             log.err("DingTalk sendImmediateResponse: HTTP request failed: {}", .{err});
@@ -237,14 +223,13 @@ pub const DingTalkChannel = struct {
         };
         defer self.allocator.free(resp);
 
-        log.info("DingTalk sendImmediateResponse: HTTP response ({d} bytes): {s}", .{ resp.len, resp });
+        if (isVerboseLog()) log.info("DingTalk sendImmediateResponse: HTTP response ({d} bytes): {s}", .{ resp.len, resp });
 
-        // Parse response to get message ID
         if (resp.len == 0) {
             log.err("DingTalk sendImmediateResponse: empty response, cannot get processKey", .{});
             return null;
         }
-        log.info("DingTalk sendImmediateResponse: parsing JSON response...", .{});
+        if (isVerboseLog()) log.info("DingTalk sendImmediateResponse: parsing JSON response...", .{});
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch |err| {
             log.err("DingTalk sendImmediateResponse: JSON parse error: {} (response: {s})", .{ err, resp });
             return null;
@@ -255,10 +240,8 @@ pub const DingTalkChannel = struct {
             return null;
         }
 
-        // Extract processKey which is the message ID for recall
-        log.info("DingTalk sendImmediateResponse: looking for processKey in response object...", .{});
+        if (isVerboseLog()) log.info("DingTalk sendImmediateResponse: looking for processKey in response object...", .{});
         const process_key = parsed.value.object.get("processKey") orelse {
-            // Check if there's an error in the response
             if (parsed.value.object.get("errcode")) |errcode| {
                 log.err("DingTalk sendImmediateResponse: API returned error code: {any}", .{errcode});
             }
@@ -273,7 +256,7 @@ pub const DingTalkChannel = struct {
             return null;
         }
 
-        log.info("DingTalk sendImmediateResponse: SUCCESS - processKey: {s}", .{process_key.string});
+        if (isVerboseLog()) log.info("DingTalk sendImmediateResponse: SUCCESS - processKey: {s}", .{process_key.string});
         return self.allocator.dupe(u8, process_key.string) catch null;
     }
 
@@ -282,7 +265,7 @@ pub const DingTalkChannel = struct {
     /// Motivation: The Bot Message API and Recall API require OAuth2 authentication.
     /// This function obtains an access token using the client credentials flow.
     pub fn getAccessToken(self: *DingTalkChannel) ?[]const u8 {
-        log.info("DingTalk getAccessToken: requesting token for client_id={s}", .{self.client_id});
+        if (isVerboseLog()) log.info("DingTalk getAccessToken: requesting token for client_id={s}", .{self.client_id});
         
         var body_buf: [512]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&body_buf);
@@ -430,17 +413,12 @@ pub const DingTalkChannel = struct {
             return null;
         }
 
-        log.info("DingTalk sendBotMessage: SUCCESS - processQueryKey={s}", .{process_key.string});
+        if (isVerboseLog()) log.info("DingTalk sendBotMessage: SUCCESS - processQueryKey={s}", .{process_key.string});
         return self.allocator.dupe(u8, process_key.string) catch null;
     }
 
-    /// Recall a message using the DingTalk API.
-    /// This is a best-effort operation - failures are logged but don't throw.
-    /// Motivation: This function withdraws the typing indicator message when the actual response is sent.
-    /// It uses the Recall API with the processQueryKey obtained from sendBotMessage.
-    /// The operation is best-effort because recall failures shouldn't prevent the actual response from being sent.
     pub fn recallMessage(self: *DingTalkChannel, msg_id: []const u8, robot_code: []const u8) void {
-        log.info("DingTalk recallMessage: attempting to recall msg_id={s}, robot_code={s}", .{ msg_id, robot_code });
+        if (isVerboseLog()) log.info("DingTalk recallMessage: attempting to recall msg_id={s}, robot_code={s}", .{ msg_id, robot_code });
         
         // Get access token for authentication
         const access_token = self.getAccessToken() orelse {
@@ -459,9 +437,8 @@ pub const DingTalkChannel = struct {
         w.writeAll("]}") catch return;
         const body = fbs.getWritten();
 
-        log.info("DingTalk recallMessage: request body: {s}", .{body});
+        if (isVerboseLog()) log.info("DingTalk recallMessage: request body: {s}", .{body});
 
-        // Build auth header with OAuth2 access token
         var auth_header_buf: [512]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_header_buf, "x-acs-dingtalk-access-token: {s}", .{access_token}) catch {
             log.err("DingTalk recallMessage: auth header too long", .{});
@@ -472,7 +449,7 @@ pub const DingTalkChannel = struct {
             auth_header,
         };
 
-        log.info("DingTalk recallMessage: sending recall request to {s}", .{RECALL_API_URL});
+        if (isVerboseLog()) log.info("DingTalk recallMessage: sending recall request to {s}", .{RECALL_API_URL});
         const resp = http_util.curlPostWithProxy(
             self.allocator,
             RECALL_API_URL,
@@ -481,13 +458,12 @@ pub const DingTalkChannel = struct {
             null,
             null,
         ) catch |err| {
-            // Recall is best-effort - don't fail if it fails
             log.err("DingTalk recallMessage failed: {} (msg_id={s}, robot_code={s})", .{ err, msg_id, robot_code });
             return;
         };
         defer self.allocator.free(resp);
 
-        log.info("DingTalk recallMessage: API response: {s}", .{resp});
+        if (isVerboseLog()) log.info("DingTalk recallMessage: API response: {s}", .{resp});
     }
 
     pub fn sendMessage(self: *DingTalkChannel, webhook_url: []const u8, text: []const u8) !void {
@@ -540,22 +516,18 @@ pub const DingTalkChannel = struct {
     fn vtableSendEvent(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8, stage: root.Channel.OutboundStage, metadata: ?[]const u8) anyerror!void {
         const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
 
-        // For chunks, send them directly (append to previous content)
         if (stage == .chunk) {
             try self.sendMessage(target, message);
             return;
         }
 
-        // For final: first send the final response via webhook, then recall typing message
-        log.info("DingTalk vtableSendEvent: sending final response via webhook to {s}", .{target});
+        if (isVerboseLog()) log.info("DingTalk vtableSendEvent: sending final response via webhook to {s}", .{target});
         try self.sendMessage(target, message);
-        log.info("DingTalk vtableSendEvent: final response sent successfully", .{});
+        if (isVerboseLog()) log.info("DingTalk vtableSendEvent: final response sent successfully", .{});
 
-        // Recall typing message after sending final response (best-effort, non-blocking)
-        // Extract typing info from metadata (passed from inbound message)
-        log.info("DingTalk vtableSendEvent: checking metadata for typing recall, metadata present: {}", .{metadata != null});
+        if (isVerboseLog()) log.info("DingTalk vtableSendEvent: checking metadata for typing recall, metadata present: {}", .{metadata != null});
         if (metadata) |meta| {
-            log.info("DingTalk vtableSendEvent: metadata length: {d}", .{meta.len});
+            if (isVerboseLog()) log.info("DingTalk vtableSendEvent: metadata length: {d}", .{meta.len});
             if (meta.len > 0) {
                 const typing_info = DingTalkChannel.extractTypingInfo(self.allocator, meta) catch |err| {
                     log.warn("DingTalk vtableSendEvent: extractTypingInfo failed: {}", .{err});
@@ -565,19 +537,18 @@ pub const DingTalkChannel = struct {
                     if (typing_info.msg_id) |msg_id| self.allocator.free(msg_id);
                     if (typing_info.robot_code) |robot_code| self.allocator.free(robot_code);
                 }
-                log.info("DingTalk vtableSendEvent: extracted typing info - msg_id: {?s}, robot_code: {?s}", .{ typing_info.msg_id, typing_info.robot_code });
-                // Recall typing message if we have both message ID and robot code
+                if (isVerboseLog()) log.info("DingTalk vtableSendEvent: extracted typing info - msg_id: {?s}, robot_code: {?s}", .{ typing_info.msg_id, typing_info.robot_code });
                 if (typing_info.msg_id != null and typing_info.robot_code != null) {
-                    log.info("DingTalk vtableSendEvent: recalling typing message {s} with robot code {s}", .{ typing_info.msg_id.?, typing_info.robot_code.? });
+                    if (isVerboseLog()) log.info("DingTalk vtableSendEvent: recalling typing message {s} with robot code {s}", .{ typing_info.msg_id.?, typing_info.robot_code.? });
                     self.recallMessage(typing_info.msg_id.?, typing_info.robot_code.?);
                 } else {
-                    log.warn("DingTalk vtableSendEvent: missing msg_id or robot_code for recall", .{});
+                    if (isVerboseLog()) log.warn("DingTalk vtableSendEvent: missing msg_id or robot_code for recall", .{});
                 }
             } else {
-                log.warn("DingTalk vtableSendEvent: metadata is empty", .{});
+                if (isVerboseLog()) log.warn("DingTalk vtableSendEvent: metadata is empty", .{});
             }
         } else {
-            log.warn("DingTalk vtableSendEvent: no metadata provided", .{});
+            if (isVerboseLog()) log.warn("DingTalk vtableSendEvent: no metadata provided", .{});
         }
     }
 
@@ -631,12 +602,11 @@ pub const DingTalkChannel = struct {
         const path = try buildTicketPath(self.allocator, parts.path, conn.ticket);
         defer self.allocator.free(path);
 
-        // Choose WebSocket implementation based on platform/environment
         if (useNativeWebSocket()) {
-            log.info("DingTalk using native Zig WebSocket", .{});
+            if (isVerboseLog()) log.info("DingTalk using native Zig WebSocket", .{});
             try self.runNativeWsLoop(parts.host, parts.port, path);
         } else {
-            log.info("DingTalk using Python WebSocket (to avoid Zig 0.15 TLS segfault on Linux)", .{});
+            if (isVerboseLog()) log.info("DingTalk using Python WebSocket (to avoid Zig 0.15 TLS segfault on Linux)", .{});
             const ws_url = try std.fmt.allocPrint(self.allocator, "wss://{s}:{d}{s}", .{ parts.host, parts.port, path });
             defer self.allocator.free(ws_url);
             try self.runPythonWsLoop(ws_url);
@@ -845,13 +815,12 @@ pub const DingTalkChannel = struct {
         const peer_kind = if (is_group) "group" else "direct";
         const peer_id = if (is_group and conversation_id.len > 0) conversation_id else staff_id;
 
-        // Send "typing..." message via Bot API (supports recall)
-        log.info("DingTalk handleBotMessage: sending typing indicator via Bot API to user {s}", .{staff_id});
-        const maybe_typing_msg_id = self.sendBotMessage(staff_id, TYPING_MESSAGE);
+        if (isVerboseLog()) log.info("DingTalk handleBotMessage: sending typing indicator via Bot API to user {s}", .{staff_id});
+        const maybe_typing_msg_id = self.sendBotMessage(staff_id, self.typing_message);
         var typing_id_owned: ?[]const u8 = null;
         if (maybe_typing_msg_id) |typing_id| {
             typing_id_owned = typing_id;
-            log.info("DingTalk handleBotMessage: typing message sent successfully, ID: {s}", .{typing_id});
+            if (isVerboseLog()) log.info("DingTalk handleBotMessage: typing message sent successfully, ID: {s}", .{typing_id});
         } else {
             log.err("DingTalk handleBotMessage: failed to send typing message, recall will not work!", .{});
         }
@@ -885,20 +854,18 @@ pub const DingTalkChannel = struct {
             mw.writeAll(",\"message_id\":") catch return;
             root.appendJsonStringW(mw, msg_id) catch return;
         }
-        // Store typing message ID for recall when final response is sent
         if (typing_id_owned) |typing_id| {
             mw.writeAll(",\"typing_msg_id\":") catch return;
             root.appendJsonStringW(mw, typing_id) catch return;
-            log.info("DingTalk handleBotMessage: stored typing_msg_id={s} in metadata", .{typing_id});
+            if (isVerboseLog()) log.info("DingTalk handleBotMessage: stored typing_msg_id={s} in metadata", .{typing_id});
         } else {
-            log.warn("DingTalk handleBotMessage: no typing_id to store in metadata", .{});
+            if (isVerboseLog()) log.warn("DingTalk handleBotMessage: no typing_id to store in metadata", .{});
         }
-        // Store client ID (robot code) for recall API
         mw.writeAll(",\"robot_code\":") catch return;
         root.appendJsonStringW(mw, self.client_id) catch return;
         mw.writeByte('}') catch return;
         
-        log.info("DingTalk handleBotMessage: metadata built ({d} bytes): {s}", .{ meta.items.len, meta.items });
+        if (isVerboseLog()) log.info("DingTalk handleBotMessage: metadata built ({d} bytes): {s}", .{ meta.items.len, meta.items });
 
         const msg = bus_mod.makeInboundFull(
             self.allocator,

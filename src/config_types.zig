@@ -385,6 +385,7 @@ pub const DingTalkConfig = struct {
     subscriptions: []const DingTalkSubscription = &.{},
     ua: ?[]const u8 = null,
     local_ip: ?[]const u8 = null,
+    typing_message: ?[]const u8 = null,
 };
 
 pub const SignalConfig = struct {
