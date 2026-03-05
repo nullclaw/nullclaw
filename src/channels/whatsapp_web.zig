@@ -27,6 +27,12 @@ const HttpPostFn = *const fn (
 /// - POST `{bridge_url}/send` with body `{"account_id":"...","to":"...","text":"..."}`
 /// - optional GET `{bridge_url}/health` for operator diagnostics.
 pub const WhatsAppWebChannel = struct {
+    const MAX_SEEN_MESSAGE_IDS: usize = 256;
+    const PublishOutcome = struct {
+        published: bool,
+        state_dirty: bool,
+    };
+
     allocator: std.mem.Allocator,
     config: config_types.WhatsAppWebConfig,
     event_bus: ?*bus.Bus = null,
@@ -34,6 +40,8 @@ pub const WhatsAppWebChannel = struct {
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
     cursor: ?[]u8 = null,
+    seen_message_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    seen_message_id_index: std.StringHashMapUnmanaged(void) = .empty,
     state_root: ?[]u8 = null,
 
     http_get: HttpGetFn = root.http_util.curlGet,
@@ -61,6 +69,9 @@ pub const WhatsAppWebChannel = struct {
             self.allocator.free(cursor);
             self.cursor = null;
         }
+        self.clearSeenMessageIds();
+        self.seen_message_id_index.deinit(self.allocator);
+        self.seen_message_ids.deinit(self.allocator);
         if (self.state_root) |state_root| {
             self.allocator.free(state_root);
             self.state_root = null;
@@ -161,6 +172,39 @@ pub const WhatsAppWebChannel = struct {
         return true;
     }
 
+    fn clearSeenMessageIds(self: *WhatsAppWebChannel) void {
+        for (self.seen_message_ids.items) |id| {
+            self.allocator.free(id);
+        }
+        self.seen_message_ids.clearRetainingCapacity();
+        self.seen_message_id_index.clearRetainingCapacity();
+    }
+
+    fn hasSeenMessageId(self: *const WhatsAppWebChannel, message_id: []const u8) bool {
+        const trimmed = std.mem.trim(u8, message_id, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        return self.seen_message_id_index.contains(trimmed);
+    }
+
+    fn rememberMessageId(self: *WhatsAppWebChannel, message_id: []const u8) !bool {
+        const trimmed = std.mem.trim(u8, message_id, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (self.seen_message_id_index.contains(trimmed)) return false;
+
+        const owned = try self.allocator.dupe(u8, trimmed);
+        errdefer self.allocator.free(owned);
+
+        try self.seen_message_ids.append(self.allocator, owned);
+        try self.seen_message_id_index.put(self.allocator, owned, {});
+
+        if (self.seen_message_ids.items.len > MAX_SEEN_MESSAGE_IDS) {
+            const evicted = self.seen_message_ids.orderedRemove(0);
+            _ = self.seen_message_id_index.remove(evicted);
+            self.allocator.free(evicted);
+        }
+        return true;
+    }
+
     fn restorePersistedCursor(self: *WhatsAppWebChannel) !void {
         const path = self.cursorStatePath() catch |err| switch (err) {
             error.StateRootNotConfigured => return,
@@ -197,6 +241,15 @@ pub const WhatsAppWebChannel = struct {
         const cursor_val = obj.get("cursor") orelse return;
         if (cursor_val != .string or cursor_val.string.len == 0) return;
         _ = try self.replaceCursor(cursor_val.string);
+
+        self.clearSeenMessageIds();
+        if (obj.get("seen_message_ids")) |seen_val| {
+            if (seen_val != .array) return;
+            for (seen_val.array.items) |id_val| {
+                if (id_val != .string) continue;
+                _ = try self.rememberMessageId(id_val.string);
+            }
+        }
     }
 
     fn persistCursor(self: *WhatsAppWebChannel) !void {
@@ -225,6 +278,12 @@ pub const WhatsAppWebChannel = struct {
         try root.appendJsonStringW(bw, trimTrailingSlash(self.config.bridge_url));
         try bw.writeAll(",\n  \"cursor\": ");
         try root.appendJsonStringW(bw, cursor);
+        try bw.writeAll(",\n  \"seen_message_ids\": [");
+        for (self.seen_message_ids.items, 0..) |id, i| {
+            if (i > 0) try bw.writeAll(", ");
+            try root.appendJsonStringW(bw, id);
+        }
+        try bw.writeAll("]");
         try bw.writeAll("\n}\n");
 
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
@@ -253,21 +312,26 @@ pub const WhatsAppWebChannel = struct {
         };
     }
 
-    fn publishParsedMessage(self: *WhatsAppWebChannel, obj: std.json.ObjectMap) !bool {
-        const sender = getObjString(obj, "from") orelse return false;
-        const text = getObjString(obj, "text") orelse getObjString(obj, "content") orelse return false;
+    fn publishParsedMessage(self: *WhatsAppWebChannel, obj: std.json.ObjectMap) !PublishOutcome {
+        const sender = getObjString(obj, "from") orelse return .{ .published = false, .state_dirty = false };
+        const text = getObjString(obj, "text") orelse getObjString(obj, "content") orelse return .{ .published = false, .state_dirty = false };
         const cleaned_text = std.mem.trim(u8, text, " \t\r\n");
-        if (cleaned_text.len == 0) return false;
+        if (cleaned_text.len == 0) return .{ .published = false, .state_dirty = false };
 
         const is_group = getObjBool(obj, "is_group") orelse false;
         const group_id = getObjString(obj, "group_id");
         const chat_id = getObjString(obj, "chat_id") orelse if (is_group) (group_id orelse sender) else sender;
 
-        if (!self.isSenderAllowed(sender, is_group)) return false;
+        if (!self.isSenderAllowed(sender, is_group)) return .{ .published = false, .state_dirty = false };
 
         const peer_kind = if (is_group) "group" else "direct";
         const peer_id = if (is_group) (group_id orelse chat_id) else sender;
         const message_id = getObjString(obj, "id");
+        if (message_id) |mid| {
+            if (self.hasSeenMessageId(mid)) {
+                return .{ .published = false, .state_dirty = false };
+            }
+        }
 
         const session_key = try std.fmt.allocPrint(
             self.allocator,
@@ -310,13 +374,17 @@ pub const WhatsAppWebChannel = struct {
                 if (err != error.Closed) {
                     log.warn("failed to publish whatsapp_web inbound: {}", .{err});
                 }
-                return false;
+                return .{ .published = false, .state_dirty = false };
             };
-            return true;
+            var state_dirty = false;
+            if (message_id) |mid| {
+                state_dirty = try self.rememberMessageId(mid);
+            }
+            return .{ .published = true, .state_dirty = state_dirty };
         }
 
         inbound.deinit(self.allocator);
-        return false;
+        return .{ .published = false, .state_dirty = false };
     }
 
     /// Parse bridge poll payload and publish all accepted messages to the bus.
@@ -325,12 +393,11 @@ pub const WhatsAppWebChannel = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return 0;
         const root_obj = parsed.value.object;
+        var state_dirty = false;
 
         if (getObjString(root_obj, "next_cursor")) |next_cursor| {
             if (try self.replaceCursor(next_cursor)) {
-                self.persistCursor() catch |err| {
-                    log.warn("failed to persist whatsapp_web cursor (account_id={s}): {}", .{ self.config.account_id, err });
-                };
+                state_dirty = true;
             }
         }
 
@@ -340,9 +407,17 @@ pub const WhatsAppWebChannel = struct {
         var published: usize = 0;
         for (messages_val.array.items) |item| {
             if (item != .object) continue;
-            if (try self.publishParsedMessage(item.object)) {
+            const outcome = try self.publishParsedMessage(item.object);
+            if (outcome.published) {
                 published += 1;
             }
+            if (outcome.state_dirty) state_dirty = true;
+        }
+
+        if (state_dirty) {
+            self.persistCursor() catch |err| {
+                log.warn("failed to persist whatsapp_web cursor (account_id={s}): {}", .{ self.config.account_id, err });
+            };
         }
         return published;
     }
@@ -665,4 +740,77 @@ test "whatsapp_web persists cursor across restart when state root is configured"
     second.http_post = mockPollPostExpectPersistedCursor;
     const published = try second.pollOnce();
     try std.testing.expectEqual(@as(usize, 0), published);
+}
+
+test "whatsapp_web does not republish seen message ids after restart" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+
+    var event_bus_first = bus.Bus.init();
+    defer event_bus_first.close();
+
+    var first = WhatsAppWebChannel.init(allocator, .{
+        .account_id = "wa-web-main",
+        .bridge_url = "http://127.0.0.1:3301",
+        .allow_from = &.{"*"},
+    });
+    defer first.deinit();
+    first.setBus(&event_bus_first);
+    try first.setStateRootFromConfigPath(config_path);
+
+    const first_payload =
+        \\{
+        \\  "next_cursor": "20",
+        \\  "messages": [
+        \\    {
+        \\      "id": "m-replay-1",
+        \\      "from": "5511999999999",
+        \\      "chat_id": "5511999999999",
+        \\      "text": "primeira entrega",
+        \\      "is_group": false
+        \\    }
+        \\  ]
+        \\}
+    ;
+    const first_published = try first.ingestPollPayload(first_payload);
+    try std.testing.expectEqual(@as(usize, 1), first_published);
+    var first_msg = event_bus_first.consumeInbound() orelse return error.TestUnexpectedResult;
+    first_msg.deinit(allocator);
+
+    var event_bus_second = bus.Bus.init();
+    defer event_bus_second.close();
+
+    var second = WhatsAppWebChannel.init(allocator, .{
+        .account_id = "wa-web-main",
+        .bridge_url = "http://127.0.0.1:3301",
+        .allow_from = &.{"*"},
+    });
+    defer second.deinit();
+    second.setBus(&event_bus_second);
+    try second.setStateRootFromConfigPath(config_path);
+
+    const replay_payload =
+        \\{
+        \\  "next_cursor": "1",
+        \\  "messages": [
+        \\    {
+        \\      "id": "m-replay-1",
+        \\      "from": "5511999999999",
+        \\      "chat_id": "5511999999999",
+        \\      "text": "primeira entrega",
+        \\      "is_group": false
+        \\    }
+        \\  ]
+        \\}
+    ;
+    const replay_published = try second.ingestPollPayload(replay_payload);
+    try std.testing.expectEqual(@as(usize, 0), replay_published);
+    try std.testing.expectEqual(@as(usize, 0), event_bus_second.inboundDepth());
 }
