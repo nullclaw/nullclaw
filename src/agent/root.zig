@@ -244,6 +244,8 @@ pub const Agent = struct {
     default_provider: []const u8 = "openrouter",
     default_provider_owned: bool = false,
     default_model: []const u8 = "anthropic/claude-sonnet-4",
+    model_routes: []const config_types.ModelRouteConfig = &.{},
+    model_pinned_by_user: bool = false,
     configured_providers: []const config_types.ProviderEntry = &.{},
     fallback_providers: []const []const u8 = &.{},
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
@@ -341,6 +343,8 @@ pub const Agent = struct {
     system_prompt_has_conversation_context: bool = false,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
+    /// Model name used when building the currently cached system prompt.
+    system_prompt_model_name: ?[]u8 = null,
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
@@ -406,6 +410,7 @@ pub const Agent = struct {
             .model_name = default_model,
             .default_provider = cfg.default_provider,
             .default_model = default_model,
+            .model_routes = cfg.model_routes,
             .configured_providers = cfg.providers,
             .fallback_providers = cfg.reliability.fallback_providers,
             .model_fallbacks = cfg.reliability.model_fallbacks,
@@ -451,6 +456,7 @@ pub const Agent = struct {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
@@ -616,23 +622,34 @@ pub const Agent = struct {
         messages: []const ChatMessage,
         tool_specs_for_estimate: ?[]const ToolSpec,
     ) u32 {
-        if (self.token_limit == 0) return self.max_tokens;
+        return self.effectiveMaxTokensForTurn(messages, tool_specs_for_estimate, self.token_limit, self.max_tokens);
+    }
+
+    fn effectiveMaxTokensForTurn(
+        self: *const Agent,
+        messages: []const ChatMessage,
+        tool_specs_for_estimate: ?[]const ToolSpec,
+        token_limit: u64,
+        max_tokens: u32,
+    ) u32 {
+        _ = self;
+        if (token_limit == 0) return max_tokens;
 
         var prompt_estimate = estimatePromptTokens(messages);
         if (tool_specs_for_estimate) |tool_specs| {
             prompt_estimate +|= estimateToolSpecsTokens(tool_specs);
         }
 
-        if (prompt_estimate >= self.token_limit) return 1;
+        if (prompt_estimate >= token_limit) return 1;
 
-        const available = self.token_limit - prompt_estimate;
+        const available = token_limit - prompt_estimate;
         const reserve = @min(@as(u64, 256), available / 4);
         if (available <= reserve) return 1;
 
         const completion_budget = available - reserve;
         const completion_budget_u32: u32 = @intCast(@min(completion_budget, @as(u64, std.math.maxInt(u32))));
         if (completion_budget_u32 == 0) return 1;
-        return @max(@as(u32, 1), @min(self.max_tokens, completion_budget_u32));
+        return @max(@as(u32, 1), @min(max_tokens, completion_budget_u32));
     }
 
     /// Auto-compact history when it exceeds thresholds.
@@ -773,6 +790,89 @@ pub const Agent = struct {
             if (matched) return true;
         }
         return false;
+    }
+
+    fn hasModelRouteHint(self: *const Agent, hint: []const u8) bool {
+        for (self.model_routes) |route| {
+            if (std.mem.eql(u8, route.hint, hint)) return true;
+        }
+        return false;
+    }
+
+    fn findModelRouteByHint(self: *const Agent, hint: []const u8) ?config_types.ModelRouteConfig {
+        for (self.model_routes) |route| {
+            if (std.mem.eql(u8, route.hint, hint)) return route;
+        }
+        return null;
+    }
+
+    fn selectRouteHintForTurn(self: *const Agent, user_message: []const u8) ?[]const u8 {
+        if (self.model_pinned_by_user or self.model_routes.len == 0) return null;
+
+        if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasModelRouteHint("vision")) {
+            return "vision";
+        }
+
+        const deep_keywords = [_][]const u8{
+            "root cause",
+            "investigate",
+            "compare",
+            "tradeoff",
+            "architecture",
+            "architectural",
+            "refactor",
+            "migration",
+            "migrate",
+            "design",
+            "plan",
+            "debug deeply",
+            "why does",
+            "why is",
+        };
+        inline for (deep_keywords) |keyword| {
+            if (containsAsciiIgnoreCase(user_message, keyword)) {
+                if (self.hasModelRouteHint("deep")) return "deep";
+                if (self.hasModelRouteHint("reasoning")) return "reasoning";
+            }
+        }
+
+        if (user_message.len > 600 or self.history.items.len >= 24) {
+            if (self.hasModelRouteHint("deep")) return "deep";
+            if (self.hasModelRouteHint("reasoning")) return "reasoning";
+        }
+
+        const fast_keywords = [_][]const u8{
+            "status",
+            "list",
+            "show",
+            "current",
+            "version",
+            "pwd",
+            "ls",
+            "whoami",
+            "doctor",
+            "health",
+            "check",
+        };
+        if (user_message.len <= 120) {
+            inline for (fast_keywords) |keyword| {
+                if (containsAsciiIgnoreCase(user_message, keyword) and self.hasModelRouteHint("fast")) {
+                    return "fast";
+                }
+            }
+        }
+
+        if (self.hasModelRouteHint("balanced")) return "balanced";
+        if (self.hasModelRouteHint("fast")) return "fast";
+        if (self.hasModelRouteHint("deep")) return "deep";
+        if (self.hasModelRouteHint("reasoning")) return "reasoning";
+        return null;
+    }
+
+    fn routeModelNameForTurn(self: *const Agent, allocator: std.mem.Allocator, user_message: []const u8) !?[]u8 {
+        const hint = self.selectRouteHintForTurn(user_message) orelse return null;
+        const route = self.findModelRouteByHint(hint) orelse return null;
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ route.provider, route.model });
     }
 
     fn isExecToolName(tool_name: []const u8) bool {
@@ -983,10 +1083,24 @@ pub const Agent = struct {
             break :blk turn_input.llm_user_message orelse user_message;
         };
 
+        const turn_model_name = if (try self.routeModelNameForTurn(self.allocator, effective_user_message)) |routed|
+            routed
+        else
+            self.model_name;
+        const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
+        defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
         const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
+        }
+        if (self.has_system_prompt) {
+            if (self.system_prompt_model_name) |cached_model| {
+                if (!std.mem.eql(u8, cached_model, turn_model_name)) {
+                    self.has_system_prompt = false;
+                }
+            }
         }
 
         const turn_has_conversation_context = self.conversation_context != null;
@@ -1007,7 +1121,7 @@ pub const Agent = struct {
 
             const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
-                .model_name = self.model_name,
+                .model_name = turn_model_name,
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
@@ -1045,6 +1159,8 @@ pub const Agent = struct {
             self.has_system_prompt = true;
             self.system_prompt_has_conversation_context = turn_has_conversation_context;
             self.workspace_prompt_fingerprint = workspace_fp;
+            if (self.system_prompt_model_name) |cached_model| self.allocator.free(cached_model);
+            self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -1084,7 +1200,7 @@ pub const Agent = struct {
                 self.history.items[0].content
             else
                 null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, effective_user_message);
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
@@ -1101,10 +1217,15 @@ pub const Agent = struct {
         // Record agent event
         const start_event = ObserverEvent{ .llm_request = .{
             .provider = self.provider.getName(),
-            .model = self.model_name,
+            .model = turn_model_name,
             .messages_count = self.history.items.len,
         } };
         self.observer.recordEvent(&start_event);
+
+        const turn_token_limit = context_tokens.resolveContextTokens(self.token_limit_override, turn_model_name);
+        const turn_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(self.max_tokens_override, turn_model_name);
+        const turn_token_limit_cap: u32 = @intCast(@min(turn_token_limit, @as(u64, std.math.maxInt(u32))));
+        const turn_max_tokens = @min(turn_max_tokens_raw, turn_token_limit_cap);
 
         // Tool call loop — reuse a single arena across iterations (retains pages)
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1121,7 +1242,7 @@ pub const Agent = struct {
             const arena = iter_arena.allocator();
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessages(arena);
+            const messages = try self.buildProviderMessages(arena, turn_model_name);
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -1129,28 +1250,30 @@ pub const Agent = struct {
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
             const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
-            const request_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+            const request_max_tokens = self.effectiveMaxTokensForTurn(
                 messages,
                 if (native_tools_enabled) turn_tool_specs else null,
+                turn_token_limit,
+                turn_max_tokens,
             );
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
             if (is_streaming) {
-                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, true);
+                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    turn_model_name,
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
@@ -1158,7 +1281,7 @@ pub const Agent = struct {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
@@ -1168,38 +1291,40 @@ pub const Agent = struct {
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
                         if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
-                        try self.markVisionDisabled();
-                        const retry_msgs = try self.buildProviderMessages(arena);
-                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                        try self.markVisionDisabled(turn_model_name);
+                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
                         );
                         response_attempt = 2;
-                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, true);
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, true);
                         break :retry_stream self.provider.streamChat(
                             self.allocator,
                             .{
                                 .messages = retry_msgs,
-                                .model = self.model_name,
+                                .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            turn_model_name,
                             self.temperature,
                             self.stream_callback.?,
                             self.stream_ctx.?,
                         ) catch |retry_err| {
-                            self.emitUsageFailure();
+                            self.emitUsageFailure(turn_model_name);
                             return retry_err;
                         };
                     }
 
-                    self.emitUsageFailure();
+                    self.emitUsageFailure(turn_model_name);
                     return err;
                 };
                 response = ChatResponse{
@@ -1209,26 +1334,26 @@ pub const Agent = struct {
                     .model = stream_result.model,
                 };
             } else {
-                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, false);
+                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
                 response = self.provider.chat(
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    turn_model_name,
                     self.temperature,
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
@@ -1238,30 +1363,33 @@ pub const Agent = struct {
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
                         if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
-                        try self.markVisionDisabled();
-                        const retry_msgs = try self.buildProviderMessages(arena);
-                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                        try self.markVisionDisabled(turn_model_name);
+                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
                         );
-                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, false);
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = retry_msgs,
-                                .model = self.model_name,
+                                .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            turn_model_name,
                             self.temperature,
                         ) catch |retry_err| {
-                            self.emitUsageFailure();
+                            self.emitUsageFailure(turn_model_name);
                             return retry_err;
                         };
                     }
@@ -1273,28 +1401,30 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
-                        const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
-                        const recovery_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                        const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                        const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                             recovery_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
                         );
                         response_attempt = 2;
-                        self.logLlmRequest(iteration + 1, 2, recovery_msgs, native_tools_enabled, false);
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = recovery_msgs,
-                                .model = self.model_name,
+                                .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = recovery_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            turn_model_name,
                             self.temperature,
                         ) catch |retry_after_compact_err| {
-                            self.emitUsageFailure();
+                            self.emitUsageFailure(turn_model_name);
                             return retry_after_compact_err;
                         };
                     }
@@ -1302,51 +1432,53 @@ pub const Agent = struct {
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
-                    self.logLlmRequest(iteration + 1, 2, messages, native_tools_enabled, false);
+                    self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
                     break :retry_blk self.provider.chat(
                         self.allocator,
                         .{
                             .messages = messages,
-                            .model = self.model_name,
+                            .model = turn_model_name,
                             .temperature = self.temperature,
                             .max_tokens = request_max_tokens,
                             .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
                         },
-                        self.model_name,
+                        turn_model_name,
                         self.temperature,
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
-                            const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
-                            const recovery_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                            const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                            const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                                 recovery_msgs,
                                 if (native_tools_enabled) turn_tool_specs else null,
+                                turn_token_limit,
+                                turn_max_tokens,
                             );
                             response_attempt = 3;
-                            self.logLlmRequest(iteration + 1, 3, recovery_msgs, native_tools_enabled, false);
+                            self.logLlmRequest(iteration + 1, 3, turn_model_name, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
                                     .messages = recovery_msgs,
-                                    .model = self.model_name,
+                                    .model = turn_model_name,
                                     .temperature = self.temperature,
                                     .max_tokens = recovery_max_tokens,
                                     .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
                                 },
-                                self.model_name,
+                                turn_model_name,
                                 self.temperature,
                             ) catch |retry_after_compact_err| {
-                                self.emitUsageFailure();
+                                self.emitUsageFailure(turn_model_name);
                                 return retry_after_compact_err;
                             };
                         }
-                        self.emitUsageFailure();
+                        self.emitUsageFailure(turn_model_name);
                         return retry_err;
                     };
                 };
@@ -1356,7 +1488,7 @@ pub const Agent = struct {
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
             const resp_event = ObserverEvent{ .llm_response = .{
                 .provider = self.provider.getName(),
-                .model = self.model_name,
+                .model = turn_model_name,
                 .duration_ms = duration_ms,
                 .success = true,
                 .error_message = null,
@@ -1537,9 +1669,9 @@ pub const Agent = struct {
                         self.history.items[0].content
                     else
                         null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, effective_user_message);
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, effective_user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
-                    rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch {};
+                    rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
                 }
 
                 return final_text;
@@ -1674,7 +1806,7 @@ pub const Agent = struct {
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
-        self.logLlmRequest(self.max_tool_iterations + 1, 1, summary_messages, false, false);
+        self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
             .{
@@ -1927,7 +2059,15 @@ pub const Agent = struct {
         return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
     }
 
-    fn logLlmRequest(self: *Agent, iteration: u32, attempt: u32, messages: []const ChatMessage, native_tools_enabled: bool, is_streaming: bool) void {
+    fn logLlmRequest(
+        self: *Agent,
+        iteration: u32,
+        attempt: u32,
+        model_name: []const u8,
+        messages: []const ChatMessage,
+        native_tools_enabled: bool,
+        is_streaming: bool,
+    ) void {
         if (!self.log_llm_io) return;
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         log.info(
@@ -1937,7 +2077,7 @@ pub const Agent = struct {
                 iteration,
                 attempt,
                 self.provider.getName(),
-                self.model_name,
+                model_name,
                 messages.len,
                 native_tools_enabled,
                 is_streaming,
@@ -2039,38 +2179,38 @@ pub const Agent = struct {
         });
     }
 
-    fn emitUsageFailure(self: *Agent) void {
+    fn emitUsageFailure(self: *Agent, model_name: []const u8) void {
         const failed = ChatResponse{
-            .model = self.model_name,
+            .model = model_name,
             .usage = .{},
         };
         self.emitUsageRecord(&failed, false);
     }
 
     /// Check if vision is disabled for current model (either configured or auto-detected).
-    fn isVisionDisabled(self: *const Agent) bool {
+    fn isVisionDisabled(self: *const Agent, model_name: []const u8) bool {
         for (self.vision_disabled_models) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) return true;
+            if (std.mem.eql(u8, model, model_name)) return true;
         }
         for (self.detected_vision_disabled.items) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) return true;
+            if (std.mem.eql(u8, model, model_name)) return true;
         }
         return false;
     }
 
     /// Add model to detected vision disabled list if not already present.
-    fn markVisionDisabled(self: *Agent) !void {
+    fn markVisionDisabled(self: *Agent, model_name: []const u8) !void {
         const already_disabled = for (self.detected_vision_disabled.items) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) break true;
+            if (std.mem.eql(u8, model, model_name)) break true;
         } else false;
         if (!already_disabled) {
-            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, self.model_name));
+            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, model_name));
         }
     }
 
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing and vision capability checks.
-    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
+    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator, model_name: []const u8) ![]ChatMessage {
         const m = try arena.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
             m[i] = msg.toChatMessage();
@@ -2082,21 +2222,21 @@ pub const Agent = struct {
         }
 
         // Check if vision is disabled (configured or auto-detected)
-        if (self.isVisionDisabled()) {
+        if (self.isVisionDisabled(model_name)) {
             if (self.verbose_level == .on or self.verbose_level == .full) {
-                log.info("Vision disabled for model {s}, stripping image markers", .{self.model_name});
+                log.info("Vision disabled for model {s}, stripping image markers", .{model_name});
             }
             return multimodal.stripImageMarkers(arena, m);
         }
 
         // Check if provider supports vision for this model
-        if (!self.provider.supportsVisionForModel(self.model_name)) {
+        if (!self.provider.supportsVisionForModel(model_name)) {
             if (self.verbose_level == .on or self.verbose_level == .full) {
-                log.info("Model {s} does not support vision, stripping image markers", .{self.model_name});
+                log.info("Model {s} does not support vision, stripping image markers", .{model_name});
             }
             // Auto-disable vision if configured
             if (self.auto_disable_vision_on_error) {
-                try self.markVisionDisabled();
+                try self.markVisionDisabled(model_name);
             }
             return multimodal.stripImageMarkers(arena, m);
         }
@@ -2713,14 +2853,14 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    const text_model_messages = try agent.buildProviderMessages(arena);
+    const text_model_messages = try agent.buildProviderMessages(arena, agent.model_name);
     try std.testing.expectEqual(@as(usize, 1), text_model_messages.len);
     try std.testing.expect(text_model_messages[0].content_parts == null);
     try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "[IMAGE:") == null);
     try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "omitted because the current model does not support vision") != null);
 
     agent.model_name = "vision-model";
-    const messages = try agent.buildProviderMessages(arena);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
 }
@@ -2801,7 +2941,7 @@ test "Agent buildProviderMessages allows workspace image paths" {
     var arena_impl = std.heap.ArenaAllocator.init(allocator);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
-    const messages = try agent.buildProviderMessages(arena);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name);
 
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
@@ -3691,6 +3831,69 @@ test "slash /model keeps explicit token_limit override" {
     try std.testing.expect(std.mem.indexOf(u8, response, "claude-opus-4-6") != null);
     try std.testing.expectEqual(@as(u64, 64_000), agent.token_limit);
     try std.testing.expectEqual(@as(u32, 1024), agent.max_tokens);
+}
+
+test "auto route selects provider-prefixed model ref for fast prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-70b", routed);
+}
+
+test "auto route is disabled when model is pinned" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+    agent.model_pinned_by_user = true;
+
+    try std.testing.expect((try agent.routeModelNameForTurn(allocator, "show current status")) == null);
+}
+
+test "slash /model auto clears pin and invalidates cached prompt model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_pinned_by_user = true;
+    agent.has_system_prompt = true;
+    agent.system_prompt_has_conversation_context = true;
+    agent.system_prompt_model_name = try allocator.dupe(u8, "groq/llama-3.3-70b");
+
+    const response = (try agent.handleSlashCommand("/model auto")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Automatic model routing enabled.", response);
+    try std.testing.expect(!agent.model_pinned_by_user);
+    try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(!agent.system_prompt_has_conversation_context);
+    try std.testing.expect(agent.system_prompt_model_name == null);
+}
+
+test "slash /model pins explicit selection" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const response = (try agent.handleSlashCommand("/model gpt-4o")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o") != null);
+    try std.testing.expect(agent.model_pinned_by_user);
 }
 
 test "slash /model without name shows current" {
@@ -4796,6 +4999,75 @@ test "slash /model dupe prevents use-after-free" {
     // Overwrite the source buffer to verify model_name is an independent copy
     @memset(&msg_buf, 0);
     try std.testing.expectEqualStrings("new-model-xyz", agent.model_name);
+}
+
+test "turn passes auto-routed model to provider" {
+    const CaptureProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, model),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "capture-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CaptureProvider.chatWithSystem,
+        .chat = CaptureProvider.chat,
+        .supportsNativeTools = CaptureProvider.supportsNativeTools,
+        .getName = CaptureProvider.getName,
+        .deinit = CaptureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrFromInt(1),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .model_routes = &.{
+            .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+            .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        },
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("show current status");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-70b", response);
 }
 
 // Bug 2: @intCast on negative i64 duration should not panic.

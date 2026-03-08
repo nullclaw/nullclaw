@@ -272,6 +272,10 @@ fn invalidateSystemPromptCache(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
     }
+    if (@hasField(@TypeOf(self.*), "system_prompt_model_name")) {
+        if (self.system_prompt_model_name) |model_name| self.allocator.free(model_name);
+        self.system_prompt_model_name = null;
+    }
 }
 
 test "configPrimaryModelForSelection treats unknown leading segment as model for default provider" {
@@ -2497,97 +2501,157 @@ fn handleDoctorCommand(self: anytype) ![]const u8 {
 
 pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
-    switch (classifySlashCommand(cmd)) {
-        .new_reset => {
-            clearSessionState(self);
-            if (cmd.arg.len > 0) {
-                try setModelName(self, cmd.arg);
-                return try std.fmt.allocPrint(self.allocator, "Session cleared. Switched to model: {s}", .{cmd.arg});
-            }
-            return try self.allocator.dupe(u8, "Session cleared.");
-        },
-        .restart => {
-            clearSessionState(self);
-            resetRuntimeCommandState(self);
-            if (cmd.arg.len > 0) {
-                try setModelName(self, cmd.arg);
-                return try std.fmt.allocPrint(self.allocator, "Session restarted. Switched to model: {s}", .{cmd.arg});
-            }
-            return try self.allocator.dupe(u8, "Session restarted.");
-        },
-        .help => return try self.allocator.dupe(u8, control_plane.HELP_TEXT),
-        .status => return try formatStatus(self),
-        .whoami => return try formatWhoAmI(self),
-        .model => {
-            if (cmd.arg.len == 0 or
-                std.ascii.eqlIgnoreCase(cmd.arg, "list") or
-                std.ascii.eqlIgnoreCase(cmd.arg, "status"))
-            {
-                return try self.formatModelStatus();
-            }
+
+    if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) {
+        clearSessionState(self);
+        if (cmd.arg.len > 0) {
             try setModelName(self, cmd.arg);
-            if (@hasField(@TypeOf(self.*), "default_model")) {
-                self.default_model = self.model_name;
+            if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                self.model_pinned_by_user = true;
             }
             invalidateSystemPromptCache(self);
-            persistSelectedModelToConfig(self, cmd.arg) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Session cleared. Switched to model: {s}", .{cmd.arg});
+        }
+        return try self.allocator.dupe(u8, "Session cleared.");
+    }
+
+    if (isSlashName(cmd, "restart")) {
+        clearSessionState(self);
+        resetRuntimeCommandState(self);
+        if (cmd.arg.len > 0) {
+            try setModelName(self, cmd.arg);
+            if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                self.model_pinned_by_user = true;
+            }
+            invalidateSystemPromptCache(self);
+            return try std.fmt.allocPrint(self.allocator, "Session restarted. Switched to model: {s}", .{cmd.arg});
+        }
+        return try self.allocator.dupe(u8, "Session restarted.");
+    }
+
+    if (isSlashName(cmd, "help") or isSlashName(cmd, "commands")) {
+        return try self.allocator.dupe(u8,
+            \\Available commands:
+            \\  /new, /reset [model], /restart [model]
+            \\  /help, /commands, /status, /whoami, /id
+            \\  /model, /models, /model <name>, /model auto
+            \\  /think, /verbose, /reasoning
+            \\  /exec, /queue, /usage, /tts, /voice
+            \\  /stop, /abort, /compact
+            \\  /allowlist, /approve, /context
+            \\  /export-session, /export
+            \\  /session ttl <duration|off>
+            \\  /subagents, /agents, /focus, /unfocus, /kill, /steer, /tell
+            \\  /config, /capabilities, /debug
+            \\  /dock-telegram, /dock-discord, /dock-slack
+            \\  /activation, /send, /elevated, /bash, /poll, /skill
+            \\  /doctor — memory subsystem diagnostics
+            \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
+            \\  exit, quit
+        );
+    }
+
+    if (isSlashName(cmd, "status")) return try formatStatus(self);
+    if (isSlashName(cmd, "whoami") or isSlashName(cmd, "id")) return try formatWhoAmI(self);
+    if (isSlashName(cmd, "model") or isSlashName(cmd, "models")) {
+        if (cmd.arg.len == 0 or
+            std.ascii.eqlIgnoreCase(cmd.arg, "list") or
+            std.ascii.eqlIgnoreCase(cmd.arg, "status"))
+        {
+            return try self.formatModelStatus();
+        }
+        if (std.ascii.eqlIgnoreCase(cmd.arg, "auto")) {
+            if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                self.model_pinned_by_user = false;
+            }
+            if (@hasField(@TypeOf(self.*), "default_model")) {
+                try setModelName(self, self.default_model);
+            }
+            invalidateSystemPromptCache(self);
+            if (@hasField(@TypeOf(self.*), "model_routes") and self.model_routes.len == 0) {
                 return try std.fmt.allocPrint(
                     self.allocator,
-                    "Switched to model: {s}\nWarning: could not persist model to config.json ({s})",
-                    .{ cmd.arg, @errorName(err) },
+                    "Automatic model routing is not configured. Reverted to the configured default model: {s}",
+                    .{self.model_name},
                 );
-            };
-            return try std.fmt.allocPrint(self.allocator, "Switched to model: {s}", .{cmd.arg});
-        },
-        .think => return try handleThinkCommand(self, cmd.arg),
-        .verbose => return try handleVerboseCommand(self, cmd.arg),
-        .reasoning => return try handleReasoningCommand(self, cmd.arg),
-        .exec => return try handleExecCommand(self, cmd.arg),
-        .queue => return try handleQueueCommand(self, cmd.arg),
-        .usage => return try handleUsageCommand(self, cmd.arg),
-        .tts => return try handleTtsCommand(self, cmd.arg),
-        .stop => return try handleStopCommand(self),
-        .compact => {
-            if (self.forceCompressHistory()) {
-                return try self.allocator.dupe(u8, "Context compacted.");
             }
-            return try self.allocator.dupe(u8, "Nothing to compact.");
-        },
-        .allowlist => return try handleAllowlistCommand(self, cmd.arg),
-        .approve => return try handleApproveCommand(self, cmd.arg),
-        .context => return try handleContextCommand(self, cmd.arg),
-        .export_session => return try handleExportSessionCommand(self, cmd.arg),
-        .session => return try handleSessionCommand(self, cmd.arg),
-        .subagents => return try handleSubagentsCommand(self, cmd.arg),
-        .agents => return try handleAgentsCommand(self),
-        .focus => return try handleFocusCommand(self, cmd.arg),
-        .unfocus => return try handleUnfocusCommand(self),
-        .kill => return try handleKillCommand(self, cmd.arg),
-        .steer => return try handleSteerCommand(self, cmd.arg),
-        .tell => return try handleTellCommand(self, cmd.arg),
-        .config => return try handleConfigCommand(self, cmd.arg),
-        .capabilities => return try handleCapabilitiesCommand(self, cmd.arg),
-        .debug => {
-            if (std.ascii.eqlIgnoreCase(cmd.arg, "show") or cmd.arg.len == 0) return try formatStatus(self);
-            if (std.ascii.eqlIgnoreCase(cmd.arg, "reset")) {
-                resetRuntimeCommandState(self);
-                return try self.allocator.dupe(u8, "Runtime debug state reset.");
-            }
-            return try self.allocator.dupe(u8, "Supported: /debug show|reset");
-        },
-        .dock_telegram => return try handleDockCommand(self, "telegram"),
-        .dock_discord => return try handleDockCommand(self, "discord"),
-        .dock_slack => return try handleDockCommand(self, "slack"),
-        .activation => return try handleActivationCommand(self, cmd.arg),
-        .send => return try handleSendCommand(self, cmd.arg),
-        .elevated => return try handleElevatedCommand(self, cmd.arg),
-        .bash => return try handleBashCommand(self, cmd.arg),
-        .poll => return try handlePollCommand(self),
-        .skill => return try handleSkillCommand(self, cmd.arg),
-        .doctor => return try handleDoctorCommand(self),
-        .memory => return try handleMemoryCommand(self, cmd.arg),
-        .unknown => return null,
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Automatic model routing enabled. Reverted to the configured default model: {s}",
+                .{self.model_name},
+            );
+        }
+        try setModelName(self, cmd.arg);
+        if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+            self.model_pinned_by_user = true;
+        }
+        if (@hasField(@TypeOf(self.*), "default_model")) {
+            self.default_model = self.model_name;
+        }
+        invalidateSystemPromptCache(self);
+        persistSelectedModelToConfig(self, cmd.arg) catch |err| {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Switched to model: {s}\nWarning: could not persist model to config.json ({s})",
+                .{ cmd.arg, @errorName(err) },
+            );
+        };
+        return try std.fmt.allocPrint(self.allocator, "Switched to model: {s}", .{cmd.arg});
     }
+
+    if (isSlashName(cmd, "think") or isSlashName(cmd, "thinking") or isSlashName(cmd, "t")) return try handleThinkCommand(self, cmd.arg);
+    if (isSlashName(cmd, "verbose") or isSlashName(cmd, "v")) return try handleVerboseCommand(self, cmd.arg);
+    if (isSlashName(cmd, "reasoning") or isSlashName(cmd, "reason")) return try handleReasoningCommand(self, cmd.arg);
+    if (isSlashName(cmd, "exec")) return try handleExecCommand(self, cmd.arg);
+    if (isSlashName(cmd, "queue")) return try handleQueueCommand(self, cmd.arg);
+    if (isSlashName(cmd, "usage")) return try handleUsageCommand(self, cmd.arg);
+    if (isSlashName(cmd, "tts") or isSlashName(cmd, "voice")) return try handleTtsCommand(self, cmd.arg);
+    if (isSlashName(cmd, "stop") or isSlashName(cmd, "abort")) return try handleStopCommand(self);
+    if (isSlashName(cmd, "compact")) {
+        if (self.forceCompressHistory()) {
+            return try self.allocator.dupe(u8, "Context compacted.");
+        }
+        return try self.allocator.dupe(u8, "Nothing to compact.");
+    }
+
+    if (isSlashName(cmd, "allowlist")) return try handleAllowlistCommand(self, cmd.arg);
+    if (isSlashName(cmd, "approve")) return try handleApproveCommand(self, cmd.arg);
+    if (isSlashName(cmd, "context")) return try handleContextCommand(self, cmd.arg);
+    if (isSlashName(cmd, "export-session") or isSlashName(cmd, "export")) return try handleExportSessionCommand(self, cmd.arg);
+    if (isSlashName(cmd, "session")) return try handleSessionCommand(self, cmd.arg);
+    if (isSlashName(cmd, "subagents")) return try handleSubagentsCommand(self, cmd.arg);
+    if (isSlashName(cmd, "agents")) return try handleAgentsCommand(self);
+    if (isSlashName(cmd, "focus")) return try handleFocusCommand(self, cmd.arg);
+    if (isSlashName(cmd, "unfocus")) return try handleUnfocusCommand(self);
+    if (isSlashName(cmd, "kill")) return try handleKillCommand(self, cmd.arg);
+    if (isSlashName(cmd, "steer")) return try handleSteerCommand(self, cmd.arg);
+    if (isSlashName(cmd, "tell")) return try handleTellCommand(self, cmd.arg);
+
+    if (isSlashName(cmd, "config")) return try handleConfigCommand(self, cmd.arg);
+    if (isSlashName(cmd, "capabilities")) return try handleCapabilitiesCommand(self, cmd.arg);
+    if (isSlashName(cmd, "debug")) {
+        if (std.ascii.eqlIgnoreCase(cmd.arg, "show") or cmd.arg.len == 0) return try formatStatus(self);
+        if (std.ascii.eqlIgnoreCase(cmd.arg, "reset")) {
+            resetRuntimeCommandState(self);
+            return try self.allocator.dupe(u8, "Runtime debug state reset.");
+        }
+        return try self.allocator.dupe(u8, "Supported: /debug show|reset");
+    }
+
+    if (isSlashName(cmd, "dock-telegram") or isSlashName(cmd, "dock_telegram")) return try handleDockCommand(self, "telegram");
+    if (isSlashName(cmd, "dock-discord") or isSlashName(cmd, "dock_discord")) return try handleDockCommand(self, "discord");
+    if (isSlashName(cmd, "dock-slack") or isSlashName(cmd, "dock_slack")) return try handleDockCommand(self, "slack");
+    if (isSlashName(cmd, "activation")) return try handleActivationCommand(self, cmd.arg);
+    if (isSlashName(cmd, "send")) return try handleSendCommand(self, cmd.arg);
+    if (isSlashName(cmd, "elevated") or isSlashName(cmd, "elev")) return try handleElevatedCommand(self, cmd.arg);
+
+    if (isSlashName(cmd, "bash")) return try handleBashCommand(self, cmd.arg);
+    if (isSlashName(cmd, "poll")) return try handlePollCommand(self);
+    if (isSlashName(cmd, "skill")) return try handleSkillCommand(self, cmd.arg);
+    if (isSlashName(cmd, "doctor")) return try handleDoctorCommand(self);
+    if (isSlashName(cmd, "memory")) return try handleMemoryCommand(self, cmd.arg);
+
+    return null;
 }
 
 fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {

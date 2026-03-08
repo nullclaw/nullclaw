@@ -153,6 +153,12 @@ pub const ModelFallbackEntry = struct {
     fallbacks: []const []const u8,
 };
 
+const ResolvedProviderTarget = struct {
+    provider: Provider,
+    model: []const u8,
+    explicit: bool,
+};
+
 /// Provider wrapper with retry, multi-provider fallback, and model failover.
 ///
 /// Wraps a primary inner provider and optional extra providers as a fallback chain.
@@ -257,6 +263,60 @@ pub const ReliableProvider = struct {
         const chain = try allocator.alloc([]const u8, 1);
         chain[0] = model;
         return chain;
+    }
+
+    fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, model: []const u8 } {
+        const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse {
+            return .{ .provider = null, .model = model_ref };
+        };
+        if (slash == 0 or slash + 1 >= model_ref.len) {
+            return .{ .provider = null, .model = model_ref };
+        }
+        return .{
+            .provider = model_ref[0..slash],
+            .model = model_ref[slash + 1 ..],
+        };
+    }
+
+    fn matchesProvider(provider_name: []const u8, requested: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(provider_name, requested);
+    }
+
+    fn resolveProviderTarget(self: *const ReliableProvider, model_ref: []const u8) ResolvedProviderTarget {
+        const split = splitProviderModel(model_ref);
+        if (std.mem.eql(u8, self.inner.getName(), "router")) {
+            return .{
+                .provider = self.inner,
+                .model = model_ref,
+                .explicit = split.provider != null,
+            };
+        }
+        if (split.provider) |requested_provider| {
+            for (self.extras) |entry| {
+                if (matchesProvider(entry.name, requested_provider) or
+                    matchesProvider(entry.provider.getName(), requested_provider))
+                {
+                    return .{
+                        .provider = entry.provider,
+                        .model = split.model,
+                        .explicit = true,
+                    };
+                }
+            }
+            if (matchesProvider(self.inner.getName(), requested_provider)) {
+                return .{
+                    .provider = self.inner,
+                    .model = split.model,
+                    .explicit = true,
+                };
+            }
+        }
+
+        return .{
+            .provider = self.inner,
+            .model = model_ref,
+            .explicit = false,
+        };
     }
 
     /// Advance to the next API key (round-robin) and return it.
@@ -380,7 +440,9 @@ pub const ReliableProvider = struct {
         var attempt: u32 = 0;
         while (attempt <= self.max_retries) : (attempt += 1) {
             root.clearLastApiErrorDetail();
-            if (prov.chat(allocator, request, current_model, request.temperature)) |result| {
+            var resolved_request = request;
+            resolved_request.model = current_model;
+            if (prov.chat(allocator, resolved_request, current_model, request.temperature)) |result| {
                 var annotated = result;
                 if (annotated.provider.len == 0) {
                     annotated.provider = allocator.dupe(u8, prov.getName()) catch "";
@@ -427,6 +489,21 @@ pub const ReliableProvider = struct {
         defer allocator.free(models);
 
         for (models) |current_model| {
+            const target = self.resolveProviderTarget(current_model);
+
+            if (target.explicit) {
+                if (self.tryChatWithSystemProvider(
+                    target.provider,
+                    allocator,
+                    system_prompt,
+                    message,
+                    target.model,
+                )) |result| {
+                    return result;
+                }
+                continue;
+            }
+
             // Try primary provider
             if (self.tryChatWithSystemProvider(
                 self.inner,
@@ -472,6 +549,23 @@ pub const ReliableProvider = struct {
         defer allocator.free(models);
 
         for (models) |current_model| {
+            const target = self.resolveProviderTarget(current_model);
+
+            if (target.explicit) {
+                if (!needs_vision or target.provider.supportsVisionForModel(target.model)) {
+                    if (needs_vision) attempted_vision_provider = true;
+                    if (self.tryChatProvider(
+                        target.provider,
+                        allocator,
+                        request,
+                        target.model,
+                    )) |result| {
+                        return result;
+                    }
+                }
+                continue;
+            }
+
             // Try primary provider (skip if it lacks vision and request needs it)
             if (!needs_vision or self.inner.supportsVisionForModel(current_model)) {
                 if (needs_vision) attempted_vision_provider = true;
@@ -513,7 +607,11 @@ pub const ReliableProvider = struct {
 
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        return self.inner.supportsStreaming();
+        if (self.inner.supportsStreaming()) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsStreaming()) return true;
+        }
+        return false;
     }
 
     fn streamChatImpl(
@@ -526,12 +624,23 @@ pub const ReliableProvider = struct {
         callback_ctx: *anyopaque,
     ) anyerror!root.StreamChatResult {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const needs_vision = hasImageParts(request);
+        const target = self.resolveProviderTarget(model);
+
+        if (target.explicit) {
+            if (needs_vision and !target.provider.supportsVisionForModel(target.model)) {
+                return error.ProviderDoesNotSupportVision;
+            }
+            var resolved_request = request;
+            resolved_request.model = target.model;
+            return target.provider.streamChat(allocator, resolved_request, target.model, temperature, callback, callback_ctx);
+        }
+
         // Streaming cannot recover mid-stream (doing so would require buffering the
         // entire response, defeating the purpose of streaming). Provider selection is
         // therefore proactive: pick the first vision-capable provider before starting.
         // Note: model-chain fallback is not supported in the streaming path — this is
         // a pre-existing limitation and is not regressed by this change.
-        const needs_vision = hasImageParts(request);
         if (!needs_vision or self.inner.supportsVisionForModel(model)) {
             return self.inner.streamChat(allocator, request, model, temperature, callback, callback_ctx);
         }
@@ -563,6 +672,8 @@ pub const ReliableProvider = struct {
 
     fn supportsVisionForModelImpl(ptr: *anyopaque, model: []const u8) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const target = self.resolveProviderTarget(model);
+        if (target.explicit) return target.provider.supportsVisionForModel(target.model);
         if (self.inner.supportsVisionForModel(model)) return true;
         for (self.extras) |entry| {
             if (entry.provider.supportsVisionForModel(model)) return true;
