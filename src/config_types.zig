@@ -385,6 +385,7 @@ pub const EmailConfig = struct {
     password: []const u8 = "",
     from_address: []const u8 = "",
     poll_interval_secs: u64 = 60,
+    max_body_bytes: u64 = 51200,
     allow_from: []const []const u8 = &.{},
     consent_granted: bool = true,
 };

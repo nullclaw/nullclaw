@@ -55,7 +55,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .lark, .key = "lark", .label = "Lark", .configured_message = "Lark configured", .listener_mode = .webhook_only },
     .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .send_only },
     .{ .id = .signal, .key = "signal", .label = "Signal", .configured_message = "Signal configured", .listener_mode = .polling },
-    .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .send_only },
+    .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .polling },
     .{ .id = .line, .key = "line", .label = "Line", .configured_message = "Line configured", .listener_mode = .webhook_only },
     .{ .id = .qq, .key = "qq", .label = "QQ", .configured_message = "QQ configured", .listener_mode = .gateway_loop },
     .{ .id = .onebot, .key = "onebot", .label = "OneBot", .configured_message = "OneBot configured", .listener_mode = .gateway_loop },

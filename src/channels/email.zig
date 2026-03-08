@@ -8,9 +8,11 @@ pub const EmailChannel = struct {
     config: config_types.EmailConfig,
     /// Tracks last Message-ID per sender for In-Reply-To/References headers.
     reply_message_ids: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Dedup set for seen IMAP UIDs (prevents reprocessing).
+    seen_uids: BoundedSeenSet,
 
     pub fn init(allocator: std.mem.Allocator, config: config_types.EmailConfig) EmailChannel {
-        return .{ .allocator = allocator, .config = config, .reply_message_ids = .empty };
+        return .{ .allocator = allocator, .config = config, .reply_message_ids = .empty, .seen_uids = BoundedSeenSet.init(allocator, 500) };
     }
 
     pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.EmailConfig) EmailChannel {
@@ -24,6 +26,7 @@ pub const EmailChannel = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.reply_message_ids.deinit(self.allocator);
+        self.seen_uids.deinit();
     }
 
     /// Record a Message-ID for a sender (for threading replies).
@@ -77,7 +80,7 @@ pub const EmailChannel = struct {
 
     // ── Channel vtable ──────────────────────────────────────────────
 
-    /// Send an email via SMTP.
+    /// Send an email via SMTP using curl (supports STARTTLS).
     /// If message starts with "Subject: <line>\n", extracts the subject.
     /// Otherwise uses a default subject.
     pub fn sendMessage(self: *EmailChannel, recipient: []const u8, message: []const u8) !void {
@@ -93,63 +96,159 @@ pub const EmailChannel = struct {
             }
         }
 
-        // Connect to SMTP server via TCP
-        const addr = std.net.Address.resolveIp(self.config.smtp_host, self.config.smtp_port) catch return error.SmtpConnectError;
-        const stream = std.net.tcpConnectToAddress(addr) catch return error.SmtpConnectError;
-        defer stream.close();
+        // Build HTML version of body (escape HTML entities, convert newlines to <br>)
+        var html_body: std.ArrayListUnmanaged(u8) = .empty;
+        defer html_body.deinit(self.allocator);
+        for (body) |c| {
+            switch (c) {
+                '&' => html_body.appendSlice(self.allocator, "&amp;") catch return error.SmtpError,
+                '<' => html_body.appendSlice(self.allocator, "&lt;") catch return error.SmtpError,
+                '>' => html_body.appendSlice(self.allocator, "&gt;") catch return error.SmtpError,
+                '\n' => html_body.appendSlice(self.allocator, "<br>\r\n") catch return error.SmtpError,
+                else => html_body.append(self.allocator, c) catch return error.SmtpError,
+            }
+        }
 
-        // Read greeting
-        var greeting_buf: [1024]u8 = undefined;
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
+        const boundary = "----=_nullclaw_boundary_001";
 
-        // EHLO
-        var ehlo_buf: [256]u8 = undefined;
-        var ehlo_fbs = std.io.fixedBufferStream(&ehlo_buf);
-        try ehlo_fbs.writer().print("EHLO nullclaw\r\n", .{});
-        try stream.writeAll(ehlo_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
+        // Build email content as multipart/alternative (plain + HTML)
+        var email_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer email_list.deinit(self.allocator);
+        const ew = email_list.writer(self.allocator);
 
-        // MAIL FROM
-        var from_buf: [512]u8 = undefined;
-        var from_fbs = std.io.fixedBufferStream(&from_buf);
-        try from_fbs.writer().print("MAIL FROM:<{s}>\r\n", .{self.config.from_address});
-        try stream.writeAll(from_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
-
-        // RCPT TO
-        var rcpt_buf: [512]u8 = undefined;
-        var rcpt_fbs = std.io.fixedBufferStream(&rcpt_buf);
-        try rcpt_fbs.writer().print("RCPT TO:<{s}>\r\n", .{recipient});
-        try stream.writeAll(rcpt_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
-
-        // DATA
-        try stream.writeAll("DATA\r\n");
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
-
-        // Build email headers + body
-        var data_buf: [16384]u8 = undefined;
-        var data_fbs = std.io.fixedBufferStream(&data_buf);
-        const dw = data_fbs.writer();
-        try dw.print("From: {s}\r\n", .{self.config.from_address});
-        try dw.print("To: {s}\r\n", .{recipient});
-        try dw.print("Subject: {s}\r\n", .{subject});
+        try ew.print("From: {s}\r\n", .{self.config.from_address});
+        try ew.print("To: {s}\r\n", .{recipient});
+        try ew.print("Subject: {s}\r\n", .{subject});
+        try ew.writeAll("MIME-Version: 1.0\r\n");
 
         // Add In-Reply-To/References headers if we have a tracked message-id
         if (self.reply_message_ids.get(recipient)) |msg_id| {
-            try dw.print("In-Reply-To: <{s}>\r\n", .{msg_id});
-            try dw.print("References: <{s}>\r\n", .{msg_id});
+            try ew.print("In-Reply-To: <{s}>\r\n", .{msg_id});
+            try ew.print("References: <{s}>\r\n", .{msg_id});
         }
 
-        try dw.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
-        try dw.writeAll("\r\n");
-        try dw.writeAll(body);
-        try dw.writeAll("\r\n.\r\n");
-        try stream.writeAll(data_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
+        try ew.print("Content-Type: multipart/alternative; boundary=\"{s}\"\r\n", .{boundary});
+        try ew.writeAll("\r\n");
 
-        // QUIT
-        try stream.writeAll("QUIT\r\n");
+        // Plain text part
+        try ew.print("--{s}\r\n", .{boundary});
+        try ew.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll(body);
+        try ew.writeAll("\r\n");
+
+        // HTML part
+        try ew.print("--{s}\r\n", .{boundary});
+        try ew.writeAll("Content-Type: text/html; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll(html_body.items);
+        try ew.writeAll("\r\n");
+
+        // End boundary
+        try ew.print("--{s}--\r\n", .{boundary});
+
+        const email_data = email_list.items;
+
+        // Build SMTP URL
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("smtp://{s}:{d}", .{ self.config.smtp_host, self.config.smtp_port });
+        const smtp_url = url_fbs.getWritten();
+
+        // Build user:pass
+        var user_buf: [512]u8 = undefined;
+        var user_fbs = std.io.fixedBufferStream(&user_buf);
+        try user_fbs.writer().print("{s}:{s}", .{ self.config.username, self.config.password });
+        const user_str = user_fbs.getWritten();
+
+        // Build --mail-from and --mail-rcpt
+        var from_arg_buf: [256]u8 = undefined;
+        var from_arg_fbs = std.io.fixedBufferStream(&from_arg_buf);
+        try from_arg_fbs.writer().print("{s}", .{self.config.from_address});
+        const from_arg = from_arg_fbs.getWritten();
+
+        var rcpt_arg_buf: [256]u8 = undefined;
+        var rcpt_arg_fbs = std.io.fixedBufferStream(&rcpt_arg_buf);
+        try rcpt_arg_fbs.writer().print("{s}", .{recipient});
+        const rcpt_arg = rcpt_arg_fbs.getWritten();
+
+        var argv_buf: [20][]const u8 = undefined;
+        var argc: usize = 0;
+
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = "30";
+        argc += 1;
+
+        // STARTTLS when smtp_tls is enabled
+        if (self.config.smtp_tls) {
+            argv_buf[argc] = "--ssl-reqd";
+            argc += 1;
+        }
+
+        argv_buf[argc] = "--url";
+        argc += 1;
+        argv_buf[argc] = smtp_url;
+        argc += 1;
+        argv_buf[argc] = "-u";
+        argc += 1;
+        argv_buf[argc] = user_str;
+        argc += 1;
+        argv_buf[argc] = "--mail-from";
+        argc += 1;
+        argv_buf[argc] = from_arg;
+        argc += 1;
+        argv_buf[argc] = "--mail-rcpt";
+        argc += 1;
+        argv_buf[argc] = rcpt_arg;
+        argc += 1;
+        argv_buf[argc] = "--upload-file";
+        argc += 1;
+        argv_buf[argc] = "-";
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+
+        // Write email data to stdin
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(email_data) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.SmtpError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        }
+
+        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        };
+        defer self.allocator.free(stdout);
+
+        const term = child.wait() catch return error.SmtpError;
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.SmtpError,
+            else => return error.SmtpError,
+        }
     }
 
     /// Send a reply email — applies Re: prefix to subject and includes threading headers.
@@ -174,6 +273,223 @@ pub const EmailChannel = struct {
         // Read response (discard for now)
         var resp_buf: [1024]u8 = undefined;
         _ = stream.read(&resp_buf) catch return error.ImapError;
+    }
+
+    // ── IMAP Polling via curl ──────────────────────────────────────
+
+    /// Run a curl IMAP command and return stdout. Caller owns returned memory.
+    pub fn imapCurl(self: *EmailChannel, allocator: std.mem.Allocator, url: []const u8, custom_request: ?[]const u8) ![]u8 {
+        var argv_buf: [16][]const u8 = undefined;
+        var argc: usize = 0;
+
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = "30";
+        argc += 1;
+
+        // Auth
+        var user_buf: [512]u8 = undefined;
+        var user_fbs = std.io.fixedBufferStream(&user_buf);
+        user_fbs.writer().print("{s}:{s}", .{ self.config.username, self.config.password }) catch return error.ImapError;
+        const user_str = user_fbs.getWritten();
+
+        argv_buf[argc] = "-u";
+        argc += 1;
+        argv_buf[argc] = user_str;
+        argc += 1;
+
+        if (custom_request) |req| {
+            argv_buf[argc] = "-X";
+            argc += 1;
+            argv_buf[argc] = req;
+            argc += 1;
+        }
+
+        argv_buf[argc] = url;
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+
+        const stdout = child.stdout.?.readToEndAlloc(allocator, 512 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.ImapError;
+        };
+
+        const term = child.wait() catch {
+            allocator.free(stdout);
+            return error.ImapError;
+        };
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                allocator.free(stdout);
+                return error.ImapError;
+            },
+            else => {
+                allocator.free(stdout);
+                return error.ImapError;
+            },
+        }
+
+        return stdout;
+    }
+
+    /// Poll for new IMAP messages. Returns slice of ChannelMessages. Caller owns all memory.
+    pub fn pollMessages(self: *EmailChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
+        // Build IMAP URL
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        url_fbs.writer().print("imaps://{s}:{d}/{s}", .{
+            self.config.imap_host, self.config.imap_port, self.config.imap_folder,
+        }) catch return error.ImapError;
+        const base_url = url_fbs.getWritten();
+
+        // SEARCH UNSEEN
+        const search_result = try self.imapCurl(allocator, base_url, "SEARCH UNSEEN");
+        defer allocator.free(search_result);
+
+        // Parse UIDs from "* SEARCH 1 2 3\r\n" response
+        var uids: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (uids.items) |uid| allocator.free(uid);
+            uids.deinit(allocator);
+        }
+
+        var lines = std.mem.splitSequence(u8, search_result, "\n");
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            // Look for "* SEARCH <uid> <uid> ..."
+            if (std.mem.startsWith(u8, trimmed, "* SEARCH")) {
+                var tokens = std.mem.tokenizeScalar(u8, trimmed["* SEARCH".len..], ' ');
+                while (tokens.next()) |token| {
+                    const clean = std.mem.trim(u8, token, " \t\r\n");
+                    if (clean.len == 0) continue;
+                    // Validate it's numeric
+                    var is_num = true;
+                    for (clean) |c| {
+                        if (!std.ascii.isDigit(c)) { is_num = false; break; }
+                    }
+                    if (is_num) {
+                        try uids.append(allocator, try allocator.dupe(u8, clean));
+                    }
+                }
+            }
+        }
+
+        var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+        errdefer {
+            for (messages.items) |msg| msg.deinit(allocator);
+            messages.deinit(allocator);
+        }
+
+        for (uids.items) |uid| {
+            // Skip already seen UIDs
+            if (self.seen_uids.contains(uid)) continue;
+
+            // Fetch the message
+            var fetch_url_buf: [576]u8 = undefined;
+            var fetch_fbs = std.io.fixedBufferStream(&fetch_url_buf);
+            fetch_fbs.writer().print("imaps://{s}:{d}/{s};UID={s}", .{
+                self.config.imap_host, self.config.imap_port, self.config.imap_folder, uid,
+            }) catch continue;
+            const fetch_url = fetch_fbs.getWritten();
+
+            const raw_email = self.imapCurl(allocator, fetch_url, null) catch |err| {
+                log.warn("Failed to fetch UID {s}: {}", .{ uid, err });
+                continue;
+            };
+            defer allocator.free(raw_email);
+
+            // Parse the email
+            const parsed = parseRawEmail(raw_email);
+            const sender_addr = extractEmailAddress(parsed.from);
+
+            // Check sender allowlist
+            if (!self.isSenderAllowed(sender_addr)) {
+                log.info("Email from non-allowed sender: {s}", .{sender_addr});
+                // Still mark as seen to avoid reprocessing
+                _ = self.seen_uids.insert(uid) catch {};
+                // Mark as read on server
+                self.imapStoreSeen(allocator, base_url, uid);
+                continue;
+            }
+
+            // Extract body
+            var body_text = extractTextBody(allocator, raw_email) catch continue;
+            defer allocator.free(body_text);
+
+            // Truncate if needed
+            const max_bytes = self.config.max_body_bytes;
+            var final_content: []u8 = undefined;
+
+            if (body_text.len > max_bytes) {
+                const truncated_marker = std.fmt.allocPrint(allocator, "{s}\n[TRUNCATED - original was {d} bytes]", .{
+                    body_text[0..max_bytes], body_text.len,
+                }) catch continue;
+                final_content = truncated_marker;
+            } else {
+                final_content = allocator.dupe(u8, body_text) catch continue;
+            }
+
+            // Injection check + untrusted wrapping
+            if (basicInjectionCheck(final_content)) {
+                log.warn("Injection pattern detected in email from {s}", .{sender_addr});
+                allocator.free(final_content);
+                _ = self.seen_uids.insert(uid) catch {};
+                self.imapStoreSeen(allocator, base_url, uid);
+                continue;
+            }
+
+            // Wrap in untrusted markers
+            const wrapped = std.fmt.allocPrint(allocator, "[UNTRUSTED_EMAIL_START]\nFrom: {s}\nSubject: {s}\n\n{s}\n[UNTRUSTED_EMAIL_END]", .{
+                sender_addr, parsed.subject, final_content,
+            }) catch {
+                allocator.free(final_content);
+                continue;
+            };
+            allocator.free(final_content);
+
+            // Track Message-ID for threading
+            if (parsed.message_id.len > 0) {
+                self.trackMessageId(sender_addr, parsed.message_id) catch {};
+            }
+
+            // Build ChannelMessage
+            try messages.append(allocator, .{
+                .id = allocator.dupe(u8, uid) catch continue,
+                .sender = allocator.dupe(u8, sender_addr) catch continue,
+                .content = wrapped,
+                .channel = "email",
+                .timestamp = root.nowEpochSecs(),
+                .reply_target = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sender_addr, parsed.subject }) catch null,
+            });
+
+            // Mark seen
+            _ = self.seen_uids.insert(uid) catch {};
+            self.imapStoreSeen(allocator, base_url, uid);
+        }
+
+        // Sleep for poll_interval is handled by the loop caller
+        return messages.toOwnedSlice(allocator);
+    }
+
+    /// Mark a UID as \Seen via curl IMAP STORE command.
+    fn imapStoreSeen(self: *EmailChannel, allocator: std.mem.Allocator, base_url: []const u8, uid: []const u8) void {
+        var cmd_buf: [128]u8 = undefined;
+        var cmd_fbs = std.io.fixedBufferStream(&cmd_buf);
+        cmd_fbs.writer().print("STORE {s} +FLAGS (\\Seen)", .{uid}) catch return;
+        const cmd = cmd_fbs.getWritten();
+        const result = self.imapCurl(allocator, base_url, cmd) catch return;
+        allocator.free(result);
     }
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
@@ -374,6 +690,113 @@ pub fn decodeRfc2047(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+const log = std.log.scoped(.email);
+
+/// Parsed email headers.
+const ParsedEmail = struct {
+    from: []const u8,
+    subject: []const u8,
+    message_id: []const u8,
+    date: []const u8,
+};
+
+/// Parse raw email headers. Returns slices into the input (no allocation).
+pub fn parseRawEmail(raw: []const u8) ParsedEmail {
+    var result = ParsedEmail{
+        .from = "",
+        .subject = "",
+        .message_id = "",
+        .date = "",
+    };
+
+    // Find end of headers (blank line)
+    const header_end = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |pos|
+        pos
+    else if (std.mem.indexOf(u8, raw, "\n\n")) |pos|
+        pos
+    else
+        raw.len;
+
+    const headers = raw[0..header_end];
+
+    var lines_iter = std.mem.splitSequence(u8, headers, "\n");
+    while (lines_iter.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (std.ascii.startsWithIgnoreCase(trimmed, "From: ")) {
+            result.from = std.mem.trim(u8, trimmed["From: ".len..], " \t");
+        } else if (std.ascii.startsWithIgnoreCase(trimmed, "Subject: ")) {
+            result.subject = std.mem.trim(u8, trimmed["Subject: ".len..], " \t");
+        } else if (std.ascii.startsWithIgnoreCase(trimmed, "Message-ID: ")) {
+            const mid = std.mem.trim(u8, trimmed["Message-ID: ".len..], " \t");
+            // Strip angle brackets
+            if (mid.len > 2 and mid[0] == '<' and mid[mid.len - 1] == '>') {
+                result.message_id = mid[1 .. mid.len - 1];
+            } else {
+                result.message_id = mid;
+            }
+        } else if (std.ascii.startsWithIgnoreCase(trimmed, "Date: ")) {
+            result.date = std.mem.trim(u8, trimmed["Date: ".len..], " \t");
+        }
+    }
+
+    return result;
+}
+
+/// Extract bare email address from a From header value.
+/// "John Doe <john@example.com>" → "john@example.com"
+/// "john@example.com" → "john@example.com"
+pub fn extractEmailAddress(from: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, from, "<")) |start| {
+        if (std.mem.indexOf(u8, from[start..], ">")) |end| {
+            return from[start + 1 .. start + end];
+        }
+    }
+    // No angle brackets — return the whole thing trimmed
+    return std.mem.trim(u8, from, " \t");
+}
+
+/// Extract text body from raw email. Strips HTML if no text/plain found.
+/// Caller owns returned memory.
+pub fn extractTextBody(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    // Find body start (after blank line)
+    const body_start = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |pos|
+        pos + 4
+    else if (std.mem.indexOf(u8, raw, "\n\n")) |pos|
+        pos + 2
+    else
+        return allocator.dupe(u8, "");
+
+    if (body_start >= raw.len) return allocator.dupe(u8, "");
+
+    const body = raw[body_start..];
+
+    // Check if it looks like HTML
+    if (std.mem.indexOf(u8, body, "<html") != null or
+        std.mem.indexOf(u8, body, "<HTML") != null or
+        std.mem.indexOf(u8, body, "<body") != null or
+        std.mem.indexOf(u8, body, "<BODY") != null)
+    {
+        return stripHtml(allocator, body);
+    }
+
+    return allocator.dupe(u8, body);
+}
+
+/// Basic injection pattern check. Returns true if suspicious.
+pub fn basicInjectionCheck(content: []const u8) bool {
+    const patterns = [_][]const u8{
+        "SYSTEM:",
+        "ASSISTANT:",
+        "[INST]",
+        "<<SYS>>",
+        "ignore previous instructions",
+    };
+    for (patterns) |pattern| {
+        if (std.ascii.indexOfIgnoreCase(content, pattern) != null) return true;
+    }
+    return false;
 }
 
 const EncodedWord = struct {
@@ -797,5 +1220,103 @@ test "markMessageSeen method exists" {
     var ch = EmailChannel.init(std.testing.allocator, .{});
     defer ch.deinit();
     const info = @typeInfo(@TypeOf(EmailChannel.markMessageSeen));
+    try std.testing.expect(info == .@"fn");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// IMAP Polling Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "parseRawEmail extracts headers" {
+    const raw =
+        "From: Alice <alice@example.com>\r\n" ++
+        "Subject: Test Subject\r\n" ++
+        "Message-ID: <msg-001@example.com>\r\n" ++
+        "Date: Mon, 1 Jan 2024 12:00:00 +0000\r\n" ++
+        "\r\n" ++
+        "Body text here";
+    const parsed = parseRawEmail(raw);
+    try std.testing.expectEqualStrings("Alice <alice@example.com>", parsed.from);
+    try std.testing.expectEqualStrings("Test Subject", parsed.subject);
+    try std.testing.expectEqualStrings("msg-001@example.com", parsed.message_id);
+    try std.testing.expectEqualStrings("Mon, 1 Jan 2024 12:00:00 +0000", parsed.date);
+}
+
+test "parseRawEmail handles missing headers" {
+    const raw = "Content-Type: text/plain\r\n\r\nJust body";
+    const parsed = parseRawEmail(raw);
+    try std.testing.expectEqualStrings("", parsed.from);
+    try std.testing.expectEqualStrings("", parsed.subject);
+    try std.testing.expectEqualStrings("", parsed.message_id);
+}
+
+test "extractEmailAddress with angle brackets" {
+    try std.testing.expectEqualStrings("alice@example.com", extractEmailAddress("Alice <alice@example.com>"));
+}
+
+test "extractEmailAddress bare address" {
+    try std.testing.expectEqualStrings("alice@example.com", extractEmailAddress("alice@example.com"));
+}
+
+test "extractEmailAddress with name and quotes" {
+    try std.testing.expectEqualStrings("bob@test.com", extractEmailAddress("\"Bob Smith\" <bob@test.com>"));
+}
+
+test "extractTextBody plain text" {
+    const allocator = std.testing.allocator;
+    const raw = "From: test@test.com\r\n\r\nHello World";
+    const body = try extractTextBody(allocator, raw);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("Hello World", body);
+}
+
+test "extractTextBody strips HTML" {
+    const allocator = std.testing.allocator;
+    const raw = "From: test@test.com\r\n\r\n<html><body><p>Hello</p></body></html>";
+    const body = try extractTextBody(allocator, raw);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("Hello", body);
+}
+
+test "extractTextBody empty body" {
+    const allocator = std.testing.allocator;
+    const raw = "From: test@test.com\r\n\r\n";
+    const body = try extractTextBody(allocator, raw);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("", body);
+}
+
+test "basicInjectionCheck detects patterns" {
+    try std.testing.expect(basicInjectionCheck("Hello SYSTEM: do something"));
+    try std.testing.expect(basicInjectionCheck("Please [INST] follow this"));
+    try std.testing.expect(basicInjectionCheck("ignore previous instructions and do X"));
+    try std.testing.expect(basicInjectionCheck("<<SYS>> new system prompt"));
+    try std.testing.expect(basicInjectionCheck("ASSISTANT: I will now"));
+}
+
+test "basicInjectionCheck passes clean content" {
+    try std.testing.expect(!basicInjectionCheck("Hello, how are you?"));
+    try std.testing.expect(!basicInjectionCheck("Meeting at 3pm tomorrow"));
+    try std.testing.expect(!basicInjectionCheck(""));
+}
+
+test "max_body_bytes config default" {
+    const config = config_types.EmailConfig{};
+    try std.testing.expectEqual(@as(u64, 51200), config.max_body_bytes);
+}
+
+test "seen_uids initialized in EmailChannel" {
+    var ch = EmailChannel.init(std.testing.allocator, .{});
+    defer ch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ch.seen_uids.len());
+}
+
+test "pollMessages method exists" {
+    const info = @typeInfo(@TypeOf(EmailChannel.pollMessages));
+    try std.testing.expect(info == .@"fn");
+}
+
+test "imapCurl method exists" {
+    const info = @typeInfo(@TypeOf(EmailChannel.imapCurl));
     try std.testing.expect(info == .@"fn");
 }
