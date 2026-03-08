@@ -45,6 +45,13 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw agent -m "..."` | Run a single prompt |
 | `nullclaw agent` | Start interactive chat mode |
 
+### Interactive model routing
+
+- In `nullclaw agent`, `/model` shows the current model plus configured routing/fallback status.
+- `/model <provider/model>` pins the current session to that model and disables automatic routing.
+- `/model auto` clears the user pin and re-enables `model_routes` for later turns in the same session.
+- Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
+
 ## Runtime and operations
 
 | Command | Purpose |

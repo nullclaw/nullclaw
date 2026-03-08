@@ -109,6 +109,32 @@ Example:
 - Sets default model route, typically `provider/vendor/model`.
 - Example: `openrouter/anthropic/claude-sonnet-4`
 
+### `model_routes`
+
+- Optional top-level routing table for automatic per-turn model selection in `nullclaw agent`.
+- Each entry maps a route `hint` to a concrete `provider` and `model`.
+- Recognized routing hints in the current daemon are `fast`, `balanced`, `deep`, `reasoning`, and `vision`.
+- `balanced` is the normal fallback when configured. `fast` is preferred for short status/list/check prompts. `deep` and `reasoning` are preferred for investigation, planning, and longer contexts. `vision` is used for image turns.
+- `api_key` is optional. If omitted, NullClaw uses the normal credential from `models.providers.<provider>`.
+
+Example:
+
+```json
+{
+  "model_routes": [
+    { "hint": "fast", "provider": "groq", "model": "llama-3.3-70b" },
+    { "hint": "balanced", "provider": "openrouter", "model": "anthropic/claude-sonnet-4" },
+    { "hint": "deep", "provider": "openrouter", "model": "anthropic/claude-opus-4" },
+    { "hint": "vision", "provider": "openrouter", "model": "openai/gpt-4.1" }
+  ]
+}
+```
+
+Notes:
+
+- `model_routes` are used only when the session is not pinned to an explicit model.
+- If both `deep` and `reasoning` are configured, deep-analysis prompts prefer `deep`.
+
 ### `channels`
 
 - Channel config lives under `channels.<name>`.

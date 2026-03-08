@@ -95,6 +95,32 @@ nullclaw onboard --interactive
 - 设置默认模型路由，格式通常为：`provider/vendor/model`。
 - 示例：`openrouter/anthropic/claude-sonnet-4`
 
+### `model_routes`
+
+- 顶层可选路由表，用于 `nullclaw agent` 在每一轮对话里自动选择模型。
+- 每个条目用 `hint` 映射到具体的 `provider` 和 `model`。
+- 当前 daemon 识别的路由提示词包括：`fast`、`balanced`、`deep`、`reasoning`、`vision`。
+- 配置了 `balanced` 时，它会作为常规兜底路线。`fast` 更适合简短的状态/列表/检查类请求。`deep` 和 `reasoning` 更适合调查、规划和长上下文。`vision` 用于图片输入回合。
+- `api_key` 是可选的；如果不填，会继续使用 `models.providers.<provider>` 里的常规凭据。
+
+示例：
+
+```json
+{
+  "model_routes": [
+    { "hint": "fast", "provider": "groq", "model": "llama-3.3-70b" },
+    { "hint": "balanced", "provider": "openrouter", "model": "anthropic/claude-sonnet-4" },
+    { "hint": "deep", "provider": "openrouter", "model": "anthropic/claude-opus-4" },
+    { "hint": "vision", "provider": "openrouter", "model": "openai/gpt-4.1" }
+  ]
+}
+```
+
+说明：
+
+- 只有在当前会话没有被显式 pin 到某个模型时，`model_routes` 才会生效。
+- 如果同时配置了 `deep` 和 `reasoning`，深度分析类请求会优先选择 `deep`。
+
 ### `channels`
 
 - 渠道配置统一在 `channels.<name>` 下。
