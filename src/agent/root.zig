@@ -3861,6 +3861,32 @@ test "auto route is disabled when model is pinned" {
     try std.testing.expect((try agent.routeModelNameForTurn(allocator, "show current status")) == null);
 }
 
+test "auto route selection benchmark stays below visible overhead" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4" },
+        .{ .hint = "vision", .provider = "openrouter", .model = "openai/gpt-4.1" },
+    };
+
+    const iterations: usize = 50_000;
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const hint = agent.selectRouteHintForTurn("show current status");
+        try std.testing.expect(hint != null);
+        try std.testing.expectEqualStrings("fast", hint.?);
+    }
+    const elapsed_ns = timer.read();
+    const avg_ns = elapsed_ns / iterations;
+
+    // Heuristic routing should stay far below human-visible latency.
+    try std.testing.expect(avg_ns < 200_000);
+}
+
 test "slash /model auto clears pin and invalidates cached prompt model" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
