@@ -120,9 +120,23 @@ pub const ShellTool = struct {
             }
         }
 
+        // On Windows, force UTF-8 output encoding to prevent GBK garbled text
+        if (comptime @import("builtin").os.tag == .windows) {
+            try env.put("PYTHONUTF8", "1");
+            try env.put("PYTHONIOENCODING", "utf-8");
+        }
+
         // Execute via platform shell
         const proc = @import("process_util.zig");
-        const result = try proc.run(allocator, &.{ platform.getShell(), platform.getShellFlag(), command }, .{
+
+        // On Windows, prepend 'chcp 65001 >nul && ' to force UTF-8 codepage for cmd.exe output
+        const final_command = if (comptime @import("builtin").os.tag == .windows) blk: {
+            const utf8_prefix = "chcp 65001 >nul 2>&1 && ";
+            break :blk try std.fmt.allocPrint(allocator, "{s}{s}", .{ utf8_prefix, command });
+        } else command;
+        defer if (comptime @import("builtin").os.tag == .windows) allocator.free(final_command);
+
+        const result = try proc.run(allocator, &.{ platform.getShell(), platform.getShellFlag(), final_command }, .{
             .cwd = effective_cwd,
             .env_map = &env,
             .max_output_bytes = self.max_output_bytes,

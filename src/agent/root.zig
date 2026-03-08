@@ -1851,7 +1851,7 @@ pub const Agent = struct {
             const preview = llmLogPreview(msg.content);
             const parts_count: usize = if (msg.content_parts) |parts| parts.len else 0;
             log.info(
-                "llm request msg session=0x{x} iter={d} attempt={d} index={d} role={s} bytes={d} parts={d} content={f}{s}",
+                "llm request msg session=0x{x} iter={d} attempt={d} index={d} role={s} bytes={d} parts={d} content={s}{s}",
                 .{
                     session_hash,
                     iteration,
@@ -1860,7 +1860,7 @@ pub const Agent = struct {
                     msg.role.toSlice(),
                     msg.content.len,
                     parts_count,
-                    std.json.fmt(preview.slice, .{}),
+                    preview.slice,
                     if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
@@ -1873,7 +1873,7 @@ pub const Agent = struct {
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={s}{s}",
             .{
                 session_hash,
                 iteration,
@@ -1883,7 +1883,7 @@ pub const Agent = struct {
                 content.len,
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
-                std.json.fmt(preview.slice, .{}),
+                preview.slice,
                 if (preview.truncated) " [log preview truncated]" else "",
             },
         );
@@ -1891,13 +1891,13 @@ pub const Agent = struct {
         if (response.reasoning_content) |reasoning| {
             const r_preview = llmLogPreview(reasoning);
             log.info(
-                "llm response reasoning session=0x{x} iter={d} attempt={d} bytes={d} content={f}{s}",
+                "llm response reasoning session=0x{x} iter={d} attempt={d} bytes={d} content={s}{s}",
                 .{
                     session_hash,
                     iteration,
                     attempt,
                     reasoning.len,
-                    std.json.fmt(r_preview.slice, .{}),
+                    r_preview.slice,
                     if (r_preview.truncated) " [log preview truncated]" else "",
                 },
             );
@@ -1906,7 +1906,7 @@ pub const Agent = struct {
         for (response.tool_calls, 0..) |tc, idx| {
             const args_preview = llmLogPreview(tc.arguments);
             log.info(
-                "llm response tool-call session=0x{x} iter={d} attempt={d} index={d} id={s} name={s} args={f}{s}",
+                "llm response tool-call session=0x{x} iter={d} attempt={d} index={d} id={s} name={s} args={s}{s}",
                 .{
                     session_hash,
                     iteration,
@@ -1914,7 +1914,7 @@ pub const Agent = struct {
                     idx + 1,
                     if (tc.id.len > 0) tc.id else "-",
                     tc.name,
-                    std.json.fmt(args_preview.slice, .{}),
+                    args_preview.slice,
                     if (args_preview.truncated) " [log preview truncated]" else "",
                 },
             );
