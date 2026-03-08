@@ -3891,6 +3891,12 @@ test "slash /model auto clears pin and invalidates cached prompt model" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+    agent.model_name = "gpt-4o";
+    agent.model_name_owned = false;
     agent.model_pinned_by_user = true;
     agent.has_system_prompt = true;
     agent.system_prompt_has_conversation_context = true;
@@ -3899,11 +3905,40 @@ test "slash /model auto clears pin and invalidates cached prompt model" {
     const response = (try agent.handleSlashCommand("/model auto")).?;
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("Automatic model routing enabled.", response);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "Automatic model routing enabled. Reverted to the configured default model: {s}",
+        .{agent.default_model},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, response);
     try std.testing.expect(!agent.model_pinned_by_user);
+    try std.testing.expectEqualStrings(agent.default_model, agent.model_name);
     try std.testing.expect(!agent.has_system_prompt);
     try std.testing.expect(!agent.system_prompt_has_conversation_context);
     try std.testing.expect(agent.system_prompt_model_name == null);
+}
+
+test "slash /model auto without routes restores default model and explains routing is not configured" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_name = "gpt-4o";
+    agent.model_name_owned = false;
+    agent.model_pinned_by_user = true;
+
+    const response = (try agent.handleSlashCommand("/model auto")).?;
+    defer allocator.free(response);
+
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "Automatic model routing is not configured. Reverted to the configured default model: {s}",
+        .{agent.default_model},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expect(!agent.model_pinned_by_user);
+    try std.testing.expectEqualStrings(agent.default_model, agent.model_name);
 }
 
 test "slash /model pins explicit selection" {

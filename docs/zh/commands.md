@@ -35,7 +35,8 @@
 
 - 在 `nullclaw agent` 里，`/model` 会显示当前模型以及已配置的路由/回退状态。
 - `/model <provider/model>` 会把当前会话 pin 到该模型，并关闭自动路由。
-- `/model auto` 会清除这个用户 pin，让同一会话后续回合重新使用 `model_routes`。
+- `/model auto` 会清除这个用户 pin，把会话恢复到配置里的默认模型，并让后续回合重新使用 `model_routes`。
+- 如果没有配置 `model_routes`，`/model auto` 仍然会清除 pin，并把会话切回配置里的默认模型。
 - 通过 `--model` 或 `--provider` 启动 `nullclaw agent` 时，也会把该次运行 pin 到显式模型，从而绕过 `model_routes`。
 
 ## 运行与运维

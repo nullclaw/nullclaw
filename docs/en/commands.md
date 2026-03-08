@@ -49,7 +49,8 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 
 - In `nullclaw agent`, `/model` shows the current model plus configured routing/fallback status.
 - `/model <provider/model>` pins the current session to that model and disables automatic routing.
-- `/model auto` clears the user pin and re-enables `model_routes` for later turns in the same session.
+- `/model auto` clears the user pin, restores the configured default model, and re-enables `model_routes` for later turns in the same session.
+- If no `model_routes` are configured, `/model auto` still clears the pin and returns the session to the configured default model.
 - Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
 
 ## Runtime and operations
