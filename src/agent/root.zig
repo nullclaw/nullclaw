@@ -1750,7 +1750,7 @@ pub const Agent = struct {
         args_json: []const u8,
         workspace_dir: []const u8,
     ) ![]const u8 {
-        var result = std.ArrayListUnmanaged(u8){};
+        var result: std.ArrayListUnmanaged(u8) = .empty;
         errdefer result.deinit(allocator);
 
         var pos: usize = 0;
@@ -2197,7 +2197,7 @@ pub const Agent = struct {
 
                         if (custom != null and custom.?.skip_llm_tpl != null) {
                             const tpl = custom.?.skip_llm_tpl.?;
-                            var output_buf = std.ArrayListUnmanaged(u8){};
+                            var output_buf: std.ArrayListUnmanaged(u8) = .empty;
                             try output_buf.ensureTotalCapacity(self.allocator, tpl.len + result.output.len);
                             defer output_buf.deinit(self.allocator);
                             var pos: usize = 0;
