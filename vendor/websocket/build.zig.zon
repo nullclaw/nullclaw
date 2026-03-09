@@ -1,0 +1,12 @@
+.{
+	.name = .websocket,
+	.version = "0.1.0",
+	.dependencies = .{},
+	.fingerprint = 0x42ce80b97512f264,
+	.paths = .{
+		"readme.md",
+		"build.zig",
+		"build.zig.zon",
+		"src",
+	},
+}
