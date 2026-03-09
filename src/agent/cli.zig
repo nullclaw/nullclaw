@@ -29,10 +29,23 @@ const Agent = @import("root.zig").Agent;
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
+    emitted_chunks: bool = false,
 };
 
-fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
+fn initCliStreamCtx(ctx: *CliStreamCtx) void {
+    ctx.* = .{
+        .sink = .{
+            .callback = cliStreamSinkCallback,
+            .ctx = undefined,
+        },
+    };
+    ctx.sink.ctx = @ptrCast(ctx);
+}
+
+fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
+    const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    stream_ctx.emitted_chunks = true;
     var buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&buf);
     const wr = &bw.interface;
@@ -44,6 +57,10 @@ fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
 fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
     streaming.forwardProviderChunk(stream_ctx.sink, chunk);
+}
+
+fn shouldPrintBufferedResponse(supports_streaming: bool, emitted_chunks: bool) bool {
+    return !supports_streaming or !emitted_chunks;
 }
 
 fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
@@ -299,18 +316,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         defer agent.deinit();
 
         // Enable streaming if provider supports it
-        var stream_sink_ctx: u8 = 0;
-        var stream_ctx = CliStreamCtx{
-            .sink = .{
-                .callback = cliStreamSinkCallback,
-                .ctx = @ptrCast(&stream_sink_ctx),
-            },
-        };
+        var stream_ctx: CliStreamCtx = undefined;
+        initCliStreamCtx(&stream_ctx);
         if (supports_streaming) {
             agent.stream_callback = cliStreamCallback;
             agent.stream_ctx = @ptrCast(&stream_ctx);
         }
 
+        stream_ctx.emitted_chunks = false;
         const response = agent.turn(message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -326,10 +339,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        if (supports_streaming) {
-            try w.print("\n", .{});
-        } else {
+        if (shouldPrintBufferedResponse(supports_streaming, stream_ctx.emitted_chunks)) {
             try w.print("{s}\n", .{response});
+        } else {
+            try w.print("\n", .{});
         }
         try w.flush();
         return;
@@ -394,13 +407,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer agent.deinit();
 
     // Enable streaming if provider supports it
-    var stream_sink_ctx: u8 = 0;
-    var stream_ctx = CliStreamCtx{
-        .sink = .{
-            .callback = cliStreamSinkCallback,
-            .ctx = @ptrCast(&stream_sink_ctx),
-        },
-    };
+    var stream_ctx: CliStreamCtx = undefined;
+    initCliStreamCtx(&stream_ctx);
     if (supports_streaming) {
         agent.stream_callback = cliStreamCallback;
         agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -429,6 +437,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Append to history
         repl_history.append(allocator, allocator.dupe(u8, line) catch continue) catch {};
 
+        stream_ctx.emitted_chunks = false;
         const response = agent.turn(line) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -444,10 +453,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        if (supports_streaming) {
-            try w.print("\n\n", .{});
-        } else {
+        if (shouldPrintBufferedResponse(supports_streaming, stream_ctx.emitted_chunks)) {
             try w.print("\n{s}\n\n", .{response});
+        } else {
+            try w.print("\n\n", .{});
         }
         try w.flush();
     }
@@ -458,6 +467,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn noopSinkEvent(_: *anyopaque, _: streaming.Event) void {}
+
+test "initCliStreamCtx wires sink context to itself" {
+    var ctx: CliStreamCtx = undefined;
+    initCliStreamCtx(&ctx);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&ctx)), ctx.sink.ctx);
+}
+
+test "shouldPrintBufferedResponse only suppresses output after streamed chunks" {
+    try std.testing.expect(shouldPrintBufferedResponse(false, false));
+    try std.testing.expect(shouldPrintBufferedResponse(true, false));
+    try std.testing.expect(!shouldPrintBufferedResponse(true, true));
+}
 
 test "cliStreamCallback handles empty delta" {
     var sink_ctx: u8 = 0;
