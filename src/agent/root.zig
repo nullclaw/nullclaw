@@ -53,6 +53,238 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
     return @intCast((text.len + 3) / 4);
 }
 
+/// Check if a trigger keyword matches in the message with word boundary support.
+/// Returns true if:
+/// - The keyword appears as a whole word (not as part of another word)
+/// - No negation word precedes the keyword within reasonable distance
+fn matchTriggerKeyword(lower_msg: []const u8, keyword: []const u8) bool {
+    var lower_kw_buf: [256]u8 = undefined;
+    if (keyword.len > lower_kw_buf.len) return false;
+    const lower_kw = lower_kw_buf[0..keyword.len];
+    for (keyword, 0..) |c, i| {
+        lower_kw[i] = std.ascii.toLower(c);
+    }
+
+    var start_idx: usize = 0;
+    while (std.mem.indexOfPos(u8, lower_msg, start_idx, lower_kw)) |pos| {
+        const has_boundary_before = pos == 0 or
+            !std.ascii.isAlphanumeric(lower_msg[pos - 1]);
+
+        const end_pos = pos + lower_kw.len;
+        const has_boundary_after = end_pos >= lower_msg.len or
+            !std.ascii.isAlphanumeric(lower_msg[end_pos]);
+
+        if (has_boundary_before and has_boundary_after) {
+            if (!hasNegationBefore(lower_msg, pos)) {
+                return true;
+            }
+        }
+
+        start_idx = pos + 1;
+    }
+
+    return false;
+}
+
+/// Default modifiers to remove from user input (English)
+const DEFAULT_MODIFIERS = [_][]const u8{
+    "please",
+    "could you",
+    "can you",
+    "would you",
+    "now",
+    "go",
+    "start",
+    "ok",
+    "begin",
+    "do",
+    "execute",
+    "run",
+    "take",
+};
+
+/// Default modifiers to remove from user input (Chinese)
+const DEFAULT_CN_MODIFIERS = [_][]const u8{
+    "请", "开始", "运行", "执行", "做", "去", "帮", "帮我", "我"
+};
+
+/// Default punctuation characters to remove
+const DEFAULT_PUNCTUATION = " .,!?。\n\r\t";
+
+/// Clean user input by removing polite modifiers and punctuation.
+/// This helps detect when user input contains only a trigger keyword.
+/// If custom_modifiers or custom_punctuation are provided, they will be used instead of defaults.
+fn cleanUserInput(
+    input: []const u8,
+    allocator: std.mem.Allocator,
+    custom_modifiers: ?[]const []const u8,
+    custom_punctuation: ?[]const u8,
+) ![]u8 {
+    const modifiers = custom_modifiers orelse DEFAULT_MODIFIERS[0..];
+    const punctuation = custom_punctuation orelse DEFAULT_PUNCTUATION;
+
+    var result = try allocator.alloc(u8, input.len);
+    @memcpy(result, input);
+    errdefer allocator.free(result);
+
+    var start: usize = 0;
+    var end: usize = result.len;
+
+    while (start < end) {
+        var found = false;
+        for (punctuation) |p| {
+            if (result[start] == p) {
+                start += 1;
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        for (modifiers) |mod| {
+            if (end - start >= mod.len) {
+                var is_match = true;
+                for (mod, 0..) |c, i| {
+                    if (std.ascii.toLower(result[start + i]) != c) {
+                        is_match = false;
+                        break;
+                    }
+                }
+                if (is_match) {
+                    start += mod.len;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) continue;
+        for (DEFAULT_CN_MODIFIERS) |mod| {
+            if (end - start >= mod.len) {
+                var is_match = true;
+                for (mod, 0..) |c, i| {
+                    if (result[start + i] != c) {
+                        is_match = false;
+                        break;
+                    }
+                }
+                if (is_match) {
+                    start += mod.len;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) continue;
+        break;
+    }
+
+    while (start < end) {
+        var found = false;
+        for (punctuation) |p| {
+            if (result[end - 1] == p) {
+                end -= 1;
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        for (modifiers) |mod| {
+            if (end - start >= mod.len) {
+                var is_match = true;
+                for (mod, 0..) |c, i| {
+                    if (std.ascii.toLower(result[end - mod.len + i]) != c) {
+                        is_match = false;
+                        break;
+                    }
+                }
+                if (is_match) {
+                    end -= mod.len;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) continue;
+        for (DEFAULT_CN_MODIFIERS) |mod| {
+            if (end - start >= mod.len) {
+                var is_match = true;
+                for (mod, 0..) |c, i| {
+                    if (result[end - mod.len + i] != c) {
+                        is_match = false;
+                        break;
+                    }
+                }
+                if (is_match) {
+                    end -= mod.len;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) continue;
+        break;
+    }
+
+    if (start > 0 or end < result.len) {
+        const trimmed_len = end - start;
+        if (trimmed_len == 0) {
+            return result[0..0];
+        }
+        const trimmed = try allocator.alloc(u8, trimmed_len);
+        @memcpy(trimmed, result[start..end]);
+        allocator.free(result);
+        return trimmed;
+    }
+
+    return result[0..end];
+}
+
+/// Check if cleaned input exactly matches a trigger keyword (whole input is the trigger)
+fn isExactTriggerMatch(cleaned_input: []const u8, keyword: []const u8) bool {
+    if (cleaned_input.len != keyword.len) return false;
+
+    for (cleaned_input, 0..) |c, i| {
+        if (std.ascii.toLower(c) != std.ascii.toLower(keyword[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Check if there's a negation word within reasonable distance before the position
+fn hasNegationBefore(lower_msg: []const u8, pos: usize) bool {
+    const negation_patterns = [_][]const u8{
+        "no ",
+        "not ",
+        "don't ",
+        "dont ",
+        "do not ",
+        "never ",
+        "without ",
+        "won't ",
+        "wont ",
+        "不",
+        "不要",
+        "别",
+        "无需",
+        "不用",
+        "不需要",
+        "禁止",
+    };
+
+    const before = lower_msg[0..pos];
+
+    for (negation_patterns) |neg| {
+        if (std.mem.indexOf(u8, before, neg)) |neg_pos| {
+            const dist = pos - neg_pos;
+            if (dist <= 30) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -315,6 +547,18 @@ pub const Agent = struct {
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
 
+    /// Tool customizations map (owned; freed by Agent.deinit).
+    /// Maps tool names to their custom configurations.
+    tool_customizations: std.StringHashMapUnmanaged(config_types.ToolCustomization) = .empty,
+
+    /// Custom modifiers to remove from user input when checking for exact trigger matches.
+    /// If empty, defaults to: please, could you, can you, would you, now, go, start, ok, begin, do, execute, run, take, 请, 帮我, 开始
+    trigger_modifiers: []const []const u8 = &.{},
+
+    /// Custom punctuation characters to remove when checking for exact trigger matches.
+    /// If empty, defaults to: space, period, comma, exclamation, question mark
+    trigger_punctuation: []const u8 = "",
+
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
@@ -398,11 +642,29 @@ pub const Agent = struct {
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
         for (tools, 0..) |t, i| {
+            const tool_name = t.name();
             specs[i] = .{
-                .name = t.name(),
-                .description = t.description(),
+                .name = tool_name,
+                .description = tool_name,
                 .parameters_json = t.parametersJson(),
             };
+        }
+
+        // Load and merge tool customizations from config and external file
+        const merged_tool_customizations = try loadAndMergeToolCustomizations(allocator, cfg.tools.tool_customizations, cfg.tools.tool_customizations_file, cfg.workspace_dir);
+
+        // Apply tool customizations to tool specs
+        for (specs, 0..) |*spec, i| {
+            const tool_name = spec.name;
+            if (merged_tool_customizations.get(tool_name)) |custom| {
+                if (custom.system_prompt) |sp| {
+                    spec.description = sp;
+                } else {
+                    spec.description = tools[i].description();
+                }
+            } else {
+                spec.description = tools[i].description();
+            }
         }
 
         const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
@@ -449,6 +711,9 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
+            .tool_customizations = merged_tool_customizations,
+            .trigger_modifiers = cfg.tools.trigger_modifiers,
+            .trigger_punctuation = cfg.tools.trigger_punctuation,
             .default_exec_security = resolved_exec_security,
             .exec_security = resolved_exec_security,
             .default_exec_ask = resolved_exec_ask,
@@ -490,6 +755,17 @@ pub const Agent = struct {
         }
         self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+        
+        // Free tool customizations
+        var iter = self.tool_customizations.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.system_prompt) |sp| self.allocator.free(sp);
+            if (entry.value_ptr.triggers.len > 0) {
+                for (entry.value_ptr.triggers) |t| self.allocator.free(t);
+                self.allocator.free(entry.value_ptr.triggers);
+            }
+        }
+        self.tool_customizations.deinit(self.allocator);
     }
 
     pub fn requestInterrupt(self: *Agent) void {
@@ -1236,6 +1512,210 @@ pub const Agent = struct {
         return commands.isExecToolName(tool_name);
     }
 
+    /// Load and merge tool customizations from external JSON file with config customizations.
+    /// Returns a merged map of tool name -> ToolCustomization.
+    fn loadAndMergeToolCustomizations(
+        allocator: std.mem.Allocator,
+        config_customizations: []const config_types.ToolCustomization,
+        customizations_file: ?[]const u8,
+        workspace_dir: []const u8,
+    ) !std.StringHashMapUnmanaged(config_types.ToolCustomization) {
+        var customizations = std.StringHashMapUnmanaged(config_types.ToolCustomization){};
+        errdefer {
+            var iter = customizations.iterator();
+            while (iter.next()) |entry| {
+                if (entry.value_ptr.system_prompt) |sp| allocator.free(sp);
+                if (entry.value_ptr.triggers.len > 0) {
+                    for (entry.value_ptr.triggers) |t| allocator.free(t);
+                    allocator.free(entry.value_ptr.triggers);
+                }
+            }
+            customizations.deinit(allocator);
+        }
+
+        // Add customizations from config
+        for (config_customizations) |custom| {
+            const result = try customizations.getOrPut(allocator, custom.name);
+            if (!result.found_existing) {
+                // Copy the customization to ensure it's owned
+                const owned_custom = try allocator.create(config_types.ToolCustomization);
+                owned_custom.* = custom;
+                result.value_ptr.* = owned_custom.*;
+            }
+        }
+
+        // Load customizations from external file if specified
+        if (customizations_file) |file_path| {
+            var file_customizations = loadToolCustomizationsFromFile(allocator, file_path, workspace_dir) catch |err| {
+                log.warn("Failed to load tool customizations from file '{s}': {}", .{ file_path, err });
+                return customizations;
+            };
+            defer {
+                var iter = file_customizations.iterator();
+                while (iter.next()) |entry| {
+                    if (entry.value_ptr.system_prompt) |sp| allocator.free(sp);
+                    if (entry.value_ptr.triggers.len > 0) {
+                        for (entry.value_ptr.triggers) |t| allocator.free(t);
+                        allocator.free(entry.value_ptr.triggers);
+                    }
+                }
+                file_customizations.deinit(allocator);
+            }
+
+            // Merge file customizations with config customizations
+            var iter = file_customizations.iterator();
+            while (iter.next()) |entry| {
+                const result = try customizations.getOrPut(allocator, entry.key_ptr.*);
+                if (!result.found_existing) {
+                    // Copy the customization to ensure it's owned
+                    const owned_custom = try allocator.create(config_types.ToolCustomization);
+                    owned_custom.* = entry.value_ptr.*;
+                    result.value_ptr.* = owned_custom.*;
+                } else {
+                    // Merge triggers if both exist
+                    const existing = result.value_ptr;
+                    if (entry.value_ptr.triggers.len > 0) {
+                        const merged_triggers = try mergeAndDeduplicateStrings(allocator, existing.triggers, entry.value_ptr.triggers);
+                        if (existing.triggers.len > 0) allocator.free(existing.triggers);
+                        existing.triggers = merged_triggers;
+                    }
+                    // Override other fields if provided
+                    if (entry.value_ptr.system_prompt != null) {
+                        if (existing.system_prompt) |sp| allocator.free(sp);
+                        existing.system_prompt = try allocator.dupe(u8, entry.value_ptr.system_prompt.?);
+                    }
+                    if (entry.value_ptr.priority > existing.priority) {
+                        existing.priority = entry.value_ptr.priority;
+                    }
+                    if (!entry.value_ptr.enabled) {
+                        existing.enabled = false;
+                    }
+                }
+            }
+        }
+
+        return customizations;
+    }
+
+    /// Load tool customizations from JSON file.
+    /// File format: {"screenshot": {"system_prompt": "...", "triggers": [...], "priority": 1}, ...}
+    fn loadToolCustomizationsFromFile(
+        allocator: std.mem.Allocator,
+        file_path: []const u8,
+        workspace_dir: []const u8,
+    ) !std.StringHashMapUnmanaged(config_types.ToolCustomization) {
+        const full_path = if (std.fs.path.isAbsolute(file_path))
+            try allocator.dupe(u8, file_path)
+        else
+            try std.fs.path.join(allocator, &.{ workspace_dir, file_path });
+        defer allocator.free(full_path);
+
+        const file = try std.fs.openFileAbsolute(full_path, .{});
+        defer file.close();
+
+        const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+        defer allocator.free(content);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .object) {
+            return error.InvalidJsonFormat;
+        }
+
+        const obj = parsed.value.object;
+        var customizations = std.StringHashMapUnmanaged(config_types.ToolCustomization){};
+        errdefer {
+            var iter = customizations.iterator();
+            while (iter.next()) |entry| {
+                if (entry.value_ptr.system_prompt) |sp| allocator.free(sp);
+                if (entry.value_ptr.triggers.len > 0) {
+                    for (entry.value_ptr.triggers) |t| allocator.free(t);
+                    allocator.free(entry.value_ptr.triggers);
+                }
+            }
+            customizations.deinit(allocator);
+        }
+
+        var iter = obj.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+
+            const tool_obj = entry.value_ptr.object;
+            var triggers_list = std.ArrayListUnmanaged([]const u8){};
+
+            if (tool_obj.get("triggers")) |triggers_val| {
+                if (triggers_val == .array) {
+                    const triggers_array = triggers_val.array;
+                    for (triggers_array.items) |item| {
+                        if (item == .string) {
+                            try triggers_list.append(allocator, try allocator.dupe(u8, item.string));
+                        }
+                    }
+                }
+            }
+
+            var custom = config_types.ToolCustomization{
+                .name = try allocator.dupe(u8, entry.key_ptr.*),
+                .system_prompt = null,
+                .triggers = try triggers_list.toOwnedSlice(allocator),
+                .priority = 0,
+                .enabled = true,
+            };
+
+            if (tool_obj.get("system_prompt")) |sp_val| {
+                if (sp_val == .string) {
+                    custom.system_prompt = try allocator.dupe(u8, sp_val.string);
+                }
+            }
+
+            if (tool_obj.get("priority")) |prio_val| {
+                if (prio_val == .integer) {
+                    custom.priority = @intCast(prio_val.integer);
+                }
+            }
+
+            if (tool_obj.get("enabled")) |enabled_val| {
+                if (enabled_val == .bool) {
+                    custom.enabled = enabled_val.bool;
+                }
+            }
+
+            try customizations.put(allocator, custom.name, custom);
+        }
+
+        return customizations;
+    }
+
+    /// Merge and deduplicate two string arrays.
+    fn mergeAndDeduplicateStrings(
+        allocator: std.mem.Allocator,
+        a: []const []const u8,
+        b: []const []const u8,
+    ) ![]const []const u8 {
+        var merged = std.ArrayListUnmanaged([]const u8){};
+        defer merged.deinit(allocator);
+
+        for (a) |item| {
+            try merged.append(allocator, item);
+        }
+
+        for (b) |item| {
+            var is_duplicate = false;
+            for (a) |existing| {
+                if (std.mem.eql(u8, existing, item)) {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            if (!is_duplicate) {
+                try merged.append(allocator, item);
+            }
+        }
+
+        return merged.toOwnedSlice(allocator);
+    }
+
     fn execBlockMessage(self: *Agent, args: std.json.ObjectMap) ?[]const u8 {
         return commands.execBlockMessage(self, args);
     }
@@ -1505,6 +1985,94 @@ pub const Agent = struct {
         const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
         defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
 
+        // Check for tool trigger keywords and handle exact/priority matching
+        var processed_user_message = effective_user_message;
+
+        if (self.tool_customizations.count() > 0) {
+            const cleaned_input = cleanUserInput(
+                effective_user_message,
+                self.allocator,
+                if (self.trigger_modifiers.len > 0) self.trigger_modifiers else null,
+                if (self.trigger_punctuation.len > 0) self.trigger_punctuation else null,
+            ) catch null;
+            defer if (cleaned_input) |ci| self.allocator.free(ci);
+
+            if (cleaned_input) |ci| {
+                var exact_match_tool: ?[]const u8 = null;
+                var highest_priority: u8 = 0;
+                var priority_tool: ?[]const u8 = null;
+
+                var iter = self.tool_customizations.iterator();
+                while (iter.next()) |entry| {
+                    const custom = entry.value_ptr.*;
+                    if (!custom.enabled or custom.triggers.len == 0) continue;
+
+                    for (custom.triggers) |kw| {
+                        if (isExactTriggerMatch(ci, kw)) {
+                            if (verbose_mod.isVerbose()) {
+                                log.debug("exact trigger match: tool={s}, keyword='{s}'", .{ custom.name, kw });
+                            }
+                            exact_match_tool = custom.name;
+                            break;
+                        }
+                    }
+                    if (exact_match_tool != null) break;
+                }
+
+                if (exact_match_tool == null) {
+                    const lower_msg = blk2: {
+                        const lm = self.allocator.alloc(u8, effective_user_message.len) catch break :blk2 null;
+                        for (effective_user_message, 0..) |c, i| {
+                            lm[i] = std.ascii.toLower(c);
+                        }
+                        break :blk2 lm;
+                    };
+                    defer if (lower_msg) |lm| self.allocator.free(lm);
+
+                    if (lower_msg) |lm| {
+                        var iter2 = self.tool_customizations.iterator();
+                        while (iter2.next()) |entry| {
+                            const custom = entry.value_ptr.*;
+                            if (!custom.enabled or custom.triggers.len == 0) continue;
+
+                            for (custom.triggers) |kw| {
+                                if (matchTriggerKeyword(lm, kw)) {
+                                    if (verbose_mod.isVerbose()) {
+                                        log.debug("trigger matched: tool={s}, keyword='{s}', priority={d}", .{ custom.name, kw, custom.priority });
+                                    }
+                                    if (custom.priority > highest_priority) {
+                                        highest_priority = custom.priority;
+                                        priority_tool = custom.name;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (exact_match_tool) |tn| {
+                    if (verbose_mod.isVerbose()) {
+                        log.debug("executing tool directly due to exact trigger match", .{});
+                    }
+
+                    if (find_tool_by_name(self.tools, tn)) |_| {
+                        const tool_call = ParsedToolCall{
+                            .name = tn,
+                            .arguments_json = "{}",
+                            .tool_call_id = "",
+                        };
+                        const result = self.executeTool(self.allocator, tool_call);
+
+                        return try std.fmt.allocPrint(self.allocator, "Tool '{s}' executed: {s}", .{ tn, result.output });
+                    }
+                } else if (priority_tool) |pn| {
+                    const processed = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
+                    processed_user_message = processed;
+                }
+            }
+        }
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
         const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
@@ -1589,9 +2157,9 @@ pub const Agent = struct {
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
         const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id)
+            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, processed_user_message, self.memory_session_id)
         else
-            try self.allocator.dupe(u8, effective_user_message);
+            try self.allocator.dupe(u8, processed_user_message);
         errdefer self.allocator.free(enriched);
 
         try self.history.append(self.allocator, .{
@@ -1606,7 +2174,7 @@ pub const Agent = struct {
                 self.history.items[0].content
             else
                 null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, effective_user_message);
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, processed_user_message);
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
@@ -2082,7 +2650,7 @@ pub const Agent = struct {
                         self.history.items[0].content
                     else
                         null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, effective_user_message);
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, processed_user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
                     rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
                 }
@@ -6909,6 +7477,118 @@ test "Agent.fromConfig does not set multimodal_unrestricted for full" {
     defer agent.deinit();
 
     try std.testing.expect(agent.multimodal_unrestricted == false);
+}
+
+test "Agent cleanUserInput removes English modifiers" {
+    const allocator = std.testing.allocator;
+
+    const input1 = "please screenshot";
+    const cleaned1 = try cleanUserInput(input1, allocator, null, null);
+    defer allocator.free(cleaned1);
+    try std.testing.expectEqualStrings("screenshot", cleaned1);
+
+    const input2 = "go screenshot";
+    const cleaned2 = try cleanUserInput(input2, allocator, null, null);
+    defer allocator.free(cleaned2);
+    try std.testing.expectEqualStrings("screenshot", cleaned2);
+
+    const input3 = "screenshot now";
+    const cleaned3 = try cleanUserInput(input3, allocator, null, null);
+    defer allocator.free(cleaned3);
+    try std.testing.expectEqualStrings("screenshot", cleaned3);
+
+    const input4 = "please go screenshot";
+    const cleaned4 = try cleanUserInput(input4, allocator, null, null);
+    defer allocator.free(cleaned4);
+    try std.testing.expectEqualStrings("screenshot", cleaned4);
+
+    const input5 = "screenshot please";
+    const cleaned5 = try cleanUserInput(input5, allocator, null, null);
+    defer allocator.free(cleaned5);
+    try std.testing.expectEqualStrings("screenshot", cleaned5);
+
+    const input6 = "screenshot now please";
+    const cleaned6 = try cleanUserInput(input6, allocator, null, null);
+    defer allocator.free(cleaned6);
+    try std.testing.expectEqualStrings("screenshot", cleaned6);
+}
+
+test "Agent cleanUserInput removes punctuation" {
+    const allocator = std.testing.allocator;
+
+    const input1 = "screenshot.";
+    const cleaned1 = try cleanUserInput(input1, allocator, null, null);
+    defer allocator.free(cleaned1);
+    try std.testing.expectEqualStrings("screenshot", cleaned1);
+
+    const input2 = " screenshot ! ";
+    const cleaned2 = try cleanUserInput(input2, allocator, null, null);
+    defer allocator.free(cleaned2);
+    try std.testing.expectEqualStrings("screenshot", cleaned2);
+}
+
+test "Agent cleanUserInput removes Chinese modifiers" {
+    const allocator = std.testing.allocator;
+
+    const input1 = "请截屏";
+    const cleaned1 = try cleanUserInput(input1, allocator, null, null);
+    defer allocator.free(cleaned1);
+    try std.testing.expectEqualStrings("截屏", cleaned1);
+
+    const input2 = "帮我截屏";
+    const cleaned2 = try cleanUserInput(input2, allocator, null, null);
+    defer allocator.free(cleaned2);
+    try std.testing.expectEqualStrings("截屏", cleaned2);
+
+    const input3 = "开始截屏";
+    const cleaned3 = try cleanUserInput(input3, allocator, null, null);
+    defer allocator.free(cleaned3);
+    try std.testing.expectEqualStrings("截屏", cleaned3);
+}
+
+test "Agent cleanUserInput uses custom modifiers" {
+    const allocator = std.testing.allocator;
+
+    const custom_modifiers = [_][]const u8{ "hey", "yo" };
+    const input1 = "hey screenshot";
+    const cleaned1 = try cleanUserInput(input1, allocator, &custom_modifiers, null);
+    defer allocator.free(cleaned1);
+    try std.testing.expectEqualStrings("screenshot", cleaned1);
+
+    const input2 = "yo screenshot";
+    const cleaned2 = try cleanUserInput(input2, allocator, &custom_modifiers, null);
+    defer allocator.free(cleaned2);
+    try std.testing.expectEqualStrings("screenshot", cleaned2);
+}
+
+test "Agent cleanUserInput uses custom punctuation" {
+    const allocator = std.testing.allocator;
+
+    const custom_punct = "!-";
+    const input1 = "screenshot!";
+    const cleaned1 = try cleanUserInput(input1, allocator, null, custom_punct);
+    defer allocator.free(cleaned1);
+    try std.testing.expectEqualStrings("screenshot", cleaned1);
+
+    const input2 = "screenshot-";
+    const cleaned2 = try cleanUserInput(input2, allocator, null, custom_punct);
+    defer allocator.free(cleaned2);
+    try std.testing.expectEqualStrings("screenshot", cleaned2);
+
+    const input3 = "screenshot.";
+    const cleaned3 = try cleanUserInput(input3, allocator, null, custom_punct);
+    defer allocator.free(cleaned3);
+    try std.testing.expectEqualStrings("screenshot.", cleaned3);
+}
+
+test "Agent isExactTriggerMatch detects exact matches" {
+    try std.testing.expect(isExactTriggerMatch("screenshot", "screenshot"));
+    try std.testing.expect(isExactTriggerMatch("SCREENSHOT", "screenshot"));
+    try std.testing.expect(isExactTriggerMatch("ScreensHot", "screenshot"));
+    try std.testing.expect(isExactTriggerMatch("截屏", "截屏"));
+    try std.testing.expect(!isExactTriggerMatch("screenshot now", "screenshot"));
+    try std.testing.expect(!isExactTriggerMatch("screenshotnow", "screenshot"));
+    try std.testing.expect(!isExactTriggerMatch("some screenshot", "screenshot"));
 }
 
 test "execBlockMessage allows all commands when exec_security=full" {

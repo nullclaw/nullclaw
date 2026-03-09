@@ -22,6 +22,7 @@ pub const HELP_TEXT =
     \\  /activation, /send, /elevated, /bash, /poll, /skill
     \\  /doctor — memory subsystem diagnostics
     \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
+    \\  /tool-customizations, /tools — show tool customizations (read-only)
     \\  exit, quit
 ;
 
@@ -45,6 +46,8 @@ pub const TELEGRAM_BOT_COMMANDS_JSON =
     \\{"command":"tts","description":"Set TTS mode"},
     \\{"command":"memory","description":"Memory tools and diagnostics"},
     \\{"command":"doctor","description":"Memory diagnostics quick check"},
+    \\{"command":"tool-customizations","description":"Show tool customizations (read-only)"},
+    \\{"command":"tools","description":"Alias for /tool-customizations"},
     \\{"command":"stop","description":"Stop active background task"},
     \\{"command":"restart","description":"Restart current session"},
     \\{"command":"compact","description":"Compact context now"}

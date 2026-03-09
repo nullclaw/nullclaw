@@ -984,6 +984,62 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tl.object.get("path_env_vars")) |v| {
                 if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
             }
+            // tools.tool_customizations
+            if (tl.object.get("tool_customizations")) |v| {
+                if (v == .array) {
+                    var custom_list: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
+                    try custom_list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
+                    for (v.array.items) |item| {
+                        if (item == .object) {
+                            var custom = types.ToolCustomization{
+                                .name = "",
+                                .system_prompt = null,
+                                .triggers = &.{},
+                                .priority = 0,
+                                .enabled = true,
+                            };
+                            if (item.object.get("name")) |nv| {
+                                if (nv == .string) custom.name = try self.allocator.dupe(u8, nv.string);
+                            }
+                            if (item.object.get("system_prompt")) |spv| {
+                                if (spv == .string) custom.system_prompt = try self.allocator.dupe(u8, spv.string);
+                            }
+                            if (item.object.get("triggers")) |tv| {
+                                if (tv == .array) custom.triggers = try parseStringArray(self.allocator, tv.array);
+                            }
+                            if (item.object.get("priority")) |pv| {
+                                if (pv == .integer) custom.priority = @intCast(pv.integer);
+                            }
+                            if (item.object.get("enabled")) |ev| {
+                                if (ev == .bool) custom.enabled = ev.bool;
+                            }
+                            try custom_list.append(self.allocator, custom);
+                        }
+                    }
+                    self.tools.tool_customizations = try custom_list.toOwnedSlice(self.allocator);
+                }
+            }
+            // tools.tool_customizations_file
+            if (tl.object.get("tool_customizations_file")) |v| {
+                if (v == .string) self.tools.tool_customizations_file = try self.allocator.dupe(u8, v.string);
+            }
+            // tools.trigger_modifiers
+            if (tl.object.get("trigger_modifiers")) |v| {
+                if (v == .array) {
+                    const modifiers_list = v.array.items;
+                    const modifiers_slice = try self.allocator.alloc([]const u8, modifiers_list.len);
+                    for (modifiers_list, 0..) |item, idx| {
+                        if (item == .string) {
+                            modifiers_slice[idx] = try self.allocator.dupe(u8, item.string);
+                        }
+                    }
+                    self.tools.trigger_modifiers = modifiers_slice;
+                }
+            }
+            // tools.trigger_punctuation
+            if (tl.object.get("trigger_punctuation")) |v| {
+                if (v == .string) self.tools.trigger_punctuation = try self.allocator.dupe(u8, v.string);
+            }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
                 if (media == .object) {

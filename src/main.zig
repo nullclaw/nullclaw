@@ -33,6 +33,7 @@ const Command = enum {
     models,
     auth,
     update,
+    tools,
     help,
 };
 
@@ -45,6 +46,7 @@ const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|for
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
 const AUTH_SUBCOMMANDS = "login|status|logout";
+const TOOLS_SUBCOMMANDS = "show|export|import|validate";
 
 const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\nullclaw -- The smallest AI assistant. Zig-powered.
@@ -70,6 +72,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  capabilities Show runtime capabilities manifest
     \\  models       Manage provider model catalogs
     \\  auth         Manage OAuth authentication (OpenAI Codex)
+    \\  tools        Manage tool customizations (system prompts, triggers, priorities)
     \\  update       Check for and install updates
     \\  help         Show this help
     \\
@@ -89,6 +92,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  capabilities [--json]
     \\  models <{s}> [ARGS]
     \\  auth <{s}> <provider> [--import-codex]
+    \\  tools <{s}> [ARGS]
     \\  update [--check] [--yes]
     \\
 ,
@@ -102,6 +106,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
         WORKSPACE_SUBCOMMANDS,
         MODELS_SUBCOMMANDS,
         AUTH_SUBCOMMANDS,
+        TOOLS_SUBCOMMANDS,
     },
 );
 
@@ -126,6 +131,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "capabilities", .capabilities },
         .{ "models", .models },
         .{ "auth", .auth },
+        .{ "tools", .tools },
         .{ "update", .update },
         .{ "help", .help },
         .{ "--help", .help },
@@ -207,6 +213,7 @@ pub fn main() !void {
         .capabilities => try runCapabilities(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
+        .tools => try runTools(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
     }
 }
@@ -2901,4 +2908,378 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
     };
 
     try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
+}
+
+// ── Tools ───────────────────────────────────────────────────────
+
+fn runTools(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw tools <{s}> [args]
+            \\
+            \\Commands:
+            \\  show                          Show current tool customizations
+            \\  show --builtin               Show all built-in tools
+            \\  export <file>                 Export customizations to JSON file
+            \\  export <file> --builtin      Export built-in tools to JSON file
+            \\  import <file>                 Import customizations from JSON file
+            \\  validate <file>               Validate customizations JSON file
+            \\
+            \\Examples:
+            \\  nullclaw tools show
+            \\  nullclaw tools show --builtin
+            \\  nullclaw tools export tool_customizations.json
+            \\  nullclaw tools export builtin_tools.json --builtin
+            \\  nullclaw tools import tool_customizations.json
+            \\  nullclaw tools validate tool_customizations.json
+            \\
+        , .{TOOLS_SUBCOMMANDS}), .{});
+        std.process.exit(1);
+    }
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "show")) {
+        const show_builtin = sub_args.len > 1 and std.mem.eql(u8, sub_args[1], "--builtin");
+        try toolsShow(allocator, show_builtin);
+    } else if (std.mem.eql(u8, subcmd, "export")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw tools export <file>\n", .{});
+            std.process.exit(1);
+        }
+        const export_builtin = sub_args.len > 2 and std.mem.eql(u8, sub_args[2], "--builtin");
+        try toolsExport(allocator, sub_args[1], export_builtin);
+    } else if (std.mem.eql(u8, subcmd, "import")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw tools import <file>\n", .{});
+            std.process.exit(1);
+        }
+        try toolsImport(allocator, sub_args[1]);
+    } else if (std.mem.eql(u8, subcmd, "validate")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw tools validate <file>\n", .{});
+            std.process.exit(1);
+        }
+        try toolsValidate(allocator, sub_args[1]);
+    } else {
+        std.debug.print("Unknown tools subcommand: {s}\n\n", .{subcmd});
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw tools <{s}> [args]
+            \\
+            \\Commands:
+            \\  show                          Show current tool customizations
+            \\  export <file>                 Export customizations to JSON file
+            \\  import <file>                 Import customizations from JSON file
+            \\  validate <file>               Validate customizations JSON file
+            \\
+        , .{TOOLS_SUBCOMMANDS}), .{});
+        std.process.exit(1);
+    }
+}
+
+fn showBuiltinTools() !void {
+    const tools = yc.tools.builtin_tool_meta;
+
+    std.debug.print("Built-in tools ({d}):\n\n", .{tools.len});
+
+    for (tools, 0..) |tool, idx| {
+        std.debug.print("  {d}. {s}\n", .{ idx + 1, tool.name });
+        std.debug.print("     Description: {s}\n", .{tool.description});
+        std.debug.print("     Parameters: {s}\n\n", .{tool.params});
+    }
+}
+
+fn toolsShow(allocator: std.mem.Allocator, show_builtin: bool) !void {
+    var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+    defer if (cfg_opt) |*c| c.deinit();
+
+    if (cfg_opt == null) {
+        std.debug.print("No configuration found. Run `nullclaw onboard` first.\n", .{});
+        return;
+    }
+
+    const cfg = cfg_opt.?;
+
+    if (show_builtin) {
+        try showBuiltinTools();
+        return;
+    }
+
+    if (cfg.tools.tool_customizations.len == 0) {
+        std.debug.print("No tool customizations configured.\n", .{});
+        std.debug.print("\nTo add customizations, edit your config file:\n  {s}\n", .{cfg.config_path});
+        std.debug.print("\nOr import from a JSON file:\n  nullclaw tools import tool_customizations.json\n", .{});
+        std.debug.print("\nTo see all built-in tools, run:\n  nullclaw tools show --builtin\n", .{});
+        return;
+    }
+
+    std.debug.print("Tool customizations ({d}):\n", .{cfg.tools.tool_customizations.len});
+    for (cfg.tools.tool_customizations, 0..) |custom, idx| {
+        std.debug.print("\n  {d}. {s}\n", .{ idx + 1, custom.name });
+        if (custom.system_prompt) |sp| {
+            std.debug.print("     System prompt: {s}\n", .{sp});
+        }
+        if (custom.triggers.len > 0) {
+            std.debug.print("     Triggers ({d}): ", .{custom.triggers.len});
+            for (custom.triggers, 0..) |trigger, tidx| {
+                if (tidx > 0) std.debug.print(", ", .{});
+                std.debug.print("\"{s}\"", .{trigger});
+            }
+            std.debug.print("\n", .{});
+        }
+        std.debug.print("     Priority: {d}\n", .{custom.priority});
+        std.debug.print("     Enabled: {}\n", .{custom.enabled});
+    }
+
+    if (cfg.tools.tool_customizations_file) |file_path| {
+        std.debug.print("\nExternal file: {s}\n", .{file_path});
+    }
+}
+
+fn exportBuiltinTools(allocator: std.mem.Allocator, file_path: []const u8) !void {
+    const tools = yc.tools.builtin_tool_meta;
+
+    var out_buffer = std.ArrayList(u8).initCapacity(allocator, 32768) catch |err| {
+        std.debug.print("Export failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer out_buffer.deinit(allocator);
+
+    try out_buffer.writer(allocator).print("{{\n", .{});
+
+    for (tools, 0..) |tool, idx| {
+        const is_last = idx == tools.len - 1;
+        const comma = if (is_last) "" else ",";
+        try out_buffer.writer(allocator).print("  \"{s}\": {{\n", .{tool.name});
+        try out_buffer.writer(allocator).print("    \"system_prompt\": \"{s}\",\n", .{tool.description});
+        try out_buffer.writer(allocator).print("    \"triggers\": [],\n", .{});
+        try out_buffer.writer(allocator).print("    \"priority\": 0,\n", .{});
+        try out_buffer.writer(allocator).print("    \"enabled\": true\n  }}{s}\n", .{comma});
+    }
+
+    try out_buffer.writer(allocator).print("}}\n", .{});
+
+    const file = try std.fs.cwd().createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(out_buffer.items);
+
+    std.debug.print("Exported {d} built-in tools to: {s}\n", .{tools.len, file_path});
+}
+
+fn toolsExport(allocator: std.mem.Allocator, file_path: []const u8, export_builtin: bool) !void {
+    if (export_builtin) {
+        try exportBuiltinTools(allocator, file_path);
+        return;
+    }
+
+    var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+    defer if (cfg_opt) |*c| c.deinit();
+
+    if (cfg_opt == null) {
+        std.debug.print("No configuration found. Run `nullclaw onboard` first.\n", .{});
+        return;
+    }
+
+    const cfg = cfg_opt.?;
+
+    if (cfg.tools.tool_customizations.len == 0) {
+        std.debug.print("No tool customizations configured.\n", .{});
+        std.debug.print("\nTo export built-in tools, run:\n  nullclaw tools export <file> --builtin\n", .{});
+        return;
+    }
+
+    var out_buffer = std.ArrayList(u8).initCapacity(allocator, 2048) catch |err| {
+        std.debug.print("Export failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer out_buffer.deinit(allocator);
+
+    try out_buffer.writer(allocator).print("{{", .{});
+
+    var first_tool = true;
+    for (cfg.tools.tool_customizations) |custom| {
+        if (!first_tool) {
+            try out_buffer.writer(allocator).print(",", .{});
+        }
+        first_tool = false;
+
+        try out_buffer.writer(allocator).print("\"{s}\":{{", .{custom.name});
+
+        if (custom.system_prompt) |sp| {
+            try out_buffer.writer(allocator).print("\"system_prompt\":\"{s}\",", .{sp});
+        }
+
+        if (custom.triggers.len > 0) {
+            try out_buffer.writer(allocator).print("\"triggers\":[", .{});
+            for (custom.triggers, 0..) |trigger, idx| {
+                if (idx > 0) try out_buffer.writer(allocator).print(",", .{});
+                try out_buffer.writer(allocator).print("\"{s}\"", .{trigger});
+            }
+            try out_buffer.writer(allocator).print("],", .{});
+        }
+
+        try out_buffer.writer(allocator).print("\"priority\":{d},", .{custom.priority});
+        try out_buffer.writer(allocator).print("\"enabled\":{}}}", .{custom.enabled});
+    }
+
+    try out_buffer.writer(allocator).print("}}", .{});
+
+    const file = try std.fs.cwd().createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(out_buffer.items);
+
+    std.debug.print("Exported {d} tool customizations to: {s}\n", .{ cfg.tools.tool_customizations.len, file_path });
+}
+
+fn toolsImport(allocator: std.mem.Allocator, file_path: []const u8) !void {
+    var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+    defer if (cfg_opt) |*c| c.deinit();
+
+    if (cfg_opt == null) {
+        std.debug.print("No configuration found. Run `nullclaw onboard` first.\n", .{});
+        return;
+    }
+
+    const cfg = cfg_opt.?;
+
+    const full_path = if (std.fs.path.isAbsolute(file_path))
+        try allocator.dupe(u8, file_path)
+    else
+        try std.fs.cwd().realpathAlloc(allocator, file_path);
+    defer allocator.free(full_path);
+
+    const file = std.fs.openFileAbsolute(full_path, .{}) catch |err| {
+        std.debug.print("Failed to open file '{s}': {s}\n", .{ file_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    defer allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
+        std.debug.print("Failed to parse JSON: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        std.debug.print("Invalid JSON format: expected object\n", .{});
+        std.process.exit(1);
+    }
+
+    const obj = parsed.value.object;
+    var iter = obj.iterator();
+
+    std.debug.print("Tool customizations to import:\n", .{});
+    var count: usize = 0;
+    while (iter.next()) |entry| {
+        count += 1;
+        std.debug.print("  {s}\n", .{entry.key_ptr.*});
+    }
+
+    std.debug.print("\nTo apply these customizations, add them to your config file:\n  {s}\n", .{cfg.config_path});
+    std.debug.print("\nOr set the tool_customizations_file path in your config:\n  \"tools\": {{ \"tool_customizations_file\": \"{s}\" }}\n", .{file_path});
+}
+
+fn toolsValidate(allocator: std.mem.Allocator, file_path: []const u8) !void {
+    var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
+    defer if (cfg_opt) |*c| c.deinit();
+
+    const full_path = if (std.fs.path.isAbsolute(file_path))
+        try allocator.dupe(u8, file_path)
+    else
+        try std.fs.cwd().realpathAlloc(allocator, file_path);
+    defer allocator.free(full_path);
+
+    const file = std.fs.openFileAbsolute(full_path, .{}) catch |err| {
+        std.debug.print("Failed to open file '{s}': {s}\n", .{ file_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    defer allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
+        std.debug.print("Failed to parse JSON: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        std.debug.print("Invalid JSON format: expected object\n", .{});
+        std.process.exit(1);
+    }
+
+    const obj = parsed.value.object;
+    var iter = obj.iterator();
+    var has_errors = false;
+
+    std.debug.print("Validating tool customizations from: {s}\n\n", .{file_path});
+
+    while (iter.next()) |entry| {
+        const tool_name = entry.key_ptr.*;
+        const tool_value = entry.value_ptr.*;
+
+        if (tool_value != .object) {
+            std.debug.print("  [ERROR] Tool '{s}' must be an object\n", .{tool_name});
+            has_errors = true;
+            continue;
+        }
+
+        const tool_obj = tool_value.object;
+        var valid = true;
+
+        if (tool_obj.get("system_prompt")) |sp_val| {
+            if (sp_val != .string) {
+                std.debug.print("  [ERROR] Tool '{s}': system_prompt must be a string\n", .{tool_name});
+                valid = false;
+                has_errors = true;
+            }
+        }
+
+        if (tool_obj.get("triggers")) |triggers_val| {
+            if (triggers_val != .array) {
+                std.debug.print("  [ERROR] Tool '{s}': triggers must be an array\n", .{tool_name});
+                valid = false;
+                has_errors = true;
+            } else {
+                for (triggers_val.array.items, 0..) |item, idx| {
+                    if (item != .string) {
+                        std.debug.print("  [ERROR] Tool '{s}': triggers[{d}] must be a string\n", .{ tool_name, idx });
+                        valid = false;
+                        has_errors = true;
+                    }
+                }
+            }
+        }
+
+        if (tool_obj.get("priority")) |priority_val| {
+            if (priority_val != .integer and priority_val != .float) {
+                std.debug.print("  [ERROR] Tool '{s}': priority must be a number\n", .{tool_name});
+                valid = false;
+                has_errors = true;
+            }
+        }
+
+        if (tool_obj.get("enabled")) |enabled_val| {
+            if (enabled_val != .bool) {
+                std.debug.print("  [ERROR] Tool '{s}': enabled must be a boolean\n", .{tool_name});
+                valid = false;
+                has_errors = true;
+            }
+        }
+
+        if (valid) {
+            std.debug.print("  [OK] {s}\n", .{tool_name});
+        }
+    }
+
+    if (has_errors) {
+        std.debug.print("\nValidation failed with errors.\n", .{});
+        std.process.exit(1);
+    } else {
+        std.debug.print("\nValidation passed. All tool customizations are valid.\n", .{});
+    }
 }

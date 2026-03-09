@@ -1,0 +1,43 @@
+{
+  "screenshot": {
+    "system_prompt": "Capture and return a screenshot of the current screen. This tool is useful when the user asks to see the screen, take a picture, or capture what's displayed on the monitor.",
+    "triggers": [
+      "截屏",
+      "截图",
+      "显示屏幕",
+      "screenshot",
+      "screen capture",
+      "capture screen",
+      "take a picture",
+      "take a photo",
+      "show me the screen",
+      "show screen"
+    ],
+    "priority": 10,
+    "enabled": true
+  },
+  "file_read": {
+    "system_prompt": "Read the contents of a file at the specified path. Use this when the user asks to read, view, or examine a file.",
+    "triggers": [
+      "读取文件",
+      "查看文件",
+      "read file",
+      "view file",
+      "open file"
+    ],
+    "priority": 5,
+    "enabled": true
+  },
+  "shell": {
+    "system_prompt": "Execute a shell command and return the output. Use this when the user asks to run commands, execute scripts, or perform system operations.",
+    "triggers": [
+      "执行命令",
+      "运行命令",
+      "run command",
+      "execute command",
+      "shell"
+    ],
+    "priority": 8,
+    "enabled": true
+  }
+}

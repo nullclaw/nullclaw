@@ -96,6 +96,48 @@ pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 
+pub const BuiltinToolMeta = struct {
+    name: []const u8,
+    description: []const u8,
+    params: []const u8,
+};
+
+pub const builtin_tool_meta: []const BuiltinToolMeta = &.{
+    .{ .name = shell.ShellTool.tool_name, .description = shell.ShellTool.tool_description, .params = shell.ShellTool.tool_params },
+    .{ .name = file_read.FileReadTool.tool_name, .description = file_read.FileReadTool.tool_description, .params = file_read.FileReadTool.tool_params },
+    .{ .name = file_write.FileWriteTool.tool_name, .description = file_write.FileWriteTool.tool_description, .params = file_write.FileWriteTool.tool_params },
+    .{ .name = file_edit.FileEditTool.tool_name, .description = file_edit.FileEditTool.tool_description, .params = file_edit.FileEditTool.tool_params },
+    .{ .name = file_append.FileAppendTool.tool_name, .description = file_append.FileAppendTool.tool_description, .params = file_append.FileAppendTool.tool_params },
+    .{ .name = git.GitTool.tool_name, .description = git.GitTool.tool_description, .params = git.GitTool.tool_params },
+    .{ .name = image.ImageInfoTool.tool_name, .description = image.ImageInfoTool.tool_description, .params = image.ImageInfoTool.tool_params },
+    .{ .name = memory_store.MemoryStoreTool.tool_name, .description = memory_store.MemoryStoreTool.tool_description, .params = memory_store.MemoryStoreTool.tool_params },
+    .{ .name = memory_recall.MemoryRecallTool.tool_name, .description = memory_recall.MemoryRecallTool.tool_description, .params = memory_recall.MemoryRecallTool.tool_params },
+    .{ .name = memory_list.MemoryListTool.tool_name, .description = memory_list.MemoryListTool.tool_description, .params = memory_list.MemoryListTool.tool_params },
+    .{ .name = memory_forget.MemoryForgetTool.tool_name, .description = memory_forget.MemoryForgetTool.tool_description, .params = memory_forget.MemoryForgetTool.tool_params },
+    .{ .name = delegate.DelegateTool.tool_name, .description = delegate.DelegateTool.tool_description, .params = delegate.DelegateTool.tool_params },
+    .{ .name = schedule.ScheduleTool.tool_name, .description = schedule.ScheduleTool.tool_description, .params = schedule.ScheduleTool.tool_params },
+    .{ .name = spawn.SpawnTool.tool_name, .description = spawn.SpawnTool.tool_description, .params = spawn.SpawnTool.tool_params },
+    .{ .name = http_request.HttpRequestTool.tool_name, .description = http_request.HttpRequestTool.tool_description, .params = http_request.HttpRequestTool.tool_params },
+    .{ .name = web_fetch.WebFetchTool.tool_name, .description = web_fetch.WebFetchTool.tool_description, .params = web_fetch.WebFetchTool.tool_params },
+    .{ .name = web_search.WebSearchTool.tool_name, .description = web_search.WebSearchTool.tool_description, .params = web_search.WebSearchTool.tool_params },
+    .{ .name = browser.BrowserTool.tool_name, .description = browser.BrowserTool.tool_description, .params = browser.BrowserTool.tool_params },
+    .{ .name = browser_open.BrowserOpenTool.tool_name, .description = browser_open.BrowserOpenTool.tool_description, .params = browser_open.BrowserOpenTool.tool_params },
+    .{ .name = screenshot.ScreenshotTool.tool_name, .description = screenshot.ScreenshotTool.tool_description, .params = screenshot.ScreenshotTool.tool_params },
+    .{ .name = composio.ComposioTool.tool_name, .description = composio.ComposioTool.tool_description, .params = composio.ComposioTool.tool_params },
+    .{ .name = hardware_info.HardwareBoardInfoTool.tool_name, .description = hardware_info.HardwareBoardInfoTool.tool_description, .params = hardware_info.HardwareBoardInfoTool.tool_params },
+    .{ .name = hardware_memory.HardwareMemoryTool.tool_name, .description = hardware_memory.HardwareMemoryTool.tool_description, .params = hardware_memory.HardwareMemoryTool.tool_params },
+    .{ .name = i2c.I2cTool.tool_name, .description = i2c.I2cTool.tool_description, .params = i2c.I2cTool.tool_params },
+    .{ .name = spi.SpiTool.tool_name, .description = spi.SpiTool.tool_description, .params = spi.SpiTool.tool_params },
+    .{ .name = message.MessageTool.tool_name, .description = message.MessageTool.tool_description, .params = message.MessageTool.tool_params },
+    .{ .name = pushover.PushoverTool.tool_name, .description = pushover.PushoverTool.tool_description, .params = pushover.PushoverTool.tool_params },
+    .{ .name = cron_add.CronAddTool.tool_name, .description = cron_add.CronAddTool.tool_description, .params = cron_add.CronAddTool.tool_params },
+    .{ .name = cron_list.CronListTool.tool_name, .description = cron_list.CronListTool.tool_description, .params = cron_list.CronListTool.tool_params },
+    .{ .name = cron_remove.CronRemoveTool.tool_name, .description = cron_remove.CronRemoveTool.tool_description, .params = cron_remove.CronRemoveTool.tool_params },
+    .{ .name = cron_update.CronUpdateTool.tool_name, .description = cron_update.CronUpdateTool.tool_description, .params = cron_update.CronUpdateTool.tool_params },
+    .{ .name = cron_run.CronRunTool.tool_name, .description = cron_run.CronRunTool.tool_description, .params = cron_run.CronRunTool.tool_params },
+    .{ .name = cron_runs.CronRunsTool.tool_name, .description = cron_runs.CronRunsTool.tool_description, .params = cron_runs.CronRunsTool.tool_params },
+};
+
 // ── Core types ──────────────────────────────────────────────────────
 
 /// Result of a tool execution.
