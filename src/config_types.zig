@@ -251,6 +251,11 @@ pub const ToolCustomization = struct {
     /// Whether this tool is enabled.
     /// If false, the tool will not be available.
     enabled: bool = true,
+    /// Skip LLM template: if provided, tool output will be formatted using this template
+    /// and returned directly to the user without LLM processing.
+    /// Template format: supports {output} placeholder for tool output.
+    /// Example: "Screenshot saved: {output}"
+    skip_llm_tpl: ?[]const u8 = null,
 };
 
 pub const ModelRouteCostClass = enum {

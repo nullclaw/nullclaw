@@ -2,6 +2,7 @@
 
 - 为内置工具添加自定义系统提示词、触发关键词和优先级，以提高工具调用的准确性和响应速度。
 - 支持事前无LLM模式: 对工具(如screenshot)支持配置特定触发词(trigger)可以实现直接调用工具的功能，而无需 LLM 参与。
+- 支持事后LLM模式: 对工具(如screenshot)支持配置skip_llm_tpl参数可将调用工具的输出直接模板化后返回给用户，而无需 LLM 参与。
 
 ## 快速开始
 
@@ -122,6 +123,7 @@ nullclaw tools import tool_customizations.json
 | `triggers` | string[] | 否 | 触发关键词列表，当用户消息包含这些词时会优先调用该工具,为空则没有触发词相关逻辑 |
 | `priority` | number | 否 | 优先级（默认 0），数值越高优先级越高 |
 | `enabled` | boolean | 否 | 是否启用该工具（默认 true） |
+| `skip_llm_tpl` | string | 否 | 跳过 LLM 模板，当配置此字段时，工具执行完成后会将输出通过此模板格式化后直接返回给用户，无需 LLM 处理。模板支持 `{output}` 占位符，例如："Screenshot saved: {output}" |
 | `trigger_modifiers` | string[] | 否 | 自定义修饰词列表，会从输入头尾移除后再匹配触发词 |
 | `trigger_punctuation` | string | 否 | 自定义标点符号，会从输入中移除后再匹配触发词 |
 
@@ -258,7 +260,7 @@ nullclaw tools import tool_customizations.json
 
 ## 示例配置
 
-### 截图工具
+### 截图工具（带 skip_llm_tpl）
 
 ```json
 {
@@ -275,9 +277,12 @@ nullclaw tools import tool_customizations.json
     "show screen"
   ],
   "priority": 10,
-  "enabled": true
+  "enabled": true,
+  "skip_llm_tpl": "截图已保存: {output}"
 }
 ```
+
+**说明**：当用户输入精确匹配触发词（如 "截图"）时，工具执行完成后会直接返回 "截图已保存: /path/to/screenshot.png"，无需经过 LLM 处理。
 
 ### 文件读取工具
 

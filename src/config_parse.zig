@@ -997,6 +997,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 .triggers = &.{},
                                 .priority = 0,
                                 .enabled = true,
+                                .skip_llm_tpl = null,
                             };
                             if (item.object.get("name")) |nv| {
                                 if (nv == .string) custom.name = try self.allocator.dupe(u8, nv.string);
@@ -1012,6 +1013,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                             if (item.object.get("enabled")) |ev| {
                                 if (ev == .bool) custom.enabled = ev.bool;
+                            }
+                            if (item.object.get("skip_llm_tpl")) |tplv| {
+                                if (tplv == .string) custom.skip_llm_tpl = try self.allocator.dupe(u8, tplv.string);
                             }
                             try custom_list.append(self.allocator, custom);
                         }

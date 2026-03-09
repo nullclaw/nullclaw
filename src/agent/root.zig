@@ -764,6 +764,7 @@ pub const Agent = struct {
                 for (entry.value_ptr.triggers) |t| self.allocator.free(t);
                 self.allocator.free(entry.value_ptr.triggers);
             }
+            if (entry.value_ptr.skip_llm_tpl) |tpl| self.allocator.free(tpl);
         }
         self.tool_customizations.deinit(self.allocator);
     }
@@ -1529,6 +1530,7 @@ pub const Agent = struct {
                     for (entry.value_ptr.triggers) |t| allocator.free(t);
                     allocator.free(entry.value_ptr.triggers);
                 }
+                if (entry.value_ptr.skip_llm_tpl) |tpl| allocator.free(tpl);
             }
             customizations.deinit(allocator);
         }
@@ -1584,6 +1586,10 @@ pub const Agent = struct {
                         if (existing.system_prompt) |sp| allocator.free(sp);
                         existing.system_prompt = try allocator.dupe(u8, entry.value_ptr.system_prompt.?);
                     }
+                    if (entry.value_ptr.skip_llm_tpl != null) {
+                        if (existing.skip_llm_tpl) |tpl| allocator.free(tpl);
+                        existing.skip_llm_tpl = try allocator.dupe(u8, entry.value_ptr.skip_llm_tpl.?);
+                    }
                     if (entry.value_ptr.priority > existing.priority) {
                         existing.priority = entry.value_ptr.priority;
                     }
@@ -1633,6 +1639,7 @@ pub const Agent = struct {
                     for (entry.value_ptr.triggers) |t| allocator.free(t);
                     allocator.free(entry.value_ptr.triggers);
                 }
+                if (entry.value_ptr.skip_llm_tpl) |tpl| allocator.free(tpl);
             }
             customizations.deinit(allocator);
         }
@@ -1661,6 +1668,7 @@ pub const Agent = struct {
                 .triggers = try triggers_list.toOwnedSlice(allocator),
                 .priority = 0,
                 .enabled = true,
+                .skip_llm_tpl = null,
             };
 
             if (tool_obj.get("system_prompt")) |sp_val| {
@@ -1678,6 +1686,12 @@ pub const Agent = struct {
             if (tool_obj.get("enabled")) |enabled_val| {
                 if (enabled_val == .bool) {
                     custom.enabled = enabled_val.bool;
+                }
+            }
+
+            if (tool_obj.get("skip_llm_tpl")) |tpl_val| {
+                if (tpl_val == .string) {
+                    custom.skip_llm_tpl = try allocator.dupe(u8, tpl_val.string);
                 }
             }
 
@@ -2063,6 +2077,26 @@ pub const Agent = struct {
                             .tool_call_id = "",
                         };
                         const result = self.executeTool(self.allocator, tool_call);
+
+                        const custom = self.tool_customizations.get(tn);
+                        if (custom != null and custom.?.skip_llm_tpl != null) {
+                            const tpl = custom.?.skip_llm_tpl.?;
+                            var output_buf = std.ArrayListUnmanaged(u8){};
+                            try output_buf.ensureTotalCapacity(self.allocator, tpl.len + result.output.len);
+                            defer output_buf.deinit(self.allocator);
+                            var pos: usize = 0;
+                            while (pos < tpl.len) {
+                                if (std.mem.indexOfPos(u8, tpl, pos, "{output}")) |idx| {
+                                    try output_buf.appendSlice(self.allocator, tpl[pos..idx]);
+                                    try output_buf.appendSlice(self.allocator, result.output);
+                                    pos = idx + "{output}".len;
+                                } else {
+                                    try output_buf.appendSlice(self.allocator, tpl[pos..]);
+                                    break;
+                                }
+                            }
+                            return try output_buf.toOwnedSlice(self.allocator);
+                        }
 
                         return try std.fmt.allocPrint(self.allocator, "Tool '{s}' executed: {s}", .{ tn, result.output });
                     }

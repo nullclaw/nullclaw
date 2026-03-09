@@ -14,7 +14,8 @@
       "show screen"
     ],
     "priority": 10,
-    "enabled": true
+    "enabled": true,
+    "skip_llm_tpl": "截图已保存: {output}"
   },
   "file_read": {
     "system_prompt": "Read the contents of a file at the specified path. Use this when the user asks to read, view, or examine a file.",

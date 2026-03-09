@@ -116,6 +116,7 @@ External file format:
 | `triggers` | string[] | No | List of trigger keywords; when user messages contain these words, the tool is prioritized |
 | `priority` | number | No | Priority (default: 0); higher values mean higher priority |
 | `enabled` | boolean | No | Whether the tool is enabled (default: true) |
+| `skip_llm_tpl` | string | No | Skip LLM template: when configured, tool output is formatted using this template and returned directly to the user without LLM processing. Supports `{output}` placeholder. Example: "Screenshot saved: {output}" |
 | `trigger_modifiers` | string[] | No | Custom modifiers list; removed from input start and end before trigger matching |
 | `trigger_punctuation` | string | No | Custom punctuation; removed from input before trigger matching |
 
@@ -253,7 +254,7 @@ In an agent session, use the following commands to view tool customizations (rea
 
 ## Example Configurations
 
-### Screenshot Tool
+### Screenshot Tool (with skipLlmTpl)
 
 ```json
 {
@@ -269,9 +270,12 @@ In an agent session, use the following commands to view tool customizations (rea
     "show screen"
   ],
   "priority": 10,
-  "enabled": true
+  "enabled": true,
+  "skip_llm_tpl": "Screenshot saved: {output}"
 }
 ```
+
+**Note**: When user input exactly matches a trigger keyword (e.g., "screenshot"), the tool output will be directly formatted as "Screenshot saved: /path/to/screenshot.png" and returned without LLM processing.
 
 ### File Read Tool
 
