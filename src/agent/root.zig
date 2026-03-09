@@ -765,6 +765,7 @@ pub const Agent = struct {
                 self.allocator.free(entry.value_ptr.triggers);
             }
             if (entry.value_ptr.skip_llm_tpl) |tpl| self.allocator.free(tpl);
+            if (entry.value_ptr.default_arguments) |args| self.allocator.free(args);
         }
         self.tool_customizations.deinit(self.allocator);
     }
@@ -1531,6 +1532,7 @@ pub const Agent = struct {
                     allocator.free(entry.value_ptr.triggers);
                 }
                 if (entry.value_ptr.skip_llm_tpl) |tpl| allocator.free(tpl);
+                if (entry.value_ptr.default_arguments) |args| allocator.free(args);
             }
             customizations.deinit(allocator);
         }
@@ -1695,6 +1697,12 @@ pub const Agent = struct {
                 }
             }
 
+            if (tool_obj.get("default_arguments")) |args_val| {
+                if (args_val == .string) {
+                    custom.default_arguments = try allocator.dupe(u8, args_val.string);
+                }
+            }
+
             try customizations.put(allocator, custom.name, custom);
         }
 
@@ -1728,6 +1736,92 @@ pub const Agent = struct {
         }
 
         return merged.toOwnedSlice(allocator);
+    }
+
+    /// Expand variables in default arguments JSON string.
+    /// Supported variables:
+    /// - {workspace_dir} - Current workspace directory
+    /// - {timestamp} - Current Unix timestamp
+    /// - {date} - Current date (YYYY-MM-DD)
+    /// - {time} - Current time (HH-MM-SS)
+    /// - {home} - User home directory
+    fn expandDefaultArguments(
+        allocator: std.mem.Allocator,
+        args_json: []const u8,
+        workspace_dir: []const u8,
+    ) ![]const u8 {
+        var result = std.ArrayListUnmanaged(u8){};
+        errdefer result.deinit(allocator);
+
+        var pos: usize = 0;
+        while (pos < args_json.len) {
+            // Find next variable placeholder
+            if (std.mem.indexOfPos(u8, args_json, pos, "{")) |start| {
+                // Append text before the variable
+                try result.appendSlice(allocator, args_json[pos..start]);
+
+                // Find the closing brace
+                const end = std.mem.indexOfPos(u8, args_json, start + 1, "}") orelse {
+                    // No closing brace, append rest as-is
+                    try result.appendSlice(allocator, args_json[start..]);
+                    break;
+                };
+
+                const var_name = args_json[start + 1 .. end];
+
+                // Expand known variables - use if-else chain without mixing comptime/runtime
+                if (std.mem.eql(u8, var_name, "workspace_dir")) {
+                    try result.appendSlice(allocator, workspace_dir);
+                } else if (std.mem.eql(u8, var_name, "timestamp")) {
+                    const ts = std.time.timestamp();
+                    var buf: [32]u8 = undefined;
+                    const str = try std.fmt.bufPrint(&buf, "{d}", .{ts});
+                    try result.appendSlice(allocator, str);
+                } else if (std.mem.eql(u8, var_name, "date")) {
+                    const ts = std.time.timestamp();
+                    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
+                    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+                    const month_day = year_day.calculateMonthDay();
+                    var buf: [16]u8 = undefined;
+                    const str = try std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+                        year_day.year,
+                        month_day.month.numeric(),
+                        month_day.day_index + 1,
+                    });
+                    try result.appendSlice(allocator, str);
+                } else if (std.mem.eql(u8, var_name, "time")) {
+                    const ts = std.time.timestamp();
+                    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
+                    const day = epoch_seconds.getDaySeconds();
+                    var buf: [16]u8 = undefined;
+                    const str = try std.fmt.bufPrint(&buf, "{d:0>2}-{d:0>2}-{d:0>2}", .{
+                        day.getHoursIntoDay(),
+                        day.getMinutesIntoHour(),
+                        day.getSecondsIntoMinute(),
+                    });
+                    try result.appendSlice(allocator, str);
+                } else if (std.mem.eql(u8, var_name, "home")) {
+                    const home = platform.getHomeDir(allocator) catch null;
+                    if (home) |h| {
+                        try result.appendSlice(allocator, h);
+                        allocator.free(h);
+                    } else {
+                        try result.appendSlice(allocator, "~");
+                    }
+                } else {
+                    // Unknown variable, keep as-is
+                    try result.appendSlice(allocator, args_json[start..end + 1]);
+                }
+
+                pos = end + 1;
+            } else {
+                // No more variables, append rest
+                try result.appendSlice(allocator, args_json[pos..]);
+                break;
+            }
+        }
+
+        return try result.toOwnedSlice(allocator);
     }
 
     fn execBlockMessage(self: *Agent, args: std.json.ObjectMap) ?[]const u8 {
@@ -2071,14 +2165,36 @@ pub const Agent = struct {
                     }
 
                     if (find_tool_by_name(self.tools, tn)) |_| {
+                        // Get default arguments from customization if available
+                        const custom = self.tool_customizations.get(tn);
+                        const args_json = blk: {
+                            if (custom != null and custom.?.default_arguments != null) {
+                                const expanded = expandDefaultArguments(
+                                    self.allocator,
+                                    custom.?.default_arguments.?,
+                                    self.workspace_dir,
+                                ) catch |err| {
+                                    if (verbose_mod.isVerbose()) {
+                                        log.debug("Failed to expand default arguments: {}, using empty args", .{err});
+                                    }
+                                    break :blk "{}";
+                                };
+                                break :blk expanded;
+                            }
+                            break :blk "{}";
+                        };
+                        // Note: args_json is either "{}" (literal) or expanded (allocated)
+                        // We need to free expanded args only if they were allocated
+                        const need_free = custom != null and custom.?.default_arguments != null and !std.mem.eql(u8, args_json, "{}");
+                        defer if (need_free) self.allocator.free(args_json);
+
                         const tool_call = ParsedToolCall{
                             .name = tn,
-                            .arguments_json = "{}",
+                            .arguments_json = args_json,
                             .tool_call_id = "",
                         };
                         const result = self.executeTool(self.allocator, tool_call);
 
-                        const custom = self.tool_customizations.get(tn);
                         if (custom != null and custom.?.skip_llm_tpl != null) {
                             const tpl = custom.?.skip_llm_tpl.?;
                             var output_buf = std.ArrayListUnmanaged(u8){};

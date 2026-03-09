@@ -124,6 +124,7 @@ nullclaw tools import tool_customizations.json
 | `priority` | number | 否 | 优先级（默认 0），数值越高优先级越高 |
 | `enabled` | boolean | 否 | 是否启用该工具（默认 true） |
 | `skip_llm_tpl` | string | 否 | 跳过 LLM 模板，当配置此字段时，工具执行完成后会将输出通过此模板格式化后直接返回给用户，无需 LLM 处理。模板支持 `{output}` 占位符，例如："Screenshot saved: {output}" |
+| `default_arguments` | string | 否 | 默认参数（JSON字符串），当触发词精确匹配时，使用这些参数直接调用工具。支持变量替换：`{workspace_dir}`（工作目录）、`{timestamp}`（时间戳）、`{date}`（日期 YYYY-MM-DD）、`{time}`（时间 HH-MM-SS）、`{home}`（用户主目录）。示例：`{"save_path": "{workspace_dir}/screenshots/{timestamp}.png"}` |
 | `trigger_modifiers` | string[] | 否 | 自定义修饰词列表，会从输入头尾移除后再匹配触发词 |
 | `trigger_punctuation` | string | 否 | 自定义标点符号，会从输入中移除后再匹配触发词 |
 

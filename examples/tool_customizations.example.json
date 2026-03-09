@@ -15,7 +15,8 @@
     ],
     "priority": 10,
     "enabled": true,
-    "skip_llm_tpl": "截图已保存: {output}"
+    "skip_llm_tpl": "截图已保存: {output}",
+    "default_arguments": "{\"save_path\": \"{workspace_dir}/screenshots/{timestamp}.png\", \"full_screen\": true}"
   },
   "file_read": {
     "system_prompt": "Read the contents of a file at the specified path. Use this when the user asks to read, view, or examine a file.",

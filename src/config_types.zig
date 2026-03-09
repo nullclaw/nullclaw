@@ -256,6 +256,11 @@ pub const ToolCustomization = struct {
     /// Template format: supports {output} placeholder for tool output.
     /// Example: "Screenshot saved: {output}"
     skip_llm_tpl: ?[]const u8 = null,
+    /// Default arguments for direct tool execution (pre-LLM mode).
+    /// When a trigger keyword exactly matches, these arguments are used to call the tool.
+    /// Supports variable substitution: {workspace_dir}, {timestamp}, {date}, {time}, {home}
+    /// Example: {"save_path": "{workspace_dir}/screenshots/{timestamp}.png"}
+    default_arguments: ?[]const u8 = null,
 };
 
 pub const ModelRouteCostClass = enum {
