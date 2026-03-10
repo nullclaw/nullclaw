@@ -3173,13 +3173,133 @@ fn toolsImportPreview(allocator: std.mem.Allocator, file_path: []const u8) !void
 
     std.debug.print("Tool customizations to import:\n", .{});
     var count: usize = 0;
+    var has_warnings = false;
+
     while (iter.next()) |entry| {
         count += 1;
-        std.debug.print("  {s}\n", .{entry.key_ptr.*});
+        const tool_name = entry.key_ptr.*;
+        const tool_value = entry.value_ptr.*;
+
+        std.debug.print("\n  [{d}] {s}\n", .{ count, tool_name });
+
+        if (tool_value != .object) {
+            std.debug.print("      [ERROR] Must be an object\n", .{});
+            has_warnings = true;
+            continue;
+        }
+
+        const tool_obj = tool_value.object;
+
+        // Check triggers
+        if (tool_obj.get("triggers")) |triggers_val| {
+            if (triggers_val == .array) {
+                std.debug.print("      Triggers: ", .{});
+                for (triggers_val.array.items, 0..) |t, i| {
+                    if (t == .string) {
+                        if (i > 0) std.debug.print(", ", .{});
+                        std.debug.print("\"{s}\"", .{t.string});
+                    }
+                }
+                std.debug.print("\n", .{});
+            }
+        }
+
+        // Check default_arguments and validate against tool schema
+        if (tool_obj.get("default_arguments")) |args_val| {
+            const tool_meta = findToolMetadata(tool_name);
+            if (tool_meta) |meta| {
+                const valid_params = try parseToolParams(allocator, meta.params);
+                defer valid_params.deinit();
+
+                if (args_val == .object) {
+                    std.debug.print("      [OK] default_arguments: configured\n", .{});
+                    validateArgumentsAgainstSchema(tool_name, args_val.object, valid_params);
+                } else {
+                    std.debug.print("      [ERROR] default_arguments: must be a JSON object (e.g., {{\"key\": \"value\"}})\n", .{});
+                    has_warnings = true;
+                }
+
+                // Show available parameters hint
+                std.debug.print("      Available parameters: ", .{});
+                for (valid_params.items, 0..) |param, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}", .{param});
+                }
+                std.debug.print("\n", .{});
+            } else {
+                std.debug.print("      [WARNING] Unknown tool '{s}' - cannot validate parameters\n", .{tool_name});
+                has_warnings = true;
+            }
+        }
+
+        // Check skip_llm_tpl
+        if (tool_obj.get("skip_llm_tpl")) |tpl_val| {
+            if (tpl_val == .string) {
+                if (std.mem.indexOf(u8, tpl_val.string, "{output}") != null) {
+                    std.debug.print("      [OK] skip_llm_tpl: configured with {{output}} placeholder\n", .{});
+                } else {
+                    std.debug.print("      [INFO] skip_llm_tpl: no {{output}} placeholder (output won't be inserted)\n", .{});
+                }
+            }
+        }
+    }
+
+    if (has_warnings) {
+        std.debug.print("\n[!] Some issues found. Review the warnings above.\n", .{});
+    } else {
+        std.debug.print("\n[OK] All tool customizations look good!\n", .{});
     }
 
     std.debug.print("\nTo apply these customizations, add them to your config file:\n  {s}\n", .{cfg.config_path});
     std.debug.print("\nOr set the tool_customizations_file path in your config:\n  \"tools\": {{ \"tool_customizations_file\": \"{s}\" }}\n", .{file_path});
+}
+
+fn findToolMetadata(tool_name: []const u8) ?yc.tools.BuiltinToolMeta {
+    for (yc.tools.builtin_tool_meta) |meta| {
+        if (std.mem.eql(u8, meta.name, tool_name)) {
+            return meta;
+        }
+    }
+    return null;
+}
+
+fn parseToolParams(allocator: std.mem.Allocator, params_json: []const u8) !std.ArrayListUnmanaged([]const u8) {
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, params_json, .{}) catch {
+        return result;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return result;
+
+    if (parsed.value.object.get("properties")) |props| {
+        if (props == .object) {
+            var iter = props.object.iterator();
+            while (iter.next()) |entry| {
+                try result.append(allocator, entry.key_ptr.*);
+            }
+        }
+    }
+
+    return result;
+}
+
+fn validateArgumentsAgainstSchema(tool_name: []const u8, args: std.json.ObjectMap, valid_params: std.ArrayListUnmanaged([]const u8)) void {
+    var iter = args.iterator();
+    while (iter.next()) |entry| {
+        const arg_name = entry.key_ptr.*;
+        var is_valid = false;
+        for (valid_params.items) |param| {
+            if (std.mem.eql(u8, arg_name, param)) {
+                is_valid = true;
+                break;
+            }
+        }
+        if (!is_valid) {
+            std.debug.print("      [WARNING] '{s}' is not a valid parameter for tool '{s}'\n", .{ arg_name, tool_name });
+        }
+    }
 }
 
 fn toolsValidate(allocator: std.mem.Allocator, file_path: []const u8) !void {

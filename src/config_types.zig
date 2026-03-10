@@ -259,7 +259,7 @@ pub const ToolCustomization = struct {
     /// Default arguments for direct tool execution (pre-LLM mode).
     /// When a trigger keyword exactly matches, these arguments are used to call the tool.
     /// Supports variable substitution: {workspace_dir}, {timestamp}, {date}, {time}, {home}
-    /// Example: {"save_path": "{workspace_dir}/screenshots/{timestamp}.png"}
+    /// Format: JSON object like {"filename": "{timestamp}.png"}
     default_arguments: ?[]const u8 = null,
 };
 

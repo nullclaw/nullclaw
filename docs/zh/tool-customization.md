@@ -124,7 +124,7 @@ nullclaw tools import-preview tool_customizations.json
 | `priority` | number | 否 | 优先级（默认 0），数值越高优先级越高 |
 | `enabled` | boolean | 否 | 是否启用该工具（默认 true） |
 | `skip_llm_tpl` | string | 否 | 跳过 LLM 模板，当配置此字段时，工具执行完成后会将输出通过此模板格式化后直接返回给用户，无需 LLM 处理。模板支持 `{output}` 占位符，例如："Screenshot saved: {output}" |
-| `default_arguments` | string | 否 | 默认参数（JSON字符串），当触发词精确匹配时，使用这些参数直接调用工具。支持变量替换：`{workspace_dir}`（工作目录）、`{timestamp}`（时间戳）、`{date}`（日期 YYYY-MM-DD）、`{time}`（时间 HH-MM-SS）、`{home}`（用户主目录）。示例：`{"save_path": "{workspace_dir}/screenshots/{timestamp}.png"}` |
+| `default_arguments` | string/object | 否 | 默认参数，当触发词精确匹配时，使用这些参数直接调用工具。支持两种格式：<br>1. **对象格式（推荐）**：`{"filename": "{timestamp}.png"}`<br>2. **字符串格式（兼容）**：`"{\"filename\": \"{timestamp}.png\"}"`<br>支持变量替换：`{workspace_dir}`（工作目录）、`{timestamp}`（时间戳）、`{date}`（日期 YYYY-MM-DD）、`{time}`（时间 HH-MM-SS）、`{home}`（用户主目录） |
 | `trigger_modifiers` | string[] | 否 | 自定义修饰词列表，会从输入头尾移除后再匹配触发词 |
 | `trigger_punctuation` | string | 否 | 自定义标点符号，会从输入中移除后再匹配触发词 |
 
@@ -333,7 +333,9 @@ nullclaw tools import-preview tool_customizations.json
   ],
   "priority": 10,
   "enabled": true,
-  "default_arguments": "{\"save_path\": \"{workspace_dir}/screenshots/{timestamp}.png\"}",
+  "default_arguments": {
+    "filename": "screenshot_{timestamp}.png"
+  },
   "skip_llm_tpl": "截图已保存: {output}"
 }
 ```
@@ -344,6 +346,163 @@ nullclaw tools import-preview tool_customizations.json
 - `{date}` - 日期（YYYY-MM-DD）
 - `{time}` - 时间（HH-MM-SS）
 - `{home}` - 用户主目录
+
+## 各工具 default_arguments 参数样例
+
+以下是常用工具的 `default_arguments` 参数样例：
+
+### screenshot（截图）
+
+```json
+{
+  "name": "screenshot",
+  "triggers": ["截图", "screenshot"],
+  "default_arguments": {
+    "filename": "screenshot_{timestamp}.png"
+  }
+}
+```
+
+**可用参数**：
+- `filename` (string): 截图文件名，保存到工作目录
+
+### shell（执行命令）
+
+```json
+{
+  "name": "shell",
+  "triggers": ["执行命令", "run command"],
+  "default_arguments": {
+    "command": "ls -la",
+    "cwd": "{workspace_dir}"
+  }
+}
+```
+
+**可用参数**：
+- `command` (string, 必填): 要执行的 shell 命令
+- `cwd` (string): 工作目录（默认为工作区根目录）
+
+### file_read（读取文件）
+
+```json
+{
+  "name": "file_read",
+  "triggers": ["读取文件", "read file"],
+  "default_arguments": {
+    "path": "README.md"
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+
+### file_write（写入文件）
+
+```json
+{
+  "name": "file_write",
+  "triggers": ["写入文件", "write file"],
+  "default_arguments": {
+    "path": "notes_{date}.md",
+    "content": "# Notes for {date}\n\n"
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+- `content` (string, 必填): 文件内容
+
+### file_edit（编辑文件）
+
+```json
+{
+  "name": "file_edit",
+  "triggers": ["编辑文件", "edit file"],
+  "default_arguments": {
+    "path": "config.txt",
+    "old_string": "old_value",
+    "new_string": "new_value"
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+- `old_string` (string, 必填): 要替换的旧文本
+- `new_string` (string, 必填): 新文本
+
+### git（Git 操作）
+
+```json
+{
+  "name": "git",
+  "triggers": ["git 状态", "git status"],
+  "default_arguments": {
+    "command": "status"
+  }
+}
+```
+
+**可用参数**：
+- `command` (string, 必填): Git 命令（如 status, log, diff 等）
+
+### browser_open（打开浏览器）
+
+```json
+{
+  "name": "browser_open",
+  "triggers": ["打开网页", "open url"],
+  "default_arguments": {
+    "url": "https://example.com"
+  }
+}
+```
+
+**可用参数**：
+- `url` (string, 必填): 要打开的 URL
+
+### web_fetch（获取网页内容）
+
+```json
+{
+  "name": "web_fetch",
+  "triggers": ["获取网页", "fetch page"],
+  "default_arguments": {
+    "url": "https://example.com/article"
+  }
+}
+```
+
+**可用参数**：
+- `url` (string, 必填): 要获取的网页 URL
+
+### http_request（HTTP 请求）
+
+```json
+{
+  "name": "http_request",
+  "triggers": ["请求 API", "api request"],
+  "default_arguments": {
+    "url": "https://api.example.com/data",
+    "method": "GET"
+  }
+}
+```
+
+**可用参数**：
+- `url` (string, 必填): 请求 URL
+- `method` (string): HTTP 方法（GET, POST, PUT, DELETE 等，默认 GET）
+
+### 查看所有工具参数
+
+使用以下命令查看所有内置工具的参数定义：
+
+```bash
+nullclaw tools show --builtin
+```
 
 ## 故障排除
 

@@ -1019,7 +1019,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 if (tplv == .string) custom.skip_llm_tpl = try self.allocator.dupe(u8, tplv.string);
                             }
                             if (item.object.get("default_arguments")) |dav| {
-                                if (dav == .string) custom.default_arguments = try self.allocator.dupe(u8, dav.string);
+                                if (dav == .object) {
+                                    // Object format: stringify to JSON string for internal storage
+                                    const json_str = try std.json.Stringify.valueAlloc(self.allocator, dav, .{});
+                                    custom.default_arguments = json_str;
+                                }
+                                // Note: string format is not supported, only object format
                             }
                             try custom_list.append(self.allocator, custom);
                         }

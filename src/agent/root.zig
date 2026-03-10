@@ -1748,9 +1748,12 @@ pub const Agent = struct {
             }
 
             if (tool_obj.get("default_arguments")) |args_val| {
-                if (args_val == .string) {
-                    custom.default_arguments = try allocator.dupe(u8, args_val.string);
+                if (args_val == .object) {
+                    // Object format: stringify to JSON string for internal storage
+                    const json_str = try std.json.Stringify.valueAlloc(allocator, args_val, .{});
+                    custom.default_arguments = json_str;
                 }
+                // Note: string format is not supported, only object format
             }
 
             try customizations.put(allocator, custom.name, custom);

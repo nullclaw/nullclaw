@@ -16,7 +16,9 @@
     "priority": 10,
     "enabled": true,
     "skip_llm_tpl": "截图已保存: {output}",
-    "default_arguments": "{\"save_path\": \"{workspace_dir}/screenshots/{timestamp}.png\", \"full_screen\": true}"
+    "default_arguments": {
+      "filename": "screenshot_{timestamp}.png"
+    }
   },
   "file_read": {
     "system_prompt": "Read the contents of a file at the specified path. Use this when the user asks to read, view, or examine a file.",
@@ -30,6 +32,21 @@
     "priority": 5,
     "enabled": true
   },
+  "file_write": {
+    "system_prompt": "Write content to a file at the specified path. Use this when the user asks to create or overwrite a file.",
+    "triggers": [
+      "写入文件",
+      "创建文件",
+      "write file",
+      "create file"
+    ],
+    "priority": 5,
+    "enabled": true,
+    "default_arguments": {
+      "path": "notes_{date}.md",
+      "content": "# Notes for {date}\n\n"
+    }
+  },
   "shell": {
     "system_prompt": "Execute a shell command and return the output. Use this when the user asks to run commands, execute scripts, or perform system operations.",
     "triggers": [
@@ -41,5 +58,18 @@
     ],
     "priority": 8,
     "enabled": true
+  },
+  "git": {
+    "system_prompt": "Execute git commands and return the output. Use this when the user asks about git status, log, diff, or other git operations.",
+    "triggers": [
+      "git 状态",
+      "git status",
+      "check git"
+    ],
+    "priority": 6,
+    "enabled": true,
+    "default_arguments": {
+      "command": "status"
+    }
   }
 }

@@ -121,7 +121,7 @@ Edit `~/.nullclaw/config.json` and add `tool_customizations` in the `tools` sect
 | `priority` | number | No | Priority (default: 0); higher values mean higher priority |
 | `enabled` | boolean | No | Whether the tool is enabled (default: true) |
 | `skip_llm_tpl` | string | No | Skip LLM template: when configured, tool output is formatted using this template and returned directly to the user without LLM processing. Supports `{output}` placeholder. Example: "Screenshot saved: {output}" |
-| `default_arguments` | string | No | Default arguments (JSON string): when trigger keywords match exactly, these arguments are used to invoke the tool directly. Supports variable substitution: `{workspace_dir}` (workspace directory), `{timestamp}` (timestamp), `{date}` (date YYYY-MM-DD), `{time}` (time HH-MM-SS), `{home}` (user home directory). Example: `{"save_path": "{workspace_dir}/screenshots/{timestamp}.png"}` |
+| `default_arguments` | object | No | Default arguments (JSON object): when trigger keywords match exactly, these arguments are used to invoke the tool directly. Format: `{"filename": "{timestamp}.png"}`. Supports variable substitution: `{workspace_dir}` (workspace directory), `{timestamp}` (timestamp), `{date}` (date YYYY-MM-DD), `{time}` (time HH-MM-SS), `{home}` (user home directory) |
 | `trigger_modifiers` | string[] | No | Custom modifiers list; removed from input start and end before trigger matching |
 | `trigger_punctuation` | string | No | Custom punctuation; removed from input before trigger matching |
 
@@ -321,11 +321,13 @@ In an agent session, use the following commands to view tool customizations (rea
   "system_prompt": "Capture and return a screenshot of the current screen.",
   "triggers": [
     "screenshot",
-    "截屏"
+    "capture"
   ],
   "priority": 10,
   "enabled": true,
-  "default_arguments": "{\"save_path\": \"{workspace_dir}/screenshots/{timestamp}.png\"}",
+  "default_arguments": {
+    "filename": "screenshot_{timestamp}.png"
+  },
   "skip_llm_tpl": "Screenshot saved: {output}"
 }
 ```
@@ -336,6 +338,163 @@ In an agent session, use the following commands to view tool customizations (rea
 - `{date}` - Date (YYYY-MM-DD)
 - `{time}` - Time (HH-MM-SS)
 - `{home}` - User home directory
+
+## Tool default_arguments Examples
+
+Below are `default_arguments` examples for common tools:
+
+### screenshot
+
+```json
+{
+  "name": "screenshot",
+  "triggers": ["screenshot", "capture"],
+  "default_arguments": {
+    "filename": "screenshot_{timestamp}.png"
+  }
+}
+```
+
+**Available parameters**:
+- `filename` (string): Screenshot filename, saved to workspace directory
+
+### shell
+
+```json
+{
+  "name": "shell",
+  "triggers": ["run command", "execute"],
+  "default_arguments": {
+    "command": "ls -la",
+    "cwd": "{workspace_dir}"
+  }
+}
+```
+
+**Available parameters**:
+- `command` (string, required): Shell command to execute
+- `cwd` (string): Working directory (defaults to workspace root)
+
+### file_read
+
+```json
+{
+  "name": "file_read",
+  "triggers": ["read file", "view file"],
+  "default_arguments": {
+    "path": "README.md"
+  }
+}
+```
+
+**Available parameters**:
+- `path` (string, required): File path relative to workspace
+
+### file_write
+
+```json
+{
+  "name": "file_write",
+  "triggers": ["write file", "create file"],
+  "default_arguments": {
+    "path": "notes_{date}.md",
+    "content": "# Notes for {date}\n\n"
+  }
+}
+```
+
+**Available parameters**:
+- `path` (string, required): File path relative to workspace
+- `content` (string, required): File content
+
+### file_edit
+
+```json
+{
+  "name": "file_edit",
+  "triggers": ["edit file", "modify file"],
+  "default_arguments": {
+    "path": "config.txt",
+    "old_string": "old_value",
+    "new_string": "new_value"
+  }
+}
+```
+
+**Available parameters**:
+- `path` (string, required): File path relative to workspace
+- `old_string` (string, required): Old text to replace
+- `new_string` (string, required): New text
+
+### git
+
+```json
+{
+  "name": "git",
+  "triggers": ["git status", "check git"],
+  "default_arguments": {
+    "command": "status"
+  }
+}
+```
+
+**Available parameters**:
+- `command` (string, required): Git command (e.g., status, log, diff)
+
+### browser_open
+
+```json
+{
+  "name": "browser_open",
+  "triggers": ["open url", "browse"],
+  "default_arguments": {
+    "url": "https://example.com"
+  }
+}
+```
+
+**Available parameters**:
+- `url` (string, required): URL to open
+
+### web_fetch
+
+```json
+{
+  "name": "web_fetch",
+  "triggers": ["fetch page", "get content"],
+  "default_arguments": {
+    "url": "https://example.com/article"
+  }
+}
+```
+
+**Available parameters**:
+- `url` (string, required): Web page URL to fetch
+
+### http_request
+
+```json
+{
+  "name": "http_request",
+  "triggers": ["api request", "http call"],
+  "default_arguments": {
+    "url": "https://api.example.com/data",
+    "method": "GET"
+  }
+}
+```
+
+**Available parameters**:
+- `url` (string, required): Request URL
+- `method` (string): HTTP method (GET, POST, PUT, DELETE, etc., default: GET)
+
+### View All Tool Parameters
+
+Use the following command to view parameter definitions for all built-in tools:
+
+```bash
+nullclaw tools show --builtin
+```
 
 ## Troubleshooting
 
