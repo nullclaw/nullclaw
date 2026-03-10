@@ -1173,7 +1173,7 @@ fn markdownToEmailHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
                 try buf.appendSlice(allocator, "<h");
                 try buf.append(allocator, '0' + clamped);
                 try buf.appendSlice(allocator, " style=\"margin:0.5em 0;color:#1a1a1a;\">");
-                try emailAppendHtmlEscaped(&buf, allocator, md[i..end]);
+                try emailAppendInlineFormatted(&buf, allocator, md[i..end]);
                 try buf.appendSlice(allocator, "</h");
                 try buf.append(allocator, '0' + clamped);
                 try buf.appendSlice(allocator, ">");
@@ -1197,7 +1197,7 @@ fn markdownToEmailHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
                 i += 2;
                 const end = std.mem.indexOfScalarPos(u8, md, i, '\n') orelse md.len;
                 try buf.appendSlice(allocator, "<li style=\"margin:2px 0;\">");
-                try emailAppendHtmlEscaped(&buf, allocator, md[i..end]);
+                try emailAppendInlineFormatted(&buf, allocator, md[i..end]);
                 try buf.appendSlice(allocator, "</li>");
                 i = end;
                 if (i < md.len) i += 1;
@@ -1260,7 +1260,7 @@ fn markdownToEmailHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
                         } else {
                             try buf.appendSlice(allocator, "<td style=\"border:1px solid #ddd;padding:8px 12px;\">");
                         }
-                        try emailAppendHtmlEscaped(&buf, allocator, cell);
+                        try emailAppendInlineFormatted(&buf, allocator, cell);
                         if (is_header) {
                             try buf.appendSlice(allocator, "</th>");
                         } else {
@@ -1423,6 +1423,87 @@ fn emailAppendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.A
             '"' => try buf.appendSlice(allocator, "&quot;"),
             else => try buf.append(allocator, c),
         }
+    }
+}
+
+/// Like emailAppendHtmlEscaped but also processes inline markdown:
+/// **bold**, _italic_, `code`, [text](url), ~~strikethrough~~
+fn emailAppendInlineFormatted(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        // ── Inline code `...` ──
+        if (text[i] == '`') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |end| {
+                try buf.appendSlice(allocator, "<code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">");
+                try emailAppendHtmlEscaped(buf, allocator, text[i + 1 .. end]);
+                try buf.appendSlice(allocator, "</code>");
+                i = end + 1;
+                continue;
+            }
+        }
+        // ── Strikethrough ~~text~~ ──
+        if (i + 1 < text.len and text[i] == '~' and text[i + 1] == '~') {
+            if (std.mem.indexOf(u8, text[i + 2 ..], "~~")) |offset| {
+                try buf.appendSlice(allocator, "<s>");
+                try emailAppendInlineFormatted(buf, allocator, text[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</s>");
+                i = i + 2 + offset + 2;
+                continue;
+            }
+        }
+        // ── Bold **text** ──
+        if (i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
+            if (std.mem.indexOf(u8, text[i + 2 ..], "**")) |offset| {
+                try buf.appendSlice(allocator, "<strong>");
+                try emailAppendInlineFormatted(buf, allocator, text[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</strong>");
+                i = i + 2 + offset + 2;
+                continue;
+            }
+        }
+        // ── Links [text](url) ──
+        if (text[i] == '[') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |cb| {
+                if (cb + 1 < text.len and text[cb + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, text, cb + 2, ')')) |cp| {
+                        const link_text = text[i + 1 .. cb];
+                        const href = text[cb + 2 .. cp];
+                        try buf.appendSlice(allocator, "<a href=\"");
+                        try emailAppendHtmlEscaped(buf, allocator, href);
+                        try buf.appendSlice(allocator, "\" style=\"color:#0066cc;\">");
+                        try emailAppendInlineFormatted(buf, allocator, link_text);
+                        try buf.appendSlice(allocator, "</a>");
+                        i = cp + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // ── Italic _text_ (not __text__) ──
+        if (text[i] == '_' and !(i + 1 < text.len and text[i + 1] == '_')) {
+            const prev_ok = (i == 0 or text[i - 1] == ' ' or text[i - 1] == '\n' or text[i - 1] == '(');
+            if (prev_ok) {
+                if (std.mem.indexOfScalarPos(u8, text, i + 1, '_')) |end| {
+                    const next_ok = (end + 1 >= text.len or text[end + 1] == ' ' or text[end + 1] == '\n' or text[end + 1] == ',' or text[end + 1] == '.' or text[end + 1] == ')');
+                    if (next_ok and end > i + 1) {
+                        try buf.appendSlice(allocator, "<em>");
+                        try emailAppendInlineFormatted(buf, allocator, text[i + 1 .. end]);
+                        try buf.appendSlice(allocator, "</em>");
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // ── Regular character (HTML-escaped) ──
+        switch (text[i]) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            '"' => try buf.appendSlice(allocator, "&quot;"),
+            else => try buf.append(allocator, text[i]),
+        }
+        i += 1;
     }
 }
 
