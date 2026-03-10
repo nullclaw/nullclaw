@@ -46,7 +46,7 @@ const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|for
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
 const AUTH_SUBCOMMANDS = "login|status|logout";
-const TOOLS_SUBCOMMANDS = "show|export|import|validate";
+const TOOLS_SUBCOMMANDS = "show|export|import-preview|validate";
 
 const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\nullclaw -- The smallest AI assistant. Zig-powered.
@@ -2922,7 +2922,7 @@ fn runTools(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  show --builtin               Show all built-in tools
             \\  export <file>                 Export customizations to JSON file
             \\  export <file> --builtin      Export built-in tools to JSON file
-            \\  import <file>                 Import customizations from JSON file
+            \\  import-preview <file>         Preview tool customizations from JSON file
             \\  validate <file>               Validate customizations JSON file
             \\
             \\Examples:
@@ -2930,7 +2930,7 @@ fn runTools(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  nullclaw tools show --builtin
             \\  nullclaw tools export tool_customizations.json
             \\  nullclaw tools export builtin_tools.json --builtin
-            \\  nullclaw tools import tool_customizations.json
+            \\  nullclaw tools import-preview tool_customizations.json
             \\  nullclaw tools validate tool_customizations.json
             \\
         , .{TOOLS_SUBCOMMANDS}), .{});
@@ -2949,12 +2949,12 @@ fn runTools(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
         const export_builtin = sub_args.len > 2 and std.mem.eql(u8, sub_args[2], "--builtin");
         try toolsExport(allocator, sub_args[1], export_builtin);
-    } else if (std.mem.eql(u8, subcmd, "import")) {
+    } else if (std.mem.eql(u8, subcmd, "import-preview")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw tools import <file>\n", .{});
+            std.debug.print("Usage: nullclaw tools import-preview <file>\n", .{});
             std.process.exit(1);
         }
-        try toolsImport(allocator, sub_args[1]);
+        try toolsImportPreview(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "validate")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw tools validate <file>\n", .{});
@@ -2969,7 +2969,7 @@ fn runTools(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  show                          Show current tool customizations
             \\  export <file>                 Export customizations to JSON file
-            \\  import <file>                 Import customizations from JSON file
+            \\  import-preview <file>         Preview tool customizations from JSON file
             \\  validate <file>               Validate customizations JSON file
             \\
         , .{TOOLS_SUBCOMMANDS}), .{});
@@ -3131,7 +3131,7 @@ fn toolsExport(allocator: std.mem.Allocator, file_path: []const u8, export_built
     std.debug.print("Exported {d} tool customizations to: {s}\n", .{ cfg.tools.tool_customizations.len, file_path });
 }
 
-fn toolsImport(allocator: std.mem.Allocator, file_path: []const u8) !void {
+fn toolsImportPreview(allocator: std.mem.Allocator, file_path: []const u8) !void {
     var cfg_opt: ?yc.config.Config = yc.config.Config.load(allocator) catch null;
     defer if (cfg_opt) |*c| c.deinit();
 

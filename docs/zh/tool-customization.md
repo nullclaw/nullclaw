@@ -39,10 +39,10 @@ nullclaw tools validate tool_customizations.json
 ### 6. 导入工具定制（查看预览）
 
 ```bash
-nullclaw tools import tool_customizations.json
+nullclaw tools import-preview tool_customizations.json
 ```
 
-**注意**：`import` 命令只显示预览，不会自动应用配置。要应用配置，需要手动编辑配置文件。
+**注意**：`import-preview` 命令只显示预览，不会自动应用配置。要应用配置，需要手动编辑配置文件。
 
 ## 配置方式
 
@@ -234,12 +234,12 @@ nullclaw tools export builtin.json --builtin # 导出所有内置工具信息
 nullclaw tools validate tool_customizations.json
 ```
 
-### `nullclaw tools import`
+### `nullclaw tools import-preview`
 
-导入工具定制（仅显示预览，不自动应用）。
+预览工具定制（仅显示预览，不自动应用）。
 
 ```bash
-nullclaw tools import tool_customizations.json
+nullclaw tools import-preview tool_customizations.json
 ```
 
 ## Agent 会话命令
@@ -320,6 +320,30 @@ nullclaw tools import tool_customizations.json
   "enabled": true
 }
 ```
+
+### 截图工具（带 default_arguments）
+
+```json
+{
+  "name": "screenshot",
+  "system_prompt": "Capture and return a screenshot of the current screen.",
+  "triggers": [
+    "截图",
+    "screenshot"
+  ],
+  "priority": 10,
+  "enabled": true,
+  "default_arguments": "{\"save_path\": \"{workspace_dir}/screenshots/{timestamp}.png\"}",
+  "skip_llm_tpl": "截图已保存: {output}"
+}
+```
+
+**说明**：当用户输入精确匹配触发词（如 "截图"）时，工具将使用 `default_arguments` 中配置的参数直接调用，无需 LLM 参与解析参数。支持以下变量替换：
+- `{workspace_dir}` - 当前工作目录
+- `{timestamp}` - 时间戳（毫秒）
+- `{date}` - 日期（YYYY-MM-DD）
+- `{time}` - 时间（HH-MM-SS）
+- `{home}` - 用户主目录
 
 ## 故障排除
 

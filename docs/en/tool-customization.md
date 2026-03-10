@@ -1,10 +1,12 @@
-# Tool Customization
+# Tool Customization Management
 
-nullclaw supports adding custom system prompts, trigger keywords, and priorities to tools to improve tool invocation accuracy and response speed.
+- Add custom system prompts, trigger keywords, and priorities to built-in tools to improve tool invocation accuracy and response speed.
+- Support pre-LLM mode: Configure specific trigger words for tools (e.g., screenshot) to enable direct tool invocation without LLM participation.
+- Support post-LLM mode: Configure the `skip_llm_tpl` parameter for tools (e.g., screenshot) to directly return templated tool output to users without LLM processing.
 
 ## Quick Start
 
-### 1. View Built-in Tools
+### 1. View Built-in Tools List
 
 ```bash
 nullclaw tools show --builtin
@@ -16,13 +18,13 @@ nullclaw tools show --builtin
 nullclaw tools show
 ```
 
-### 3. Export Built-in Tools to JSON
+### 3. Export Built-in Tools to JSON File
 
 ```bash
 nullclaw tools export builtin_tools.json --builtin
 ```
 
-### 4. Export Tool Customizations to JSON
+### 4. Export Tool Customizations to JSON File
 
 ```bash
 nullclaw tools export tool_customizations.json
@@ -37,44 +39,14 @@ nullclaw tools validate tool_customizations.json
 ### 6. Import Tool Customizations (Preview Only)
 
 ```bash
-nullclaw tools import tool_customizations.json
+nullclaw tools import-preview tool_customizations.json
 ```
 
-**Note**: The `import` command only shows a preview and does not automatically apply the configuration. To apply changes, manually edit the configuration file.
+**Note**: The `import-preview` command only shows a preview and does not automatically apply the configuration. To apply changes, manually edit the configuration file.
 
 ## Configuration Methods
 
-### Method 1: Direct Configuration File Editing
-
-Edit `~/.nullclaw/config.json` and add `tool_customizations` in the `tools` section:
-
-```json
-{
-  "tools": {
-    "shell_timeout_secs": 60,
-    "shell_max_output_bytes": 1048576,
-    "max_file_size_bytes": 10485760,
-    "web_fetch_max_chars": 50000,
-    "tool_customizations": [
-      {
-        "name": "screenshot",
-        "system_prompt": "Capture and return a screenshot of the current screen. This tool is useful when the user asks to see the screen, take a picture, or capture what's displayed on the monitor.",
-        "triggers": [
-          "screenshot",
-          "screen capture",
-          "capture screen",
-          "show me the screen",
-          "show screen"
-        ],
-        "priority": 10,
-        "enabled": true
-      }
-    ]
-  }
-}
-```
-
-### Method 2: Using External JSON File
+### Method 1: Using External JSON File
 
 Specify an external file path in `~/.nullclaw/config.json`:
 
@@ -105,6 +77,38 @@ External file format:
 }
 ```
 
+### Method 2: Direct Configuration File Editing
+
+Edit `~/.nullclaw/config.json` and add `tool_customizations` in the `tools` section:
+
+```json
+{
+  "tools": {
+    "shell_timeout_secs": 60,
+    "shell_max_output_bytes": 1048576,
+    "max_file_size_bytes": 10485760,
+    "web_fetch_max_chars": 50000,
+    "tool_customizations": [
+      {
+        "name": "screenshot",
+        "system_prompt": "Capture and return a screenshot of the current screen. This tool is useful when the user asks to see the screen, take a picture, or capture what's displayed on the monitor.",
+        "triggers": [
+          "screenshot",
+          "screen capture",
+          "capture screen",
+          "take a picture",
+          "take a photo",
+          "show me the screen",
+          "show screen"
+        ],
+        "priority": 10,
+        "enabled": true
+      }
+    ]
+  }
+}
+```
+
 ## Field Reference
 
 ### ToolCustomization Structure
@@ -113,10 +117,11 @@ External file format:
 |-------|------|----------|-------------|
 | `name` | string | Yes | Tool name (e.g., "screenshot", "file_read", "shell") |
 | `system_prompt` | string | No | Custom system prompt that overrides the default tool description |
-| `triggers` | string[] | No | List of trigger keywords; when user messages contain these words, the tool is prioritized |
+| `triggers` | string[] | No | List of trigger keywords; when user messages contain these words, the tool is prioritized. If empty, no trigger logic applies |
 | `priority` | number | No | Priority (default: 0); higher values mean higher priority |
 | `enabled` | boolean | No | Whether the tool is enabled (default: true) |
 | `skip_llm_tpl` | string | No | Skip LLM template: when configured, tool output is formatted using this template and returned directly to the user without LLM processing. Supports `{output}` placeholder. Example: "Screenshot saved: {output}" |
+| `default_arguments` | string | No | Default arguments (JSON string): when trigger keywords match exactly, these arguments are used to invoke the tool directly. Supports variable substitution: `{workspace_dir}` (workspace directory), `{timestamp}` (timestamp), `{date}` (date YYYY-MM-DD), `{time}` (time HH-MM-SS), `{home}` (user home directory). Example: `{"save_path": "{workspace_dir}/screenshots/{timestamp}.png"}` |
 | `trigger_modifiers` | string[] | No | Custom modifiers list; removed from input start and end before trigger matching |
 | `trigger_punctuation` | string | No | Custom punctuation; removed from input before trigger matching |
 
@@ -128,24 +133,24 @@ Trigger keywords use an intelligent matching algorithm with two trigger modes:
 
 When user input **contains only** the trigger keyword (after removing modifiers and punctuation), the tool is executed directly without calling LLM:
 
-**Input Cleaning** - removes from start and end:
-- Default English modifiers: `please`, `could you`, `can you`, `would you`, `now`, `go`, `start`, `ok`, `begin`, `do`, `execute`, `run`, `take`
-- Default Chinese modifiers: `请`, `帮我`, `开始`
-- Default punctuation: space, period, comma, exclamation, question mark, etc.
-- **Modifiers and punctuation are configurable and can be extended.**
+**Input Cleaning** - removes from both ends:
+- Common modifiers: `please`, `could you`, `can you`, `would you`, `now`, `go`, `start`, `ok`, `begin`, `do`, `execute`, `run`, `take`, `请`, `帮我`, `开始`
+- Full-width/half-width punctuation: spaces, periods, commas, exclamation marks, question marks, etc.
+- **The above modifiers and punctuation are removed, leaving only the trigger keyword**
+- **Modifiers and punctuation to be cleaned are configurable and extendable, including all defaults above**
 
 **Match Examples**:
 
 | User Input | Cleaned | Trigger | Result |
 |------------|---------|---------|--------|
-| "screenshot" | "screenshot" | "screenshot" | ✅ Execute screenshot tool |
-| "screenshot." | "screenshot" | "screenshot" | ✅ Execute screenshot tool |
-| "please screenshot" | "screenshot" | "screenshot" | ✅ Execute screenshot tool |
-| "screenshot please" | "screenshot" | "screenshot" | ✅ Execute screenshot tool |
-| "screenshot now" | "screenshot" | "screenshot" | ✅ Execute screenshot tool |
-| " screenshot ." | "screenshot" | "screenshot" | ✅ Execute screenshot tool |
-| " 截屏 。" | "截屏" | "截屏" | ✅ Execute screenshot tool |
-| "请截屏请" | "截屏" | "截屏" | ✅ Execute screenshot tool |
+| "screenshot" | "screenshot" | "screenshot" | ✅ Execute screenshot tool directly |
+| "screenshot." | "screenshot" | "screenshot" | ✅ Execute screenshot tool directly |
+| "please screenshot" | "screenshot" | "screenshot" | ✅ Execute screenshot tool directly |
+| "screenshot please" | "screenshot" | "screenshot" | ✅ Execute screenshot tool directly |
+| "screenshot now" | "screenshot" | "screenshot" | ✅ Execute screenshot tool directly |
+| " screenshot ." | "screenshot" | "screenshot" | ✅ Execute screenshot tool directly |
+| " 截屏 。" | "截屏" | "截屏" | ✅ Execute screenshot tool directly |
+| "请截屏请" | "截屏" | "截屏" | ✅ Execute screenshot tool directly |
 | "some screenshot" | "somescreenshot" | "screenshot" | ❌ No match (extra word) |
 
 ### 2. Priority Hint (Send to LLM)
@@ -154,9 +159,9 @@ When user input **contains** the trigger keyword but is not an exact match, a pr
 
 | User Input | Trigger | Result |
 |------------|---------|--------|
-| "please screenshot" | "screenshot" | Add priority hint, send to LLM |
+| "please help me screenshot" | "screenshot" | Add priority hint, send to LLM |
 | "帮我截个图" | "截屏" | Add priority hint, send to LLM |
-| "don't screenshot" | "screenshot" | ❌ No trigger (negation) |
+| "don't screenshot" | "screenshot" | ❌ No trigger (has negation) |
 
 ### Word Boundary Matching
 
@@ -194,10 +199,9 @@ debug: executing tool directly due to exact trigger match
 
 ### Best Practices
 
-1. **Exact match triggers**: Use short, clear trigger keywords like "screenshot"
+1. **Exact match triggers**: Use short, clear trigger keywords like "screenshot", "截屏"
 2. **Avoid substring conflicts**: Use "screen capture" instead of "screen"
 3. **Set reasonable priorities**: Higher priority for important tools
-4. **Configure modifiers**: Customize trigger_modifiers and trigger_punctuation in config
 
 ## CLI Commands
 
@@ -227,12 +231,12 @@ Validate the format of a tool customization JSON file.
 nullclaw tools validate tool_customizations.json
 ```
 
-### `nullclaw tools import`
+### `nullclaw tools import-preview`
 
-Import tool customizations (preview only, not auto-applied).
+Preview tool customizations (preview only, not auto-applied).
 
 ```bash
-nullclaw tools import tool_customizations.json
+nullclaw tools import-preview tool_customizations.json
 ```
 
 ## Agent Session Commands
@@ -254,7 +258,7 @@ In an agent session, use the following commands to view tool customizations (rea
 
 ## Example Configurations
 
-### Screenshot Tool (with skipLlmTpl)
+### Screenshot Tool (with skip_llm_tpl)
 
 ```json
 {
@@ -308,6 +312,30 @@ In an agent session, use the following commands to view tool customizations (rea
   "enabled": true
 }
 ```
+
+### Screenshot Tool (with default_arguments)
+
+```json
+{
+  "name": "screenshot",
+  "system_prompt": "Capture and return a screenshot of the current screen.",
+  "triggers": [
+    "screenshot",
+    "截屏"
+  ],
+  "priority": 10,
+  "enabled": true,
+  "default_arguments": "{\"save_path\": \"{workspace_dir}/screenshots/{timestamp}.png\"}",
+  "skip_llm_tpl": "Screenshot saved: {output}"
+}
+```
+
+**Note**: When user input exactly matches a trigger keyword (e.g., "screenshot"), the tool will use the parameters configured in `default_arguments` to invoke directly, without LLM participating in parameter parsing. Supports the following variable substitutions:
+- `{workspace_dir}` - Current workspace directory
+- `{timestamp}` - Timestamp (milliseconds)
+- `{date}` - Date (YYYY-MM-DD)
+- `{time}` - Time (HH-MM-SS)
+- `{home}` - User home directory
 
 ## Troubleshooting
 

@@ -2988,7 +2988,7 @@ fn handleToolCustomizationsCommand(self: anytype, arg: []const u8) ![]const u8 {
         }
 
         if (self.tool_customizations.count() == 0) {
-            return try self.allocator.dupe(u8, "No tool customizations configured.\n\nTo add customizations, use:\n  nullclaw tools import <file>");
+            return try self.allocator.dupe(u8, "No tool customizations configured.\n\nTo add customizations, use:\n  nullclaw tools import-preview <file>");
         }
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
