@@ -433,6 +433,25 @@ nullclaw tools import-preview tool_customizations.json
 - `command` (string, 必填): 要执行的 shell 命令
 - `cwd` (string): 工作目录（默认为工作区根目录）
 
+**自动添加到 allowed_commands**：
+- 配置了 `trigger_arguments` 的 shell 工具，其命令会自动添加到 `autonomy.allowed_commands` 中
+- 这提高了可用性，无需手动配置 `allowed_commands` 即可使用触发词
+- 提取命令的基础部分（第一个单词，忽略参数和管道符）
+- 例如：`ls -la` 会提取 `ls`，`ps aux | grep nginx` 会提取 `ps`
+
+**disable_commands 安全控制**：
+- `autonomy.disable_commands` 可配置禁止自动添加的命令列表
+- 防止潜在危险的命令被自动添加到 `allowed_commands`
+- 示例配置：
+  ```json
+  {
+    "autonomy": {
+      "disable_commands": ["rm", "sudo", "su", "chmod", "chown"]
+    }
+  }
+  ```
+- 即使在 `trigger_arguments` 中配置了这些命令，也不会自动添加到 `allowed_commands`
+
 ### file_write（写入文件）- 带后缀标识示例
 
 ```json

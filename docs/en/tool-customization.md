@@ -358,6 +358,29 @@ For example, the shell tool can have multiple trigger keywords, each executing a
 }
 ```
 
+**Available Parameters**:
+- `command` (string, required): Shell command to execute
+- `cwd` (string): Working directory (defaults to workspace root)
+
+**Auto-add to allowed_commands**:
+- Shell tools configured with `trigger_arguments` will have their commands automatically added to `autonomy.allowed_commands`
+- This improves usability by allowing trigger keywords to work without manual `allowed_commands` setup
+- Extracts the base command (first word, ignoring parameters and pipe operators)
+- Example: `ls -la` extracts `ls`, `ps aux | grep nginx` extracts `ps`
+
+**disable_commands Security Control**:
+- `autonomy.disable_commands` can configure a list of commands to prevent auto-adding
+- Prevents potentially dangerous commands from being automatically added to `allowed_commands`
+- Example configuration:
+  ```json
+  {
+    "autonomy": {
+      "disable_commands": ["rm", "sudo", "su", "chmod", "chown"]
+    }
+  }
+  ```
+- Even if these commands are configured in `trigger_arguments`, they will not be auto-added to `allowed_commands`
+
 ### Matching Rules
 
 | User Input | Trigger Config | Matching Keyword | Args Key Used | Command Executed |

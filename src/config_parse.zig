@@ -753,6 +753,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("allowed_paths")) |v| {
                 if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
             }
+            if (aut.object.get("disable_commands")) |v| {
+                if (v == .array) self.autonomy.disable_commands = try parseStringArray(self.allocator, v.array);
+            }
         }
     }
 
@@ -1027,6 +1030,85 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                     }
                     self.tools.tool_customizations = try custom_list.toOwnedSlice(self.allocator);
+                    
+                    // Auto-add shell commands from trigger_arguments to allowed_commands
+                    // This improves usability by allowing configured tool triggers to work without manual allowed_commands setup
+                    var shell_commands: std.ArrayListUnmanaged([]const u8) = .empty;
+                    defer shell_commands.deinit(self.allocator);
+                    
+                    for (custom_list.items) |custom| {
+                        // Only process shell tool
+                        if (!std.mem.eql(u8, custom.name, "shell")) continue;
+                        
+                        // Check if trigger_arguments exist and is an object
+                        if (custom.trigger_arguments) |ta| {
+                            if (ta == .object) {
+                                var ta_iter = ta.object.iterator();
+                                while (ta_iter.next()) |entry| {
+                                    if (entry.value_ptr.* == .object) {
+                                        if (entry.value_ptr.*.object.get("command")) |cmd_val| {
+                                            if (cmd_val == .string) {
+                                                const cmd_str = cmd_val.string;
+                                                
+                                                // Extract the base command (first word, before any space or pipe)
+                                                var base_cmd: []const u8 = cmd_str;
+                                                if (std.mem.indexOfScalar(u8, cmd_str, ' ')) |idx| {
+                                                    base_cmd = cmd_str[0..idx];
+                                                }
+                                                if (std.mem.indexOfScalar(u8, cmd_str, '|')) |idx| {
+                                                    base_cmd = cmd_str[0..idx];
+                                                }
+                                                
+                                                // Check if command is in disable_commands
+                                                var is_disabled = false;
+                                                for (self.autonomy.disable_commands) |disabled| {
+                                                    if (std.mem.eql(u8, base_cmd, disabled)) {
+                                                        is_disabled = true;
+                                                        break;
+                                                    }
+                                                }
+                                                
+                                                // Check if already in allowed_commands
+                                                var already_allowed = false;
+                                                for (self.autonomy.allowed_commands) |allowed| {
+                                                    if (std.mem.eql(u8, base_cmd, allowed)) {
+                                                        already_allowed = true;
+                                                        break;
+                                                    }
+                                                }
+                                                
+                                                // Add to shell_commands if not disabled and not already allowed
+                                                if (!is_disabled and !already_allowed) {
+                                                    try shell_commands.append(self.allocator, try self.allocator.dupe(u8, base_cmd));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Merge shell_commands into allowed_commands
+                    if (shell_commands.items.len > 0) {
+                        const total_len = self.autonomy.allowed_commands.len + shell_commands.items.len;
+                        const merged = try self.allocator.alloc([]const u8, total_len);
+                        var idx: usize = 0;
+                        
+                        // Copy existing allowed_commands
+                        for (self.autonomy.allowed_commands) |cmd| {
+                            merged[idx] = cmd;
+                            idx += 1;
+                        }
+                        
+                        // Add new shell_commands
+                        for (shell_commands.items) |cmd| {
+                            merged[idx] = cmd;
+                            idx += 1;
+                        }
+                        
+                        self.autonomy.allowed_commands = merged;
+                    }
                 }
             }
             // tools.tool_customizations_file

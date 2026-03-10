@@ -106,6 +106,9 @@ pub const AutonomyConfig = struct {
     /// Additional directories (absolute paths) the agent may access beyond workspace_dir.
     /// Resolved via realpath at check time; system-critical paths are always blocked.
     allowed_paths: []const []const u8 = &.{},
+    /// Commands that should NOT be auto-added to allowed_commands from tool trigger_arguments.
+    /// This provides security control to prevent automatic inclusion of potentially dangerous commands.
+    disable_commands: []const []const u8 = &.{},
 };
 
 pub const DockerRuntimeConfig = struct {

@@ -1,4 +1,7 @@
 {
+  "autonomy": {
+    "disable_commands": ["rm", "sudo", "su", "chmod", "chown"]
+  },
   "screenshot": {
     "system_prompt": "Capture and return a screenshot of the current screen. This tool is useful when the user asks to see the screen, take a picture, or capture what's displayed on the monitor.",
     "triggers": [
