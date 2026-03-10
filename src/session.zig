@@ -11,7 +11,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
-const Agent = @import("agent/root.zig").Agent;
+const agent_mod = @import("agent/root.zig");
+const Agent = agent_mod.Agent;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
@@ -34,6 +35,22 @@ fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bo
         return .{ .slice = text, .truncated = false };
     }
     return .{ .slice = text[0..MESSAGE_LOG_MAX_BYTES], .truncated = true };
+}
+
+fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
+    var total: u64 = 0;
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.role, "assistant")) continue;
+        total += agent_mod.estimate_text_tokens(entry.content);
+    }
+    return total;
+}
+
+fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8 {
+    if (agent.history.items.len == 0) return response;
+    const last = agent.history.items[agent.history.items.len - 1];
+    if (last.role != .assistant) return response;
+    return last.content;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -168,40 +185,22 @@ pub const SessionManager = struct {
 
         // Restore persisted conversation history from session store
         if (self.session_store) |store| {
-            const entries = store.loadMessages(self.allocator, session_key) catch &.{};
-            if (entries.len > 0) {
-                session.agent.loadHistory(entries) catch {};
-                for (entries) |entry| {
-                    self.allocator.free(entry.role);
-                    self.allocator.free(entry.content);
+            const maybe_entries = store.loadMessages(self.allocator, session_key) catch null;
+            if (maybe_entries) |entries| {
+                defer memory_mod.freeMessages(self.allocator, entries);
+                if (entries.len > 0) {
+                    session.agent.loadHistory(entries) catch {};
                 }
-                self.allocator.free(entries);
+                if (try store.loadUsage(session_key)) |total_tokens| {
+                    session.agent.total_tokens = total_tokens;
+                } else if (entries.len > 0) {
+                    session.agent.total_tokens = estimateRestoredSessionTokens(entries);
+                }
             }
         }
 
         try self.sessions.put(self.allocator, owned_key, session);
         return session;
-    }
-
-    fn slashCommandName(message: []const u8) ?[]const u8 {
-        const trimmed = std.mem.trim(u8, message, " \t\r\n");
-        if (trimmed.len <= 1 or trimmed[0] != '/') return null;
-
-        const body = trimmed[1..];
-        var split_idx: usize = 0;
-        while (split_idx < body.len) : (split_idx += 1) {
-            const ch = body[split_idx];
-            if (ch == ':' or ch == ' ' or ch == '\t') break;
-        }
-        if (split_idx == 0) return null;
-        return body[0..split_idx];
-    }
-
-    fn slashClearsSession(message: []const u8) bool {
-        const cmd = slashCommandName(message) orelse return false;
-        return std.ascii.eqlIgnoreCase(cmd, "new") or
-            std.ascii.eqlIgnoreCase(cmd, "reset") or
-            std.ascii.eqlIgnoreCase(cmd, "restart");
     }
 
     const StreamAdapterCtx = struct {
@@ -417,6 +416,7 @@ pub const SessionManager = struct {
             session.agent.stream_ctx = null;
         }
 
+        const turn_input = agent_mod.commands.planTurnInput(content);
         const response = try session.agent.turn(content);
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
@@ -428,16 +428,29 @@ pub const SessionManager = struct {
 
         // Persist messages via session store
         if (self.session_store) |store| {
-            const trimmed = std.mem.trim(u8, content, " \t\r\n");
-            if (slashClearsSession(trimmed)) {
+            if (turn_input.clear_session) {
                 // Clear persisted messages on session reset
                 store.clearMessages(session_key) catch {};
                 // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
-            } else if (!std.mem.startsWith(u8, trimmed, "/")) {
-                // Persist user + assistant messages (skip slash commands)
-                store.saveMessage(session_key, "user", content) catch {};
-                store.saveMessage(session_key, "assistant", response) catch {};
+            }
+
+            if (turn_input.llm_user_message) |persisted_user| {
+                // Persist canonical conversation history.
+                // Local-only slash commands are skipped, but any input that
+                // reached the LLM must persist with the exact same routing
+                // decision used by Agent.turn().
+                // When the turn ends with an assistant history message, prefer
+                // that canonical text over the rendered reply so restored
+                // sessions do not replay /usage footers or reasoning blocks.
+                // Some degraded turns return a fallback response without
+                // appending a final assistant history entry; in that case we
+                // must persist the actual response instead of stale tool-step
+                // assistant text from earlier in the turn.
+                const persisted_assistant = persistedAssistantReply(&session.agent, response);
+                store.saveMessage(session_key, "user", persisted_user) catch {};
+                store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
+                store.saveUsage(session_key, session.agent.total_tokens) catch {};
             }
         }
 
@@ -698,6 +711,86 @@ const DeltaCollector = struct {
     fn deinit(self: *DeltaCollector) void {
         self.data.deinit(self.allocator);
     }
+};
+
+const ProbeTool = struct {
+    pub const tool_name = "probe";
+    pub const tool_description = "Test probe tool";
+    pub const tool_params = "{}";
+    const vtable = tools_mod.ToolVTable(@This());
+
+    fn tool(self: *@This()) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(_: *@This(), allocator: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        return .{ .success = true, .output = try allocator.dupe(u8, "probe ok") };
+    }
+};
+
+const SummaryFailureProvider = struct {
+    call_count: usize = 0,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *SummaryFailureProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *SummaryFailureProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+
+        if (self.call_count == 1) {
+            const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-probe"),
+                .name = try allocator.dupe(u8, "probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "running"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        return error.ProviderError;
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "summary_failure";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
 };
 
 /// Create a test SessionManager with mock provider.
@@ -1224,6 +1317,326 @@ test "processMessage preserves session across calls" {
 
     // History should have grown (user msg + assistant response added)
     try testing.expect(session.agent.historyLen() > history_before);
+}
+
+test "restored session reconstructs token count from persisted assistant replies" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-1";
+    const reply = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reply);
+
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    const first_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), first_session.agent.total_tokens);
+
+    first_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+
+    const status = try restored_session.agent.handleSlashCommand("/status");
+    defer {
+        if (status) |resp| testing.allocator.free(resp);
+    }
+    try testing.expect(status != null);
+
+    var expected_line_buf: [64]u8 = undefined;
+    const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
+    try testing.expect(std.mem.indexOf(u8, status.?, expected_line) != null);
+}
+
+test "restored session token reconstruction ignores usage footer decorations" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-usage";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.usage_mode = .tokens;
+
+    const reply = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "[usage] total_tokens=") != null);
+
+    const entries = try sqlite_mem.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings("assistant reply", entries[1].content);
+
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+}
+
+test "persisted session falls back to rendered response when degraded turn has no final assistant history entry" {
+    var provider = SummaryFailureProvider{};
+    var probe_tool = ProbeTool{};
+    const tools = [_]Tool{probe_tool.tool()};
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-fallback";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.max_tool_iterations = 1;
+
+    const response = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "Could not produce a summary") != null);
+    try testing.expect(session.agent.history.items.len > 0);
+    try testing.expect(session.agent.history.items[session.agent.history.items.len - 1].role != .assistant);
+
+    const entries = try sqlite_mem.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings(response, entries[1].content);
+    try testing.expect(!std.mem.eql(u8, entries[1].content, "running"));
+
+    const live_total_tokens = session.agent.total_tokens;
+    try testing.expect(live_total_tokens > 0);
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(live_total_tokens, restored_session.agent.total_tokens);
+}
+
+test "restored session token reconstruction stays aligned across response cache hits" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var response_cache = try memory_mod.ResponseCache.init(":memory:", 60, 1000);
+    defer response_cache.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        &response_cache,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-cache";
+    const first = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(first);
+
+    const second = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings(first, second);
+
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), live_session.agent.total_tokens);
+    try testing.expectEqual(@as(u32, 0), live_session.agent.last_turn_usage.total_tokens);
+
+    live_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+}
+
+fn expectResetTurnPersistsFreshSession(command: []const u8) !void {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-reset-usage";
+    const store = sqlite_mem.sessionStore();
+
+    const first = try sm.processMessage(session_key, "before reset", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(first);
+
+    const token_cost = @as(u64, agent_mod.estimate_text_tokens("ok"));
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(token_cost, session.agent.total_tokens);
+
+    const reset_reply = try sm.processMessage(session_key, command, .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reset_reply);
+    try testing.expectEqual(token_cost, session.agent.total_tokens);
+
+    const entries = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("user", entries[0].role);
+    try testing.expectEqualStrings(agent_mod.commands.bareSessionResetPrompt(command).?, entries[0].content);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings("ok", entries[1].content);
+    try testing.expectEqual(@as(?u64, token_cost), try store.loadUsage(session_key));
+
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expectEqual(token_cost, restored.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
+    try testing.expectEqualStrings(entries[0].content, restored.agent.history.items[0].content);
+    try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
+}
+
+test "processMessage bare /new persists fresh-session turn across reload" {
+    try expectResetTurnPersistsFreshSession("/new");
+}
+
+test "processMessage bare /reset with mention persists fresh-session turn across reload" {
+    try expectResetTurnPersistsFreshSession("/reset@nullclaw_bot:");
+}
+
+test "processMessage slash-prefixed prompt that is not a local command persists across reload" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:slash-path";
+    const slash_prompt = "/etc/hosts";
+    const response = try sm.processMessage(session_key, slash_prompt, .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(response);
+
+    const expected_tokens = @as(u64, agent_mod.estimate_text_tokens("ok"));
+    const store = sqlite_mem.sessionStore();
+    const entries = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("user", entries[0].role);
+    try testing.expectEqualStrings(slash_prompt, entries[0].content);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings("ok", entries[1].content);
+    try testing.expectEqual(@as(?u64, expected_tokens), try store.loadUsage(session_key));
+
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(expected_tokens, live_session.agent.total_tokens);
+    live_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expectEqual(expected_tokens, restored.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
+    try testing.expectEqualStrings(slash_prompt, restored.agent.history.items[0].content);
+    try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
 }
 
 test "processMessage different keys — independent sessions" {

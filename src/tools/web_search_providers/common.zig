@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("../root.zig");
 const http_util = @import("../../http_util.zig");
+const search_base_url = @import("../../search_base_url.zig");
 const url_percent = @import("../../url_percent.zig");
 
 const log = std.log.scoped(.web_search);
@@ -69,35 +70,10 @@ pub fn buildSearxngSearchUrl(
     encoded_query: []const u8,
     count: usize,
 ) ![]u8 {
-    var trimmed = std.mem.trim(u8, base_url, " \t\n\r");
-    if (trimmed.len == 0) return error.InvalidSearchBaseUrl;
-    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
-        trimmed = trimmed[0 .. trimmed.len - 1];
-    }
-    if (!std.mem.startsWith(u8, trimmed, "https://")) return error.InvalidSearchBaseUrl;
-    if (std.mem.indexOfAny(u8, trimmed, "?#") != null) {
-        return error.InvalidSearchBaseUrl;
-    }
-    const after_scheme = trimmed["https://".len..];
-    if (after_scheme.len == 0 or after_scheme[0] == '/') {
-        return error.InvalidSearchBaseUrl;
-    }
-    const authority_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
-    const authority = after_scheme[0..authority_end];
-    if (authority.len == 0 or std.mem.indexOfAny(u8, authority, " \t\r\n") != null) {
-        return error.InvalidSearchBaseUrl;
-    }
-    if (authority_end < after_scheme.len) {
-        const path = after_scheme[authority_end..];
-        if (!std.mem.eql(u8, path, "/search")) {
-            return error.InvalidSearchBaseUrl;
-        }
-    }
-
-    const endpoint = if (std.mem.endsWith(u8, trimmed, "/search"))
-        try allocator.dupe(u8, trimmed)
-    else
-        try std.fmt.allocPrint(allocator, "{s}/search", .{trimmed});
+    const endpoint = search_base_url.normalizeEndpoint(allocator, base_url) catch |err| switch (err) {
+        error.InvalidSearchBaseUrl => return error.InvalidSearchBaseUrl,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     defer allocator.free(endpoint);
 
     return std.fmt.allocPrint(

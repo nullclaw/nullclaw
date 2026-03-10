@@ -316,7 +316,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.7";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.8";
     const channels_raw = b.option(
         []const u8,
         "channels",

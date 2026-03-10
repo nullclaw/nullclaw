@@ -210,6 +210,8 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
     // Get current executable path
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
 
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
@@ -247,12 +249,45 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
         \\  <string>{s}</string>
         \\</dict>
         \\</plist>
-    , .{ SERVICE_LABEL, xmlEscape(exe_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
+    , .{ SERVICE_LABEL, xmlEscape(service_exe_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(plist, .{});
     defer file.close();
     try file.writeAll(content);
+}
+
+fn resolveServiceExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
+    if (try preferredHomebrewShimPath(allocator, exe_path)) |candidate| {
+        std.fs.accessAbsolute(candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                allocator.free(candidate);
+                return allocator.dupe(u8, exe_path);
+            },
+            else => {
+                allocator.free(candidate);
+                return err;
+            },
+        };
+        return candidate;
+    }
+    return allocator.dupe(u8, exe_path);
+}
+
+fn preferredHomebrewShimPath(allocator: std.mem.Allocator, exe_path: []const u8) !?[]u8 {
+    if (!std.mem.endsWith(u8, exe_path, "/bin/nullclaw")) {
+        return null;
+    }
+
+    const cellar_marker = "/Cellar/nullclaw/";
+    const cellar_index = std.mem.indexOf(u8, exe_path, cellar_marker) orelse return null;
+    if (cellar_index == 0) {
+        return null;
+    }
+
+    // selfExePath uses POSIX separators for Homebrew installs even when tests run on Windows.
+    const candidate = try std.fmt.allocPrint(allocator, "{s}/bin/nullclaw", .{exe_path[0..cellar_index]});
+    return candidate;
 }
 
 fn installLinux(allocator: std.mem.Allocator) !void {
@@ -267,6 +302,8 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
 
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
@@ -287,7 +324,7 @@ fn installLinux(allocator: std.mem.Allocator) !void {
         \\
         \\[Install]
         \\WantedBy=default.target
-    , .{ exe_path, config_dir });
+    , .{ service_exe_path, config_dir });
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(unit, .{});
@@ -556,6 +593,32 @@ test "linuxServiceFile contains service suffix" {
 test "xmlEscape returns input for safe strings" {
     const input = "/usr/local/bin/nullclaw";
     try std.testing.expectEqualStrings(input, xmlEscape(input));
+}
+
+test "preferredHomebrewShimPath resolves Apple Silicon Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Intel Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/usr/local/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/usr/local/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Linux Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/home/linuxbrew/.linuxbrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/home/linuxbrew/.linuxbrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath ignores non-Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/Applications/nullclaw/bin/nullclaw")) == null);
+}
+
+test "preferredHomebrewShimPath ignores non-executable Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/share/nullclaw.txt")) == null);
 }
 
 test "runChecked succeeds for true command" {

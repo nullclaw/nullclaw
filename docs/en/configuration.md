@@ -186,7 +186,7 @@ Use only in controlled environments:
 
 Notes:
 
-- `search_base_url` must be a valid URL, otherwise startup validation fails.
+- `search_base_url` must be `https://host[/search]` or a local/private `http://host[:port][/search]` URL, otherwise startup validation fails.
 - `allowed_commands: ["*"]` and `allowed_paths: ["*"]` significantly widen execution scope.
 
 ## Validate After Config Changes

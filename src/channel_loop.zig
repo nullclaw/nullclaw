@@ -34,11 +34,16 @@ const Atomic = @import("portable_atomic.zig").Atomic;
 const log = std.log.scoped(.channel_loop);
 
 /// Set ScheduleTool's default chat_id for delivery context.
-fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) void {
+fn setScheduleToolContext(
+    tools: []const tools_mod.Tool,
+    channel: ?[]const u8,
+    account_id: ?[]const u8,
+    chat_id: ?[]const u8,
+) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
             const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-            schedule_tool.setContext("telegram", chat_id);
+            schedule_tool.setContext(channel, account_id, chat_id);
             break;
         }
     }
@@ -67,8 +72,9 @@ fn processTelegramMessage(
     tg_ptr.startTyping(typing_target) catch {};
     defer tg_ptr.stopTyping(typing_target) catch {};
 
-    // Set ScheduleTool context for delivery
-    setScheduleToolContext(runtime.tools, sender);
+    // Set ScheduleTool context for delivery.
+    setScheduleToolContext(runtime.tools, "telegram", tg_ptr.account_id, sender);
+    defer setScheduleToolContext(runtime.tools, null, null, null);
 
     // Build conversation context for Telegram
     const conversation_context: ?ConversationContext = .{
@@ -850,6 +856,10 @@ pub fn runSignalLoop(
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
         for (messages) |msg| {
+            const schedule_chat_id = msg.reply_target orelse msg.sender;
+            setScheduleToolContext(runtime.tools, "signal", sg_ptr.account_id, schedule_chat_id);
+            defer setScheduleToolContext(runtime.tools, null, null, null);
+
             // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
             const group_peer_id = signalGroupPeerId(msg.reply_target);
@@ -1063,6 +1073,10 @@ pub fn runMatrixLoop(
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
         for (messages) |msg| {
+            const schedule_chat_id = msg.reply_target orelse msg.sender;
+            setScheduleToolContext(runtime.tools, "matrix", mx_ptr.account_id, schedule_chat_id);
+            defer setScheduleToolContext(runtime.tools, null, null, null);
+
             var key_buf: [192]u8 = undefined;
             const room_peer_id = matrixRoomPeerId(msg.reply_target);
             var routed_session_key: ?[]const u8 = null;

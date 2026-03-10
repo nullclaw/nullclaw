@@ -11,10 +11,12 @@ const compatible = @import("compatible.zig");
 const claude_cli = @import("claude_cli.zig");
 const codex_cli = @import("codex_cli.zig");
 const openai_codex = @import("openai_codex.zig");
+const provider_names = @import("../provider_names.zig");
 
 pub const ProviderKind = enum {
     anthropic_provider,
     openai_provider,
+    azure_openai_provider,
     openrouter_provider,
     ollama_provider,
     gemini_provider,
@@ -184,10 +186,41 @@ fn findCompatProvider(name: []const u8) ?CompatProvider {
     return null;
 }
 
+const AZURE_DEFAULT_BASE_URL = "https://your-resource.openai.azure.com";
+const AZURE_DEFAULT_COMPAT_BASE_URL = "https://your-resource.openai.azure.com/openai/v1";
+
+fn trimTrailingSlash(s: []const u8) []const u8 {
+    if (s.len > 0 and s[s.len - 1] == '/') {
+        return s[0 .. s.len - 1];
+    }
+    return s;
+}
+
+fn normalizeAzureBaseUrlOwned(allocator: std.mem.Allocator, base_url: ?[]const u8) ![]u8 {
+    const raw = trimTrailingSlash(base_url orelse AZURE_DEFAULT_BASE_URL);
+
+    if (std.mem.endsWith(u8, raw, "/chat/completions") or std.mem.endsWith(u8, raw, "/openai/v1")) {
+        return allocator.dupe(u8, raw);
+    }
+
+    if (std.mem.endsWith(u8, raw, "/responses")) {
+        return allocator.dupe(u8, raw[0 .. raw.len - "/responses".len]);
+    }
+
+    if (std.mem.endsWith(u8, raw, "/openai")) {
+        return std.fmt.allocPrint(allocator, "{s}/v1", .{raw});
+    }
+
+    return std.fmt.allocPrint(allocator, "{s}/openai/v1", .{raw});
+}
+
 /// Core (non-compatible) providers that have their own dedicated implementations.
 const core_providers = std.StaticStringMap(ProviderKind).initComptime(.{
     .{ "anthropic", .anthropic_provider },
     .{ "openai", .openai_provider },
+    .{ "azure", .azure_openai_provider },
+    .{ "azure-openai", .azure_openai_provider },
+    .{ "azure_openai", .azure_openai_provider },
     .{ "openrouter", .openrouter_provider },
     .{ "ollama", .ollama_provider },
     .{ "gemini", .gemini_provider },
@@ -203,11 +236,13 @@ const core_providers = std.StaticStringMap(ProviderKind).initComptime(.{
 
 /// Determine which provider to create from a name string.
 pub fn classifyProvider(name: []const u8) ProviderKind {
+    const canonical = provider_names.canonicalProviderName(name);
+
     // Check core (non-compatible) providers first.
-    if (core_providers.get(name)) |kind| return kind;
+    if (core_providers.get(canonical)) |kind| return kind;
 
     // Check compatible providers table.
-    if (findCompatProvider(name) != null) return .compatible_provider;
+    if (findCompatProvider(canonical) != null or findCompatProvider(name) != null) return .compatible_provider;
 
     // custom: prefix
     if (std.mem.startsWith(u8, name, "custom:")) return .compatible_provider;
@@ -301,6 +336,21 @@ pub const ProviderHolder = union(enum) {
                     base_url,
             ) },
             .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent) },
+            .azure_openai_provider => blk: {
+                const azure_url = normalizeAzureBaseUrlOwned(allocator, base_url) catch null;
+                var prov = compatible.OpenAiCompatibleProvider.init(
+                    allocator,
+                    provider_name,
+                    if (azure_url) |url| url else AZURE_DEFAULT_COMPAT_BASE_URL,
+                    api_key,
+                    .custom,
+                    user_agent,
+                );
+                prov.owned_base_url = azure_url;
+                prov.custom_header = "api-key";
+                if (!native_tools) prov.native_tools = false;
+                break :blk .{ .compatible = prov };
+            },
             .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
             .vertex_provider => .{ .vertex = vertex.VertexProvider.init(allocator, api_key, base_url) },
             .ollama_provider => .{ .ollama = ollama.OllamaProvider.init(allocator, base_url) },
@@ -374,6 +424,9 @@ pub const ProviderHolder = union(enum) {
 test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("anthropic") == .anthropic_provider);
     try std.testing.expect(classifyProvider("openai") == .openai_provider);
+    try std.testing.expect(classifyProvider("azure") == .azure_openai_provider);
+    try std.testing.expect(classifyProvider("azure-openai") == .azure_openai_provider);
+    try std.testing.expect(classifyProvider("azure_openai") == .azure_openai_provider);
     try std.testing.expect(classifyProvider("openrouter") == .openrouter_provider);
     try std.testing.expect(classifyProvider("ollama") == .ollama_provider);
     try std.testing.expect(classifyProvider("gemini") == .gemini_provider);
@@ -456,6 +509,30 @@ test "compatibleProviderUrl new providers" {
     try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", compatibleProviderUrl("kimi-code").?);
     try std.testing.expectEqualStrings("https://portal.qwen.ai/v1", compatibleProviderUrl("qwen-portal").?);
     try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", compatibleProviderUrl("telnyx").?);
+}
+
+test "normalizeAzureBaseUrlOwned appends openai v1 path" {
+    const alloc = std.testing.allocator;
+
+    const plain = try normalizeAzureBaseUrlOwned(alloc, "https://resource.openai.azure.com");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", plain);
+
+    const openai_only = try normalizeAzureBaseUrlOwned(alloc, "https://resource.openai.azure.com/openai/");
+    defer alloc.free(openai_only);
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", openai_only);
+
+    const v1 = try normalizeAzureBaseUrlOwned(alloc, "https://resource.openai.azure.com/openai/v1/");
+    defer alloc.free(v1);
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", v1);
+}
+
+test "normalizeAzureBaseUrlOwned strips terminal responses endpoint" {
+    const alloc = std.testing.allocator;
+
+    const responses = try normalizeAzureBaseUrlOwned(alloc, "https://resource.openai.azure.com/openai/v1/responses/");
+    defer alloc.free(responses);
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", responses);
 }
 
 test "compatibleProviderUrl CN/intl variants" {
@@ -675,6 +752,13 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null);
     defer h2.deinit();
     try std.testing.expect(h2 == .openai);
+    // azure openai
+    var h2a = ProviderHolder.fromConfig(alloc, "azure", "test-key", "https://test.openai.azure.com", true, null);
+    defer h2a.deinit();
+    try std.testing.expect(h2a == .compatible);
+    try std.testing.expectEqualStrings("https://test.openai.azure.com/openai/v1", h2a.compatible.base_url);
+    try std.testing.expect(h2a.compatible.auth_style == .custom);
+    try std.testing.expectEqualStrings("api-key", h2a.compatible.custom_header.?);
     // gemini
     var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null);
     defer h3.deinit();

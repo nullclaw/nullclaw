@@ -417,7 +417,7 @@ fn curlGetWithProxyAndResolve(
 
     const term = child.wait() catch |err| {
         log.err("curl child.wait failed: {}", .{err});
-        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+        return error.CurlWaitError;
     };
     switch (term) {
         .Exited => |code| if (code != 0) {

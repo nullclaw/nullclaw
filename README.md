@@ -22,7 +22,7 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
 
 ```
-678 KB binary · <2 ms startup · 3,230+ tests · 23+ providers · 18 channels · Pluggable everything
+678 KB binary · <2 ms startup · 5,100+ tests · 50+ providers · 19 channels · Pluggable everything
 ```
 
 ### Features
@@ -31,7 +31,7 @@ Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributi
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 23+ providers, 18 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 50+ providers, 19 channels, 30+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
 ### Why nullclaw
 
@@ -50,8 +50,8 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
 | **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **3,230+** |
-| **Source Files** | ~400+ | — | — | ~120 | **~110** |
+| **Tests** | — | — | — | 1,017 | **5,100+** |
+| **Source Files** | ~400+ | — | — | ~120 | **~230** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
 > Measured with `/usr/bin/time -l` on ReleaseSmall builds. nullclaw is a static binary with zero runtime dependencies.
@@ -212,7 +212,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
-| **AI Models** | `Provider` | 23+ providers (OpenRouter, Anthropic, OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, pushover, and more | Any capability |
@@ -485,7 +485,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
 }
 ```
 
-- `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`).
+- `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`); local/private SearXNG instances may also use plain HTTP such as `http://localhost:8888` or `http://192.168.1.10:8888/search`.
 - Invalid `http_request.search_base_url` now fails config validation at startup (no automatic fallback for malformed URL).
 - `http_request.search_provider` supports: `auto`, `searxng`, `duckduckgo` (`ddg`), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina`.
 - `http_request.search_fallback_providers` is optional and is tried in order when the primary provider fails.
@@ -593,7 +593,7 @@ Build and tests are pinned to **Zig 0.15.2**.
 ```bash
 zig build                          # Dev build
 zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 3,230+ tests
+zig build test --summary all       # 5,100+ tests
 ```
 
 ### Channel Flow Coverage
@@ -610,9 +610,9 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 
 ```
 Language:     Zig 0.15.2
-Source files: ~110
-Lines of code: ~45,000
-Tests:        3,230+
+Source files: ~230
+Lines of code: ~175,000
+Tests:        5,100+
 Binary:       678 KB (ReleaseSmall)
 Peak RSS:     ~1 MB
 Startup:      <2 ms (Apple Silicon)
@@ -630,9 +630,9 @@ src/
   daemon.zig            Daemon supervisor with exponential backoff
   gateway.zig           HTTP gateway (rate limiting, idempotency, pairing)
   channels/             19 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
-  providers/            23+ AI provider implementations
+  providers/            50+ AI provider integrations
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
-  tools/                18 tool implementations
+  tools/                33 tool implementations
   security/             Secrets (ChaCha20), sandbox backends (landlock, firejail, ...)
   cron.zig              Cron scheduler with JSON persistence
   health.zig            Component health registry

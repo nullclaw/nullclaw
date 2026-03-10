@@ -3,6 +3,7 @@ const agent_mod = @import("agent/root.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const observability = @import("observability.zig");
+const provider_names = @import("provider_names.zig");
 const providers = @import("providers/root.zig");
 const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
@@ -15,7 +16,7 @@ fn findProviderEntry(
     entries: []const config_types.ProviderEntry,
 ) ?config_types.ProviderEntry {
     for (entries) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, provider_name)) return entry;
+        if (provider_names.providerNamesMatchIgnoreCase(entry.name, provider_name)) return entry;
     }
     return null;
 }
@@ -150,4 +151,12 @@ test "findProviderEntry matches case-insensitively" {
     };
     const found = findProviderEntry("customgw", &entries) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://example.com/v1", found.base_url.?);
+}
+
+test "findProviderEntry matches provider aliases" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "azure", .base_url = "https://resource.openai.azure.com/openai/v1" },
+    };
+    const found = findProviderEntry("AZURE-OPENAI", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", found.base_url.?);
 }

@@ -256,6 +256,12 @@ pub const ApiMemory = struct {
         return std.fmt.allocPrint(alloc, "{s}/sessions/{s}/messages", .{ self.base_url, encoded_sid });
     }
 
+    fn buildSessionUsageUrl(self: *const Self, alloc: Allocator, session_id: []const u8) ![]u8 {
+        const encoded_sid = try urlEncode(alloc, session_id);
+        defer alloc.free(encoded_sid);
+        return std.fmt.allocPrint(alloc, "{s}/sessions/{s}/usage", .{ self.base_url, encoded_sid });
+    }
+
     fn buildAutoSavedUrl(self: *const Self, alloc: Allocator, session_id: ?[]const u8) ![]u8 {
         if (session_id) |sid| {
             const encoded_sid = try urlEncode(alloc, sid);
@@ -321,6 +327,18 @@ pub const ApiMemory = struct {
         try buf.appendSlice(alloc, "\",\"content\":\"");
         try appendJsonEscaped(&buf, alloc, content);
         try buf.appendSlice(alloc, "\"}");
+        return buf.toOwnedSlice(alloc);
+    }
+
+    fn buildUsagePayload(alloc: Allocator, total_tokens: u64) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(alloc);
+
+        try buf.appendSlice(alloc, "{\"total_tokens\":");
+        var total_buf: [32]u8 = undefined;
+        const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{total_tokens}) catch unreachable;
+        try buf.appendSlice(alloc, total_str);
+        try buf.append(alloc, '}');
         return buf.toOwnedSlice(alloc);
     }
 
@@ -509,6 +527,23 @@ pub const ApiMemory = struct {
         return results.toOwnedSlice(alloc);
     }
 
+    fn parseUsage(alloc: Allocator, body: []const u8) !?u64 {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
+        defer parsed.deinit();
+
+        const total_val = switch (parsed.value) {
+            .object => |obj| obj.get("total_tokens") orelse return error.ApiInvalidResponse,
+            else => return error.ApiInvalidResponse,
+        };
+
+        return switch (total_val) {
+            .null => null,
+            .integer => |n| if (n >= 0) @intCast(n) else return error.ApiInvalidResponse,
+            .string => |s| std.fmt.parseInt(u64, s, 10) catch return error.ApiInvalidResponse,
+            else => return error.ApiInvalidResponse,
+        };
+    }
+
     fn parseCount(alloc: Allocator, body: []const u8) !usize {
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
         defer parsed.deinit();
@@ -663,6 +698,9 @@ pub const ApiMemory = struct {
     };
 
     // ── SessionStore vtable implementation ───────────────────────
+    // API contract:
+    // - POST/GET/DELETE {base}/sessions/{session_id}/messages
+    // - PUT/GET/DELETE  {base}/sessions/{session_id}/usage with {"total_tokens":123}
 
     fn implSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -710,8 +748,19 @@ pub const ApiMemory = struct {
         const resp = try self.doRequest(alloc, url, .DELETE, null);
         defer alloc.free(resp.body);
 
-        if (resp.status != .ok) {
+        if (resp.status != .ok and resp.status != .not_found) {
             log.warn("API clearMessages failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        const usage_url = try self.buildSessionUsageUrl(alloc, session_id);
+        defer alloc.free(usage_url);
+
+        const usage_resp = try self.doRequest(alloc, usage_url, .DELETE, null);
+        defer alloc.free(usage_resp.body);
+
+        if (usage_resp.status != .ok and usage_resp.status != .not_found) {
+            log.warn("API clearUsage failed: status={d}", .{@intFromEnum(usage_resp.status)});
             return error.ApiRequestFailed;
         }
     }
@@ -732,11 +781,51 @@ pub const ApiMemory = struct {
         }
     }
 
+    fn implSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildSessionUsageUrl(alloc, session_id);
+        defer alloc.free(url);
+
+        const payload = try buildUsagePayload(alloc, total_tokens);
+        defer alloc.free(payload);
+
+        const resp = try self.doRequest(alloc, url, .PUT, payload);
+        defer alloc.free(resp.body);
+
+        if (resp.status != .ok) {
+            log.warn("API saveUsage failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+    }
+
+    fn implLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildSessionUsageUrl(alloc, session_id);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return null;
+        if (resp.status != .ok) {
+            log.warn("API loadUsage failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        return parseUsage(alloc, resp.body);
+    }
+
     const session_vtable = SessionStore.VTable{
         .saveMessage = &implSaveMessage,
         .loadMessages = &implLoadMessages,
         .clearMessages = &implClearMessages,
         .clearAutoSaved = &implClearAutoSaved,
+        .saveUsage = &implSaveUsage,
+        .loadUsage = &implLoadUsage,
     };
 };
 
@@ -830,6 +919,11 @@ test "api url building" {
     const url6 = try mem.buildSessionMessagesUrl(std.testing.allocator, "sess-42");
     defer std.testing.allocator.free(url6);
     try std.testing.expectEqualStrings("http://localhost:8080/v1/agent/sessions/sess-42/messages", url6);
+
+    // Session usage URL
+    const url7 = try mem.buildSessionUsageUrl(std.testing.allocator, "sess-42");
+    defer std.testing.allocator.free(url7);
+    try std.testing.expectEqualStrings("http://localhost:8080/v1/agent/sessions/sess-42/usage", url7);
 }
 
 test "api url building with trailing slash" {
@@ -1007,6 +1101,39 @@ test "api parse messages invalid json" {
     try std.testing.expectError(error.ApiInvalidResponse, result);
 }
 
+test "api parse usage" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"total_tokens":123}
+    ;
+    const total = try ApiMemory.parseUsage(alloc, json);
+    try std.testing.expectEqual(@as(?u64, 123), total);
+}
+
+test "api parse usage accepts string" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"total_tokens":"456"}
+    ;
+    const total = try ApiMemory.parseUsage(alloc, json);
+    try std.testing.expectEqual(@as(?u64, 456), total);
+}
+
+test "api parse usage null" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"total_tokens":null}
+    ;
+    const total = try ApiMemory.parseUsage(alloc, json);
+    try std.testing.expectEqual(@as(?u64, null), total);
+}
+
+test "api parse usage invalid" {
+    const alloc = std.testing.allocator;
+    const result = ApiMemory.parseUsage(alloc, "{\"count\":5}");
+    try std.testing.expectError(error.ApiInvalidResponse, result);
+}
+
 test "api parse count" {
     const alloc = std.testing.allocator;
     const json =
@@ -1118,6 +1245,18 @@ test "api build message payload" {
     try std.testing.expectEqualStrings("Hello world", obj.get("content").?.string);
 }
 
+test "api build usage payload" {
+    const alloc = std.testing.allocator;
+    const payload = try ApiMemory.buildUsagePayload(alloc, 321);
+    defer alloc.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 321), obj.get("total_tokens").?.integer);
+}
+
 test "api memory produces vtable" {
     var mem = try ApiMemory.init(std.testing.allocator, .{ .url = "http://127.0.0.1:8080" });
     defer mem.deinit();
@@ -1143,6 +1282,8 @@ test "api memory produces session store vtable" {
     try std.testing.expect(ss.vtable.loadMessages == &ApiMemory.implLoadMessages);
     try std.testing.expect(ss.vtable.clearMessages == &ApiMemory.implClearMessages);
     try std.testing.expect(ss.vtable.clearAutoSaved == &ApiMemory.implClearAutoSaved);
+    try std.testing.expect(ss.vtable.saveUsage == &ApiMemory.implSaveUsage);
+    try std.testing.expect(ss.vtable.loadUsage == &ApiMemory.implLoadUsage);
 }
 
 test "api memory no session store when disabled" {

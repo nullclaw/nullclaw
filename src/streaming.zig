@@ -47,14 +47,14 @@ pub fn forwardProviderChunk(sink: Sink, chunk: providers.StreamChunk) void {
 }
 
 // ---------------------------------------------------------------------------
-// TagFilter – state-machine that strips <tool_call>…</tool_call> (and bracket
-// variants) from a stream of chunks before forwarding to an inner Sink.
+// TagFilter – state-machine that strips tool-control blocks from a stream of
+// chunks before forwarding to an inner Sink.
 // ---------------------------------------------------------------------------
 
 pub const TagFilter = struct {
     inner: Sink,
     state: State = .passthrough,
-    buf: [max_tag_len]u8 = undefined,
+    buf: [max_buf_len]u8 = undefined,
     buf_len: u8 = 0,
 
     const State = enum {
@@ -66,20 +66,49 @@ pub const TagFilter = struct {
     };
 
     // Opening tag prefixes. After matching, skip until '>'.
-    // Handles both `<tool_call>` and `<tool_result name="x" status="ok">`.
+    // Handles canonical XML tags plus provider-specific *_begin wrappers.
     const open_prefixes = [_][]const u8{
         "<tool_call",
         "<tool_result",
+        "<tool_call_begin",
+        "<tool_result_begin",
+        "<|tool_call_begin|",
+        "<|tool_result_begin|",
     };
 
     // Closing tags (fixed match).
     const close_tags = [_][]const u8{
         "</tool_call>",
         "</tool_result>",
+        "<tool_call_end>",
+        "<tool_result_end>",
+        "<|tool_call_end|>",
+        "<|tool_result_end|>",
     };
 
-    const max_prefix_len = 12; // "<tool_result".len
-    const max_tag_len = 14; // "</tool_result>".len
+    // Standalone control tokens that should be stripped, but do not wrap body text.
+    const standalone_tags = [_][]const u8{
+        "<tool_calls_section_begin>",
+        "<tool_calls_section_end>",
+        "<tool_calls_section_end|>",
+        "<|tool_calls_section_begin|>",
+        "<|tool_calls_section_end|>",
+        "<tool_call_argument_begin>",
+        "<|tool_call_argument_begin|>",
+    };
+
+    fn maxLen(comptime tags: []const []const u8) comptime_int {
+        var longest: usize = 0;
+        for (tags) |tag| {
+            if (tag.len > longest) longest = tag.len;
+        }
+        return longest;
+    }
+
+    const max_prefix_len = maxLen(&open_prefixes);
+    const max_tag_len = maxLen(&close_tags);
+    const max_standalone_len = maxLen(&standalone_tags);
+    const max_buf_len = @max(@max(max_prefix_len + 1, max_tag_len), max_standalone_len);
 
     pub fn init(inner: Sink) TagFilter {
         return .{ .inner = inner };
@@ -122,6 +151,12 @@ pub const TagFilter = struct {
                     self.buf[self.buf_len] = b;
                     self.buf_len += 1;
                     const prefix = self.buf[0..self.buf_len];
+                    if (matchesAny(prefix, &standalone_tags)) |_| {
+                        self.buf_len = 0;
+                        self.state = .passthrough;
+                        clean_start = i + 1;
+                        continue;
+                    }
                     // Check if the bytes before this one match a full open prefix
                     // and this byte is a delimiter ('>' closes the tag, ' ' starts attrs).
                     if (self.buf_len > 1 and (b == '>' or b == ' ') and
@@ -137,7 +172,7 @@ pub const TagFilter = struct {
                         continue;
                     }
                     // Still a valid prefix of some open tag — keep buffering.
-                    if (prefixOfAny(prefix, &open_prefixes)) {
+                    if (prefixOfAny(prefix, &open_prefixes) or prefixOfAny(prefix, &standalone_tags)) {
                         clean_start = i + 1;
                         continue;
                     }
@@ -355,4 +390,60 @@ test "TagFilter incomplete open tag at end flushes on final" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("end<tool_c", col.joined(&buf));
     try std.testing.expect(col.got_final);
+}
+
+test "TagFilter strips pipe-delimited tool_call control block" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Before <|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|> after");
+    s.emitFinal();
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Before  after", col.joined(&buf));
+}
+
+test "TagFilter strips pipe-delimited tool_result block split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<|tool_result_be");
+    s.emitChunk("gin|>hidden");
+    s.emitChunk("<|tool_result_end|>B");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
+}
+
+test "TagFilter strips pipe-delimited tool_calls section wrapper" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Before <|tool_calls_section_begin|>");
+    s.emitChunk("<|tool_call_begin|>{\"name\":\"shell\"}");
+    s.emitChunk("<|tool_call_end|><|tool_calls_section_end|> after");
+    s.emitFinal();
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Before  after", col.joined(&buf));
+}
+
+test "TagFilter strips begin-style tool_call without pipe delimiters" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<tool_call_begin>{\"name\":\"shell\"}</tool_call>B");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
+}
+
+test "TagFilter strips section wrapper with mixed pipe-delimited close tag" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<tool_calls_section_begin>");
+    s.emitChunk("<tool_call_begin> functions.shell:5<{\"command\":\"pwd\"}</tool_call>");
+    s.emitChunk("<tool_calls_section_end|>B");
+    s.emitFinal();
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
 }

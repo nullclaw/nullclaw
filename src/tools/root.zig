@@ -315,6 +315,7 @@ pub fn allTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
     };
     try list.append(allocator, st.tool());
 
@@ -543,6 +544,7 @@ pub fn subagentTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
     };
     try list.append(allocator, st.tool());
 

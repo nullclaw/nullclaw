@@ -102,6 +102,9 @@ const PostgresMemoryImpl = struct {
     q_save_msg: []const u8,
     q_load_msgs: []const u8,
     q_clear_msgs: []const u8,
+    q_save_usage: []const u8,
+    q_load_usage: []const u8,
+    q_clear_usage: []const u8,
     q_clear_auto: []const u8,
     q_clear_auto_sid: []const u8,
     q_recall_sid: []const u8,
@@ -142,6 +145,9 @@ const PostgresMemoryImpl = struct {
             .q_save_msg = undefined,
             .q_load_msgs = undefined,
             .q_clear_msgs = undefined,
+            .q_save_usage = undefined,
+            .q_load_usage = undefined,
+            .q_clear_usage = undefined,
             .q_clear_auto = undefined,
             .q_clear_auto_sid = undefined,
             .q_recall_sid = undefined,
@@ -188,6 +194,16 @@ const PostgresMemoryImpl = struct {
         self_.q_clear_msgs = try buildQuery(allocator, "DELETE FROM {schema}.messages WHERE session_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_msgs);
 
+        self_.q_save_usage = try buildQuery(allocator, "INSERT INTO {schema}.session_usage (session_id, total_tokens, updated_at) VALUES ($1, $2, NOW()) " ++
+            "ON CONFLICT (session_id) DO UPDATE SET total_tokens = EXCLUDED.total_tokens, updated_at = NOW()", schema_q, table_q);
+        errdefer allocator.free(self_.q_save_usage);
+
+        self_.q_load_usage = try buildQuery(allocator, "SELECT total_tokens FROM {schema}.session_usage WHERE session_id = $1", schema_q, table_q);
+        errdefer allocator.free(self_.q_load_usage);
+
+        self_.q_clear_usage = try buildQuery(allocator, "DELETE FROM {schema}.session_usage WHERE session_id = $1", schema_q, table_q);
+        errdefer allocator.free(self_.q_clear_usage);
+
         self_.q_clear_auto = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND instance_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_auto);
 
@@ -225,6 +241,9 @@ const PostgresMemoryImpl = struct {
         self.allocator.free(self.q_save_msg);
         self.allocator.free(self.q_load_msgs);
         self.allocator.free(self.q_clear_msgs);
+        self.allocator.free(self.q_save_usage);
+        self.allocator.free(self.q_load_usage);
+        self.allocator.free(self.q_clear_usage);
         self.allocator.free(self.q_clear_auto);
         self.allocator.free(self.q_clear_auto_sid);
         self.allocator.free(self.q_recall_sid);
@@ -264,6 +283,11 @@ const PostgresMemoryImpl = struct {
             \\    content TEXT NOT NULL,
             \\    created_at TIMESTAMP DEFAULT NOW()
             \\);
+            \\CREATE TABLE IF NOT EXISTS {s}.session_usage (
+            \\    session_id TEXT PRIMARY KEY,
+            \\    total_tokens BIGINT NOT NULL DEFAULT 0,
+            \\    updated_at TIMESTAMP DEFAULT NOW()
+            \\);
         , .{
             self.schema_q, self.table_q,
             self.schema_q, self.table_q,
@@ -274,7 +298,7 @@ const PostgresMemoryImpl = struct {
             raw_table,     self.schema_q,
             self.table_q,  raw_table,
             self.schema_q, self.table_q,
-            self.schema_q,
+            self.schema_q, self.schema_q,
         });
         defer self.allocator.free(ddl);
 
@@ -677,6 +701,9 @@ const PostgresMemoryImpl = struct {
 
         const result = try self_.execParams(self_.q_clear_msgs, &params, &lengths);
         c.PQclear(result);
+
+        const usage_result = try self_.execParams(self_.q_clear_usage, &params, &lengths);
+        c.PQclear(usage_result);
     }
 
     fn implSessionClearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
@@ -700,11 +727,46 @@ const PostgresMemoryImpl = struct {
         }
     }
 
+    fn implSessionSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sid_z = try self_.allocator.dupeZ(u8, session_id);
+        defer self_.allocator.free(sid_z);
+
+        const total_z = try std.fmt.allocPrintZ(self_.allocator, "{d}", .{total_tokens});
+        defer self_.allocator.free(total_z);
+        const params = [_]?[*:0]const u8{ sid_z, total_z };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(total_z.len) };
+
+        const result = try self_.execParams(self_.q_save_usage, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    fn implSessionLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sid_z = try self_.allocator.dupeZ(u8, session_id);
+        defer self_.allocator.free(sid_z);
+
+        const params = [_]?[*:0]const u8{sid_z};
+        const lengths = [_]c_int{@intCast(session_id.len)};
+
+        const result = try self_.execParams(self_.q_load_usage, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return null;
+        const raw = c.PQgetvalue(result, 0, 0);
+        const len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        return try std.fmt.parseInt(u64, raw[0..len], 10);
+    }
+
     const session_vtable = SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveUsage = &implSessionSaveUsage,
+        .loadUsage = &implSessionLoadUsage,
     };
 
     pub fn sessionStore(self: *Self) SessionStore {

@@ -820,6 +820,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
+            if (ag.object.get("vision_disabled_models")) |v| {
+                if (v == .array) self.agent.vision_disabled_models = try parseStringArray(self.allocator, v.array);
+            }
+            if (ag.object.get("auto_disable_vision_on_error")) |v| {
+                if (v == .bool) self.agent.auto_disable_vision_on_error = v.bool;
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {
@@ -866,6 +872,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
+            }
+            if (tl.object.get("path_env_vars")) |v| {
+                if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {

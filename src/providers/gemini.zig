@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
+const sse = @import("sse.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -726,7 +727,8 @@ pub const GeminiProvider = struct {
 
     /// Run curl in SSE streaming mode for Gemini and parse output line by line.
     ///
-    /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
+    /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast
+    /// flag: `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
     /// For each SSE delta, calls `callback(ctx, chunk)`.
     /// Returns accumulated result after stream completes.
     /// Stream ends when curl connection closes (no [DONE] sentinel).
@@ -749,7 +751,7 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
-        argv_buf[argc] = "--fail-with-body";
+        argv_buf[argc] = sse.curlFailFastArg(allocator);
         argc += 1;
 
         var timeout_buf: [32]u8 = undefined;

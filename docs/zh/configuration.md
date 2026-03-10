@@ -170,7 +170,7 @@ Telegram 示例：
 
 注意：
 
-- `search_base_url` 必须是合法 URL，否则启动校验会失败。
+- `search_base_url` 必须是 `https://host[/search]`，或者本地/内网可达的 `http://host[:port][/search]`，否则启动校验会失败。
 - `allowed_commands: ["*"]` 与 `allowed_paths: ["*"]` 会显著扩大执行范围。
 
 ## 配置变更后的验证

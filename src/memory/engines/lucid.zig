@@ -515,11 +515,23 @@ pub const LucidMemory = struct {
         return self.local.clearAutoSaved(session_id);
     }
 
+    fn implSessionSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self = castSelf(ptr);
+        return self.local.saveUsage(session_id, total_tokens);
+    }
+
+    fn implSessionLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self = castSelf(ptr);
+        return self.local.loadUsage(session_id);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveUsage = &implSessionSaveUsage,
+        .loadUsage = &implSessionLoadUsage,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

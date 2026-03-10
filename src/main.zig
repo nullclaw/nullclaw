@@ -231,6 +231,15 @@ fn applyRuntimeProviderOverrides(config: *const yc.config.Config) void {
     };
 }
 
+fn hasVerboseFlag(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
     var port: u16 = cfg.gateway.port;
     var host: []const u8 = cfg.gateway.host;
@@ -264,6 +273,23 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
+    // Check both sub_args and global args for --verbose flag 
+    var verbose = hasVerboseFlag(sub_args);
+    if (!verbose) {
+        // Also check global args for --verbose flag
+        const args = std.process.argsAlloc(allocator) catch &.{};
+        defer std.process.argsFree(allocator, args);
+        for (args) |arg| {
+            if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+                verbose = true;
+                break;
+            }
+        }
+    }
+    if (verbose) {
+        log.warn("Verbose flag detected, enabling verbose logging", .{});
+        yc.verbose.setVerbose(true);
+    }
     cfg.validate() catch |err| {
         yc.config.Config.printValidationError(err);
         std.process.exit(1);

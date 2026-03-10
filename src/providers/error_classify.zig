@@ -96,7 +96,8 @@ pub fn isVisionUnsupportedText(text: []const u8) bool {
         containsAsciiFold(text, "image input not supported") or
         containsAsciiFold(text, "no endpoints found that support image input") or
         containsAsciiFold(text, "vision not supported") or
-        containsAsciiFold(text, "multimodal not supported"))
+        containsAsciiFold(text, "multimodal not supported") or
+        containsAsciiFold(text, "not a multimodal model"))
     {
         return true;
     }

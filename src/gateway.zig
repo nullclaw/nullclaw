@@ -2659,6 +2659,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .agents = cfg.agents,
                     .fallback_api_key = resolved_api_key,
                     .allowed_paths = cfg.autonomy.allowed_paths,
+                    .tools_config = cfg.tools,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .subagent_manager = subagent_manager_opt,
                     .bootstrap_provider = bootstrap_provider_opt,

@@ -23,7 +23,7 @@ pub const Skill = struct {
     instructions: []const u8 = "",
     enabled: bool = true,
     /// If true, full instructions are always included in the system prompt.
-    /// If false, only an XML summary is included and the agent must use read_file to load instructions.
+    /// If false, only an XML summary is included and the agent must use file_read to load instructions.
     always: bool = false,
     /// List of CLI binaries required by this skill (e.g. "docker", "git").
     requires_bins: []const []const u8 = &.{},
@@ -33,7 +33,7 @@ pub const Skill = struct {
     available: bool = true,
     /// Human-readable description of missing dependencies. Set by checkRequirements().
     missing_deps: []const u8 = "",
-    /// Path to the skill directory on disk (for read_file references).
+    /// Path to the skill directory on disk (for file_read references).
     path: []const u8 = "",
 };
 

@@ -331,6 +331,11 @@ pub const SqliteMemory = struct {
             \\  created_at TEXT DEFAULT (datetime('now')),
             \\  updated_at TEXT DEFAULT (datetime('now'))
             \\);
+            \\CREATE TABLE IF NOT EXISTS session_usage (
+            \\  session_id TEXT PRIMARY KEY,
+            \\  total_tokens INTEGER NOT NULL DEFAULT 0,
+            \\  updated_at TEXT DEFAULT (datetime('now'))
+            \\);
             \\CREATE TABLE IF NOT EXISTS kv (
             \\  key TEXT PRIMARY KEY,
             \\  value TEXT NOT NULL
@@ -668,6 +673,47 @@ pub const SqliteMemory = struct {
 
         _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+
+        try self.clearUsage(session_id);
+    }
+
+    pub fn saveUsage(self: *Self, session_id: []const u8, total_tokens: u64) !void {
+        const sql =
+            "INSERT INTO session_usage (session_id, total_tokens, updated_at) VALUES (?1, ?2, datetime('now')) " ++
+            "ON CONFLICT(session_id) DO UPDATE SET total_tokens = excluded.total_tokens, updated_at = datetime('now')";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(total_tokens));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    pub fn loadUsage(self: *Self, session_id: []const u8) !?u64 {
+        const sql = "SELECT total_tokens FROM session_usage WHERE session_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const total = c.sqlite3_column_int64(stmt, 0);
+        if (total < 0) return 0;
+        return @intCast(total);
+    }
+
+    fn clearUsage(self: *Self, session_id: []const u8) !void {
+        const sql = "DELETE FROM session_usage WHERE session_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
     }
 
     /// Delete auto-saved memory entries (autosave_user_*, autosave_assistant_*).
@@ -712,11 +758,23 @@ pub const SqliteMemory = struct {
         return self_.clearAutoSaved(session_id);
     }
 
+    fn implSessionSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.saveUsage(session_id, total_tokens);
+    }
+
+    fn implSessionLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadUsage(session_id);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveUsage = &implSessionSaveUsage,
+        .loadUsage = &implSessionLoadUsage,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {
@@ -1934,11 +1992,22 @@ test "sqlite sessionStore clearMessages" {
 
     const store = mem.sessionStore();
     try store.saveMessage("s1", "user", "hello");
+    try store.saveUsage("s1", 99);
     try store.clearMessages("s1");
 
     const msgs = try store.loadMessages(allocator, "s1");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
+    try std.testing.expectEqual(@as(?u64, null), try store.loadUsage("s1"));
+}
+
+test "sqlite sessionStore saveUsage + loadUsage roundtrip" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveUsage("s1", 123);
+    try std.testing.expectEqual(@as(?u64, 123), try store.loadUsage("s1"));
 }
 
 test "sqlite sessionStore clearAutoSaved" {

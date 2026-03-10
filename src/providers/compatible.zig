@@ -54,6 +54,8 @@ pub const AuthStyle = enum {
 pub const OpenAiCompatibleProvider = struct {
     name: []const u8,
     base_url: []const u8,
+    /// Optional owned copy of base_url when the caller had to normalize/build it.
+    owned_base_url: ?[]u8 = null,
     api_key: ?[]const u8,
     auth_style: AuthStyle,
     /// Custom header name when auth_style is .custom (e.g. "X-Custom-Key").
@@ -615,6 +617,7 @@ pub const OpenAiCompatibleProvider = struct {
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
         .supports_vision = supportsVisionImpl,
+        .supports_vision_for_model = supportsVisionForModelImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
@@ -874,12 +877,24 @@ pub const OpenAiCompatibleProvider = struct {
         return true;
     }
 
+    fn supportsVisionForModelImpl(_: *anyopaque, _: []const u8) bool {
+        // Vision capability is managed by Agent's vision_disabled_models.
+        // Provider assumes all models support vision by default.
+        return true;
+    }
+
     fn getNameImpl(ptr: *anyopaque) []const u8 {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         return self.name;
     }
 
-    fn deinitImpl(_: *anyopaque) void {}
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        if (self.owned_base_url) |owned| {
+            self.allocator.free(owned);
+            self.owned_base_url = null;
+        }
+    }
 };
 
 /// Serialize a single message's content field — delegates to shared helper in providers/helpers.zig.

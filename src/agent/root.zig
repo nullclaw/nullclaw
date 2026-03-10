@@ -26,6 +26,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const verbose_mod = @import("../verbose.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -48,7 +49,7 @@ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
-fn estimate_text_tokens(text: []const u8) u32 {
+pub fn estimate_text_tokens(text: []const u8) u32 {
     return @intCast((text.len + 3) / 4);
 }
 
@@ -250,6 +251,15 @@ pub const Agent = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
     multimodal_unrestricted: bool = false,
+    /// List of models that do not support image/vision input.
+    /// When image markers are detected and the model is in this list,
+    /// the agent will skip processing images instead of returning an error.
+    vision_disabled_models: []const []const u8 = &.{},
+    /// When true, automatically adds the current model to vision_disabled_models
+    /// upon receiving a "model does not support vision" error.
+    auto_disable_vision_on_error: bool = true,
+    /// Models auto-detected as not supporting vision (built at runtime).
+    detected_vision_disabled: std.ArrayListUnmanaged([]const u8) = .empty,
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
@@ -403,6 +413,8 @@ pub const Agent = struct {
             .workspace_dir = cfg.workspace_dir,
             .allowed_paths = cfg.autonomy.allowed_paths,
             .multimodal_unrestricted = cfg.autonomy.level == .yolo,
+            .vision_disabled_models = cfg.agent.vision_disabled_models,
+            .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
@@ -454,6 +466,10 @@ pub const Agent = struct {
             msg.deinit(self.allocator);
         }
         self.history.deinit(self.allocator);
+        for (self.detected_vision_disabled.items) |model| {
+            self.allocator.free(model);
+        }
+        self.detected_vision_disabled.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
     }
 
@@ -953,21 +969,18 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
+        const turn_input = commands.planTurnInput(user_message);
         const effective_user_message = blk: {
-            if (commands.bareSessionResetPrompt(user_message)) |fresh_prompt| {
-                // Preserve slash side-effects (/new|/reset session clear), but route bare command
-                // through a fresh-session prompt instead of returning command text.
-                if (try self.handleSlashCommand(user_message)) |slash_response| {
+            if (turn_input.invoke_local_handler) {
+                const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
+                if (turn_input.llm_user_message) |llm_user_message| {
+                    // Bare /new and /reset clear session state first, then continue as a fresh LLM turn.
                     self.allocator.free(slash_response);
+                    break :blk llm_user_message;
                 }
-                break :blk fresh_prompt;
+                return slash_response;
             }
-
-            // Handle regular slash commands before sending to LLM (saves tokens).
-            if (try self.handleSlashCommand(user_message)) |response| {
-                return response;
-            }
-            break :blk user_message;
+            break :blk turn_input.llm_user_message orelse user_message;
         };
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
@@ -1080,6 +1093,7 @@ pub const Agent = struct {
                     .role = .assistant,
                     .content = history_copy,
                 });
+                self.last_turn_usage = .{};
                 return cached_response;
             }
         }
@@ -1140,7 +1154,7 @@ pub const Agent = struct {
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
-                ) catch |err| {
+                ) catch |err| retry_stream: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
@@ -1150,6 +1164,41 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // Auto-disable vision on first "model does not support vision" error
+                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
+                        if (self.verbose_level == .on or self.verbose_level == .full) {
+                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                        }
+                        try self.markVisionDisabled();
+                        const retry_msgs = try self.buildProviderMessages(arena);
+                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                            retry_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                        );
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, true);
+                        break :retry_stream self.provider.streamChat(
+                            self.allocator,
+                            .{
+                                .messages = retry_msgs,
+                                .model = self.model_name,
+                                .temperature = self.temperature,
+                                .max_tokens = retry_max_tokens,
+                                .tools = null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            self.model_name,
+                            self.temperature,
+                            self.stream_callback.?,
+                            self.stream_ctx.?,
+                        ) catch |retry_err| {
+                            self.emitUsageFailure();
+                            return retry_err;
+                        };
+                    }
+
                     self.emitUsageFailure();
                     return err;
                 };
@@ -1185,6 +1234,37 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // Auto-disable vision on first "model does not support vision" error
+                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
+                        if (self.verbose_level == .on or self.verbose_level == .full) {
+                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                        }
+                        try self.markVisionDisabled();
+                        const retry_msgs = try self.buildProviderMessages(arena);
+                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                            retry_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                        );
+                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, false);
+                        break :retry_blk self.provider.chat(
+                            self.allocator,
+                            .{
+                                .messages = retry_msgs,
+                                .model = self.model_name,
+                                .temperature = self.temperature,
+                                .max_tokens = retry_max_tokens,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            self.model_name,
+                            self.temperature,
+                        ) catch |retry_err| {
+                            self.emitUsageFailure();
+                            return retry_err;
+                        };
+                    }
 
                     // Context exhaustion: compact immediately before first retry
                     const err_name = @errorName(err);
@@ -1801,6 +1881,9 @@ pub const Agent = struct {
                 @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const result = t.execute(tool_allocator, args) catch |err| {
+                    if (verbose_mod.isVerbose()) {
+                        log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
+                    }
                     return .{
                         .name = call.name,
                         .output = @errorName(err),
@@ -1813,6 +1896,10 @@ pub const Agent = struct {
                         std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
                 if (was_interrupted) {
                     self.noteInterruptedTool(trimmed_call_name) catch {};
+                }
+                if (verbose_mod.isVerbose()) {
+                    const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
+                    log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
                 }
                 return .{
                     .name = call.name,
@@ -1960,6 +2047,27 @@ pub const Agent = struct {
         self.emitUsageRecord(&failed, false);
     }
 
+    /// Check if vision is disabled for current model (either configured or auto-detected).
+    fn isVisionDisabled(self: *const Agent) bool {
+        for (self.vision_disabled_models) |model| {
+            if (std.mem.eql(u8, model, self.model_name)) return true;
+        }
+        for (self.detected_vision_disabled.items) |model| {
+            if (std.mem.eql(u8, model, self.model_name)) return true;
+        }
+        return false;
+    }
+
+    /// Add model to detected vision disabled list if not already present.
+    fn markVisionDisabled(self: *Agent) !void {
+        const already_disabled = for (self.detected_vision_disabled.items) |model| {
+            if (std.mem.eql(u8, model, self.model_name)) break true;
+        } else false;
+        if (!already_disabled) {
+            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, self.model_name));
+        }
+    }
+
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing and vision capability checks.
     fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
@@ -1969,8 +2077,28 @@ pub const Agent = struct {
         }
 
         const image_marker_count = multimodal.countImageMarkersInLastUser(m);
-        if (image_marker_count > 0 and !self.provider.supportsVisionForModel(self.model_name)) {
-            return error.ProviderDoesNotSupportVision;
+        if (image_marker_count == 0) {
+            return m;
+        }
+
+        // Check if vision is disabled (configured or auto-detected)
+        if (self.isVisionDisabled()) {
+            if (self.verbose_level == .on or self.verbose_level == .full) {
+                log.info("Vision disabled for model {s}, stripping image markers", .{self.model_name});
+            }
+            return multimodal.stripImageMarkers(arena, m);
+        }
+
+        // Check if provider supports vision for this model
+        if (!self.provider.supportsVisionForModel(self.model_name)) {
+            if (self.verbose_level == .on or self.verbose_level == .full) {
+                log.info("Model {s} does not support vision, stripping image markers", .{self.model_name});
+            }
+            // Auto-disable vision if configured
+            if (self.auto_disable_vision_on_error) {
+                try self.markVisionDisabled();
+            }
+            return multimodal.stripImageMarkers(arena, m);
         }
 
         // Allow local multimodal reads from:
@@ -2585,7 +2713,11 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    try std.testing.expectError(error.ProviderDoesNotSupportVision, agent.buildProviderMessages(arena));
+    const text_model_messages = try agent.buildProviderMessages(arena);
+    try std.testing.expectEqual(@as(usize, 1), text_model_messages.len);
+    try std.testing.expect(text_model_messages[0].content_parts == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "[IMAGE:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "omitted because the current model does not support vision") != null);
 
     agent.model_name = "vision-model";
     const messages = try agent.buildProviderMessages(arena);
@@ -3230,6 +3362,8 @@ test "slash /new clears history" {
         .content = try allocator.dupe(u8, "hello"),
     });
     agent.has_system_prompt = true;
+    agent.total_tokens = 42;
+    agent.last_turn_usage = .{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 15 };
 
     const response = (try agent.handleSlashCommand("/new")).?;
     defer allocator.free(response);
@@ -3237,6 +3371,8 @@ test "slash /new clears history" {
     try std.testing.expectEqualStrings("Session cleared.", response);
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
+    try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
 }
 
 test "slash /reset clears history and switches model" {
@@ -4079,6 +4215,8 @@ test "slash /restart clears runtime command settings" {
     defer allocator.free(usage_resp);
     const tts_resp = (try agent.handleSlashCommand("/tts always provider test-provider")).?;
     defer allocator.free(tts_resp);
+    agent.total_tokens = 42;
+    agent.last_turn_usage = .{ .prompt_tokens = 7, .completion_tokens = 5, .total_tokens = 12 };
 
     const response = (try agent.handleSlashCommand("/restart")).?;
     defer allocator.free(response);
@@ -4089,6 +4227,8 @@ test "slash /restart clears runtime command settings" {
     try std.testing.expect(agent.usage_mode == .off);
     try std.testing.expect(agent.tts_mode == .off);
     try std.testing.expect(agent.tts_provider == null);
+    try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
+    try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
 }
 
 test "turn includes reasoning and usage footer when enabled" {
@@ -5063,6 +5203,153 @@ test "Agent tool loop frees dynamic tool outputs" {
 
     try std.testing.expectEqualStrings("done", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "Agent shell failure with normalized output does not poison next turn" {
+    const ShellFailureProvider = struct {
+        const Self = @This();
+
+        call_count: usize = 0,
+        saw_tool_results: bool = false,
+        saw_error_tool_result: bool = false,
+        saw_valid_utf8_tool_results: bool = false,
+        saw_non_empty_error_tool_result: bool = false,
+
+        fn failingShellCommand() []const u8 {
+            return if (comptime builtin.os.tag == .windows)
+                "powershell.exe -NoProfile -Command \"[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4)\" & exit /b 1"
+            else
+                "printf '\\200' >&2; exit 1";
+        }
+
+        fn captureToolResultMessage(self: *Self, messages: []const ChatMessage) void {
+            const start_marker = "<tool_result name=\"shell\" status=\"error\">";
+            const end_marker = "</tool_result>";
+
+            for (messages) |msg| {
+                if (msg.role != .user) continue;
+                if (std.mem.indexOf(u8, msg.content, "[Tool results]") == null) continue;
+
+                self.saw_tool_results = true;
+                self.saw_error_tool_result = std.mem.indexOf(u8, msg.content, "<tool_result name=\"shell\" status=\"error\">") != null;
+                self.saw_valid_utf8_tool_results = std.unicode.utf8ValidateSlice(msg.content);
+                if (std.mem.indexOf(u8, msg.content, start_marker)) |start_idx| {
+                    const body_start = start_idx + start_marker.len;
+                    if (std.mem.indexOf(u8, msg.content[body_start..], end_marker)) |end_rel| {
+                        const body = std.mem.trim(u8, msg.content[body_start .. body_start + end_rel], " \t\r\n");
+                        self.saw_non_empty_error_tool_result = body.len > 0;
+                    }
+                }
+                break;
+            }
+        }
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-shell-1"),
+                    .name = try allocator.dupe(u8, "shell"),
+                    .arguments = try std.fmt.allocPrint(allocator, "{{\"command\":{f}}}", .{
+                        std.json.fmt(failingShellCommand(), .{}),
+                    }),
+                };
+
+                return .{
+                    .content = try allocator.dupe(u8, "Run shell"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            self.captureToolResultMessage(request.messages);
+            return .{
+                .content = try allocator.dupe(u8, "recovered"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "shell-failure-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = ShellFailureProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ShellFailureProvider.chatWithSystem,
+        .chat = ShellFailureProvider.chat,
+        .supportsNativeTools = ShellFailureProvider.supportsNativeTools,
+        .getName = ShellFailureProvider.getName,
+        .deinit = ShellFailureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var shell_tool_impl = tools_mod.shell.ShellTool{ .workspace_dir = "." };
+    const tool_list = [_]Tool{shell_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run failing shell");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_tool_results);
+    try std.testing.expect(provider_state.saw_error_tool_result);
+    try std.testing.expect(provider_state.saw_valid_utf8_tool_results);
+    try std.testing.expect(provider_state.saw_non_empty_error_tool_result);
+
+    for (agent.history.items) |msg| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(msg.content));
+    }
 }
 
 test "Agent streaming fields can be set" {

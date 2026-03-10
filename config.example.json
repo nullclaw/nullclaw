@@ -6,6 +6,10 @@
       "openrouter": {
         "api_key": "YOUR_OPENROUTER_API_KEY"
       },
+      "azure": {
+        "api_key": "YOUR_AZURE_OPENAI_API_KEY",
+        "base_url": "https://your-resource.openai.azure.com"
+      },
       "vertex": {
         "api_key": {
           "type": "service_account",

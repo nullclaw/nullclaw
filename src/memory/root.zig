@@ -163,6 +163,8 @@ pub const SessionStore = struct {
         loadMessages: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]MessageEntry,
         clearMessages: *const fn (ptr: *anyopaque, session_id: []const u8) anyerror!void,
         clearAutoSaved: *const fn (ptr: *anyopaque, session_id: ?[]const u8) anyerror!void,
+        saveUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void = null,
+        loadUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!?u64 = null,
     };
 
     pub fn saveMessage(self: SessionStore, session_id: []const u8, role: []const u8, content: []const u8) !void {
@@ -179,6 +181,16 @@ pub const SessionStore = struct {
 
     pub fn clearAutoSaved(self: SessionStore, session_id: ?[]const u8) !void {
         return self.vtable.clearAutoSaved(self.ptr, session_id);
+    }
+
+    pub fn saveUsage(self: SessionStore, session_id: []const u8, total_tokens: u64) !void {
+        const func = self.vtable.saveUsage orelse return error.NotSupported;
+        return func(self.ptr, session_id, total_tokens);
+    }
+
+    pub fn loadUsage(self: SessionStore, session_id: []const u8) !?u64 {
+        const func = self.vtable.loadUsage orelse return null;
+        return func(self.ptr, session_id);
     }
 };
 
@@ -1338,12 +1350,21 @@ test "SessionStore delegates through vtable" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.call_count += 1;
         }
+        fn implSaveUsage(ptr: *anyopaque, _: []const u8, _: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+        }
+        fn implLoadUsage(_: *anyopaque, _: []const u8) anyerror!?u64 {
+            return 42;
+        }
 
         const sess_vtable = SessionStore.VTable{
             .saveMessage = &implSaveMessage,
             .loadMessages = &implLoadMessages,
             .clearMessages = &implClearMessages,
             .clearAutoSaved = &implClearAutoSaved,
+            .saveUsage = &implSaveUsage,
+            .loadUsage = &implLoadUsage,
         };
     };
 
@@ -1362,6 +1383,12 @@ test "SessionStore delegates through vtable" {
 
     try store.clearAutoSaved(null);
     try std.testing.expectEqual(@as(usize, 3), mock.call_count);
+
+    try store.saveUsage("s1", 7);
+    try std.testing.expectEqual(@as(usize, 4), mock.call_count);
+
+    const usage = try store.loadUsage("s1");
+    try std.testing.expectEqual(@as(?u64, 42), usage);
 }
 
 test "freeMessages frees all entries" {
