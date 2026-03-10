@@ -2640,7 +2640,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
-                    mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
+                    mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, cfg.subagent);
                     mgr.task_runner = subagent_runner.runTaskWithTools;
                     subagent_manager_opt = mgr;
                 }

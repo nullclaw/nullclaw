@@ -96,18 +96,9 @@ pub const EmailChannel = struct {
             }
         }
 
-        // Build HTML version of body (escape HTML entities, convert newlines to <br>)
-        var html_body: std.ArrayListUnmanaged(u8) = .empty;
-        defer html_body.deinit(self.allocator);
-        for (body) |c| {
-            switch (c) {
-                '&' => html_body.appendSlice(self.allocator, "&amp;") catch return error.SmtpError,
-                '<' => html_body.appendSlice(self.allocator, "&lt;") catch return error.SmtpError,
-                '>' => html_body.appendSlice(self.allocator, "&gt;") catch return error.SmtpError,
-                '\n' => html_body.appendSlice(self.allocator, "<br>\r\n") catch return error.SmtpError,
-                else => html_body.append(self.allocator, c) catch return error.SmtpError,
-            }
-        }
+        // Convert markdown body to email-safe HTML with inline styles
+        const html_body_owned = markdownToEmailHtml(self.allocator, body) catch return error.SmtpError;
+        defer self.allocator.free(html_body_owned);
 
         const boundary = "----=_nullclaw_boundary_001";
 
@@ -143,7 +134,17 @@ pub const EmailChannel = struct {
         try ew.writeAll("Content-Type: text/html; charset=utf-8\r\n");
         try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
         try ew.writeAll("\r\n");
-        try ew.writeAll(html_body.items);
+        try ew.writeAll("<div style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;line-height:1.6;color:#333;\">");
+        try ew.writeAll(html_body_owned);
+        try ew.writeAll("</div>");
+
+        // Append HTML signature if configured
+        const sig_html = self.loadSignature();
+        defer if (sig_html) |s| self.allocator.free(s);
+        if (sig_html) |sig| {
+            try ew.writeAll("\r\n");
+            try ew.writeAll(sig);
+        }
         try ew.writeAll("\r\n");
 
         // End boundary
@@ -251,6 +252,15 @@ pub const EmailChannel = struct {
         }
     }
 
+    /// Load HTML signature from the configured signature_file path.
+    /// Returns null if no file is configured or if reading fails.
+    fn loadSignature(self: *EmailChannel) ?[]u8 {
+        if (self.config.signature_file.len == 0) return null;
+        const file = std.fs.cwd().openFile(self.config.signature_file, .{}) catch return null;
+        defer file.close();
+        return file.readToEndAlloc(self.allocator, 64 * 1024) catch null;
+    }
+
     /// Send a reply email — applies Re: prefix to subject and includes threading headers.
     pub fn sendReply(self: *EmailChannel, recipient: []const u8, original_subject: []const u8, message: []const u8) !void {
         var buf: [16384]u8 = undefined;
@@ -353,8 +363,8 @@ pub const EmailChannel = struct {
         }) catch return error.ImapError;
         const base_url = url_fbs.getWritten();
 
-        // SEARCH UNSEEN
-        const search_result = try self.imapCurl(allocator, base_url, "SEARCH UNSEEN");
+        // UID SEARCH returns actual UIDs (not sequence numbers) so they work with ;UID= fetch
+        const search_result = try self.imapCurl(allocator, base_url, "UID SEARCH UNSEEN");
         defer allocator.free(search_result);
 
         // Parse UIDs from "* SEARCH 1 2 3\r\n" response
@@ -376,7 +386,10 @@ pub const EmailChannel = struct {
                     // Validate it's numeric
                     var is_num = true;
                     for (clean) |c| {
-                        if (!std.ascii.isDigit(c)) { is_num = false; break; }
+                        if (!std.ascii.isDigit(c)) {
+                            is_num = false;
+                            break;
+                        }
                     }
                     if (is_num) {
                         try uids.append(allocator, try allocator.dupe(u8, clean));
@@ -449,13 +462,50 @@ pub const EmailChannel = struct {
                 continue;
             }
 
+            // Extract and save attachments (if enabled)
+            var saved_attachments: []root.Attachment = &.{};
+            if (self.config.attachment_save_enabled) {
+                saved_attachments = extractAndSaveAttachments(
+                    allocator,
+                    raw_email,
+                    self.config.attachment_save_dir,
+                    self.config.attachment_extensions,
+                    self.config.attachment_max_bytes,
+                    uid,
+                ) catch &.{};
+            }
+
+            // Build attachment info text for LLM context
+            var attachment_info: []u8 = &.{};
+            defer if (attachment_info.len > 0) allocator.free(attachment_info);
+
+            if (saved_attachments.len > 0) {
+                var info_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer info_buf.deinit(allocator);
+                const writer = info_buf.writer(allocator);
+                writer.writeAll("\n\n[ATTACHMENTS]\n") catch {};
+                for (saved_attachments) |att| {
+                    writer.print("- {s} (saved to: {s})\n", .{ att.filename, att.path }) catch {};
+                }
+                writer.writeAll("[/ATTACHMENTS]") catch {};
+                attachment_info = info_buf.toOwnedSlice(allocator) catch &.{};
+            }
+
             // Wrap in untrusted markers
-            const wrapped = std.fmt.allocPrint(allocator, "[UNTRUSTED_EMAIL_START]\nFrom: {s}\nSubject: {s}\n\n{s}\n[UNTRUSTED_EMAIL_END]", .{
-                sender_addr, parsed.subject, final_content,
-            }) catch {
-                allocator.free(final_content);
-                continue;
-            };
+            const wrapped = if (attachment_info.len > 0)
+                std.fmt.allocPrint(allocator, "[UNTRUSTED_EMAIL_START]\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n[UNTRUSTED_EMAIL_END]", .{
+                    sender_addr, parsed.subject, final_content, attachment_info,
+                }) catch {
+                    allocator.free(final_content);
+                    continue;
+                }
+            else
+                std.fmt.allocPrint(allocator, "[UNTRUSTED_EMAIL_START]\nFrom: {s}\nSubject: {s}\n\n{s}\n[UNTRUSTED_EMAIL_END]", .{
+                    sender_addr, parsed.subject, final_content,
+                }) catch {
+                    allocator.free(final_content);
+                    continue;
+                };
             allocator.free(final_content);
 
             // Track Message-ID for threading
@@ -471,6 +521,7 @@ pub const EmailChannel = struct {
                 .channel = "email",
                 .timestamp = root.nowEpochSecs(),
                 .reply_target = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sender_addr, parsed.subject }) catch null,
+                .attachments = saved_attachments,
             });
 
             // Mark seen
@@ -486,7 +537,7 @@ pub const EmailChannel = struct {
     fn imapStoreSeen(self: *EmailChannel, allocator: std.mem.Allocator, base_url: []const u8, uid: []const u8) void {
         var cmd_buf: [128]u8 = undefined;
         var cmd_fbs = std.io.fixedBufferStream(&cmd_buf);
-        cmd_fbs.writer().print("STORE {s} +FLAGS (\\Seen)", .{uid}) catch return;
+        cmd_fbs.writer().print("UID STORE {s} +FLAGS (\\Seen)", .{uid}) catch return;
         const cmd = cmd_fbs.getWritten();
         const result = self.imapCurl(allocator, base_url, cmd) catch return;
         allocator.free(result);
@@ -784,6 +835,219 @@ pub fn extractTextBody(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return allocator.dupe(u8, body);
 }
 
+/// Extract MIME boundary from a Content-Type header value.
+/// E.g. "multipart/mixed; boundary=\"----=_Part_123\"" → "----=_Part_123"
+pub fn extractMimeBoundary(raw: []const u8) ?[]const u8 {
+    // Find Content-Type header in the raw email headers
+    const header_end = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |pos|
+        pos
+    else if (std.mem.indexOf(u8, raw, "\n\n")) |pos|
+        pos
+    else
+        return null;
+
+    const headers = raw[0..header_end];
+    // Case-insensitive search for "content-type:" containing "multipart"
+    var lines_iter = std.mem.splitSequence(u8, headers, "\n");
+    while (lines_iter.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (std.ascii.startsWithIgnoreCase(trimmed, "Content-Type:")) {
+            const ct_value = trimmed["Content-Type:".len..];
+            if (std.ascii.indexOfIgnoreCase(ct_value, "multipart") == null) return null;
+            // Find boundary=
+            if (std.ascii.indexOfIgnoreCase(ct_value, "boundary=")) |bpos| {
+                var bval = ct_value[bpos + "boundary=".len ..];
+                bval = std.mem.trim(u8, bval, " \t");
+                if (bval.len > 0 and bval[0] == '"') {
+                    bval = bval[1..];
+                    if (std.mem.indexOf(u8, bval, "\"")) |end| {
+                        return bval[0..end];
+                    }
+                } else {
+                    // Unquoted — ends at whitespace or semicolon
+                    var end: usize = 0;
+                    while (end < bval.len and bval[end] != ';' and bval[end] != ' ' and bval[end] != '\t' and bval[end] != '\r' and bval[end] != '\n') {
+                        end += 1;
+                    }
+                    if (end > 0) return bval[0..end];
+                }
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Check if a filename has an allowed extension.
+pub fn hasAllowedExtension(filename: []const u8, allowed: []const []const u8) bool {
+    // Find last dot
+    var dot_pos: ?usize = null;
+    var i: usize = filename.len;
+    while (i > 0) {
+        i -= 1;
+        if (filename[i] == '.') {
+            dot_pos = i;
+            break;
+        }
+    }
+    const ext_start = dot_pos orelse return false;
+    const ext = filename[ext_start..];
+    for (allowed) |allowed_ext| {
+        if (std.ascii.eqlIgnoreCase(ext, allowed_ext)) return true;
+    }
+    return false;
+}
+
+/// Extract filename from a Content-Disposition header value.
+/// E.g. "attachment; filename=\"report.pdf\"" → "report.pdf"
+fn extractAttachmentFilename(header_value: []const u8) ?[]const u8 {
+    // Must start with "attachment"
+    if (std.ascii.indexOfIgnoreCase(header_value, "attachment") == null) return null;
+    // Find filename=
+    if (std.ascii.indexOfIgnoreCase(header_value, "filename=")) |fpos| {
+        var fval = header_value[fpos + "filename=".len ..];
+        fval = std.mem.trim(u8, fval, " \t");
+        if (fval.len > 0 and fval[0] == '"') {
+            fval = fval[1..];
+            if (std.mem.indexOf(u8, fval, "\"")) |end| {
+                return fval[0..end];
+            }
+        } else {
+            var end: usize = 0;
+            while (end < fval.len and fval[end] != ';' and fval[end] != ' ' and fval[end] != '\t' and fval[end] != '\r' and fval[end] != '\n') {
+                end += 1;
+            }
+            if (end > 0) return fval[0..end];
+        }
+    }
+    return null;
+}
+
+/// Parse MIME parts and extract attachments with allowed extensions.
+/// Saves files to save_dir. Returns list of saved Attachment structs.
+pub fn extractAndSaveAttachments(
+    allocator: std.mem.Allocator,
+    raw_email: []const u8,
+    save_dir: []const u8,
+    allowed_extensions: []const []const u8,
+    max_bytes: u64,
+    uid: []const u8,
+) ![]root.Attachment {
+    const boundary = extractMimeBoundary(raw_email) orelse return allocator.alloc(root.Attachment, 0);
+
+    // Build the delimiter: "--" + boundary
+    var delim_buf: [256]u8 = undefined;
+    var delim_fbs = std.io.fixedBufferStream(&delim_buf);
+    delim_fbs.writer().print("--{s}", .{boundary}) catch return allocator.alloc(root.Attachment, 0);
+    const delimiter = delim_fbs.getWritten();
+
+    var attachments: std.ArrayListUnmanaged(root.Attachment) = .empty;
+    errdefer {
+        for (attachments.items) |att| att.deinit(allocator);
+        attachments.deinit(allocator);
+    }
+
+    // Split by boundary
+    var parts = std.mem.splitSequence(u8, raw_email, delimiter);
+    _ = parts.next(); // preamble — skip
+
+    while (parts.next()) |part| {
+        // Skip closing boundary marker
+        if (part.len >= 2 and std.mem.startsWith(u8, part, "--")) continue;
+
+        // Find header/body separator within this part
+        const part_body_start = if (std.mem.indexOf(u8, part, "\r\n\r\n")) |pos|
+            pos + 4
+        else if (std.mem.indexOf(u8, part, "\n\n")) |pos|
+            pos + 2
+        else
+            continue;
+
+        const part_headers = part[0..part_body_start];
+        const part_body = std.mem.trimRight(u8, part[part_body_start..], " \t\r\n");
+
+        // Look for Content-Disposition: attachment; filename="..."
+        var filename: ?[]const u8 = null;
+        var is_base64 = false;
+
+        var hdr_lines = std.mem.splitSequence(u8, part_headers, "\n");
+        while (hdr_lines.next()) |hline| {
+            const htrimmed = std.mem.trimRight(u8, hline, "\r");
+            if (std.ascii.startsWithIgnoreCase(htrimmed, "Content-Disposition:")) {
+                filename = extractAttachmentFilename(htrimmed["Content-Disposition:".len..]);
+            } else if (std.ascii.startsWithIgnoreCase(htrimmed, "Content-Transfer-Encoding:")) {
+                const enc = std.mem.trim(u8, htrimmed["Content-Transfer-Encoding:".len..], " \t");
+                if (std.ascii.eqlIgnoreCase(enc, "base64")) is_base64 = true;
+            }
+        }
+
+        const fname = filename orelse continue;
+        if (!hasAllowedExtension(fname, allowed_extensions)) continue;
+
+        // Decode body
+        var decoded: []u8 = undefined;
+        if (is_base64) {
+            // Strip whitespace from base64 payload
+            var clean: std.ArrayListUnmanaged(u8) = .empty;
+            defer clean.deinit(allocator);
+            for (part_body) |c| {
+                if (c != '\r' and c != '\n' and c != ' ' and c != '\t') {
+                    try clean.append(allocator, c);
+                }
+            }
+            const out_size = std.base64.standard.Decoder.calcSizeForSlice(clean.items) catch continue;
+            if (out_size > max_bytes) {
+                log.warn("Attachment {s} exceeds max size ({d} > {d}), skipping", .{ fname, out_size, max_bytes });
+                continue;
+            }
+            decoded = try allocator.alloc(u8, out_size);
+            std.base64.standard.Decoder.decode(decoded, clean.items) catch {
+                allocator.free(decoded);
+                continue;
+            };
+        } else {
+            if (part_body.len > max_bytes) {
+                log.warn("Attachment {s} exceeds max size, skipping", .{fname});
+                continue;
+            }
+            decoded = try allocator.dupe(u8, part_body);
+        }
+        defer allocator.free(decoded);
+
+        // Ensure save directory exists
+        std.fs.cwd().makePath(save_dir) catch |err| {
+            log.warn("Failed to create attachment dir {s}: {}", .{ save_dir, err });
+            continue;
+        };
+
+        // Build unique filename: uid_originalname
+        var path_buf: [512]u8 = undefined;
+        var path_fbs = std.io.fixedBufferStream(&path_buf);
+        path_fbs.writer().print("{s}/{s}_{s}", .{ save_dir, uid, fname }) catch continue;
+        const file_path = path_fbs.getWritten();
+
+        // Write file
+        const file = std.fs.cwd().createFile(file_path, .{}) catch |err| {
+            log.warn("Failed to save attachment {s}: {}", .{ file_path, err });
+            continue;
+        };
+        defer file.close();
+        file.writeAll(decoded) catch |err| {
+            log.warn("Failed to write attachment {s}: {}", .{ file_path, err });
+            continue;
+        };
+
+        log.info("Saved attachment: {s} ({d} bytes)", .{ file_path, decoded.len });
+
+        try attachments.append(allocator, .{
+            .path = try allocator.dupe(u8, file_path),
+            .filename = try allocator.dupe(u8, fname),
+        });
+    }
+
+    return attachments.toOwnedSlice(allocator);
+}
+
 /// Basic injection pattern check. Returns true if suspicious.
 pub fn basicInjectionCheck(content: []const u8) bool {
     const patterns = [_][]const u8{
@@ -838,6 +1102,329 @@ fn hexDigit(c: u8) ?u8 {
     if (c >= 'A' and c <= 'F') return c - 'A' + 10;
     if (c >= 'a' and c <= 'f') return c - 'a' + 10;
     return null;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Markdown → Email HTML
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Convert markdown text to email-safe HTML with inline styles.
+/// Caller owns returned slice and must free with the same allocator.
+fn markdownToEmailHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var i: usize = 0;
+    var line_start = true;
+    var in_ul = false; // track whether we're inside a <ul>
+
+    while (i < md.len) {
+        // ── Close <ul> if we're in one and this line is not a bullet ──
+        if (line_start and in_ul) {
+            const is_bullet = (i + 1 < md.len and md[i] == '-' and md[i + 1] == ' ');
+            const is_star_bullet = (i + 1 < md.len and md[i] == '*' and md[i + 1] == ' ' and
+                !(i + 2 < md.len and md[i + 1] == '*'));
+            if (!is_bullet and !is_star_bullet) {
+                try buf.appendSlice(allocator, "</ul>");
+                in_ul = false;
+            }
+        }
+
+        // ── Code blocks ``` ... ``` ──
+        if (i + 2 < md.len and md[i] == '`' and md[i + 1] == '`' and md[i + 2] == '`') {
+            const content_start = if (i + 3 < md.len and md[i + 3] == '\n') i + 4 else i + 3;
+            const lang_end = std.mem.indexOfScalarPos(u8, md, i + 3, '\n') orelse md.len;
+            const actual_start = if (lang_end < md.len) lang_end + 1 else content_start;
+
+            const close = emailFindTripleBacktick(md, actual_start);
+            if (close) |end| {
+                try buf.appendSlice(allocator, "<pre style=\"background:#f4f4f4;padding:12px;border-radius:6px;font-family:monospace;font-size:0.9em;overflow-x:auto;\">");
+                try emailAppendHtmlEscaped(&buf, allocator, md[actual_start..end]);
+                try buf.appendSlice(allocator, "</pre>");
+                i = end + 3;
+                if (i < md.len and md[i] == '\n') i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Inline code `...` ──
+        if (md[i] == '`') {
+            const close = std.mem.indexOfScalarPos(u8, md, i + 1, '`');
+            if (close) |end| {
+                try buf.appendSlice(allocator, "<code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i + 1 .. end]);
+                try buf.appendSlice(allocator, "</code>");
+                i = end + 1;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Headers at line start ──
+        if (line_start and md[i] == '#') {
+            var level: usize = 0;
+            while (i + level < md.len and md[i + level] == '#') level += 1;
+            if (level <= 6 and i + level < md.len and md[i + level] == ' ') {
+                i += level + 1;
+                const end = std.mem.indexOfScalarPos(u8, md, i, '\n') orelse md.len;
+                // Map markdown levels: # → h2, ## → h3, etc.
+                const tag_level = level + 1;
+                const clamped = if (tag_level > 6) @as(u8, 6) else @as(u8, @intCast(tag_level));
+                try buf.appendSlice(allocator, "<h");
+                try buf.append(allocator, '0' + clamped);
+                try buf.appendSlice(allocator, " style=\"margin:0.5em 0;color:#1a1a1a;\">");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i..end]);
+                try buf.appendSlice(allocator, "</h");
+                try buf.append(allocator, '0' + clamped);
+                try buf.appendSlice(allocator, ">");
+                i = end;
+                if (i < md.len) i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Bullet lists at line start (- item or * item) ──
+        if (line_start) {
+            const is_dash_bullet = (i + 1 < md.len and md[i] == '-' and md[i + 1] == ' ');
+            const is_star_bullet = (i + 1 < md.len and md[i] == '*' and md[i + 1] == ' ' and
+                !(i + 2 < md.len and md[i + 1] == '*'));
+            if (is_dash_bullet or is_star_bullet) {
+                if (!in_ul) {
+                    try buf.appendSlice(allocator, "<ul style=\"margin:0.5em 0;padding-left:1.5em;\">");
+                    in_ul = true;
+                }
+                i += 2;
+                const end = std.mem.indexOfScalarPos(u8, md, i, '\n') orelse md.len;
+                try buf.appendSlice(allocator, "<li style=\"margin:2px 0;\">");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i..end]);
+                try buf.appendSlice(allocator, "</li>");
+                i = end;
+                if (i < md.len) i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Tables (| col | col | ... ) ──
+        if (line_start and md[i] == '|') {
+            // Collect all contiguous table lines (lines starting with |)
+            const table_start = i;
+            var table_end = i;
+            var line_count: usize = 0;
+            {
+                var scan = table_start;
+                while (scan < md.len) {
+                    // Each iteration: scan is at the start of a line
+                    if (md[scan] != '|') break;
+                    // Find end of this line
+                    const eol = std.mem.indexOfScalarPos(u8, md, scan, '\n') orelse md.len;
+                    line_count += 1;
+                    table_end = eol;
+                    if (eol >= md.len) break;
+                    scan = eol + 1;
+                }
+            }
+            // Need at least 2 lines (header + separator) for a valid table
+            if (line_count >= 2) {
+                // Close any open <ul>
+                if (in_ul) {
+                    try buf.appendSlice(allocator, "</ul>");
+                    in_ul = false;
+                }
+                try buf.appendSlice(allocator, "<table style=\"border-collapse:collapse;margin:0.5em 0;width:100%;\">");
+                var row: usize = 0;
+                var pos = table_start;
+                while (pos < table_end) {
+                    const eol = std.mem.indexOfScalarPos(u8, md, pos, '\n') orelse table_end;
+                    const line = md[pos..eol];
+
+                    // Skip separator row (| --- | --- |)
+                    if (isTableSeparator(line)) {
+                        pos = if (eol < md.len) eol + 1 else eol;
+                        row += 1;
+                        continue;
+                    }
+
+                    const is_header = (row == 0);
+                    try buf.appendSlice(allocator, "<tr>");
+
+                    // Parse cells between pipes
+                    var ci: usize = 0;
+                    if (ci < line.len and line[ci] == '|') ci += 1; // skip leading |
+                    while (ci < line.len) {
+                        const next_pipe = std.mem.indexOfScalarPos(u8, line, ci, '|') orelse line.len;
+                        const cell = std.mem.trim(u8, line[ci..next_pipe], " \t");
+                        if (is_header) {
+                            try buf.appendSlice(allocator, "<th style=\"border:1px solid #ddd;padding:8px 12px;background:#f8f8f8;text-align:left;font-weight:600;\">");
+                        } else {
+                            try buf.appendSlice(allocator, "<td style=\"border:1px solid #ddd;padding:8px 12px;\">");
+                        }
+                        try emailAppendHtmlEscaped(&buf, allocator, cell);
+                        if (is_header) {
+                            try buf.appendSlice(allocator, "</th>");
+                        } else {
+                            try buf.appendSlice(allocator, "</td>");
+                        }
+                        if (next_pipe >= line.len) break;
+                        ci = next_pipe + 1;
+                        // Skip trailing pipe at end of line
+                        if (ci < line.len and std.mem.indexOfScalarPos(u8, line, ci, '|') == null) {
+                            const remaining = std.mem.trim(u8, line[ci..], " \t");
+                            if (remaining.len == 0) break;
+                        }
+                    }
+                    try buf.appendSlice(allocator, "</tr>");
+                    pos = if (eol < md.len) eol + 1 else eol;
+                    row += 1;
+                }
+                try buf.appendSlice(allocator, "</table>");
+                i = table_end;
+                if (i < md.len and md[i] == '\n') i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Strikethrough ~~text~~ ──
+        if (i + 1 < md.len and md[i] == '~' and md[i + 1] == '~') {
+            const close = std.mem.indexOf(u8, md[i + 2 ..], "~~");
+            if (close) |offset| {
+                try buf.appendSlice(allocator, "<s>");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</s>");
+                i = i + 2 + offset + 2;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Bold **text** ──
+        if (i + 1 < md.len and md[i] == '*' and md[i + 1] == '*') {
+            const close = std.mem.indexOf(u8, md[i + 2 ..], "**");
+            if (close) |offset| {
+                try buf.appendSlice(allocator, "<strong>");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</strong>");
+                i = i + 2 + offset + 2;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Links [text](url) ──
+        if (md[i] == '[') {
+            const close_bracket = std.mem.indexOfScalarPos(u8, md, i + 1, ']');
+            if (close_bracket) |cb| {
+                if (cb + 1 < md.len and md[cb + 1] == '(') {
+                    const close_paren = std.mem.indexOfScalarPos(u8, md, cb + 2, ')');
+                    if (close_paren) |cp| {
+                        const text = md[i + 1 .. cb];
+                        const href = md[cb + 2 .. cp];
+                        try buf.appendSlice(allocator, "<a href=\"");
+                        try emailAppendHtmlEscaped(&buf, allocator, href);
+                        try buf.appendSlice(allocator, "\" style=\"color:#0066cc;\">");
+                        try emailAppendHtmlEscaped(&buf, allocator, text);
+                        try buf.appendSlice(allocator, "</a>");
+                        i = cp + 1;
+                        line_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Italic _text_ (not __text__) ──
+        if (md[i] == '_' and !(i + 1 < md.len and md[i + 1] == '_')) {
+            const prev_ok = (i == 0 or md[i - 1] == ' ' or md[i - 1] == '\n' or md[i - 1] == '(');
+            if (prev_ok) {
+                const close = std.mem.indexOfScalarPos(u8, md, i + 1, '_');
+                if (close) |end| {
+                    const next_ok = (end + 1 >= md.len or md[end + 1] == ' ' or md[end + 1] == '\n' or md[end + 1] == ',' or md[end + 1] == '.' or md[end + 1] == ')');
+                    if (next_ok and end > i + 1) {
+                        try buf.appendSlice(allocator, "<em>");
+                        try emailAppendHtmlEscaped(&buf, allocator, md[i + 1 .. end]);
+                        try buf.appendSlice(allocator, "</em>");
+                        i = end + 1;
+                        line_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Paragraph breaks (empty lines) ──
+        if (md[i] == '\n') {
+            if (i + 1 < md.len and md[i + 1] == '\n') {
+                // Close any open <ul> before paragraph break
+                if (in_ul) {
+                    try buf.appendSlice(allocator, "</ul>");
+                    in_ul = false;
+                }
+                try buf.appendSlice(allocator, "<p>");
+                // Skip consecutive newlines
+                while (i < md.len and md[i] == '\n') i += 1;
+                line_start = true;
+                continue;
+            }
+            try buf.append(allocator, '\n');
+            line_start = true;
+            i += 1;
+            continue;
+        }
+
+        // ── Regular character ──
+        switch (md[i]) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            else => try buf.append(allocator, md[i]),
+        }
+        line_start = false;
+        i += 1;
+    }
+
+    // Close any trailing open <ul>
+    if (in_ul) {
+        try buf.appendSlice(allocator, "</ul>");
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn isTableSeparator(line: []const u8) bool {
+    // A separator row contains only |, -, :, and whitespace
+    var has_dash = false;
+    for (line) |c| {
+        switch (c) {
+            '|', ' ', '\t', ':' => {},
+            '-' => has_dash = true,
+            else => return false,
+        }
+    }
+    return has_dash;
+}
+
+fn emailFindTripleBacktick(md: []const u8, from: usize) ?usize {
+    var pos = from;
+    while (pos + 2 < md.len) {
+        if (md[pos] == '`' and md[pos + 1] == '`' and md[pos + 2] == '`') return pos;
+        pos += 1;
+    }
+    return null;
+}
+
+fn emailAppendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            '"' => try buf.appendSlice(allocator, "&quot;"),
+            else => try buf.append(allocator, c),
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1319,4 +1906,229 @@ test "pollMessages method exists" {
 test "imapCurl method exists" {
     const info = @typeInfo(@TypeOf(EmailChannel.imapCurl));
     try std.testing.expect(info == .@"fn");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Attachment Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "extractMimeBoundary finds quoted boundary" {
+    const raw = "Content-Type: multipart/mixed; boundary=\"----=_Part_123\"\r\n\r\nBody";
+    const boundary = extractMimeBoundary(raw);
+    try std.testing.expect(boundary != null);
+    try std.testing.expectEqualStrings("----=_Part_123", boundary.?);
+}
+
+test "extractMimeBoundary finds unquoted boundary" {
+    const raw = "Content-Type: multipart/mixed; boundary=simpleboundary\r\n\r\nBody";
+    const boundary = extractMimeBoundary(raw);
+    try std.testing.expect(boundary != null);
+    try std.testing.expectEqualStrings("simpleboundary", boundary.?);
+}
+
+test "extractMimeBoundary returns null for non-multipart" {
+    const raw = "Content-Type: text/plain\r\n\r\nBody";
+    try std.testing.expect(extractMimeBoundary(raw) == null);
+}
+
+test "extractMimeBoundary returns null for no content-type" {
+    const raw = "From: test@test.com\r\n\r\nBody";
+    try std.testing.expect(extractMimeBoundary(raw) == null);
+}
+
+test "hasAllowedExtension matches pdf" {
+    const allowed = [_][]const u8{ ".pdf", ".docx" };
+    try std.testing.expect(hasAllowedExtension("report.pdf", &allowed));
+    try std.testing.expect(hasAllowedExtension("REPORT.PDF", &allowed));
+}
+
+test "hasAllowedExtension matches docx" {
+    const allowed = [_][]const u8{ ".pdf", ".docx" };
+    try std.testing.expect(hasAllowedExtension("document.docx", &allowed));
+}
+
+test "hasAllowedExtension rejects disallowed" {
+    const allowed = [_][]const u8{ ".pdf", ".docx" };
+    try std.testing.expect(!hasAllowedExtension("script.exe", &allowed));
+    try std.testing.expect(!hasAllowedExtension("image.png", &allowed));
+    try std.testing.expect(!hasAllowedExtension("noextension", &allowed));
+}
+
+test "hasAllowedExtension rejects empty filename" {
+    const allowed = [_][]const u8{".pdf"};
+    try std.testing.expect(!hasAllowedExtension("", &allowed));
+}
+
+test "extractAttachmentFilename quoted" {
+    const fname = extractAttachmentFilename(" attachment; filename=\"report.pdf\"");
+    try std.testing.expect(fname != null);
+    try std.testing.expectEqualStrings("report.pdf", fname.?);
+}
+
+test "extractAttachmentFilename unquoted" {
+    const fname = extractAttachmentFilename("attachment; filename=report.pdf");
+    try std.testing.expect(fname != null);
+    try std.testing.expectEqualStrings("report.pdf", fname.?);
+}
+
+test "extractAttachmentFilename returns null for inline" {
+    try std.testing.expect(extractAttachmentFilename("inline; filename=\"img.png\"") == null);
+}
+
+test "extractAttachmentFilename returns null for no filename" {
+    try std.testing.expect(extractAttachmentFilename("attachment") == null);
+}
+
+test "attachment config defaults" {
+    const config = config_types.EmailConfig{};
+    try std.testing.expect(!config.attachment_save_enabled);
+    try std.testing.expectEqualStrings("workspace/docs", config.attachment_save_dir);
+    try std.testing.expectEqual(@as(usize, 2), config.attachment_extensions.len);
+    try std.testing.expectEqualStrings(".pdf", config.attachment_extensions[0]);
+    try std.testing.expectEqualStrings(".docx", config.attachment_extensions[1]);
+    try std.testing.expectEqual(@as(u64, 20 * 1024 * 1024), config.attachment_max_bytes);
+}
+
+test "extractAndSaveAttachments returns empty for non-multipart" {
+    const allocator = std.testing.allocator;
+    const raw = "Content-Type: text/plain\r\n\r\nJust text";
+    const allowed = [_][]const u8{".pdf"};
+    const result = try extractAndSaveAttachments(allocator, raw, "/tmp/test-att", &allowed, 1024 * 1024, "1");
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// markdownToEmailHtml tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "markdownToEmailHtml plain text is escaped" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "Hello <world> & friends");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello &lt;world&gt; &amp; friends", result);
+}
+
+test "markdownToEmailHtml headers" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "# Title\n## Subtitle");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<h2 style=\"margin:0.5em 0;color:#1a1a1a;\">Title</h2><h3 style=\"margin:0.5em 0;color:#1a1a1a;\">Subtitle</h3>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml bold and italic" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "This is **bold** and _italic_ text.");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("This is <strong>bold</strong> and <em>italic</em> text.", result);
+}
+
+test "markdownToEmailHtml inline code" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "Use `fmt.Println` here");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "Use <code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">fmt.Println</code> here",
+        result,
+    );
+}
+
+test "markdownToEmailHtml code block" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "```zig\nconst x = 1;\n```");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<pre style=\"background:#f4f4f4;padding:12px;border-radius:6px;font-family:monospace;font-size:0.9em;overflow-x:auto;\">const x = 1;\n</pre>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml bullet list" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "- one\n- two\n- three");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<ul style=\"margin:0.5em 0;padding-left:1.5em;\"><li style=\"margin:2px 0;\">one</li><li style=\"margin:2px 0;\">two</li><li style=\"margin:2px 0;\">three</li></ul>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml links" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "Visit [Google](https://google.com) now");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "Visit <a href=\"https://google.com\" style=\"color:#0066cc;\">Google</a> now",
+        result,
+    );
+}
+
+test "markdownToEmailHtml strikethrough" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "This is ~~wrong~~ right");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("This is <s>wrong</s> right", result);
+}
+
+test "markdownToEmailHtml paragraph breaks" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "First paragraph.\n\nSecond paragraph.");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("First paragraph.<p>Second paragraph.", result);
+}
+
+test "markdownToEmailHtml mixed content" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "# Hello\n\nThis is **bold** with `code`.\n\n- item one\n- item two");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<h2 style=\"margin:0.5em 0;color:#1a1a1a;\">Hello</h2><p>This is <strong>bold</strong> with <code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">code</code>.<p><ul style=\"margin:0.5em 0;padding-left:1.5em;\"><li style=\"margin:2px 0;\">item one</li><li style=\"margin:2px 0;\">item two</li></ul>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml simple table" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "| Name | Age |\n| --- | --- |\n| Alice | 30 |");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<table style=\"border-collapse:collapse;margin:0.5em 0;width:100%;\">" ++
+            "<tr><th style=\"border:1px solid #ddd;padding:8px 12px;background:#f8f8f8;text-align:left;font-weight:600;\">Name</th>" ++
+            "<th style=\"border:1px solid #ddd;padding:8px 12px;background:#f8f8f8;text-align:left;font-weight:600;\">Age</th></tr>" ++
+            "<tr><td style=\"border:1px solid #ddd;padding:8px 12px;\">Alice</td>" ++
+            "<td style=\"border:1px solid #ddd;padding:8px 12px;\">30</td></tr>" ++
+            "</table>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml table with multiple rows" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "| Col1 | Col2 |\n|------|------|\n| A | B |\n| C | D |");
+    defer allocator.free(result);
+    // Verify table structure
+    try std.testing.expect(std.mem.startsWith(u8, result, "<table"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "<th") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Col1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<td") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "</table>") != null);
+    // Should have 3 <tr> (header + 2 data rows)
+    var tr_count: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, result, search, "<tr>")) |pos| {
+        tr_count += 1;
+        search = pos + 4;
+    }
+    try std.testing.expectEqual(@as(usize, 3), tr_count);
+}
+
+test "markdownToEmailHtml isTableSeparator" {
+    try std.testing.expect(isTableSeparator("| --- | --- |"));
+    try std.testing.expect(isTableSeparator("|---|---|"));
+    try std.testing.expect(isTableSeparator("| :---: | ---: |"));
+    try std.testing.expect(!isTableSeparator("| hello | world |"));
+    try std.testing.expect(!isTableSeparator("just text"));
 }

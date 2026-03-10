@@ -865,7 +865,7 @@ pub const CronScheduler = struct {
     }
 };
 
-const AgentRunResult = struct {
+pub const AgentRunResult = struct {
     success: bool,
     output: []const u8,
 };
@@ -988,7 +988,7 @@ fn preferAgentExecPath(self_exe_path: []const u8) []const u8 {
     return self_exe_path;
 }
 
-fn runAgentJob(
+pub fn runAgentJob(
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
     prompt: []const u8,

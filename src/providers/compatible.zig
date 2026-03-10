@@ -182,15 +182,22 @@ pub const OpenAiCompatibleProvider = struct {
         message: []const u8,
         model: []const u8,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":\"");
+        try buf.appendSlice(allocator, model);
+        try buf.appendSlice(allocator, "\",\"input\":[{\"role\":\"user\",\"content\":");
+        try root.appendJsonString(&buf, allocator, message);
+        try buf.appendSlice(allocator, "}]");
+
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"instructions":"{s}","stream":false}}
-            , .{ model, message, sys });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"stream":false}}
-            , .{ model, message });
+            try buf.appendSlice(allocator, ",\"instructions\":");
+            try root.appendJsonString(&buf, allocator, sys);
         }
+
+        try buf.appendSlice(allocator, ",\"stream\":false}");
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Extract text from a Responses API JSON response.
@@ -731,7 +738,6 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror![]const u8 {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
-
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
@@ -832,10 +838,13 @@ pub const OpenAiCompatibleProvider = struct {
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        return parseNativeResponse(allocator, resp_body) catch |err| {
+        const result = parseNativeResponse(allocator, resp_body) catch |err| {
             logCompatibleApiError(allocator, self.name, err, url, resp_body);
             return err;
         };
+
+
+        return result;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {

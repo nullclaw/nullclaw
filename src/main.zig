@@ -1749,7 +1749,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .tracker = &tracker,
     };
 
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
+    var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, config.subagent);
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
@@ -2070,7 +2070,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .tracker = &tracker,
     };
 
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
+    var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, config.subagent);
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 

@@ -852,6 +852,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Subagent
+    if (root.get("subagent")) |sa| {
+        if (sa == .object) {
+            if (sa.object.get("max_iterations")) |v| {
+                if (v == .integer) self.subagent.max_iterations = @intCast(v.integer);
+            }
+            if (sa.object.get("max_concurrent")) |v| {
+                if (v == .integer) self.subagent.max_concurrent = @intCast(v.integer);
+            }
+        }
+    }
+
     // Tools (including tools.media.audio)
     if (root.get("tools")) |tl| {
         if (tl == .object) {

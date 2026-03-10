@@ -14,9 +14,9 @@ threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional: chat_id for Telegram delivery";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Set type='agent' to run as autonomous agent task (default: shell). Optional: model, prompt, chat_id.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification (e.g. Telegram chat_id)"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent' (autonomous agent task)"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs (default: config primary model)"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification (e.g. Telegram chat_id)"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -122,9 +122,20 @@ pub const ScheduleTool = struct {
             };
             defer scheduler.deinit();
 
-            const job = scheduler.addJob(expression, command) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            const is_agent = if (root.getString(args, "type")) |t| std.ascii.eqlIgnoreCase(t, "agent") else false;
+
+            const job = if (is_agent) blk: {
+                const prompt = root.getString(args, "prompt") orelse command;
+                const model = root.getString(args, "model");
+                break :blk scheduler.addAgentJob(expression, prompt, model) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create agent job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+            } else blk: {
+                break :blk scheduler.addJob(expression, command) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
             };
 
             // Set delivery config if chat_id is provided
@@ -140,7 +151,9 @@ pub const ScheduleTool = struct {
 
             cron.saveJobs(&scheduler) catch {};
 
-            const msg = try std.fmt.allocPrint(allocator, "Created job {s} | {s} | cmd: {s}", .{
+            const type_label: []const u8 = if (is_agent) "agent" else "shell";
+            const msg = try std.fmt.allocPrint(allocator, "Created {s} job {s} | {s} | cmd: {s}", .{
+                type_label,
                 job.id,
                 job.expression,
                 job.command,
@@ -159,9 +172,20 @@ pub const ScheduleTool = struct {
             };
             defer scheduler.deinit();
 
-            const job = scheduler.addOnce(delay, command) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            const is_agent = if (root.getString(args, "type")) |t| std.ascii.eqlIgnoreCase(t, "agent") else false;
+
+            const job = if (is_agent) blk: {
+                const prompt = root.getString(args, "prompt") orelse command;
+                const model = root.getString(args, "model");
+                break :blk scheduler.addAgentOnce(delay, prompt, model) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot agent task: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+            } else blk: {
+                break :blk scheduler.addOnce(delay, command) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
             };
 
             // Set delivery config if chat_id is provided
@@ -177,7 +201,9 @@ pub const ScheduleTool = struct {
 
             cron.saveJobs(&scheduler) catch {};
 
-            const msg = try std.fmt.allocPrint(allocator, "Created one-shot task {s} | runs at {d} | cmd: {s}", .{
+            const type_label: []const u8 = if (is_agent) "agent" else "shell";
+            const msg = try std.fmt.allocPrint(allocator, "Created one-shot {s} task {s} | runs at {d} | cmd: {s}", .{
+                type_label,
                 job.id,
                 job.next_run_secs,
                 job.command,

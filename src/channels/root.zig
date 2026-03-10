@@ -22,6 +22,19 @@ const streaming = @import("../streaming.zig");
 // Shared Types
 // ════════════════════════════════════════════════════════════════════════════
 
+/// A saved email attachment.
+pub const Attachment = struct {
+    /// On-disk file path (allocator-owned).
+    path: []const u8,
+    /// Original filename from the email.
+    filename: []const u8,
+
+    pub fn deinit(self: *const Attachment, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.filename);
+    }
+};
+
 /// A message received from or sent to a channel.
 pub const ChannelMessage = struct {
     id: []const u8,
@@ -41,6 +54,8 @@ pub const ChannelMessage = struct {
     sender_uuid: ?[]const u8 = null,
     /// Group ID (Signal-specific: for group chats).
     group_id: ?[]const u8 = null,
+    /// Saved attachments (email channel only). Caller owns.
+    attachments: []const Attachment = &.{},
 
     pub fn deinit(self: *const ChannelMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -51,6 +66,8 @@ pub const ChannelMessage = struct {
         if (self.first_name) |fn_| allocator.free(fn_);
         if (self.sender_uuid) |uuid| allocator.free(uuid);
         if (self.group_id) |gid| allocator.free(gid);
+        for (self.attachments) |att| att.deinit(allocator);
+        if (self.attachments.len > 0) allocator.free(self.attachments);
     }
 };
 

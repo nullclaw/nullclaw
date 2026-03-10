@@ -90,6 +90,7 @@ pub const NamedAgentConfig = config_types.NamedAgentConfig;
 pub const McpServerConfig = config_types.McpServerConfig;
 pub const ModelPricing = config_types.ModelPricing;
 pub const ToolsConfig = config_types.ToolsConfig;
+pub const SubagentConfig = config_types.SubagentConfig;
 pub const ProviderEntry = config_types.ProviderEntry;
 pub const AudioMediaConfig = config_types.AudioMediaConfig;
 pub const DmScope = config_types.DmScope;
@@ -144,6 +145,7 @@ pub const Config = struct {
     hardware: HardwareConfig = .{},
     security: SecurityConfig = .{},
     tools: ToolsConfig = .{},
+    subagent: SubagentConfig = .{},
     session: SessionConfig = .{},
 
     // Convenience aliases for backward-compat flat access used by other modules.
@@ -2362,6 +2364,28 @@ test "json parse agent token_limit explicit remains false when omitted" {
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, cfg.agent.token_limit);
     try std.testing.expect(!cfg.agent.token_limit_explicit);
     try std.testing.expect(cfg.agent.status_show_emojis);
+}
+
+test "json parse subagent section" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"subagent": {"max_iterations": 50, "max_concurrent": 8}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 50), cfg.subagent.max_iterations);
+    try std.testing.expectEqual(@as(u32, 8), cfg.subagent.max_concurrent);
+}
+
+test "json parse subagent defaults when omitted" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 15), cfg.subagent.max_iterations);
+    try std.testing.expectEqual(@as(u32, 4), cfg.subagent.max_concurrent);
 }
 
 test "json parse composio section" {

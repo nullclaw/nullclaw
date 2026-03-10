@@ -195,7 +195,32 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 continue;
             };
             switch (tick_result.outcome) {
-                .processed => log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count}),
+                .processed => {
+                    log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count});
+
+                    // Execute collected tasks as agent subprocesses.
+                    const tasks = heartbeat_engine.collectTasks(allocator) catch |err| {
+                        log.warn("heartbeat collectTasks failed: {s}", .{@errorName(err)});
+                        next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+                        std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                        continue;
+                    };
+                    defer heartbeat_mod.HeartbeatEngine.freeTasks(allocator, tasks);
+
+                    for (tasks) |task| {
+                        log.info("heartbeat executing task: {s}", .{task});
+                        const result = cron.runAgentJob(allocator, config.workspace_dir, task, config.default_model, config.scheduler.agent_timeout_secs) catch |err| {
+                            log.warn("heartbeat agent task failed: {s}", .{@errorName(err)});
+                            continue;
+                        };
+                        defer allocator.free(result.output);
+                        if (result.success) {
+                            log.info("heartbeat task completed successfully", .{});
+                        } else {
+                            log.warn("heartbeat task finished with error", .{});
+                        }
+                    }
+                },
                 .skipped_empty_file => log.debug("heartbeat tick skipped: HEARTBEAT.md has no actionable content", .{}),
                 .skipped_missing_file => log.debug("heartbeat tick skipped: HEARTBEAT.md is missing", .{}),
             }
@@ -842,7 +867,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Spawn gateway thread
     state.markRunning("gateway");
-    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
+    const gw_thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
         state.markError("gateway", @errorName(err));
         try stdout.print("Failed to spawn gateway: {}\n", .{err});
         return err;
@@ -852,7 +877,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -864,7 +889,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var sched_thread: ?std.Thread = null;
     if (config.scheduler.enabled) {
         state.markRunning("scheduler");
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
             sched_thread = thread;
         } else |err| {
             state.markError("scheduler", @errorName(err));
@@ -894,7 +919,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Spawn channel supervisor thread (only if channels are configured)
     var chan_thread: ?std.Thread = null;
     if (has_supervised_channels) {
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, channelSupervisorThread, .{
             allocator, config, &state, &channel_registry, channel_rt, &event_bus,
         })) |thread| {
             chan_thread = thread;

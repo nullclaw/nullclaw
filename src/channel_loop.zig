@@ -374,7 +374,7 @@ pub const ChannelRuntime = struct {
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
         if (subagent_manager) |mgr| {
-            mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, .{});
+            mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, config.subagent);
             mgr.task_runner = subagent_runner.runTaskWithTools;
             errdefer {
                 mgr.deinit();
@@ -1060,6 +1060,145 @@ fn splitEmailTarget(target: []const u8) struct { addr: []const u8, subject: []co
     return .{ .addr = target, .subject = "" };
 }
 
+// ── PII redaction helpers ─────────────────────────────────────────────────
+// Spawn the Python pii_redactor.py script, piping content via stdin.
+// On any error, returns null so the caller can fall back to the original text.
+
+fn redactPii(allocator: std.mem.Allocator, content: []const u8, msg_id: []const u8, sender: []const u8, use_spacy: bool) ?[]u8 {
+    const script = "/home/nullclaw/.nullclaw/workspace/scripts/pii_redactor.py";
+
+    var argv_buf: [8][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "python3";
+    argc += 1;
+    argv_buf[argc] = script;
+    argc += 1;
+    argv_buf[argc] = "redact";
+    argc += 1;
+
+    // Build --id=<msg_id> string
+    const id_arg = std.fmt.allocPrint(allocator, "--id={s}", .{msg_id}) catch return null;
+    defer allocator.free(id_arg);
+    argv_buf[argc] = id_arg;
+    argc += 1;
+
+    // Build --sender=<sender>
+    var sender_arg: ?[]u8 = null;
+    defer if (sender_arg) |s| allocator.free(s);
+    if (sender.len > 0) {
+        sender_arg = std.fmt.allocPrint(allocator, "--sender={s}", .{sender}) catch return null;
+        argv_buf[argc] = sender_arg.?;
+        argc += 1;
+    }
+
+    if (use_spacy) {
+        argv_buf[argc] = "--spacy";
+        argc += 1;
+    }
+
+    const argv = argv_buf[0..argc];
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        log.warn("PII redact spawn error: {}", .{err});
+        return null;
+    };
+
+    // Write content to stdin, then close
+    if (child.stdin) |*stdin_stream| {
+        stdin_stream.writeAll(content) catch {};
+        stdin_stream.close();
+        child.stdin = null;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1_048_576) catch |err| {
+        log.warn("PII redact stdout read error: {}", .{err});
+        _ = child.wait() catch {};
+        return null;
+    };
+    // Read stderr but discard
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 65_536) catch "";
+    defer if (stderr.len > 0) allocator.free(stderr);
+
+    const term = child.wait() catch |err| {
+        log.warn("PII redact wait error: {}", .{err});
+        allocator.free(stdout);
+        return null;
+    };
+
+    const exit_ok = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    if (!exit_ok) {
+        log.warn("PII redact exited with error", .{});
+        if (stderr.len > 0) log.warn("PII redact stderr: {s}", .{stderr});
+        allocator.free(stdout);
+        return null;
+    }
+
+    return stdout;
+}
+
+fn deredactPii(allocator: std.mem.Allocator, text: []const u8, msg_id: []const u8) ?[]u8 {
+    const script = "/home/nullclaw/.nullclaw/workspace/scripts/pii_redactor.py";
+
+    const id_arg = std.fmt.allocPrint(allocator, "--id={s}", .{msg_id}) catch return null;
+    defer allocator.free(id_arg);
+
+    const argv = [_][]const u8{ "python3", script, "deredact", id_arg };
+
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        log.warn("PII deredact spawn error: {}", .{err});
+        return null;
+    };
+
+    if (child.stdin) |*stdin_stream| {
+        stdin_stream.writeAll(text) catch {};
+        stdin_stream.close();
+        child.stdin = null;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1_048_576) catch |err| {
+        log.warn("PII deredact stdout read error: {}", .{err});
+        _ = child.wait() catch {};
+        return null;
+    };
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 65_536) catch "";
+    defer if (stderr.len > 0) allocator.free(stderr);
+
+    const term = child.wait() catch |err| {
+        log.warn("PII deredact wait error: {}", .{err});
+        allocator.free(stdout);
+        return null;
+    };
+
+    const exit_ok = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    if (!exit_ok) {
+        log.warn("PII deredact exited with error", .{});
+        if (stderr.len > 0) log.warn("PII deredact stderr: {s}", .{stderr});
+        allocator.free(stdout);
+        return null;
+    }
+
+    return stdout;
+}
+
 // runEmailLoop — polling thread function
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1107,7 +1246,22 @@ pub fn runEmailLoop(
                 break :blk route.session_key;
             };
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            // ── PII redaction (pre-LLM) ──────────────────────────────
+            const pii_enabled = em_ptr.config.pii_redaction;
+            var redacted_content: ?[]u8 = null;
+            defer if (redacted_content) |rc| allocator.free(rc);
+
+            const content_for_llm = if (pii_enabled) blk: {
+                redacted_content = redactPii(allocator, msg.content, msg.id, msg.sender, em_ptr.config.pii_spacy);
+                if (redacted_content) |rc| {
+                    break :blk rc;
+                } else {
+                    log.warn("PII redaction failed, using original content", .{});
+                    break :blk msg.content;
+                }
+            } else msg.content;
+
+            const reply = runtime.session_mgr.processMessage(session_key, content_for_llm, null) catch |err| {
                 log.err("Email agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -1125,9 +1279,23 @@ pub fn runEmailLoop(
             };
             defer allocator.free(reply);
 
+            // ── PII de-redaction (post-LLM) ─────────────────────────
+            var deredacted_reply: ?[]u8 = null;
+            defer if (deredacted_reply) |dr| allocator.free(dr);
+
+            const final_reply = if (pii_enabled) blk: {
+                deredacted_reply = deredactPii(allocator, reply, msg.id);
+                if (deredacted_reply) |dr| {
+                    break :blk dr;
+                } else {
+                    log.warn("PII de-redaction failed, using redacted reply", .{});
+                    break :blk reply;
+                }
+            } else reply;
+
             if (msg.reply_target) |target| {
                 const recipient = splitEmailTarget(target);
-                em_ptr.sendReply(recipient.addr, recipient.subject, reply) catch |err| {
+                em_ptr.sendReply(recipient.addr, recipient.subject, final_reply) catch |err| {
                     log.warn("Email send error: {}", .{err});
                 };
             }

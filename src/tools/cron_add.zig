@@ -9,9 +9,9 @@ const CronScheduler = cron.CronScheduler;
 /// CronAdd tool — creates a new cron job with either a cron expression or a delay.
 pub const CronAddTool = struct {
     pub const tool_name = "cron_add";
-    pub const tool_description = "Create a scheduled cron job. Provide either 'expression' (cron syntax) or 'delay' (e.g. '30m', '2h') plus 'command'.";
+    pub const tool_description = "Create a scheduled cron job. Provide either 'expression' (cron syntax) or 'delay' (e.g. '30m', '2h') plus 'command'. Set type='agent' for autonomous agent tasks.";
     pub const tool_params =
-        \\{"type":"object","properties":{"expression":{"type":"string","description":"Cron expression (e.g. '*/5 * * * *')"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"name":{"type":"string","description":"Optional job name"}},"required":["command"]}
+        \\{"type":"object","properties":{"expression":{"type":"string","description":"Cron expression (e.g. '*/5 * * * *')"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent'"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs"},"name":{"type":"string","description":"Optional job name"}},"required":["command"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -50,16 +50,28 @@ pub const CronAddTool = struct {
         };
         defer scheduler.deinit();
 
+        const is_agent = if (root.getString(args, "type")) |t| std.ascii.eqlIgnoreCase(t, "agent") else false;
+        const prompt = root.getString(args, "prompt") orelse command;
+        const model = root.getString(args, "model");
+
         // Prefer expression (recurring) over delay (one-shot)
         if (expression) |expr| {
-            const job = scheduler.addJob(expr, command) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            };
+            const job = if (is_agent)
+                scheduler.addAgentJob(expr, prompt, model) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create agent job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
+            else
+                scheduler.addJob(expr, command) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create job: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
 
             cron.saveJobs(&scheduler) catch {};
 
-            const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
+            const type_label: []const u8 = if (is_agent) "agent " else "";
+            const msg = try std.fmt.allocPrint(allocator, "Created {s}cron job {s}: {s} \u{2192} {s}", .{
+                type_label,
                 job.id,
                 job.expression,
                 job.command,
@@ -68,14 +80,22 @@ pub const CronAddTool = struct {
         }
 
         if (delay) |d| {
-            const job = scheduler.addOnce(d, command) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            };
+            const job = if (is_agent)
+                scheduler.addAgentOnce(d, prompt, model) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot agent task: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
+            else
+                scheduler.addOnce(d, command) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
 
             cron.saveJobs(&scheduler) catch {};
 
-            const msg = try std.fmt.allocPrint(allocator, "Created cron job {s}: {s} \u{2192} {s}", .{
+            const type_label: []const u8 = if (is_agent) "agent " else "";
+            const msg = try std.fmt.allocPrint(allocator, "Created {s}cron job {s}: {s} \u{2192} {s}", .{
+                type_label,
                 job.id,
                 job.expression,
                 job.command,
