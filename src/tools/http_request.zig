@@ -74,7 +74,7 @@ pub const HttpRequestTool = struct {
 
         // Parse custom headers from ObjectMap
         const headers_val = root.getValue(args, "headers");
-        var header_list: std.ArrayList([2][]const u8) = .{};
+        var header_list: std.ArrayList([2][]const u8) = .empty;
         errdefer {
             for (header_list.items) |h| {
                 allocator.free(h[0]);
@@ -408,7 +408,7 @@ fn parseHeaders(allocator: std.mem.Allocator, headers_json: ?[]const u8) ![]cons
     const json = headers_json orelse return &.{};
     if (json.len < 2) return &.{};
 
-    var list: std.ArrayList([2][]const u8) = .{};
+    var list: std.ArrayList([2][]const u8) = .empty;
     errdefer {
         for (list.items) |h| {
             allocator.free(h[0]);
@@ -457,7 +457,7 @@ fn parseHeaders(allocator: std.mem.Allocator, headers_json: ?[]const u8) ![]cons
 fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]const u8) ![]const u8 {
     if (headers.len == 0) return "";
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     for (headers, 0..) |h, i| {

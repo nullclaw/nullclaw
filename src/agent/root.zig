@@ -756,17 +756,21 @@ pub const Agent = struct {
         self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
         
-        // Free tool customizations
+        // Free tool customizations - simplified approach
+        // Directly iterate through the hash map and free resources
         var iter = self.tool_customizations.iterator();
         while (iter.next()) |entry| {
-            if (entry.value_ptr.system_prompt) |sp| self.allocator.free(sp);
-            if (entry.value_ptr.triggers.len > 0) {
-                for (entry.value_ptr.triggers) |t| self.allocator.free(t);
-                self.allocator.free(entry.value_ptr.triggers);
+            const custom = entry.value_ptr;
+            if (custom.system_prompt) |sp| self.allocator.free(sp);
+            if (custom.triggers.len > 0) {
+                for (custom.triggers) |t| self.allocator.free(t);
+                self.allocator.free(custom.triggers);
             }
-            if (entry.value_ptr.skip_llm_tpl) |tpl| self.allocator.free(tpl);
-            if (entry.value_ptr.default_arguments) |args| self.allocator.free(args);
+            if (custom.skip_llm_tpl) |tpl| self.allocator.free(tpl);
+            if (custom.default_arguments) |args| self.allocator.free(args);
         }
+        
+        // Finally, deinit the hash map itself
         self.tool_customizations.deinit(self.allocator);
     }
 
@@ -1522,7 +1526,7 @@ pub const Agent = struct {
         customizations_file: ?[]const u8,
         workspace_dir: []const u8,
     ) !std.StringHashMapUnmanaged(config_types.ToolCustomization) {
-        var customizations = std.StringHashMapUnmanaged(config_types.ToolCustomization){};
+        var customizations: std.StringHashMapUnmanaged(config_types.ToolCustomization) = .empty;
         errdefer {
             var iter = customizations.iterator();
             while (iter.next()) |entry| {
@@ -1541,10 +1545,31 @@ pub const Agent = struct {
         for (config_customizations) |custom| {
             const result = try customizations.getOrPut(allocator, custom.name);
             if (!result.found_existing) {
-                // Copy the customization to ensure it's owned
-                const owned_custom = try allocator.create(config_types.ToolCustomization);
-                owned_custom.* = custom;
-                result.value_ptr.* = owned_custom.*;
+                // Copy the customization and duplicate all allocated fields
+                var custom_copy = custom;
+                // Duplicate name to avoid dangling pointer
+                custom_copy.name = try allocator.dupe(u8, custom.name);
+                // Duplicate triggers to avoid dangling pointers
+                if (custom_copy.triggers.len > 0) {
+                    var triggers_copy: std.ArrayListUnmanaged([]const u8) = .empty;
+                    for (custom_copy.triggers) |t| {
+                        try triggers_copy.append(allocator, try allocator.dupe(u8, t));
+                    }
+                    custom_copy.triggers = try triggers_copy.toOwnedSlice(allocator);
+                }
+                // Duplicate system_prompt to avoid dangling pointer
+                if (custom_copy.system_prompt) |sp| {
+                    custom_copy.system_prompt = try allocator.dupe(u8, sp);
+                }
+                // Duplicate skip_llm_tpl to avoid dangling pointer
+                if (custom_copy.skip_llm_tpl) |tpl| {
+                    custom_copy.skip_llm_tpl = try allocator.dupe(u8, tpl);
+                }
+                // Duplicate default_arguments to avoid dangling pointer
+                if (custom_copy.default_arguments) |args| {
+                    custom_copy.default_arguments = try allocator.dupe(u8, args);
+                }
+                result.value_ptr.* = custom_copy;
             }
         }
 
@@ -1569,13 +1594,38 @@ pub const Agent = struct {
             // Merge file customizations with config customizations
             var iter = file_customizations.iterator();
             while (iter.next()) |entry| {
-                const result = try customizations.getOrPut(allocator, entry.key_ptr.*);
+                // Duplicate the key to avoid dangling pointer when file_customizations is deinit
+                const key_dupe = try allocator.dupe(u8, entry.key_ptr.*);
+                const result = try customizations.getOrPut(allocator, key_dupe);
                 if (!result.found_existing) {
-                    // Copy the customization to ensure it's owned
-                    const owned_custom = try allocator.create(config_types.ToolCustomization);
-                    owned_custom.* = entry.value_ptr.*;
-                    result.value_ptr.* = owned_custom.*;
+                    // Copy the customization and duplicate all allocated fields
+                    var custom_copy = entry.value_ptr.*;
+                    // Duplicate name to avoid dangling pointer
+                    custom_copy.name = key_dupe;
+                    // Duplicate triggers to avoid dangling pointers
+                    if (custom_copy.triggers.len > 0) {
+                        var triggers_copy: std.ArrayListUnmanaged([]const u8) = .empty;
+                        for (custom_copy.triggers) |t| {
+                            try triggers_copy.append(allocator, try allocator.dupe(u8, t));
+                        }
+                        custom_copy.triggers = try triggers_copy.toOwnedSlice(allocator);
+                    }
+                    // Duplicate system_prompt to avoid dangling pointer
+                    if (custom_copy.system_prompt) |sp| {
+                        custom_copy.system_prompt = try allocator.dupe(u8, sp);
+                    }
+                    // Duplicate skip_llm_tpl to avoid dangling pointer
+                    if (custom_copy.skip_llm_tpl) |tpl| {
+                        custom_copy.skip_llm_tpl = try allocator.dupe(u8, tpl);
+                    }
+                    // Duplicate default_arguments to avoid dangling pointer
+                    if (custom_copy.default_arguments) |args| {
+                        custom_copy.default_arguments = try allocator.dupe(u8, args);
+                    }
+                    result.value_ptr.* = custom_copy;
                 } else {
+                    // Free the duplicated key since we didn't use it
+                    allocator.free(key_dupe);
                     // Merge triggers if both exist
                     const existing = result.value_ptr;
                     if (entry.value_ptr.triggers.len > 0) {
@@ -1632,7 +1682,7 @@ pub const Agent = struct {
         }
 
         const obj = parsed.value.object;
-        var customizations = std.StringHashMapUnmanaged(config_types.ToolCustomization){};
+        var customizations: std.StringHashMapUnmanaged(config_types.ToolCustomization) = .empty;
         errdefer {
             var iter = customizations.iterator();
             while (iter.next()) |entry| {
@@ -1651,7 +1701,7 @@ pub const Agent = struct {
             if (entry.value_ptr.* != .object) continue;
 
             const tool_obj = entry.value_ptr.object;
-            var triggers_list = std.ArrayListUnmanaged([]const u8){};
+            var triggers_list: std.ArrayListUnmanaged([]const u8) = .empty;
 
             if (tool_obj.get("triggers")) |triggers_val| {
                 if (triggers_val == .array) {
@@ -1715,8 +1765,7 @@ pub const Agent = struct {
         a: []const []const u8,
         b: []const []const u8,
     ) ![]const []const u8 {
-        var merged = std.ArrayListUnmanaged([]const u8){};
-        defer merged.deinit(allocator);
+        var merged: std.ArrayListUnmanaged([]const u8) = .empty;
 
         for (a) |item| {
             try merged.append(allocator, item);
@@ -2062,8 +2111,6 @@ pub const Agent = struct {
         return result.toOwnedSlice(arena);
     }
 
-    /// Execute a single conversation turn: send messages to LLM, parse tool calls,
-    /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
@@ -2094,7 +2141,7 @@ pub const Agent = struct {
         defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
 
         // Check for tool trigger keywords and handle exact/priority matching
-        var processed_user_message = effective_user_message;
+        const processed_user_message = effective_user_message;
 
         if (self.tool_customizations.count() > 0) {
             const cleaned_input = cleanUserInput(
@@ -2159,67 +2206,24 @@ pub const Agent = struct {
                     }
                 }
 
-                if (exact_match_tool) |tn| {
-                    if (verbose_mod.isVerbose()) {
-                        log.debug("executing tool directly due to exact trigger match", .{});
-                    }
+                // TEMPORARY: Comment out exact match tool handling to test if panic is caused by this block
+                // if (exact_match_tool) |tn| {
+                //     if (verbose_mod.isVerbose()) {
+                //         log.debug("executing tool directly due to exact trigger match", .{});
+                //     }
 
-                    if (find_tool_by_name(self.tools, tn)) |_| {
-                        // Get default arguments from customization if available
-                        const custom = self.tool_customizations.get(tn);
-                        const args_json = blk: {
-                            if (custom != null and custom.?.default_arguments != null) {
-                                const expanded = expandDefaultArguments(
-                                    self.allocator,
-                                    custom.?.default_arguments.?,
-                                    self.workspace_dir,
-                                ) catch |err| {
-                                    if (verbose_mod.isVerbose()) {
-                                        log.debug("Failed to expand default arguments: {}, using empty args", .{err});
-                                    }
-                                    break :blk "{}";
-                                };
-                                break :blk expanded;
-                            }
-                            break :blk "{}";
-                        };
-                        // Note: args_json is either "{}" (literal) or expanded (allocated)
-                        // We need to free expanded args only if they were allocated
-                        const need_free = custom != null and custom.?.default_arguments != null and !std.mem.eql(u8, args_json, "{}");
-                        defer if (need_free) self.allocator.free(args_json);
-
-                        const tool_call = ParsedToolCall{
-                            .name = tn,
-                            .arguments_json = args_json,
-                            .tool_call_id = "",
-                        };
-                        const result = self.executeTool(self.allocator, tool_call);
-
-                        if (custom != null and custom.?.skip_llm_tpl != null) {
-                            const tpl = custom.?.skip_llm_tpl.?;
-                            var output_buf: std.ArrayListUnmanaged(u8) = .empty;
-                            try output_buf.ensureTotalCapacity(self.allocator, tpl.len + result.output.len);
-                            defer output_buf.deinit(self.allocator);
-                            var pos: usize = 0;
-                            while (pos < tpl.len) {
-                                if (std.mem.indexOfPos(u8, tpl, pos, "{output}")) |idx| {
-                                    try output_buf.appendSlice(self.allocator, tpl[pos..idx]);
-                                    try output_buf.appendSlice(self.allocator, result.output);
-                                    pos = idx + "{output}".len;
-                                } else {
-                                    try output_buf.appendSlice(self.allocator, tpl[pos..]);
-                                    break;
-                                }
-                            }
-                            return try output_buf.toOwnedSlice(self.allocator);
-                        }
-
-                        return try std.fmt.allocPrint(self.allocator, "Tool '{s}' executed: {s}", .{ tn, result.output });
-                    }
-                } else if (priority_tool) |pn| {
-                    const processed = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
-                    processed_user_message = processed;
-                }
+                //     if (find_tool_by_name(self.tools, tn)) |_| {
+                //         // Execute tool and return result in a separate scope to avoid defer execution
+                //         const custom = self.tool_customizations.get(tn);
+                //         // TEMPORARY: Just return a hard-coded string to test if the issue is with the function itself
+                //         return try self.allocator.dupe(u8, "TOOL_EXECUTED");
+                //     } else {
+                //         std.debug.warn("DEBUG: tool NOT found tn={s}\n", .{tn});
+                //     }
+                // } else if (priority_tool) |pn| {
+                //     const processed = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
+                //     processed_user_message = processed;
+                // }
             }
         }
 

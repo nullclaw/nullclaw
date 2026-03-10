@@ -56,15 +56,15 @@ pub fn expandQuery(allocator: Allocator, raw_query: []const u8) !ExpandedQuery {
     const lang = detectLanguage(trimmed);
 
     // Tokenize
-    var orig_list: std.ArrayListUnmanaged([]const u8) = .{};
+    var orig_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer orig_list.deinit(allocator);
     errdefer for (orig_list.items) |t| allocator.free(t);
-    var filt_list: std.ArrayListUnmanaged([]const u8) = .{};
+    var filt_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer filt_list.deinit(allocator);
     errdefer for (filt_list.items) |t| allocator.free(t);
 
     // Tokenize into raw segments
-    var raw_tokens: std.ArrayListUnmanaged([]const u8) = .{};
+    var raw_tokens: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (raw_tokens.items) |t| allocator.free(t);
         raw_tokens.deinit(allocator);
@@ -264,10 +264,10 @@ fn tokenize(allocator: Allocator, text: []const u8, lang: Language, out: *std.Ar
 
 fn tokenizeChinese(allocator: Allocator, text: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
     // Collect CJK characters
-    var chars: std.ArrayListUnmanaged([]const u8) = .{};
+    var chars: std.ArrayListUnmanaged([]const u8) = .empty;
     defer chars.deinit(allocator);
 
-    var ascii_buf: std.ArrayListUnmanaged(u8) = .{};
+    var ascii_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer ascii_buf.deinit(allocator);
 
     var i: usize = 0;
@@ -392,7 +392,7 @@ fn emitJapaneseChunk(
             // Emit the whole chunk + bigrams
             try out.append(allocator, try allocator.dupe(u8, chunk));
             // Generate bigrams
-            var chars: std.ArrayListUnmanaged([]const u8) = .{};
+            var chars: std.ArrayListUnmanaged([]const u8) = .empty;
             defer chars.deinit(allocator);
             var ci: usize = 0;
             while (ci < chunk.len) {
@@ -970,7 +970,7 @@ fn isPunctCodepoint(cp: u21) bool {
 /// Short tokens (< 4 ASCII chars) get prefix wildcard.
 /// Tokens with special FTS5 chars are quoted.
 fn buildFts5Query(allocator: Allocator, tokens: []const []const u8) ![]const u8 {
-    var parts: std.ArrayListUnmanaged([]const u8) = .{};
+    var parts: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (parts.items) |p| allocator.free(p);
         parts.deinit(allocator);

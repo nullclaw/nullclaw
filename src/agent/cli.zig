@@ -346,7 +346,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
             return err;
         };
-        defer allocator.free(response);
+        // defer allocator.free(response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("{s}\n", .{response});
@@ -397,6 +397,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     allocator.free(entry);
                 };
             }
+            // allocator.free(entries);
         }
     }
 

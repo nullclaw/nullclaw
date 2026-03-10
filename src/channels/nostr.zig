@@ -595,7 +595,7 @@ pub const NostrChannel = struct {
     /// Best-effort: caller should ignore errors (dedup is non-critical).
     pub fn recordSeenRumor(self: *NostrChannel, rumor_id: []const u8, now: i64) !void {
         // Collect stale keys (can't remove during iteration).
-        var stale = std.ArrayListUnmanaged([]const u8){};
+        var stale: std.ArrayListUnmanaged([]const u8) = .empty;
         defer stale.deinit(self.allocator);
 
         var it = self.seen_rumor_ids.iterator();

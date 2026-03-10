@@ -590,7 +590,7 @@ fn appendAnthropicThinkingConfig(
 
 /// HTTP POST with OAuth-specific headers (anthropic-beta, user-agent).
 fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8, auth_hdr: []const u8, version_hdr: []const u8) ![]u8 {
-    var argv = std.ArrayListUnmanaged([]const u8){};
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "curl", "-s", "-X", "POST" });
 

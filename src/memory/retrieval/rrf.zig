@@ -29,7 +29,7 @@ pub fn rrfMerge(
     var score_map = std.StringHashMap(ScoreEntry).init(allocator);
     defer score_map.deinit();
 
-    var merged = std.ArrayListUnmanaged(MergeItem){};
+    var merged: std.ArrayListUnmanaged(MergeItem) = .empty;
     defer merged.deinit(allocator);
 
     for (sources) |source_list| {

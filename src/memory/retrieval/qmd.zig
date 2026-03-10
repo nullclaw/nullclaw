@@ -139,7 +139,7 @@ pub const QmdAdapter = struct {
         };
         defer parsed.deinit();
 
-        var candidates = std.ArrayListUnmanaged(RetrievalCandidate){};
+        var candidates: std.ArrayListUnmanaged(RetrievalCandidate) = .empty;
         errdefer {
             for (candidates.items) |*c| c.deinit(allocator);
             candidates.deinit(allocator);

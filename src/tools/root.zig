@@ -283,7 +283,7 @@ pub fn defaultToolsWithPaths(
     workspace_dir: []const u8,
     allowed_paths: []const []const u8,
 ) ![]Tool {
-    var list: std.ArrayList(Tool) = .{};
+    var list: std.ArrayList(Tool) = .empty;
     errdefer {
         for (list.items) |t| {
             t.deinit(allocator);
@@ -340,7 +340,7 @@ pub fn allTools(
         backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
-    var list: std.ArrayList(Tool) = .{};
+    var list: std.ArrayList(Tool) = .empty;
     errdefer {
         for (list.items) |t| {
             t.deinit(allocator);
@@ -571,7 +571,7 @@ pub fn subagentTools(
         backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
-    var list: std.ArrayList(Tool) = .{};
+    var list: std.ArrayList(Tool) = .empty;
     errdefer {
         for (list.items) |t| {
             t.deinit(allocator);
