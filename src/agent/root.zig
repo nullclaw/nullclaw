@@ -2180,9 +2180,19 @@ pub const Agent = struct {
                     if (ci.len == keyword_part.len) {
                         var is_match = true;
                         for (ci, 0..) |c, i| {
-                            if (std.ascii.toLower(c) != std.ascii.toLower(keyword_part[i])) {
-                                is_match = false;
-                                break;
+                            // For ASCII characters, use case-insensitive comparison
+                            // For non-ASCII (like Chinese), use exact comparison
+                            if (std.ascii.isAscii(c) and std.ascii.isAscii(keyword_part[i])) {
+                                if (std.ascii.toLower(c) != std.ascii.toLower(keyword_part[i])) {
+                                    is_match = false;
+                                    break;
+                                }
+                            } else {
+                                // For non-ASCII characters, use exact byte comparison
+                                if (c != keyword_part[i]) {
+                                    is_match = false;
+                                    break;
+                                }
                             }
                         }
                         if (is_match) {
