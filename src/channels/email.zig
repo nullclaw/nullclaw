@@ -426,14 +426,11 @@ pub const EmailChannel = struct {
             const parsed = parseRawEmail(raw_email);
             const sender_addr = extractEmailAddress(parsed.from);
 
-            // Check sender allowlist
-            if (!self.isSenderAllowed(sender_addr)) {
-                log.info("Email from non-allowed sender: {s}", .{sender_addr});
-                // Still mark as seen to avoid reprocessing
-                _ = self.seen_uids.insert(uid) catch {};
-                // Mark as read on server
-                self.imapStoreSeen(allocator, base_url, uid);
-                continue;
+            // Check sender allowlist — unknown senders are still delivered
+            // but wrapped with [UNKNOWN_SENDER] so the agent can decide
+            const is_known_sender = self.isSenderAllowed(sender_addr);
+            if (!is_known_sender) {
+                log.info("Email from unknown sender: {s} — forwarding to agent for triage", .{sender_addr});
             }
 
             // Extract body
@@ -491,17 +488,19 @@ pub const EmailChannel = struct {
                 attachment_info = info_buf.toOwnedSlice(allocator) catch &.{};
             }
 
-            // Wrap in untrusted markers
+            // Wrap in markers — unknown senders get extra [UNKNOWN_SENDER] tag
+            const tag_start: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_START]" else "[UNKNOWN_SENDER_START]";
+            const tag_end: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_END]" else "[UNKNOWN_SENDER_END]";
             const wrapped = if (attachment_info.len > 0)
-                std.fmt.allocPrint(allocator, "[UNTRUSTED_EMAIL_START]\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n[UNTRUSTED_EMAIL_END]", .{
-                    sender_addr, parsed.subject, final_content, attachment_info,
+                std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n{s}", .{
+                    tag_start, sender_addr, parsed.subject, final_content, attachment_info, tag_end,
                 }) catch {
                     allocator.free(final_content);
                     continue;
                 }
             else
-                std.fmt.allocPrint(allocator, "[UNTRUSTED_EMAIL_START]\nFrom: {s}\nSubject: {s}\n\n{s}\n[UNTRUSTED_EMAIL_END]", .{
-                    sender_addr, parsed.subject, final_content,
+                std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}\n{s}", .{
+                    tag_start, sender_addr, parsed.subject, final_content, tag_end,
                 }) catch {
                     allocator.free(final_content);
                     continue;
