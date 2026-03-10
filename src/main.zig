@@ -3190,46 +3190,63 @@ fn toolsImportPreview(allocator: std.mem.Allocator, file_path: []const u8) !void
 
         const tool_obj = tool_value.object;
 
-        // Check triggers
+        // Check triggers with suffix parsing
         if (tool_obj.get("triggers")) |triggers_val| {
             if (triggers_val == .array) {
-                std.debug.print("      Triggers: ", .{});
-                for (triggers_val.array.items, 0..) |t, i| {
+                std.debug.print("      Triggers:\n", .{});
+                for (triggers_val.array.items) |t| {
                     if (t == .string) {
-                        if (i > 0) std.debug.print(", ", .{});
-                        std.debug.print("\"{s}\"", .{t.string});
+                        const trigger_str = t.string;
+                        // Parse trigger keyword with optional suffix
+                        if (std.mem.indexOf(u8, trigger_str, "::")) |idx| {
+                            const keyword = trigger_str[0..idx];
+                            const args_key = trigger_str[idx + 2 ..];
+                            std.debug.print("        \"{s}\" -> args_key: \"{s}\"\n", .{ keyword, args_key });
+                        } else {
+                            std.debug.print("        \"{s}\" -> args_key: \"default\"\n", .{trigger_str});
+                        }
                     }
                 }
-                std.debug.print("\n", .{});
             }
         }
 
-        // Check default_arguments and validate against tool schema
-        if (tool_obj.get("default_arguments")) |args_val| {
-            const tool_meta = findToolMetadata(tool_name);
-            if (tool_meta) |meta| {
-                const valid_params = try parseToolParams(allocator, meta.params);
-                defer valid_params.deinit();
+        // Check trigger_arguments and validate against tool schema
+        const tool_meta = findToolMetadata(tool_name);
+        if (tool_meta) |meta| {
+            var valid_params = try parseToolParams(allocator, meta.params);
+            defer valid_params.deinit(allocator);
 
-                if (args_val == .object) {
-                    std.debug.print("      [OK] default_arguments: configured\n", .{});
-                    validateArgumentsAgainstSchema(tool_name, args_val.object, valid_params);
+            // Show available parameters hint
+            std.debug.print("      Available parameters: ", .{});
+            for (valid_params.items, 0..) |param, i| {
+                if (i > 0) std.debug.print(", ", .{});
+                std.debug.print("{s}", .{param});
+            }
+            std.debug.print("\n", .{});
+
+            // Check trigger_arguments
+            if (tool_obj.get("trigger_arguments")) |ta_val| {
+                if (ta_val == .object) {
+                    std.debug.print("      Trigger arguments:\n", .{});
+                    var ta_iter = ta_val.object.iterator();
+                    while (ta_iter.next()) |ta_entry| {
+                        const args_key = ta_entry.key_ptr.*;
+                        if (ta_entry.value_ptr.* == .object) {
+                            std.debug.print("        [{s}]: ", .{args_key});
+                            validateArgumentsAgainstSchema(tool_name, ta_entry.value_ptr.*.object, valid_params);
+                        } else {
+                            std.debug.print("        [ERROR] [{s}]: must be a JSON object\n", .{args_key});
+                            has_warnings = true;
+                        }
+                    }
                 } else {
-                    std.debug.print("      [ERROR] default_arguments: must be a JSON object (e.g., {{\"key\": \"value\"}})\n", .{});
+                    std.debug.print("      [ERROR] trigger_arguments: must be a JSON object\n", .{});
                     has_warnings = true;
                 }
-
-                // Show available parameters hint
-                std.debug.print("      Available parameters: ", .{});
-                for (valid_params.items, 0..) |param, i| {
-                    if (i > 0) std.debug.print(", ", .{});
-                    std.debug.print("{s}", .{param});
-                }
-                std.debug.print("\n", .{});
-            } else {
-                std.debug.print("      [WARNING] Unknown tool '{s}' - cannot validate parameters\n", .{tool_name});
-                has_warnings = true;
             }
+        } else {
+            std.debug.print("      [WARNING] Unknown tool '{s}' - cannot validate parameters\n", .{tool_name});
+            has_warnings = true;
         }
 
         // Check skip_llm_tpl

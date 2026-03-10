@@ -1,8 +1,12 @@
 # 工具定制管理
 
-- 为内置工具添加自定义系统提示词、触发关键词和优先级，以提高工具调用的准确性和响应速度。
-- 支持事前无LLM模式: 对工具(如screenshot)支持配置特定触发词(trigger)可以实现直接调用工具的功能，而无需 LLM 参与。
-- 支持事后LLM模式: 对工具(如screenshot)支持配置skip_llm_tpl参数可将调用工具的输出直接模板化后返回给用户，而无需 LLM 参与。
+为内置工具添加自定义系统提示词、触发关键词和优先级，以提高工具调用的准确性和响应速度。
+
+## 核心功能
+
+- **事前无 LLM 模式**：为工具（如 screenshot）配置特定触发词（trigger）可以实现直接调用工具，无需 LLM 参与
+- **事后无 LLM 模式**：为工具（如 screenshot）配置 `skip_llm_tpl` 参数可将工具输出直接模板化后返回给用户，无需 LLM 处理
+- **触发词特定参数映射**：为每个触发词配置不同的参数，实现快捷方式，更且明确且灵活地调用工具
 
 ## 快速开始
 
@@ -120,11 +124,11 @@ nullclaw tools import-preview tool_customizations.json
 |------|------|------|------|
 | `name` | string | 是 | 工具名称（如 "screenshot", "file_read", "shell"） |
 | `system_prompt` | string | 否 | 自定义系统提示词，覆盖默认工具描述 |
-| `triggers` | string[] | 否 | 触发关键词列表，当用户消息包含这些词时会优先调用该工具,为空则没有触发词相关逻辑 |
+| `triggers` | string[] | 否 | 触发关键词列表，当用户消息包含这些词时会优先调用该工具，为空则没有触发词相关逻辑 |
 | `priority` | number | 否 | 优先级（默认 0），数值越高优先级越高 |
 | `enabled` | boolean | 否 | 是否启用该工具（默认 true） |
 | `skip_llm_tpl` | string | 否 | 跳过 LLM 模板，当配置此字段时，工具执行完成后会将输出通过此模板格式化后直接返回给用户，无需 LLM 处理。模板支持 `{output}` 占位符，例如："Screenshot saved: {output}" |
-| `default_arguments` | string/object | 否 | 默认参数，当触发词精确匹配时，使用这些参数直接调用工具。支持两种格式：<br>1. **对象格式（推荐）**：`{"filename": "{timestamp}.png"}`<br>2. **字符串格式（兼容）**：`"{\"filename\": \"{timestamp}.png\"}"`<br>支持变量替换：`{workspace_dir}`（工作目录）、`{timestamp}`（时间戳）、`{date}`（日期 YYYY-MM-DD）、`{time}`（时间 HH-MM-SS）、`{home}`（用户主目录） |
+| `trigger_arguments` | object | 否 | 触发词特定参数映射。键为触发词后缀标识（如 `"ls"` 来自 `"查看目录::ls"`），特殊键 `"default"` 用于无后缀或后缀未找到时。格式：`{"default": {"command": "ls"}, "ps": {"command": "ps aux"}}`。支持变量替换：`{workspace_dir}`（工作目录）、`{timestamp}`（时间戳）、`{date}`（日期 YYYY-MM-DD）、`{time}`（时间 HH-MM-SS）、`{home}`（用户主目录） |
 | `trigger_modifiers` | string[] | 否 | 自定义修饰词列表，会从输入头尾移除后再匹配触发词 |
 | `trigger_punctuation` | string | 否 | 自定义标点符号，会从输入中移除后再匹配触发词 |
 
@@ -134,7 +138,9 @@ nullclaw tools import-preview tool_customizations.json
 
 ### 1. 精确匹配（直接执行工具）
 
-当用户输入**仅包含**触发词时（去除修饰词和标点后），直接执行工具，不经过 LLM：
+当用户输入**仅包含**触发词时（去除修饰词和标点后），直接执行工具，不经过 LLM。
+
+**注意**：配置了 `trigger_arguments` 的工具，其触发词默认允许直接执行，无需额外确认。如需禁用，请将 `enabled` 设置为 `false`。
 
 **输入清理** - 从头尾两端移除：
 - 常见修饰词：`please`, `could you`, `can you`, `would you`, `now`, `go`, `start`, `ok`, `begin`, `do`, `execute`, `run`, `take`, `请`, `帮我`, `开始`
@@ -321,35 +327,62 @@ nullclaw tools import-preview tool_customizations.json
 }
 ```
 
-### 截图工具（带 default_arguments）
+## 触发词后缀标识（高级功能）
+
+支持在触发词后添加 `::argsKey` 后缀，实现**同一个工具的不同触发词对应不同参数配置**。
+
+### 使用场景
+
+例如，shell 工具可以有多个触发词，每个触发词执行不同的命令：
+- `"查看目录"` → 执行 `ls -la`
+- `"查看进程"` → 执行 `ps aux`
+- `"查看磁盘"` → 执行 `df -h`
+
+### 配置格式
 
 ```json
 {
-  "name": "screenshot",
-  "system_prompt": "Capture and return a screenshot of the current screen.",
+  "name": "shell",
   "triggers": [
-    "截图",
-    "screenshot"
+    "执行命令",
+    "查看目录::ls",
+    "查看进程::ps",
+    "查看磁盘::df"
   ],
-  "priority": 10,
-  "enabled": true,
-  "default_arguments": {
-    "filename": "screenshot_{timestamp}.png"
-  },
-  "skip_llm_tpl": "截图已保存: {output}"
+  "trigger_arguments": {
+    "default": {
+      "command": "echo 'No command specified'"
+    },
+    "ls": {
+      "command": "ls -la"
+    },
+    "ps": {
+      "command": "ps aux"
+    },
+    "df": {
+      "command": "df -h"
+    }
+  }
 }
 ```
 
-**说明**：当用户输入精确匹配触发词（如 "截图"）时，工具将使用 `default_arguments` 中配置的参数直接调用，无需 LLM 参与解析参数。支持以下变量替换：
-- `{workspace_dir}` - 当前工作目录
-- `{timestamp}` - 时间戳（毫秒）
-- `{date}` - 日期（YYYY-MM-DD）
-- `{time}` - 时间（HH-MM-SS）
-- `{home}` - 用户主目录
+### 匹配规则
 
-## 各工具 default_arguments 参数样例
+| 用户输入 | 触发词配置 | 匹配关键字 | 使用的参数键 | 执行的命令 |
+|---------|-----------|-----------|-------------|-----------|
+| "查看目录" | `"查看目录::ls"` | "查看目录" | `"ls"` | `ls -la` |
+| "查看进程" | `"查看进程::ps"` | "查看进程" | `"ps"` | `ps aux` |
+| "查看磁盘" | `"查看磁盘::df"` | "查看磁盘" | `"df"` | `df -h` |
+| "执行命令" | `"执行命令"` | "执行命令" | `"default"` | `echo 'No command specified'` |
 
-以下是常用工具的 `default_arguments` 参数样例：
+**说明**：
+- 后缀 `::argsKey` 不参与匹配，仅用于选择参数配置
+- 无后缀的触发词使用 `"default"` 键的参数
+- 如果后缀对应的键不存在，回退到 `"default"` 键
+
+## 各工具 trigger_arguments 参数样例
+
+以下是常用工具的 `trigger_arguments` 参数样例：
 
 ### screenshot（截图）
 
@@ -357,8 +390,10 @@ nullclaw tools import-preview tool_customizations.json
 {
   "name": "screenshot",
   "triggers": ["截图", "screenshot"],
-  "default_arguments": {
-    "filename": "screenshot_{timestamp}.png"
+  "trigger_arguments": {
+    "default": {
+      "filename": "screenshot_{timestamp}.png"
+    }
   }
 }
 ```
@@ -366,15 +401,30 @@ nullclaw tools import-preview tool_customizations.json
 **可用参数**：
 - `filename` (string): 截图文件名，保存到工作目录
 
-### shell（执行命令）
+### shell（执行命令）- 带后缀标识示例
 
 ```json
 {
   "name": "shell",
-  "triggers": ["执行命令", "run command"],
-  "default_arguments": {
-    "command": "ls -la",
-    "cwd": "{workspace_dir}"
+  "triggers": [
+    "执行命令",
+    "查看目录::ls",
+    "查看进程::ps",
+    "查看磁盘::df"
+  ],
+  "trigger_arguments": {
+    "default": {
+      "command": "echo 'No command specified'"
+    },
+    "ls": {
+      "command": "ls -la"
+    },
+    "ps": {
+      "command": "ps aux"
+    },
+    "df": {
+      "command": "df -h"
+    }
   }
 }
 ```
@@ -383,14 +433,51 @@ nullclaw tools import-preview tool_customizations.json
 - `command` (string, 必填): 要执行的 shell 命令
 - `cwd` (string): 工作目录（默认为工作区根目录）
 
+### file_write（写入文件）- 带后缀标识示例
+
+```json
+{
+  "name": "file_write",
+  "triggers": [
+    "写笔记::note",
+    "写配置::config",
+    "写日志::log"
+  ],
+  "trigger_arguments": {
+    "default": {
+      "path": "output.txt",
+      "content": ""
+    },
+    "note": {
+      "path": "notes_{date}.md",
+      "content": "# Notes for {date}\n\n"
+    },
+    "config": {
+      "path": "config.json",
+      "content": "{\n  \"version\": \"1.0.0\"\n}"
+    },
+    "log": {
+      "path": "app_{date}.log",
+      "content": "Log started at {time}\n\n"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+- `content` (string, 必填): 文件内容
+
 ### file_read（读取文件）
 
 ```json
 {
   "name": "file_read",
   "triggers": ["读取文件", "read file"],
-  "default_arguments": {
-    "path": "README.md"
+  "trigger_arguments": {
+    "default": {
+      "path": "README.md"
+    }
   }
 }
 ```
@@ -404,9 +491,11 @@ nullclaw tools import-preview tool_customizations.json
 {
   "name": "file_write",
   "triggers": ["写入文件", "write file"],
-  "default_arguments": {
-    "path": "notes_{date}.md",
-    "content": "# Notes for {date}\n\n"
+  "trigger_arguments": {
+    "default": {
+      "path": "notes_{date}.md",
+      "content": "# Notes for {date}\n\n"
+    }
   }
 }
 ```
@@ -421,10 +510,12 @@ nullclaw tools import-preview tool_customizations.json
 {
   "name": "file_edit",
   "triggers": ["编辑文件", "edit file"],
-  "default_arguments": {
-    "path": "config.txt",
-    "old_string": "old_value",
-    "new_string": "new_value"
+  "trigger_arguments": {
+    "default": {
+      "path": "config.txt",
+      "old_string": "old_value",
+      "new_string": "new_value"
+    }
   }
 }
 ```
@@ -440,8 +531,10 @@ nullclaw tools import-preview tool_customizations.json
 {
   "name": "git",
   "triggers": ["git 状态", "git status"],
-  "default_arguments": {
-    "command": "status"
+  "trigger_arguments": {
+    "default": {
+      "command": "status"
+    }
   }
 }
 ```
@@ -455,8 +548,10 @@ nullclaw tools import-preview tool_customizations.json
 {
   "name": "browser_open",
   "triggers": ["打开网页", "open url"],
-  "default_arguments": {
-    "url": "https://example.com"
+  "trigger_arguments": {
+    "default": {
+      "url": "https://example.com"
+    }
   }
 }
 ```
@@ -470,8 +565,10 @@ nullclaw tools import-preview tool_customizations.json
 {
   "name": "web_fetch",
   "triggers": ["获取网页", "fetch page"],
-  "default_arguments": {
-    "url": "https://example.com/article"
+  "trigger_arguments": {
+    "default": {
+      "url": "https://example.com/article"
+    }
   }
 }
 ```
@@ -485,9 +582,11 @@ nullclaw tools import-preview tool_customizations.json
 {
   "name": "http_request",
   "triggers": ["请求 API", "api request"],
-  "default_arguments": {
-    "url": "https://api.example.com/data",
-    "method": "GET"
+  "trigger_arguments": {
+    "default": {
+      "url": "https://api.example.com/data",
+      "method": "GET"
+    }
   }
 }
 ```

@@ -16,8 +16,10 @@
     "priority": 10,
     "enabled": true,
     "skip_llm_tpl": "截图已保存: {output}",
-    "default_arguments": {
-      "filename": "screenshot_{timestamp}.png"
+    "trigger_arguments": {
+      "default": {
+        "filename": "screenshot_{timestamp}.png"
+      }
     }
   },
   "file_read": {
@@ -42,9 +44,11 @@
     ],
     "priority": 5,
     "enabled": true,
-    "default_arguments": {
-      "path": "notes_{date}.md",
-      "content": "# Notes for {date}\n\n"
+    "trigger_arguments": {
+      "default": {
+        "path": "output.txt",
+        "content": ""
+      }
     }
   },
   "shell": {
@@ -54,10 +58,27 @@
       "运行命令",
       "run command",
       "execute command",
-      "shell"
+      "shell",
+      "查看目录::ls",
+      "查看进程::ps",
+      "查看磁盘::df"
     ],
     "priority": 8,
-    "enabled": true
+    "enabled": true,
+    "trigger_arguments": {
+      "default": {
+        "command": "echo 'No command specified'"
+      },
+      "ls": {
+        "command": "ls -la"
+      },
+      "ps": {
+        "command": "ps aux"
+      },
+      "df": {
+        "command": "df -h"
+      }
+    }
   },
   "git": {
     "system_prompt": "Execute git commands and return the output. Use this when the user asks about git status, log, diff, or other git operations.",
@@ -68,8 +89,10 @@
     ],
     "priority": 6,
     "enabled": true,
-    "default_arguments": {
-      "command": "status"
+    "trigger_arguments": {
+      "default": {
+        "command": "status"
+      }
     }
   }
 }

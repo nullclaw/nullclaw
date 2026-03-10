@@ -238,16 +238,35 @@ fn cleanUserInput(
     return result[0..end];
 }
 
+/// Parse trigger keyword with optional suffix (e.g., "查看目录::ls" -> {"查看目录", "ls"})
+/// Returns the keyword part (for matching) and optional args key (for argument selection)
+fn parseTriggerKeyword(keyword: []const u8) struct { keyword: []const u8, args_key: ?[]const u8 } {
+    if (std.mem.indexOf(u8, keyword, "::")) |idx| {
+        return .{
+            .keyword = keyword[0..idx],
+            .args_key = keyword[idx + 2 ..],
+        };
+    }
+    return .{
+        .keyword = keyword,
+        .args_key = null,
+    };
+}
+
 /// Check if cleaned input exactly matches a trigger keyword (whole input is the trigger)
-fn isExactTriggerMatch(cleaned_input: []const u8, keyword: []const u8) bool {
-    if (cleaned_input.len != keyword.len) return false;
+/// Returns the matched args_key if any
+fn isExactTriggerMatch(cleaned_input: []const u8, keyword: []const u8) ?[]const u8 {
+    const parsed = parseTriggerKeyword(keyword);
+    const keyword_part = parsed.keyword;
+
+    if (cleaned_input.len != keyword_part.len) return null;
 
     for (cleaned_input, 0..) |c, i| {
-        if (std.ascii.toLower(c) != std.ascii.toLower(keyword[i])) {
-            return false;
+        if (std.ascii.toLower(c) != std.ascii.toLower(keyword_part[i])) {
+            return null;
         }
     }
-    return true;
+    return parsed.args_key;
 }
 
 /// Check if there's a negation word within reasonable distance before the position
@@ -767,7 +786,6 @@ pub const Agent = struct {
                 self.allocator.free(custom.triggers);
             }
             if (custom.skip_llm_tpl) |tpl| self.allocator.free(tpl);
-            if (custom.default_arguments) |args| self.allocator.free(args);
         }
         
         // Finally, deinit the hash map itself
@@ -1536,7 +1554,6 @@ pub const Agent = struct {
                     allocator.free(entry.value_ptr.triggers);
                 }
                 if (entry.value_ptr.skip_llm_tpl) |tpl| allocator.free(tpl);
-                if (entry.value_ptr.default_arguments) |args| allocator.free(args);
             }
             customizations.deinit(allocator);
         }
@@ -1564,10 +1581,6 @@ pub const Agent = struct {
                 // Duplicate skip_llm_tpl to avoid dangling pointer
                 if (custom_copy.skip_llm_tpl) |tpl| {
                     custom_copy.skip_llm_tpl = try allocator.dupe(u8, tpl);
-                }
-                // Duplicate default_arguments to avoid dangling pointer
-                if (custom_copy.default_arguments) |args| {
-                    custom_copy.default_arguments = try allocator.dupe(u8, args);
                 }
                 result.value_ptr.* = custom_copy;
             }
@@ -1617,10 +1630,6 @@ pub const Agent = struct {
                     // Duplicate skip_llm_tpl to avoid dangling pointer
                     if (custom_copy.skip_llm_tpl) |tpl| {
                         custom_copy.skip_llm_tpl = try allocator.dupe(u8, tpl);
-                    }
-                    // Duplicate default_arguments to avoid dangling pointer
-                    if (custom_copy.default_arguments) |args| {
-                        custom_copy.default_arguments = try allocator.dupe(u8, args);
                     }
                     result.value_ptr.* = custom_copy;
                 } else {
@@ -1747,13 +1756,10 @@ pub const Agent = struct {
                 }
             }
 
-            if (tool_obj.get("default_arguments")) |args_val| {
-                if (args_val == .object) {
-                    // Object format: stringify to JSON string for internal storage
-                    const json_str = try std.json.Stringify.valueAlloc(allocator, args_val, .{});
-                    custom.default_arguments = json_str;
+            if (tool_obj.get("trigger_arguments")) |tav| {
+                if (tav == .object) {
+                    custom.trigger_arguments = tav;
                 }
-                // Note: string format is not supported, only object format
             }
 
             try customizations.put(allocator, custom.name, custom);
@@ -2159,6 +2165,7 @@ pub const Agent = struct {
 
             if (cleaned_input) |ci| {
                 var exact_match_tool: ?[]const u8 = null;
+                var exact_match_args_key: ?[]const u8 = null;
                 var highest_priority: u8 = 0;
                 var priority_tool: ?[]const u8 = null;
 
@@ -2168,14 +2175,26 @@ pub const Agent = struct {
                     if (!custom.enabled or custom.triggers.len == 0) continue;
 
                     for (custom.triggers) |kw| {
-                        if (isExactTriggerMatch(ci, kw)) {
+                    const parsed = parseTriggerKeyword(kw);
+                    const keyword_part = parsed.keyword;
+                    if (ci.len == keyword_part.len) {
+                        var is_match = true;
+                        for (ci, 0..) |c, i| {
+                            if (std.ascii.toLower(c) != std.ascii.toLower(keyword_part[i])) {
+                                is_match = false;
+                                break;
+                            }
+                        }
+                        if (is_match) {
                             if (verbose_mod.isVerbose()) {
                                 log.debug("exact trigger match: tool={s}, keyword='{s}'", .{ custom.name, kw });
                             }
                             exact_match_tool = custom.name;
+                            exact_match_args_key = parsed.args_key;
                             break;
                         }
                     }
+                }
                     if (exact_match_tool != null) break;
                 }
 
@@ -2219,14 +2238,24 @@ pub const Agent = struct {
 
                     if (find_tool_by_name(self.tools, tn)) |tool| {
                         const custom = self.tool_customizations.get(tn);
-                        
-                        // Build arguments from default_arguments or empty object
+
+                        // Build arguments from trigger_arguments
                         const args_json: []const u8 = if (custom) |c| blk: {
-                            if (c.default_arguments) |da| {
-                                const expanded = expandDefaultArguments(self.allocator, da, self.workspace_dir) catch null;
-                                if (expanded) |exp| {
-                                    defer self.allocator.free(exp);
-                                    break :blk try self.allocator.dupe(u8, exp);
+                            if (c.trigger_arguments) |ta| {
+                                if (ta == .object) {
+                                    // Use args_key from trigger match, or "default" if not specified
+                                    const key_to_use = exact_match_args_key orelse "default";
+                                    if (ta.object.get(key_to_use)) |args_val| {
+                                        const json_str = std.json.Stringify.valueAlloc(self.allocator, args_val, .{}) catch null;
+                                        if (json_str) |js| {
+                                            const expanded = expandDefaultArguments(self.allocator, js, self.workspace_dir) catch null;
+                                            self.allocator.free(js);
+                                            if (expanded) |exp| {
+                                                defer self.allocator.free(exp);
+                                                break :blk try self.allocator.dupe(u8, exp);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             break :blk try self.allocator.dupe(u8, "{}");
@@ -7830,13 +7859,42 @@ test "Agent cleanUserInput uses custom punctuation" {
 }
 
 test "Agent isExactTriggerMatch detects exact matches" {
-    try std.testing.expect(isExactTriggerMatch("screenshot", "screenshot"));
-    try std.testing.expect(isExactTriggerMatch("SCREENSHOT", "screenshot"));
-    try std.testing.expect(isExactTriggerMatch("ScreensHot", "screenshot"));
-    try std.testing.expect(isExactTriggerMatch("截屏", "截屏"));
-    try std.testing.expect(!isExactTriggerMatch("screenshot now", "screenshot"));
-    try std.testing.expect(!isExactTriggerMatch("screenshotnow", "screenshot"));
-    try std.testing.expect(!isExactTriggerMatch("some screenshot", "screenshot"));
+    // Match without suffix returns null (use default args)
+    try std.testing.expect(isExactTriggerMatch("screenshot", "screenshot") == null);
+    try std.testing.expect(isExactTriggerMatch("SCREENSHOT", "screenshot") == null);
+    try std.testing.expect(isExactTriggerMatch("ScreensHot", "screenshot") == null);
+    try std.testing.expect(isExactTriggerMatch("截屏", "截屏") == null);
+    // No match returns null
+    try std.testing.expect(isExactTriggerMatch("screenshot now", "screenshot") == null);
+    try std.testing.expect(isExactTriggerMatch("screenshotnow", "screenshot") == null);
+    try std.testing.expect(isExactTriggerMatch("some screenshot", "screenshot") == null);
+}
+
+test "Agent parseTriggerKeyword parses suffix correctly" {
+    const parsed1 = parseTriggerKeyword("查看目录::ls");
+    try std.testing.expectEqualStrings("查看目录", parsed1.keyword);
+    try std.testing.expectEqualStrings("ls", parsed1.args_key.?);
+
+    const parsed2 = parseTriggerKeyword("screenshot");
+    try std.testing.expectEqualStrings("screenshot", parsed2.keyword);
+    try std.testing.expect(parsed2.args_key == null);
+
+    const parsed3 = parseTriggerKeyword("run command::exec");
+    try std.testing.expectEqualStrings("run command", parsed3.keyword);
+    try std.testing.expectEqualStrings("exec", parsed3.args_key.?);
+}
+
+test "Agent isExactTriggerMatch extracts args_key from suffix" {
+    const args_key1 = isExactTriggerMatch("查看目录", "查看目录::ls");
+    try std.testing.expect(args_key1 != null);
+    try std.testing.expectEqualStrings("ls", args_key1.?);
+
+    const args_key2 = isExactTriggerMatch("screenshot", "screenshot");
+    try std.testing.expect(args_key2 == null);
+
+    const args_key3 = isExactTriggerMatch("run command", "run command::exec");
+    try std.testing.expect(args_key3 != null);
+    try std.testing.expectEqualStrings("exec", args_key3.?);
 }
 
 test "execBlockMessage allows all commands when exec_security=full" {

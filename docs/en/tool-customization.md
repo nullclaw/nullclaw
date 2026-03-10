@@ -1,8 +1,12 @@
 # Tool Customization Management
 
-- Add custom system prompts, trigger keywords, and priorities to built-in tools to improve tool invocation accuracy and response speed.
-- Support pre-LLM mode: Configure specific trigger words for tools (e.g., screenshot) to enable direct tool invocation without LLM participation.
-- Support post-LLM mode: Configure the `skip_llm_tpl` parameter for tools (e.g., screenshot) to directly return templated tool output to users without LLM processing.
+Add custom system prompts, trigger keywords, and priorities to built-in tools to improve tool invocation accuracy and response speed.
+
+## Core Features
+
+- **Pre-LLM Mode**: Configure specific trigger words for tools (e.g., screenshot) to enable direct tool invocation without LLM participation
+- **Post-LLM Mode**: Configure the `skip_llm_tpl` parameter for tools (e.g., screenshot) to directly return templated tool output to users without LLM processing
+- **Trigger-Specific Arguments Mapping**: Configure different parameters for each trigger keyword as shortcuts for more flexible tool invocation
 
 ## Quick Start
 
@@ -121,7 +125,7 @@ Edit `~/.nullclaw/config.json` and add `tool_customizations` in the `tools` sect
 | `priority` | number | No | Priority (default: 0); higher values mean higher priority |
 | `enabled` | boolean | No | Whether the tool is enabled (default: true) |
 | `skip_llm_tpl` | string | No | Skip LLM template: when configured, tool output is formatted using this template and returned directly to the user without LLM processing. Supports `{output}` placeholder. Example: "Screenshot saved: {output}" |
-| `default_arguments` | object | No | Default arguments (JSON object): when trigger keywords match exactly, these arguments are used to invoke the tool directly. Format: `{"filename": "{timestamp}.png"}`. Supports variable substitution: `{workspace_dir}` (workspace directory), `{timestamp}` (timestamp), `{date}` (date YYYY-MM-DD), `{time}` (time HH-MM-SS), `{home}` (user home directory) |
+| `trigger_arguments` | object | No | Trigger-specific arguments mapping. Key is the argsKey from trigger suffix (e.g., `"ls"` from `"list directory::ls"`), special key `"default"` is used when no suffix or suffix not found. Format: `{"default": {"command": "ls"}, "ps": {"command": "ps aux"}}`. Supports variable substitution: `{workspace_dir}` (workspace directory), `{timestamp}` (timestamp), `{date}` (date YYYY-MM-DD), `{time}` (time HH-MM-SS), `{home}` (user home directory) |
 | `trigger_modifiers` | string[] | No | Custom modifiers list; removed from input start and end before trigger matching |
 | `trigger_punctuation` | string | No | Custom punctuation; removed from input before trigger matching |
 
@@ -131,7 +135,9 @@ Trigger keywords use an intelligent matching algorithm with two trigger modes:
 
 ### 1. Exact Match (Direct Tool Execution)
 
-When user input **contains only** the trigger keyword (after removing modifiers and punctuation), the tool is executed directly without calling LLM:
+When user input **contains only** the trigger keyword (after removing modifiers and punctuation), the tool is executed directly without calling LLM.
+
+**Note**: Tools configured with `trigger_arguments` allow their triggers to execute directly by default, without additional confirmation. To disable, set `enabled` to `false`.
 
 **Input Cleaning** - removes from both ends:
 - Common modifiers: `please`, `could you`, `can you`, `would you`, `now`, `go`, `start`, `ok`, `begin`, `do`, `execute`, `run`, `take`, `请`, `帮我`, `开始`
@@ -313,35 +319,62 @@ In an agent session, use the following commands to view tool customizations (rea
 }
 ```
 
-### Screenshot Tool (with default_arguments)
+## Trigger Keyword Suffix Identifier (Advanced Feature)
+
+Support adding `::argsKey` suffix to trigger keywords, enabling **different trigger keywords for the same tool to correspond to different parameter configurations**.
+
+### Use Case
+
+For example, the shell tool can have multiple trigger keywords, each executing a different command:
+- `"list directory"` → execute `ls -la`
+- `"show processes"` → execute `ps aux`
+- `"check disk"` → execute `df -h`
+
+### Configuration Format
 
 ```json
 {
-  "name": "screenshot",
-  "system_prompt": "Capture and return a screenshot of the current screen.",
+  "name": "shell",
   "triggers": [
-    "screenshot",
-    "capture"
+    "run command",
+    "list directory::ls",
+    "show processes::ps",
+    "check disk::df"
   ],
-  "priority": 10,
-  "enabled": true,
-  "default_arguments": {
-    "filename": "screenshot_{timestamp}.png"
-  },
-  "skip_llm_tpl": "Screenshot saved: {output}"
+  "trigger_arguments": {
+    "default": {
+      "command": "echo 'No command specified'"
+    },
+    "ls": {
+      "command": "ls -la"
+    },
+    "ps": {
+      "command": "ps aux"
+    },
+    "df": {
+      "command": "df -h"
+    }
+  }
 }
 ```
 
-**Note**: When user input exactly matches a trigger keyword (e.g., "screenshot"), the tool will use the parameters configured in `default_arguments` to invoke directly, without LLM participating in parameter parsing. Supports the following variable substitutions:
-- `{workspace_dir}` - Current workspace directory
-- `{timestamp}` - Timestamp (milliseconds)
-- `{date}` - Date (YYYY-MM-DD)
-- `{time}` - Time (HH-MM-SS)
-- `{home}` - User home directory
+### Matching Rules
 
-## Tool default_arguments Examples
+| User Input | Trigger Config | Matching Keyword | Args Key Used | Command Executed |
+|-----------|---------------|-----------------|--------------|-----------------|
+| "list directory" | `"list directory::ls"` | "list directory" | `"ls"` | `ls -la` |
+| "show processes" | `"show processes::ps"` | "show processes" | `"ps"` | `ps aux` |
+| "check disk" | `"check disk::df"` | "check disk" | `"df"` | `df -h` |
+| "run command" | `"run command"` | "run command" | `"default"` | `echo 'No command specified'` |
 
-Below are `default_arguments` examples for common tools:
+**Notes**:
+- The suffix `::argsKey` does not participate in matching, only used for selecting parameter configuration
+- Trigger keywords without suffix use the `"default"` key's parameters
+- If the key corresponding to the suffix does not exist, fall back to the `"default"` key
+
+## `trigger_arguments` Examples for Common Tools
+
+Below are `trigger_arguments` examples for common tools:
 
 ### screenshot
 
@@ -349,8 +382,10 @@ Below are `default_arguments` examples for common tools:
 {
   "name": "screenshot",
   "triggers": ["screenshot", "capture"],
-  "default_arguments": {
-    "filename": "screenshot_{timestamp}.png"
+  "trigger_arguments": {
+    "default": {
+      "filename": "screenshot_{timestamp}.png"
+    }
   }
 }
 ```
@@ -358,15 +393,30 @@ Below are `default_arguments` examples for common tools:
 **Available parameters**:
 - `filename` (string): Screenshot filename, saved to workspace directory
 
-### shell
+### shell - With Suffix Identifier Example
 
 ```json
 {
   "name": "shell",
-  "triggers": ["run command", "execute"],
-  "default_arguments": {
-    "command": "ls -la",
-    "cwd": "{workspace_dir}"
+  "triggers": [
+    "run command",
+    "list directory::ls",
+    "show processes::ps",
+    "check disk::df"
+  ],
+  "trigger_arguments": {
+    "default": {
+      "command": "echo 'No command specified'"
+    },
+    "ls": {
+      "command": "ls -la"
+    },
+    "ps": {
+      "command": "ps aux"
+    },
+    "df": {
+      "command": "df -h"
+    }
   }
 }
 ```
@@ -375,14 +425,51 @@ Below are `default_arguments` examples for common tools:
 - `command` (string, required): Shell command to execute
 - `cwd` (string): Working directory (defaults to workspace root)
 
+### file_write - With Suffix Identifier Example
+
+```json
+{
+  "name": "file_write",
+  "triggers": [
+    "write note::note",
+    "write config::config",
+    "write log::log"
+  ],
+  "trigger_arguments": {
+    "default": {
+      "path": "output.txt",
+      "content": ""
+    },
+    "note": {
+      "path": "notes_{date}.md",
+      "content": "# Notes for {date}\n\n"
+    },
+    "config": {
+      "path": "config.json",
+      "content": "{\n  \"version\": \"1.0.0\"\n}"
+    },
+    "log": {
+      "path": "app_{date}.log",
+      "content": "Log started at {time}\n\n"
+    }
+  }
+}
+```
+
+**Available parameters**:
+- `path` (string, required): File path relative to workspace
+- `content` (string, required): File content
+
 ### file_read
 
 ```json
 {
   "name": "file_read",
   "triggers": ["read file", "view file"],
-  "default_arguments": {
-    "path": "README.md"
+  "trigger_arguments": {
+    "default": {
+      "path": "README.md"
+    }
   }
 }
 ```
@@ -396,9 +483,11 @@ Below are `default_arguments` examples for common tools:
 {
   "name": "file_write",
   "triggers": ["write file", "create file"],
-  "default_arguments": {
-    "path": "notes_{date}.md",
-    "content": "# Notes for {date}\n\n"
+  "trigger_arguments": {
+    "default": {
+      "path": "notes_{date}.md",
+      "content": "# Notes for {date}\n\n"
+    }
   }
 }
 ```
@@ -413,10 +502,12 @@ Below are `default_arguments` examples for common tools:
 {
   "name": "file_edit",
   "triggers": ["edit file", "modify file"],
-  "default_arguments": {
-    "path": "config.txt",
-    "old_string": "old_value",
-    "new_string": "new_value"
+  "trigger_arguments": {
+    "default": {
+      "path": "config.txt",
+      "old_string": "old_value",
+      "new_string": "new_value"
+    }
   }
 }
 ```
@@ -432,8 +523,10 @@ Below are `default_arguments` examples for common tools:
 {
   "name": "git",
   "triggers": ["git status", "check git"],
-  "default_arguments": {
-    "command": "status"
+  "trigger_arguments": {
+    "default": {
+      "command": "status"
+    }
   }
 }
 ```
@@ -447,8 +540,10 @@ Below are `default_arguments` examples for common tools:
 {
   "name": "browser_open",
   "triggers": ["open url", "browse"],
-  "default_arguments": {
-    "url": "https://example.com"
+  "trigger_arguments": {
+    "default": {
+      "url": "https://example.com"
+    }
   }
 }
 ```
@@ -462,8 +557,10 @@ Below are `default_arguments` examples for common tools:
 {
   "name": "web_fetch",
   "triggers": ["fetch page", "get content"],
-  "default_arguments": {
-    "url": "https://example.com/article"
+  "trigger_arguments": {
+    "default": {
+      "url": "https://example.com/article"
+    }
   }
 }
 ```
@@ -477,20 +574,22 @@ Below are `default_arguments` examples for common tools:
 {
   "name": "http_request",
   "triggers": ["api request", "http call"],
-  "default_arguments": {
-    "url": "https://api.example.com/data",
-    "method": "GET"
+  "trigger_arguments": {
+    "default": {
+      "url": "https://api.example.com/data",
+      "method": "GET"
+    }
   }
 }
 ```
 
 **Available parameters**:
 - `url` (string, required): Request URL
-- `method` (string): HTTP method (GET, POST, PUT, DELETE, etc., default: GET)
+- `method` (string): HTTP method (GET, POST, PUT, DELETE, etc., default GET)
 
 ### View All Tool Parameters
 
-Use the following command to view parameter definitions for all built-in tools:
+Use the following command to view all built-in tool parameter definitions:
 
 ```bash
 nullclaw tools show --builtin
@@ -500,25 +599,25 @@ nullclaw tools show --builtin
 
 ### Issue: `nullclaw tools show` displays "No tool customizations configured"
 
-**Solution**:
+**Solutions**:
 1. Check if the configuration file path is correct
 2. Confirm that the `tool_customizations` field exists in the `tools` object
-3. Verify the JSON format is correct
+3. Verify that the JSON format is correct
 
-### Issue: Configuration changes don't take effect
+### Issue: Configuration changes not taking effect
 
-**Solution**:
+**Solutions**:
 1. Restart the agent process
 2. Check if the configuration file syntax is correct
-3. Run `nullclaw tools validate` to validate the configuration
+3. Run `nullclaw tools validate` to verify the configuration
 
-### Issue: Tool is not being triggered
+### Issue: Tool not being triggered
 
-**Solution**:
-1. Check if the `enabled` field is `true`
-2. Confirm trigger keywords are correct
-3. Check if priority settings are reasonable
-4. Check logs to understand tool invocation behavior
+**Solutions**:
+1. Check if the `enabled` field is set to `true`
+2. Confirm that the trigger keywords are correct
+3. Check if the priority settings are reasonable
+4. View logs to understand tool invocation status
 
 ## Related Files
 

@@ -256,11 +256,12 @@ pub const ToolCustomization = struct {
     /// Template format: supports {output} placeholder for tool output.
     /// Example: "Screenshot saved: {output}"
     skip_llm_tpl: ?[]const u8 = null,
-    /// Default arguments for direct tool execution (pre-LLM mode).
-    /// When a trigger keyword exactly matches, these arguments are used to call the tool.
-    /// Supports variable substitution: {workspace_dir}, {timestamp}, {date}, {time}, {home}
-    /// Format: JSON object like {"filename": "{timestamp}.png"}
-    default_arguments: ?[]const u8 = null,
+    /// Trigger-specific arguments mapping for direct tool execution (pre-LLM mode).
+    /// Key is the argsKey from trigger suffix (e.g., "ls" from "查看目录::ls").
+    /// Special key "default" is used when trigger has no suffix or suffix not found.
+    /// Format: {"default": {"command": "ls"}, "ps": {"command": "ps aux"}}
+    /// Supports variable substitution in values: {workspace_dir}, {timestamp}, {date}, {time}, {home}
+    trigger_arguments: ?std.json.Value = null,
 };
 
 pub const ModelRouteCostClass = enum {
