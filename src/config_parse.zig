@@ -1029,13 +1029,14 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             try custom_list.append(self.allocator, custom);
                         }
                     }
-                    self.tools.tool_customizations = try custom_list.toOwnedSlice(self.allocator);
                     
                     // Auto-add shell commands from trigger_arguments to allowed_commands
                     // This improves usability by allowing configured tool triggers to work without manual allowed_commands setup
+                    // Full command strings are added for exact matching
                     var shell_commands: std.ArrayListUnmanaged([]const u8) = .empty;
                     defer shell_commands.deinit(self.allocator);
                     
+                    // Process custom_list BEFORE calling toOwnedSlice, as it will clear the list
                     for (custom_list.items) |custom| {
                         // Only process shell tool
                         if (!std.mem.eql(u8, custom.name, "shell")) continue;
@@ -1050,19 +1051,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                             if (cmd_val == .string) {
                                                 const cmd_str = cmd_val.string;
                                                 
-                                                // Extract the base command (first word, before any space or pipe)
-                                                var base_cmd: []const u8 = cmd_str;
-                                                if (std.mem.indexOfScalar(u8, cmd_str, ' ')) |idx| {
-                                                    base_cmd = cmd_str[0..idx];
+                                                // Normalize command string (remove newlines and extra whitespace)
+                                                const normalized_cmd = std.mem.trim(u8, cmd_str, " \t\r\n");
+                                                var cmd_buf: [1024]u8 = undefined;
+                                                var cmd_idx: usize = 0;
+                                                for (normalized_cmd) |c| {
+                                                    if (c == '\n' or c == '\r') {
+                                                        if (cmd_idx > 0 and cmd_buf[cmd_idx - 1] != ' ') {
+                                                            cmd_buf[cmd_idx] = ' ';
+                                                            cmd_idx += 1;
+                                                        }
+                                                    } else {
+                                                        cmd_buf[cmd_idx] = c;
+                                                        cmd_idx += 1;
+                                                    }
                                                 }
-                                                if (std.mem.indexOfScalar(u8, cmd_str, '|')) |idx| {
-                                                    base_cmd = cmd_str[0..idx];
-                                                }
+                                                const final_cmd = std.mem.trim(u8, cmd_buf[0..cmd_idx], " \t\r\n");
                                                 
                                                 // Check if command is in disable_commands
                                                 var is_disabled = false;
                                                 for (self.autonomy.disable_commands) |disabled| {
-                                                    if (std.mem.eql(u8, base_cmd, disabled)) {
+                                                    if (std.mem.eql(u8, final_cmd, disabled)) {
                                                         is_disabled = true;
                                                         break;
                                                     }
@@ -1071,15 +1080,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                                 // Check if already in allowed_commands
                                                 var already_allowed = false;
                                                 for (self.autonomy.allowed_commands) |allowed| {
-                                                    if (std.mem.eql(u8, base_cmd, allowed)) {
+                                                    if (std.mem.eql(u8, final_cmd, allowed)) {
                                                         already_allowed = true;
                                                         break;
                                                     }
                                                 }
                                                 
-                                                // Add to shell_commands if not disabled and not already allowed
+                                                // Add full command string to shell_commands if not disabled and not already allowed
                                                 if (!is_disabled and !already_allowed) {
-                                                    try shell_commands.append(self.allocator, try self.allocator.dupe(u8, base_cmd));
+                                                    try shell_commands.append(self.allocator, try self.allocator.dupe(u8, final_cmd));
                                                 }
                                             }
                                         }
@@ -1088,6 +1097,8 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                         }
                     }
+                    
+                    self.tools.tool_customizations = try custom_list.toOwnedSlice(self.allocator);
                     
                     // Merge shell_commands into allowed_commands
                     if (shell_commands.items.len > 0) {
@@ -1101,7 +1112,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             idx += 1;
                         }
                         
-                        // Add new shell_commands
+                        // Add new shell_commands (full command strings)
                         for (shell_commands.items) |cmd| {
                             merged[idx] = cmd;
                             idx += 1;

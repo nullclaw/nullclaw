@@ -2336,8 +2336,29 @@ pub const Agent = struct {
                             .content = try self.allocator.dupe(u8, final_output),
                         });
 
+                        // Auto-save tool result to memory for future context
+                        if (self.auto_save) {
+                            if (self.mem) |mem| {
+                                const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                                const save_key = std.fmt.allocPrint(self.allocator, "autosave_tool_{d}", .{ts}) catch null;
+                                if (save_key) |key| {
+                                    defer self.allocator.free(key);
+                                    // Store both the trigger and the tool result
+                                    const tool_result_msg = try std.fmt.allocPrint(self.allocator, "Tool '{s}' executed: {s}", .{ tn, final_output });
+                                    defer self.allocator.free(tool_result_msg);
+                                    
+                                    if (mem.store(key, tool_result_msg, .conversation, self.memory_session_id)) |_| {
+                                        // Vector sync after auto-save
+                                        if (self.mem_rt) |rt| {
+                                            rt.syncVectorAfterStore(self.allocator, key, tool_result_msg);
+                                        }
+                                    } else |_| {}
+                                }
+                            }
+                        }
+
                         if (verbose_mod.isVerbose()) {
-                            log.debug("exact match tool result: {s}", .{final_output});
+                            log.debug("exact trigger match: tool={s}", .{ tn });
                         }
 
                         // Print output to console (since cli.zig may skip printing for streaming)

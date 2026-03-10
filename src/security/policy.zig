@@ -221,6 +221,24 @@ pub const SecurityPolicy = struct {
         const norm_len = normalizeCommand(command, &normalized);
         const norm = normalized[0..norm_len];
 
+        // First, check if the full command is in allowed_commands (exact match)
+        // This allows full command strings from trigger_arguments to work
+        var full_match = false;
+        for (self.allowed_commands) |raw_allowed| {
+            const allowed = std.mem.trim(u8, raw_allowed, " \t\r\n");
+            if (allowed.len == 0) continue;
+            if (std.mem.eql(u8, allowed, command)) {
+                full_match = true;
+                break;
+            }
+        }
+
+        // If full command matches, allow it without further checks
+        if (full_match) {
+            return true;
+        }
+
+        // Otherwise, fall back to per-segment checking
         var has_cmd = false;
         var iter = std.mem.splitScalar(u8, norm, 0);
         while (iter.next()) |raw_segment| {
