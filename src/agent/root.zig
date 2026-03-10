@@ -2141,7 +2141,9 @@ pub const Agent = struct {
         defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
 
         // Check for tool trigger keywords and handle exact/priority matching
-        const processed_user_message = effective_user_message;
+        var processed_user_message: []const u8 = effective_user_message;
+        var processed_user_message_owned = false;
+        defer if (processed_user_message_owned) self.allocator.free(processed_user_message);
 
         if (self.tool_customizations.count() > 0) {
             const cleaned_input = cleanUserInput(
@@ -2206,24 +2208,113 @@ pub const Agent = struct {
                     }
                 }
 
-                // TEMPORARY: Comment out exact match tool handling to test if panic is caused by this block
-                // if (exact_match_tool) |tn| {
-                //     if (verbose_mod.isVerbose()) {
-                //         log.debug("executing tool directly due to exact trigger match", .{});
-                //     }
+                // Handle exact match tool: execute directly without LLM
+                if (exact_match_tool) |tn| {
+                    if (verbose_mod.isVerbose()) {
+                        log.debug("executing tool directly due to exact trigger match: {s}", .{tn});
+                    }
 
-                //     if (find_tool_by_name(self.tools, tn)) |_| {
-                //         // Execute tool and return result in a separate scope to avoid defer execution
-                //         const custom = self.tool_customizations.get(tn);
-                //         // TEMPORARY: Just return a hard-coded string to test if the issue is with the function itself
-                //         return try self.allocator.dupe(u8, "TOOL_EXECUTED");
-                //     } else {
-                //         std.debug.warn("DEBUG: tool NOT found tn={s}\n", .{tn});
-                //     }
-                // } else if (priority_tool) |pn| {
-                //     const processed = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
-                //     processed_user_message = processed;
-                // }
+                    if (find_tool_by_name(self.tools, tn)) |tool| {
+                        const custom = self.tool_customizations.get(tn);
+                        
+                        // Build arguments from default_arguments or empty object
+                        const args_json: []const u8 = if (custom) |c| blk: {
+                            if (c.default_arguments) |da| {
+                                const expanded = expandDefaultArguments(self.allocator, da, self.workspace_dir) catch null;
+                                if (expanded) |exp| {
+                                    defer self.allocator.free(exp);
+                                    break :blk try self.allocator.dupe(u8, exp);
+                                }
+                            }
+                            break :blk try self.allocator.dupe(u8, "{}");
+                        } else try self.allocator.dupe(u8, "{}");
+                        defer self.allocator.free(args_json);
+
+                        // Execute tool
+                        var arena = std.heap.ArenaAllocator.init(self.allocator);
+                        defer arena.deinit();
+                        const tool_arena = arena.allocator();
+
+                        const parsed = std.json.parseFromSlice(
+                            std.json.Value,
+                            tool_arena,
+                            args_json,
+                            .{},
+                        ) catch {
+                            const err_msg = try std.fmt.allocPrint(self.allocator, "Invalid arguments JSON: {s}", .{args_json});
+                            return err_msg;
+                        };
+                        const args: std.json.ObjectMap = switch (parsed.value) {
+                            .object => |o| o,
+                            else => {
+                                return try self.allocator.dupe(u8, "Arguments must be a JSON object");
+                            },
+                        };
+
+                        const result = tool.execute(tool_arena, args) catch |err| {
+                            const err_msg = try std.fmt.allocPrint(self.allocator, "Tool execution error: {s}", .{@errorName(err)});
+                            return err_msg;
+                        };
+
+                        // Copy output from arena to self.allocator since arena will be freed
+                        const output = if (result.success) 
+                            try self.allocator.dupe(u8, result.output)
+                        else 
+                            try self.allocator.dupe(u8, result.error_msg orelse result.output);
+                        defer self.allocator.free(output);
+
+                        // Apply skip_llm_tpl if configured
+                        const final_output: []const u8 = if (custom) |c| blk2: {
+                            if (c.skip_llm_tpl) |tpl| {
+                                var output_buf: std.ArrayListUnmanaged(u8) = .empty;
+                                try output_buf.ensureTotalCapacity(self.allocator, tpl.len + output.len);
+                                var pos: usize = 0;
+                                while (pos < tpl.len) {
+                                    if (std.mem.indexOfPos(u8, tpl, pos, "{output}")) |idx| {
+                                        try output_buf.appendSlice(self.allocator, tpl[pos..idx]);
+                                        try output_buf.appendSlice(self.allocator, output);
+                                        pos = idx + 8;
+                                    } else {
+                                        try output_buf.appendSlice(self.allocator, tpl[pos..]);
+                                        break;
+                                    }
+                                }
+                                break :blk2 try output_buf.toOwnedSlice(self.allocator);
+                            }
+                            break :blk2 try self.allocator.dupe(u8, output);
+                        } else try self.allocator.dupe(u8, output);
+
+                        // Save to history so LLM knows what happened
+                        try self.history.append(self.allocator, .{
+                            .role = .user,
+                            .content = try self.allocator.dupe(u8, effective_user_message),
+                        });
+                        try self.history.append(self.allocator, .{
+                            .role = .assistant,
+                            .content = try self.allocator.dupe(u8, final_output),
+                        });
+
+                        if (verbose_mod.isVerbose()) {
+                            log.debug("exact match tool result: {s}", .{final_output});
+                        }
+
+                        // Print output to console (since cli.zig may skip printing for streaming)
+                        if (!builtin.is_test) {
+                            var out_buf: [4096]u8 = undefined;
+                            var bw = std.fs.File.stdout().writer(&out_buf);
+                            const w = &bw.interface;
+                            w.print("{s}\n", .{final_output}) catch {};
+                            w.flush() catch {};
+                        }
+
+                        return final_output;
+                    }
+                } else if (priority_tool) |pn| {
+                    // Priority tool: inject hint into message
+                    const processed = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
+                    processed_user_message = processed;
+                    processed_user_message_owned = true;
+                }
             }
         }
 
