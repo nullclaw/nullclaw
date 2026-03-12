@@ -22,20 +22,8 @@ This guide covers the main installation paths for macOS, Linux, and Windows.
 - [Commands](./commands.md): come here first if the CLI is missing or `nullclaw --help` does not work yet
 - [Development](./development.md): return here if a contributor workflow also needs a clean local binary setup
 
-## Prerequisites
-
-- If building from source, use **Zig 0.15.2**.
-- Git (required for source install).
-
-Check Zig version:
-
-```bash
-zig version
-```
-
-The output must be `0.15.2`.
-
-## Option 1: Homebrew (recommended for macOS/Linux)
+## Option 1: Start from Binary File
+### Homebrew (recommended for macOS/Linux)
 
 ```bash
 brew install nullclaw
@@ -48,56 +36,55 @@ Here is the English translation of your content with preserved formatting:
 
 ---
 
-**cmd (for Windows)**
+## CMD (for Windows)
 
-Check Zig version:
-```cmd
-zig version
-```
+You can directly execute the downloaded nullclaw binary file (.exe) in the command line.  
 
-If the output shows similar content as below, it means Zig is installed correctly:
-```cmd
-x:\zig version
-0.16.0-dev.2736+3b515fbed
-```
+For example, the command to check the nullclaw version is as follows:  
 
-Otherwise, check  https://ziglang.org/download/ and install zig, then configure Zig's system variable in "Path" to make sure above zig version is showed correctly if needed(if you install it with zig binary exe file).
+```cmd Add parameters to the nullclaw binary filename
+x:\path\nullclaw-xxx version
+```  
 
-Rename the downloaded nullclaw binary file (`.exe`) to `nullclaw.exe`.
+For convenience, you can rename the downloaded nullclaw binary file (.exe) to `nullclaw.exe`,  
+then execute the following command in PowerShell with administrator privileges to add the path where the file is located to the Windows system environment variable $PATH:  
 
-Check the current nullclaw version in the command line:
-```cmd
-nullclaw version
-```
-
-If it displays the version matching the nullclaw binary (like below), installation is successful:
-
-```cmd
-x:\path>zig version
-0.16.0-dev.2736+3b515fbed
-```
-
-If not, run the following command in PowerShell **as administrator** to add the current path to Windows system variable `PATH`:
-
-```powershell (Admin)
+```PowerShell with Administrator privileges
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
-$new = "$old;x:\binary_directory"
+$new = "$old;x:\nullclaw_exe_file_path"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")
-```
+```  
 
-Verify again in the command line:
+Then you can run the nullclaw command from any path in a new command line(to make sure the EnvironmentVariable effective ). 
+
+For example, the command to check the nullclaw version is as follow:  
 
 ```cmd
-nullclaw version
-```
+x:\any_path\nullclaw version
+```  
 
-Successful installation will show the version matching your nullclaw binary (example):
+If the version number matchs the current nullclaw binary file (similar as below), it means the modifications works.  
+
 ```cmd
-x:\you_nullclaw_exe_path>nullclaw version
+x:\any_path>nullclaw version
 nullclaw 2026.3.11
 ```
 
+
 ## Option 2: Build from Source (cross-platform)
+
+### Prerequisites
+
+- If building from source, use **Zig 0.15.2**.
+- Git (required for source install).
+
+Check Zig version:
+
+```bash
+zig version
+```
+
+The output must be `0.15.2`.
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
