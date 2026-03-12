@@ -27,8 +27,27 @@ zig version
 brew install nullclaw
 nullclaw --help
 ```
-
 如果命令可用，说明安装成功。
+
+cmd(Windows)
+将下载的二进制文件（.exe)改名为nullclaw.exe，
+再在命令行中查看当前版本号
+```cmd
+nullclaw version
+```
+如果显示出与当前二进制文件nullclaw对应的版本号就表示安装成功，
+否则以管理员权限在Powershell中执行如下命令，将当前路径加入到windows系统变量PATH中：
+
+```powershell 管理员权限
+$old = [Environment]::GetEnvironmentVariable("Path", "Machine")
+$new = "$old;x:\二进制文件所在目录"
+[Environment]::SetEnvironmentVariable("Path", $new, "Machine")
+```
+再在命令行中查看当前版本号
+```cmd
+nullclaw version
+```
+如果显示出与当前二进制文件nullclaw对应的版本号就表示安装成功。
 
 ## 方式二：源码构建（通用）
 
