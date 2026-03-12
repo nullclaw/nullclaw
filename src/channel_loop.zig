@@ -1202,8 +1202,8 @@ fn deredactPii(allocator: std.mem.Allocator, text: []const u8, msg_id: []const u
 // runEmailLoop — polling thread function
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Thread-entry function for Email IMAP polling.
-/// Uses curl's native IMAP support to poll for unseen messages.
+/// Thread-entry function for Email IMAP.
+/// Dispatches to IDLE mode (persistent connection) or polling (curl) based on config.
 pub fn runEmailLoop(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -1213,6 +1213,311 @@ pub fn runEmailLoop(
 ) void {
     loop_state.last_activity.store(std.time.timestamp(), .release);
 
+    if (em_ptr.config.imap_idle) {
+        runEmailIdleLoop(allocator, config, runtime, loop_state, em_ptr);
+    } else {
+        runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+    }
+}
+
+/// IDLE-based email loop — persistent TLS+IMAP connection with push notifications.
+fn runEmailIdleLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *EmailLoopState,
+    em_ptr: *email.EmailChannel,
+) void {
+    var imap = email.ImapClient.init(allocator, em_ptr.config);
+    defer imap.disconnect();
+
+    var evict_counter: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        // ── Connect phase ────────────────────────────────────────────
+        imap.connect() catch {
+            imap.backoff();
+            if (imap.shouldFallbackToPoll()) {
+                log.warn("IMAP IDLE: too many connect failures, falling back to poll mode", .{});
+                runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+                return;
+            }
+            continue;
+        };
+
+        imap.login() catch {
+            imap.disconnect();
+            imap.backoff();
+            if (imap.shouldFallbackToPoll()) {
+                log.warn("IMAP IDLE: login failures, falling back to poll mode", .{});
+                runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+                return;
+            }
+            continue;
+        };
+
+        imap.capability() catch {
+            imap.disconnect();
+            imap.backoff();
+            continue;
+        };
+
+        if (!imap.server_supports_idle) {
+            log.info("IMAP server lacks IDLE capability, using poll mode", .{});
+            imap.logout();
+            runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+            return;
+        }
+
+        imap.selectFolder() catch {
+            imap.disconnect();
+            imap.backoff();
+            continue;
+        };
+
+        // Connected successfully
+        imap.resetBackoff();
+        log.info("IMAP IDLE mode active", .{});
+
+        // ── Main IDLE loop ───────────────────────────────────────────
+        inner: while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+            // Check for unseen messages before entering IDLE
+            const uids = imap.searchUnseen(allocator) catch break :inner;
+            defer {
+                for (uids) |uid| allocator.free(uid);
+                allocator.free(uids);
+            }
+
+            // Process new messages
+            for (uids) |uid| {
+                if (em_ptr.seen_uids.contains(uid)) continue;
+
+                // Fetch raw email via native IMAP
+                const raw_email = imap.fetchMessage(allocator, uid) catch |err| {
+                    log.warn("IMAP IDLE: failed to fetch UID {s}: {}", .{ uid, err });
+                    continue;
+                };
+                defer allocator.free(raw_email);
+
+                // Reuse existing email processing pipeline
+                processIncomingEmail(allocator, config, runtime, em_ptr, uid, raw_email);
+
+                // Mark seen on the server
+                imap.storeSeen(uid) catch {};
+            }
+
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            health.markComponentOk("email");
+
+            evict_counter += 1;
+            if (evict_counter >= 100) {
+                evict_counter = 0;
+                _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+            }
+
+            // Enter IDLE — blocks until new mail, timeout renewal, or shutdown
+            const result = imap.idle(&loop_state.stop_requested) catch break :inner;
+            switch (result) {
+                .new_mail => continue :inner, // loop back to searchUnseen
+                .renewal => continue :inner, // 25-min renewal
+                .shutdown => {
+                    imap.logout();
+                    return;
+                },
+            }
+        }
+
+        // Broke out of inner loop — reconnect
+        imap.disconnect();
+        imap.backoff();
+    }
+
+    // Clean shutdown
+    imap.logout();
+}
+
+/// Process a single incoming email — extracted from the poll loop for reuse.
+/// Handles parsing, allowlist check, PII, agent dispatch, and reply.
+fn processIncomingEmail(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    em_ptr: *email.EmailChannel,
+    uid: []const u8,
+    raw_email_data: []const u8,
+) void {
+    const parsed = email.parseRawEmail(raw_email_data);
+    const sender_addr = email.extractEmailAddress(parsed.from);
+
+    const is_known_sender = em_ptr.isSenderAllowed(sender_addr);
+    if (!is_known_sender) {
+        log.info("Email from unknown sender: {s} — forwarding to agent for triage", .{sender_addr});
+    }
+
+    var body_text = email.extractTextBody(allocator, raw_email_data) catch return;
+    defer allocator.free(body_text);
+
+    const max_bytes = em_ptr.config.max_body_bytes;
+    var final_content: []u8 = undefined;
+
+    if (body_text.len > max_bytes) {
+        final_content = std.fmt.allocPrint(allocator, "{s}\n[TRUNCATED - original was {d} bytes]", .{
+            body_text[0..max_bytes], body_text.len,
+        }) catch return;
+    } else {
+        final_content = allocator.dupe(u8, body_text) catch return;
+    }
+
+    // Injection check
+    if (email.basicInjectionCheck(final_content)) {
+        log.warn("Injection pattern detected in email from {s}", .{sender_addr});
+        allocator.free(final_content);
+        _ = em_ptr.seen_uids.insert(uid) catch {};
+        return;
+    }
+
+    // Extract and save attachments
+    var saved_attachments: []channels_mod.Attachment = &.{};
+    if (em_ptr.config.attachment_save_enabled) {
+        saved_attachments = email.extractAndSaveAttachments(
+            allocator,
+            raw_email_data,
+            em_ptr.config.attachment_save_dir,
+            em_ptr.config.attachment_extensions,
+            em_ptr.config.attachment_max_bytes,
+            uid,
+        ) catch &.{};
+    }
+
+    // Build attachment info text
+    var attachment_info: []u8 = &.{};
+    defer if (attachment_info.len > 0) allocator.free(attachment_info);
+
+    if (saved_attachments.len > 0) {
+        var info_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer info_buf.deinit(allocator);
+        const writer = info_buf.writer(allocator);
+        writer.writeAll("\n\n[ATTACHMENTS]\n") catch {};
+        for (saved_attachments) |att| {
+            writer.print("- {s} (saved to: {s})\n", .{ att.filename, att.path }) catch {};
+        }
+        writer.writeAll("[/ATTACHMENTS]") catch {};
+        attachment_info = info_buf.toOwnedSlice(allocator) catch &.{};
+    }
+
+    // Wrap with security markers
+    const tag_start: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_START]" else "[UNKNOWN_SENDER_START]";
+    const tag_end: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_END]" else "[UNKNOWN_SENDER_END]";
+    const wrapped = if (attachment_info.len > 0)
+        std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n{s}", .{
+            tag_start, sender_addr, parsed.subject, final_content, attachment_info, tag_end,
+        }) catch {
+            allocator.free(final_content);
+            return;
+        }
+    else
+        std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}\n{s}", .{
+            tag_start, sender_addr, parsed.subject, final_content, tag_end,
+        }) catch {
+            allocator.free(final_content);
+            return;
+        };
+    allocator.free(final_content);
+    defer allocator.free(wrapped);
+
+    // Track Message-ID for threading
+    if (parsed.message_id.len > 0) {
+        em_ptr.trackMessageId(sender_addr, parsed.message_id) catch {};
+    }
+
+    // Mark as seen in dedup set
+    _ = em_ptr.seen_uids.insert(uid) catch {};
+
+    // ── Agent dispatch ───────────────────────────────────────────
+    var key_buf: [192]u8 = undefined;
+    var routed_session_key: ?[]const u8 = null;
+    defer if (routed_session_key) |key| allocator.free(key);
+
+    const session_key = blk: {
+        const route = agent_routing.resolveRouteWithSession(allocator, .{
+            .channel = "email",
+            .account_id = em_ptr.config.account_id,
+            .peer = .{
+                .kind = .direct,
+                .id = sender_addr,
+            },
+        }, config.agent_bindings, config.agents, config.session) catch break :blk
+            std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ em_ptr.config.account_id, sender_addr }) catch sender_addr;
+
+        allocator.free(route.main_session_key);
+        routed_session_key = route.session_key;
+        break :blk route.session_key;
+    };
+
+    // PII redaction (pre-LLM)
+    const pii_enabled = em_ptr.config.pii_redaction;
+    var redacted_content: ?[]u8 = null;
+    defer if (redacted_content) |rc| allocator.free(rc);
+
+    const content_for_llm = if (pii_enabled) pii_blk: {
+        redacted_content = redactPii(allocator, wrapped, uid, sender_addr, em_ptr.config.pii_spacy);
+        if (redacted_content) |rc| {
+            break :pii_blk rc;
+        } else {
+            log.warn("PII redaction failed, using original content", .{});
+            break :pii_blk wrapped;
+        }
+    } else wrapped;
+
+    const reply = runtime.session_mgr.processMessage(session_key, content_for_llm, null) catch |err| {
+        log.err("Email agent error: {}", .{err});
+        const err_msg: []const u8 = switch (err) {
+            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+            error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+            error.NoResponseContent => "Model returned an empty response. Please try again.",
+            error.AllProvidersFailed => "All configured providers failed for this request.",
+            error.OutOfMemory => "Out of memory.",
+            else => "An error occurred. Try again.",
+        };
+        em_ptr.sendReply(sender_addr, parsed.subject, err_msg) catch |send_err| log.err("failed to send email error reply: {}", .{send_err});
+        return;
+    };
+    defer allocator.free(reply);
+
+    // PII de-redaction (post-LLM)
+    var deredacted_reply: ?[]u8 = null;
+    defer if (deredacted_reply) |dr| allocator.free(dr);
+
+    const final_reply = if (pii_enabled) deredact_blk: {
+        deredacted_reply = deredactPii(allocator, reply, uid);
+        if (deredacted_reply) |dr| {
+            break :deredact_blk dr;
+        } else {
+            log.warn("PII de-redaction failed, using redacted reply", .{});
+            break :deredact_blk reply;
+        }
+    } else reply;
+
+    // If the agent prefixes its reply with [NO_REPLY], suppress the email reply.
+    // Used for unknown sender triage where the agent handles routing via tools.
+    if (std.mem.startsWith(u8, std.mem.trimLeft(u8, final_reply, " \t\n"), "[NO_REPLY]")) {
+        log.info("Email reply suppressed by [NO_REPLY] marker for {s}", .{sender_addr});
+        return;
+    }
+
+    em_ptr.sendReply(sender_addr, parsed.subject, final_reply) catch |err| {
+        log.warn("Email send error: {}", .{err});
+    };
+}
+
+/// Curl-based polling loop (fallback when IDLE is unavailable or disabled).
+fn runEmailPollLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *EmailLoopState,
+    em_ptr: *email.EmailChannel,
+) void {
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
@@ -1246,7 +1551,7 @@ pub fn runEmailLoop(
                 break :blk route.session_key;
             };
 
-            // ── PII redaction (pre-LLM) ──────────────────────────────
+            // PII redaction (pre-LLM)
             const pii_enabled = em_ptr.config.pii_redaction;
             var redacted_content: ?[]u8 = null;
             defer if (redacted_content) |rc| allocator.free(rc);
@@ -1279,7 +1584,7 @@ pub fn runEmailLoop(
             };
             defer allocator.free(reply);
 
-            // ── PII de-redaction (post-LLM) ─────────────────────────
+            // PII de-redaction (post-LLM)
             var deredacted_reply: ?[]u8 = null;
             defer if (deredacted_reply) |dr| allocator.free(dr);
 

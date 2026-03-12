@@ -325,7 +325,7 @@ pub const EmailChannel = struct {
         var child = std.process.Child.init(argv_buf[0..argc], allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
 
         try child.spawn();
 
@@ -335,16 +335,21 @@ pub const EmailChannel = struct {
             return error.ImapError;
         };
 
+        const stderr = child.stderr.?.readToEndAlloc(allocator, 64 * 1024) catch "";
+        defer if (stderr.len > 0) allocator.free(stderr);
+
         const term = child.wait() catch {
             allocator.free(stdout);
             return error.ImapError;
         };
         switch (term) {
             .Exited => |code| if (code != 0) {
+                log.warn("curl IMAP failed (exit {d}): {s}", .{ code, if (stderr.len > 0) stderr else "(no stderr)" });
                 allocator.free(stdout);
                 return error.ImapError;
             },
             else => {
+                log.warn("curl IMAP abnormal termination: {s}", .{if (stderr.len > 0) stderr else "(no stderr)"});
                 allocator.free(stdout);
                 return error.ImapError;
             },
@@ -492,15 +497,15 @@ pub const EmailChannel = struct {
             const tag_start: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_START]" else "[UNKNOWN_SENDER_START]";
             const tag_end: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_END]" else "[UNKNOWN_SENDER_END]";
             const wrapped = if (attachment_info.len > 0)
-                std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n{s}", .{
-                    tag_start, sender_addr, parsed.subject, final_content, attachment_info, tag_end,
+                std.fmt.allocPrint(allocator, "{s}\nUID: {s}\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n{s}", .{
+                    tag_start, uid, sender_addr, parsed.subject, final_content, attachment_info, tag_end,
                 }) catch {
                     allocator.free(final_content);
                     continue;
                 }
             else
-                std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}\n{s}", .{
-                    tag_start, sender_addr, parsed.subject, final_content, tag_end,
+                std.fmt.allocPrint(allocator, "{s}\nUID: {s}\nFrom: {s}\nSubject: {s}\n\n{s}\n{s}", .{
+                    tag_start, uid, sender_addr, parsed.subject, final_content, tag_end,
                 }) catch {
                     allocator.free(final_content);
                     continue;
@@ -576,6 +581,559 @@ pub const EmailChannel = struct {
 
     pub fn channel(self: *EmailChannel) root.Channel {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
+// ── Native IMAP Client with IDLE support ────────────────────────────────
+//
+// Persistent TLS+IMAP connection that uses IDLE for push notifications
+// instead of spawning curl every poll interval.
+
+pub const ImapClient = struct {
+    allocator: std.mem.Allocator,
+    config: config_types.EmailConfig,
+
+    // Connection state — openssl s_client subprocess
+    child: ?std.process.Child = null,
+    state: ImapState = .disconnected,
+
+    // IMAP protocol
+    tag_counter: u32 = 0,
+    server_supports_idle: bool = false,
+
+    // Backoff
+    consecutive_failures: u32 = 0,
+    backoff_ms: u64 = 1000,
+
+    // Line read buffer
+    line_buf: [4096]u8 = undefined,
+    line_len: usize = 0,
+
+    pub const ImapState = enum {
+        disconnected,
+        connected,
+        authenticated,
+        selected,
+        idling,
+    };
+
+    pub const IdleResult = enum {
+        new_mail,
+        renewal,
+        shutdown,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, config: config_types.EmailConfig) ImapClient {
+        return .{
+            .allocator = allocator,
+            .config = config,
+        };
+    }
+
+    /// Connect via `openssl s_client` subprocess to the IMAP server.
+    /// This avoids Zig's std TLS Client which doesn't support server-first protocols.
+    pub fn connect(self: *ImapClient) !void {
+        if (self.state != .disconnected) return;
+
+        // Build connect string "host:port"
+        var addr_buf: [280]u8 = undefined;
+        var addr_fbs = std.io.fixedBufferStream(&addr_buf);
+        addr_fbs.writer().print("{s}:{d}", .{ self.config.imap_host, self.config.imap_port }) catch
+            return error.ImapConnectFailed;
+        const connect_addr = addr_fbs.getWritten();
+
+        var child = std.process.Child.init(
+            &.{ "openssl", "s_client", "-connect", connect_addr, "-quiet" },
+            self.allocator,
+        );
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch |err| {
+            log.warn("IMAP openssl spawn failed: {}", .{err});
+            return error.ImapConnectFailed;
+        };
+
+        self.child = child;
+
+        // Read server greeting
+        const greeting = self.readLine() catch |err| {
+            log.warn("IMAP greeting read failed: {}", .{err});
+            self.disconnect();
+            return error.ImapConnectFailed;
+        };
+        if (!std.mem.startsWith(u8, greeting, "* OK")) {
+            log.warn("IMAP unexpected greeting: {s}", .{greeting});
+            self.disconnect();
+            return error.ImapConnectFailed;
+        }
+
+        self.state = .connected;
+        log.info("IMAP connected to {s}:{d}", .{ self.config.imap_host, self.config.imap_port });
+    }
+
+    /// Send LOGIN command.
+    pub fn login(self: *ImapClient) !void {
+        if (self.state != .connected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} LOGIN {s} {s}\r\n", .{ tag, self.config.username, self.config.password }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        // Read response lines until tagged response
+        try self.expectTaggedOk(tag);
+        self.state = .authenticated;
+        log.info("IMAP authenticated as {s}", .{self.config.username});
+    }
+
+    /// Send CAPABILITY command and check for IDLE support.
+    pub fn capability(self: *ImapClient) !void {
+        const tag = self.nextTag();
+        var cmd_buf: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} CAPABILITY\r\n", .{tag}) catch return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        self.server_supports_idle = false;
+        while (true) {
+            const line = try self.readLine();
+            if (std.mem.startsWith(u8, line, "* CAPABILITY")) {
+                // Check for IDLE in capability list
+                var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+                while (tokens.next()) |token| {
+                    if (std.ascii.eqlIgnoreCase(token, "IDLE")) {
+                        self.server_supports_idle = true;
+                    }
+                }
+            }
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) return error.ImapProtocolError;
+                break;
+            }
+        }
+    }
+
+    /// Send SELECT command for the configured folder.
+    pub fn selectFolder(self: *ImapClient) !void {
+        if (self.state != .authenticated) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [256]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} SELECT {s}\r\n", .{ tag, self.config.imap_folder }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        try self.expectTaggedOk(tag);
+        self.state = .selected;
+    }
+
+    /// Send UID SEARCH UNSEEN and return list of UID strings. Caller owns memory.
+    pub fn searchUnseen(self: *ImapClient, allocator: std.mem.Allocator) ![][]const u8 {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} UID SEARCH UNSEEN\r\n", .{tag}) catch return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        var uids: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (uids.items) |uid| allocator.free(uid);
+            uids.deinit(allocator);
+        }
+
+        while (true) {
+            const line = try self.readLine();
+            if (std.mem.startsWith(u8, line, "* SEARCH")) {
+                var tokens = std.mem.tokenizeScalar(u8, line["* SEARCH".len..], ' ');
+                while (tokens.next()) |token| {
+                    const clean = std.mem.trim(u8, token, " \t\r\n");
+                    if (clean.len == 0) continue;
+                    var is_num = true;
+                    for (clean) |c| {
+                        if (!std.ascii.isDigit(c)) {
+                            is_num = false;
+                            break;
+                        }
+                    }
+                    if (is_num) {
+                        try uids.append(allocator, try allocator.dupe(u8, clean));
+                    }
+                }
+            }
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) return error.ImapProtocolError;
+                break;
+            }
+        }
+
+        return uids.toOwnedSlice(allocator);
+    }
+
+    /// Fetch a single message by UID. Returns raw RFC822 bytes. Caller owns memory.
+    pub fn fetchMessage(self: *ImapClient, allocator: std.mem.Allocator, uid: []const u8) ![]u8 {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} UID FETCH {s} (BODY.PEEK[])\r\n", .{ tag, uid }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        // Read response — look for literal {N}
+        var message_data: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer message_data.deinit(allocator);
+
+        while (true) {
+            const line = try self.readLine();
+
+            // Look for literal size: "* N FETCH ... {SIZE}"
+            if (std.mem.startsWith(u8, line, "* ") and std.mem.indexOf(u8, line, "FETCH") != null) {
+                if (std.mem.lastIndexOf(u8, line, "{")) |brace_start| {
+                    if (std.mem.indexOf(u8, line[brace_start..], "}")) |brace_end| {
+                        const size_str = line[brace_start + 1 .. brace_start + brace_end];
+                        const literal_size = std.fmt.parseInt(usize, size_str, 10) catch continue;
+                        // Cap at max_body_bytes * 2 to prevent OOM
+                        const max_size = @min(literal_size, self.config.max_body_bytes * 2);
+                        // Read exactly literal_size bytes
+                        try message_data.ensureTotalCapacity(allocator, max_size);
+                        var remaining = literal_size;
+                        while (remaining > 0) {
+                            var read_buf: [4096]u8 = undefined;
+                            const to_read = @min(remaining, read_buf.len);
+                            const n = self.readRaw(read_buf[0..to_read]) catch break;
+                            if (n == 0) break;
+                            const actual = @min(n, max_size - message_data.items.len);
+                            if (actual > 0) {
+                                try message_data.appendSlice(allocator, read_buf[0..actual]);
+                            }
+                            remaining -= n;
+                        }
+                    }
+                }
+            }
+
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) {
+                    message_data.deinit(allocator);
+                    return error.ImapProtocolError;
+                }
+                break;
+            }
+        }
+
+        return message_data.toOwnedSlice(allocator);
+    }
+
+    /// Mark a UID as \Seen via UID STORE.
+    pub fn storeSeen(self: *ImapClient, uid: []const u8) !void {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} UID STORE {s} +FLAGS (\\Seen)\r\n", .{ tag, uid }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+        try self.expectTaggedOk(tag);
+    }
+
+    /// Enter IDLE mode and wait for new mail or timeout.
+    /// Returns the reason IDLE was exited.
+    pub fn idle(self: *ImapClient, stop_requested: *const std.atomic.Value(bool)) !IdleResult {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} IDLE\r\n", .{tag}) catch return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        // Wait for continuation response "+ idling" or "+ "
+        const cont = self.readLine() catch |err| {
+            log.warn("IMAP IDLE continuation failed: {}", .{err});
+            return error.ImapProtocolError;
+        };
+        if (cont.len == 0 or cont[0] != '+') {
+            log.warn("IMAP IDLE unexpected response: {s}", .{cont});
+            return error.ImapProtocolError;
+        }
+
+        self.state = .idling;
+        const idle_start = std.time.timestamp();
+        const idle_max_secs: i64 = 25 * 60; // 25 minutes (RFC 2177 max is 29)
+
+        // IDLE read loop with SO_RCVTIMEO providing 30s timeouts
+        while (true) {
+            if (stop_requested.load(.acquire)) {
+                // Shutdown requested — exit IDLE
+                try self.writeAll("DONE\r\n");
+                self.expectTaggedOk(tag) catch {};
+                self.state = .selected;
+                return .shutdown;
+            }
+
+            const line = self.readLine() catch |err| {
+                if (err == error.ImapTimeout) {
+                    // Check if we've been idling too long
+                    const elapsed = std.time.timestamp() - idle_start;
+                    if (elapsed >= idle_max_secs) {
+                        // Renew IDLE
+                        try self.writeAll("DONE\r\n");
+                        self.expectTaggedOk(tag) catch {};
+                        self.state = .selected;
+                        return .renewal;
+                    }
+                    // Otherwise just continue waiting
+                    continue;
+                }
+                // Real error — connection probably dropped
+                self.state = .disconnected;
+                return err;
+            };
+
+            // Check for EXISTS notification (new mail)
+            if (std.mem.indexOf(u8, line, "EXISTS") != null) {
+                try self.writeAll("DONE\r\n");
+                self.expectTaggedOk(tag) catch {};
+                self.state = .selected;
+                return .new_mail;
+            }
+
+            // Check for BYE (server shutting down)
+            if (std.mem.startsWith(u8, line, "* BYE")) {
+                log.warn("IMAP server sent BYE during IDLE", .{});
+                self.state = .disconnected;
+                return error.ImapServerBye;
+            }
+        }
+    }
+
+    /// Send LOGOUT and clean up.
+    pub fn logout(self: *ImapClient) void {
+        if (self.state == .disconnected) return;
+
+        const tag = self.nextTag();
+        var cmd_buf: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} LOGOUT\r\n", .{tag}) catch {
+            self.disconnect();
+            return;
+        };
+        self.writeAll(fbs.getWritten()) catch {
+            self.disconnect();
+            return;
+        };
+        // Read response but don't wait forever
+        _ = self.readLine() catch {};
+        self.disconnect();
+    }
+
+    /// Kill subprocess and clean up.
+    pub fn disconnect(self: *ImapClient) void {
+        if (self.child) |*child| {
+            if (child.stdin) |stdin| stdin.close();
+            child.stdin = null;
+            if (child.stdout) |stdout| stdout.close();
+            child.stdout = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            self.child = null;
+        }
+        self.state = .disconnected;
+    }
+
+    /// Backoff after a failure — exponential up to 60s.
+    pub fn backoff(self: *ImapClient) void {
+        std.Thread.sleep(self.backoff_ms * std.time.ns_per_ms);
+        self.backoff_ms = @min(self.backoff_ms * 2, 60_000);
+        self.consecutive_failures += 1;
+    }
+
+    pub fn resetBackoff(self: *ImapClient) void {
+        self.backoff_ms = 1000;
+        self.consecutive_failures = 0;
+    }
+
+    pub fn shouldFallbackToPoll(self: *const ImapClient) bool {
+        return self.consecutive_failures >= 5;
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────
+
+    /// Read raw bytes from subprocess stdout with poll-based timeout (30s).
+    fn readRaw(self: *ImapClient, out: []u8) !usize {
+        const child = self.child orelse return error.ImapReadError;
+        const stdout = child.stdout orelse return error.ImapReadError;
+        const fd = stdout.handle;
+
+        // Poll with 30s timeout for data availability
+        var pollfds = [1]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const poll_result = std.posix.poll(&pollfds, 30_000) catch return error.ImapReadError;
+        if (poll_result == 0) return error.ImapTimeout; // 30s timeout
+        if (pollfds[0].revents & std.posix.POLL.IN != 0) {
+            // Data available — read below
+        } else if (pollfds[0].revents & std.posix.POLL.HUP != 0) {
+            return @as(usize, 0); // EOF
+        } else {
+            return error.ImapReadError;
+        }
+
+        return std.posix.read(fd, out) catch return error.ImapReadError;
+    }
+
+    /// Write all bytes to subprocess stdin.
+    fn writeAll(self: *ImapClient, data: []const u8) !void {
+        const child = self.child orelse return error.ImapWriteError;
+        const stdin = child.stdin orelse return error.ImapWriteError;
+        stdin.writeAll(data) catch return error.ImapWriteError;
+    }
+
+    /// Read a single IMAP response line (up to \r\n).
+    fn readLine(self: *ImapClient) ![]const u8 {
+        self.line_len = 0;
+        while (self.line_len < self.line_buf.len - 1) {
+            var byte_buf: [1]u8 = undefined;
+            const n = self.readRaw(&byte_buf) catch |err| {
+                if (err == error.ImapTimeout) {
+                    if (self.line_len > 0) continue; // partial line, keep reading
+                    return error.ImapTimeout;
+                }
+                return err;
+            };
+            if (n == 0) {
+                if (self.line_len > 0) {
+                    return self.line_buf[0..self.line_len];
+                }
+                return error.ImapReadError; // connection closed
+            }
+            const b = byte_buf[0];
+            if (b == '\n') {
+                // Strip trailing \r if present
+                const end = if (self.line_len > 0 and self.line_buf[self.line_len - 1] == '\r')
+                    self.line_len - 1
+                else
+                    self.line_len;
+                return self.line_buf[0..end];
+            }
+            self.line_buf[self.line_len] = b;
+            self.line_len += 1;
+        }
+        // Line too long — return what we have
+        return self.line_buf[0..self.line_len];
+    }
+
+    /// Generate next IMAP tag: A0001, A0002, ...
+    fn nextTag(self: *ImapClient) [5]u8 {
+        self.tag_counter += 1;
+        var tag: [5]u8 = undefined;
+        _ = std.fmt.bufPrint(&tag, "A{d:0>4}", .{self.tag_counter}) catch {
+            tag = .{ 'A', '0', '0', '0', '1' };
+        };
+        return tag;
+    }
+
+    /// Check if a line is a tagged response for the given tag.
+    fn isTaggedResponse(self: *ImapClient, line: []const u8, tag: [5]u8) bool {
+        _ = self;
+        return line.len >= 5 and std.mem.eql(u8, line[0..5], &tag);
+    }
+
+    /// Check if a tagged response is OK.
+    fn isOkResponse(self: *ImapClient, line: []const u8, tag: [5]u8) bool {
+        _ = self;
+        if (line.len < 8) return false; // "AXXXX OK" = 8 chars minimum
+        return std.mem.eql(u8, line[0..5], &tag) and
+            line.len > 6 and std.mem.startsWith(u8, line[5..], " OK");
+    }
+
+    /// Read responses until we get the tagged OK. Returns error if NO/BAD.
+    fn expectTaggedOk(self: *ImapClient, tag: [5]u8) !void {
+        while (true) {
+            const line = try self.readLine();
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) {
+                    log.warn("IMAP command failed: {s}", .{line});
+                    return error.ImapProtocolError;
+                }
+                return;
+            }
+        }
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────
+
+    test "ImapClient init defaults" {
+        const cfg = config_types.EmailConfig{};
+        const client = ImapClient.init(std.testing.allocator, cfg);
+        try std.testing.expect(client.state == .disconnected);
+        try std.testing.expect(!client.server_supports_idle);
+        try std.testing.expectEqual(@as(u32, 0), client.tag_counter);
+        try std.testing.expectEqual(@as(u64, 1000), client.backoff_ms);
+    }
+
+    test "ImapClient nextTag increments" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        const tag1 = client.nextTag();
+        try std.testing.expectEqualStrings("A0001", &tag1);
+        const tag2 = client.nextTag();
+        try std.testing.expectEqualStrings("A0002", &tag2);
+    }
+
+    test "ImapClient isTaggedResponse" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        const tag = [5]u8{ 'A', '0', '0', '0', '1' };
+        try std.testing.expect(client.isTaggedResponse("A0001 OK Success", tag));
+        try std.testing.expect(!client.isTaggedResponse("A0002 OK Success", tag));
+        try std.testing.expect(!client.isTaggedResponse("* OK", tag));
+    }
+
+    test "ImapClient isOkResponse" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        const tag = [5]u8{ 'A', '0', '0', '0', '1' };
+        try std.testing.expect(client.isOkResponse("A0001 OK Success", tag));
+        try std.testing.expect(!client.isOkResponse("A0001 NO Denied", tag));
+        try std.testing.expect(!client.isOkResponse("A0001 BAD Syntax", tag));
+    }
+
+    test "ImapClient backoff exponential" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        try std.testing.expectEqual(@as(u64, 1000), client.backoff_ms);
+        // Simulate backoff without actual sleep
+        client.backoff_ms = @min(client.backoff_ms * 2, 60_000);
+        client.consecutive_failures += 1;
+        try std.testing.expectEqual(@as(u64, 2000), client.backoff_ms);
+        client.backoff_ms = @min(client.backoff_ms * 2, 60_000);
+        try std.testing.expectEqual(@as(u64, 4000), client.backoff_ms);
+        // Test cap
+        client.backoff_ms = 32_000;
+        client.backoff_ms = @min(client.backoff_ms * 2, 60_000);
+        try std.testing.expectEqual(@as(u64, 60_000), client.backoff_ms);
+    }
+
+    test "ImapClient shouldFallbackToPoll" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        try std.testing.expect(!client.shouldFallbackToPoll());
+        client.consecutive_failures = 4;
+        try std.testing.expect(!client.shouldFallbackToPoll());
+        client.consecutive_failures = 5;
+        try std.testing.expect(client.shouldFallbackToPoll());
     }
 };
 

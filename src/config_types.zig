@@ -404,6 +404,9 @@ pub const EmailConfig = struct {
     attachment_extensions: []const []const u8 = &.{ ".pdf", ".docx" },
     /// Maximum attachment size in bytes (default 20MB).
     attachment_max_bytes: u64 = 20 * 1024 * 1024,
+    /// Use IMAP IDLE for persistent connection instead of polling (default: true).
+    /// Falls back to polling if server lacks IDLE capability.
+    imap_idle: bool = true,
 };
 
 pub const LineConfig = struct {
