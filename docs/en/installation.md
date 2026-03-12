@@ -44,6 +44,59 @@ nullclaw --help
 
 If the command works, installation is complete.
 
+Here is the English translation of your content with preserved formatting:
+
+---
+
+**cmd (for Windows)**
+
+Check Zig version:
+```cmd
+zig version
+```
+
+If the output shows similar content as below, it means Zig is installed correctly:
+```cmd
+x:\zig version
+0.16.0-dev.2736+3b515fbed
+```
+
+Otherwise, check  https://ziglang.org/download/ and install zig, then configure Zig's system variable in "Path" to make sure above zig version is showed correctly if needed(if you install it with zig binary exe file).
+
+Rename the downloaded nullclaw binary file (`.exe`) to `nullclaw.exe`.
+
+Check the current nullclaw version in the command line:
+```cmd
+nullclaw version
+```
+
+If it displays the version matching the nullclaw binary (like below), installation is successful:
+
+```cmd
+x:\path>zig version
+0.16.0-dev.2736+3b515fbed
+```
+
+If not, run the following command in PowerShell **as administrator** to add the current path to Windows system variable `PATH`:
+
+```powershell (Admin)
+$old = [Environment]::GetEnvironmentVariable("Path", "Machine")
+$new = "$old;x:\binary_directory"
+[Environment]::SetEnvironmentVariable("Path", $new, "Machine")
+```
+
+Verify again in the command line:
+
+```cmd
+nullclaw version
+```
+
+Successful installation will show the version matching your nullclaw binary (example):
+```cmd
+x:\you_nullclaw_exe_path>nullclaw version
+nullclaw 2026.3.11
+```
+
 ## Option 2: Build from Source (cross-platform)
 
 ```bash

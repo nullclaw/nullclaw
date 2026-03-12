@@ -30,24 +30,51 @@ nullclaw --help
 如果命令可用，说明安装成功。
 
 cmd(Windows)
-将下载的二进制文件（.exe)改名为nullclaw.exe，
-再在命令行中查看当前版本号
+
+检查 Zig 版本：
+
+```cmd
+zig version
+```
+
+如果显示出类似这样的内容表示已经安装好zig：
+
+```cmd
+x:\zig version
+0.16.0-dev.2736+3b515fbed
+```
+
+否则请到https://ziglang.org/download/ 下载对应的zig的EXE二进制文件后安装并配置好zig的系统变量。
+
+将下载的nullclaw的二进制文件（.exe)改名为nullclaw.exe，
+
+再在命令行中查看当前版本号：
+
 ```cmd
 nullclaw version
 ```
-如果显示出与当前二进制文件nullclaw对应的版本号就表示安装成功，
+如果显示出与当前二进制文件nullclaw对应的版本号就表示安装成功；
+
 否则以管理员权限在Powershell中执行如下命令，将当前路径加入到windows系统变量PATH中：
 
-```powershell 管理员权限
+```Powershell 管理员权限
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
 $new = "$old;x:\二进制文件所在目录"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")
 ```
-再在命令行中查看当前版本号
+
+再在命令行中查看当前版本号:
+
 ```cmd
 nullclaw version
 ```
-如果显示出与当前二进制文件nullclaw对应的版本号就表示安装成功。
+
+如果显示出与当前二进制文件nullclaw对应的版本号（类似下面的内容）就表示安装成功。
+
+```cmd
+x:\path>zig version
+0.16.0-dev.2736+3b515fbed
+```
 
 ## 方式二：源码构建（通用）
 
