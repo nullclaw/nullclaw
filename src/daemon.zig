@@ -474,6 +474,10 @@ const ParsedInboundMetadata = struct {
     }
 };
 
+/// Parse inbound metadata JSON into structured fields.
+/// Motivation: This function extracts channel-specific metadata from inbound messages
+/// for use in routing and session management. For DingTalk, it extracts typing_msg_id and robot_code
+/// needed to recall the typing indicator when the actual response is sent.
 fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8) ParsedInboundMetadata {
     var parsed = ParsedInboundMetadata{};
     const meta_json = metadata_json orelse return parsed;
@@ -760,12 +764,13 @@ fn inboundDispatcherThread(
                 error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                 error.NoResponseContent => "Model returned an empty response. Please try again.",
                 error.OutOfMemory => "Out of memory.",
+                error.InvalidToolCallFormat => "I had trouble understanding the tool format. Please try rephrasing your request.",
                 else => "An error occurred. Try again.",
             };
             const err_out = if (outbound_account_id) |aid|
-                bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
+                bus_mod.makeOutboundWithAccountStageAndMetadata(allocator, msg.channel, aid, msg.chat_id, err_msg, .final, msg.metadata_json) catch continue
             else
-                bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
+                bus_mod.makeOutboundWithStageAndMetadata(allocator, msg.channel, msg.chat_id, err_msg, .final, msg.metadata_json) catch continue;
             event_bus.publishOutbound(err_out) catch {
                 err_out.deinit(allocator);
             };
@@ -774,9 +779,9 @@ fn inboundDispatcherThread(
         defer allocator.free(reply);
 
         const out = (if (outbound_account_id) |aid|
-            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reply)
+            bus_mod.makeOutboundWithAccountStageAndMetadata(allocator, msg.channel, aid, msg.chat_id, reply, .final, msg.metadata_json)
         else
-            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply)) catch |err| {
+            bus_mod.makeOutboundWithStageAndMetadata(allocator, msg.channel, msg.chat_id, reply, .final, msg.metadata_json)) catch |err| {
             log.err("inbound dispatch makeOutbound failed: {}", .{err});
             continue;
         };

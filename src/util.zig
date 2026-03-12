@@ -158,3 +158,32 @@ test "appendJsonEscaped empty string" {
     try appendJsonEscaped(&buf, std.testing.allocator, "");
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
+
+// ── Python module check ─────────────────────────────────────────
+
+/// Check if a Python module is available by attempting to import it.
+/// Returns true if the module can be imported successfully.
+pub fn checkPythonModule(allocator: std.mem.Allocator, module_name: []const u8) bool {
+    const code = std.fmt.allocPrint(allocator, "import {s}", .{module_name}) catch return false;
+    defer allocator.free(code);
+    const argv = &[_][]const u8{ "python3", "-c", code };
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    const term = child.spawnAndWait() catch return false;
+    switch (term) {
+        .Exited => |code_val| return code_val == 0,
+        else => return false,
+    }
+}
+
+test "checkPythonModule detects available module" {
+    // sys is always available
+    try std.testing.expect(checkPythonModule(std.testing.allocator, "sys"));
+}
+
+test "checkPythonModule returns false for nonexistent module" {
+    // this_module_definitely_does_not_exist_12345 should not exist
+    try std.testing.expect(!checkPythonModule(std.testing.allocator, "this_module_definitely_does_not_exist_12345"));
+}

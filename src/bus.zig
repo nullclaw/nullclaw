@@ -41,6 +41,11 @@ pub const OutboundMessage = struct {
     chat_id: []const u8, // target chat
     content: []const u8, // response text
     media: []const []const u8 = &.{}, // file paths/URLs to send
+    /// Metadata from inbound message (for channel-specific features like DingTalk typing recall).
+    /// Motivation: This field allows channels to pass metadata through the message bus
+    /// for channel-specific operations. For DingTalk, it carries the typing message ID
+    /// and robot code needed to recall the typing indicator when the actual response is sent.
+    metadata_json: ?[]const u8 = null,
     stage: streaming.OutboundStage = .final,
 
     pub fn deinit(self: *const OutboundMessage, allocator: Allocator) void {
@@ -48,6 +53,7 @@ pub const OutboundMessage = struct {
         if (self.media.len > 0) allocator.free(self.media);
         // channel is a string literal or long-lived config pointer — not owned, don't free
         if (self.account_id) |aid| allocator.free(aid);
+        if (self.metadata_json) |md| allocator.free(md);
         allocator.free(self.chat_id);
         allocator.free(self.content);
     }
@@ -251,6 +257,66 @@ fn makeOutboundWithMedia(
         .chat_id = cid,
         .content = ct,
         .media = media,
+    };
+}
+
+/// Create an OutboundMessage with stage and metadata (for DingTalk typing recall).
+/// Motivation: This constructor allows creating outbound messages with metadata
+/// needed for channel-specific operations like DingTalk typing indicator recall.
+/// The metadata is passed through the message bus to the channel's sendEvent implementation.
+pub fn makeOutboundWithStageAndMetadata(
+    allocator: Allocator,
+    channel: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    stage: streaming.OutboundStage,
+    metadata: ?[]const u8,
+) Allocator.Error!OutboundMessage {
+    const cid = try allocator.dupe(u8, chat_id);
+    errdefer allocator.free(cid);
+    const ct = try allocator.dupe(u8, content);
+    errdefer allocator.free(ct);
+    const md = if (metadata) |m| try allocator.dupe(u8, m) else null;
+    errdefer if (md) |m| allocator.free(m);
+
+    return .{
+        .channel = channel,
+        .chat_id = cid,
+        .content = ct,
+        .stage = stage,
+        .metadata_json = md,
+    };
+}
+
+/// Create an OutboundMessage with account, stage and metadata (for DingTalk typing recall).
+/// Motivation: This constructor allows creating outbound messages for multi-account channels
+/// with metadata needed for channel-specific operations like DingTalk typing indicator recall.
+/// The metadata is passed through the message bus to the channel's sendEvent implementation.
+pub fn makeOutboundWithAccountStageAndMetadata(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    stage: streaming.OutboundStage,
+    metadata: ?[]const u8,
+) Allocator.Error!OutboundMessage {
+    const cid = try allocator.dupe(u8, chat_id);
+    errdefer allocator.free(cid);
+    const ct = try allocator.dupe(u8, content);
+    errdefer allocator.free(ct);
+    const aid = try allocator.dupe(u8, account_id);
+    errdefer allocator.free(aid);
+    const md = if (metadata) |m| try allocator.dupe(u8, m) else null;
+    errdefer if (md) |m| allocator.free(m);
+
+    return .{
+        .channel = channel,
+        .account_id = aid,
+        .chat_id = cid,
+        .content = ct,
+        .stage = stage,
+        .metadata_json = md,
     };
 }
 

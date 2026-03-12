@@ -250,6 +250,7 @@ pub fn parseXmlToolCalls(
                 }
             }
 
+            // Try to parse the inner content if not already parsed
             if (parsed_call == null) {
                 const inner = std.mem.trim(u8, after_open[0..selected_end], " \t\r\n");
                 parsed_call = try parseInnerToolCall(allocator, inner);

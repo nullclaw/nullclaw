@@ -942,7 +942,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     }
     if (channel_catalog.isBuildEnabled(.dingtalk)) {
         expected_total += config.channels.dingtalk.len;
-        expected_send_only += config.channels.dingtalk.len;
+        expected_gateway_loop += config.channels.dingtalk.len;
     }
 
     try std.testing.expectEqual(expected_total, mgr.count());

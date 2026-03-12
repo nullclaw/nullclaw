@@ -85,6 +85,19 @@ pub const Channel = struct {
             media: []const []const u8,
             stage: OutboundStage,
         ) anyerror!void = null,
+        /// Extended sendEvent with metadata for channel-specific features (e.g., DingTalk typing recall).
+        /// metadata: optional metadata from inbound message.
+        /// Motivation: This parameter allows channels to receive metadata from inbound messages
+        /// for channel-specific operations. For DingTalk, it carries the typing message ID and robot code
+        /// needed to recall the typing indicator when the actual response is sent.
+        sendEventWithMeta: ?*const fn (
+            ptr: *anyopaque,
+            target: []const u8,
+            message: []const u8,
+            media: []const []const u8,
+            stage: OutboundStage,
+            metadata: ?[]const u8,
+        ) anyerror!void = null,
         /// Start processing indicator for a recipient (e.g., typing status).
         startTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStartTyping,
         /// Stop processing indicator for a recipient.
@@ -108,6 +121,15 @@ pub const Channel = struct {
             return fn_send_event(self.ptr, target, message, media, stage);
         }
         if (stage == .final) return self.send(target, message, media);
+    }
+
+    /// Extended sendEvent with metadata for channel-specific features.
+    pub fn sendEventWithMeta(self: Channel, target: []const u8, message: []const u8, media: []const []const u8, stage: OutboundStage, metadata: ?[]const u8) !void {
+        if (self.vtable.sendEventWithMeta) |fn_send_event_meta| {
+            return fn_send_event_meta(self.ptr, target, message, media, stage, metadata);
+        }
+        // Fallback to sendEvent if sendEventWithMeta not implemented
+        return self.sendEvent(target, message, media, stage);
     }
 
     pub fn name(self: Channel) []const u8 {
