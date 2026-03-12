@@ -2,6 +2,12 @@
 
 NullClaw 默认走 secure-by-default：本地绑定、配对鉴权、沙箱隔离、最小权限。
 
+## 页面导航
+
+- 这页适合谁：要评估默认安全边界、审查风险配置，或准备把 NullClaw 接到长期运行环境的人。
+- 看完去哪里：要落到具体字段看 [配置指南](./configuration.md)；要对外提供 webhook 看 [Gateway API](./gateway-api.md)；想理解这些边界在系统中的位置看 [架构总览](./architecture.md)。
+- 如果你是从某页来的：从 [配置指南](./configuration.md) 来，这页补的是风险判断与默认建议；从 [使用与运维](./usage.md) 来，这页可作为上线前安全检查表；从 [Gateway API](./gateway-api.md) 来，这页帮助确认 pairing、public bind 与 token 管理原则。
+
 ## 基线能力
 
 | 项 | 状态 | 说明 |
@@ -48,6 +54,21 @@ NullClaw 默认走 secure-by-default：本地绑定、配对鉴权、沙箱隔�
 }
 ```
 
+## Shell 环境变量
+
+默认情况下，只有最小的安全环境变量集（`PATH`、`HOME`、`TERM` 等）会传递给 shell 子进程，防止 API 密钥泄露（CWE-200）。
+
+### 路径验证环境变量
+
+`tools.path_env_vars` 允许指定值为平台路径列表（Unix 用 `:`，Windows 用 `;`）的环境变量。每个路径组件在传递前都会针对沙箱验证（必须在工作区或 `allowed_paths` 内，系统路径始终被拒绝）。
+
+```json
+{
+  "autonomy": { "allowed_paths": ["/opt/tools"] },
+  "tools": { "path_env_vars": ["LD_LIBRARY_PATH", "PYTHONHOME", "NODE_PATH"] }
+}
+```
+
 ## 高风险配置提醒
 
 以下配置会显著扩大权限边界，应仅用于受控环境：
@@ -56,3 +77,16 @@ NullClaw 默认走 secure-by-default：本地绑定、配对鉴权、沙箱隔�
 - `allowed_commands = ["*"]`
 - `allowed_paths = ["*"]`
 - `gateway.allow_public_bind = true`
+
+## 下一步
+
+- 要把建议落实到配置：继续看 [配置指南](./configuration.md)，逐项对照 `gateway`、`autonomy`、`security`。
+- 要验证对外接入面：继续看 [Gateway API](./gateway-api.md)，检查鉴权与调用方式。
+- 要做上线前回归：继续看 [使用与运维](./usage.md)，按诊断与健康检查顺序执行。
+
+## 相关页面
+
+- [配置指南](./configuration.md)
+- [使用与运维](./usage.md)
+- [Gateway API](./gateway-api.md)
+- [架构总览](./architecture.md)

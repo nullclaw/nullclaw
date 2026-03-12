@@ -331,6 +331,11 @@ pub const SqliteMemory = struct {
             \\  created_at TEXT DEFAULT (datetime('now')),
             \\  updated_at TEXT DEFAULT (datetime('now'))
             \\);
+            \\CREATE TABLE IF NOT EXISTS session_usage (
+            \\  session_id TEXT PRIMARY KEY,
+            \\  total_tokens INTEGER NOT NULL DEFAULT 0,
+            \\  updated_at TEXT DEFAULT (datetime('now'))
+            \\);
             \\CREATE TABLE IF NOT EXISTS kv (
             \\  key TEXT PRIMARY KEY,
             \\  value TEXT NOT NULL
@@ -668,6 +673,47 @@ pub const SqliteMemory = struct {
 
         _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+
+        try self.clearUsage(session_id);
+    }
+
+    pub fn saveUsage(self: *Self, session_id: []const u8, total_tokens: u64) !void {
+        const sql =
+            "INSERT INTO session_usage (session_id, total_tokens, updated_at) VALUES (?1, ?2, datetime('now')) " ++
+            "ON CONFLICT(session_id) DO UPDATE SET total_tokens = excluded.total_tokens, updated_at = datetime('now')";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(total_tokens));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    pub fn loadUsage(self: *Self, session_id: []const u8) !?u64 {
+        const sql = "SELECT total_tokens FROM session_usage WHERE session_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const total = c.sqlite3_column_int64(stmt, 0);
+        if (total < 0) return 0;
+        return @intCast(total);
+    }
+
+    fn clearUsage(self: *Self, session_id: []const u8) !void {
+        const sql = "DELETE FROM session_usage WHERE session_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
     }
 
     /// Delete auto-saved memory entries (autosave_user_*, autosave_assistant_*).
@@ -688,6 +734,118 @@ pub const SqliteMemory = struct {
         }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    // ── History queries ──────────────────────────────────────────────
+
+    pub fn countSessions(self: *Self) !u64 {
+        const sql = "SELECT COUNT(*) FROM (SELECT 1 FROM messages GROUP BY session_id)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        const total = c.sqlite3_column_int64(stmt, 0);
+        if (total < 0) return 0;
+        return @intCast(total);
+    }
+
+    /// List sessions with message counts and time bounds.
+    pub fn listSessions(self: *Self, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]root.SessionInfo {
+        const sql =
+            "SELECT session_id, COUNT(*) as msg_count, MIN(created_at) as first_at, MAX(created_at) as last_at " ++
+            "FROM messages GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT ?1 OFFSET ?2";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(limit));
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(offset));
+
+        var list: std.ArrayListUnmanaged(root.SessionInfo) = .empty;
+        errdefer {
+            for (list.items) |info| info.deinit(allocator);
+            list.deinit(allocator);
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const sid_ptr = c.sqlite3_column_text(stmt, 0);
+            const sid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            const count = c.sqlite3_column_int64(stmt, 1);
+            const first_ptr = c.sqlite3_column_text(stmt, 2);
+            const first_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+            const last_ptr = c.sqlite3_column_text(stmt, 3);
+            const last_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+
+            if (sid_ptr == null) continue;
+
+            try list.append(allocator, .{
+                .session_id = try allocator.dupe(u8, sid_ptr[0..sid_len]),
+                .message_count = if (count < 0) 0 else @intCast(count),
+                .first_message_at = if (first_ptr) |p| try allocator.dupe(u8, p[0..first_len]) else try allocator.dupe(u8, ""),
+                .last_message_at = if (last_ptr) |p| try allocator.dupe(u8, p[0..last_len]) else try allocator.dupe(u8, ""),
+            });
+        }
+
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn countDetailedMessages(self: *Self, session_id: []const u8) !u64 {
+        const sql = "SELECT COUNT(*) FROM messages WHERE session_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        const total = c.sqlite3_column_int64(stmt, 0);
+        if (total < 0) return 0;
+        return @intCast(total);
+    }
+
+    /// Load messages with timestamps for a session.
+    pub fn loadMessagesDetailed(self: *Self, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) ![]root.DetailedMessageEntry {
+        const sql = "SELECT role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC LIMIT ?2 OFFSET ?3";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+        _ = c.sqlite3_bind_int64(stmt, 3, @intCast(offset));
+
+        var list: std.ArrayListUnmanaged(root.DetailedMessageEntry) = .empty;
+        errdefer {
+            for (list.items) |entry| {
+                allocator.free(entry.role);
+                allocator.free(entry.content);
+                allocator.free(entry.created_at);
+            }
+            list.deinit(allocator);
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const role_ptr = c.sqlite3_column_text(stmt, 0);
+            const role_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            const content_ptr = c.sqlite3_column_text(stmt, 1);
+            const content_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const ts_ptr = c.sqlite3_column_text(stmt, 2);
+            const ts_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+
+            if (role_ptr == null or content_ptr == null) continue;
+
+            try list.append(allocator, .{
+                .role = try allocator.dupe(u8, role_ptr[0..role_len]),
+                .content = try allocator.dupe(u8, content_ptr[0..content_len]),
+                .created_at = if (ts_ptr) |p| try allocator.dupe(u8, p[0..ts_len]) else try allocator.dupe(u8, ""),
+            });
+        }
+
+        return list.toOwnedSlice(allocator);
     }
 
     // ── SessionStore vtable ────────────────────────────────────────
@@ -712,11 +870,47 @@ pub const SqliteMemory = struct {
         return self_.clearAutoSaved(session_id);
     }
 
+    fn implSessionSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.saveUsage(session_id, total_tokens);
+    }
+
+    fn implSessionLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadUsage(session_id);
+    }
+
+    fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.countSessions();
+    }
+
+    fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.listSessions(allocator, limit, offset);
+    }
+
+    fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.countDetailedMessages(session_id);
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadMessagesDetailed(allocator, session_id, limit, offset);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveUsage = &implSessionSaveUsage,
+        .loadUsage = &implSessionLoadUsage,
+        .countSessions = &implSessionCountSessions,
+        .listSessions = &implSessionListSessions,
+        .countDetailedMessages = &implSessionCountDetailedMessages,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {
@@ -1934,11 +2128,22 @@ test "sqlite sessionStore clearMessages" {
 
     const store = mem.sessionStore();
     try store.saveMessage("s1", "user", "hello");
+    try store.saveUsage("s1", 99);
     try store.clearMessages("s1");
 
     const msgs = try store.loadMessages(allocator, "s1");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
+    try std.testing.expectEqual(@as(?u64, null), try store.loadUsage("s1"));
+}
+
+test "sqlite sessionStore saveUsage + loadUsage roundtrip" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveUsage("s1", 123);
+    try std.testing.expectEqual(@as(?u64, 123), try store.loadUsage("s1"));
 }
 
 test "sqlite sessionStore clearAutoSaved" {

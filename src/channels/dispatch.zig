@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
+const thread_stacks = @import("../thread_stacks.zig");
 
 /// Message dispatch — routes incoming ChannelMessages to the agent,
 /// routes agent responses back to the originating channel.
@@ -631,7 +632,7 @@ test "dispatcher runs in a separate thread" {
     var stats = DispatchStats{};
 
     // Spawn dispatcher thread
-    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, runOutboundDispatcher, .{
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, runOutboundDispatcher, .{
         allocator, &event_bus, &reg, &stats,
     });
 
@@ -664,14 +665,14 @@ test "dispatcher concurrent producers + single dispatcher" {
     const total = num_producers * msgs_per_producer;
 
     // Spawn dispatcher
-    const dispatcher = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, runOutboundDispatcher, .{
+    const dispatcher = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, runOutboundDispatcher, .{
         allocator, &event_bus, &reg, &stats,
     });
 
     // Spawn producers
     var producers: [num_producers]std.Thread = undefined;
     for (0..num_producers) |i| {
-        producers[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        producers[i] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(b: *bus.Bus, a: Allocator) void {
                 for (0..msgs_per_producer) |_| {
                     const m = bus.makeOutbound(a, "test", "c", "x") catch return;

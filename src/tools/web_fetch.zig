@@ -95,6 +95,9 @@ pub const WebFetchTool = struct {
             );
         } catch |err| {
             log.err("web_fetch connection failed for {s}: {}", .{ url, err });
+            if (err == error.CurlInterrupted) {
+                return ToolResult.fail("Interrupted by /stop");
+            }
             const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };

@@ -171,9 +171,13 @@ fn deriveDiscordPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_rou
 
 fn deriveSlackPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
     const is_dm = meta.is_dm orelse (input.chat_id.len > 0 and input.chat_id[0] == 'D');
+    var channel_id = meta.channel_id orelse input.chat_id;
+    if (std.mem.indexOfScalar(u8, channel_id, ':')) |idx| {
+        if (idx > 0) channel_id = channel_id[0..idx];
+    }
     return .{
         .kind = if (is_dm) .direct else .channel,
-        .id = if (is_dm) input.sender_id else input.chat_id,
+        .id = if (is_dm) input.sender_id else channel_id,
     };
 }
 

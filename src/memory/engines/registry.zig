@@ -13,6 +13,7 @@ const pg = if (build_options.enable_postgres) @import("postgres.zig") else struc
 const redis_engine = @import("redis.zig");
 const lancedb_engine = @import("lancedb.zig");
 const api_engine = @import("api.zig");
+const clickhouse_engine = @import("clickhouse.zig");
 
 // ── Capability & descriptor types ────────────────────────────────
 
@@ -42,6 +43,7 @@ pub const BackendConfig = struct {
     postgres_connect_timeout_secs: u32 = 30,
     redis_config: ?config_types.MemoryRedisConfig = null,
     api_config: ?config_types.MemoryApiConfig = null,
+    clickhouse_config: ?config_types.MemoryClickHouseConfig = null,
     instance_id: []const u8 = "",
 };
 
@@ -191,7 +193,17 @@ const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
     .create = &createPostgres,
 }} else [0]BackendDescriptor{};
 
-pub const all = hybrid_backends ++ markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends;
+const clickhouse_backends = if (build_options.enable_memory_clickhouse) [_]BackendDescriptor{.{
+    .name = "clickhouse",
+    .label = "ClickHouse — columnar analytics memory store",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = true, .supports_transactions = false, .supports_outbox = false },
+    .needs_db_path = false,
+    .needs_workspace = false,
+    .create = &createClickHouse,
+}} else [0]BackendDescriptor{};
+
+pub const all = hybrid_backends ++ markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends ++ clickhouse_backends;
 pub const known_backend_names = [_][]const u8{
     "hybrid",
     "none",
@@ -203,8 +215,9 @@ pub const known_backend_names = [_][]const u8{
     "redis",
     "lancedb",
     "postgres",
+    "clickhouse",
 };
-pub const known_backends_csv = "hybrid, none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres";
+pub const known_backends_csv = "hybrid, none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres, clickhouse";
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -233,6 +246,7 @@ pub fn engineTokenForBackend(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "redis")) return "redis";
     if (std.mem.eql(u8, name, "lancedb")) return "lancedb";
     if (std.mem.eql(u8, name, "postgres")) return "postgres";
+    if (std.mem.eql(u8, name, "clickhouse")) return "clickhouse";
     return null;
 }
 
@@ -260,6 +274,7 @@ pub fn resolvePaths(
     postgres_cfg: ?config_types.MemoryPostgresConfig,
     redis_cfg: ?config_types.MemoryRedisConfig,
     api_cfg: ?config_types.MemoryApiConfig,
+    clickhouse_cfg: ?config_types.MemoryClickHouseConfig,
 ) !BackendConfig {
     const db_path: ?[*:0]const u8 = if (desc.needs_db_path)
         try std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" })
@@ -289,6 +304,7 @@ pub fn resolvePaths(
         .postgres_connect_timeout_secs = pg_connect_timeout_secs,
         .redis_config = redis_cfg,
         .api_config = api_cfg,
+        .clickhouse_config = clickhouse_cfg,
     };
 }
 
@@ -388,6 +404,25 @@ fn createPostgres(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInst
     return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
 }
 
+fn createClickHouse(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
+    if (!build_options.enable_memory_clickhouse) return error.ClickHouseNotEnabled;
+    const ch_cfg = cfg.clickhouse_config orelse config_types.MemoryClickHouseConfig{};
+    const impl_ = try allocator.create(clickhouse_engine.ClickHouseMemory);
+    errdefer allocator.destroy(impl_);
+    impl_.* = try clickhouse_engine.ClickHouseMemory.init(allocator, .{
+        .host = ch_cfg.host,
+        .port = ch_cfg.port,
+        .database = ch_cfg.database,
+        .table = ch_cfg.table,
+        .user = ch_cfg.user,
+        .password = ch_cfg.password,
+        .use_https = ch_cfg.use_https,
+        .instance_id = cfg.instance_id,
+    });
+    impl_.owns_self = true;
+    return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
+}
+
 fn applyPostgresConnectTimeout(
     allocator: std.mem.Allocator,
     base_url: []const u8,
@@ -424,7 +459,8 @@ test "registry length" {
         @as(usize, @intFromBool(build_options.enable_memory_lucid)) +
         @as(usize, @intFromBool(build_options.enable_memory_redis)) +
         @as(usize, @intFromBool(build_options.enable_memory_lancedb)) +
-        @as(usize, @intFromBool(build_options.enable_postgres));
+        @as(usize, @intFromBool(build_options.enable_postgres)) +
+        @as(usize, @intFromBool(build_options.enable_memory_clickhouse));
     try std.testing.expectEqual(expected, all.len);
 }
 
@@ -545,6 +581,22 @@ test "findBackend api" {
     try std.testing.expect(desc.auto_save_default);
 }
 
+test "findBackend clickhouse" {
+    if (!build_options.enable_memory_clickhouse) {
+        try std.testing.expect(findBackend("clickhouse") == null);
+        return;
+    }
+    const desc = findBackend("clickhouse") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("clickhouse", desc.name);
+    try std.testing.expect(!desc.capabilities.supports_keyword_rank);
+    try std.testing.expect(desc.capabilities.supports_session_store);
+    try std.testing.expect(!desc.capabilities.supports_transactions);
+    try std.testing.expect(!desc.capabilities.supports_outbox);
+    try std.testing.expect(!desc.needs_db_path);
+    try std.testing.expect(!desc.needs_workspace);
+    try std.testing.expect(desc.auto_save_default);
+}
+
 test "findBackend unknown returns null" {
     try std.testing.expect(findBackend("nonexistent") == null);
 }
@@ -587,7 +639,7 @@ test "resolvePaths sqlite has db_path" {
         return;
     }
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
     defer if (cfg.db_path) |p| std.testing.allocator.free(std.mem.span(p));
 
     try std.testing.expect(cfg.db_path != null);
@@ -602,7 +654,7 @@ test "resolvePaths markdown has no db_path" {
         return;
     }
     const desc = findBackend("markdown") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -614,7 +666,7 @@ test "resolvePaths none has no db_path" {
         return;
     }
     const desc = findBackend("none") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -663,7 +715,7 @@ test "resolvePaths redis config is preserved" {
         .db_index = 2,
         .key_prefix = "agent",
         .ttl_seconds = 120,
-    }, null);
+    }, null, null);
 
     try std.testing.expect(cfg.redis_config != null);
     try std.testing.expectEqualStrings("10.10.10.10", cfg.redis_config.?.host);

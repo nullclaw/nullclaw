@@ -38,6 +38,7 @@ pub const MemoryBootstrapProvider = struct {
 
     const vtable = BootstrapProvider.VTable{
         .load = implLoad,
+        .load_excerpt = implLoadExcerpt,
         .store = implStore,
         .remove = implRemove,
         .exists = implExists,
@@ -84,6 +85,38 @@ pub const MemoryBootstrapProvider = struct {
         // Disk fallback for graceful migration.
         if (self.workspace_dir) |dir| {
             return diskFallback(dir, allocator, filename);
+        }
+
+        return null;
+    }
+
+    fn implLoadExcerpt(ptr: *anyopaque, allocator: std.mem.Allocator, filename: []const u8, max_bytes: usize) anyerror!?[]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (!isBootstrapFilename(filename)) return Error.NotBootstrapFile;
+
+        const key = try memoryKey(allocator, filename);
+        defer allocator.free(key);
+
+        if (try self.mem.get(allocator, key)) |entry| {
+            defer allocator.free(entry.id);
+            defer allocator.free(entry.key);
+            defer allocator.free(entry.timestamp);
+            defer if (entry.session_id) |sid| allocator.free(sid);
+            defer switch (entry.category) {
+                .custom => |name| allocator.free(name),
+                else => {},
+            };
+
+            if (entry.content.len <= max_bytes) {
+                return entry.content;
+            }
+
+            defer allocator.free(entry.content);
+            return try allocator.dupe(u8, entry.content[0..max_bytes]);
+        }
+
+        if (self.workspace_dir) |dir| {
+            return diskFallbackExcerpt(dir, allocator, filename, max_bytes);
         }
 
         return null;
@@ -211,6 +244,34 @@ pub const MemoryBootstrapProvider = struct {
     }
 };
 
+fn diskFallbackExcerpt(workspace_dir: []const u8, allocator: std.mem.Allocator, filename: []const u8, max_bytes: usize) ?[]const u8 {
+    const path = std.fs.path.join(allocator, &.{ workspace_dir, filename }) catch return null;
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    const buf = allocator.alloc(u8, max_bytes) catch return null;
+    const read_len = file.readAll(buf) catch {
+        allocator.free(buf);
+        return null;
+    };
+    return shrink_alloc(allocator, buf, read_len) catch {
+        allocator.free(buf);
+        return null;
+    };
+}
+
+fn shrink_alloc(allocator: std.mem.Allocator, slice: []u8, new_len: usize) ![]u8 {
+    if (new_len >= slice.len) return slice;
+    return allocator.realloc(slice, new_len) catch blk: {
+        const fresh = try allocator.alloc(u8, new_len);
+        @memcpy(fresh, slice[0..new_len]);
+        allocator.free(slice);
+        break :blk fresh;
+    };
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -251,6 +312,20 @@ test "load missing returns null" {
     try testing.expect(content == null);
 }
 
+test "load_excerpt returns prefix for stored memory bootstrap" {
+    var lru = InMemoryLruMemory.init(testing.allocator, 100);
+    defer lru.deinit();
+
+    var ctx = initTestProvider(&lru, null);
+    var bp = ctx.provider.provider();
+
+    try bp.store("AGENTS.md", "abcdef");
+    const excerpt = try bp.load_excerpt(testing.allocator, "AGENTS.md", 4);
+    defer if (excerpt) |c| testing.allocator.free(c);
+
+    try testing.expectEqualStrings("abcd", excerpt.?);
+}
+
 test "fallback reads from workspace dir when not in DB" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -271,6 +346,27 @@ test "fallback reads from workspace dir when not in DB" {
     defer if (content) |c| testing.allocator.free(c);
 
     try testing.expectEqualStrings("disk identity", content.?);
+}
+
+test "load_excerpt uses disk fallback prefix when not in DB" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    tmp.dir.writeFile(.{ .sub_path = "IDENTITY.md", .data = "disk identity" }) catch unreachable;
+
+    const workspace = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(workspace);
+
+    var lru = InMemoryLruMemory.init(testing.allocator, 100);
+    defer lru.deinit();
+
+    var ctx = initTestProvider(&lru, workspace);
+    var bp = ctx.provider.provider();
+
+    const excerpt = try bp.load_excerpt(testing.allocator, "IDENTITY.md", 4);
+    defer if (excerpt) |c| testing.allocator.free(c);
+
+    try testing.expectEqualStrings("disk", excerpt.?);
 }
 
 test "DB takes priority over disk fallback" {

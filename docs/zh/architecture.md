@@ -2,6 +2,12 @@
 
 NullClaw 采用 vtable 可插拔架构。多数能力通过接口实现并在工厂注册，不需要改核心调用链。
 
+## 页面导航
+
+- 这页适合谁：想理解 NullClaw 模块边界、扩展点和实现取舍的开发者与维护者。
+- 看完去哪里：准备改代码看 [开发指南](./development.md)；要对照运行时配置看 [配置指南](./configuration.md)；涉及高风险边界看 [安全机制](./security.md)。
+- 如果你是从某页来的：从 [README](./README.md) 来，这页提供整体脑图；从 [开发指南](./development.md) 来，这页用于补齐接口与工厂层理解；从 [安全机制](./security.md) 来，可在这里回看 `security`、`runtime`、`gateway` 所在层次。
+
 ## 设计核心
 
 - 所有子系统通过统一接口抽象：`ptr: *anyopaque + vtable`。
@@ -38,3 +44,16 @@ NullClaw 采用 vtable 可插拔架构。多数能力通过接口实现并在工
 1. 优先通过新增实现扩展，不直接侵入核心流程。
 2. 保持模块职责单一：provider 不跨层依赖 channel 内部。
 3. 变更高风险路径（security/runtime/gateway/tools）时，必须补失败路径验证。
+
+## 下一步
+
+- 要开始改实现：继续看 [开发指南](./development.md)，再回到本页对照模块边界。
+- 要确认 CLI 与用户侧入口：继续看 [命令参考](./commands.md) 与 [配置指南](./configuration.md)。
+- 要审视高风险模块：继续看 [安全机制](./security.md) 和 [Gateway API](./gateway-api.md)。
+
+## 相关页面
+
+- [中文文档入口](./README.md)
+- [开发指南](./development.md)
+- [配置指南](./configuration.md)
+- [安全机制](./security.md)

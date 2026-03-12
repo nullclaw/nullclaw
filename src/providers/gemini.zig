@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
+const sse = @import("sse.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -601,7 +602,13 @@ pub const GeminiProvider = struct {
 
         // Check for error first
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("gemini", sanitized orelse summary);
+            return mapped_err;
         }
 
         var usage = root.TokenUsage{};
@@ -611,23 +618,38 @@ pub const GeminiProvider = struct {
             }
         }
 
-        // Extract text from candidates
+        // Extract text and thinking from candidates.
+        // Parts with "thought": true are reasoning traces; all others are visible content.
         if (root_obj.get("candidates")) |candidates| {
             if (candidates.array.items.len > 0) {
                 const candidate = candidates.array.items[0].object;
                 if (candidate.get("content")) |content| {
                     if (content.object.get("parts")) |parts| {
-                        if (parts.array.items.len > 0) {
-                            const part = parts.array.items[0].object;
+                        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer text_buf.deinit(allocator);
+                        var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer thought_buf.deinit(allocator);
+
+                        for (parts.array.items) |part_val| {
+                            const part = part_val.object;
+                            const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
                             if (part.get("text")) |text| {
-                                if (text == .string) {
-                                    return .{
-                                        .content = try allocator.dupe(u8, text.string),
-                                        .usage = usage,
-                                    };
+                                if (text == .string and text.string.len > 0) {
+                                    const buf = if (is_thought) &thought_buf else &text_buf;
+                                    if (buf.items.len > 0) try buf.append(allocator, '\n');
+                                    try buf.appendSlice(allocator, text.string);
                                 }
                             }
                         }
+
+                        if (text_buf.items.len == 0 and thought_buf.items.len == 0)
+                            return error.NoResponseContent;
+
+                        return .{
+                            .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
+                            .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
+                            .usage = usage,
+                        };
                     }
                 }
             }
@@ -705,7 +727,8 @@ pub const GeminiProvider = struct {
 
     /// Run curl in SSE streaming mode for Gemini and parse output line by line.
     ///
-    /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
+    /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast
+    /// flag: `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
     /// For each SSE delta, calls `callback(ctx, chunk)`.
     /// Returns accumulated result after stream completes.
     /// Stream ends when curl connection closes (no [DONE] sentinel).
@@ -728,7 +751,7 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
-        argv_buf[argc] = "--fail-with-body";
+        argv_buf[argc] = sse.curlFailFastArg(allocator);
         argc += 1;
 
         var timeout_buf: [32]u8 = undefined;
@@ -1238,7 +1261,12 @@ test "parseResponse error response" {
     const body =
         \\{"error":{"message":"Invalid API key"}}
     ;
+    root.clearLastApiErrorDetail();
     try std.testing.expectError(error.ApiError, GeminiProvider.parseResponse(std.testing.allocator, body));
+    const detail = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "gemini:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "message=Invalid API key") != null);
 }
 
 test "parseResponse classifies rate-limit errors" {
@@ -1285,13 +1313,45 @@ test "parseResponse no text field fails" {
     try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
 }
 
-test "parseResponse multiple parts returns first text" {
+test "parseResponse multiple parts concatenates visible text" {
     const body =
         \\{"candidates":[{"content":{"parts":[{"text":"First"},{"text":"Second"}]}}]}
     ;
     const result = try GeminiProvider.parseResponse(std.testing.allocator, body);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("First", result);
+    try std.testing.expectEqualStrings("First\nSecond", result);
+}
+
+test "parseChatResponse separates thought parts into reasoning_content" {
+    const body =
+        \\{"candidates":[{"content":{"parts":[{"thought":true,"text":"My reasoning trace"},{"text":"Visible answer"}]}}]}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try GeminiProvider.parseChatResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expectEqualStrings("Visible answer", response.content.?);
+    try std.testing.expectEqualStrings("My reasoning trace", response.reasoning_content.?);
+}
+
+test "parseChatResponse thought only leaves content null" {
+    const body =
+        \\{"candidates":[{"content":{"parts":[{"thought":true,"text":"only thinking"}]}}]}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try GeminiProvider.parseChatResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expect(response.content == null);
+    try std.testing.expectEqualStrings("only thinking", response.reasoning_content.?);
 }
 
 test "provider rejects whitespace key" {

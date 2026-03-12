@@ -13,6 +13,8 @@ const core_tool_names = [_][]const u8{
     "file_read",
     "file_write",
     "file_edit",
+    "file_read_hashed",
+    "file_edit_hashed",
     "git",
     "image_info",
     "memory_store",
@@ -422,6 +424,8 @@ test "buildManifestJson emits core sections" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"channels\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"memory_engines\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_read_hashed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_edit_hashed\"") != null);
 }
 
 test "buildManifestJson includes runtime_loaded when runtime tools are unavailable" {

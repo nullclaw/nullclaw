@@ -1,5 +1,9 @@
 name: CI
 
+env:
+  ANDROID_API_LEVEL: 24
+  ANDROID_NDK_VERSION: 29.0.14206865
+
 on:
   push:
     branches: [main]
@@ -35,11 +39,13 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Cache .zig-cache
+      - name: Cache Zig build outputs
         uses: actions/cache@v4
         with:
-          path: .zig-cache
-          key: zig-${{ matrix.target }}-${{ hashFiles('src/**/*.zig', 'build.zig') }}
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-${{ matrix.target }}-${{ hashFiles('src/**/*.zig', 'build.zig', 'build.zig.zon', 'vendor/sqlite3/**') }}
           restore-keys: zig-${{ matrix.target }}-
 
       - name: Run tests
@@ -48,17 +54,10 @@ jobs:
       - name: Build ReleaseSmall
         run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSmall
 
-      - name: Cross-compile linux-aarch64 (Termux/ARM)
-        if: runner.os == 'Linux'
-        run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
-
-      - name: Cross-compile linux-arm32 (glibc)
-        if: runner.os == 'Linux'
-        run: zig build -Dtarget=arm-linux-gnueabihf -Doptimize=ReleaseSmall
-
-      - name: Cross-compile linux-arm32 (musl)
-        if: runner.os == 'Linux'
-        run: zig build -Dtarget=arm-linux-musleabihf -Doptimize=ReleaseSmall
+      - name: Preserve host binary
+        run: |
+          mkdir -p ci-artifacts
+          cp "zig-out/bin/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}" "ci-artifacts/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}"
 
       - name: Job summary
         if: always()
@@ -75,9 +74,9 @@ jobs:
             echo "| Test MaxRSS | ${RSS:-—} |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          BIN="zig-out/bin/nullclaw"
+          BIN="ci-artifacts/nullclaw"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            BIN="zig-out/bin/nullclaw.exe"
+            BIN="ci-artifacts/nullclaw.exe"
           fi
           if [ -f "$BIN" ]; then
             SIZE=$(wc -c < "$BIN" | tr -d ' ')
@@ -90,4 +89,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nullclaw-${{ matrix.target }}
-          path: zig-out/bin/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}
+          path: ci-artifacts/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}

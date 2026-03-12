@@ -12,6 +12,7 @@ COPY src/ src/
 COPY vendor/sqlite3/ vendor/sqlite3/
 
 ARG TARGETARCH
+ARG VERSION=dev
 RUN --mount=type=cache,target=/root/.cache/zig \
     --mount=type=cache,target=/app/.zig-cache \
     set -eu; \
@@ -28,7 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
       arm64) zig_target="aarch64-linux-musl" ;; \
       *) echo "Unsupported TARGETARCH: ${arch}" >&2; exit 1 ;; \
     esac; \
-    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall -Dversion="${VERSION}"
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
 FROM busybox:1.37 AS config

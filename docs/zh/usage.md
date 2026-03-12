@@ -2,6 +2,12 @@
 
 本页聚焦日常操作、服务化运行和常见故障排查。
 
+## 页面导航
+
+- 这页适合谁：已经完成安装与基础配置，准备日常使用、服务化运行或排障的人。
+- 看完去哪里：命令细节继续看 [命令参考](./commands.md)；要核对配置字段看 [配置指南](./configuration.md)；涉及 webhook 与对外接入看 [Gateway API](./gateway-api.md)。
+- 如果你是从某页来的：从 [安装指南](./installation.md) 来，这页就是首次跑通的下一站；从 [配置指南](./configuration.md) 来，这页用来验证配置是否真能工作；从 [Gateway API](./gateway-api.md) 来，可回到这里看长期运行与排障顺序。
+
 ## 首次启动流程
 
 1. 执行初始化：
@@ -136,3 +142,16 @@ nullclaw agent -m "self-check"
 nullclaw gateway
 curl http://127.0.0.1:3000/health
 ```
+
+## 下一步
+
+- 要细查具体 CLI 行为：继续看 [命令参考](./commands.md)，按子命令逐项核对。
+- 要排查配置或调整 provider/channel：继续看 [配置指南](./configuration.md)。
+- 要把网关开放给外部系统：继续看 [Gateway API](./gateway-api.md) 和 [安全机制](./security.md)。
+
+## 相关页面
+
+- [安装指南](./installation.md)
+- [配置指南](./configuration.md)
+- [命令参考](./commands.md)
+- [Gateway API](./gateway-api.md)

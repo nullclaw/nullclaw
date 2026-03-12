@@ -12,7 +12,9 @@ const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
 const MessageEntry = root.MessageEntry;
+const SessionInfo = root.SessionInfo;
 const SessionStore = root.SessionStore;
+const DetailedMessageEntry = root.DetailedMessageEntry;
 const config_types = @import("../../config_types.zig");
 const net_security = @import("../../net_security.zig");
 const url_percent = @import("../../url_percent.zig");
@@ -32,6 +34,24 @@ pub const ApiMemory = struct {
     const HttpResponse = struct {
         status: std.http.Status,
         body: []u8,
+    };
+
+    const HistoryListResponse = struct {
+        total: u64,
+        sessions: []SessionInfo,
+
+        fn deinit(self: @This(), alloc: Allocator) void {
+            root.freeSessionInfos(alloc, self.sessions);
+        }
+    };
+
+    const HistoryShowResponse = struct {
+        total: u64,
+        messages: []DetailedMessageEntry,
+
+        fn deinit(self: @This(), alloc: Allocator) void {
+            root.freeDetailedMessages(alloc, self.messages);
+        }
     };
 
     pub fn init(allocator: Allocator, config: config_types.MemoryApiConfig) !Self {
@@ -256,6 +276,12 @@ pub const ApiMemory = struct {
         return std.fmt.allocPrint(alloc, "{s}/sessions/{s}/messages", .{ self.base_url, encoded_sid });
     }
 
+    fn buildSessionUsageUrl(self: *const Self, alloc: Allocator, session_id: []const u8) ![]u8 {
+        const encoded_sid = try urlEncode(alloc, session_id);
+        defer alloc.free(encoded_sid);
+        return std.fmt.allocPrint(alloc, "{s}/sessions/{s}/usage", .{ self.base_url, encoded_sid });
+    }
+
     fn buildAutoSavedUrl(self: *const Self, alloc: Allocator, session_id: ?[]const u8) ![]u8 {
         if (session_id) |sid| {
             const encoded_sid = try urlEncode(alloc, sid);
@@ -263,6 +289,16 @@ pub const ApiMemory = struct {
             return std.fmt.allocPrint(alloc, "{s}/sessions/auto-saved?session_id={s}", .{ self.base_url, encoded_sid });
         }
         return std.fmt.allocPrint(alloc, "{s}/sessions/auto-saved", .{self.base_url});
+    }
+
+    fn buildHistoryListUrl(self: *const Self, alloc: Allocator, limit: usize, offset: usize) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/history?limit={d}&offset={d}", .{ self.base_url, limit, offset });
+    }
+
+    fn buildHistoryShowUrl(self: *const Self, alloc: Allocator, session_id: []const u8, limit: usize, offset: usize) ![]u8 {
+        const encoded_sid = try urlEncode(alloc, session_id);
+        defer alloc.free(encoded_sid);
+        return std.fmt.allocPrint(alloc, "{s}/history/{s}?limit={d}&offset={d}", .{ self.base_url, encoded_sid, limit, offset });
     }
 
     // ── JSON builders ────────────────────────────────────────────
@@ -321,6 +357,18 @@ pub const ApiMemory = struct {
         try buf.appendSlice(alloc, "\",\"content\":\"");
         try appendJsonEscaped(&buf, alloc, content);
         try buf.appendSlice(alloc, "\"}");
+        return buf.toOwnedSlice(alloc);
+    }
+
+    fn buildUsagePayload(alloc: Allocator, total_tokens: u64) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(alloc);
+
+        try buf.appendSlice(alloc, "{\"total_tokens\":");
+        var total_buf: [32]u8 = undefined;
+        const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{total_tokens}) catch unreachable;
+        try buf.appendSlice(alloc, total_str);
+        try buf.append(alloc, '}');
         return buf.toOwnedSlice(alloc);
     }
 
@@ -509,6 +557,23 @@ pub const ApiMemory = struct {
         return results.toOwnedSlice(alloc);
     }
 
+    fn parseUsage(alloc: Allocator, body: []const u8) !?u64 {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
+        defer parsed.deinit();
+
+        const total_val = switch (parsed.value) {
+            .object => |obj| obj.get("total_tokens") orelse return error.ApiInvalidResponse,
+            else => return error.ApiInvalidResponse,
+        };
+
+        return switch (total_val) {
+            .null => null,
+            .integer => |n| if (n >= 0) @intCast(n) else return error.ApiInvalidResponse,
+            .string => |s| std.fmt.parseInt(u64, s, 10) catch return error.ApiInvalidResponse,
+            else => return error.ApiInvalidResponse,
+        };
+    }
+
     fn parseCount(alloc: Allocator, body: []const u8) !usize {
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
         defer parsed.deinit();
@@ -521,6 +586,156 @@ pub const ApiMemory = struct {
         return switch (count_val) {
             .integer => |n| if (n >= 0) @intCast(n) else return error.ApiInvalidResponse,
             else => return error.ApiInvalidResponse,
+        };
+    }
+
+    fn parseJsonU64(value: std.json.Value) !u64 {
+        return switch (value) {
+            .integer => |n| if (n >= 0) @intCast(n) else return error.ApiInvalidResponse,
+            .string => |s| std.fmt.parseInt(u64, s, 10) catch return error.ApiInvalidResponse,
+            else => return error.ApiInvalidResponse,
+        };
+    }
+
+    fn parseHistorySessionInfos(alloc: Allocator, sessions_arr: std.json.Array) ![]SessionInfo {
+        var results: std.ArrayListUnmanaged(SessionInfo) = .empty;
+        errdefer {
+            for (results.items) |info| info.deinit(alloc);
+            results.deinit(alloc);
+        }
+
+        for (sessions_arr.items) |item| {
+            const obj = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+
+            const session_id = if (obj.get("session_id")) |v| switch (v) {
+                .string => |s| s,
+                else => continue,
+            } else continue;
+
+            const message_count = if (obj.get("message_count")) |v|
+                try parseJsonU64(v)
+            else
+                continue;
+
+            const first_message_at = if (obj.get("first_message_at")) |v| switch (v) {
+                .string => |s| s,
+                else => continue,
+            } else continue;
+
+            const last_message_at = if (obj.get("last_message_at")) |v| switch (v) {
+                .string => |s| s,
+                else => continue,
+            } else continue;
+
+            const owned_session_id = try alloc.dupe(u8, session_id);
+            errdefer alloc.free(owned_session_id);
+            const owned_first = try alloc.dupe(u8, first_message_at);
+            errdefer alloc.free(owned_first);
+            const owned_last = try alloc.dupe(u8, last_message_at);
+            errdefer alloc.free(owned_last);
+
+            try results.append(alloc, .{
+                .session_id = owned_session_id,
+                .message_count = message_count,
+                .first_message_at = owned_first,
+                .last_message_at = owned_last,
+            });
+        }
+
+        return results.toOwnedSlice(alloc);
+    }
+
+    fn parseHistoryDetailedMessages(alloc: Allocator, messages_arr: std.json.Array) ![]DetailedMessageEntry {
+        var results: std.ArrayListUnmanaged(DetailedMessageEntry) = .empty;
+        errdefer {
+            for (results.items) |entry| {
+                alloc.free(entry.role);
+                alloc.free(entry.content);
+                alloc.free(entry.created_at);
+            }
+            results.deinit(alloc);
+        }
+
+        for (messages_arr.items) |item| {
+            const obj = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+
+            const role = if (obj.get("role")) |v| switch (v) {
+                .string => |s| s,
+                else => continue,
+            } else continue;
+
+            const content = if (obj.get("content")) |v| switch (v) {
+                .string => |s| s,
+                else => continue,
+            } else continue;
+
+            const created_at = if (obj.get("created_at")) |v| switch (v) {
+                .string => |s| s,
+                else => "",
+            } else "";
+
+            const owned_role = try alloc.dupe(u8, role);
+            errdefer alloc.free(owned_role);
+            const owned_content = try alloc.dupe(u8, content);
+            errdefer alloc.free(owned_content);
+            const owned_created_at = try alloc.dupe(u8, created_at);
+            errdefer alloc.free(owned_created_at);
+
+            try results.append(alloc, .{
+                .role = owned_role,
+                .content = owned_content,
+                .created_at = owned_created_at,
+            });
+        }
+
+        return results.toOwnedSlice(alloc);
+    }
+
+    fn parseHistoryListResponse(alloc: Allocator, body: []const u8) !HistoryListResponse {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return error.ApiInvalidResponse,
+        };
+
+        const total = try parseJsonU64(obj.get("total") orelse return error.ApiInvalidResponse);
+        const sessions_arr = switch (obj.get("sessions") orelse return error.ApiInvalidResponse) {
+            .array => |a| a,
+            else => return error.ApiInvalidResponse,
+        };
+
+        return .{
+            .total = total,
+            .sessions = try parseHistorySessionInfos(alloc, sessions_arr),
+        };
+    }
+
+    fn parseHistoryShowResponse(alloc: Allocator, body: []const u8) !HistoryShowResponse {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return error.ApiInvalidResponse,
+        };
+
+        const total = try parseJsonU64(obj.get("total") orelse return error.ApiInvalidResponse);
+        const messages_arr = switch (obj.get("messages") orelse return error.ApiInvalidResponse) {
+            .array => |a| a,
+            else => return error.ApiInvalidResponse,
+        };
+
+        return .{
+            .total = total,
+            .messages = try parseHistoryDetailedMessages(alloc, messages_arr),
         };
     }
 
@@ -663,6 +878,13 @@ pub const ApiMemory = struct {
     };
 
     // ── SessionStore vtable implementation ───────────────────────
+    // API contract:
+    // - POST/GET/DELETE {base}/sessions/{session_id}/messages
+    // - PUT/GET/DELETE  {base}/sessions/{session_id}/usage with {"total_tokens":123}
+    // - GET             {base}/history?limit=N&offset=N
+    //     -> {"total":123,"limit":50,"offset":0,"sessions":[...]}
+    // - GET             {base}/history/{session_id}?limit=N&offset=N
+    //     -> {"session_id":"...","total":123,"limit":100,"offset":0,"messages":[...]}
 
     fn implSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -710,8 +932,19 @@ pub const ApiMemory = struct {
         const resp = try self.doRequest(alloc, url, .DELETE, null);
         defer alloc.free(resp.body);
 
-        if (resp.status != .ok) {
+        if (resp.status != .ok and resp.status != .not_found) {
             log.warn("API clearMessages failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        const usage_url = try self.buildSessionUsageUrl(alloc, session_id);
+        defer alloc.free(usage_url);
+
+        const usage_resp = try self.doRequest(alloc, usage_url, .DELETE, null);
+        defer alloc.free(usage_resp.body);
+
+        if (usage_resp.status != .ok and usage_resp.status != .not_found) {
+            log.warn("API clearUsage failed: status={d}", .{@intFromEnum(usage_resp.status)});
             return error.ApiRequestFailed;
         }
     }
@@ -732,11 +965,135 @@ pub const ApiMemory = struct {
         }
     }
 
+    fn implSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildSessionUsageUrl(alloc, session_id);
+        defer alloc.free(url);
+
+        const payload = try buildUsagePayload(alloc, total_tokens);
+        defer alloc.free(payload);
+
+        const resp = try self.doRequest(alloc, url, .PUT, payload);
+        defer alloc.free(resp.body);
+
+        if (resp.status != .ok) {
+            log.warn("API saveUsage failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+    }
+
+    fn implLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildSessionUsageUrl(alloc, session_id);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return null;
+        if (resp.status != .ok) {
+            log.warn("API loadUsage failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        return parseUsage(alloc, resp.body);
+    }
+
+    fn implCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildHistoryListUrl(alloc, 1, 0);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return error.NotSupported;
+        if (resp.status != .ok) {
+            log.warn("API history countSessions failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        var parsed = try parseHistoryListResponse(alloc, resp.body);
+        defer parsed.deinit(alloc);
+        return parsed.total;
+    }
+
+    fn implListSessions(ptr: *anyopaque, alloc: Allocator, limit: usize, offset: usize) anyerror![]SessionInfo {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const url = try self.buildHistoryListUrl(alloc, limit, offset);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return error.NotSupported;
+        if (resp.status != .ok) {
+            log.warn("API history listSessions failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        const parsed = try parseHistoryListResponse(alloc, resp.body);
+        return parsed.sessions;
+    }
+
+    fn implCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildHistoryShowUrl(alloc, session_id, 1, 0);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return error.NotSupported;
+        if (resp.status != .ok) {
+            log.warn("API history countDetailedMessages failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        var parsed = try parseHistoryShowResponse(alloc, resp.body);
+        defer parsed.deinit(alloc);
+        return parsed.total;
+    }
+
+    fn implLoadMessagesDetailed(ptr: *anyopaque, alloc: Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]DetailedMessageEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const url = try self.buildHistoryShowUrl(alloc, session_id, limit, offset);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return error.NotSupported;
+        if (resp.status != .ok) {
+            log.warn("API history loadMessagesDetailed failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        const parsed = try parseHistoryShowResponse(alloc, resp.body);
+        return parsed.messages;
+    }
+
     const session_vtable = SessionStore.VTable{
         .saveMessage = &implSaveMessage,
         .loadMessages = &implLoadMessages,
         .clearMessages = &implClearMessages,
         .clearAutoSaved = &implClearAutoSaved,
+        .saveUsage = &implSaveUsage,
+        .loadUsage = &implLoadUsage,
+        .countSessions = &implCountSessions,
+        .listSessions = &implListSessions,
+        .countDetailedMessages = &implCountDetailedMessages,
+        .loadMessagesDetailed = &implLoadMessagesDetailed,
     };
 };
 
@@ -830,6 +1187,21 @@ test "api url building" {
     const url6 = try mem.buildSessionMessagesUrl(std.testing.allocator, "sess-42");
     defer std.testing.allocator.free(url6);
     try std.testing.expectEqualStrings("http://localhost:8080/v1/agent/sessions/sess-42/messages", url6);
+
+    // Session usage URL
+    const url7 = try mem.buildSessionUsageUrl(std.testing.allocator, "sess-42");
+    defer std.testing.allocator.free(url7);
+    try std.testing.expectEqualStrings("http://localhost:8080/v1/agent/sessions/sess-42/usage", url7);
+
+    // History list URL
+    const url8 = try mem.buildHistoryListUrl(std.testing.allocator, 50, 10);
+    defer std.testing.allocator.free(url8);
+    try std.testing.expectEqualStrings("http://localhost:8080/v1/agent/history?limit=50&offset=10", url8);
+
+    // History show URL
+    const url9 = try mem.buildHistoryShowUrl(std.testing.allocator, "sess-42", 100, 20);
+    defer std.testing.allocator.free(url9);
+    try std.testing.expectEqualStrings("http://localhost:8080/v1/agent/history/sess-42?limit=100&offset=20", url9);
 }
 
 test "api url building with trailing slash" {
@@ -1007,6 +1379,90 @@ test "api parse messages invalid json" {
     try std.testing.expectError(error.ApiInvalidResponse, result);
 }
 
+test "api parse usage" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"total_tokens":123}
+    ;
+    const total = try ApiMemory.parseUsage(alloc, json);
+    try std.testing.expectEqual(@as(?u64, 123), total);
+}
+
+test "api parse usage accepts string" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"total_tokens":"456"}
+    ;
+    const total = try ApiMemory.parseUsage(alloc, json);
+    try std.testing.expectEqual(@as(?u64, 456), total);
+}
+
+test "api parse usage null" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"total_tokens":null}
+    ;
+    const total = try ApiMemory.parseUsage(alloc, json);
+    try std.testing.expectEqual(@as(?u64, null), total);
+}
+
+test "api parse usage invalid" {
+    const alloc = std.testing.allocator;
+    const result = ApiMemory.parseUsage(alloc, "{\"count\":5}");
+    try std.testing.expectError(error.ApiInvalidResponse, result);
+}
+
+test "api parse history list response" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"total":2,"limit":50,"offset":0,"sessions":[
+        \\  {"session_id":"sess-1","message_count":4,"first_message_at":"2026-03-01T10:00:00Z","last_message_at":"2026-03-01T10:05:00Z"},
+        \\  {"session_id":"sess-2","message_count":"2","first_message_at":"2026-03-02T11:00:00Z","last_message_at":"2026-03-02T11:01:00Z"}
+        \\]}
+    ;
+
+    var parsed = try ApiMemory.parseHistoryListResponse(alloc, json);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u64, 2), parsed.total);
+    try std.testing.expectEqual(@as(usize, 2), parsed.sessions.len);
+    try std.testing.expectEqualStrings("sess-1", parsed.sessions[0].session_id);
+    try std.testing.expectEqual(@as(u64, 4), parsed.sessions[0].message_count);
+    try std.testing.expectEqualStrings("2026-03-01T10:00:00Z", parsed.sessions[0].first_message_at);
+    try std.testing.expectEqualStrings("2026-03-02T11:01:00Z", parsed.sessions[1].last_message_at);
+}
+
+test "api parse history show response" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"session_id":"sess-1","total":"2","limit":100,"offset":0,"messages":[
+        \\  {"role":"user","content":"Hello","created_at":"2026-03-01T10:00:00Z"},
+        \\  {"role":"assistant","content":"Hi","created_at":"2026-03-01T10:00:01Z"}
+        \\]}
+    ;
+
+    var parsed = try ApiMemory.parseHistoryShowResponse(alloc, json);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u64, 2), parsed.total);
+    try std.testing.expectEqual(@as(usize, 2), parsed.messages.len);
+    try std.testing.expectEqualStrings("user", parsed.messages[0].role);
+    try std.testing.expectEqualStrings("Hello", parsed.messages[0].content);
+    try std.testing.expectEqualStrings("2026-03-01T10:00:01Z", parsed.messages[1].created_at);
+}
+
+test "api parse history list response invalid" {
+    const alloc = std.testing.allocator;
+    const result = ApiMemory.parseHistoryListResponse(alloc, "{\"sessions\":[]}");
+    try std.testing.expectError(error.ApiInvalidResponse, result);
+}
+
+test "api parse history show response invalid" {
+    const alloc = std.testing.allocator;
+    const result = ApiMemory.parseHistoryShowResponse(alloc, "{\"total\":1}");
+    try std.testing.expectError(error.ApiInvalidResponse, result);
+}
+
 test "api parse count" {
     const alloc = std.testing.allocator;
     const json =
@@ -1118,6 +1574,18 @@ test "api build message payload" {
     try std.testing.expectEqualStrings("Hello world", obj.get("content").?.string);
 }
 
+test "api build usage payload" {
+    const alloc = std.testing.allocator;
+    const payload = try ApiMemory.buildUsagePayload(alloc, 321);
+    defer alloc.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 321), obj.get("total_tokens").?.integer);
+}
+
 test "api memory produces vtable" {
     var mem = try ApiMemory.init(std.testing.allocator, .{ .url = "http://127.0.0.1:8080" });
     defer mem.deinit();
@@ -1143,6 +1611,12 @@ test "api memory produces session store vtable" {
     try std.testing.expect(ss.vtable.loadMessages == &ApiMemory.implLoadMessages);
     try std.testing.expect(ss.vtable.clearMessages == &ApiMemory.implClearMessages);
     try std.testing.expect(ss.vtable.clearAutoSaved == &ApiMemory.implClearAutoSaved);
+    try std.testing.expect(ss.vtable.saveUsage == &ApiMemory.implSaveUsage);
+    try std.testing.expect(ss.vtable.loadUsage == &ApiMemory.implLoadUsage);
+    try std.testing.expect(ss.vtable.countSessions == &ApiMemory.implCountSessions);
+    try std.testing.expect(ss.vtable.listSessions == &ApiMemory.implListSessions);
+    try std.testing.expect(ss.vtable.countDetailedMessages == &ApiMemory.implCountDetailedMessages);
+    try std.testing.expect(ss.vtable.loadMessagesDetailed == &ApiMemory.implLoadMessagesDetailed);
 }
 
 test "api memory no session store when disabled" {

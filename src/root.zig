@@ -25,6 +25,7 @@ pub const capabilities = @import("capabilities.zig");
 pub const config_mutator = @import("config_mutator.zig");
 pub const service = @import("service.zig");
 pub const daemon = @import("daemon.zig");
+pub const control_plane = @import("control_plane.zig");
 pub const channel_loop = @import("channel_loop.zig");
 pub const channel_manager = @import("channel_manager.zig");
 pub const channel_catalog = @import("channel_catalog.zig");
@@ -80,6 +81,7 @@ pub const integrations = @import("integrations.zig");
 pub const peripherals = @import("peripherals.zig");
 pub const rag = @import("rag.zig");
 pub const skillforge = @import("skillforge.zig");
+pub const verbose = @import("verbose.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");
 

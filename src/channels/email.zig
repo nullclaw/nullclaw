@@ -1736,7 +1736,15 @@ fn markdownToEmailHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
                 try buf.append(allocator, '0' + clamped);
                 try buf.appendSlice(allocator, ">");
                 i = end;
-                if (i < md.len) i += 1;
+                // Skip the trailing newline, but only if it's not part of a
+                // double-newline paragraph break (so the \n\n → <p> rule fires).
+                if (i < md.len and md[i] == '\n') {
+                    if (i + 1 < md.len and md[i + 1] == '\n') {
+                        // Leave i on the first \n so the paragraph-break handler sees \n\n
+                    } else {
+                        i += 1;
+                    }
+                }
                 line_start = true;
                 continue;
             }
@@ -2254,14 +2262,14 @@ test "consent not granted blocks send" {
 }
 
 test "consent granted allows send attempt" {
-    // With consent but invalid host, we expect SmtpConnectError (not ConsentNotGranted)
+    // With consent but invalid host, we expect SmtpError (not ConsentNotGranted)
     var ch = EmailChannel.init(std.testing.allocator, .{
         .consent_granted = true,
         .smtp_host = "999.999.999.999",
     });
     defer ch.deinit();
     const result = ch.sendMessage("test@example.com", "hello");
-    try std.testing.expectError(error.SmtpConnectError, result);
+    try std.testing.expectError(error.SmtpError, result);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

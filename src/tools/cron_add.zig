@@ -57,7 +57,7 @@ pub const CronAddTool = struct {
         // Prefer expression (recurring) over delay (one-shot)
         if (expression) |expr| {
             const job = if (is_agent)
-                scheduler.addAgentJob(expr, prompt, model) catch |err| {
+                scheduler.addAgentJob(expr, prompt, model, .{}) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create agent job: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 }

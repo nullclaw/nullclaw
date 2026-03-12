@@ -17,8 +17,6 @@ const WizardAnswers = struct {
     tunnel: ?[]const u8 = null,
     autonomy: ?[]const u8 = null,
     gateway_port: ?u16 = null,
-    /// Comma-separated channel keys (e.g. "cli,webhook,web").
-    channels: ?[]const u8 = null,
     /// Override config/workspace directory (used by nullhub for instance isolation).
     /// Falls back to NULLCLAW_HOME env, then ~/.nullclaw/.
     home: ?[]const u8 = null,
@@ -48,6 +46,12 @@ fn applyAutonomySelection(cfg: *Config, autonomy: []const u8) AutonomySelectionE
     }
     if (std.mem.eql(u8, autonomy, "fully_autonomous")) {
         cfg.autonomy.level = .full;
+        cfg.autonomy.require_approval_for_medium_risk = false;
+        cfg.autonomy.block_high_risk_commands = false;
+        return;
+    }
+    if (std.mem.eql(u8, autonomy, "yolo")) {
+        cfg.autonomy.level = .yolo;
         cfg.autonomy.require_approval_for_medium_risk = false;
         cfg.autonomy.block_high_risk_commands = false;
         return;
@@ -135,24 +139,8 @@ fn loadConfigForFromJson(allocator: std.mem.Allocator, custom_home: ?[]const u8)
 fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
     if (items.len == 0) return;
 
-    // First entry sets default_provider and default_model
-    if (items[0] == .object) {
-        const first = items[0].object;
-        if (first.get("provider")) |v| {
-            if (v == .string) {
-                const provider_info = onboard.resolveProviderForQuickSetup(v.string) orelse {
-                    std.debug.print("error: unknown provider '{s}'\n", .{v.string});
-                    std.process.exit(1);
-                };
-                cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
-            }
-        }
-        if (first.get("model")) |v| {
-            if (v == .string and v.string.len > 0) {
-                cfg.default_model = try cfg.allocator.dupe(u8, v.string);
-            }
-        }
-    }
+    var primary_provider_set = false;
+    var primary_model_set = false;
 
     // Create ProviderEntry array from all entries
     var entries_list: std.ArrayListUnmanaged(config_mod.ProviderEntry) = .empty;
@@ -168,7 +156,29 @@ fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
         else
             null;
 
-        const resolved = onboard.resolveProviderForQuickSetup(name) orelse continue;
+        const resolved = onboard.resolveProviderForQuickSetup(name) orelse {
+            if (!primary_provider_set) {
+                std.debug.print("error: unknown provider '{s}'\n", .{name});
+                std.process.exit(1);
+            }
+            continue;
+        };
+
+        if (!primary_provider_set) {
+            cfg.default_provider = try cfg.allocator.dupe(u8, resolved.key);
+            primary_provider_set = true;
+
+            if (obj.get("model")) |model_v| {
+                if (model_v == .string) {
+                    const trimmed_model = std.mem.trim(u8, model_v.string, " \t\r\n");
+                    if (trimmed_model.len > 0) {
+                        cfg.default_model = try cfg.allocator.dupe(u8, trimmed_model);
+                        primary_model_set = true;
+                    }
+                }
+            }
+        }
+
         try entries_list.append(cfg.allocator, .{
             .name = try cfg.allocator.dupe(u8, resolved.key),
             .api_key = if (api_key) |k| try cfg.allocator.dupe(u8, k) else null,
@@ -178,57 +188,219 @@ fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
     if (entries_list.items.len > 0) {
         cfg.providers = try entries_list.toOwnedSlice(cfg.allocator);
     }
+
+    if (primary_provider_set and !primary_model_set) {
+        cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
+    }
 }
 
-/// Merge channel configurations from the wizard's JSON object into config.json.
-///
-/// Wizard sends channels as: {"telegram": {"default": {"bot_token": "..."}}}
-/// Config.json expects:       {"channels": {"telegram": {"accounts": {"default": {"bot_token": "..."}}}}}
-///
-/// After cfg.save() wrote the base config, this function reads it back,
-/// merges the wizard's channel configs (wrapped with "accounts"), and writes it back.
-fn mergeChannelsIntoConfig(allocator: std.mem.Allocator, config_path: []const u8, wizard_channels: std.json.ObjectMap) !void {
-    // Read existing config.json
-    const file = try std.fs.openFileAbsolute(config_path, .{});
-    const content = try file.readToEndAlloc(allocator, 1024 * 256);
-    defer allocator.free(content);
-    file.close();
+fn channelSupportsAccounts(channel_type: []const u8) bool {
+    inline for (std.meta.fields(config_mod.ChannelsConfig)) |field| {
+        if (std.mem.eql(u8, channel_type, field.name)) {
+            return switch (@typeInfo(field.type)) {
+                .pointer => |ptr| ptr.size == .slice,
+                else => false,
+            };
+        }
+    }
+    return false;
+}
 
-    // Parse existing config as Value tree
-    const config_parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always }) catch return;
-    defer config_parsed.deinit();
+fn channelExistsInConfig(channel_type: []const u8) bool {
+    inline for (std.meta.fields(config_mod.ChannelsConfig)) |field| {
+        if (std.mem.eql(u8, channel_type, field.name)) return true;
+    }
+    return false;
+}
 
-    if (config_parsed.value != .object) return;
+fn firstObjectValue(map: std.json.ObjectMap) ?std.json.Value {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .object) return entry.value_ptr.*;
+    }
+    return null;
+}
 
-    // Get channels section
-    const channels_ptr = config_parsed.value.object.getPtr("channels") orelse return;
-    if (channels_ptr.* != .object) return;
+fn selectPreferredAccountValue(map: std.json.ObjectMap, channel_type: []const u8) ?std.json.Value {
+    if (map.get("default")) |v| {
+        if (v == .object) return v;
+    }
+    if (map.get("main")) |v| {
+        if (v == .object) return v;
+    }
+    if (map.get(channel_type)) |v| {
+        if (v == .object) return v;
+    }
+    return firstObjectValue(map);
+}
 
-    // For each channel type in wizard input
-    var ch_iter = wizard_channels.iterator();
-    while (ch_iter.next()) |entry| {
-        const channel_type = entry.key_ptr.*;
-        const accounts_obj = entry.value_ptr.*;
-        if (accounts_obj != .object) continue;
+fn isLikelyInlineSingleChannelObject(obj: std.json.ObjectMap) bool {
+    var has_non_object = false;
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) {
+            has_non_object = true;
+            break;
+        }
+    }
+    return has_non_object;
+}
 
-        // Skip cli (boolean flag, not an accounts object)
-        if (std.mem.eql(u8, channel_type, "cli")) continue;
+fn cloneJsonValueWithNormalizedObjects(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
+    return switch (value) {
+        .object => |obj| .{ .object = try normalizeWizardAccountObject(allocator, obj) },
+        .array => |arr| blk: {
+            var cloned = std.json.Array.init(allocator);
+            for (arr.items) |item| {
+                try cloned.append(try cloneJsonValueWithNormalizedObjects(allocator, item));
+            }
+            break :blk .{ .array = cloned };
+        },
+        else => value,
+    };
+}
 
-        // Wrap wizard format in "accounts" to match config.json format:
-        // {"default": {"bot_token": "..."}} → {"accounts": {"default": {"bot_token": "..."}}}
-        var channel_obj = std.json.ObjectMap.init(allocator);
-        channel_obj.put("accounts", accounts_obj) catch continue;
-
-        channels_ptr.*.object.put(channel_type, .{ .object = channel_obj }) catch continue;
+fn putValueByDottedKey(
+    allocator: std.mem.Allocator,
+    root_obj: *std.json.ObjectMap,
+    dotted_key: []const u8,
+    value: std.json.Value,
+) anyerror!void {
+    if (std.mem.indexOfScalar(u8, dotted_key, '.') == null) {
+        try root_obj.put(dotted_key, value);
+        return;
     }
 
-    // Serialize back to config.json using pretty-print
-    const json_out = std.json.Stringify.valueAlloc(allocator, config_parsed.value, .{ .whitespace = .indent_2 }) catch return;
-    defer allocator.free(json_out);
+    var segments = std.mem.splitScalar(u8, dotted_key, '.');
+    const first = segments.next() orelse return;
 
-    const out_file = std.fs.createFileAbsolute(config_path, .{}) catch return;
-    defer out_file.close();
-    out_file.writeAll(json_out) catch return;
+    var current_obj: *std.json.ObjectMap = root_obj;
+    var segment = first;
+
+    while (segments.next()) |next_segment| {
+        if (current_obj.getPtr(segment)) |existing_ptr| {
+            if (existing_ptr.* != .object) {
+                existing_ptr.* = .{ .object = std.json.ObjectMap.init(allocator) };
+            }
+        } else {
+            try current_obj.put(segment, .{ .object = std.json.ObjectMap.init(allocator) });
+        }
+
+        current_obj = &current_obj.getPtr(segment).?.object;
+        segment = next_segment;
+    }
+
+    try current_obj.put(segment, value);
+}
+
+fn normalizeWizardAccountObject(
+    allocator: std.mem.Allocator,
+    raw_obj: std.json.ObjectMap,
+) anyerror!std.json.ObjectMap {
+    var normalized = std.json.ObjectMap.init(allocator);
+
+    var it = raw_obj.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const cloned_value = try cloneJsonValueWithNormalizedObjects(allocator, entry.value_ptr.*);
+        try putValueByDottedKey(allocator, &normalized, key, cloned_value);
+    }
+
+    return normalized;
+}
+
+fn addAccountsChannelValue(
+    allocator: std.mem.Allocator,
+    channels_obj: *std.json.ObjectMap,
+    channel_type: []const u8,
+    raw_channel_obj: std.json.ObjectMap,
+) !void {
+    const accounts_source = blk: {
+        if (raw_channel_obj.get("accounts")) |v| {
+            if (v == .object) break :blk v.object;
+        }
+        break :blk raw_channel_obj;
+    };
+
+    var accounts_obj = std.json.ObjectMap.init(allocator);
+    var acc_it = accounts_source.iterator();
+    while (acc_it.next()) |acc_entry| {
+        const account_name = acc_entry.key_ptr.*;
+        if (acc_entry.value_ptr.* != .object) continue;
+        const normalized = try normalizeWizardAccountObject(allocator, acc_entry.value_ptr.*.object);
+        try accounts_obj.put(account_name, .{ .object = normalized });
+    }
+
+    if (accounts_obj.count() == 0) return;
+
+    var wrapper = std.json.ObjectMap.init(allocator);
+    try wrapper.put("accounts", .{ .object = accounts_obj });
+    try channels_obj.put(channel_type, .{ .object = wrapper });
+}
+
+fn addSingleChannelValue(
+    allocator: std.mem.Allocator,
+    channels_obj: *std.json.ObjectMap,
+    channel_type: []const u8,
+    raw_channel_obj: std.json.ObjectMap,
+) !void {
+    const candidate = blk: {
+        if (raw_channel_obj.get("accounts")) |v| {
+            if (v == .object) {
+                if (selectPreferredAccountValue(v.object, channel_type)) |selected| {
+                    break :blk selected;
+                }
+            }
+        }
+
+        if (isLikelyInlineSingleChannelObject(raw_channel_obj)) {
+            break :blk std.json.Value{ .object = raw_channel_obj };
+        }
+
+        if (selectPreferredAccountValue(raw_channel_obj, channel_type)) |selected| {
+            break :blk selected;
+        }
+
+        break :blk std.json.Value{ .null = {} };
+    };
+
+    if (candidate != .object) return;
+    const normalized = try normalizeWizardAccountObject(allocator, candidate.object);
+    try channels_obj.put(channel_type, .{ .object = normalized });
+}
+
+fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void {
+    var channels_obj = std.json.ObjectMap.init(cfg.allocator);
+
+    var ch_it = raw_channels.iterator();
+    while (ch_it.next()) |ch_entry| {
+        const channel_type = ch_entry.key_ptr.*;
+        const channel_value = ch_entry.value_ptr.*;
+
+        if (!channelExistsInConfig(channel_type)) continue;
+        if (std.mem.eql(u8, channel_type, "cli")) continue;
+        if (channel_value != .object) continue;
+
+        if (channelSupportsAccounts(channel_type)) {
+            try addAccountsChannelValue(cfg.allocator, &channels_obj, channel_type, channel_value.object);
+        } else {
+            try addSingleChannelValue(cfg.allocator, &channels_obj, channel_type, channel_value.object);
+        }
+    }
+
+    if (channels_obj.getPtr("webhook")) |webhook_ptr| {
+        if (webhook_ptr.* == .object and webhook_ptr.object.get("port") == null) {
+            try webhook_ptr.object.put("port", .{ .integer = @as(i64, @intCast(cfg.gateway.port)) });
+        }
+    }
+
+    var root_obj = std.json.ObjectMap.init(cfg.allocator);
+    try root_obj.put("channels", .{ .object = channels_obj });
+    const root_value: std.json.Value = .{ .object = root_obj };
+    const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, root_value, .{});
+    defer cfg.allocator.free(patch_json);
+
+    try cfg.parseJson(patch_json);
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -364,10 +536,25 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         cfg.gateway.port = port;
     }
 
-    // Apply channels (comma-separated string, e.g. "cli,web,webhook").
-    // Unknown or unsupported channels are silently skipped.
-    if (answers.channels) |channels_csv| {
-        applyChannelsFromString(&cfg, channels_csv);
+    // Apply channels from raw JSON payload.
+    // Supports:
+    // - legacy CSV string: "channels": "cli,web,webhook"
+    // - wizard object map: "channels": {"telegram": {"default": {...}}}
+    if (raw_parsed) |rp| {
+        if (rp.value == .object) {
+            if (rp.value.object.get("channels")) |channels_val| {
+                switch (channels_val) {
+                    .string => |channels_csv| applyChannelsFromString(&cfg, channels_csv),
+                    .object => |channels_obj| {
+                        applyChannelsFromObject(&cfg, channels_obj) catch |err| {
+                            std.debug.print("error: invalid channels payload ({s})\n", .{@errorName(err)});
+                            std.process.exit(1);
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 
     // Ensure a valid default model exists even when omitted in JSON payload.
@@ -399,21 +586,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Save config
     try cfg.save();
-
-    // After save, merge channel configs from wizard's channels object into config.json.
-    // The channels object has format: {"telegram": {"default": {"bot_token": "..."}}}
-    // which needs wrapping with "accounts" to match config.json format.
-    if (raw_parsed) |rp| {
-        if (rp.value == .object) {
-            if (rp.value.object.get("channels")) |ch_val| {
-                if (ch_val == .object and ch_val.object.count() > 0) {
-                    mergeChannelsIntoConfig(allocator, cfg.config_path, ch_val.object) catch |err| {
-                        std.debug.print("warning: failed to merge channel configs: {s}\n", .{@errorName(err)});
-                    };
-                }
-            }
-        }
-    }
 
     // Output success as JSON to stdout
     var stdout_buf: [4096]u8 = undefined;
@@ -464,4 +636,104 @@ test "applyChannelsFromString ignores unknown channels" {
     // Unknown channels are silently skipped (future-proofing).
     applyChannelsFromString(&cfg, "cli,web,future-channel,telegram");
     try std.testing.expect(cfg.channels.webhook == null);
+}
+
+test "applyChannelsFromObject maps wizard telegram account and dotted keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+
+    const payload =
+        \\{
+        \\  "channels": {
+        \\    "telegram": {
+        \\      "default": {
+        \\        "bot_token": "123:ABC",
+        \\        "interactive.enabled": true,
+        \\        "interactive.ttl_secs": 42
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    try applyChannelsFromObject(&cfg, parsed.value.object.get("channels").?.object);
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
+    try std.testing.expectEqualStrings("default", cfg.channels.telegram[0].account_id);
+    try std.testing.expectEqualStrings("123:ABC", cfg.channels.telegram[0].bot_token);
+    try std.testing.expect(cfg.channels.telegram[0].interactive.enabled);
+    try std.testing.expectEqual(@as(u64, 42), cfg.channels.telegram[0].interactive.ttl_secs);
+}
+
+test "applyChannelsFromObject maps single-account webhook channel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+    cfg.gateway.port = 4321;
+
+    const payload =
+        \\{
+        \\  "channels": {
+        \\    "webhook": {
+        \\      "webhook": {
+        \\        "secret": "sec"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    try applyChannelsFromObject(&cfg, parsed.value.object.get("channels").?.object);
+    try std.testing.expect(cfg.channels.webhook != null);
+    try std.testing.expectEqual(@as(u16, 4321), cfg.channels.webhook.?.port);
+    try std.testing.expectEqualStrings("sec", cfg.channels.webhook.?.secret.?);
+}
+
+test "applyProvidersFromArray sets model default from primary provider when omitted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+    cfg.default_provider = "openrouter";
+    cfg.default_model = "openrouter/some-old-model";
+
+    const payload =
+        \\{
+        \\  "providers": [
+        \\    { "provider": "groq", "api_key": "gsk_test" },
+        \\    { "provider": "openrouter", "api_key": "sk-or-test" }
+        \\  ]
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const providers = parsed.value.object.get("providers").?.array.items;
+    try applyProvidersFromArray(&cfg, providers);
+
+    try std.testing.expectEqualStrings("groq", cfg.default_provider);
+    try std.testing.expect(cfg.default_model != null);
+    try std.testing.expectEqualStrings(onboard.defaultModelForProvider("groq"), cfg.default_model.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
 }

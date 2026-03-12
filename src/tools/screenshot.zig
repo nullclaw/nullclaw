@@ -4,10 +4,13 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+const verbose = @import("../verbose.zig");
+const log = std.log.scoped(.screenshot);
 
 /// Screenshot tool — capture the screen using platform-native commands.
 /// macOS: `screencapture -x FILE`
 /// Linux: `import FILE` (ImageMagick)
+/// Windows: PowerShell-based screen capture
 pub const ScreenshotTool = struct {
     workspace_dir: []const u8,
 
@@ -27,10 +30,18 @@ pub const ScreenshotTool = struct {
     }
 
     pub fn execute(self: *ScreenshotTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const log_enabled = verbose.isVerbose();
+        if (log_enabled) {
+            log.info("OS tag: {}", .{comptime builtin.os.tag});
+        }
+
         const filename = root.getString(args, "filename") orelse "screenshot.png";
 
         // Build output path: workspace_dir/filename
-        const output_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_dir, filename });
+        const output_path = if (comptime builtin.os.tag == .windows)
+            try std.fmt.allocPrint(allocator, "{s}\\{s}", .{ self.workspace_dir, filename })
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_dir, filename });
         defer allocator.free(output_path);
 
         // In test mode, return a mock result without spawning a real process
@@ -43,16 +54,63 @@ pub const ScreenshotTool = struct {
         const argv: []const []const u8 = switch (comptime builtin.os.tag) {
             .macos => &.{ "screencapture", "-x", output_path },
             .linux => &.{ "import", "-window", "root", output_path },
+            .windows => blk: {
+                const ps_script = try std.fmt.allocPrint(allocator,
+                    \\Add-Type -AssemblyName System.Windows.Forms; 
+                    \\Add-Type -AssemblyName System.Drawing; 
+                    \\$screen = [System.Windows.Forms.Screen]::PrimaryScreen; 
+                    \\$bounds = $screen.Bounds; 
+                    \\$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height; 
+                    \\$g = [System.Drawing.Graphics]::FromImage($bmp); 
+                    \\$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size); 
+                    \\$bmp.Save('{s}', [System.Drawing.Imaging.ImageFormat]::Png); 
+                    \\$g.Dispose(); 
+                    \\$bmp.Dispose(); 
+                    \\exit 0
+                , .{output_path});
+
+                if (log_enabled) {
+                    log.info("ps_script: {s}", .{ps_script});
+                    log.info("output_path: {s}", .{output_path});
+                }
+
+                const argv_win = try allocator.alloc([]const u8, 6);
+                argv_win[0] = "powershell.exe";
+                argv_win[1] = "-NoProfile";
+                argv_win[2] = "-ExecutionPolicy";
+                argv_win[3] = "Bypass";
+                argv_win[4] = "-Command";
+                argv_win[5] = ps_script;
+
+                break :blk argv_win;
+            },
             else => {
                 return ToolResult.fail("Screenshot not supported on this platform");
             },
         };
 
         const proc = @import("process_util.zig");
-        const result = proc.run(allocator, argv, .{}) catch {
-            return ToolResult.fail("Failed to spawn screenshot command");
+
+        const result = proc.run(allocator, argv, .{}) catch |err| {
+            if (comptime builtin.os.tag == .windows) {
+                allocator.free(argv[5]);
+                allocator.free(argv);
+            }
+            log.err("Failed to spawn: {s}", .{@errorName(err)});
+            return ToolResult.fail("Screenshot failed: cannot execute screenshot command. This may be due to sandbox restrictions in this environment. Try running the screenshot tool in a normal terminal environment.");
         };
         defer result.deinit(allocator);
+        if (comptime builtin.os.tag == .windows) {
+            allocator.free(argv[5]);
+            allocator.free(argv);
+        }
+
+        if (log_enabled) {
+            log.info("Result: success={}, exit_code={?}, stdout_len={d}, stderr_len={d}", .{ result.success, result.exit_code, result.stdout.len, result.stderr.len });
+            if (result.stderr.len > 0) {
+                log.info("Stderr: {s}", .{result.stderr});
+            }
+        }
 
         if (result.success) {
             const msg = try std.fmt.allocPrint(allocator, "[IMAGE:{s}/{s}]", .{ self.workspace_dir, filename });

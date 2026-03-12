@@ -28,7 +28,12 @@ fn parseApiKeyField(allocator: std.mem.Allocator, value: std.json.Value) !?[]con
     };
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+const PrimaryModelRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
+
+fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
     if (std.mem.startsWith(u8, primary, "custom:")) {
         // The format is "custom:<provider_url>/<model>" where <provider_url> may contain slashes.
@@ -67,11 +72,104 @@ fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, mod
     };
 }
 
+fn parseNamedAgentObject(
+    allocator: std.mem.Allocator,
+    agent_name: []const u8,
+    item: std.json.Value,
+) !?types.NamedAgentConfig {
+    if (item != .object) return null;
+
+    const provider_val = item.object.get("provider");
+    const resolved_ref: ?PrimaryModelRef = blk: {
+        const m = item.object.get("model") orelse break :blk null;
+        if (provider_val) |pv| {
+            if (pv != .string) break :blk null;
+            if (m == .string) {
+                break :blk .{
+                    .provider = pv.string,
+                    .model = m.string,
+                };
+            }
+            if (m == .object) {
+                if (m.object.get("primary")) |mp| {
+                    if (mp == .string) {
+                        break :blk .{
+                            .provider = pv.string,
+                            .model = mp.string,
+                        };
+                    }
+                }
+            }
+            break :blk null;
+        }
+
+        if (m == .string) {
+            if (splitPrimaryModelRef(m.string)) |parsed_ref| {
+                break :blk parsed_ref;
+            }
+            break :blk null;
+        }
+        if (m == .object) {
+            if (m.object.get("primary")) |mp| {
+                if (mp == .string) {
+                    if (splitPrimaryModelRef(mp.string)) |parsed_ref| {
+                        break :blk parsed_ref;
+                    }
+                }
+            }
+        }
+        break :blk null;
+    };
+    if (resolved_ref == null) return null;
+
+    var agent_cfg = types.NamedAgentConfig{
+        .name = try allocator.dupe(u8, agent_name),
+        .provider = try allocator.dupe(u8, resolved_ref.?.provider),
+        .model = try allocator.dupe(u8, resolved_ref.?.model),
+    };
+    if (item.object.get("system_prompt")) |sp| {
+        if (sp == .string) agent_cfg.system_prompt = try allocator.dupe(u8, sp.string);
+    }
+    if (item.object.get("api_key")) |ak| {
+        if (ak == .string) agent_cfg.api_key = try allocator.dupe(u8, ak.string);
+    }
+    if (item.object.get("temperature")) |t| {
+        if (t == .float) agent_cfg.temperature = t.float;
+        if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
+    }
+    if (item.object.get("max_depth")) |md| {
+        if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
+    }
+    return agent_cfg;
+}
+
 fn parsePeerKind(kind: []const u8) ?agent_routing.ChatType {
     if (std.mem.eql(u8, kind, "direct") or std.mem.eql(u8, kind, "dm")) return .direct;
     if (std.mem.eql(u8, kind, "group")) return .group;
     if (std.mem.eql(u8, kind, "channel")) return .channel;
     return null;
+}
+
+fn parseModelRouteCostClass(raw: []const u8) ?types.ModelRouteCostClass {
+    if (std.ascii.eqlIgnoreCase(raw, "free")) return .free;
+    if (std.ascii.eqlIgnoreCase(raw, "cheap")) return .cheap;
+    if (std.ascii.eqlIgnoreCase(raw, "standard")) return .standard;
+    if (std.ascii.eqlIgnoreCase(raw, "premium")) return .premium;
+    return null;
+}
+
+fn parseModelRouteQuotaClass(raw: []const u8) ?types.ModelRouteQuotaClass {
+    if (std.ascii.eqlIgnoreCase(raw, "unlimited")) return .unlimited;
+    if (std.ascii.eqlIgnoreCase(raw, "normal")) return .normal;
+    if (std.ascii.eqlIgnoreCase(raw, "constrained")) return .constrained;
+    return null;
+}
+
+fn freeModelRouteConfig(allocator: std.mem.Allocator, route: types.ModelRouteConfig) void {
+    allocator.free(route.hint);
+    allocator.free(route.provider);
+    allocator.free(route.model);
+    if (route.api_key) |api_key| allocator.free(api_key);
 }
 
 fn parseAgentBindingsArray(
@@ -368,6 +466,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     if (root.get("model_routes")) |v| {
         if (v == .array) {
             var list: std.ArrayListUnmanaged(types.ModelRouteConfig) = .empty;
+            errdefer {
+                for (list.items) |route| freeModelRouteConfig(self.allocator, route);
+                list.deinit(self.allocator);
+            }
             try list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
             for (v.array.items) |item| {
                 if (item == .object) {
@@ -375,15 +477,40 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     const provider = item.object.get("provider") orelse continue;
                     const model = item.object.get("model") orelse continue;
                     if (hint != .string or provider != .string or model != .string) continue;
-                    var route = types.ModelRouteConfig{
-                        .hint = try self.allocator.dupe(u8, hint.string),
-                        .provider = try self.allocator.dupe(u8, provider.string),
-                        .model = try self.allocator.dupe(u8, model.string),
-                    };
-                    if (item.object.get("api_key")) |ak| {
-                        if (ak == .string) route.api_key = try self.allocator.dupe(u8, ak.string);
+                    {
+                        const hint_owned = try self.allocator.dupe(u8, hint.string);
+                        errdefer self.allocator.free(hint_owned);
+                        const provider_owned = try self.allocator.dupe(u8, provider.string);
+                        errdefer self.allocator.free(provider_owned);
+                        const model_owned = try self.allocator.dupe(u8, model.string);
+                        errdefer self.allocator.free(model_owned);
+
+                        var route = types.ModelRouteConfig{
+                            .hint = hint_owned,
+                            .provider = provider_owned,
+                            .model = model_owned,
+                        };
+                        errdefer if (route.api_key) |api_key| self.allocator.free(api_key);
+
+                        if (item.object.get("api_key")) |ak| {
+                            if (ak == .string) route.api_key = try self.allocator.dupe(u8, ak.string);
+                        }
+                        if (item.object.get("cost_class")) |cost_class| {
+                            if (cost_class == .string) {
+                                if (parseModelRouteCostClass(cost_class.string)) |parsed_cost_class| {
+                                    route.cost_class = parsed_cost_class;
+                                }
+                            }
+                        }
+                        if (item.object.get("quota_class")) |quota_class| {
+                            if (quota_class == .string) {
+                                if (parseModelRouteQuotaClass(quota_class.string)) |parsed_quota_class| {
+                                    route.quota_class = parsed_quota_class;
+                                }
+                            }
+                        }
+                        try list.append(self.allocator, route);
                     }
-                    try list.append(self.allocator, route);
                 }
             }
             self.model_routes = try list.toOwnedSlice(self.allocator);
@@ -460,47 +587,28 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     try list.ensureTotalCapacity(self.allocator, @intCast(list_val.array.items.len));
                     for (list_val.array.items) |item| {
                         if (item == .object) {
-                            // "id" or "name" for the agent name
                             const name_val = item.object.get("id") orelse item.object.get("name") orelse continue;
-                            const provider = item.object.get("provider") orelse continue;
-                            if (name_val != .string or provider != .string) continue;
-
-                            // model can be string or {"primary": "..."}
-                            const model_str: ?[]const u8 = blk: {
-                                const m = item.object.get("model") orelse break :blk null;
-                                if (m == .string) break :blk m.string;
-                                if (m == .object) {
-                                    if (m.object.get("primary")) |mp| {
-                                        if (mp == .string) break :blk mp.string;
-                                    }
-                                }
-                                break :blk null;
-                            };
-                            if (model_str == null) continue;
-
-                            var agent_cfg = types.NamedAgentConfig{
-                                .name = try self.allocator.dupe(u8, name_val.string),
-                                .provider = try self.allocator.dupe(u8, provider.string),
-                                .model = try self.allocator.dupe(u8, model_str.?),
-                            };
-                            if (item.object.get("system_prompt")) |sp| {
-                                if (sp == .string) agent_cfg.system_prompt = try self.allocator.dupe(u8, sp.string);
-                            }
-                            if (item.object.get("api_key")) |ak| {
-                                if (ak == .string) agent_cfg.api_key = try self.allocator.dupe(u8, ak.string);
-                            }
-                            if (item.object.get("temperature")) |t| {
-                                if (t == .float) agent_cfg.temperature = t.float;
-                                if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
-                            }
-                            if (item.object.get("max_depth")) |md| {
-                                if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
-                            }
+                            if (name_val != .string) continue;
+                            const agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
                             try list.append(self.allocator, agent_cfg);
                         }
                     }
                     self.agents = try list.toOwnedSlice(self.allocator);
                 }
+            }
+
+            // Also accept the object-of-objects shape:
+            // "agents": { "defaults": {...}, "coder": {...}, "researcher": {...} }
+            if (self.agents.len == 0) {
+                var named_agent_list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                var it = agents_val.object.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "defaults") or std.mem.eql(u8, key, "list")) continue;
+                    const agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    try named_agent_list.append(self.allocator, agent_cfg);
+                }
+                self.agents = try named_agent_list.toOwnedSlice(self.allocator);
             }
         }
     }
@@ -820,6 +928,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
+            if (ag.object.get("vision_disabled_models")) |v| {
+                if (v == .array) self.agent.vision_disabled_models = try parseStringArray(self.allocator, v.array);
+            }
+            if (ag.object.get("auto_disable_vision_on_error")) |v| {
+                if (v == .bool) self.agent.auto_disable_vision_on_error = v.bool;
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {
@@ -878,6 +992,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
+            }
+            if (tl.object.get("path_env_vars")) |v| {
+                if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {

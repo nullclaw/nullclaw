@@ -69,7 +69,7 @@ pub const FileEditTool = struct {
                 if (!bootstrap_mod.backendUsesFiles(self.backend_name)) {
                     const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
                     const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
-                        const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {}", .{err});
+                        const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
                         return ToolResult{ .success = false, .output = "", .error_msg = msg };
                     };
                     defer allocator.free(resolved_ancestor);
@@ -102,7 +102,7 @@ pub const FileEditTool = struct {
 
         // Resolve to catch symlink escapes
         const resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {}", .{err});
+            const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(resolved);
@@ -237,6 +237,25 @@ test "file_edit old_text not found" {
 
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not found") != null);
+}
+
+test "file_edit nonexistent file error includes requested path" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var ft = FileEditTool{ .workspace_dir = ws_path };
+    const t = ft.tool();
+    const parsed = try root.parseTestArgs("{\"path\": \"missing.txt\", \"old_text\": \"old\", \"new_text\": \"new\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "missing.txt") != null);
 }
 
 test "file_edit empty file returns not found" {

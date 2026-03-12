@@ -9,6 +9,7 @@ pub const BootstrapProvider = struct {
 
     pub const VTable = struct {
         load: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, filename: []const u8) anyerror!?[]const u8,
+        load_excerpt: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, filename: []const u8, max_bytes: usize) anyerror!?[]const u8,
         store: *const fn (ptr: *anyopaque, filename: []const u8, content: []const u8) anyerror!void,
         remove: *const fn (ptr: *anyopaque, filename: []const u8) anyerror!bool,
         exists: *const fn (ptr: *anyopaque, filename: []const u8) bool,
@@ -19,6 +20,10 @@ pub const BootstrapProvider = struct {
 
     pub fn load(self: BootstrapProvider, allocator: std.mem.Allocator, filename: []const u8) !?[]const u8 {
         return self.vtable.load(self.ptr, allocator, filename);
+    }
+
+    pub fn load_excerpt(self: BootstrapProvider, allocator: std.mem.Allocator, filename: []const u8, max_bytes: usize) !?[]const u8 {
+        return self.vtable.load_excerpt(self.ptr, allocator, filename, max_bytes);
     }
 
     pub fn store(self: BootstrapProvider, filename: []const u8, content: []const u8) !void {

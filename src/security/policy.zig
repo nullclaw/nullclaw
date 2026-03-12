@@ -9,6 +9,8 @@ pub const AutonomyLevel = enum {
     supervised,
     /// Full: autonomous execution within policy bounds
     full,
+    /// YOLO: bypasses all security checks (allowlist, syntax, risk, approval, rate limiting)
+    yolo,
 
     pub fn default() AutonomyLevel {
         return .supervised;
@@ -19,6 +21,7 @@ pub const AutonomyLevel = enum {
             .read_only => "readonly",
             .supervised => "supervised",
             .full => "full",
+            .yolo => "yolo",
         };
     }
 
@@ -26,6 +29,7 @@ pub const AutonomyLevel = enum {
         if (std.mem.eql(u8, s, "readonly") or std.mem.eql(u8, s, "read_only")) return .read_only;
         if (std.mem.eql(u8, s, "supervised")) return .supervised;
         if (std.mem.eql(u8, s, "full")) return .full;
+        if (std.mem.eql(u8, s, "yolo")) return .yolo;
         return null;
     }
 };
@@ -145,6 +149,7 @@ pub const SecurityPolicy = struct {
         command: []const u8,
         approved: bool,
     ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
+        if (self.autonomy == .yolo) return .low;
         if (!self.isCommandAllowed(command)) {
             return error.CommandNotAllowed;
         }
@@ -173,6 +178,7 @@ pub const SecurityPolicy = struct {
 
     /// Check if a shell command is allowed.
     pub fn isCommandAllowed(self: *const SecurityPolicy, command: []const u8) bool {
+        if (self.autonomy == .yolo) return true;
         if (self.autonomy == .read_only) return false;
 
         // Reject oversized commands — never silently truncate
@@ -249,7 +255,7 @@ pub const SecurityPolicy = struct {
             if (!found) return false;
 
             // Block dangerous arguments for specific commands
-            if (!isArgsSafe(base_cmd, cmd_part)) return false;
+            if (!isArgsSafe(self, base_cmd, cmd_part)) return false;
         }
 
         return has_cmd;
@@ -263,6 +269,7 @@ pub const SecurityPolicy = struct {
     /// Record an action and check if the rate limit has been exceeded.
     /// Returns true if the action is allowed, false if rate-limited.
     pub fn recordAction(self: *const SecurityPolicy) !bool {
+        if (self.autonomy == .yolo) return true;
         if (self.tracker) |tracker| {
             return tracker.recordAction();
         }
@@ -271,6 +278,7 @@ pub const SecurityPolicy = struct {
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn isRateLimited(self: *const SecurityPolicy) bool {
+        if (self.autonomy == .yolo) return false;
         if (self.tracker) |tracker| {
             return tracker.isLimited();
         }
@@ -542,7 +550,29 @@ fn isCargoMediumVerb(verb: []const u8) bool {
 }
 
 /// Check for dangerous arguments that allow sub-command execution.
-fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
+fn hasParentTraversalSegment(path: []const u8) bool {
+    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+    while (iter.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return true;
+    }
+    return false;
+}
+
+fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool {
+    const trimmed = trimMatchingQuotes(std.mem.trim(u8, raw_arg, " \t"));
+
+    // Per `git -C <path>`, an empty path is a no-op on cwd.
+    if (trimmed.len == 0) return true;
+
+    if (!self.workspace_only) return true;
+
+    // Keep git `-C` scoped to the workspace when workspace_only is enabled.
+    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (hasParentTraversalSegment(trimmed)) return false;
+    return true;
+}
+
+fn isArgsSafe(self: *const SecurityPolicy, base_cmd: []const u8, full_cmd: []const u8) bool {
     const lower_base = lowerBuf(base_cmd);
     const lower_cmd = lowerBuf(full_cmd);
     const base = lower_base.slice();
@@ -560,18 +590,46 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
     }
 
     if (std.mem.eql(u8, base, "git")) {
-        // git config, alias, and -c can set dangerous options
+        // Git keeps `-c` and `-C` case-sensitive: `-c` injects config,
+        // `-C` changes directory. We must preserve that distinction while
+        // keeping workspace_only protection intact for `-C`.
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
-        _ = iter.next(); // skip "git" itself
+        _ = iter.next(); // skip lowercased "git" itself
+        var orig_iter = std.mem.tokenizeScalar(u8, full_cmd, ' ');
+        _ = orig_iter.next(); // skip original "git" itself
+        var expect_change_dir_arg = false;
         while (iter.next()) |arg| {
+            const orig_arg = orig_iter.next() orelse arg;
+
+            if (expect_change_dir_arg) {
+                if (!isSafeGitChangeDirArg(self, orig_arg)) return false;
+                expect_change_dir_arg = false;
+                continue;
+            }
+
             if (std.mem.eql(u8, arg, "config") or
                 std.mem.startsWith(u8, arg, "config.") or
                 std.mem.eql(u8, arg, "alias") or
                 std.mem.startsWith(u8, arg, "alias.") or
-                std.mem.eql(u8, arg, "-c"))
+                std.mem.eql(u8, orig_arg, "-c") or
+                std.mem.startsWith(u8, orig_arg, "-c") or
+                std.mem.eql(u8, arg, "--config-env") or
+                std.mem.startsWith(u8, arg, "--config-env="))
             {
                 return false;
             }
+
+            if (std.mem.eql(u8, orig_arg, "-C")) {
+                expect_change_dir_arg = true;
+                continue;
+            }
+            if (std.mem.startsWith(u8, orig_arg, "-C") and orig_arg.len > 2) {
+                if (!isSafeGitChangeDirArg(self, orig_arg[2..])) return false;
+            }
+        }
+
+        if (expect_change_dir_arg) {
+            return false;
         }
         return true;
     }
@@ -1296,6 +1354,7 @@ test "git config is blocked" {
     try std.testing.expect(!p.isCommandAllowed("git config core.editor \"rm -rf /\""));
     try std.testing.expect(!p.isCommandAllowed("git alias.st status"));
     try std.testing.expect(!p.isCommandAllowed("git -c core.editor=calc.exe commit"));
+    try std.testing.expect(!p.isCommandAllowed("git --config-env=core.editor=EVIL_EDITOR status"));
 }
 
 test "git status is allowed" {
@@ -1303,6 +1362,21 @@ test "git status is allowed" {
     try std.testing.expect(p.isCommandAllowed("git status"));
     try std.testing.expect(p.isCommandAllowed("git add ."));
     try std.testing.expect(p.isCommandAllowed("git log"));
+}
+
+test "git -C stays workspace-scoped while lowercase -c remains blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("git -C . status"));
+    try std.testing.expect(p.isCommandAllowed("git -C ./repo log"));
+    try std.testing.expect(p.isCommandAllowed("git -Crepo status"));
+    try std.testing.expect(!p.isCommandAllowed("git -C /tmp/repo log"));
+    try std.testing.expect(!p.isCommandAllowed("git -C ../repo log"));
+    try std.testing.expect(!p.isCommandAllowed("git -c core.editor=calc.exe commit"));
+}
+
+test "git -C absolute paths are allowed when workspace_only is disabled" {
+    const p = SecurityPolicy{ .workspace_only = false };
+    try std.testing.expect(p.isCommandAllowed("git -C /tmp/repo log"));
 }
 
 test "echo hello | tee /tmp/out is blocked" {
@@ -1583,4 +1657,66 @@ test "full autonomy wildcard: arbitrary commands allowed" {
     try std.testing.expect(p.isCommandAllowed("cargo build --release"));
     try std.testing.expect(p.isCommandAllowed("make all"));
     try std.testing.expect(p.isCommandAllowed("zig build test"));
+}
+
+// ── YOLO autonomy level tests ───────────────────────────────────
+
+test "yolo fromString returns yolo" {
+    try std.testing.expectEqual(AutonomyLevel.yolo, AutonomyLevel.fromString("yolo").?);
+}
+
+test "yolo toString returns yolo" {
+    try std.testing.expectEqualStrings("yolo", AutonomyLevel.yolo.toString());
+}
+
+test "yolo isCommandAllowed bypasses all syntax checks" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    // Subshell expansion — blocked by full, allowed by yolo
+    try std.testing.expect(p.isCommandAllowed("echo $(whoami)"));
+    // Backtick expansion
+    try std.testing.expect(p.isCommandAllowed("echo `id`"));
+    // Output redirection
+    try std.testing.expect(p.isCommandAllowed("echo hi > /tmp/out"));
+    // Background &
+    try std.testing.expect(p.isCommandAllowed("sleep 1 &"));
+    // Process substitution
+    try std.testing.expect(p.isCommandAllowed("diff <(ls) <(ls /tmp)"));
+}
+
+test "yolo validateCommandExecution returns low for all commands" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    // High-risk command — yolo bypasses entirely
+    const risk1 = try p.validateCommandExecution("sudo rm -rf /", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk1);
+    // Command not on any allowlist — yolo bypasses
+    const risk2 = try p.validateCommandExecution("python3 exploit.py", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk2);
+}
+
+test "yolo canAct returns true" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    try std.testing.expect(p.canAct());
+}
+
+test "yolo recordAction bypasses rate limiting" {
+    var tracker = RateTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    var p = SecurityPolicy{
+        .autonomy = .yolo,
+        .tracker = &tracker,
+    };
+    try std.testing.expect(try p.recordAction());
+    try std.testing.expect(try p.recordAction());
+    try std.testing.expect(try p.recordAction());
+}
+
+test "yolo isRateLimited always false" {
+    var tracker = RateTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    var p = SecurityPolicy{
+        .autonomy = .yolo,
+        .tracker = &tracker,
+    };
+    _ = try tracker.recordAction();
+    try std.testing.expect(p.isRateLimited() == false);
 }

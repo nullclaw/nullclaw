@@ -49,7 +49,7 @@ const ProviderSearchError = search_common.ProviderSearchError;
 
 /// Web search tool supporting multiple providers.
 pub const WebSearchTool = struct {
-    /// Optional SearXNG base URL (e.g. https://searx.example.com or .../search).
+    /// Optional SearXNG base URL (HTTPS anywhere, or local/private HTTP).
     searxng_base_url: ?[]const u8 = null,
     /// Primary provider ("auto" by default).
     provider: []const u8 = "auto",
@@ -94,7 +94,7 @@ pub const WebSearchTool = struct {
         for (chain) |provider| {
             const result = executeWithProvider(self, allocator, provider, query, count) catch |err| {
                 if (err == error.InvalidSearchBaseUrl) {
-                    return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search]");
+                    return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search] or local http://host[:port][/search]");
                 }
 
                 if (failures.items.len > 0) {
@@ -418,6 +418,10 @@ test "buildSearxngSearchUrl normalizes base URLs" {
     const from_search = try buildSearxngSearchUrl(testing.allocator, "https://searx.example.com/search", encoded_query, 3);
     defer testing.allocator.free(from_search);
     try testing.expect(std.mem.indexOf(u8, from_search, "https://searx.example.com/search?") != null);
+
+    const from_local_http = try buildSearxngSearchUrl(testing.allocator, "http://localhost:8888/", encoded_query, 3);
+    defer testing.allocator.free(from_local_http);
+    try testing.expect(std.mem.indexOf(u8, from_local_http, "http://localhost:8888/search?") != null);
 }
 
 test "buildSearxngSearchUrl rejects query and fragment" {
@@ -432,6 +436,10 @@ test "buildSearxngSearchUrl rejects query and fragment" {
     try testing.expectError(
         error.InvalidSearchBaseUrl,
         buildSearxngSearchUrl(testing.allocator, "https://searx.example.com/custom", "zig", 3),
+    );
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "http://searx.example.com", "zig", 3),
     );
 }
 

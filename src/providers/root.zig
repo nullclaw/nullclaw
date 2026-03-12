@@ -17,6 +17,7 @@ pub const claude_cli = @import("claude_cli.zig");
 pub const codex_cli = @import("codex_cli.zig");
 pub const openai_codex = @import("openai_codex.zig");
 pub const runtime_bundle = @import("runtime_bundle.zig");
+pub const api_error_details = @import("api_error_details.zig");
 
 // Extracted sub-modules
 pub const scrub = @import("scrub.zig");
@@ -29,6 +30,9 @@ pub const scrubSecretPatterns = scrub.scrubSecretPatterns;
 pub const scrubToolOutput = scrub.scrubToolOutput;
 pub const sanitizeApiError = scrub.sanitizeApiError;
 pub const setApiErrorLimitOverride = scrub.setApiErrorLimitOverride;
+pub const clearLastApiErrorDetail = api_error_details.clear;
+pub const setLastApiErrorDetail = api_error_details.set;
+pub const snapshotLastApiErrorDetail = api_error_details.snapshot;
 
 // Re-exports from api_key.zig
 pub const resolveApiKey = api_key.resolveApiKey;
@@ -59,6 +63,10 @@ pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const curlPostTimed = helpers.curlPostTimed;
 pub const curlPostFormTimed = helpers.curlPostFormTimed;
 pub const extractContent = helpers.extractContent;
+pub const SplitThinkContent = helpers.SplitThinkContent;
+pub const splitThinkContent = helpers.splitThinkContent;
+pub const stripThinkBlocks = helpers.stripThinkBlocks;
+pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
 
 // Direct re-exports from utility modules
 pub const appendJsonString = json_util.appendJsonString;

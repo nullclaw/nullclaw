@@ -77,7 +77,13 @@ pub const OpenAiProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("openai", sanitized orelse summary);
+            return mapped_err;
         }
 
         if (root_obj.get("choices")) |choices| {
@@ -102,7 +108,13 @@ pub const OpenAiProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("openai", sanitized orelse summary);
+            return mapped_err;
         }
 
         if (root_obj.get("choices")) |choices| {
@@ -111,9 +123,12 @@ pub const OpenAiProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                var reasoning_content: ?[]const u8 = null;
                 if (msg_obj.get("content")) |c| {
                     if (c == .string) {
-                        content = try allocator.dupe(u8, c.string);
+                        const split = try root.splitThinkContent(allocator, c.string);
+                        content = split.visible;
+                        reasoning_content = split.reasoning;
                     }
                 }
 
@@ -158,6 +173,7 @@ pub const OpenAiProvider = struct {
 
                 return .{
                     .content = content,
+                    .reasoning_content = reasoning_content,
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,

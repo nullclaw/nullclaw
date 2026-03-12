@@ -5,6 +5,7 @@ const websocket = @import("../websocket.zig");
 const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
 const url_percent = @import("../url_percent.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -335,7 +336,7 @@ pub const MattermostChannel = struct {
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         self.connected.store(false, .release);
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayLoop, .{self});
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {

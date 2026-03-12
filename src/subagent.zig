@@ -10,6 +10,7 @@ const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const providers = @import("providers/root.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 const log = std.log.scoped(.subagent);
 
@@ -231,7 +232,7 @@ pub const SubagentManager = struct {
             .agent_name = agent_name_copy,
         };
 
-        state.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, subagentThreadFn, .{ctx});
+        state.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, subagentThreadFn, .{ctx});
 
         return task_id;
     }

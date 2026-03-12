@@ -33,6 +33,11 @@ fn runContractTests(bp: BootstrapProvider) !void {
     defer if (loaded2) |c| allocator.free(c);
     try testing.expectEqualStrings("# Soul v2", loaded2.?);
 
+    // 3b. excerpt
+    const excerpt = try bp.load_excerpt(allocator, "SOUL.md", 3);
+    defer if (excerpt) |c| allocator.free(c);
+    try testing.expectEqualStrings("# S", excerpt.?);
+
     // 4. list contains stored files
     try bp.store("AGENTS.md", "# Agents");
     const items = try bp.list(allocator);
@@ -90,6 +95,8 @@ test "contract: NullBootstrapProvider has no-op semantics" {
     try bp.store("SOUL.md", "content");
     const loaded = try bp.load(testing.allocator, "SOUL.md");
     try testing.expect(loaded == null);
+    const excerpt = try bp.load_excerpt(testing.allocator, "SOUL.md", 3);
+    try testing.expect(excerpt == null);
     try testing.expect(!bp.exists("SOUL.md"));
 
     // list returns empty.

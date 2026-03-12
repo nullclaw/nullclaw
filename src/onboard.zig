@@ -15,6 +15,7 @@ const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
+const provider_names = @import("provider_names.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
@@ -82,6 +83,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
     .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
+    .{ .key = "azure", .label = "Azure OpenAI (GPT via Azure)", .default_model = "gpt-5.2-chat", .env_var = "AZURE_OPENAI_API_KEY" },
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
@@ -134,12 +136,7 @@ pub const known_providers = [_]ProviderInfo{
 
 /// Canonicalize provider name (handle aliases).
 pub fn canonicalProviderName(name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "grok")) return "xai";
-    if (std.mem.eql(u8, name, "together")) return "together-ai";
-    if (std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return "gemini";
-    if (std.mem.eql(u8, name, "vertex-ai") or std.mem.eql(u8, name, "google-vertex")) return "vertex";
-    if (std.mem.eql(u8, name, "claude-code")) return "claude-cli";
-    return name;
+    return provider_names.canonicalProviderName(name);
 }
 
 fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
@@ -1482,6 +1479,37 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.print("  -> Custom: {s}\n\n", .{custom_url});
     }
 
+    const is_azure_provider = provider_idx < known_providers.len and
+        std.mem.eql(u8, known_providers[provider_idx].key, "azure");
+
+    var provider_base_url: ?[]const u8 = null;
+    if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
+        provider_base_url = cfg.providers[0].base_url;
+    }
+
+    if (is_azure_provider) {
+        var azure_endpoint_buf: [512]u8 = undefined;
+        const default_endpoint = provider_base_url orelse "";
+        if (default_endpoint.len > 0) {
+            try out.print("  Azure OpenAI endpoint [{s}]: ", .{default_endpoint});
+        } else {
+            try out.writeAll("  Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com): ");
+        }
+        const azure_endpoint = prompt(out, &azure_endpoint_buf, "", default_endpoint) orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (azure_endpoint.len == 0) {
+            try out.writeAll("\n  Error: Azure OpenAI endpoint is required\n");
+            try out.flush();
+            return;
+        }
+        provider_base_url = try cfg.allocator.dupe(u8, azure_endpoint);
+        try out.writeAll("  Note: Azure OpenAI uses your model name as the deployment name in URLs.\n");
+        try out.writeAll("  Configure your Azure deployment with the same name as your model (e.g., gpt-5.2-chat).\n");
+    }
+
     // ── Step 2: API key ──
     const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
     try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
@@ -1493,18 +1521,22 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     if (api_key_input.len > 0) {
         // Store in providers section (preserve base_url if already set for custom provider)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        var base_url: ?[]const u8 = null;
-        if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
-            base_url = cfg.providers[0].base_url;
-        }
         entries[0] = .{
             .name = try cfg.allocator.dupe(u8, cfg.default_provider),
             .api_key = try cfg.allocator.dupe(u8, api_key_input),
-            .base_url = base_url,
+            .base_url = provider_base_url,
         };
         cfg.providers = entries;
         try out.writeAll("  -> API key set\n\n");
     } else {
+        if (is_azure_provider) {
+            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+            entries[0] = .{
+                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+                .base_url = provider_base_url,
+            };
+            cfg.providers = entries;
+        }
         try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
     }
 
@@ -2426,12 +2458,15 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex-ai"));
     try std.testing.expectEqualStrings("vertex", canonicalProviderName("google-vertex"));
     try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
+    try std.testing.expectEqualStrings("azure", canonicalProviderName("azure-openai"));
+    try std.testing.expectEqualStrings("azure", canonicalProviderName("azure_openai"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
 
 test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
+    try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
 }
@@ -2444,6 +2479,7 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", providerEnvVar("openrouter"));
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
 
@@ -3117,7 +3153,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 33);
+    try std.testing.expect(known_providers.len == 34);
     // The wizard would clamp to default (0) for out of range input
 }
 

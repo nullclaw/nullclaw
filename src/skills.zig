@@ -23,7 +23,7 @@ pub const Skill = struct {
     instructions: []const u8 = "",
     enabled: bool = true,
     /// If true, full instructions are always included in the system prompt.
-    /// If false, only an XML summary is included and the agent must use read_file to load instructions.
+    /// If false, only an XML summary is included and the agent must use file_read to load instructions.
     always: bool = false,
     /// List of CLI binaries required by this skill (e.g. "docker", "git").
     requires_bins: []const []const u8 = &.{},
@@ -33,7 +33,7 @@ pub const Skill = struct {
     available: bool = true,
     /// Human-readable description of missing dependencies. Set by checkRequirements().
     missing_deps: []const u8 = "",
-    /// Path to the skill directory on disk (for read_file references).
+    /// Path to the skill directory on disk (for file_read references).
     path: []const u8 = "",
 };
 
@@ -725,6 +725,11 @@ const SKILL_SCRIPT_SUFFIXES = [_][]const u8{
     ".bat",
     ".cmd",
 };
+const SKILL_MARKER_BASENAMES = [_][]const u8{
+    "SKILL.md",
+    "SKILL.toml",
+    "skill.json",
+};
 
 fn startsWithAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
@@ -1265,21 +1270,49 @@ fn pathExists(path: []const u8) bool {
 }
 
 fn hasSkillMarkers(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
-    const md = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{dir_path});
-    defer allocator.free(md);
-    if (pathExists(md)) return true;
-
-    const toml = try std.fmt.allocPrint(allocator, "{s}/SKILL.toml", .{dir_path});
-    defer allocator.free(toml);
-    if (pathExists(toml)) return true;
-
-    const json = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{dir_path});
-    defer allocator.free(json);
-    return pathExists(json);
+    for (SKILL_MARKER_BASENAMES) |marker| {
+        const marker_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, marker });
+        defer allocator.free(marker_path);
+        if (pathExists(marker_path)) return true;
+    }
+    return false;
 }
 
 fn hasInstallableSkillContent(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
     return hasSkillMarkers(allocator, dir_path);
+}
+
+fn isSkillMarkerBasename(base_name: []const u8) bool {
+    for (SKILL_MARKER_BASENAMES) |marker| {
+        if (std.mem.eql(u8, base_name, marker)) return true;
+    }
+    return false;
+}
+
+fn resolveInstallableSkillSourceRoot(allocator: std.mem.Allocator, source_path: []const u8) ![]u8 {
+    const source_abs = std.fs.cwd().realpathAlloc(allocator, source_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return error.ManifestNotFound,
+        else => return err,
+    };
+    errdefer allocator.free(source_abs);
+
+    if (try hasInstallableSkillContent(allocator, source_abs)) {
+        return source_abs;
+    }
+
+    const base_name = std.fs.path.basename(source_abs);
+    if (!isSkillMarkerBasename(base_name)) return error.ManifestNotFound;
+
+    const parent = std.fs.path.dirname(source_abs) orelse return error.ManifestNotFound;
+    const parent_owned = try allocator.dupe(u8, parent);
+    errdefer allocator.free(parent_owned);
+
+    if (!(try hasInstallableSkillContent(allocator, parent_owned))) {
+        return error.ManifestNotFound;
+    }
+
+    allocator.free(source_abs);
+    return parent_owned;
 }
 
 const CopyDirPair = struct {
@@ -1556,13 +1589,8 @@ pub fn installSkill(allocator: std.mem.Allocator, source: []const u8, workspace_
 /// Install a skill by copying its directory into workspace_dir/skills/<source-dirname>/.
 /// Destination directory naming follows zeroclaw local install behavior.
 pub fn installSkillFromPath(allocator: std.mem.Allocator, source_path: []const u8, workspace_dir: []const u8) !void {
-    const source_abs = std.fs.cwd().realpathAlloc(allocator, source_path) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return error.ManifestNotFound,
-        else => return err,
-    };
+    const source_abs = try resolveInstallableSkillSourceRoot(allocator, source_path);
     defer allocator.free(source_abs);
-
-    if (!(try hasInstallableSkillContent(allocator, source_abs))) return error.ManifestNotFound;
 
     const source_dir_name = try deriveSkillNameFromSourcePath(allocator, source_abs);
     defer allocator.free(source_dir_name);
@@ -2930,6 +2958,68 @@ test "installSkillFromPath supports markdown-only source directory" {
     const content = try std.fs.cwd().readFileAlloc(allocator, installed_path, 1024);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("# Markdown only install", content);
+}
+
+test "installSkillFromPath accepts direct manifest file paths" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+
+    const cases = [_]struct {
+        source_dir_name: []const u8,
+        manifest_name: []const u8,
+        manifest_body: []const u8,
+    }{
+        .{
+            .source_dir_name = "source-file-md",
+            .manifest_name = "SKILL.md",
+            .manifest_body = "# File path install",
+        },
+        .{
+            .source_dir_name = "source-file-toml",
+            .manifest_name = "SKILL.toml",
+            .manifest_body =
+            \\[skill]
+            \\name = "file-path-install"
+            \\description = "toml manifest path"
+            ,
+        },
+        .{
+            .source_dir_name = "source-file-json",
+            .manifest_name = "skill.json",
+            .manifest_body = "{\"name\":\"file-path-install-json\",\"version\":\"1.0.0\"}",
+        },
+    };
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+
+    for (cases) |case| {
+        try tmp.dir.makePath(case.source_dir_name);
+
+        const source_rel = try std.fs.path.join(allocator, &.{ case.source_dir_name, case.manifest_name });
+        defer allocator.free(source_rel);
+        {
+            const f = try tmp.dir.createFile(source_rel, .{});
+            defer f.close();
+            try f.writeAll(case.manifest_body);
+        }
+
+        const source_file = try std.fs.path.join(allocator, &.{ base, case.source_dir_name, case.manifest_name });
+        defer allocator.free(source_file);
+
+        try installSkillFromPath(allocator, source_file, workspace);
+
+        const installed_path = try std.fs.path.join(allocator, &.{ workspace, "skills", case.source_dir_name, case.manifest_name });
+        defer allocator.free(installed_path);
+        const content = try std.fs.cwd().readFileAlloc(allocator, installed_path, 1024);
+        defer allocator.free(content);
+        try std.testing.expectEqualStrings(case.manifest_body, content);
+    }
 }
 
 test "installSkillFromPath supports legacy skill.json-only source directory" {

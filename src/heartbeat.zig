@@ -3,6 +3,8 @@ const observability = @import("observability.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 
+const MAX_HEARTBEAT_FILE_BYTES: usize = 64 * 1024;
+
 pub const TickOutcome = enum {
     processed,
     skipped_empty_file,
@@ -57,7 +59,7 @@ pub const HeartbeatEngine = struct {
     pub fn collectTasks(self: *const HeartbeatEngine, allocator: std.mem.Allocator) ![][]const u8 {
         // Try bootstrap provider first when available.
         if (self.bootstrap_provider) |bp| {
-            const bp_content = bp.load(allocator, "HEARTBEAT.md") catch null;
+            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch null;
             if (bp_content) |content| {
                 defer allocator.free(content);
                 if (isContentEffectivelyEmpty(content)) return &.{};
@@ -76,7 +78,7 @@ pub const HeartbeatEngine = struct {
         };
         defer file.close();
 
-        const content = try file.readToEndAlloc(allocator, 1024 * 64);
+        const content = try file.readToEndAlloc(allocator, MAX_HEARTBEAT_FILE_BYTES);
         defer allocator.free(content);
 
         if (isContentEffectivelyEmpty(content)) return &.{};
@@ -105,7 +107,7 @@ pub const HeartbeatEngine = struct {
     pub fn tick(self: *const HeartbeatEngine, allocator: std.mem.Allocator) !TickResult {
         // Try bootstrap provider first when available.
         if (self.bootstrap_provider) |bp| {
-            const bp_content = bp.load(allocator, "HEARTBEAT.md") catch null;
+            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch null;
             if (bp_content) |content| {
                 defer allocator.free(content);
                 if (isContentEffectivelyEmpty(content)) {
@@ -128,7 +130,7 @@ pub const HeartbeatEngine = struct {
         };
         defer file.close();
 
-        const content = try file.readToEndAlloc(allocator, 1024 * 64);
+        const content = try file.readToEndAlloc(allocator, MAX_HEARTBEAT_FILE_BYTES);
         defer allocator.free(content);
         if (isContentEffectivelyEmpty(content)) {
             return .{ .outcome = .skipped_empty_file, .task_count = 0 };

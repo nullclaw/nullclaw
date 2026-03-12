@@ -210,6 +210,7 @@ const EngineSelection = struct {
     enable_memory_redis: bool = false,
     enable_memory_lancedb: bool = false,
     enable_postgres: bool = false,
+    enable_memory_clickhouse: bool = false,
 
     fn enableBase(self: *EngineSelection) void {
         self.enable_memory_none = true;
@@ -224,6 +225,7 @@ const EngineSelection = struct {
         self.enable_memory_redis = true;
         self.enable_memory_lancedb = true;
         self.enable_postgres = true;
+        self.enable_memory_clickhouse = true;
     }
 
     fn finalize(self: *EngineSelection) void {
@@ -240,7 +242,8 @@ const EngineSelection = struct {
             self.enable_memory_lucid or
             self.enable_memory_redis or
             self.enable_memory_lancedb or
-            self.enable_postgres;
+            self.enable_postgres or
+            self.enable_memory_clickhouse;
     }
 };
 
@@ -291,6 +294,8 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
             selection.enable_memory_lancedb = true;
         } else if (std.mem.eql(u8, token, "postgres")) {
             selection.enable_postgres = true;
+        } else if (std.mem.eql(u8, token, "clickhouse")) {
+            selection.enable_memory_clickhouse = true;
         } else {
             std.log.err("unknown engine '{s}' in -Dengines list", .{token});
             return error.InvalidEnginesOption;
@@ -311,12 +316,39 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
     return selection;
 }
 
+fn envExists(name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return false;
+    std.heap.page_allocator.free(value);
+    return true;
+}
+
+fn ensureAndroidBuildEnvironment(b: *std.Build) void {
+    if (envExists("TERMUX_VERSION")) return;
+    if (b.libc_file != null) return;
+
+    const has_android_sdk_or_ndk =
+        envExists("ANDROID_NDK_HOME") or
+        envExists("ANDROID_NDK_ROOT") or
+        envExists("ANDROID_HOME") or
+        envExists("ANDROID_SDK_ROOT");
+
+    std.log.err("Android cross-builds need a Zig libc/sysroot file passed via --libc (or ZIG_LIBC).", .{});
+    if (has_android_sdk_or_ndk) {
+        std.log.err("An Android SDK/NDK environment was detected, but Zig still needs --libc pointing at the generated libc/sysroot file.", .{});
+    } else {
+        std.log.err("Install the Android NDK, generate a libc/sysroot file for the target, and pass it with --libc.", .{});
+    }
+    std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
+    std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.15.2.", .{});
+    std.process.exit(1);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.4";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "dev";
     const channels_raw = b.option(
         []const u8,
         "channels",
@@ -332,7 +364,7 @@ pub fn build(b: *std.Build) void {
     const engines_raw = b.option(
         []const u8,
         "engines",
-        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres (default: base,sqlite)",
+        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres|clickhouse (default: base,sqlite)",
     );
     const engines = if (engines_raw) |raw| blk: {
         const parsed = parseEnginesOption(raw) catch {
@@ -351,6 +383,7 @@ pub fn build(b: *std.Build) void {
     const enable_memory_redis = engines.enable_memory_redis;
     const enable_memory_lancedb = engines.enable_memory_lancedb;
     const enable_postgres = engines.enable_postgres;
+    const enable_memory_clickhouse = engines.enable_memory_clickhouse;
     const enable_channel_cli = channels.enable_channel_cli;
     const enable_channel_telegram = channels.enable_channel_telegram;
     const enable_channel_discord = channels.enable_channel_discord;
@@ -370,6 +403,10 @@ pub fn build(b: *std.Build) void {
     const enable_channel_signal = channels.enable_channel_signal;
     const enable_channel_nostr = channels.enable_channel_nostr;
     const enable_channel_web = channels.enable_channel_web;
+
+    if (target.result.abi == .android) {
+        ensureAndroidBuildEnvironment(b);
+    }
 
     const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
     const effective_enable_memory_lucid = enable_sqlite and enable_memory_lucid;
@@ -404,6 +441,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_memory_lucid", effective_enable_memory_lucid);
     build_options.addOption(bool, "enable_memory_redis", enable_memory_redis);
     build_options.addOption(bool, "enable_memory_lancedb", effective_enable_memory_lancedb);
+    build_options.addOption(bool, "enable_memory_clickhouse", enable_memory_clickhouse);
     build_options.addOption(bool, "enable_channel_cli", enable_channel_cli);
     build_options.addOption(bool, "enable_channel_telegram", enable_channel_telegram);
     build_options.addOption(bool, "enable_channel_discord", enable_channel_discord);

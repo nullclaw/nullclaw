@@ -486,7 +486,7 @@ fn readWorkspaceContextForSummary(
 ) ![]u8 {
     // Try bootstrap provider first when available.
     if (bootstrap_provider) |bp| {
-        const bp_content = bp.load(allocator, "AGENTS.md") catch null;
+        const bp_content = bp.load_excerpt(allocator, "AGENTS.md", MAX_AGENTS_FILE_BYTES) catch null;
         if (bp_content) |content| {
             defer allocator.free(content);
             const sections = try extractSections(allocator, content, &.{ "Session Startup", "Red Lines" });

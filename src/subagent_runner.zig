@@ -3,6 +3,7 @@ const agent_mod = @import("agent/root.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const observability = @import("observability.zig");
+const provider_names = @import("provider_names.zig");
 const providers = @import("providers/root.zig");
 const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
@@ -15,7 +16,7 @@ fn findProviderEntry(
     entries: []const config_types.ProviderEntry,
 ) ?config_types.ProviderEntry {
     for (entries) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, provider_name)) return entry;
+        if (provider_names.providerNamesMatchIgnoreCase(entry.name, provider_name)) return entry;
     }
     return null;
 }
@@ -123,7 +124,7 @@ pub fn runTaskWithTools(
     defer agent.deinit();
     agent.policy = &policy;
 
-    const tool_instructions = try agent_mod.dispatcher.buildToolInstructions(allocator, tools);
+    const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
     defer allocator.free(tool_instructions);
 
     const full_system = try std.fmt.allocPrint(
@@ -131,12 +132,15 @@ pub fn runTaskWithTools(
         "{s}\n\n{s}",
         .{ request.system_prompt, tool_instructions },
     );
-    errdefer allocator.free(full_system);
-
-    try agent.history.append(allocator, .{
+    // After append, ownership transfers to agent.history; agent.deinit() frees it.
+    // Use catch to free only if append itself fails (avoids double-free with deinit).
+    agent.history.append(allocator, .{
         .role = .system,
         .content = full_system,
-    });
+    }) catch |err| {
+        allocator.free(full_system);
+        return err;
+    };
     agent.has_system_prompt = true;
     agent.system_prompt_has_conversation_context = false;
     agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap) catch null;
@@ -150,4 +154,12 @@ test "findProviderEntry matches case-insensitively" {
     };
     const found = findProviderEntry("customgw", &entries) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://example.com/v1", found.base_url.?);
+}
+
+test "findProviderEntry matches provider aliases" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "azure", .base_url = "https://resource.openai.azure.com/openai/v1" },
+    };
+    const found = findProviderEntry("AZURE-OPENAI", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", found.base_url.?);
 }

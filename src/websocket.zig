@@ -58,6 +58,11 @@ pub const WsClient = struct {
     tls: *TlsState,
     write_mu: std.Thread.Mutex,
 
+    pub const Message = struct {
+        opcode: Opcode,
+        payload: []u8,
+    };
+
     /// Connect to wss://host:port/path.
     /// `extra_headers`: additional HTTP request headers (without trailing CRLF).
     pub fn connect(
@@ -346,6 +351,13 @@ pub const WsClient = struct {
         try self.writeFrameLocked(.text, text);
     }
 
+    /// Send a binary frame (acquires write_mu).
+    pub fn writeBinary(self: *WsClient, payload: []const u8) !void {
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
+        try self.writeFrameLocked(.binary, payload);
+    }
+
     /// Send a close frame (acquires write_mu, ignores errors).
     pub fn writeClose(self: *WsClient) void {
         self.write_mu.lock();
@@ -384,6 +396,67 @@ pub const WsClient = struct {
                 },
                 .ping => {}, // auto-handled inside readFrame
                 .binary => {}, // Discord uses text only
+                else => {},
+            }
+        }
+    }
+
+    /// Read a complete text or binary message, aggregating continuation frames.
+    /// Returns heap-allocated payload (caller frees) or null on graceful close.
+    pub fn readMessage(self: *WsClient) !?Message {
+        var message: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer message.deinit(self.allocator);
+        var message_opcode: ?Opcode = null;
+
+        while (true) {
+            const maybe_frame = try self.readFrame();
+            if (maybe_frame == null) {
+                message.deinit(self.allocator);
+                return null;
+            }
+            const frame = maybe_frame.?;
+            defer if (frame.payload.len > 0) self.allocator.free(frame.payload);
+
+            switch (frame.opcode) {
+                .text, .binary => {
+                    if (message_opcode == null) {
+                        message_opcode = frame.opcode;
+                    } else if (message_opcode.? != frame.opcode) {
+                        message.deinit(self.allocator);
+                        return error.WsProtocolError;
+                    }
+                    try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
+                    if (frame.fin) {
+                        const payload = try message.toOwnedSlice(self.allocator);
+                        return .{
+                            .opcode = message_opcode.?,
+                            .payload = payload,
+                        };
+                    }
+                },
+                .continuation => {
+                    if (message_opcode == null) {
+                        message.deinit(self.allocator);
+                        return error.WsProtocolError;
+                    }
+                    try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
+                    if (frame.fin) {
+                        const payload = try message.toOwnedSlice(self.allocator);
+                        return .{
+                            .opcode = message_opcode.?,
+                            .payload = payload,
+                        };
+                    }
+                },
+                .ping => {}, // auto-handled inside readFrame
                 else => {},
             }
         }

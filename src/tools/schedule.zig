@@ -8,23 +8,25 @@ const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
+threadlocal var tls_schedule_account_id: ?[]const u8 = null;
 threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
 
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Set type='agent' to run as autonomous agent task (default: shell). Optional: model, prompt, chat_id.";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Set type='agent' to run as autonomous agent task (default: shell). Optional: model, prompt, channel, account_id, chat_id.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent' (autonomous agent task)"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs (default: config primary model)"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification (e.g. Telegram chat_id)"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent' (autonomous agent task)"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs (default: config primary model)"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
 
     /// Set the context for the current turn (called before agent.turn).
-    pub fn setContext(self: *ScheduleTool, channel: ?[]const u8, chat_id: ?[]const u8) void {
+    pub fn setContext(self: *ScheduleTool, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8) void {
         _ = self;
         tls_schedule_channel = channel;
+        tls_schedule_account_id = account_id;
         tls_schedule_chat_id = chat_id;
     }
 
@@ -40,9 +42,24 @@ pub const ScheduleTool = struct {
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing 'action' parameter");
 
+        const explicit_channel = root.getString(args, "channel");
+        const explicit_account_id = root.getString(args, "account_id");
+        const explicit_chat_id = root.getString(args, "chat_id");
+
         // Prefer explicit args; otherwise use per-thread context injected by channel_loop.
-        const chat_id = root.getString(args, "chat_id") orelse tls_schedule_chat_id;
-        const delivery_channel = tls_schedule_channel orelse "telegram";
+        const chat_id = explicit_chat_id orelse tls_schedule_chat_id;
+        const delivery_channel = explicit_channel orelse tls_schedule_channel orelse "telegram";
+        const delivery_account_id = explicit_account_id orelse tls_schedule_account_id;
+
+        if (explicit_channel) |channel| {
+            if (explicit_chat_id == null and tls_schedule_chat_id != null) {
+                if (tls_schedule_channel) |current_channel| {
+                    if (!std.mem.eql(u8, channel, current_channel)) {
+                        return ToolResult.fail("When overriding 'channel', also provide 'chat_id' for the target conversation");
+                    }
+                }
+            }
+        }
 
         if (std.mem.eql(u8, action, "list")) {
             var scheduler = loadScheduler(allocator) catch {
@@ -124,10 +141,17 @@ pub const ScheduleTool = struct {
 
             const is_agent = if (root.getString(args, "type")) |t| std.ascii.eqlIgnoreCase(t, "agent") else false;
 
+            const delivery_cfg: cron.DeliveryConfig = if (chat_id) |cid| .{
+                .mode = .always,
+                .channel = delivery_channel,
+                .account_id = delivery_account_id,
+                .to = cid,
+            } else .{};
+
             const job = if (is_agent) blk: {
                 const prompt = root.getString(args, "prompt") orelse command;
                 const model = root.getString(args, "model");
-                break :blk scheduler.addAgentJob(expression, prompt, model) catch |err| {
+                break :blk scheduler.addAgentJob(expression, prompt, model, delivery_cfg) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create agent job: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 };
@@ -138,15 +162,19 @@ pub const ScheduleTool = struct {
                 };
             };
 
-            // Set delivery config if chat_id is provided
-            if (chat_id) |cid| {
-                job.delivery = .{
-                    .mode = .always,
-                    .channel = try allocator.dupe(u8, delivery_channel),
-                    .to = try allocator.dupe(u8, cid),
-                    .channel_owned = true,
-                    .to_owned = true,
-                };
+            // Set delivery config if chat_id is provided (agent jobs get delivery via addAgentJob)
+            if (!is_agent) {
+                if (chat_id) |cid| {
+                    job.delivery = .{
+                        .mode = .always,
+                        .channel = try allocator.dupe(u8, delivery_channel),
+                        .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
+                        .to = try allocator.dupe(u8, cid),
+                        .channel_owned = true,
+                        .account_id_owned = delivery_account_id != null,
+                        .to_owned = true,
+                    };
+                }
             }
 
             cron.saveJobs(&scheduler) catch {};
@@ -193,8 +221,10 @@ pub const ScheduleTool = struct {
                 job.delivery = .{
                     .mode = .always,
                     .channel = try allocator.dupe(u8, delivery_channel),
+                    .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
                     .to = try allocator.dupe(u8, cid),
                     .channel_owned = true,
+                    .account_id_owned = delivery_account_id != null,
                     .to_owned = true,
                 };
             }
@@ -303,8 +333,23 @@ test "schedule create with expression" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     // Succeeds if HOME/.nullclaw is writable, otherwise may fail gracefully
     if (result.success) {
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "Created shell job") != null);
     }
+}
+
+test "schedule create rejects cross-channel override without explicit chat_id" {
+    var st = ScheduleTool{};
+    st.setContext("telegram", "main", "chat-123");
+    defer st.setContext(null, null, null);
+
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"command\": \"echo hello\", \"channel\": \"signal\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "chat_id") != null);
 }
 
 // ── Additional schedule tests ───────────────────────────────────
@@ -422,7 +467,7 @@ test "schedule add creates recurring job" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     if (result.success) {
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "Created shell job") != null);
     }
 }
 

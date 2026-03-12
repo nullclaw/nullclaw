@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const platform = @import("../platform.zig");
 const websocket = @import("../websocket.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.qq);
@@ -118,6 +120,79 @@ fn isRemoteMediaUrl(url: []const u8) bool {
     return std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://");
 }
 
+const QQ_ATTACHMENT_CACHE_SUBDIR = "nullclaw_qq_media";
+const QQ_ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+fn imageExtensionFromContentType(content_type: []const u8) []const u8 {
+    if (content_type.len == 0) return ".img";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/png")) return ".png";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/jpeg")) return ".jpg";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/jpg")) return ".jpg";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/gif")) return ".gif";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/webp")) return ".webp";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/bmp")) return ".bmp";
+    return ".img";
+}
+
+fn attachmentCacheDirPath(allocator: std.mem.Allocator) ![]u8 {
+    const tmp_dir = try platform.getTempDir(allocator);
+    defer allocator.free(tmp_dir);
+    return std.fs.path.join(allocator, &.{ tmp_dir, QQ_ATTACHMENT_CACHE_SUBDIR });
+}
+
+fn ensureAttachmentCacheDir(cache_dir: []const u8) !void {
+    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => try std.fs.cwd().makePath(cache_dir),
+    };
+}
+
+fn downloadImageAttachmentToLocal(
+    allocator: std.mem.Allocator,
+    image_url: []const u8,
+    content_type: []const u8,
+    auth_header_opt: ?[]const u8,
+) !?[]u8 {
+    if (!std.mem.startsWith(u8, image_url, "https://")) return null;
+
+    var header_buf: [1][]const u8 = undefined;
+    const headers: []const []const u8 = if (auth_header_opt) |auth_header| blk: {
+        header_buf[0] = auth_header;
+        break :blk header_buf[0..1];
+    } else &.{};
+
+    const image_bytes = root.http_util.curlGet(allocator, image_url, headers, "30") catch {
+        return null;
+    };
+    defer allocator.free(image_bytes);
+
+    if (image_bytes.len == 0 or image_bytes.len > QQ_ATTACHMENT_MAX_BYTES) return null;
+
+    const cache_dir = try attachmentCacheDirPath(allocator);
+    defer allocator.free(cache_dir);
+    ensureAttachmentCacheDir(cache_dir) catch return null;
+
+    const ext = imageExtensionFromContentType(content_type);
+    const ts: u64 = @intCast(@max(std.time.timestamp(), 0));
+    const nonce = std.crypto.random.int(u64);
+
+    var filename_buf: [96]u8 = undefined;
+    const filename = std.fmt.bufPrint(&filename_buf, "qq_{d}_{x}{s}", .{ ts, nonce, ext }) catch return null;
+    const local_path = try std.fs.path.join(allocator, &.{ cache_dir, filename });
+
+    const file = std.fs.createFileAbsolute(local_path, .{ .read = false, .truncate = true }) catch {
+        allocator.free(local_path);
+        return null;
+    };
+    defer file.close();
+    file.writeAll(image_bytes) catch {
+        allocator.free(local_path);
+        return null;
+    };
+
+    return local_path;
+}
+
 fn parseImageMarkerLine(line: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     const prefix = "[IMAGE:";
@@ -177,7 +252,7 @@ fn parseOutgoingContent(allocator: std.mem.Allocator, content: []const u8) !Pars
 
 /// Extract image attachment markers as newline-joined "[IMAGE:<url>]".
 /// Caller owns returned slice.
-fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![]u8 {
+fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value, auth_header_opt: ?[]const u8) ![]u8 {
     if (payload != .object) return allocator.dupe(u8, "");
     const attachments = payload.object.get("attachments") orelse return allocator.dupe(u8, "");
     if (attachments != .array) return allocator.dupe(u8, "");
@@ -196,10 +271,20 @@ fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![
         const is_image = (content_type.len >= 6 and std.ascii.eqlIgnoreCase(content_type[0..6], "image/")) or isImageFilename(filename);
         if (!is_image) continue;
 
+        const marker_target = blk: {
+            if (!builtin.is_test) {
+                if (try downloadImageAttachmentToLocal(allocator, url, content_type, auth_header_opt)) |local_path| {
+                    break :blk local_path;
+                }
+            }
+            break :blk try allocator.dupe(u8, url);
+        };
+        defer allocator.free(marker_target);
+
         if (!first) try out.append(allocator, '\n');
         first = false;
         try out.appendSlice(allocator, "[IMAGE:");
-        try out.appendSlice(allocator, url);
+        try out.appendSlice(allocator, marker_target);
         try out.append(allocator, ']');
     }
 
@@ -1058,7 +1143,15 @@ pub const QQChannel = struct {
 
         // Trim whitespace
         const trimmed = std.mem.trim(u8, stripped_content, " \t\n\r");
-        const image_markers = extractImageMarkers(self.allocator, d) catch |err| {
+        var auth_buf: [512]u8 = undefined;
+        const auth_header_opt: ?[]const u8 = blk: {
+            if (builtin.is_test) break :blk null;
+            const token = self.ensureAccessToken() catch break :blk null;
+            defer self.allocator.free(token);
+            break :blk buildAuthHeader(&auth_buf, token) catch null;
+        };
+
+        const image_markers = extractImageMarkers(self.allocator, d, auth_header_opt) catch |err| {
             log.info("handleMessageCreate: DROPPED — extractImageMarkers failed: {}", .{err});
             return;
         };
@@ -1384,7 +1477,7 @@ pub const QQChannel = struct {
         self.running.store(true, .release);
         self.heartbeat_stop.store(false, .release);
         log.info("QQ channel starting (sandbox={s}, app_id={s})", .{ if (self.config.sandbox) "true" else "false", self.config.app_id });
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayLoop, .{self});
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -1513,7 +1606,7 @@ pub const QQChannel = struct {
         self.heartbeat_stop.store(false, .release);
         self.force_heartbeat.store(false, .release);
         self.heartbeat_interval_ms.store(0, .release);
-        const hbt = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatLoop, .{ self, &ws }) catch |err| {
+        const hbt = std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, heartbeatLoop, .{ self, &ws }) catch |err| {
             ws.deinit();
             return err;
         };
@@ -1887,6 +1980,18 @@ test "qq buildAuthHeader" {
     var buf: [256]u8 = undefined;
     const header = try buildAuthHeader(&buf, "my-access-token");
     try std.testing.expectEqualStrings("Authorization: QQBot my-access-token", header);
+}
+
+test "qq attachmentCacheDirPath uses system temp dir" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = try platform.getTempDir(alloc);
+    defer alloc.free(tmp_dir);
+
+    const cache_dir = try attachmentCacheDirPath(alloc);
+    defer alloc.free(cache_dir);
+
+    try std.testing.expect(std.mem.startsWith(u8, cache_dir, tmp_dir));
+    try std.testing.expect(std.mem.endsWith(u8, cache_dir, QQ_ATTACHMENT_CACHE_SUBDIR));
 }
 
 test "qq isGroupAllowed policy allow" {
@@ -2405,6 +2510,24 @@ test "qq handleGatewayEvent empty message content ignored" {
     ;
     try ch.handleGatewayEvent(msg_json);
     try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
+}
+
+test "qq handleGatewayEvent image-only attachment keeps marker content" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .allow_from = &.{"*"} });
+    ch.setBus(&event_bus_inst);
+
+    const msg_json =
+        \\{"op":0,"s":16,"t":"C2C_MESSAGE_CREATE","d":{"id":"msg_img","author":{"user_openid":"u_img"},"content":"   ","attachments":[{"url":"https://cdn.example.com/a.png","content_type":"image/png"}]}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("[IMAGE:https://cdn.example.com/a.png]", msg.content);
 }
 
 test "qq handleGatewayEvent strips CQ codes from content" {

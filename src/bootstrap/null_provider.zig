@@ -27,6 +27,10 @@ pub const NullBootstrapProvider = struct {
         return null;
     }
 
+    fn implLoadExcerpt(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: usize) anyerror!?[]const u8 {
+        return null;
+    }
+
     fn implStore(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
 
     fn implRemove(_: *anyopaque, _: []const u8) anyerror!bool {
@@ -54,6 +58,7 @@ pub const NullBootstrapProvider = struct {
 
     const vtable = BootstrapProvider.VTable{
         .load = &implLoad,
+        .load_excerpt = &implLoadExcerpt,
         .store = &implStore,
         .remove = &implRemove,
         .exists = &implExists,
@@ -67,6 +72,13 @@ test "load returns null" {
     var np = NullBootstrapProvider.init();
     const bp = np.provider();
     const result = try bp.load(std.testing.allocator, "AGENTS.md");
+    try std.testing.expect(result == null);
+}
+
+test "load_excerpt returns null" {
+    var np = NullBootstrapProvider.init();
+    const bp = np.provider();
+    const result = try bp.load_excerpt(std.testing.allocator, "AGENTS.md", 4);
     try std.testing.expect(result == null);
 }
 

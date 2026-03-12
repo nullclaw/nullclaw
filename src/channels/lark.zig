@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const http_util = @import("../http_util.zig");
 const websocket = @import("../websocket.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.lark);
 
@@ -11,6 +13,62 @@ const SocketFd = std.net.Stream.Handle;
 const invalid_socket: SocketFd = switch (builtin.os.tag) {
     .windows => std.os.windows.ws2_32.INVALID_SOCKET,
     else => -1,
+};
+const AtomicU32 = std.atomic.Value(u32);
+const DEFAULT_LARK_PING_INTERVAL_MS: u32 = 120 * std.time.ms_per_s;
+const EVENT_CACHE_TTL_MS: i64 = 10_000;
+const LARK_WS_METHOD_CONTROL: i32 = 0;
+const LARK_WS_METHOD_DATA: i32 = 1;
+
+const LarkWsConnectConfig = struct {
+    url: []u8,
+    ping_interval_ms: u32 = DEFAULT_LARK_PING_INTERVAL_MS,
+
+    fn deinit(self: *LarkWsConnectConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+    }
+};
+
+const LarkWsHeader = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+const LarkWsFrame = struct {
+    seq_id: u64,
+    log_id: u64,
+    service: i32,
+    method: i32,
+    headers: []LarkWsHeader,
+    payload_encoding: ?[]const u8 = null,
+    payload_type: ?[]const u8 = null,
+    payload: []const u8 = &.{},
+    log_id_new: ?[]const u8 = null,
+
+    fn deinit(self: *LarkWsFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.headers);
+    }
+};
+
+const LarkWsEventBuffer = struct {
+    trace_id: []u8,
+    parts: []?[]u8,
+    created_at_ms: i64,
+
+    fn deinit(self: *LarkWsEventBuffer, allocator: std.mem.Allocator) void {
+        allocator.free(self.trace_id);
+        for (self.parts) |part| {
+            if (part) |payload| allocator.free(payload);
+        }
+        allocator.free(self.parts);
+    }
+};
+
+const LarkWsPingLoopCtx = struct {
+    ws: *websocket.WsClient,
+    running: *const std.atomic.Value(bool),
+    ping_interval_ms: *AtomicU32,
+    service_id: i32,
 };
 
 /// Lark/Feishu channel — receives events via WebSocket or HTTP callback, sends via Open API.
@@ -41,6 +99,9 @@ pub const LarkChannel = struct {
 
     pub const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
     pub const LARK_BASE_URL = "https://open.larksuite.com/open-apis";
+    /// Host root for callback endpoints (e.g. websocket config). Path is /callback/ws/endpoint, not under /open-apis.
+    pub const FEISHU_CALLBACK_HOST = "https://open.feishu.cn";
+    pub const LARK_CALLBACK_HOST = "https://open.larksuite.com";
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -208,6 +269,17 @@ pub const LarkChannel = struct {
         };
     }
 
+    fn componentAsSlice(component: std.Uri.Component) []const u8 {
+        return switch (component) {
+            .raw => |v| v,
+            .percent_encoded => |v| v,
+        };
+    }
+
+    fn statusCodeIsSuccess(code: u16) bool {
+        return code >= 200 and code < 300;
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Obtain a tenant access token from the Feishu/Lark API.
@@ -260,25 +332,17 @@ pub const LarkChannel = struct {
         try fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
         const body = fbs.getWritten();
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
+        const resp = http_util.curlPostWithStatus(
+            self.allocator,
+            url,
+            body,
+            &.{},
+        ) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
 
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
 
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-            },
-            .response_writer = &aw.writer,
-        }) catch return error.LarkApiError;
-
-        if (result.status != .ok) return error.LarkApiError;
-
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
+        const resp_body = resp.body;
         if (resp_body.len == 0) return error.LarkApiError;
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.LarkApiError;
@@ -332,20 +396,17 @@ pub const LarkChannel = struct {
         try auth_fbs.writer().print("Bearer {s}", .{token});
         const auth_value = auth_fbs.getWritten();
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+        const send_resp = http_util.curlPostWithStatus(
+            self.allocator,
+            url,
+            body,
+            &.{auth_header},
+        ) catch return error.LarkApiError;
+        defer self.allocator.free(send_resp.body);
 
-        const send_result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                .{ .name = "Authorization", .value = auth_value },
-            },
-        }) catch return error.LarkApiError;
-
-        if (send_result.status == .unauthorized) {
+        if (send_resp.status_code == 401) {
             // Token expired — invalidate cache and retry once
             self.invalidateToken();
             const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
@@ -356,53 +417,123 @@ pub const LarkChannel = struct {
             try retry_auth_fbs.writer().print("Bearer {s}", .{new_token});
             const retry_auth_value = retry_auth_fbs.getWritten();
 
-            var retry_client = std.http.Client{ .allocator = self.allocator };
-            defer retry_client.deinit();
+            var retry_auth_header_buf: [576]u8 = undefined;
+            const retry_auth_header = std.fmt.bufPrint(&retry_auth_header_buf, "Authorization: {s}", .{retry_auth_value}) catch return error.LarkApiError;
+            const retry_resp = http_util.curlPostWithStatus(
+                self.allocator,
+                url,
+                body,
+                &.{retry_auth_header},
+            ) catch return error.LarkApiError;
+            defer self.allocator.free(retry_resp.body);
 
-            const retry_result = retry_client.fetch(.{
-                .location = .{ .url = url },
-                .method = .POST,
-                .payload = body,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                    .{ .name = "Authorization", .value = retry_auth_value },
-                },
-            }) catch return error.LarkApiError;
-
-            if (retry_result.status != .ok) {
+            if (!statusCodeIsSuccess(retry_resp.status_code)) {
                 return error.LarkApiError;
             }
             return;
         }
 
-        if (send_result.status != .ok) {
+        if (!statusCodeIsSuccess(send_resp.status_code)) {
             return error.LarkApiError;
         }
     }
 
-    fn websocketHost(self: *const LarkChannel) []const u8 {
-        return if (self.use_feishu) "open.feishu.cn" else "open.larksuite.com";
+    fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
+        const host = if (self.use_feishu) FEISHU_CALLBACK_HOST else LARK_CALLBACK_HOST;
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().print("{s}/callback/ws/endpoint", .{host});
+        return fbs.getWritten();
     }
 
-    fn appendUrlQueryEscaped(writer: anytype, input: []const u8) !void {
-        for (input) |c| {
-            const is_unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
-            if (is_unreserved) {
-                try writer.writeByte(c);
-            } else {
-                try writer.print("%{X:0>2}", .{c});
-            }
-        }
-    }
-
-    fn buildWebsocketPath(buf: []u8, app_id: []const u8, app_access_token: []const u8) ![]const u8 {
+    fn buildWebsocketConfigBody(buf: []u8, app_id: []const u8, app_secret: []const u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
-        try w.writeAll("/ws/v2?app_id=");
-        try appendUrlQueryEscaped(w, app_id);
-        try w.writeAll("&access_token=");
-        try appendUrlQueryEscaped(w, app_access_token);
+        try w.writeAll("{\"AppID\":");
+        try root.appendJsonStringW(w, app_id);
+        try w.writeAll(",\"AppSecret\":");
+        try root.appendJsonStringW(w, app_secret);
+        try w.writeAll("}");
         return fbs.getWritten();
+    }
+
+    fn extractWebsocketConnectConfig(allocator: std.mem.Allocator, resp_body: []const u8) !LarkWsConnectConfig {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return error.LarkApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.LarkApiError;
+
+        if (parsed.value.object.get("code")) |code_val| {
+            if (code_val == .integer and code_val.integer != 0) return error.LarkApiError;
+        }
+
+        const data_val = parsed.value.object.get("data") orelse return error.LarkApiError;
+        if (data_val != .object) return error.LarkApiError;
+
+        const url_val = data_val.object.get("URL") orelse data_val.object.get("url") orelse return error.LarkApiError;
+        if (url_val != .string or url_val.string.len == 0) return error.LarkApiError;
+
+        var cfg = LarkWsConnectConfig{
+            .url = try allocator.dupe(u8, url_val.string),
+        };
+        errdefer cfg.deinit(allocator);
+
+        if (data_val.object.get("ClientConfig")) |client_cfg_val| {
+            if (client_cfg_val == .object) {
+                if (client_cfg_val.object.get("PingInterval")) |ping_val| {
+                    const ping_secs = switch (ping_val) {
+                        .integer => |v| if (v > 0) @as(u64, @intCast(v)) else 0,
+                        .float => |v| if (v > 0) @as(u64, @intFromFloat(v)) else 0,
+                        else => 0,
+                    };
+                    if (ping_secs > 0) {
+                        cfg.ping_interval_ms = std.math.cast(u32, ping_secs * std.time.ms_per_s) orelse return error.LarkApiError;
+                    }
+                }
+            }
+        }
+
+        return cfg;
+    }
+
+    fn extractWebsocketConnectUrl(allocator: std.mem.Allocator, resp_body: []const u8) ![]u8 {
+        const cfg = try extractWebsocketConnectConfig(allocator, resp_body);
+        return cfg.url;
+    }
+
+    fn parseWebsocketConnectUrl(
+        connect_url: []const u8,
+        host_buf: []u8,
+        path_buf: []u8,
+    ) !struct { host: []const u8, port: u16, path: []const u8, service_id: ?i32 } {
+        const uri = std.Uri.parse(connect_url) catch return error.LarkApiError;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "wss")) return error.LarkApiError;
+
+        const host = uri.getHost(host_buf) catch return error.LarkApiError;
+        const port = uri.port orelse 443;
+        const raw_path = componentAsSlice(uri.path);
+        const query = if (uri.query) |q| componentAsSlice(q) else "";
+        const service_id = if (query.len > 0) blk: {
+            const raw_service = queryParam(query, "service_id") orelse break :blk null;
+            break :blk std.fmt.parseInt(i32, raw_service, 10) catch null;
+        } else null;
+
+        var fbs = std.io.fixedBufferStream(path_buf);
+        const w = fbs.writer();
+        if (raw_path.len == 0) {
+            try w.writeByte('/');
+        } else {
+            if (raw_path[0] != '/') try w.writeByte('/');
+            try w.writeAll(raw_path);
+        }
+        if (query.len > 0) {
+            try w.writeByte('?');
+            try w.writeAll(query);
+        }
+        return .{
+            .host = host,
+            .port = port,
+            .path = fbs.getWritten(),
+            .service_id = service_id,
+        };
     }
 
     fn buildWebsocketPong(buf: []u8, ts: []const u8) ![]const u8 {
@@ -423,47 +554,25 @@ pub const LarkChannel = struct {
         return fbs.getWritten();
     }
 
-    fn fetchAppAccessToken(self: *LarkChannel) ![]const u8 {
-        const base = self.apiBase();
-
+    fn fetchWebsocketConnectConfig(self: *LarkChannel) !LarkWsConnectConfig {
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/auth/v3/app_access_token/internal", .{base});
-        const url = url_fbs.getWritten();
+        const url = try buildWebsocketConfigUrl(self, &url_buf);
 
         var body_buf: [512]u8 = undefined;
-        var body_fbs = std.io.fixedBufferStream(&body_buf);
-        try body_fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
-        const body = body_fbs.getWritten();
+        const body = try buildWebsocketConfigBody(&body_buf, self.app_id, self.app_secret);
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+        const resp = http_util.curlPostWithStatus(
+            self.allocator,
+            url,
+            body,
+            &.{
+                "locale: zh",
             },
-            .response_writer = &aw.writer,
-        }) catch return error.LarkApiError;
+        ) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
 
-        if (result.status != .ok) return error.LarkApiError;
-
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
-        if (resp_body.len == 0) return error.LarkApiError;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.LarkApiError;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.LarkApiError;
-
-        const token_val = parsed.value.object.get("app_access_token") orelse return error.LarkApiError;
-        if (token_val != .string) return error.LarkApiError;
-        return self.allocator.dupe(u8, token_val.string);
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        return extractWebsocketConnectConfig(self.allocator, resp.body);
     }
 
     fn publishInboundMessage(self: *LarkChannel, msg: ParsedLarkMessage) void {
@@ -506,7 +615,19 @@ pub const LarkChannel = struct {
         }
     }
 
-    fn handleWebsocketPayload(self: *LarkChannel, ws: *websocket.WsClient, payload: []const u8) !void {
+    fn processEventPayload(self: *LarkChannel, payload: []const u8) !void {
+        const messages = try self.parseEventPayload(self.allocator, payload);
+        defer if (messages.len > 0) {
+            for (messages) |*m| m.deinit(self.allocator);
+            self.allocator.free(messages);
+        };
+
+        for (messages) |m| {
+            self.publishInboundMessage(m);
+        }
+    }
+
+    fn handleLegacyWebsocketPayload(self: *LarkChannel, ws: *websocket.WsClient, payload: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch null;
         if (parsed) |pp| {
             var p = pp;
@@ -539,29 +660,63 @@ pub const LarkChannel = struct {
             }
         }
 
-        const messages = try self.parseEventPayload(self.allocator, payload);
-        defer if (messages.len > 0) {
-            for (messages) |*m| m.deinit(self.allocator);
-            self.allocator.free(messages);
-        };
+        try self.processEventPayload(payload);
+    }
 
-        for (messages) |m| {
-            self.publishInboundMessage(m);
+    fn handleBinaryWebsocketPayload(
+        self: *LarkChannel,
+        ws: *websocket.WsClient,
+        payload: []const u8,
+        event_buffers: *std.StringHashMapUnmanaged(LarkWsEventBuffer),
+        ping_interval_ms: *AtomicU32,
+    ) !void {
+        var frame = try decodeLarkWsFrame(self.allocator, payload);
+        defer frame.deinit(self.allocator);
+
+        if (frame.method == LARK_WS_METHOD_CONTROL) {
+            const msg_type = larkWsHeaderValue(frame.headers, "type") orelse return;
+            if (std.mem.eql(u8, msg_type, "pong") and frame.payload.len > 0) {
+                updatePingIntervalFromControlPayload(ping_interval_ms, frame.payload);
+            }
+            return;
+        }
+
+        if (frame.method != LARK_WS_METHOD_DATA) return;
+
+        const msg_type = larkWsHeaderValue(frame.headers, "type") orelse return;
+        if (!std.mem.eql(u8, msg_type, "event")) return;
+
+        const started_at_ms = std.time.milliTimestamp();
+        const maybe_payload = try mergeLarkWsEventPayload(self.allocator, event_buffers, frame);
+        defer if (maybe_payload) |merged_payload| self.allocator.free(merged_payload);
+
+        if (maybe_payload) |merged_payload| {
+            self.processEventPayload(merged_payload) catch |err| {
+                log.warn("lark websocket event handling failed: {}", .{err});
+            };
+
+            var ack_buf: [4096]u8 = undefined;
+            const elapsed_ms: u64 = @intCast(@max(std.time.milliTimestamp() - started_at_ms, 0));
+            const ack = buildLarkWsEventAckFrame(&ack_buf, frame, elapsed_ms) catch return;
+            ws.writeBinary(ack) catch |err| {
+                log.warn("lark websocket protobuf ack failed: {}", .{err});
+            };
         }
     }
 
     fn runWebsocketOnce(self: *LarkChannel) !void {
-        const app_access_token = try self.fetchAppAccessToken();
-        defer self.allocator.free(app_access_token);
+        var connect_cfg = try self.fetchWebsocketConnectConfig();
+        defer connect_cfg.deinit(self.allocator);
 
-        var path_buf: [1024]u8 = undefined;
-        const path = try buildWebsocketPath(&path_buf, self.app_id, app_access_token);
+        var host_buf: [256]u8 = undefined;
+        var path_buf: [2048]u8 = undefined;
+        const connect_parts = try parseWebsocketConnectUrl(connect_cfg.url, &host_buf, &path_buf);
 
         var ws = try websocket.WsClient.connect(
             self.allocator,
-            self.websocketHost(),
-            443,
-            path,
+            connect_parts.host,
+            connect_parts.port,
+            connect_parts.path,
             &.{},
         );
 
@@ -573,17 +728,44 @@ pub const LarkChannel = struct {
             ws.deinit();
         }
 
+        var event_buffers: std.StringHashMapUnmanaged(LarkWsEventBuffer) = .empty;
+        defer deinitLarkWsEventBuffers(self.allocator, &event_buffers);
+
+        var ping_interval_ms = AtomicU32.init(connect_cfg.ping_interval_ms);
+        var ping_thread: ?std.Thread = null;
+        var ping_ctx: LarkWsPingLoopCtx = undefined;
+        if (connect_parts.service_id) |service_id| {
+            ping_ctx = .{
+                .ws = &ws,
+                .running = &self.running,
+                .ping_interval_ms = &ping_interval_ms,
+                .service_id = service_id,
+            };
+            ping_thread = std.Thread.spawn(.{}, larkWsPingLoop, .{&ping_ctx}) catch |err| blk: {
+                log.warn("lark websocket ping loop spawn failed: {}", .{err});
+                break :blk null;
+            };
+        }
+        defer if (ping_thread) |t| t.join();
+
         while (self.running.load(.acquire)) {
-            const maybe_text = ws.readTextMessage() catch |err| {
+            const maybe_message = ws.readMessage() catch |err| {
                 log.warn("lark websocket read failed: {}", .{err});
                 break;
             };
-            const text = maybe_text orelse break;
-            defer self.allocator.free(text);
+            if (maybe_message == null) break;
+            const message = maybe_message.?;
+            defer self.allocator.free(message.payload);
 
-            self.handleWebsocketPayload(&ws, text) catch |err| {
-                log.warn("lark websocket payload handling failed: {}", .{err});
-            };
+            switch (message.opcode) {
+                .text => self.handleLegacyWebsocketPayload(&ws, message.payload) catch |err| {
+                    log.warn("lark websocket text payload handling failed: {}", .{err});
+                },
+                .binary => self.handleBinaryWebsocketPayload(&ws, message.payload, &event_buffers, &ping_interval_ms) catch |err| {
+                    log.warn("lark websocket binary payload handling failed: {}", .{err});
+                },
+                else => {},
+            }
         }
     }
 
@@ -616,7 +798,7 @@ pub const LarkChannel = struct {
         }
 
         self.connected.store(false, .release);
-        self.ws_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, websocketLoop, .{self}) catch |err| {
+        self.ws_thread = std.Thread.spawn(.{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE }, websocketLoop, .{self}) catch |err| {
             self.running.store(false, .release);
             return err;
         };
@@ -805,6 +987,417 @@ pub fn shouldRespondInGroup(mentions_val: ?std.json.Value, text: []const u8, bot
         if (std.mem.indexOf(u8, text, bot_name)) |_| return true;
     }
     return false;
+}
+
+fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |entry| {
+        const eq_idx = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        if (std.mem.eql(u8, entry[0..eq_idx], key)) return entry[eq_idx + 1 ..];
+    }
+    return null;
+}
+
+fn protoReadVarint(bytes: []const u8, index: *usize) !u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (index.* < bytes.len and shift < 64) {
+        const byte = bytes[index.*];
+        index.* += 1;
+        result |= (@as(u64, byte & 0x7F) << shift);
+        if ((byte & 0x80) == 0) return result;
+        shift += 7;
+    }
+    return error.LarkApiError;
+}
+
+fn protoReadLengthDelimited(bytes: []const u8, index: *usize) ![]const u8 {
+    const raw_len = try protoReadVarint(bytes, index);
+    const len: usize = std.math.cast(usize, raw_len) orelse return error.LarkApiError;
+    if (index.* + len > bytes.len) return error.LarkApiError;
+    const out = bytes[index.* .. index.* + len];
+    index.* += len;
+    return out;
+}
+
+fn protoSkipField(bytes: []const u8, index: *usize, wire_type: u64) !void {
+    switch (wire_type) {
+        0 => _ = try protoReadVarint(bytes, index),
+        2 => _ = try protoReadLengthDelimited(bytes, index),
+        else => return error.LarkApiError,
+    }
+}
+
+fn decodeLarkWsHeader(bytes: []const u8) !LarkWsHeader {
+    var index: usize = 0;
+    var key: ?[]const u8 = null;
+    var value: ?[]const u8 = null;
+
+    while (index < bytes.len) {
+        const tag = try protoReadVarint(bytes, &index);
+        const field_number = tag >> 3;
+        const wire_type = tag & 0x07;
+
+        switch (field_number) {
+            1 => {
+                if (wire_type != 2) return error.LarkApiError;
+                key = try protoReadLengthDelimited(bytes, &index);
+            },
+            2 => {
+                if (wire_type != 2) return error.LarkApiError;
+                value = try protoReadLengthDelimited(bytes, &index);
+            },
+            else => try protoSkipField(bytes, &index, wire_type),
+        }
+    }
+
+    return .{
+        .key = key orelse return error.LarkApiError,
+        .value = value orelse return error.LarkApiError,
+    };
+}
+
+fn decodeLarkWsFrame(allocator: std.mem.Allocator, bytes: []const u8) !LarkWsFrame {
+    var index: usize = 0;
+    var headers: std.ArrayListUnmanaged(LarkWsHeader) = .empty;
+    errdefer headers.deinit(allocator);
+
+    var seq_id: u64 = 0;
+    var log_id: u64 = 0;
+    var service: i32 = 0;
+    var method: i32 = 0;
+    var payload_encoding: ?[]const u8 = null;
+    var payload_type: ?[]const u8 = null;
+    var payload: []const u8 = &.{};
+    var log_id_new: ?[]const u8 = null;
+
+    var saw_seq_id = false;
+    var saw_log_id = false;
+    var saw_service = false;
+    var saw_method = false;
+
+    while (index < bytes.len) {
+        const tag = try protoReadVarint(bytes, &index);
+        const field_number = tag >> 3;
+        const wire_type = tag & 0x07;
+
+        switch (field_number) {
+            1 => {
+                if (wire_type != 0) return error.LarkApiError;
+                seq_id = try protoReadVarint(bytes, &index);
+                saw_seq_id = true;
+            },
+            2 => {
+                if (wire_type != 0) return error.LarkApiError;
+                log_id = try protoReadVarint(bytes, &index);
+                saw_log_id = true;
+            },
+            3 => {
+                if (wire_type != 0) return error.LarkApiError;
+                const raw = try protoReadVarint(bytes, &index);
+                service = std.math.cast(i32, raw) orelse return error.LarkApiError;
+                saw_service = true;
+            },
+            4 => {
+                if (wire_type != 0) return error.LarkApiError;
+                const raw = try protoReadVarint(bytes, &index);
+                method = std.math.cast(i32, raw) orelse return error.LarkApiError;
+                saw_method = true;
+            },
+            5 => {
+                if (wire_type != 2) return error.LarkApiError;
+                const header_bytes = try protoReadLengthDelimited(bytes, &index);
+                try headers.append(allocator, try decodeLarkWsHeader(header_bytes));
+            },
+            6 => {
+                if (wire_type != 2) return error.LarkApiError;
+                payload_encoding = try protoReadLengthDelimited(bytes, &index);
+            },
+            7 => {
+                if (wire_type != 2) return error.LarkApiError;
+                payload_type = try protoReadLengthDelimited(bytes, &index);
+            },
+            8 => {
+                if (wire_type != 2) return error.LarkApiError;
+                payload = try protoReadLengthDelimited(bytes, &index);
+            },
+            9 => {
+                if (wire_type != 2) return error.LarkApiError;
+                log_id_new = try protoReadLengthDelimited(bytes, &index);
+            },
+            else => try protoSkipField(bytes, &index, wire_type),
+        }
+    }
+
+    if (!saw_seq_id or !saw_log_id or !saw_service or !saw_method) return error.LarkApiError;
+
+    return .{
+        .seq_id = seq_id,
+        .log_id = log_id,
+        .service = service,
+        .method = method,
+        .headers = try headers.toOwnedSlice(allocator),
+        .payload_encoding = payload_encoding,
+        .payload_type = payload_type,
+        .payload = payload,
+        .log_id_new = log_id_new,
+    };
+}
+
+fn protoWriteVarint(writer: anytype, value: u64) !void {
+    var tmp = value;
+    while (true) {
+        var byte: u8 = @intCast(tmp & 0x7F);
+        tmp >>= 7;
+        if (tmp != 0) byte |= 0x80;
+        try writer.writeByte(byte);
+        if (tmp == 0) break;
+    }
+}
+
+fn protoWriteTag(writer: anytype, field_number: u32, wire_type: u3) !void {
+    try protoWriteVarint(writer, (@as(u64, field_number) << 3) | wire_type);
+}
+
+fn protoWriteU64(writer: anytype, field_number: u32, value: u64) !void {
+    try protoWriteTag(writer, field_number, 0);
+    try protoWriteVarint(writer, value);
+}
+
+fn protoWriteInt32(writer: anytype, field_number: u32, value: i32) !void {
+    if (value < 0) return error.LarkApiError;
+    try protoWriteU64(writer, field_number, @intCast(value));
+}
+
+fn protoWriteBytes(writer: anytype, field_number: u32, value: []const u8) !void {
+    try protoWriteTag(writer, field_number, 2);
+    try protoWriteVarint(writer, value.len);
+    try writer.writeAll(value);
+}
+
+fn protoWriteString(writer: anytype, field_number: u32, value: []const u8) !void {
+    try protoWriteBytes(writer, field_number, value);
+}
+
+fn protoWriteHeader(writer: anytype, key: []const u8, value: []const u8) !void {
+    var header_buf: [1024]u8 = undefined;
+    var header_fbs = std.io.fixedBufferStream(&header_buf);
+    const header_writer = header_fbs.writer();
+    try protoWriteString(header_writer, 1, key);
+    try protoWriteString(header_writer, 2, value);
+    try protoWriteBytes(writer, 5, header_fbs.getWritten());
+}
+
+fn larkWsHeaderValue(headers: []const LarkWsHeader, key: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.mem.eql(u8, header.key, key)) return header.value;
+    }
+    return null;
+}
+
+fn buildLarkWsPingFrame(buf: []u8, service_id: i32) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+    try protoWriteU64(writer, 1, 0);
+    try protoWriteU64(writer, 2, 0);
+    try protoWriteInt32(writer, 3, service_id);
+    try protoWriteInt32(writer, 4, LARK_WS_METHOD_CONTROL);
+    try protoWriteHeader(writer, "type", "ping");
+    return fbs.getWritten();
+}
+
+fn buildLarkWsEventAckFrame(buf: []u8, frame: LarkWsFrame, biz_rt_ms: u64) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+    try protoWriteU64(writer, 1, frame.seq_id);
+    try protoWriteU64(writer, 2, frame.log_id);
+    try protoWriteInt32(writer, 3, frame.service);
+    try protoWriteInt32(writer, 4, frame.method);
+    for (frame.headers) |header| {
+        try protoWriteHeader(writer, header.key, header.value);
+    }
+
+    var biz_rt_buf: [32]u8 = undefined;
+    const biz_rt = std.fmt.bufPrint(&biz_rt_buf, "{d}", .{biz_rt_ms}) catch return error.LarkApiError;
+    try protoWriteHeader(writer, "biz_rt", biz_rt);
+
+    if (frame.payload_encoding) |payload_encoding| {
+        try protoWriteString(writer, 6, payload_encoding);
+    }
+    if (frame.payload_type) |payload_type| {
+        try protoWriteString(writer, 7, payload_type);
+    }
+    try protoWriteBytes(writer, 8, "{\"code\":200}");
+    if (frame.log_id_new) |log_id_new| {
+        try protoWriteString(writer, 9, log_id_new);
+    }
+    return fbs.getWritten();
+}
+
+fn updatePingIntervalFromControlPayload(ping_interval_ms: *AtomicU32, payload: []const u8) void {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const ping_val = parsed.value.object.get("PingInterval") orelse return;
+    const ping_secs = switch (ping_val) {
+        .integer => |v| if (v > 0) @as(u64, @intCast(v)) else return,
+        .float => |v| if (v > 0) @as(u64, @intFromFloat(v)) else return,
+        else => return,
+    };
+    const ping_interval_ms_value = std.math.cast(u32, ping_secs * std.time.ms_per_s) orelse return;
+    ping_interval_ms.store(ping_interval_ms_value, .release);
+}
+
+fn cleanupExpiredLarkWsEventBuffers(
+    allocator: std.mem.Allocator,
+    event_buffers: *std.StringHashMapUnmanaged(LarkWsEventBuffer),
+    now_ms: i64,
+) !void {
+    var stale_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer stale_keys.deinit(allocator);
+
+    var it = event_buffers.iterator();
+    while (it.next()) |entry| {
+        if (now_ms - entry.value_ptr.created_at_ms > EVENT_CACHE_TTL_MS) {
+            try stale_keys.append(allocator, entry.key_ptr.*);
+        }
+    }
+
+    for (stale_keys.items) |key| {
+        if (event_buffers.fetchRemove(key)) |entry| {
+            var value = entry.value;
+            value.deinit(allocator);
+            allocator.free(@constCast(entry.key));
+        }
+    }
+}
+
+fn mergeLarkWsEventPayload(
+    allocator: std.mem.Allocator,
+    event_buffers: *std.StringHashMapUnmanaged(LarkWsEventBuffer),
+    frame: LarkWsFrame,
+) !?[]u8 {
+    try cleanupExpiredLarkWsEventBuffers(allocator, event_buffers, std.time.milliTimestamp());
+
+    const message_id = larkWsHeaderValue(frame.headers, "message_id") orelse {
+        if (frame.payload.len == 0) return null;
+        return try allocator.dupe(u8, frame.payload);
+    };
+    const sum_raw = larkWsHeaderValue(frame.headers, "sum") orelse {
+        if (frame.payload.len == 0) return null;
+        return try allocator.dupe(u8, frame.payload);
+    };
+    const seq_raw = larkWsHeaderValue(frame.headers, "seq") orelse {
+        if (frame.payload.len == 0) return null;
+        return try allocator.dupe(u8, frame.payload);
+    };
+
+    const sum = std.fmt.parseInt(usize, sum_raw, 10) catch return error.LarkApiError;
+    const seq = std.fmt.parseInt(usize, seq_raw, 10) catch return error.LarkApiError;
+    if (sum <= 1) {
+        if (frame.payload.len == 0) return null;
+        return try allocator.dupe(u8, frame.payload);
+    }
+    if (seq >= sum) return error.LarkApiError;
+
+    const trace_id = larkWsHeaderValue(frame.headers, "trace_id") orelse "";
+    const gop = try event_buffers.getOrPut(allocator, message_id);
+    if (!gop.found_existing) {
+        const key_copy = try allocator.dupe(u8, message_id);
+        errdefer allocator.free(key_copy);
+
+        const trace_id_copy = try allocator.dupe(u8, trace_id);
+        errdefer allocator.free(trace_id_copy);
+
+        const parts = try allocator.alloc(?[]u8, sum);
+        errdefer allocator.free(parts);
+        for (parts) |*part| part.* = null;
+
+        gop.key_ptr.* = key_copy;
+        gop.value_ptr.* = .{
+            .trace_id = trace_id_copy,
+            .parts = parts,
+            .created_at_ms = std.time.milliTimestamp(),
+        };
+    } else if (gop.value_ptr.parts.len != sum) {
+        gop.value_ptr.deinit(allocator);
+
+        const trace_id_copy = try allocator.dupe(u8, trace_id);
+        errdefer allocator.free(trace_id_copy);
+
+        const parts = try allocator.alloc(?[]u8, sum);
+        errdefer allocator.free(parts);
+        for (parts) |*part| part.* = null;
+
+        gop.value_ptr.* = .{
+            .trace_id = trace_id_copy,
+            .parts = parts,
+            .created_at_ms = std.time.milliTimestamp(),
+        };
+    }
+
+    if (gop.value_ptr.parts[seq]) |existing| allocator.free(existing);
+    gop.value_ptr.parts[seq] = try allocator.dupe(u8, frame.payload);
+
+    for (gop.value_ptr.parts) |part| {
+        if (part == null) return null;
+    }
+
+    var merged: std.ArrayListUnmanaged(u8) = .empty;
+    defer merged.deinit(allocator);
+    for (gop.value_ptr.parts) |part| {
+        try merged.appendSlice(allocator, part.?);
+    }
+    const merged_payload = try merged.toOwnedSlice(allocator);
+
+    if (event_buffers.fetchRemove(message_id)) |entry| {
+        var value = entry.value;
+        value.deinit(allocator);
+        allocator.free(@constCast(entry.key));
+    }
+
+    return merged_payload;
+}
+
+fn deinitLarkWsEventBuffers(
+    allocator: std.mem.Allocator,
+    event_buffers: *std.StringHashMapUnmanaged(LarkWsEventBuffer),
+) void {
+    var it = event_buffers.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+        allocator.free(entry.key_ptr.*);
+    }
+    event_buffers.deinit(allocator);
+}
+
+fn larkWsPingLoop(ctx: *LarkWsPingLoopCtx) void {
+    while (ctx.running.load(.acquire)) {
+        const interval_ms = blk: {
+            const current = ctx.ping_interval_ms.load(.acquire);
+            break :blk if (current > 0) current else DEFAULT_LARK_PING_INTERVAL_MS;
+        };
+
+        var waited_ms: u32 = 0;
+        while (waited_ms < interval_ms and ctx.running.load(.acquire)) {
+            const step_ms: u32 = @min(interval_ms - waited_ms, @as(u32, 1000));
+            std.Thread.sleep(@as(u64, step_ms) * std.time.ns_per_ms);
+            waited_ms += step_ms;
+        }
+        if (!ctx.running.load(.acquire)) break;
+
+        var ping_buf: [256]u8 = undefined;
+        const ping = buildLarkWsPingFrame(&ping_buf, ctx.service_id) catch {
+            log.warn("lark websocket ping build failed", .{});
+            continue;
+        };
+        ctx.ws.writeBinary(ping) catch |err| {
+            if (ctx.running.load(.acquire)) {
+                log.warn("lark websocket ping failed: {}", .{err});
+            }
+            break;
+        };
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1055,18 +1648,27 @@ test "lark apiBase returns larksuite URL when use_feishu is false" {
     try std.testing.expectEqualStrings("https://open.larksuite.com/open-apis", ch.apiBase());
 }
 
-test "lark websocketHost follows region" {
+test "lark buildWebsocketConfigUrl follows region" {
     var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
     ch.use_feishu = true;
-    try std.testing.expectEqualStrings("open.feishu.cn", ch.websocketHost());
+    var feishu_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://open.feishu.cn/callback/ws/endpoint",
+        try ch.buildWebsocketConfigUrl(&feishu_buf),
+    );
+
     ch.use_feishu = false;
-    try std.testing.expectEqualStrings("open.larksuite.com", ch.websocketHost());
+    var lark_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://open.larksuite.com/callback/ws/endpoint",
+        try ch.buildWebsocketConfigUrl(&lark_buf),
+    );
 }
 
-test "lark buildWebsocketPath formats query parameters" {
+test "lark buildWebsocketConfigBody uses official field names" {
     var buf: [256]u8 = undefined;
-    const path = try LarkChannel.buildWebsocketPath(&buf, "cli_app", "tok_123");
-    try std.testing.expectEqualStrings("/ws/v2?app_id=cli_app&access_token=tok_123", path);
+    const body = try LarkChannel.buildWebsocketConfigBody(&buf, "cli_app", "sec_123");
+    try std.testing.expectEqualStrings("{\"AppID\":\"cli_app\",\"AppSecret\":\"sec_123\"}", body);
 }
 
 test "lark websocket pong and ack payload format" {
@@ -1305,13 +1907,129 @@ test "lark healthCheck websocket mode requires both running and connected" {
     try std.testing.expect(ch.healthCheck());
 }
 
-test "lark buildWebsocketPath handles special characters in token" {
-    var buf: [512]u8 = undefined;
-    const path = try LarkChannel.buildWebsocketPath(&buf, "app_id_with_special_chars", "token+with/special=chars");
-    try std.testing.expectEqualStrings(
-        "/ws/v2?app_id=app_id_with_special_chars&access_token=token%2Bwith%2Fspecial%3Dchars",
-        path,
+test "lark extractWebsocketConnectUrl parses official response shape" {
+    const allocator = std.testing.allocator;
+    const resp =
+        \\{"code":0,"data":{"URL":"wss://ws-client.feishu.cn/ws/?app_id=cli_xxx&device_id=dev1","ClientConfig":{"PingInterval":30}}}
+    ;
+    const url = try LarkChannel.extractWebsocketConnectUrl(allocator, resp);
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings("wss://ws-client.feishu.cn/ws/?app_id=cli_xxx&device_id=dev1", url);
+}
+
+test "lark extractWebsocketConnectConfig captures ping interval" {
+    const allocator = std.testing.allocator;
+    const resp =
+        \\{"code":0,"data":{"URL":"wss://ws-client.feishu.cn/ws/?app_id=cli_xxx&device_id=dev1&service_id=7","ClientConfig":{"PingInterval":45}}}
+    ;
+    var cfg = try LarkChannel.extractWebsocketConnectConfig(allocator, resp);
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqualStrings("wss://ws-client.feishu.cn/ws/?app_id=cli_xxx&device_id=dev1&service_id=7", cfg.url);
+    try std.testing.expectEqual(@as(u32, 45 * std.time.ms_per_s), cfg.ping_interval_ms);
+}
+
+test "lark parseWebsocketConnectUrl extracts host port and path" {
+    var host_buf: [256]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const parsed = try LarkChannel.parseWebsocketConnectUrl(
+        "wss://ws-client.feishu.cn/v1/ws?app_id=cli_xxx&device_id=dev1&service_id=7",
+        &host_buf,
+        &path_buf,
     );
+    try std.testing.expectEqualStrings("ws-client.feishu.cn", parsed.host);
+    try std.testing.expectEqual(@as(u16, 443), parsed.port);
+    try std.testing.expectEqualStrings("/v1/ws?app_id=cli_xxx&device_id=dev1&service_id=7", parsed.path);
+    try std.testing.expectEqual(@as(?i32, 7), parsed.service_id);
+}
+
+test "lark protobuf ping frame round-trips" {
+    var buf: [256]u8 = undefined;
+    const encoded = try buildLarkWsPingFrame(&buf, 9);
+    var frame = try decodeLarkWsFrame(std.testing.allocator, encoded);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 0), frame.seq_id);
+    try std.testing.expectEqual(@as(u64, 0), frame.log_id);
+    try std.testing.expectEqual(@as(i32, 9), frame.service);
+    try std.testing.expectEqual(@as(i32, LARK_WS_METHOD_CONTROL), frame.method);
+    try std.testing.expectEqualStrings("ping", larkWsHeaderValue(frame.headers, "type").?);
+}
+
+test "lark mergeLarkWsEventPayload merges chunked protobuf payload" {
+    const allocator = std.testing.allocator;
+    var event_buffers: std.StringHashMapUnmanaged(LarkWsEventBuffer) = .empty;
+    defer deinitLarkWsEventBuffers(allocator, &event_buffers);
+
+    const headers_0 = [_]LarkWsHeader{
+        .{ .key = "type", .value = "event" },
+        .{ .key = "message_id", .value = "msg-1" },
+        .{ .key = "sum", .value = "2" },
+        .{ .key = "seq", .value = "0" },
+        .{ .key = "trace_id", .value = "trace-1" },
+    };
+    const headers_1 = [_]LarkWsHeader{
+        .{ .key = "type", .value = "event" },
+        .{ .key = "message_id", .value = "msg-1" },
+        .{ .key = "sum", .value = "2" },
+        .{ .key = "seq", .value = "1" },
+        .{ .key = "trace_id", .value = "trace-1" },
+    };
+
+    const frame_0 = LarkWsFrame{
+        .seq_id = 1,
+        .log_id = 2,
+        .service = 3,
+        .method = LARK_WS_METHOD_DATA,
+        .headers = @constCast(headers_0[0..]),
+        .payload = "{\"foo\":",
+    };
+    const frame_1 = LarkWsFrame{
+        .seq_id = 1,
+        .log_id = 2,
+        .service = 3,
+        .method = LARK_WS_METHOD_DATA,
+        .headers = @constCast(headers_1[0..]),
+        .payload = "1}",
+    };
+
+    const maybe_first = try mergeLarkWsEventPayload(allocator, &event_buffers, frame_0);
+    try std.testing.expect(maybe_first == null);
+
+    const merged = (try mergeLarkWsEventPayload(allocator, &event_buffers, frame_1)).?;
+    defer allocator.free(merged);
+    try std.testing.expectEqualStrings("{\"foo\":1}", merged);
+}
+
+test "lark protobuf event ack preserves frame metadata" {
+    const headers = [_]LarkWsHeader{
+        .{ .key = "type", .value = "event" },
+        .{ .key = "message_id", .value = "msg-1" },
+    };
+    const src = LarkWsFrame{
+        .seq_id = 11,
+        .log_id = 22,
+        .service = 33,
+        .method = LARK_WS_METHOD_DATA,
+        .headers = @constCast(headers[0..]),
+        .payload_encoding = "json",
+        .payload_type = "application/json",
+        .log_id_new = "log-new",
+    };
+
+    var buf: [1024]u8 = undefined;
+    const encoded = try buildLarkWsEventAckFrame(&buf, src, 17);
+    var decoded = try decodeLarkWsFrame(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 11), decoded.seq_id);
+    try std.testing.expectEqual(@as(u64, 22), decoded.log_id);
+    try std.testing.expectEqual(@as(i32, 33), decoded.service);
+    try std.testing.expectEqual(@as(i32, LARK_WS_METHOD_DATA), decoded.method);
+    try std.testing.expectEqualStrings("{\"code\":200}", decoded.payload);
+    try std.testing.expectEqualStrings("json", decoded.payload_encoding.?);
+    try std.testing.expectEqualStrings("application/json", decoded.payload_type.?);
+    try std.testing.expectEqualStrings("log-new", decoded.log_id_new.?);
+    try std.testing.expectEqualStrings("event", larkWsHeaderValue(decoded.headers, "type").?);
+    try std.testing.expect(larkWsHeaderValue(decoded.headers, "biz_rt") != null);
 }
 
 test "lark buildWebsocketPong handles empty timestamp" {
@@ -1378,20 +2096,6 @@ test "lark parseEventPayload handles websocket message with mentions" {
     try std.testing.expect(msgs[0].is_group);
     // Should strip @_user_1 placeholder
     try std.testing.expectEqualStrings("Hello everyone", msgs[0].content);
-}
-
-test "lark websocketHost returns correct host for feishu" {
-    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
-    ch.use_feishu = true;
-    const host = ch.websocketHost();
-    try std.testing.expectEqualStrings("open.feishu.cn", host);
-}
-
-test "lark websocketHost returns correct host for lark" {
-    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
-    ch.use_feishu = false;
-    const host = ch.websocketHost();
-    try std.testing.expectEqualStrings("open.larksuite.com", host);
 }
 
 test "lark initFromConfig with websocket mode" {

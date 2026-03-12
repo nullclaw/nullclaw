@@ -32,6 +32,7 @@ pub const FileBootstrapProvider = struct {
 
     const vtable = BootstrapProvider.VTable{
         .load = load,
+        .load_excerpt = load_excerpt,
         .store = store,
         .remove = remove,
         .exists = exists,
@@ -47,13 +48,29 @@ pub const FileBootstrapProvider = struct {
         const path = try std.fs.path.join(allocator, &.{ self.workspace_dir, filename });
         defer allocator.free(path);
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer file.close();
 
         return try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    }
+
+    fn load_excerpt(ptr: *anyopaque, allocator: std.mem.Allocator, filename: []const u8, max_bytes: usize) anyerror!?[]const u8 {
+        const self = castSelf(ptr);
+        if (!isBootstrapFilename(filename)) return Error.NotBootstrapFile;
+
+        const path = try std.fs.path.join(allocator, &.{ self.workspace_dir, filename });
+        defer allocator.free(path);
+
+        var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close();
+
+        return try read_file_excerpt(allocator, &file, max_bytes);
     }
 
     fn store(ptr: *anyopaque, filename: []const u8, content: []const u8) anyerror!void {
@@ -148,6 +165,24 @@ pub const FileBootstrapProvider = struct {
     }
 };
 
+fn read_file_excerpt(allocator: std.mem.Allocator, file: *std.fs.File, max_bytes: usize) ![]const u8 {
+    const buf = try allocator.alloc(u8, max_bytes);
+    errdefer allocator.free(buf);
+
+    const read_len = try file.readAll(buf);
+    return shrink_alloc(allocator, buf, read_len);
+}
+
+fn shrink_alloc(allocator: std.mem.Allocator, slice: []u8, new_len: usize) ![]u8 {
+    if (new_len >= slice.len) return slice;
+    return allocator.realloc(slice, new_len) catch blk: {
+        const fresh = try allocator.alloc(u8, new_len);
+        @memcpy(fresh, slice[0..new_len]);
+        allocator.free(slice);
+        break :blk fresh;
+    };
+}
+
 // --- Tests ---
 
 const testing = std.testing;
@@ -190,6 +225,22 @@ test "load missing returns null" {
 
     const content = try bp.load(testing.allocator, "SOUL.md");
     try testing.expect(content == null);
+}
+
+test "load_excerpt returns prefix for oversized file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var ctx = try setupTestProvider(&tmp);
+    defer testing.allocator.free(ctx.workspace);
+
+    var bp = ctx.provider.provider();
+
+    try bp.store("SOUL.md", "abcdef");
+    const excerpt = try bp.load_excerpt(testing.allocator, "SOUL.md", 3);
+    defer if (excerpt) |c| testing.allocator.free(c);
+
+    try testing.expectEqualStrings("abc", excerpt.?);
 }
 
 test "remove deletes file" {
