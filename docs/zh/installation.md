@@ -177,7 +177,9 @@ zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /path
 
 ## 将二进制加入 PATH
 
-### macOS/Linux（zsh/bash）
+### 使用源码编译后的二进制文件
+
+#### macOS/Linux（zsh/bash）
 
 ```bash
 zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
@@ -186,7 +188,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-### Windows（PowerShell）
+#### Windows（PowerShell）
 
 ```powershell
 zig build -Doptimize=ReleaseSmall -p "$HOME\.local"
@@ -197,6 +199,15 @@ if (-not ($user_path -split ";" | Where-Object { $_ -eq $bin })) {
   [Environment]::SetEnvironmentVariable("Path", "$user_path;$bin", "User")
 }
 $env:Path = "$env:Path;$bin"
+```
+
+### 直接使用下载的二进制文件（Windows)
+可将下载的nullclaw二进制文件（.exe)改名为nullclaw.exe，再以管理员权限在Powershell中执行如下命令，将该文件所在的路径加入到windows系统变量PATH中：
+
+```Powershell 
+$old = [Environment]::GetEnvironmentVariable("Path", "Machine")
+$new = "$old;x:\nullclaww二进制文件所在目录"
+[Environment]::SetEnvironmentVariable("Path", $new, "Machine")
 ```
 
 ## 安装验证
