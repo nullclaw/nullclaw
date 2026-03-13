@@ -37,6 +37,7 @@ pub const prompt = @import("prompt.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 pub const turn_scorer = @import("turn_scorer.zig");
+pub const retry = @import("retry.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
@@ -2219,7 +2220,7 @@ pub const Agent = struct {
                 arena,
                 "{s}\n\nReflect on the tool results above and decide your next steps. " ++
                     "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
-                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
+                    "Transient errors (timeout/network/rate-limit) are automatically retried with backoff — if a tool still failed after retries, try an alternative approach or inform the user.",
                 .{scrubbed_results},
             );
             try self.history.append(self.allocator, .{
@@ -2470,33 +2471,76 @@ pub const Agent = struct {
                 defer tools_mod.process_util.setThreadInterruptFlag(null);
                 @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
-                const result = t.execute(tool_allocator, args) catch |err| {
+
+                // ── Retry loop with exponential backoff ──
+                const policy = retry.default_policy;
+                var attempt: u8 = 0;
+                while (true) {
+                    const result = t.execute(tool_allocator, args) catch |err| {
+                        const err_name = @errorName(err);
+                        if (verbose_mod.isVerbose()) {
+                            log.info("tool result: name={s} error={s}", .{ call.name, err_name });
+                        }
+                        const class = retry.classifyError(err_name, "");
+                        if (retry.shouldRetry(policy, class, attempt)) {
+                            const bo = retry.backoffMs(policy, attempt);
+                            const retry_event = ObserverEvent{ .tool_retry = .{
+                                .tool = call.name,
+                                .attempt = attempt + 1,
+                                .backoff_ms = bo,
+                                .error_class = "transient",
+                            } };
+                            self.observer.recordEvent(&retry_event);
+                            std.Thread.sleep(bo * std.time.ns_per_ms);
+                            attempt += 1;
+                            continue;
+                        }
+                        return .{
+                            .name = call.name,
+                            .output = err_name,
+                            .success = false,
+                            .tool_call_id = call.tool_call_id,
+                        };
+                    };
+
+                    // Check for interrupt
+                    const was_interrupted = !result.success and
+                        ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
+                            std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
+                    if (was_interrupted) {
+                        self.noteInterruptedTool(trimmed_call_name) catch {};
+                    }
+
+                    // Retry on soft failure (result.success == false, not interrupted)
+                    if (!result.success and !was_interrupted) {
+                        const output = result.error_msg orelse result.output;
+                        const class = retry.classifyError("", output);
+                        if (retry.shouldRetry(policy, class, attempt)) {
+                            const bo = retry.backoffMs(policy, attempt);
+                            const retry_event = ObserverEvent{ .tool_retry = .{
+                                .tool = call.name,
+                                .attempt = attempt + 1,
+                                .backoff_ms = bo,
+                                .error_class = "transient",
+                            } };
+                            self.observer.recordEvent(&retry_event);
+                            std.Thread.sleep(bo * std.time.ns_per_ms);
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+
                     if (verbose_mod.isVerbose()) {
-                        log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
+                        const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
+                        log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
                     }
                     return .{
                         .name = call.name,
-                        .output = @errorName(err),
-                        .success = false,
+                        .output = if (result.success) result.output else (result.error_msg orelse result.output),
+                        .success = result.success,
                         .tool_call_id = call.tool_call_id,
                     };
-                };
-                const was_interrupted = !result.success and
-                    ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
-                        std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
-                if (was_interrupted) {
-                    self.noteInterruptedTool(trimmed_call_name) catch {};
                 }
-                if (verbose_mod.isVerbose()) {
-                    const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
-                    log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
-                }
-                return .{
-                    .name = call.name,
-                    .output = if (result.success) result.output else (result.error_msg orelse result.output),
-                    .success = result.success,
-                    .tool_call_id = call.tool_call_id,
-                };
             }
         }
 
