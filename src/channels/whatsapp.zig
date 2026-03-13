@@ -2,6 +2,8 @@ const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 
+const log = std.log.scoped(.whatsapp);
+
 /// WhatsApp channel — uses WhatsApp Business Cloud API.
 /// Operates in webhook mode (push-based); messages received via gateway endpoint.
 pub const WhatsAppChannel = struct {
@@ -302,6 +304,56 @@ pub const WhatsAppChannel = struct {
         }
     }
 
+    /// Send a document (file) to a WhatsApp recipient via link.
+    pub fn sendDocument(self: *WhatsAppChannel, recipient: []const u8, document_url: []const u8, caption: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("https://graph.facebook.com/{s}/{s}/messages", .{ API_VERSION, self.phone_number_id });
+        const url = url_fbs.getWritten();
+
+        const to = if (recipient.len > 0 and recipient[0] == '+') recipient[1..] else recipient;
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const w = body_list.writer(self.allocator);
+        try w.writeAll("{\"messaging_product\":\"whatsapp\",\"recipient_type\":\"individual\",\"to\":\"");
+        try w.writeAll(to);
+        try w.writeAll("\",\"type\":\"document\",\"document\":{\"link\":");
+        try root.appendJsonStringW(w, document_url);
+        if (caption.len > 0) {
+            try w.writeAll(",\"caption\":");
+            try root.appendJsonStringW(w, caption);
+        }
+        // Extract filename from URL/path
+        if (std.mem.lastIndexOfScalar(u8, document_url, '/')) |slash| {
+            try w.writeAll(",\"filename\":");
+            try root.appendJsonStringW(w, document_url[slash + 1 ..]);
+        }
+        try w.writeAll("}}");
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Bearer {s}", .{self.access_token});
+        const auth_value = auth_fbs.getWritten();
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body_list.items,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Authorization", .value = auth_value },
+            },
+        }) catch return error.WhatsAppApiError;
+
+        if (result.status != .ok) {
+            return error.WhatsAppApiError;
+        }
+    }
+
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         _ = ptr;
         // WhatsApp uses webhooks (push-based); no persistent connection needed.
@@ -313,11 +365,23 @@ pub const WhatsAppChannel = struct {
 
     const MAX_MESSAGE_LEN: usize = 4000;
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *WhatsAppChannel = @ptrCast(@alignCast(ptr));
-        var it = root.splitMessage(message, MAX_MESSAGE_LEN);
-        while (it.next()) |chunk| {
-            try self.sendMessage(target, chunk);
+
+        // Send document attachments first (with first message as caption)
+        for (media) |path| {
+            const caption = if (message.len > 0 and message.len <= 1024) message else "";
+            self.sendDocument(target, path, caption) catch |err| {
+                log.warn("WhatsApp document send failed for {s}: {s}", .{ path, @errorName(err) });
+            };
+        }
+
+        // Send text message (skip if only caption was needed and media was sent)
+        if (media.len == 0 or message.len > 1024) {
+            var it = root.splitMessage(message, MAX_MESSAGE_LEN);
+            while (it.next()) |chunk| {
+                try self.sendMessage(target, chunk);
+            }
         }
     }
 

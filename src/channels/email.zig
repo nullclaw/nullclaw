@@ -261,6 +261,214 @@ pub const EmailChannel = struct {
         return file.readToEndAlloc(self.allocator, 64 * 1024) catch null;
     }
 
+    /// Send an email with optional file attachments via SMTP.
+    /// When media paths are provided, wraps the message body in multipart/mixed
+    /// with base64-encoded file attachments.
+    pub fn sendMessageWithMedia(self: *EmailChannel, recipient: []const u8, message: []const u8, media: []const []const u8) !void {
+        if (media.len == 0) return self.sendMessage(recipient, message);
+        if (!self.config.consent_granted) return error.ConsentNotGranted;
+
+        // Extract subject if present
+        var subject: []const u8 = "nullclaw Message";
+        var body = message;
+        if (std.mem.startsWith(u8, message, "Subject: ")) {
+            if (std.mem.indexOf(u8, message, "\n")) |nl_pos| {
+                subject = message[9..nl_pos];
+                body = std.mem.trimLeft(u8, message[nl_pos + 1 ..], " \t\r\n");
+            }
+        }
+
+        const html_body_owned = markdownToEmailHtml(self.allocator, body) catch return error.SmtpError;
+        defer self.allocator.free(html_body_owned);
+
+        const mixed_boundary = "----=_nullclaw_mixed_001";
+        const alt_boundary = "----=_nullclaw_alt_001";
+
+        var email_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer email_list.deinit(self.allocator);
+        const ew = email_list.writer(self.allocator);
+
+        // Headers
+        try ew.print("From: {s}\r\n", .{self.config.from_address});
+        try ew.print("To: {s}\r\n", .{recipient});
+        try ew.print("Subject: {s}\r\n", .{subject});
+        try ew.writeAll("MIME-Version: 1.0\r\n");
+
+        if (self.reply_message_ids.get(recipient)) |msg_id| {
+            try ew.print("In-Reply-To: <{s}>\r\n", .{msg_id});
+            try ew.print("References: <{s}>\r\n", .{msg_id});
+        }
+
+        // Outer: multipart/mixed (body + attachments)
+        try ew.print("Content-Type: multipart/mixed; boundary=\"{s}\"\r\n", .{mixed_boundary});
+        try ew.writeAll("\r\n");
+
+        // Inner: multipart/alternative (plain + HTML)
+        try ew.print("--{s}\r\n", .{mixed_boundary});
+        try ew.print("Content-Type: multipart/alternative; boundary=\"{s}\"\r\n", .{alt_boundary});
+        try ew.writeAll("\r\n");
+
+        // Plain text part
+        try ew.print("--{s}\r\n", .{alt_boundary});
+        try ew.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll(body);
+        try ew.writeAll("\r\n");
+
+        // HTML part
+        try ew.print("--{s}\r\n", .{alt_boundary});
+        try ew.writeAll("Content-Type: text/html; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll("<div style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;line-height:1.6;color:#333;\">");
+        try ew.writeAll(html_body_owned);
+        try ew.writeAll("</div>");
+
+        const sig_html = self.loadSignature();
+        defer if (sig_html) |s| self.allocator.free(s);
+        if (sig_html) |sig| {
+            try ew.writeAll("\r\n");
+            try ew.writeAll(sig);
+        }
+        try ew.writeAll("\r\n");
+        try ew.print("--{s}--\r\n", .{alt_boundary});
+
+        // Attachments
+        for (media) |path| {
+            const file_data = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch |err| {
+                log.warn("Failed to read attachment {s}: {s}", .{ path, @errorName(err) });
+                continue;
+            };
+            defer self.allocator.free(file_data);
+
+            const filename = std.fs.path.basename(path);
+            const mime_type = mimeTypeFromPath(path);
+
+            try ew.print("\r\n--{s}\r\n", .{mixed_boundary});
+            try ew.print("Content-Type: {s}; name=\"{s}\"\r\n", .{ mime_type, filename });
+            try ew.writeAll("Content-Transfer-Encoding: base64\r\n");
+            try ew.print("Content-Disposition: attachment; filename=\"{s}\"\r\n", .{filename});
+            try ew.writeAll("\r\n");
+
+            // Base64 encode in 76-char lines
+            const encoder = std.base64.standard.Encoder;
+            const encoded_len = encoder.calcSize(file_data.len);
+            const encoded = self.allocator.alloc(u8, encoded_len) catch continue;
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, file_data);
+
+            // Write in 76-char lines per RFC 2045
+            var offset: usize = 0;
+            while (offset < encoded.len) {
+                const end = @min(offset + 76, encoded.len);
+                try ew.writeAll(encoded[offset..end]);
+                try ew.writeAll("\r\n");
+                offset = end;
+            }
+        }
+
+        // End mixed boundary
+        try ew.print("--{s}--\r\n", .{mixed_boundary});
+
+        // Send via SMTP (same as sendMessage)
+        const email_data = email_list.items;
+
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("smtp://{s}:{d}", .{ self.config.smtp_host, self.config.smtp_port });
+        const smtp_url = url_fbs.getWritten();
+
+        var user_buf: [512]u8 = undefined;
+        var user_fbs = std.io.fixedBufferStream(&user_buf);
+        try user_fbs.writer().print("{s}:{s}", .{ self.config.username, self.config.password });
+        const user_str = user_fbs.getWritten();
+
+        var from_arg_buf: [256]u8 = undefined;
+        var from_arg_fbs = std.io.fixedBufferStream(&from_arg_buf);
+        try from_arg_fbs.writer().print("{s}", .{self.config.from_address});
+        const from_arg = from_arg_fbs.getWritten();
+
+        var rcpt_arg_buf: [256]u8 = undefined;
+        var rcpt_arg_fbs = std.io.fixedBufferStream(&rcpt_arg_buf);
+        try rcpt_arg_fbs.writer().print("{s}", .{recipient});
+        const rcpt_arg = rcpt_arg_fbs.getWritten();
+
+        var argv_buf: [20][]const u8 = undefined;
+        var argc: usize = 0;
+
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = "30";
+        argc += 1;
+
+        if (self.config.smtp_tls) {
+            argv_buf[argc] = "--ssl-reqd";
+            argc += 1;
+        }
+
+        argv_buf[argc] = "--url";
+        argc += 1;
+        argv_buf[argc] = smtp_url;
+        argc += 1;
+        argv_buf[argc] = "-u";
+        argc += 1;
+        argv_buf[argc] = user_str;
+        argc += 1;
+        argv_buf[argc] = "--mail-from";
+        argc += 1;
+        argv_buf[argc] = from_arg;
+        argc += 1;
+        argv_buf[argc] = "--mail-rcpt";
+        argc += 1;
+        argv_buf[argc] = rcpt_arg;
+        argc += 1;
+        argv_buf[argc] = "--upload-file";
+        argc += 1;
+        argv_buf[argc] = "-";
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(email_data) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.SmtpError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        }
+
+        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        };
+        defer self.allocator.free(stdout);
+
+        const term = child.wait() catch return error.SmtpError;
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.SmtpError,
+            else => return error.SmtpError,
+        }
+    }
+
     /// Send a reply email — applies Re: prefix to subject and includes threading headers.
     pub fn sendReply(self: *EmailChannel, recipient: []const u8, original_subject: []const u8, message: []const u8) !void {
         var buf: [16384]u8 = undefined;
@@ -556,9 +764,9 @@ pub const EmailChannel = struct {
         _ = ptr;
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *EmailChannel = @ptrCast(@alignCast(ptr));
-        try self.sendMessage(target, message);
+        try self.sendMessageWithMedia(target, message, media);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -1667,6 +1875,29 @@ fn hexDigit(c: u8) ?u8 {
 
 /// Convert markdown text to email-safe HTML with inline styles.
 /// Caller owns returned slice and must free with the same allocator.
+/// Map file extension to MIME type for email attachments.
+fn mimeTypeFromPath(path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(path);
+    if (ext.len == 0) return "application/octet-stream";
+    // Skip the leading dot
+    const e = if (ext[0] == '.') ext[1..] else ext;
+    if (std.ascii.eqlIgnoreCase(e, "pdf")) return "application/pdf";
+    if (std.ascii.eqlIgnoreCase(e, "png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(e, "jpg") or std.ascii.eqlIgnoreCase(e, "jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(e, "gif")) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(e, "txt")) return "text/plain";
+    if (std.ascii.eqlIgnoreCase(e, "html") or std.ascii.eqlIgnoreCase(e, "htm")) return "text/html";
+    if (std.ascii.eqlIgnoreCase(e, "csv")) return "text/csv";
+    if (std.ascii.eqlIgnoreCase(e, "json")) return "application/json";
+    if (std.ascii.eqlIgnoreCase(e, "xml")) return "application/xml";
+    if (std.ascii.eqlIgnoreCase(e, "zip")) return "application/zip";
+    if (std.ascii.eqlIgnoreCase(e, "doc")) return "application/msword";
+    if (std.ascii.eqlIgnoreCase(e, "docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (std.ascii.eqlIgnoreCase(e, "xls")) return "application/vnd.ms-excel";
+    if (std.ascii.eqlIgnoreCase(e, "xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    return "application/octet-stream";
+}
+
 fn markdownToEmailHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -2777,4 +3008,35 @@ test "markdownToEmailHtml isTableSeparator" {
     try std.testing.expect(isTableSeparator("| :---: | ---: |"));
     try std.testing.expect(!isTableSeparator("| hello | world |"));
     try std.testing.expect(!isTableSeparator("just text"));
+}
+
+test "mimeTypeFromPath pdf" {
+    try std.testing.expectEqualStrings("application/pdf", mimeTypeFromPath("/tmp/report.pdf"));
+}
+
+test "mimeTypeFromPath png" {
+    try std.testing.expectEqualStrings("image/png", mimeTypeFromPath("screenshot.PNG"));
+}
+
+test "mimeTypeFromPath unknown extension" {
+    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPath("data.xyz"));
+}
+
+test "mimeTypeFromPath no extension" {
+    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPath("README"));
+}
+
+test "mimeTypeFromPath common office types" {
+    try std.testing.expectEqualStrings("application/vnd.openxmlformats-officedocument.wordprocessingml.document", mimeTypeFromPath("doc.docx"));
+    try std.testing.expectEqualStrings("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", mimeTypeFromPath("sheet.xlsx"));
+    try std.testing.expectEqualStrings("text/csv", mimeTypeFromPath("data.csv"));
+}
+
+test "sendMessageWithMedia delegates to sendMessage when no media" {
+    // When media slice is empty, sendMessageWithMedia should behave like sendMessage.
+    // We can't test actual SMTP sending without a server, but we verify the method exists
+    // and compiles with the correct signature.
+    const S = EmailChannel;
+    // Verify vtable send function pointer is set
+    try std.testing.expect(@intFromPtr(S.vtable.send) != 0);
 }

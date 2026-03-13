@@ -220,7 +220,7 @@ fn makeOutboundWithAccountStage(
 }
 
 /// Create an OutboundMessage with media attachments.
-fn makeOutboundWithMedia(
+pub fn makeOutboundWithMedia(
     allocator: Allocator,
     channel: []const u8,
     chat_id: []const u8,
