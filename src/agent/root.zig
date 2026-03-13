@@ -1691,6 +1691,7 @@ pub const Agent = struct {
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
+        var empty_response_retry_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
@@ -2054,6 +2055,22 @@ pub const Agent = struct {
             const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
 
             if (parsed_calls.len == 0) {
+                const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
+
+                if (trimmed_display_text.len == 0) {
+                    self.freeResponseFields(&response);
+                    if (!is_streaming and
+                        empty_response_retry_count < 1 and
+                        iteration + 1 < self.max_tool_iterations)
+                    {
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") });
+                        self.trimHistory();
+                        empty_response_retry_count += 1;
+                        continue;
+                    }
+                    return error.NoResponseContent;
+                }
+
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
@@ -7254,6 +7271,157 @@ test "Agent selectDisplayText hides malformed tool markup present in parsed text
     const parsed_with_markup = "Some text <tool_call>{\"name\":\"shell\"";
     const selected = Agent.selectDisplayText(parsed_with_markup, parsed_with_markup, 0);
     try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent retries empty final response once before succeeding" {
+    const EmptyThenRecoveredProvider = struct {
+        call_count: usize = 0,
+        saw_empty_retry_prompt: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                return .{
+                    .content = try allocator.dupe(u8, ""),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            for (request.messages) |msg| {
+                if (msg.role == .user and std.mem.indexOf(u8, msg.content, "previous reply was empty") != null) {
+                    self.saw_empty_retry_prompt = true;
+                }
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "recovered"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "empty-then-recovered-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = EmptyThenRecoveredProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = EmptyThenRecoveredProvider.chatWithSystem,
+        .chat = EmptyThenRecoveredProvider.chat,
+        .supportsNativeTools = EmptyThenRecoveredProvider.supportsNativeTools,
+        .getName = EmptyThenRecoveredProvider.getName,
+        .deinit = EmptyThenRecoveredProvider.deinitFn,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_empty_retry_prompt);
+}
+
+test "Agent returns NoResponseContent after repeated empty final responses" {
+    const AlwaysEmptyProvider = struct {
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            return .{
+                .content = try allocator.dupe(u8, ""),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "always-empty-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = AlwaysEmptyProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = AlwaysEmptyProvider.chatWithSystem,
+        .chat = AlwaysEmptyProvider.chat,
+        .supportsNativeTools = AlwaysEmptyProvider.supportsNativeTools,
+        .getName = AlwaysEmptyProvider.getName,
+        .deinit = AlwaysEmptyProvider.deinitFn,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("hello"));
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
 test "Agent.fromConfig sets exec_security=full for full autonomy" {

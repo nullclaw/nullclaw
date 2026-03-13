@@ -2593,6 +2593,20 @@ fn markOnboardingCompletedAt(allocator: std.mem.Allocator, state: *WorkspaceOnbo
     state.onboarding_completed_at = try makeIsoTimestamp(allocator);
 }
 
+pub fn markOnboardingCompletedAfterBootstrapRemoval(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) !void {
+    var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
+    defer state.deinit(allocator);
+
+    if (state.bootstrap_seeded_at == null) {
+        try markBootstrapSeededAt(allocator, &state);
+    }
+    try markOnboardingCompletedAt(allocator, &state);
+    try writeWorkspaceOnboardingState(allocator, workspace_dir, &state);
+}
+
 fn memoryTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
     return std.fmt.allocPrint(allocator,
         \\# MEMORY.md - Long-Term Memory

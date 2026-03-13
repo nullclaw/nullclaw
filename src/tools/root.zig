@@ -63,6 +63,7 @@ pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");
 pub const file_write = @import("file_write.zig");
 pub const file_edit = @import("file_edit.zig");
+pub const file_delete = @import("file_delete.zig");
 pub const file_read_hashed = @import("file_read_hashed.zig");
 pub const file_edit_hashed = @import("file_edit_hashed.zig");
 pub const http_request = @import("http_request.zig");
@@ -323,7 +324,13 @@ pub fn allTools(
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+    ft.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
@@ -344,6 +351,15 @@ pub fn allTools(
         .backend_name = opts.backend_name,
     };
     try list.append(allocator, et2.tool());
+
+    const dt = try allocator.create(file_delete.FileDeleteTool);
+    dt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
+    try list.append(allocator, dt.tool());
 
     const frh = try allocator.create(file_read_hashed.FileReadHashedTool);
     frh.* = .{
@@ -574,6 +590,8 @@ pub fn subagentTools(
         .workspace_dir = workspace_dir,
         .allowed_paths = opts.allowed_paths,
         .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
     };
     try list.append(allocator, ft.tool());
 
@@ -595,6 +613,15 @@ pub fn subagentTools(
         .backend_name = opts.backend_name,
     };
     try list.append(allocator, et.tool());
+
+    const dt = try allocator.create(file_delete.FileDeleteTool);
+    dt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
+    try list.append(allocator, dt.tool());
 
     const frh = try allocator.create(file_read_hashed.FileReadHashedTool);
     frh.* = .{
@@ -775,21 +802,21 @@ test "all tools includes extras when enabled" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // Order: shell, file_read, file_write, file_edit, file_read_hashed, file_edit_hashed, git, image_info,
+    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
     //        delegate, schedule, spawn, pushover, http_request, web_search,
-    //        web_fetch, browser = 20
-    try std.testing.expectEqual(@as(usize, 20), tools.len);
+    //        web_fetch, browser = 21
+    try std.testing.expectEqual(@as(usize, 21), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
     defer deinitTools(std.testing.allocator, tools);
 
-    // Order: shell, file_read, file_write, file_edit, file_read_hashed, file_edit_hashed, git, image_info,
+    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn = 15
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    //        delegate, schedule, spawn = 16
+    try std.testing.expectEqual(@as(usize, 16), tools.len);
 }
 
 test "all tools wires http and web_search config into tool instances" {
@@ -841,6 +868,48 @@ test "all tools wires http and web_search config into tool instances" {
     try std.testing.expect(saw_http);
     try std.testing.expect(saw_search);
     try std.testing.expect(saw_fetch);
+}
+
+test "all tools wire bootstrap provider into file_read for sqlite backends" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), ws_path);
+    const provider = bp_impl.provider();
+    try provider.store("USER.md", "name: Igor");
+
+    const tools = try allTools(std.testing.allocator, ws_path, .{
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = provider,
+        .backend_name = "sqlite",
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var checked = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expect(ft.bootstrap_provider != null);
+        try std.testing.expectEqualStrings("sqlite", ft.backend_name);
+
+        const parsed = try parseTestArgs("{\"path\": \"USER.md\"}");
+        defer parsed.deinit();
+        const result = try t.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+        defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+        try std.testing.expect(result.success);
+        try std.testing.expectEqualStrings("name: Igor", result.output);
+        checked = true;
+        break;
+    }
+
+    try std.testing.expect(checked);
 }
 
 test "all tools wires subagent manager into spawn tool" {
@@ -924,6 +993,39 @@ test "subagent tools use configured shell and file limits" {
     try std.testing.expect(saw_file_edit);
     try std.testing.expect(saw_file_read_hashed);
     try std.testing.expect(saw_file_edit_hashed);
+}
+
+test "subagent tools wire bootstrap provider into file_read for sqlite backends" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), ws_path);
+    const provider = bp_impl.provider();
+    try provider.store("SOUL.md", "## Soul");
+
+    const tools = try subagentTools(std.testing.allocator, ws_path, .{
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = provider,
+        .backend_name = "sqlite",
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var checked = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expect(ft.bootstrap_provider != null);
+        try std.testing.expectEqualStrings("sqlite", ft.backend_name);
+        checked = true;
+        break;
+    }
+
+    try std.testing.expect(checked);
 }
 
 test "subagent tools wire http allowlist and response limit" {

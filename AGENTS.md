@@ -221,6 +221,8 @@ For release changes:
 zig build -Doptimize=ReleaseSmall  # must compile clean
 ```
 
+Before any version bump, release branch, or tag work: read `RELEASING.md` and follow it exactly. Do not tag feature branches.
+
 Additional expectations by change type:
 
 - **Docs/comments only**: no build required, but verify no broken code references.

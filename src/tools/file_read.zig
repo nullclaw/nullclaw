@@ -6,6 +6,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const bootstrap_mod = @import("../bootstrap/root.zig");
+const memory_root = @import("../memory/root.zig");
 
 /// Default maximum file size to read (10MB).
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -102,6 +104,8 @@ pub const FileReadTool = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
     max_file_size: u64 = DEFAULT_MAX_FILE_SIZE,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+    backend_name: []const u8 = "hybrid",
 
     pub const tool_name = "file_read";
     pub const tool_description = "Read the contents of a file in the workspace";
@@ -136,6 +140,57 @@ pub const FileReadTool = struct {
         };
         defer allocator.free(full_path);
 
+        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+        defer if (ws_resolved) |wr| allocator.free(wr);
+        const ws_path = ws_resolved orelse "";
+        const bootstrap_filename = bootstrapRootFilename(path);
+        const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
+        const effective_max_file_size = @min(self.max_file_size, max_usize_u64);
+
+        if (bootstrap_filename) |filename| {
+            if (self.bootstrap_provider) |bp| {
+                if (!bootstrap_mod.backendUsesFiles(self.backend_name)) {
+                    const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+                    const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
+                        const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    };
+                    defer allocator.free(resolved_ancestor);
+
+                    if (!isResolvedPathAllowed(allocator, resolved_ancestor, ws_path, self.allowed_paths)) {
+                        return ToolResult.fail("Path is outside allowed areas");
+                    }
+
+                    const contents = try bp.load(allocator, filename) orelse
+                        return ToolResult.fail("File not found in memory backend");
+                    errdefer allocator.free(contents);
+
+                    if (@as(u64, @intCast(contents.len)) > effective_max_file_size) {
+                        const msg = try std.fmt.allocPrint(
+                            allocator,
+                            "File too large: {} bytes (limit: {} bytes)",
+                            .{ contents.len, effective_max_file_size },
+                        );
+                        allocator.free(contents);
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    }
+
+                    if (isBinaryContent(contents)) {
+                        const file_type = getBinaryFileType(contents, path);
+                        const msg = try std.fmt.allocPrint(
+                            allocator,
+                            "[Binary file detected: {s}, size: {d} bytes. Use [IMAGE:path] marker for images, or appropriate tool for other binary files.]",
+                            .{ file_type, contents.len },
+                        );
+                        allocator.free(contents);
+                        return ToolResult{ .success = true, .output = msg };
+                    }
+
+                    return ToolResult{ .success = true, .output = contents };
+                }
+            }
+        }
+
         // Resolve to catch symlink escapes
         const resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
@@ -144,9 +199,6 @@ pub const FileReadTool = struct {
         defer allocator.free(resolved);
 
         // Validate against workspace + allowed_paths + system blocklist
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-
         if (!isResolvedPathAllowed(allocator, resolved, ws_resolved orelse "", self.allowed_paths)) {
             return ToolResult.fail("Path is outside allowed areas");
         }
@@ -159,8 +211,6 @@ pub const FileReadTool = struct {
         defer file.close();
 
         const stat = try fs_compat.stat(file);
-        const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
-        const effective_max_file_size = @min(self.max_file_size, max_usize_u64);
         if (stat.size > effective_max_file_size) {
             const msg = try std.fmt.allocPrint(
                 allocator,
@@ -192,6 +242,25 @@ pub const FileReadTool = struct {
         return ToolResult{ .success = true, .output = contents };
     }
 };
+
+fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(path) orelse return err;
+            if (std.mem.eql(u8, parent, path)) return err;
+            return resolveNearestExistingAncestor(allocator, parent);
+        },
+        else => return err,
+    };
+}
+
+fn bootstrapRootFilename(path: []const u8) ?[]const u8 {
+    if (std.fs.path.isAbsolute(path)) return null;
+    const basename = std.fs.path.basename(path);
+    if (!std.mem.eql(u8, basename, path)) return null;
+    if (!bootstrap_mod.isBootstrapFilename(basename)) return null;
+    return basename;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -321,6 +390,35 @@ test "file_read empty file" {
 
     try std.testing.expect(result.success);
     try std.testing.expectEqualStrings("", result.output);
+}
+
+test "file_read reads bootstrap doc from memory backend" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var lru = memory_root.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), ws_path);
+    try bp_impl.provider().store("USER.md", "name: Igor");
+
+    var ft = FileReadTool{
+        .workspace_dir = ws_path,
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = bp_impl.provider(),
+        .backend_name = "sqlite",
+    };
+    const t = ft.tool();
+    const parsed = try root.parseTestArgs("{\"path\": \"USER.md\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("name: Igor", result.output);
 }
 
 test "isPathSafe blocks null bytes" {
