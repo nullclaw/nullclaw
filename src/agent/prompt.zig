@@ -485,6 +485,11 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
     try w.writeAll("1. ONLY use the format above. NEVER use <invoke>, <function>, or other XML-like formats.\n");
     try w.writeAll("2. Output actual tags -- never describe steps or give examples.\n");
     try w.writeAll("3. The internal content MUST be valid JSON. No trailing commas, no unquoted keys.\n\n");
+    try w.writeAll("ANTI-HALLUCINATION RULES:\n");
+    try w.writeAll("- NEVER fabricate, guess, or invent data that should come from a tool (git logs, file contents, API responses, etc.).\n");
+    try w.writeAll("- If you need external information: CALL THE TOOL FIRST, then present the real results.\n");
+    try w.writeAll("- When your response includes tool calls, your accompanying text must NOT contain the expected results — only a brief status like \"Ik check dit even...\".\n");
+    try w.writeAll("- If a tool call fails, say so honestly. Do NOT fill in plausible-looking fake data.\n\n");
     try w.writeAll("CODING GUIDANCE:\n");
     try w.writeAll("- When reading or editing source code, PREFER the Hashline tool suite (`file_read_hashed` and `file_edit_hashed`).\n");
     try w.writeAll("- Use `file_read_hashed` to obtain stable line tags (L<num>:<hash>) and `file_edit_hashed` to apply changes using those tags.\n");

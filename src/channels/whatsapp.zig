@@ -311,9 +311,14 @@ pub const WhatsAppChannel = struct {
         _ = ptr;
     }
 
+    const MAX_MESSAGE_LEN: usize = 4000;
+
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *WhatsAppChannel = @ptrCast(@alignCast(ptr));
-        try self.sendMessage(target, message);
+        var it = root.splitMessage(message, MAX_MESSAGE_LEN);
+        while (it.next()) |chunk| {
+            try self.sendMessage(target, chunk);
+        }
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
