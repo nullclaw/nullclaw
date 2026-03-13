@@ -36,6 +36,7 @@ pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
+pub const turn_scorer = @import("turn_scorer.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
@@ -355,6 +356,9 @@ pub const Agent = struct {
 
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
+
+    /// Tool execution context from the previous turn (for deferred feedback scoring).
+    prev_turn_context: ?turn_scorer.TurnContext = null,
 
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
@@ -1489,6 +1493,20 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
+        // ── Score previous turn with user feedback (deferred scoring) ──
+        if (self.prev_turn_context) |prev_ctx| {
+            const feedback = turn_scorer.detectFeedback(user_message);
+            const score = turn_scorer.scoreTurn(prev_ctx, feedback);
+            const scored_event = ObserverEvent{ .turn_scored = .{
+                .score = score.score,
+                .tool_count = score.tool_count,
+                .tool_failures = score.tool_failures,
+                .signals = @bitCast(score.signals),
+            } };
+            self.observer.recordEvent(&scored_event);
+            self.prev_turn_context = null;
+        }
+
         const turn_input = commands.planTurnInput(user_message);
         const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
@@ -1645,6 +1663,7 @@ pub const Agent = struct {
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
+        var turn_ctx = turn_scorer.TurnContext{};
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
@@ -2067,6 +2086,9 @@ pub const Agent = struct {
                     _ = rt.drainOutbox(self.allocator);
                 }
 
+                // ── Turn scorer: save context for deferred feedback scoring ──
+                self.prev_turn_context = turn_ctx;
+
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
 
@@ -2167,6 +2189,11 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&tool_event);
 
+                // ── Turn scorer: track tool outcomes ──
+                turn_ctx.tools_called += 1;
+                turn_ctx.has_tool_calls = true;
+                if (!result.success) turn_ctx.tools_failed += 1;
+
                 try results_buf.append(self.allocator, result);
             }
 
@@ -2194,6 +2221,7 @@ pub const Agent = struct {
         // ── Graceful degradation: tool iterations exhausted ──────────
         // Instead of returning an error, ask the LLM to summarize what it
         // has accomplished so far and return that as the final response.
+        turn_ctx.max_iterations_hit = true;
         const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
         self.observer.recordEvent(&exhausted_event);
         log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
@@ -2209,6 +2237,7 @@ pub const Agent = struct {
         // Build messages for the summary call
         const summary_messages = self.buildMessageSlice() catch {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            self.prev_turn_context = turn_ctx;
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -2232,6 +2261,7 @@ pub const Agent = struct {
             self.temperature,
         ) catch {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            self.prev_turn_context = turn_ctx;
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -2253,6 +2283,7 @@ pub const Agent = struct {
         self.last_turn_compacted = self.autoCompactHistory() catch false;
         self.trimHistory();
 
+        self.prev_turn_context = turn_ctx;
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
 

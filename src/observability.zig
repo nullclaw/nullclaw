@@ -10,6 +10,12 @@ pub const ObserverEvent = union(enum) {
     tool_call_start: struct { tool: []const u8 },
     tool_call: struct { tool: []const u8, duration_ms: u64, success: bool, detail: ?[]const u8 = null },
     tool_iterations_exhausted: struct { iterations: u32 },
+    turn_scored: struct {
+        score: f32,
+        tool_count: u16,
+        tool_failures: u16,
+        signals: u8, // packed SignalSet as byte
+    },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
@@ -121,6 +127,7 @@ pub const LogObserver = struct {
                 }
             },
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
+            .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2}", .{ e.score, e.tool_count, e.tool_failures, e.signals }),
             .turn_complete => std.log.info("turn.complete", .{}),
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
@@ -304,6 +311,7 @@ pub const FileObserver = struct {
                 break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return;
             },
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
+            .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d}}}", .{ e.score, e.tool_count, e.tool_failures, e.signals }) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
@@ -555,6 +563,19 @@ pub const OtelObserver = struct {
                 const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iterations}) catch "0";
                 self.addSpan("tool.iterations_exhausted", now, now, &.{
                     .{ .key = "iterations", .value = iter_str },
+                });
+            },
+            .turn_scored => |e| {
+                var score_buf: [20]u8 = undefined;
+                const score_str = std.fmt.bufPrint(&score_buf, "{d:.2}", .{e.score}) catch "0";
+                var tc_buf: [10]u8 = undefined;
+                const tc_str = std.fmt.bufPrint(&tc_buf, "{d}", .{e.tool_count}) catch "0";
+                var tf_buf: [10]u8 = undefined;
+                const tf_str = std.fmt.bufPrint(&tf_buf, "{d}", .{e.tool_failures}) catch "0";
+                self.addSpan("turn.scored", now, now, &.{
+                    .{ .key = "score", .value = score_str },
+                    .{ .key = "tool_count", .value = tc_str },
+                    .{ .key = "tool_failures", .value = tf_str },
                 });
             },
             .turn_complete => {
