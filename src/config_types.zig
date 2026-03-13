@@ -206,6 +206,11 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+    /// Enable keyword-based skill routing. When true, skills are selected per-turn
+    /// based on user message relevance instead of the always/not-always flag.
+    skill_routing_enabled: bool = false,
+    /// Maximum number of skills to load as Active (full text) when routing is enabled.
+    skill_routing_max_active: u32 = 3,
 };
 
 pub const ToolsConfig = struct {

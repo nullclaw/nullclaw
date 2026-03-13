@@ -360,6 +360,11 @@ pub const Agent = struct {
     /// Tool execution context from the previous turn (for deferred feedback scoring).
     prev_turn_context: ?turn_scorer.TurnContext = null,
 
+    /// Enable keyword-based skill routing (select top-N skills per turn).
+    skill_routing_enabled: bool = false,
+    /// Max skills loaded as Active when routing is enabled.
+    skill_routing_max_active: u32 = 3,
+
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
         role: providers.Role,
@@ -462,6 +467,8 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
+            .skill_routing_enabled = cfg.agent.skill_routing_enabled,
+            .skill_routing_max_active = cfg.agent.skill_routing_max_active,
             .default_exec_security = resolved_exec_security,
             .exec_security = resolved_exec_security,
             .default_exec_ask = resolved_exec_ask,
@@ -1545,6 +1552,12 @@ pub const Agent = struct {
             }
         }
 
+        // When skill routing is enabled, rebuild prompt every turn so the
+        // router can select skills based on the current user message.
+        if (self.skill_routing_enabled and self.has_system_prompt) {
+            self.has_system_prompt = false;
+        }
+
         const turn_has_conversation_context = self.conversation_context != null;
         const conversation_context_changed = self.has_system_prompt and
             self.system_prompt_has_conversation_context != turn_has_conversation_context;
@@ -1568,6 +1581,8 @@ pub const Agent = struct {
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
+                .skill_routing_message = if (self.skill_routing_enabled) effective_user_message else null,
+                .skill_routing_max_active = self.skill_routing_max_active,
             });
 
             // Keep exactly one canonical system prompt at history[0].
