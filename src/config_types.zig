@@ -219,6 +219,12 @@ pub const AgentConfig = struct {
     session_digest_on_reset: bool = true,
     /// Generate digest on session eviction (idle timeout).
     session_digest_on_eviction: bool = true,
+    /// Enable skill evolution trigger detection.
+    skill_evolution_enabled: bool = false,
+    /// Max evolution triggers per skill per day.
+    skill_evolution_max_per_day: u32 = 3,
+    /// Cooldown between evolution triggers for the same skill (minutes).
+    skill_evolution_cooldown_minutes: u32 = 30,
 };
 
 pub const ToolsConfig = struct {

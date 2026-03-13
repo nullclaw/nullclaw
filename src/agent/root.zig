@@ -39,6 +39,7 @@ pub const commands = @import("commands.zig");
 pub const turn_scorer = @import("turn_scorer.zig");
 pub const retry = @import("retry.zig");
 pub const session_digest = @import("session_digest.zig");
+const skillforge_evolution = @import("../skillforge_evolution.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
@@ -367,6 +368,10 @@ pub const Agent = struct {
     /// Max skills loaded as Active when routing is enabled.
     skill_routing_max_active: u32 = 3,
 
+    /// Skill evolution performance tracker (detects improvement opportunities).
+    /// Heap-allocated because the tracker is ~11 KB (32 skill slots × ring buffers).
+    evolution_tracker: ?*skillforge_evolution.SkillPerformanceTracker = null,
+
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
         role: providers.Role,
@@ -471,6 +476,15 @@ pub const Agent = struct {
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .skill_routing_enabled = cfg.agent.skill_routing_enabled,
             .skill_routing_max_active = cfg.agent.skill_routing_max_active,
+            .evolution_tracker = if (cfg.agent.skill_evolution_enabled) blk: {
+                const tracker = try allocator.create(skillforge_evolution.SkillPerformanceTracker);
+                tracker.* = skillforge_evolution.SkillPerformanceTracker.init(.{
+                    .enabled = true,
+                    .max_per_skill_per_day = cfg.agent.skill_evolution_max_per_day,
+                    .cooldown_minutes = cfg.agent.skill_evolution_cooldown_minutes,
+                });
+                break :blk tracker;
+            } else null,
             .default_exec_security = resolved_exec_security,
             .exec_security = resolved_exec_security,
             .default_exec_ask = resolved_exec_ask,
@@ -499,6 +513,7 @@ pub const Agent = struct {
         for (self.interrupted_tools.items) |name| self.allocator.free(name);
         self.interrupted_tools.deinit(self.allocator);
         self.tool_state_mu.unlock();
+        if (self.evolution_tracker) |tracker| self.allocator.destroy(tracker);
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
         }
@@ -1513,6 +1528,32 @@ pub const Agent = struct {
                 .signals = @bitCast(score.signals),
             } };
             self.observer.recordEvent(&scored_event);
+
+            // ── Skill evolution: check for improvement triggers ──
+            if (self.evolution_tracker) |tracker| {
+                const now_ts = std.time.timestamp();
+                if (tracker.recordScore(
+                    self.model_name,
+                    score.score,
+                    score.tool_failures,
+                    score.signals.tool_failure,
+                    score.signals.explicit_negative,
+                    now_ts,
+                )) |trigger| {
+                    const evo_event = ObserverEvent{ .evolution_trigger = .{
+                        .skill = trigger.skill_name,
+                        .trigger_type = trigger.trigger_type.toSlice(),
+                        .score = trigger.score,
+                    } };
+                    self.observer.recordEvent(&evo_event);
+
+                    // Persist trigger to memory (best-effort)
+                    if (self.mem_rt) |rt| {
+                        skillforge_evolution.storeTrigger(rt.memory, &trigger, self.allocator);
+                    }
+                }
+            }
+
             self.prev_turn_context = null;
         }
 

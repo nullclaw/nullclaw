@@ -17,6 +17,7 @@ pub const ObserverEvent = union(enum) {
         signals: u8, // packed SignalSet as byte
     },
     tool_retry: struct { tool: []const u8, attempt: u8, backoff_ms: u64, error_class: []const u8 },
+    evolution_trigger: struct { skill: []const u8, trigger_type: []const u8, score: f32 },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
@@ -130,6 +131,7 @@ pub const LogObserver = struct {
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
             .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2}", .{ e.score, e.tool_count, e.tool_failures, e.signals }),
             .tool_retry => |e| std.log.info("tool.retry tool={s} attempt={d} backoff_ms={d} class={s}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }),
+            .evolution_trigger => |e| std.log.info("evolution.trigger skill={s} type={s} score={d:.2}", .{ e.skill, e.trigger_type, e.score }),
             .turn_complete => std.log.info("turn.complete", .{}),
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
@@ -315,6 +317,7 @@ pub const FileObserver = struct {
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
             .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d}}}", .{ e.score, e.tool_count, e.tool_failures, e.signals }) catch return,
             .tool_retry => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_retry\",\"tool\":\"{s}\",\"attempt\":{d},\"backoff_ms\":{d},\"class\":\"{s}\"}}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }) catch return,
+            .evolution_trigger => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"evolution_trigger\",\"skill\":\"{s}\",\"type\":\"{s}\",\"score\":{d:.2}}}", .{ e.skill, e.trigger_type, e.score }) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
@@ -591,6 +594,15 @@ pub const OtelObserver = struct {
                     .{ .key = "attempt", .value = att_str },
                     .{ .key = "backoff_ms", .value = bo_str },
                     .{ .key = "error_class", .value = e.error_class },
+                });
+            },
+            .evolution_trigger => |e| {
+                var score_buf: [16]u8 = undefined;
+                const score_str = std.fmt.bufPrint(&score_buf, "{d:.2}", .{e.score}) catch "0";
+                self.addSpan("evolution.trigger", now, now, &.{
+                    .{ .key = "skill", .value = e.skill },
+                    .{ .key = "trigger_type", .value = e.trigger_type },
+                    .{ .key = "score", .value = score_str },
                 });
             },
             .turn_complete => {
