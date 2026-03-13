@@ -28,7 +28,7 @@ zig build -Dtarget=x86_64-linux-musl  # cross-compile for target triple
 zig build -Dversion=2026.3.1        # override CalVer version string
 ```
 
-Channel tokens: `all`, `none`, or comma-separated names (`cli`, `telegram`, `discord`, `slack`, `signal`, `matrix`, `web`, `nostr`, `irc`, `email`, `imessage`, `whatsapp`, `mattermost`, `lark`, `dingtalk`, `line`, `onebot`, `qq`, `maixcam`).
+Channel tokens: `all`, `none`, or comma-separated names (`cli`, `telegram`, `discord`, `slack`, `signal`, `matrix`, `web`, `nostr`, `irc`, `email`, `imessage`, `whatsapp`, `whatsapp_web`, `mattermost`, `lark`, `dingtalk`, `line`, `onebot`, `qq`, `maixcam`).
 
 Engine tokens: `base`/`minimal` (enables `none`, `markdown`, `memory`, `api`), `sqlite`, `lucid`, `redis`, `lancedb`, `postgres`, `all`.
 
