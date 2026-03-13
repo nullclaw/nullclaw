@@ -211,6 +211,14 @@ pub const AgentConfig = struct {
     skill_routing_enabled: bool = false,
     /// Maximum number of skills to load as Active (full text) when routing is enabled.
     skill_routing_max_active: u32 = 3,
+    /// Enable post-session digest generation for learning from conversations.
+    session_digest_enabled: bool = false,
+    /// Minimum turns before a digest is generated.
+    session_digest_min_turns: u32 = 3,
+    /// Generate digest on /new or /reset.
+    session_digest_on_reset: bool = true,
+    /// Generate digest on session eviction (idle timeout).
+    session_digest_on_eviction: bool = true,
 };
 
 pub const ToolsConfig = struct {

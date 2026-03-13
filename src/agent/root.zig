@@ -38,6 +38,7 @@ pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 pub const turn_scorer = @import("turn_scorer.zig");
 pub const retry = @import("retry.zig");
+pub const session_digest = @import("session_digest.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
