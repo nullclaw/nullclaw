@@ -520,6 +520,16 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
     }
 }
 
+/// Enable tier generation on the memory_store tool for L0/L1 extractive summaries.
+pub fn enableTierGeneration(tools: []const Tool, enabled: bool) void {
+    for (tools) |t| {
+        if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
+            const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
+            mt.tier_generation_enabled = enabled;
+        }
+    }
+}
+
 /// Free all heap-allocated tool structs and the tools slice itself.
 /// Pairs with `allTools` / `defaultTools` / `subagentTools`.
 pub fn deinitTools(allocator: std.mem.Allocator, tools: []const Tool) void {

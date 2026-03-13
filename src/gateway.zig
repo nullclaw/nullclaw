@@ -2798,6 +2798,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
+                tools_mod.enableTierGeneration(tools_slice, true);
                 session_mgr_opt = sm;
             }
         }

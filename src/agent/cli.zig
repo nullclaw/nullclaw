@@ -292,6 +292,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (mem_rt) |*rt| {
         tools_mod.bindMemoryRuntime(tools, rt);
     }
+    // Enable extractive tier generation for tiered context loading.
+    tools_mod.enableTierGeneration(tools, true);
 
     // Provider interface from runtime bundle (includes retries/fallbacks).
     const provider_i: Provider = runtime_provider.provider();

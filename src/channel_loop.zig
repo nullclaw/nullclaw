@@ -828,6 +828,7 @@ pub const ChannelRuntime = struct {
             self.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(tools, rt);
         }
+        tools_mod.enableTierGeneration(tools, true);
         return self;
     }
 
