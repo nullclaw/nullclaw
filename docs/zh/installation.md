@@ -208,6 +208,7 @@ $env:Path = "$env:Path;$bin"
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
 $new = "$old;x:\nullclaww二进制文件所在目录"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")
+```
 
 ## 安装验证
 
