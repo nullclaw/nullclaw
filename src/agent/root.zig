@@ -1526,6 +1526,7 @@ pub const Agent = struct {
                 .tool_count = score.tool_count,
                 .tool_failures = score.tool_failures,
                 .signals = @bitCast(score.signals),
+                .model = prev_ctx.model,
             } };
             self.observer.recordEvent(&scored_event);
 
@@ -1533,7 +1534,7 @@ pub const Agent = struct {
             if (self.evolution_tracker) |tracker| {
                 const now_ts = std.time.timestamp();
                 if (tracker.recordScore(
-                    self.model_name,
+                    prev_ctx.model,
                     score.score,
                     score.tool_failures,
                     score.signals.tool_failure,
@@ -1721,7 +1722,7 @@ pub const Agent = struct {
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
-        var turn_ctx = turn_scorer.TurnContext{};
+        var turn_ctx = turn_scorer.TurnContext{ .model = self.model_name };
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();

@@ -53,6 +53,8 @@ pub const TurnContext = struct {
     tools_failed: u16 = 0,
     has_tool_calls: bool = false,
     max_iterations_hit: bool = false,
+    /// Model used for this turn (for per-model attribution in deferred scoring).
+    model: []const u8 = "",
 };
 
 /// User feedback signals detected from the next user message.

@@ -15,6 +15,7 @@ pub const ObserverEvent = union(enum) {
         tool_count: u16,
         tool_failures: u16,
         signals: u8, // packed SignalSet as byte
+        model: []const u8 = "",
     },
     tool_retry: struct { tool: []const u8, attempt: u8, backoff_ms: u64, error_class: []const u8 },
     evolution_trigger: struct { skill: []const u8, trigger_type: []const u8, score: f32 },
@@ -129,7 +130,7 @@ pub const LogObserver = struct {
                 }
             },
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
-            .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2}", .{ e.score, e.tool_count, e.tool_failures, e.signals }),
+            .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2} model={s}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model }),
             .tool_retry => |e| std.log.info("tool.retry tool={s} attempt={d} backoff_ms={d} class={s}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }),
             .evolution_trigger => |e| std.log.info("evolution.trigger skill={s} type={s} score={d:.2}", .{ e.skill, e.trigger_type, e.score }),
             .turn_complete => std.log.info("turn.complete", .{}),
@@ -315,7 +316,7 @@ pub const FileObserver = struct {
                 break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return;
             },
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
-            .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d}}}", .{ e.score, e.tool_count, e.tool_failures, e.signals }) catch return,
+            .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d},\"model\":\"{s}\"}}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model }) catch return,
             .tool_retry => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_retry\",\"tool\":\"{s}\",\"attempt\":{d},\"backoff_ms\":{d},\"class\":\"{s}\"}}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }) catch return,
             .evolution_trigger => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"evolution_trigger\",\"skill\":\"{s}\",\"type\":\"{s}\",\"score\":{d:.2}}}", .{ e.skill, e.trigger_type, e.score }) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
@@ -582,6 +583,7 @@ pub const OtelObserver = struct {
                     .{ .key = "score", .value = score_str },
                     .{ .key = "tool_count", .value = tc_str },
                     .{ .key = "tool_failures", .value = tf_str },
+                    .{ .key = "model", .value = e.model },
                 });
             },
             .tool_retry => |e| {
