@@ -372,6 +372,12 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    whatsapp_web_sidecar_url: []const u8 = "",
+    whatsapp_web_auth_token: []const u8 = "",
+    whatsapp_web_allow_from: []const []const u8 = &.{},
+    whatsapp_web_group_allow_from: []const []const u8 = &.{},
+    whatsapp_web_group_policy: []const u8 = "allowlist",
+    whatsapp_web_account_id: []const u8 = "default",
     qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
@@ -1683,6 +1689,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
     .{ .path = "/qq", .handler = handleQqWebhookRoute },
+    .{ .path = "/whatsapp_web", .handler = handleWhatsAppWebWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -1960,6 +1967,114 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 } else {
                     ctx.response_body = "{\"status\":\"received\"}";
                 }
+            } else {
+                ctx.response_body = "{\"status\":\"received\"}";
+            }
+        } else {
+            ctx.response_body = "{\"status\":\"received\"}";
+        }
+    } else {
+        ctx.response_body = "{\"status\":\"received\"}";
+    }
+}
+
+fn handleWhatsAppWebWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_whatsapp_web) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"whatsapp_web channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "whatsapp_web")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    // Parse the simplified sidecar payload
+    const waw_allow_from = ctx.state.whatsapp_web_allow_from;
+    const waw_group_allow_from = ctx.state.whatsapp_web_group_allow_from;
+    const waw_group_policy = ctx.state.whatsapp_web_group_policy;
+    const waw_account_id = ctx.state.whatsapp_web_account_id;
+
+    const sender = jsonStringField(body, "from");
+    const is_group = blk: {
+        // Simple JSON boolean check for "is_group":true
+        if (std.mem.indexOf(u8, body, "\"is_group\":true")) |_| break :blk true;
+        break :blk false;
+    };
+    const group_id = jsonStringField(body, "group_id");
+
+    // Apply allowlist — skip for LID-format senders (WhatsApp internal IDs
+    // that lack a real phone number; already authenticated by the WA session).
+    // Check reply_to field — if it contains "@lid" this is a LID-format message
+    // (WhatsApp internal ID without a real phone number). Skip allowlist for these
+    // since they're already authenticated by the WhatsApp session itself.
+    const reply_to_raw = jsonStringField(body, "reply_to");
+    const sender_is_lid = if (reply_to_raw) |rt| std.mem.indexOf(u8, rt, "@lid") != null else false;
+    if (!sender_is_lid) {
+        if (!is_group) {
+            if (waw_allow_from.len > 0) {
+                if (sender) |s| {
+                    if (!channels.isAllowed(waw_allow_from, s)) {
+                        ctx.response_body = "{\"status\":\"unauthorized\"}";
+                        return;
+                    }
+                }
+            }
+        } else {
+            if (std.mem.eql(u8, waw_group_policy, "disabled")) {
+                ctx.response_body = "{\"status\":\"unauthorized\"}";
+                return;
+            }
+            if (!std.mem.eql(u8, waw_group_policy, "open")) {
+                const effective = if (waw_group_allow_from.len > 0) waw_group_allow_from else waw_allow_from;
+                if (sender) |s| {
+                    if (effective.len == 0 or !channels.isAllowed(effective, s)) {
+                        ctx.response_body = "{\"status\":\"unauthorized\"}";
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    const msg_text = jsonStringField(body, "text");
+    if (msg_text) |mt| {
+        const reply_to = reply_to_raw;
+        const wa_sender = sender orelse "unknown";
+        const session_key = reply_to orelse wa_sender;
+        const wa_peer_kind = if (is_group) "group" else "direct";
+        const wa_peer_id = group_id orelse wa_sender;
+
+        if (ctx.state.event_bus) |eb| {
+            var meta_buf: [384]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                waw_account_id,
+                wa_peer_kind,
+                wa_peer_id,
+            }) catch null;
+            _ = publishToBus(eb, ctx.state.allocator, "whatsapp_web", wa_sender, reply_to orelse wa_sender, mt, session_key, meta);
+            ctx.response_body = "{\"status\":\"received\"}";
+        } else if (ctx.session_mgr_opt) |sm| {
+            const reply: ?[]const u8 = sm.processMessage(session_key, mt, null) catch |err| blk: {
+                ctx.response_body = userFacingAgentErrorJson(err);
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                ctx.response_body = ctx.req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
             } else {
                 ctx.response_body = "{\"status\":\"received\"}";
             }
@@ -2585,6 +2700,14 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.whatsapp_groups = wa_cfg.groups;
             state.whatsapp_group_policy = wa_cfg.group_policy;
             state.whatsapp_account_id = wa_cfg.account_id;
+        }
+        if (cfg.channels.whatsappWebPrimary()) |waw_cfg| {
+            state.whatsapp_web_sidecar_url = waw_cfg.sidecar_url;
+            state.whatsapp_web_auth_token = waw_cfg.auth_token;
+            state.whatsapp_web_allow_from = waw_cfg.allow_from;
+            state.whatsapp_web_group_allow_from = waw_cfg.group_allow_from;
+            state.whatsapp_web_group_policy = waw_cfg.group_policy;
+            state.whatsapp_web_account_id = waw_cfg.account_id;
         }
         if (cfg.channels.linePrimary()) |line_cfg| {
             state.line_channel_secret = line_cfg.channel_secret;

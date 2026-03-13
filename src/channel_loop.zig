@@ -1871,6 +1871,10 @@ fn processIncomingEmail(
         }
     } else wrapped;
 
+    // Set ScheduleTool context so subagents know the originating channel.
+    setScheduleToolContext(runtime.tools, "email", em_ptr.config.account_id, sender_addr);
+    defer setScheduleToolContext(runtime.tools, null, null, null);
+
     const reply = runtime.session_mgr.processMessage(session_key, content_for_llm, null) catch |err| {
         log.err("Email agent error: {}", .{err});
         const err_msg: []const u8 = switch (err) {

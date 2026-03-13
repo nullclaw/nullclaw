@@ -393,6 +393,15 @@ pub const WhatsAppConfig = struct {
     group_policy: []const u8 = "allowlist",
 };
 
+pub const WhatsAppWebConfig = struct {
+    account_id: []const u8 = "default",
+    sidecar_url: []const u8 = "http://127.0.0.1:7100",
+    auth_token: []const u8 = "",
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+};
+
 pub const IrcConfig = struct {
     account_id: []const u8 = "default",
     host: []const u8,
@@ -731,6 +740,7 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
+    whatsapp_web: []const WhatsAppWebConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
@@ -781,6 +791,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
+    }
+    pub fn whatsappWebPrimary(self: *const ChannelsConfig) ?WhatsAppWebConfig {
+        return primaryAccount(WhatsAppWebConfig, self.whatsapp_web);
     }
     pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
         return primaryAccount(IrcConfig, self.irc);
