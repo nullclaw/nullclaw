@@ -35,7 +35,8 @@ zig version
 
 The output must be `0.15.2`.
 
-## Option 1: Homebrew (recommended for macOS/Linux)
+## Option 1: Start from binary file
+### Homebrew (recommended for macOS/Linux)
 
 ```bash
 brew install nullclaw
@@ -43,6 +44,20 @@ nullclaw --help
 ```
 
 If the command works, installation is complete.
+
+
+### Command Line(CMD,for Windows)
+
+You can directly execute the downloaded nullclaw binary file (.exe) in a command line without any installation.  
+
+For example, the command to check the nullclaw version is as below:  
+
+```cmd
+x:\path\nullclaw-xxx version
+
+#or
+x:\path\nullclaw-xxx.exe version
+```  
 
 ## Option 2: Official Container Image (Docker / Podman)
 
