@@ -8,6 +8,7 @@
 //! or message history storage.
 
 const std = @import("std");
+const fs_compat = @import("fs_compat.zig");
 const providers = @import("providers/root.zig");
 const ChatMessage = providers.ChatMessage;
 const ContentPart = providers.ContentPart;
@@ -195,7 +196,7 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
 fn readFromFile(allocator: std.mem.Allocator, file: std.fs.File, max_size: u64) !ImageData {
     defer file.close();
 
-    const stat = try file.stat();
+    const stat = try fs_compat.stat(file);
     const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
     const effective_max_size = @min(max_size, max_usize_u64);
     if (stat.size > effective_max_size)

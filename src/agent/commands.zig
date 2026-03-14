@@ -276,6 +276,9 @@ fn invalidateSystemPromptCache(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
     }
+    if (@hasField(@TypeOf(self.*), "system_prompt_conversation_context_fingerprint")) {
+        self.system_prompt_conversation_context_fingerprint = null;
+    }
     if (@hasField(@TypeOf(self.*), "system_prompt_model_name")) {
         if (self.system_prompt_model_name) |model_name| self.allocator.free(model_name);
         self.system_prompt_model_name = null;
@@ -1025,10 +1028,14 @@ fn clearSessionState(self: anytype) void {
 
 fn formatWhoAmI(self: anytype) ![]const u8 {
     const session_id = self.memory_session_id orelse "unknown";
+    const profile_name = if (@hasField(@TypeOf(self.*), "profile_name"))
+        self.profile_name orelse "default"
+    else
+        "default";
     return try std.fmt.allocPrint(
         self.allocator,
-        "Session: {s}\nModel: {s}",
-        .{ session_id, self.model_name },
+        "Session: {s}\nAgent profile: {s}\nModel: {s}",
+        .{ session_id, profile_name, self.model_name },
     );
 }
 
@@ -1209,6 +1216,9 @@ fn formatStatus(self: anytype) ![]const u8 {
     const tasks_label = if (show_emojis) "🧵 Tasks" else "Tasks";
 
     try w.print("{s}NullClaw {s}\n", .{ title_prefix, version.string });
+    if (@hasField(@TypeOf(self.*), "profile_name")) {
+        try w.print("Agent profile: {s}\n", .{self.profile_name orelse "default"});
+    }
     try w.print("{s}: {s}\n", .{ model_label, self.model_name });
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });

@@ -836,6 +836,18 @@ pub const DiscordChannel = struct {
             return;
         };
 
+        // Extract author.username
+        const author_username: ?[]const u8 = if (author_obj.get("username")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
+        // Extract author.global_name (Discord display name)
+        const author_display_name: ?[]const u8 = if (author_obj.get("global_name")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
         // Extract author.bot (defaults to false if absent)
         const author_is_bot: bool = if (author_obj.get("bot")) |v| switch (v) {
             .bool => |b| b,
@@ -932,6 +944,14 @@ pub const DiscordChannel = struct {
         if (guild_id) |gid| {
             try mw.writeAll(",\"guild_id\":");
             try root.appendJsonStringW(mw, gid);
+        }
+        if (author_username) |uname| {
+            try mw.writeAll(",\"sender_username\":");
+            try root.appendJsonStringW(mw, uname);
+        }
+        if (author_display_name) |dname| {
+            try mw.writeAll(",\"sender_display_name\":");
+            try root.appendJsonStringW(mw, dname);
         }
         try mw.writeByte('}');
 
@@ -1178,7 +1198,7 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     ch.setBus(&event_bus);
 
     const msg_json =
-        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","username":"discord-user","global_name":"Discord User","bot":false}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();
@@ -1200,9 +1220,13 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expect(meta.value.object.get("account_id") != null);
     try std.testing.expect(meta.value.object.get("is_dm") != null);
     try std.testing.expect(meta.value.object.get("guild_id") != null);
+    try std.testing.expect(meta.value.object.get("sender_username") != null);
+    try std.testing.expect(meta.value.object.get("sender_display_name") != null);
     try std.testing.expectEqualStrings("dc-main", meta.value.object.get("account_id").?.string);
     try std.testing.expect(!meta.value.object.get("is_dm").?.bool);
     try std.testing.expectEqualStrings("g-1", meta.value.object.get("guild_id").?.string);
+    try std.testing.expectEqualStrings("discord-user", meta.value.object.get("sender_username").?.string);
+    try std.testing.expectEqualStrings("Discord User", meta.value.object.get("sender_display_name").?.string);
 }
 
 test "discord handleMessageCreate sets is_dm metadata for direct messages" {

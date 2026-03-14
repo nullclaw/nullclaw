@@ -107,7 +107,7 @@ pub fn run() !void {
         \\        "description": "Your provider API key",
         \\        "type": "secret",
         \\        "required": true,
-        \\        "condition": { "step": "provider", "not_in": "ollama,lm-studio,claude-cli,codex-cli" }
+        \\        "condition": { "step": "provider", "not_in": "ollama,lm-studio,claude-cli,codex-cli,openai-codex" }
         \\      },
         \\
     );

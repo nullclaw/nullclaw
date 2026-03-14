@@ -14,6 +14,7 @@ const Config = @import("config.zig").Config;
 const channel_catalog = @import("channel_catalog.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
+const fs_compat = @import("fs_compat.zig");
 const builtin = @import("builtin");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
@@ -447,7 +448,7 @@ pub fn checkDaemonState(
     const state_path = try daemon.stateFilePath(allocator, config);
     defer allocator.free(state_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, state_path, 1024 * 1024) catch {
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 1024 * 1024) catch {
         try items.append(allocator, DiagItem.err(cat, try std.fmt.allocPrint(
             allocator,
             "state file not found: {s} -- is the daemon running?",

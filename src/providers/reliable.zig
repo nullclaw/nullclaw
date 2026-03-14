@@ -362,8 +362,10 @@ pub const ReliableProvider = struct {
 
     fn finalFailureError(self: *const ReliableProvider) anyerror {
         const err_slice = self.lastErrorSlice();
-        if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
+        // Check rate limiting BEFORE context exhaustion — rate limit errors
+        // often contain "token" + "exceed" which false-matches context checks.
         if (isRateLimited(err_slice)) return error.RateLimited;
+        if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
         if (std.mem.eql(u8, err_slice, "ProviderDoesNotSupportVision")) return error.ProviderDoesNotSupportVision;
         return error.AllProvidersFailed;
     }

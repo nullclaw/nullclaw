@@ -53,6 +53,7 @@ pub const SlackConfig = config_types.SlackConfig;
 pub const WebhookConfig = config_types.WebhookConfig;
 pub const IMessageConfig = config_types.IMessageConfig;
 pub const MatrixConfig = config_types.MatrixConfig;
+pub const MaxConfig = config_types.MaxConfig;
 pub const MattermostConfig = config_types.MattermostConfig;
 pub const WhatsAppConfig = config_types.WhatsAppConfig;
 pub const IrcConfig = config_types.IrcConfig;
@@ -72,6 +73,7 @@ pub const ChannelsConfig = config_types.ChannelsConfig;
 pub const MemoryConfig = config_types.MemoryConfig;
 pub const TunnelConfig = config_types.TunnelConfig;
 pub const GatewayConfig = config_types.GatewayConfig;
+pub const A2aConfig = config_types.A2aConfig;
 pub const ComposioConfig = config_types.ComposioConfig;
 pub const SecretsConfig = config_types.SecretsConfig;
 pub const BrowserComputerUseConfig = config_types.BrowserComputerUseConfig;
@@ -99,6 +101,28 @@ pub const IdentityLink = config_types.IdentityLink;
 pub const SessionConfig = config_types.SessionConfig;
 pub const NostrConfig = config_types.NostrConfig;
 
+const SerializedNamedAgentConfig = struct {
+    name: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    system_prompt: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    temperature: ?f64 = null,
+    max_depth: u32 = 3,
+};
+
+fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentConfig) void {
+    for (agents) |agent_cfg| {
+        allocator.free(agent_cfg.name);
+        allocator.free(agent_cfg.provider);
+        allocator.free(agent_cfg.model);
+        if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
+        if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+        if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+    }
+    allocator.free(agents);
+}
+
 // ── Top-level Config ────────────────────────────────────────────
 
 pub const Config = struct {
@@ -121,6 +145,8 @@ pub const Config = struct {
     model_routes: []const ModelRouteConfig = &.{},
     agents: []const NamedAgentConfig = &.{},
     agent_bindings: []const @import("agent_routing.zig").AgentBinding = &.{},
+    /// Runtime-only flag used by live `/bind` updates.
+    agent_bindings_runtime_owned: bool = false,
     mcp_servers: []const McpServerConfig = &.{},
 
     // Nested sub-configs
@@ -136,6 +162,7 @@ pub const Config = struct {
     memory: MemoryConfig = .{},
     tunnel: TunnelConfig = .{},
     gateway: GatewayConfig = .{},
+    a2a: A2aConfig = .{},
     composio: ComposioConfig = .{},
     secrets: SecretsConfig = .{},
     browser: BrowserConfig = .{},
@@ -271,6 +298,14 @@ pub const Config = struct {
         // Backfill runtime-derived fields not present in JSON
         if (cfg.channels.nostr) |ns| {
             ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
+        }
+        // Backfill config_dir for Teams channels (used for conversation reference persistence)
+        {
+            const dir = std.fs.path.dirname(config_path) orelse ".";
+            const teams_mut = @constCast(cfg.channels.teams);
+            for (teams_mut) |*tc| {
+                tc.config_dir = dir;
+            }
         }
 
         // Environment variable overrides
@@ -665,10 +700,23 @@ pub const Config = struct {
                     try w.print("    }}", .{});
                 }
                 if (has_agents) {
+                    const serialized_agents = try self.allocator.alloc(SerializedNamedAgentConfig, self.agents.len);
+                    defer self.allocator.free(serialized_agents);
+                    for (self.agents, 0..) |agent_cfg, i| {
+                        serialized_agents[i] = .{
+                            .name = agent_cfg.name,
+                            .provider = agent_cfg.provider,
+                            .model = agent_cfg.model,
+                            .system_prompt = agent_cfg.system_prompt_path orelse agent_cfg.system_prompt,
+                            .api_key = agent_cfg.api_key,
+                            .temperature = agent_cfg.temperature,
+                            .max_depth = agent_cfg.max_depth,
+                        };
+                    }
                     if (wrote_agent_field) {
                         try w.print(",\n", .{});
                     }
-                    try w.print("    \"list\": {f}\n", .{std.json.fmt(self.agents, .{})});
+                    try w.print("    \"list\": {f}\n", .{std.json.fmt(serialized_agents, .{})});
                 } else {
                     try w.print("\n", .{});
                 }
@@ -748,6 +796,7 @@ pub const Config = struct {
 
         try w.print("  \"memory\": {f},\n", .{std.json.fmt(self.memory, .{})});
         try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
+        try w.print("  \"a2a\": {f},\n", .{std.json.fmt(self.a2a, .{})});
         try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
         try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
         try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
@@ -1625,7 +1674,11 @@ test "save roundtrip preserves extended config sections" {
     cfg.gateway.idempotency_ttl_secs = 120;
     cfg.gateway.paired_tokens = &.{ "tok-1", "tok-2" };
 
-    cfg.tunnel.provider = "cloudflare";
+    cfg.tunnel.provider = "ngrok";
+    cfg.tunnel.ngrok = .{
+        .auth_token = "ngrok-test-token",
+        .domain = "test.ngrok-free.app",
+    };
 
     cfg.composio.enabled = true;
     cfg.composio.api_key = "comp-key";
@@ -1726,7 +1779,10 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.memory.response_cache.enabled);
     try std.testing.expectEqual(@as(u32, 2), loaded.gateway.paired_tokens.len);
     try std.testing.expect(loaded.gateway.allow_public_bind);
-    try std.testing.expectEqualStrings("cloudflare", loaded.tunnel.provider);
+    try std.testing.expectEqualStrings("ngrok", loaded.tunnel.provider);
+    try std.testing.expect(loaded.tunnel.ngrok != null);
+    try std.testing.expectEqualStrings("ngrok-test-token", loaded.tunnel.ngrok.?.auth_token.?);
+    try std.testing.expectEqualStrings("test.ngrok-free.app", loaded.tunnel.ngrok.?.domain.?);
     try std.testing.expect(loaded.composio.enabled);
     try std.testing.expect(!loaded.secrets.encrypt);
     try std.testing.expect(loaded.browser.enabled);
@@ -2788,6 +2844,7 @@ test "json parse agents" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqual(@as(usize, 2), cfg.agents.len);
     try std.testing.expectEqualStrings("researcher", cfg.agents[0].name);
     try std.testing.expectEqualStrings("anthropic", cfg.agents[0].provider);
@@ -2801,15 +2858,6 @@ test "json parse agents" {
     try std.testing.expectEqualStrings("sk-test", cfg.agents[1].api_key.?);
     try std.testing.expectEqual(@as(f64, 0.3), cfg.agents[1].temperature.?);
     try std.testing.expectEqual(@as(u32, 3), cfg.agents[1].max_depth);
-    // Cleanup
-    for (cfg.agents) |a| {
-        allocator.free(a.name);
-        allocator.free(a.provider);
-        allocator.free(a.model);
-        if (a.system_prompt) |sp| allocator.free(sp);
-        if (a.api_key) |k| allocator.free(k);
-    }
-    allocator.free(cfg.agents);
 }
 
 test "json parse agents skips invalid entries" {
@@ -2823,12 +2871,86 @@ test "json parse agents skips invalid entries" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
     try std.testing.expectEqualStrings("ok", cfg.agents[0].name);
-    allocator.free(cfg.agents[0].name);
-    allocator.free(cfg.agents[0].provider);
-    allocator.free(cfg.agents[0].model);
-    allocator.free(cfg.agents);
+}
+
+test "system_prompt absolute file path loads file content" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const prompt_content = "You are a helpful coding assistant from file.";
+    try tmp.dir.writeFile(.{ .sub_path = "prompt.md", .data = prompt_content });
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const prompt_path = try std.fmt.allocPrint(allocator, "{s}{c}prompt.md", .{ base, std.fs.path.sep });
+    defer allocator.free(prompt_path);
+    const prompt_path_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = prompt_path }, .{});
+    defer allocator.free(prompt_path_json);
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agents\": {{\"list\": [{{\"name\": \"file_agent\", \"provider\": \"openai\", \"model\": \"gpt-4\", \"system_prompt\": {s}}}]}}}}",
+        .{prompt_path_json},
+    );
+    defer allocator.free(json);
+
+    var cfg = Config{ .workspace_dir = base, .config_path = base, .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqualStrings(prompt_content, cfg.agents[0].system_prompt.?);
+    try std.testing.expectEqualStrings(prompt_path, cfg.agents[0].system_prompt_path.?);
+}
+
+test "system_prompt missing file falls back to raw string and keeps remaining fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const missing_path = try std.fmt.allocPrint(allocator, "{s}{c}missing-prompt.md", .{ base, std.fs.path.sep });
+    defer allocator.free(missing_path);
+    const missing_path_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = missing_path }, .{});
+    defer allocator.free(missing_path_json);
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agents\": {{\"list\": [{{\"name\": \"full\", \"provider\": \"p\", \"model\": \"m\", \"system_prompt\": {s}, \"temperature\": 0.5, \"max_depth\": 7}}]}}}}",
+        .{missing_path_json},
+    );
+    defer allocator.free(json);
+
+    var cfg = Config{ .workspace_dir = base, .config_path = base, .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqualStrings(missing_path, cfg.agents[0].system_prompt.?);
+    try std.testing.expect(cfg.agents[0].system_prompt_path == null);
+    try std.testing.expectEqual(@as(f64, 0.5), cfg.agents[0].temperature.?);
+    try std.testing.expectEqual(@as(u32, 7), cfg.agents[0].max_depth);
+}
+
+test "system_prompt with newlines stays inline" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents": {"list": [
+        \\  {"name": "inline", "provider": "p", "model": "m", "system_prompt": "Line one\nLine two"}
+        \\]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqualStrings("Line one\nLine two", cfg.agents[0].system_prompt.?);
+    try std.testing.expect(cfg.agents[0].system_prompt_path == null);
 }
 
 // ── Combined: all new fields in one JSON ────────────────────────
@@ -2858,10 +2980,7 @@ test "json parse all new fields together" {
     allocator.free(cfg.model_routes[0].provider);
     allocator.free(cfg.model_routes[0].model);
     allocator.free(cfg.model_routes);
-    allocator.free(cfg.agents[0].name);
-    allocator.free(cfg.agents[0].provider);
-    allocator.free(cfg.agents[0].model);
-    allocator.free(cfg.agents);
+    freeNamedAgentSlice(allocator, cfg.agents);
     allocator.free(cfg.autonomy.allowed_commands[0]);
     allocator.free(cfg.autonomy.allowed_commands);
     allocator.free(cfg.gateway.paired_tokens[0]);
@@ -2978,6 +3097,59 @@ test "save and load roundtrip" {
     try std.testing.expect(!cfg2.agent.auto_disable_vision_on_error);
 }
 
+test "save preserves file-backed system_prompt path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}{c}config.json", .{ base, std.fs.path.sep });
+    defer allocator.free(config_path);
+    const prompt_path = try std.fmt.allocPrint(allocator, "{s}{c}prompt.md", .{ base, std.fs.path.sep });
+    defer allocator.free(prompt_path);
+    const prompt_content = "Prompt content that must stay in the file.";
+
+    try tmp.dir.writeFile(.{ .sub_path = "prompt.md", .data = prompt_content });
+
+    const prompt_path_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = prompt_path }, .{});
+    defer allocator.free(prompt_path_json);
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agents\": {{\"list\": [{{\"name\": \"file_agent\", \"provider\": \"openai\", \"model\": \"gpt-4\", \"system_prompt\": {s}}}]}}}}",
+        .{prompt_path_json},
+    );
+    defer allocator.free(json);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(raw);
+
+    try std.testing.expect(std.mem.indexOf(u8, raw, prompt_content) == null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(raw);
+    try std.testing.expectEqual(@as(usize, 1), loaded.agents.len);
+    try std.testing.expectEqualStrings(prompt_content, loaded.agents[0].system_prompt.?);
+    try std.testing.expectEqualStrings(prompt_path, loaded.agents[0].system_prompt_path.?);
+}
+
 test "parse agents.list with model object" {
     const allocator = std.testing.allocator;
     const json =
@@ -2985,12 +3157,9 @@ test "parse agents.list with model object" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.agents[0].model);
-    allocator.free(cfg.agents[0].name);
-    allocator.free(cfg.agents[0].provider);
-    allocator.free(cfg.agents[0].model);
-    allocator.free(cfg.agents);
 }
 
 test "parse agents.list with id field" {
@@ -3000,12 +3169,9 @@ test "parse agents.list with id field" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
     try std.testing.expectEqualStrings("researcher", cfg.agents[0].name);
-    allocator.free(cfg.agents[0].name);
-    allocator.free(cfg.agents[0].provider);
-    allocator.free(cfg.agents[0].model);
-    allocator.free(cfg.agents);
 }
 
 test "parse agents.list primary model ref without provider field" {
@@ -3015,14 +3181,11 @@ test "parse agents.list primary model ref without provider field" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
     try std.testing.expectEqualStrings("coder", cfg.agents[0].name);
     try std.testing.expectEqualStrings("ollama", cfg.agents[0].provider);
     try std.testing.expectEqualStrings("qwen3.5:cloud", cfg.agents[0].model);
-    allocator.free(cfg.agents[0].name);
-    allocator.free(cfg.agents[0].provider);
-    allocator.free(cfg.agents[0].model);
-    allocator.free(cfg.agents);
 }
 
 test "parse agents object-of-objects shape" {
@@ -3038,6 +3201,7 @@ test "parse agents object-of-objects shape" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 2), cfg.agents.len);
@@ -3051,14 +3215,6 @@ test "parse agents object-of-objects shape" {
     try std.testing.expectEqual(@as(u32, 5), cfg.agents[1].max_depth);
     allocator.free(cfg.default_provider);
     allocator.free(cfg.default_model.?);
-    for (cfg.agents) |a| {
-        allocator.free(a.name);
-        allocator.free(a.provider);
-        allocator.free(a.model);
-        if (a.system_prompt) |sp| allocator.free(sp);
-        if (a.api_key) |k| allocator.free(k);
-    }
-    allocator.free(cfg.agents);
 }
 
 test "parse agents object-of-objects primary model ref without provider" {
@@ -3073,6 +3229,7 @@ test "parse agents object-of-objects primary model ref without provider" {
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
     try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
@@ -3081,10 +3238,6 @@ test "parse agents object-of-objects primary model ref without provider" {
     try std.testing.expectEqualStrings("qwen3.5:cloud", cfg.agents[0].model);
     allocator.free(cfg.default_provider);
     allocator.free(cfg.default_model.?);
-    allocator.free(cfg.agents[0].name);
-    allocator.free(cfg.agents[0].provider);
-    allocator.free(cfg.agents[0].model);
-    allocator.free(cfg.agents);
 }
 
 test "parse top-level bindings with snake_case fields" {
@@ -3555,7 +3708,7 @@ test "tools.media.audio disabled" {
 test "parse telegram accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "status_reactions": true, "topic_commands_enabled": false, "topic_map_command_enabled": false, "commands_menu_mode": "scoped", "reaction_emojis": {"accepted": "🟡", "running": "🔵", "done": "🟢", "failed": "🔴"}, "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "status_reactions": true, "binding_commands_enabled": false, "topic_commands_enabled": false, "topic_map_command_enabled": false, "commands_menu_mode": "scoped", "reaction_emojis": {"accepted": "🟡", "running": "🔵", "done": "🟢", "failed": "🔴"}, "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3568,6 +3721,7 @@ test "parse telegram accounts" {
     try std.testing.expect(!tg.reply_in_private);
     try std.testing.expectEqualStrings("socks5://host:1080", tg.proxy.?);
     try std.testing.expect(tg.status_reactions);
+    try std.testing.expect(!tg.binding_commands_enabled);
     try std.testing.expect(!tg.topic_commands_enabled);
     try std.testing.expect(!tg.topic_map_command_enabled);
     try std.testing.expect(tg.commands_menu_mode == .scoped);
@@ -3600,6 +3754,7 @@ test "parse telegram accounts interactive defaults when omitted" {
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
     try std.testing.expect(!cfg.channels.telegram[0].status_reactions);
+    try std.testing.expect(cfg.channels.telegram[0].binding_commands_enabled);
     try std.testing.expect(cfg.channels.telegram[0].topic_commands_enabled);
     try std.testing.expect(cfg.channels.telegram[0].topic_map_command_enabled);
     try std.testing.expect(cfg.channels.telegram[0].commands_menu_mode == .flat);
@@ -3806,7 +3961,7 @@ test "parse lark accounts" {
 test "parse dingtalk accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"dingtalk": {"accounts": {"main": {"client_id": "cid", "client_secret": "csec", "allow_from": ["u1"]}}}}}
+        \\{"channels": {"dingtalk": {"accounts": {"main": {"client_id": "cid", "client_secret": "csec", "allow_from": ["u1"], "ai_card_template_id": "tmpl.schema", "ai_card_streaming_key": "contentStreamingKey"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3815,9 +3970,13 @@ test "parse dingtalk accounts" {
     try std.testing.expectEqualStrings("main", dc.account_id);
     try std.testing.expectEqualStrings("cid", dc.client_id);
     try std.testing.expectEqualStrings("csec", dc.client_secret);
+    try std.testing.expectEqualStrings("tmpl.schema", dc.ai_card_template_id.?);
+    try std.testing.expectEqualStrings("contentStreamingKey", dc.ai_card_streaming_key.?);
     allocator.free(dc.account_id);
     allocator.free(dc.client_id);
     allocator.free(dc.client_secret);
+    allocator.free(dc.ai_card_template_id.?);
+    allocator.free(dc.ai_card_streaming_key.?);
     for (dc.allow_from) |u| allocator.free(u);
     allocator.free(dc.allow_from);
     allocator.free(cfg.channels.dingtalk);

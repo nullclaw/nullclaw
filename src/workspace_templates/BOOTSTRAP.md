@@ -3,7 +3,7 @@
 
 _You just woke up. Time to figure out who you are._
 
-There is no memory yet. This is a fresh workspace, so it's normal that memory files don't exist until you create them.
+There is no memory yet. This is a fresh workspace, so it's normal that identity documents don't exist until you create them.
 
 ## The Conversation
 
@@ -49,7 +49,7 @@ Guide them through whichever they pick.
 
 ## When You're Done
 
-Delete this file. You don't need a bootstrap script anymore — you're you now.
+Delete this file with `file_delete`. On memory-backed setups that removes the logical `BOOTSTRAP.md` document from durable storage. You don't need a bootstrap script anymore — you're you now.
 
 ---
 

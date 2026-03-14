@@ -21,7 +21,7 @@ const subagent_mod = @import("../subagent.zig");
 const subagent_runner = @import("../subagent_runner.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
-const auth_mod = @import("../auth.zig");
+const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
@@ -56,14 +56,7 @@ fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
 }
 
 fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
-    const token = auth_mod.loadCredential(allocator, providers.openai_codex.CREDENTIAL_KEY) catch return false;
-    if (token) |tok| {
-        allocator.free(tok.access_token);
-        if (tok.refresh_token) |rt| allocator.free(rt);
-        allocator.free(tok.token_type);
-        return true;
-    }
-    return false;
+    return codex_support.hasOpenAiCodexCredential(allocator);
 }
 
 fn shouldPrintOpenAiCodexHint(default_provider: []const u8, has_codex_credential: bool) bool {
@@ -77,9 +70,43 @@ fn maybePrintAllProvidersFailedHint(
 ) !void {
     if (!shouldPrintOpenAiCodexHint(default_provider, hasOpenAiCodexCredential(allocator))) return;
     try w.print(
-        "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" or run with --provider openai-codex --model gpt-5.3-codex.\n",
+        "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/{s}\" or run with --provider openai-codex --model {s}.\n",
+        .{ default_provider, codex_support.DEFAULT_CODEX_MODEL, codex_support.DEFAULT_CODEX_MODEL },
+    );
+}
+
+fn providerFailureLooksQuotaConstrained(detail: []const u8) bool {
+    return providers.reliable.isRateLimited(detail) or
+        std.ascii.indexOfIgnoreCase(detail, "quota") != null or
+        std.ascii.indexOfIgnoreCase(detail, "credit") != null or
+        std.ascii.indexOfIgnoreCase(detail, "billing") != null or
+        std.ascii.indexOfIgnoreCase(detail, "out of credits") != null;
+}
+
+fn writeRateLimitHint(w: *std.Io.Writer, default_provider: []const u8) !void {
+    try w.print(
+        "Hint: {s} appears rate-limited or quota-constrained. Low-quota coding plans often reject tool-heavy agent loops even when plain chat still works.\n",
         .{default_provider},
     );
+    try w.writeAll(
+        "Hint: keep \"reliability.provider_retries\" low, raise \"reliability.provider_backoff_ms\", and add \"reliability.fallback_providers\" or \"reliability.api_keys\" if you have alternatives.\n",
+    );
+    try w.writeAll(
+        "Hint: use `nullclaw agent --verbose` for foreground runs. In service mode, inspect `~/.nullclaw/logs/daemon.stdout.log` and `~/.nullclaw/logs/daemon.stderr.log`.\n",
+    );
+}
+
+fn maybePrintRateLimitHint(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    default_provider: []const u8,
+) !void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |msg| {
+        defer allocator.free(msg);
+        if (!providerFailureLooksQuotaConstrained(msg)) return;
+        try writeRateLimitHint(w, default_provider);
+    }
 }
 
 fn maybePrintLastProviderApiError(
@@ -190,10 +217,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     };
 
-    // Ensure lifecycle parity: seed workspace files on first agent run
-    // so prompts always have the expected bootstrap context.
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{}, null);
-
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
@@ -261,6 +284,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     ) catch null;
     defer if (bootstrap_provider) |bp| bp.deinit();
 
+    // Ensure lifecycle parity: seed workspace files on first agent run
+    // so prompts always have the expected bootstrap context.
+    try onboard.scaffoldWorkspace(
+        allocator,
+        cfg.workspace_dir,
+        &onboard.ProjectContext{},
+        bootstrap_provider,
+    );
+
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,
@@ -302,11 +334,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Single message mode: nullclaw agent -m "hello"
     if (message_arg) |message| {
-        try w.print("Sending to {s}...\n", .{cfg.default_provider});
-        if (session_id) |sid| {
-            try w.print("Session: {s}\n", .{sid});
+        // Keep subprocess runs quiet by default; cron and other callers
+        // consume this mode programmatically and should only see the response.
+        if (verbose.isVerbose()) {
+            log.info("Sending to {s}...", .{cfg.default_provider});
+            if (session_id) |sid| {
+                log.info("Session: {s}", .{sid});
+            }
         }
-        try w.flush();
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
         agent.policy = &policy;
@@ -341,8 +376,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 try w.flush();
                 return;
             }
+            if (err == error.RateLimited) {
+                try w.print("Error: {}\n", .{err});
+                try maybePrintLastProviderApiError(allocator, w);
+                try writeRateLimitHint(w, cfg.default_provider);
+                try w.flush();
+            }
             if (err == error.AllProvidersFailed) {
                 try maybePrintLastProviderApiError(allocator, w);
+                try maybePrintRateLimitHint(allocator, w, cfg.default_provider);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
                 try w.flush();
             }
@@ -460,9 +502,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const response = agent.turn(line) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
+            } else if (err == error.RateLimited) {
+                try w.print("Error: {}\n", .{err});
+                try maybePrintLastProviderApiError(allocator, w);
+                try writeRateLimitHint(w, cfg.default_provider);
             } else if (err == error.AllProvidersFailed) {
                 try w.print("Error: {}\n", .{err});
                 try maybePrintLastProviderApiError(allocator, w);
+                try maybePrintRateLimitHint(allocator, w, cfg.default_provider);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
             } else {
                 try w.print("Error: {}\n", .{err});
@@ -599,4 +646,21 @@ test "shouldPrintOpenAiCodexHint false when provider is openai-codex" {
 
 test "shouldPrintOpenAiCodexHint false when codex auth is missing" {
     try std.testing.expect(!shouldPrintOpenAiCodexHint("openai", false));
+}
+
+test "providerFailureLooksQuotaConstrained detects rate and quota detail" {
+    try std.testing.expect(providerFailureLooksQuotaConstrained("compatible: status=429 message=Rate limit exceeded"));
+    try std.testing.expect(providerFailureLooksQuotaConstrained("groq: out of credits"));
+    try std.testing.expect(providerFailureLooksQuotaConstrained("openai: billing hard limit reached"));
+    try std.testing.expect(!providerFailureLooksQuotaConstrained("compatible: status=401 message=Unauthorized"));
+}
+
+test "writeRateLimitHint mentions reliability knobs and logs" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeRateLimitHint(&aw.writer, "kimi");
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "reliability.provider_backoff_ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "~/.nullclaw/logs/daemon.stdout.log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "kimi appears rate-limited or quota-constrained") != null);
 }

@@ -200,6 +200,34 @@
     "require_pairing": true
   },
 
+  "tunnel": {
+    "provider": "none",
+    "ngrok": {
+      "auth_token": "YOUR_NGROK_AUTH_TOKEN",
+      "domain": "your-domain.ngrok-free.app"
+    },
+    "cloudflare": {
+      "token": "YOUR_CLOUDFLARE_TUNNEL_TOKEN"
+    },
+    "tailscale": {
+      "funnel": false,
+      "hostname": "your-hostname.ts.net"
+    },
+    "custom": {
+      "start_command": "/path/to/tunnel-start.sh",
+      "health_url": "http://localhost:4040/api/tunnels",
+      "url_pattern": "https://[a-z0-9-]+\\.[a-z]+"
+    }
+  },
+
+  "a2a": {
+    "enabled": false,
+    "name": "NullClaw",
+    "description": "AI assistant",
+    "url": "https://agent.example.com",
+    "version": "1.0.0"
+  },
+
   "security": {
     "sandbox": {
       "backend": "auto"

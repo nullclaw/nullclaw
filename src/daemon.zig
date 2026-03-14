@@ -12,6 +12,7 @@ const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
+const channels_mod = @import("channels/root.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
@@ -19,11 +20,14 @@ const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
+const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
+const tunnel_mod = @import("tunnel.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -52,6 +56,8 @@ pub const DaemonState = struct {
     gateway_port: u16 = 3000,
     components: [MAX_COMPONENTS]?ComponentStatus = .{null} ** MAX_COMPONENTS,
     component_count: usize = 0,
+    tunnel_provider: []const u8 = "none",
+    tunnel_url: ?[]const u8 = null,
 
     pub fn addComponent(self: *DaemonState, name: []const u8) void {
         if (self.component_count < MAX_COMPONENTS) {
@@ -103,6 +109,14 @@ pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *co
     try buf.appendSlice(allocator, "{\n");
     try buf.appendSlice(allocator, "  \"status\": \"running\",\n");
     try std.fmt.format(buf.writer(allocator), "  \"gateway\": \"{s}:{d}\",\n", .{ state.gateway_host, state.gateway_port });
+
+    // Tunnel info
+    try std.fmt.format(buf.writer(allocator), "  \"tunnel_provider\": \"{s}\",\n", .{state.tunnel_provider});
+    if (state.tunnel_url) |url| {
+        try std.fmt.format(buf.writer(allocator), "  \"tunnel_url\": \"{s}\",\n", .{url});
+    } else {
+        try buf.appendSlice(allocator, "  \"tunnel_url\": null,\n");
+    }
 
     // Components array
     try buf.appendSlice(allocator, "  \"components\": [\n");
@@ -537,6 +551,12 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("is_group")) |v| {
             if (v == .bool) parsed.fields.is_group = v.bool;
         }
+        if (pm.value.object.get("sender_username")) |v| {
+            if (v == .string) parsed.fields.sender_username = v.string;
+        }
+        if (pm.value.object.get("sender_display_name")) |v| {
+            if (v == .string) parsed.fields.sender_display_name = v.string;
+        }
     }
     return parsed;
 }
@@ -564,6 +584,26 @@ fn resolveInboundRouteSessionKeyWithMetadata(
         }, meta) orelse return null
     else
         return null;
+
+    if (std.mem.eql(u8, msg.channel, "telegram") and
+        peer.kind == .group and
+        meta.thread_id != null)
+    {
+        const topic_peer_id = std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ peer.id, meta.thread_id.? }) catch return null;
+        defer allocator.free(topic_peer_id);
+
+        const route = agent_routing.resolveRouteWithSession(allocator, .{
+            .channel = msg.channel,
+            .account_id = account_id,
+            .peer = .{ .kind = peer.kind, .id = topic_peer_id },
+            .parent_peer = peer,
+            .guild_id = meta.guild_id,
+            .team_id = meta.team_id,
+        }, config.agent_bindings, config.agents, config.session) catch return null;
+        allocator.free(route.main_session_key);
+        return route.session_key;
+    }
+
     const route = agent_routing.resolveRouteWithSession(allocator, .{
         .channel = msg.channel,
         .account_id = account_id,
@@ -623,7 +663,7 @@ fn resolveTypingRecipient(
         return std.fmt.allocPrint(allocator, "{s}:{s}", .{ slack_target.channel_id, slack_target.thread_ts }) catch null;
     }
 
-    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost")) {
+    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost") and !std.mem.eql(u8, channel_name, "teams")) {
         return null;
     }
     if (chat_id.len == 0) return null;
@@ -699,7 +739,39 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
 }
 
 fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or std.mem.eql(u8, channel, "telegram");
+    return std.mem.eql(u8, channel, "web") or
+        std.mem.eql(u8, channel, "telegram") or
+        std.mem.eql(u8, channel, "dingtalk");
+}
+
+fn makeAssistantReplyOutbound(
+    allocator: std.mem.Allocator,
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+    reply: []const u8,
+) !bus_mod.OutboundMessage {
+    if (std.mem.indexOf(u8, reply, interaction_choices.START_TAG) == null) {
+        return if (account_id) |aid|
+            bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, reply)
+        else
+            bus_mod.makeOutbound(allocator, channel, chat_id, reply);
+    }
+
+    var parsed = try interaction_choices.parseAssistantChoices(allocator, reply);
+    defer parsed.deinit(allocator);
+
+    if (parsed.choices) |choices| {
+        return if (account_id) |aid|
+            bus_mod.makeOutboundWithAccountChoices(allocator, channel, aid, chat_id, parsed.visible_text, choices.options)
+        else
+            bus_mod.makeOutboundWithChoices(allocator, channel, chat_id, parsed.visible_text, choices.options);
+    }
+
+    return if (account_id) |aid|
+        bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, parsed.visible_text)
+    else
+        bus_mod.makeOutbound(allocator, channel, chat_id, parsed.visible_text);
 }
 
 fn makeStreamingSinkForChannel(
@@ -771,10 +843,29 @@ fn inboundDispatcherThread(
             stream_sink = makeStreamingSinkForChannel(msg.channel, raw_sink, &outbound_tag_filter);
         }
 
+        if (std.mem.eql(u8, msg.channel, "max")) {
+            channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
+            defer channels_mod.max.setInteractiveOwnerContext(null);
+        }
+
+        // Build conversation context for channels that provide sender metadata.
+        // Discord passes sender info via metadata JSON; Signal/Telegram do it in channel_loop.
+        const conversation_context: ?ConversationContext = if (std.mem.eql(u8, msg.channel, "discord"))
+            .{
+                .channel = "discord",
+                .sender_id = msg.sender_id,
+                .sender_username = parsed_meta.fields.sender_username,
+                .sender_display_name = parsed_meta.fields.sender_display_name,
+                .group_id = parsed_meta.fields.guild_id,
+                .is_group = if (parsed_meta.fields.is_dm) |dm| !dm else null,
+            }
+        else
+            null;
+
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
             msg.content,
-            null,
+            conversation_context,
             stream_sink,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
@@ -798,10 +889,13 @@ fn inboundDispatcherThread(
         };
         defer allocator.free(reply);
 
-        const out = (if (outbound_account_id) |aid|
-            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reply)
-        else
-            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply)) catch |err| {
+        const out = makeAssistantReplyOutbound(
+            allocator,
+            msg.channel,
+            outbound_account_id,
+            msg.chat_id,
+            reply,
+        ) catch |err| {
             log.err("inbound dispatch makeOutbound failed: {}", .{err});
             continue;
         };
@@ -825,6 +919,46 @@ fn inboundDispatcherThread(
     }
 }
 
+fn startConfiguredTunnel(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    host: []const u8,
+    port: u16,
+    state: *DaemonState,
+) ?tunnel_mod.Tunnel {
+    if (config.tunnel.provider.len == 0 or std.mem.eql(u8, config.tunnel.provider, "none")) {
+        health.markComponentOk("tunnel");
+        return null;
+    }
+
+    state.addComponent("tunnel");
+
+    var tunnel = tunnel_mod.createTunnel(config.tunnel) catch |err| {
+        state.markError("tunnel", @errorName(err));
+        health.markComponentError("tunnel", @errorName(err));
+        log.warn("Failed to create tunnel: {s}", .{@errorName(err)});
+        return null;
+    } orelse {
+        health.markComponentOk("tunnel");
+        return null;
+    };
+
+    tunnel.allocator = allocator;
+    if (tunnel.start(host, port)) |url| {
+        state.tunnel_provider = config.tunnel.provider;
+        state.tunnel_url = url;
+        state.markRunning("tunnel");
+        health.markComponentOk("tunnel");
+        return tunnel;
+    } else |err| {
+        state.markError("tunnel", @errorName(err));
+        health.markComponentError("tunnel", @errorName(err));
+        log.warn("Failed to start tunnel: {s}", .{@errorName(err)});
+        tunnel.stop();
+        return null;
+    }
+}
+
 /// Run the long-lived runtime. This is the main entry point for `nullclaw gateway`.
 /// Spawns threads for gateway, heartbeat, and channels, then loops until
 /// shutdown is requested (Ctrl+C signal or explicit request).
@@ -832,7 +966,7 @@ fn inboundDispatcherThread(
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.
-    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &onboard.ProjectContext{}, null);
+    try onboard.scaffoldWorkspaceForConfig(allocator, config, &onboard.ProjectContext{});
 
     health.markComponentOk("daemon");
     shutdown_requested.store(false, .release);
@@ -858,11 +992,17 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     state.addComponent("scheduler");
 
+    // Start tunnel before gateway so any public URL is available immediately.
+    var tunnel = startConfiguredTunnel(allocator, config, host, port, &state);
+
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("nullclaw gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
+    if (state.tunnel_url) |url| {
+        try stdout.print("  Tunnel:   {s} ({s})\n", .{ url, state.tunnel_provider });
+    }
     try stdout.print("  Components: {d} active\n", .{state.component_count});
     try stdout.flush();
     config.printModelConfig();
@@ -996,6 +1136,11 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     if (hb_thread) |t| t.join();
     gw_thread.join();
 
+    // Stop tunnel if running
+    if (tunnel) |*t| {
+        t.stop();
+    }
+
     try stdout.print("nullclaw gateway runtime stopped.\n", .{});
 }
 
@@ -1067,6 +1212,19 @@ test "makeStreamingSinkForChannel filters web chunks" {
 
     try std.testing.expectEqualStrings("AB", collector.text());
     try std.testing.expect(collector.got_final);
+}
+
+test "makeStreamingSinkForChannel supports dingtalk" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("dingtalk", .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter);
+    try std.testing.expect(sink != null);
 }
 
 test "makeStreamingSinkForChannel returns null for unsupported channel" {
@@ -1787,6 +1945,47 @@ test "resolveInboundRouteSessionKey supports standardized peer metadata for unkn
     try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", routed.?);
 }
 
+test "resolveInboundRouteSessionKey uses telegram thread metadata for topic routing" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "tg-topic-agent",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+            },
+        },
+        .{
+            .agent_id = "tg-group-agent",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "user-1",
+        .chat_id = "-100123#topic:42",
+        .content = "hello",
+        .session_key = "telegram:-100123#topic:42",
+        .metadata_json = "{\"account_id\":\"main\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"42\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:tg-topic-agent:telegram:group:-100123:thread:42", routed.?);
+}
+
 test "parseInboundMetadata extracts message_id and thread_id" {
     var parsed = parseInboundMetadata(
         std.testing.allocator,
@@ -1798,6 +1997,43 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("C1", parsed.fields.channel_id.?);
     try std.testing.expectEqualStrings("1700.1", parsed.fields.message_id.?);
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
+}
+
+test "parseInboundMetadata extracts discord sender identity fields" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"sender_username\":\"discord-user\",\"sender_display_name\":\"Discord User\"}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("discord-user", parsed.fields.sender_username.?);
+    try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
+}
+
+test "makeAssistantReplyOutbound preserves plain replies without choices" {
+    const allocator = std.testing.allocator;
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", null, "chat1", "hello");
+    defer msg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("hello", msg.content);
+    try std.testing.expectEqual(@as(usize, 0), msg.choices.len);
+    try std.testing.expect(msg.account_id == null);
+}
+
+test "makeAssistantReplyOutbound extracts structured choices from assistant reply" {
+    const allocator = std.testing.allocator;
+    const reply =
+        \\Choose one:
+        \\<nc_choices>{"v":1,"options":[{"id":"yes","label":"Yes","submit_text":"yes"},{"id":"no","label":"No"}]}</nc_choices>
+    ;
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", "backup", "chat1", reply);
+    defer msg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("backup", msg.account_id.?);
+    try std.testing.expectEqualStrings("Choose one:\n", msg.content);
+    try std.testing.expectEqual(@as(usize, 2), msg.choices.len);
+    try std.testing.expectEqualStrings("yes", msg.choices[0].id);
+    try std.testing.expectEqualStrings("No", msg.choices[1].label);
 }
 
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
@@ -2028,4 +2264,96 @@ test "writeStateFile produces valid content" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"status\": \"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "test-comp") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "127.0.0.1:8080") != null);
+}
+
+test "writeStateFile includes tunnel fields" {
+    var state = DaemonState{
+        .started = true,
+        .gateway_host = "127.0.0.1",
+        .gateway_port = 3000,
+        .tunnel_provider = "ngrok",
+        .tunnel_url = "https://test.ngrok-free.app",
+    };
+    state.addComponent("gateway");
+    state.addComponent("tunnel");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    defer std.testing.allocator.free(path);
+
+    try writeStateFile(std.testing.allocator, path, &state);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_provider\": \"ngrok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_url\": \"https://test.ngrok-free.app\"") != null);
+}
+
+test "writeStateFile handles null tunnel_url" {
+    var state = DaemonState{
+        .started = true,
+        .gateway_host = "127.0.0.1",
+        .gateway_port = 3000,
+        .tunnel_provider = "none",
+        .tunnel_url = null,
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    defer std.testing.allocator.free(path);
+
+    try writeStateFile(std.testing.allocator, path, &state);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_provider\": \"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_url\": null") != null);
+}
+
+test "startConfiguredTunnel skips none provider" {
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var state = DaemonState{};
+
+    const tunnel = startConfiguredTunnel(std.testing.allocator, &config, "127.0.0.1", 3000, &state);
+
+    try std.testing.expect(tunnel == null);
+    try std.testing.expectEqual(@as(usize, 0), state.component_count);
+    try std.testing.expectEqualStrings("none", state.tunnel_provider);
+    try std.testing.expect(state.tunnel_url == null);
+}
+
+test "startConfiguredTunnel records create failure" {
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    config.tunnel.provider = "ngrok";
+
+    var state = DaemonState{};
+    const tunnel = startConfiguredTunnel(std.testing.allocator, &config, "127.0.0.1", 3000, &state);
+
+    try std.testing.expect(tunnel == null);
+    try std.testing.expectEqual(@as(usize, 1), state.component_count);
+    try std.testing.expectEqualStrings("tunnel", state.components[0].?.name);
+    try std.testing.expect(!state.components[0].?.running);
+    try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
+    try std.testing.expectEqualStrings("MissingNgrokConfig", state.components[0].?.last_error.?);
+    try std.testing.expect(state.tunnel_url == null);
 }

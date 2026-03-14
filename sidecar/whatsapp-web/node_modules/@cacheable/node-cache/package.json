@@ -1,0 +1,69 @@
+{
+  "name": "@cacheable/node-cache",
+  "version": "1.7.6",
+  "description": "Simple and Maintained fast NodeJS internal caching",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredwray/cacheable.git",
+    "directory": "packages/node-cache"
+  },
+  "author": "Jared Wray <me@jaredwray.com>",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "cache",
+    "caching",
+    "node",
+    "nodejs",
+    "cacheable",
+    "cacheable-node-cache",
+    "node-cache",
+    "cacheable-node"
+  ],
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.8",
+    "@faker-js/faker": "^10.1.0",
+    "@types/node": "^25.0.2",
+    "@vitest/coverage-v8": "^4.0.15",
+    "rimraf": "^6.1.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.15"
+  },
+  "dependencies": {
+    "hookified": "^1.14.0",
+    "keyv": "^5.5.5",
+    "cacheable": "^2.3.1"
+  },
+  "files": [
+    "dist",
+    "license"
+  ],
+  "scripts": {
+    "build": "rimraf ./dist && tsup src/index.ts --format cjs,esm --dts --clean",
+    "prepublish": "pnpm build",
+    "lint": "biome check --write --error-on-warnings",
+    "test": "pnpm lint && vitest run --coverage",
+    "test:ci": "biome check --error-on-warnings && vitest run --coverage",
+    "clean": "rimraf ./dist ./coverage ./node_modules"
+  }
+}

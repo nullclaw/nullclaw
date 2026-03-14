@@ -7,6 +7,7 @@
 //! This backend is append-only: forget() is a no-op to preserve audit trail.
 
 const std = @import("std");
+const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -75,7 +76,7 @@ pub const MarkdownMemory = struct {
         const file = try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
         defer file.close();
 
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const size = stat.size;
 
         try file.seekTo(size);
@@ -173,7 +174,7 @@ pub const MarkdownMemory = struct {
             const root_path = try self.rootPath(allocator, candidate.filename);
             defer allocator.free(root_path);
 
-            const content = std.fs.cwd().readFileAlloc(allocator, root_path, 1024 * 1024) catch continue;
+            const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, root_path, 1024 * 1024) catch continue;
             defer allocator.free(content);
 
             const canonical = std.fs.realpathAlloc(allocator, root_path) catch
@@ -200,7 +201,7 @@ pub const MarkdownMemory = struct {
                 if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
                 const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ md, entry.name });
                 defer allocator.free(fpath);
-                if (std.fs.cwd().readFileAlloc(allocator, fpath, 1024 * 1024)) |content| {
+                if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, fpath, 1024 * 1024)) |content| {
                     defer allocator.free(content);
                     const fname = entry.name[0 .. entry.name.len - 3];
                     const entries = try parseEntries(content, fname, .daily, allocator);

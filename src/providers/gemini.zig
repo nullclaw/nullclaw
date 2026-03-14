@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
@@ -1842,7 +1843,7 @@ test "writeCredentialsJson produces valid JSON" {
     try std.testing.expect(obj.get("expires_at").?.integer == 1999999999);
 
     if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const mode = stat.mode & 0o777;
         // Respect process umask: require owner rw and forbid executable bits.
         try std.testing.expect((mode & 0o600) == 0o600);

@@ -70,6 +70,35 @@ pub const ParsedMessage = struct {
     }
 };
 
+const OwnedOutboundPayload = struct {
+    text: []u8,
+    attachments: []root.Channel.OutboundAttachment,
+    choices: []root.Channel.OutboundChoice,
+
+    fn deinit(self: *OwnedOutboundPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.attachments) |attachment| {
+            allocator.free(attachment.target);
+            if (attachment.caption) |caption| allocator.free(caption);
+        }
+        allocator.free(self.attachments);
+        for (self.choices) |choice| {
+            allocator.free(choice.id);
+            allocator.free(choice.label);
+            allocator.free(choice.submit_text);
+        }
+        allocator.free(self.choices);
+    }
+
+    fn payload(self: *const OwnedOutboundPayload) root.Channel.OutboundPayload {
+        return .{
+            .text = self.text,
+            .attachments = self.attachments,
+            .choices = self.choices,
+        };
+    }
+};
+
 const PendingInteractionOption = struct {
     id: []const u8,
     label: []const u8,
@@ -421,6 +450,133 @@ fn parseMarkerKind(kind_str: []const u8) ?AttachmentKind {
     return null;
 }
 
+fn to_root_attachment_kind(kind: AttachmentKind) root.Channel.OutboundAttachmentKind {
+    return switch (kind) {
+        .image => .image,
+        .document => .document,
+        .video => .video,
+        .audio => .audio,
+        .voice => .voice,
+    };
+}
+
+fn from_root_attachment_kind(kind: root.Channel.OutboundAttachmentKind) AttachmentKind {
+    return switch (kind) {
+        .image => .image,
+        .document => .document,
+        .video => .video,
+        .audio => .audio,
+        .voice => .voice,
+    };
+}
+
+fn buildChoicesDirectiveFromPayload(
+    allocator: std.mem.Allocator,
+    choices: []const root.Channel.OutboundChoice,
+) !interaction_choices.ChoicesDirective {
+    if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) {
+        return error.InvalidChoices;
+    }
+
+    var options = try allocator.alloc(interaction_choices.ChoiceOption, choices.len);
+    var built: usize = 0;
+    errdefer {
+        for (options[0..built]) |opt| opt.deinit(allocator);
+        allocator.free(options);
+    }
+
+    for (choices, 0..) |choice, i| {
+        if (choice.id.len == 0 or choice.id.len > interaction_choices.MAX_ID_LEN) return error.InvalidChoices;
+        if (choice.label.len == 0 or choice.label.len > interaction_choices.MAX_LABEL_LEN) return error.InvalidChoices;
+        if (choice.submit_text.len == 0 or choice.submit_text.len > interaction_choices.MAX_SUBMIT_TEXT_LEN) return error.InvalidChoices;
+
+        options[i] = .{
+            .id = try allocator.dupe(u8, choice.id),
+            .label = try allocator.dupe(u8, choice.label),
+            .submit_text = try allocator.dupe(u8, choice.submit_text),
+        };
+        built += 1;
+    }
+
+    return .{
+        .version = 1,
+        .options = options,
+    };
+}
+
+fn buildOwnedOutboundPayloadFromLegacy(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    media: []const []const u8,
+    allow_choices: bool,
+) !OwnedOutboundPayload {
+    var parsed_choices = try interaction_choices.parseAssistantChoices(allocator, text);
+    defer parsed_choices.deinit(allocator);
+
+    const parsed = try parseAttachmentMarkers(allocator, parsed_choices.visible_text);
+    defer parsed.deinit(allocator);
+
+    const choices_enabled = allow_choices and parsed_choices.choices != null and parsed.attachments.len == 0 and media.len == 0;
+    const attachments_len = parsed.attachments.len + media.len;
+    var attachments = try allocator.alloc(root.Channel.OutboundAttachment, attachments_len);
+    var built_attachments: usize = 0;
+    errdefer {
+        for (attachments[0..built_attachments]) |attachment| {
+            allocator.free(attachment.target);
+            if (attachment.caption) |caption| allocator.free(caption);
+        }
+        allocator.free(attachments);
+    }
+
+    for (parsed.attachments, 0..) |attachment, i| {
+        attachments[i] = .{
+            .kind = to_root_attachment_kind(attachment.kind),
+            .target = try allocator.dupe(u8, attachment.target),
+            .caption = if (attachment.caption) |caption| try allocator.dupe(u8, caption) else null,
+        };
+        built_attachments += 1;
+    }
+    for (media, 0..) |item, i| {
+        attachments[parsed.attachments.len + i] = .{
+            .kind = to_root_attachment_kind(inferAttachmentKindFromExtension(item)),
+            .target = try allocator.dupe(u8, item),
+            .caption = null,
+        };
+        built_attachments += 1;
+    }
+
+    const choices = if (choices_enabled)
+        try allocator.alloc(root.Channel.OutboundChoice, parsed_choices.choices.?.options.len)
+    else
+        try allocator.alloc(root.Channel.OutboundChoice, 0);
+    var built_choices: usize = 0;
+    errdefer {
+        for (choices[0..built_choices]) |choice| {
+            allocator.free(choice.id);
+            allocator.free(choice.label);
+            allocator.free(choice.submit_text);
+        }
+        allocator.free(choices);
+    }
+
+    if (choices_enabled) {
+        for (parsed_choices.choices.?.options, 0..) |choice, i| {
+            choices[i] = .{
+                .id = try allocator.dupe(u8, choice.id),
+                .label = try allocator.dupe(u8, choice.label),
+                .submit_text = try allocator.dupe(u8, choice.submit_text),
+            };
+            built_choices += 1;
+        }
+    }
+
+    return .{
+        .text = try allocator.dupe(u8, parsed.remaining_text),
+        .attachments = attachments,
+        .choices = choices,
+    };
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Smart Message Splitting
 // ════════════════════════════════════════════════════════════════════════════
@@ -510,6 +666,7 @@ pub const TelegramChannel = struct {
     streaming_enabled: bool = true,
     status_reactions_enabled: bool = false,
     reaction_emojis: config_types.TelegramReactionEmojisConfig = .{},
+    binding_commands_enabled: bool = true,
     topic_commands_enabled: bool = true,
     topic_map_command_enabled: bool = true,
     commands_menu_mode: config_types.TelegramCommandsMenuMode = .flat,
@@ -570,6 +727,7 @@ pub const TelegramChannel = struct {
         ch.streaming_enabled = cfg.streaming;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.reaction_emojis = cfg.reaction_emojis;
+        ch.binding_commands_enabled = cfg.binding_commands_enabled;
         ch.topic_commands_enabled = cfg.topic_commands_enabled;
         ch.topic_map_command_enabled = cfg.topic_map_command_enabled;
         ch.commands_menu_mode = cfg.commands_menu_mode;
@@ -812,11 +970,13 @@ pub const TelegramChannel = struct {
     fn setMyCommandsForScope(
         self: *TelegramChannel,
         scope: control_plane.TelegramBotCommandScope,
+        include_bind_command: bool,
         include_topic_command: bool,
         include_topics_command: bool,
     ) !void {
         const commands_json = try control_plane.buildTelegramBotCommandsJson(self.allocator, .{
             .scope = scope,
+            .include_bind_command = include_bind_command,
             .include_topic_command = include_topic_command,
             .include_topics_command = include_topics_command,
         });
@@ -845,7 +1005,7 @@ pub const TelegramChannel = struct {
                 };
             },
             .flat => {
-                self.setMyCommandsForScope(.default, self.topic_commands_enabled, self.topic_map_command_enabled) catch |err| {
+                self.setMyCommandsForScope(.default, self.binding_commands_enabled, self.topic_commands_enabled, self.topic_map_command_enabled) catch |err| {
                     log.warn("setMyCommands(default) failed: {}", .{err});
                 };
                 self.deleteMyCommandsForScope(.all_private_chats) catch |err| {
@@ -856,10 +1016,10 @@ pub const TelegramChannel = struct {
                 };
             },
             .scoped => {
-                self.setMyCommandsForScope(.all_private_chats, false, false) catch |err| {
+                self.setMyCommandsForScope(.all_private_chats, self.binding_commands_enabled, false, false) catch |err| {
                     log.warn("setMyCommands(all_private_chats) failed: {}", .{err});
                 };
-                self.setMyCommandsForScope(.all_group_chats, self.topic_commands_enabled, self.topic_map_command_enabled) catch |err| {
+                self.setMyCommandsForScope(.all_group_chats, self.binding_commands_enabled, self.topic_commands_enabled, self.topic_map_command_enabled) catch |err| {
                     log.warn("setMyCommands(all_group_chats) failed: {}", .{err});
                 };
                 self.deleteMyCommandsForScope(.default) catch |err| {
@@ -1055,23 +1215,6 @@ pub const TelegramChannel = struct {
         var buf: [32]u8 = undefined;
         const token = try std.fmt.bufPrint(&buf, "{x}", .{seq});
         return self.allocator.dupe(u8, token);
-    }
-
-    fn isAttachmentMarkerCandidate(text: []const u8) bool {
-        return std.mem.indexOf(u8, text, "[IMAGE:") != null or
-            std.mem.indexOf(u8, text, "[image:") != null or
-            std.mem.indexOf(u8, text, "[FILE:") != null or
-            std.mem.indexOf(u8, text, "[file:") != null or
-            std.mem.indexOf(u8, text, "[DOCUMENT:") != null or
-            std.mem.indexOf(u8, text, "[document:") != null or
-            std.mem.indexOf(u8, text, "[PHOTO:") != null or
-            std.mem.indexOf(u8, text, "[photo:") != null or
-            std.mem.indexOf(u8, text, "[VIDEO:") != null or
-            std.mem.indexOf(u8, text, "[video:") != null or
-            std.mem.indexOf(u8, text, "[AUDIO:") != null or
-            std.mem.indexOf(u8, text, "[audio:") != null or
-            std.mem.indexOf(u8, text, "[VOICE:") != null or
-            std.mem.indexOf(u8, text, "[voice:") != null;
     }
 
     fn buildInlineKeyboardJson(
@@ -1597,58 +1740,9 @@ pub const TelegramChannel = struct {
         text: []const u8,
         reply_to: ?i64,
     ) !void {
-        var parsed = try interaction_choices.parseAssistantChoices(self.allocator, text);
-        defer parsed.deinit(self.allocator);
-
-        const directive = parsed.choices;
-        if (directive == null or !self.interactive.enabled) {
-            return self.sendMessageWithReply(target, parsed.visible_text, reply_to);
-        }
-
-        // v1 scope: interactive choices do not support attachment-marker payloads.
-        if (isAttachmentMarkerCandidate(parsed.visible_text)) {
-            return self.sendMessageWithReply(target, parsed.visible_text, reply_to);
-        }
-
-        const token = self.nextInteractionToken() catch {
-            return self.sendMessageWithReply(target, parsed.visible_text, reply_to);
-        };
-        defer self.allocator.free(token);
-
-        const keyboard_json = self.buildInlineKeyboardJson(directive.?, token) catch |err| {
-            if (err != error.CallbackDataTooLong) {
-                log.warn("telegram buildInlineKeyboardJson failed: {}", .{err});
-            }
-            return self.sendMessageWithReply(target, parsed.visible_text, reply_to);
-        };
-        defer self.allocator.free(keyboard_json);
-
-        const sent = self.sendSplitTextWithMarkdownFallbackWithMarkup(target, parsed.visible_text, reply_to, keyboard_json) catch |err| {
-            if (err == error.PartiallySent) {
-                log.warn("telegram interactive send partially succeeded; skipping full fallback to avoid duplicate chunks", .{});
-                return;
-            }
-            log.warn("telegram interactive send failed, falling back to plain send: {}", .{err});
-            return self.sendMessageWithReply(target, parsed.visible_text, reply_to);
-        };
-
-        if (sent.message_id == null) {
-            log.warn("telegram interactive send succeeded but response had no message_id; buttons will not be tracked", .{});
-            return;
-        }
-
-        const enforce_owner = is_group and self.interactive.owner_only;
-        self.registerPendingInteraction(
-            token,
-            target,
-            if (enforce_owner) owner_identity else null,
-            enforce_owner,
-            self.interactive.remove_on_click,
-            sent.message_id,
-            directive.?,
-        ) catch |err| {
-            log.warn("telegram registerPendingInteraction failed: {}", .{err});
-        };
+        var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, text, &.{}, true);
+        defer payload.deinit(self.allocator);
+        try self.sendRichMessageWithReply(target, owner_identity, is_group, payload.payload(), reply_to);
     }
 
     fn nextAdaptiveSplitLimit(current_limit: usize, text_len: usize) usize {
@@ -1670,21 +1764,86 @@ pub const TelegramChannel = struct {
 
     /// Send a message with optional reply-to, continuation markers, and delay between chunks.
     pub fn sendMessageWithReply(self: *TelegramChannel, target: []const u8, text: []const u8, reply_to: ?i64) !void {
+        var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, text, &.{}, false);
+        defer payload.deinit(self.allocator);
+        return self.sendRichMessageWithReply(target, "", false, payload.payload(), reply_to);
+    }
+
+    fn sendRichMessageWithReply(
+        self: *TelegramChannel,
+        target: []const u8,
+        owner_identity: []const u8,
+        is_group: bool,
+        payload: root.Channel.OutboundPayload,
+        reply_to: ?i64,
+    ) !void {
         // Send typing indicator (best-effort)
         self.sendTypingIndicator(target);
 
-        // Parse attachment markers
-        const parsed = try parseAttachmentMarkers(self.allocator, text);
-        defer parsed.deinit(self.allocator);
+        if (payload.choices.len > 0 and payload.attachments.len == 0 and self.interactive.enabled) {
+            var directive = buildChoicesDirectiveFromPayload(self.allocator, payload.choices) catch |err| {
+                log.warn("telegram buildChoicesDirectiveFromPayload failed, falling back to plain send: {}", .{err});
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+            defer directive.deinit(self.allocator);
 
-        // Send remaining text (if any) with smart splitting
-        if (parsed.remaining_text.len > 0) {
-            _ = try self.sendSplitTextWithMarkdownFallbackWithMarkup(target, parsed.remaining_text, reply_to, null);
+            const token = self.nextInteractionToken() catch {
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+            defer self.allocator.free(token);
+
+            const keyboard_json = self.buildInlineKeyboardJson(directive, token) catch |err| {
+                if (err != error.CallbackDataTooLong) {
+                    log.warn("telegram buildInlineKeyboardJson failed: {}", .{err});
+                }
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+            defer self.allocator.free(keyboard_json);
+
+            const sent = self.sendSplitTextWithMarkdownFallbackWithMarkup(target, payload.text, reply_to, keyboard_json) catch |err| {
+                if (err == error.PartiallySent) {
+                    log.warn("telegram interactive send partially succeeded; skipping full fallback to avoid duplicate chunks", .{});
+                    return;
+                }
+                log.warn("telegram interactive send failed, falling back to plain send: {}", .{err});
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+
+            if (sent.message_id == null) {
+                log.warn("telegram interactive send succeeded but response had no message_id; buttons will not be tracked", .{});
+                return;
+            }
+
+            const enforce_owner = is_group and self.interactive.owner_only;
+            self.registerPendingInteraction(
+                token,
+                target,
+                if (enforce_owner) owner_identity else null,
+                enforce_owner,
+                self.interactive.remove_on_click,
+                sent.message_id,
+                directive,
+            ) catch |err| {
+                log.warn("telegram registerPendingInteraction failed: {}", .{err});
+            };
+            return;
         }
 
-        // Send attachments
-        for (parsed.attachments) |att| {
-            self.sendMediaMultipart(target, self.allocator, att.kind, att.target, att.caption) catch |err| {
+        return self.sendStructuredPayload(target, payload, reply_to);
+    }
+
+    fn sendStructuredPayload(
+        self: *TelegramChannel,
+        target: []const u8,
+        payload: root.Channel.OutboundPayload,
+        reply_to: ?i64,
+    ) !void {
+        if (payload.text.len > 0) {
+            _ = try self.sendSplitTextWithMarkdownFallbackWithMarkup(target, payload.text, reply_to, null);
+        }
+
+        for (payload.attachments) |attachment| {
+            self.sendMediaMultipart(target, self.allocator, from_root_attachment_kind(attachment.kind), attachment.target, attachment.caption) catch |err| {
                 log.err("sendMediaMultipart failed: {}", .{err});
                 continue;
             };
@@ -2768,16 +2927,16 @@ pub const TelegramChannel = struct {
         }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
-        // Outbound dispatcher (cron/gateway) uses the generic channel vtable path.
-        // If the payload contains an nc_choices directive, route it through the
-        // assistant interactive send path so Telegram renders inline buttons.
-        if (std.mem.indexOf(u8, message, interaction_choices.START_TAG) != null) {
-            try self.sendAssistantMessageWithReply(target, "", false, message, null);
-            return;
-        }
-        try self.sendMessage(target, message);
+        var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, message, media, true);
+        defer payload.deinit(self.allocator);
+        try self.sendRichMessageWithReply(target, "", false, payload.payload(), null);
+    }
+
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichMessageWithReply(target, "", false, payload, null);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -2805,6 +2964,7 @@ pub const TelegramChannel = struct {
         .stop = &vtableStop,
         .send = &vtableSend,
         .sendEvent = &vtableSendEvent,
+        .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
@@ -3413,6 +3573,51 @@ test "telegram parseAttachmentMarkers FILE alias" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
     try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[0].kind);
+}
+
+test "telegram buildOwnedOutboundPayloadFromLegacy lifts choices into structured payload" {
+    var payload = try buildOwnedOutboundPayloadFromLegacy(
+        std.testing.allocator,
+        "Question?\n<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\",\"submit_text\":\"No\"}]}</nc_choices>",
+        &.{},
+        true,
+    );
+    defer payload.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Question?", payload.text);
+    try std.testing.expectEqual(@as(usize, 0), payload.attachments.len);
+    try std.testing.expectEqual(@as(usize, 2), payload.choices.len);
+    try std.testing.expectEqualStrings("yes", payload.choices[0].id);
+    try std.testing.expectEqualStrings("No", payload.choices[1].label);
+}
+
+test "telegram buildOwnedOutboundPayloadFromLegacy suppresses choices when explicit media is present" {
+    var payload = try buildOwnedOutboundPayloadFromLegacy(
+        std.testing.allocator,
+        "Question?\n<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\",\"submit_text\":\"No\"}]}</nc_choices>",
+        &.{"/tmp/photo.png"},
+        true,
+    );
+    defer payload.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Question?", payload.text);
+    try std.testing.expectEqual(@as(usize, 1), payload.attachments.len);
+    try std.testing.expectEqual(root.Channel.OutboundAttachmentKind.image, payload.attachments[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), payload.choices.len);
+}
+
+test "telegram buildOwnedOutboundPayloadFromLegacy keeps choices disabled for plain send path" {
+    var payload = try buildOwnedOutboundPayloadFromLegacy(
+        std.testing.allocator,
+        "Question?\n<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\",\"submit_text\":\"No\"}]}</nc_choices>",
+        &.{},
+        false,
+    );
+    defer payload.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Question?", payload.text);
+    try std.testing.expectEqual(@as(usize, 0), payload.attachments.len);
+    try std.testing.expectEqual(@as(usize, 0), payload.choices.len);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

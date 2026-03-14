@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
@@ -216,7 +217,7 @@ fn preserveArchiveFile(
     mem: Memory,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !void {
-    const content = try archive_dir.readFileAlloc(allocator, file_name, ARCHIVE_READ_MAX_BYTES);
+    const content = try fs_compat.readFileAlloc(archive_dir, allocator, file_name, ARCHIVE_READ_MAX_BYTES);
     defer allocator.free(content);
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) return;
 

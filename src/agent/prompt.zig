@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
+const memory_root = @import("../memory/root.zig");
 const tools_mod = @import("../tools/root.zig");
 const path_prefix = @import("../path_prefix.zig");
 const Tool = tools_mod.Tool;
@@ -87,7 +89,7 @@ fn openWorkspaceFileWithGuards(
         },
     };
 
-    const stat = file.stat() catch {
+    const stat = fs_compat.stat(file) catch {
         file.close();
         allocator.free(canonical_path);
         return null;
@@ -105,13 +107,38 @@ fn openWorkspaceFileWithGuards(
     };
 }
 
-/// Conversation context for the current turn (Signal-specific for now).
+/// Conversation context for the current turn.
+/// Carries per-message sender metadata so the LLM always knows who is talking.
 pub const ConversationContext = struct {
     channel: ?[]const u8 = null,
+    // Signal
     sender_number: ?[]const u8 = null,
     sender_uuid: ?[]const u8 = null,
+    sender_name: ?[]const u8 = null,
+    // Discord
+    sender_id: ?[]const u8 = null,
+    sender_username: ?[]const u8 = null,
+    sender_display_name: ?[]const u8 = null,
+    // Shared
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
+
+    /// Compute a hash fingerprint of sender-identifying fields so the system
+    /// prompt can be rebuilt when the *sender* changes, not just when context
+    /// goes from null ↔ non-null.
+    pub fn senderFingerprint(self: ConversationContext) u64 {
+        var h = std.hash.Wyhash.init(0x1234_5678);
+        // Hash each sender-identifying field (or a sentinel null byte).
+        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name }) |field| {
+            if (field) |v| {
+                h.update(v);
+            } else {
+                h.update(&.{0});
+            }
+            h.update(&.{0xff}); // field separator
+        }
+        return h.final();
+    }
 };
 
 /// Context passed to prompt sections during construction.
@@ -224,8 +251,25 @@ pub fn buildSystemPrompt(
         if (cc.sender_number) |num| {
             try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
         }
-        if (cc.sender_uuid) |uuid| {
-            try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+        // Show sender identity: "Sender: Name (UUID)" or just "Sender: (UUID)"
+        if (cc.sender_name) |name| {
+            if (cc.sender_uuid) |uuid| {
+                try std.fmt.format(w, "- Sender: {s} ({s})\n", .{ name, uuid });
+            } else {
+                try std.fmt.format(w, "- Sender: {s}\n", .{name});
+            }
+        } else if (cc.sender_uuid) |uuid| {
+            try std.fmt.format(w, "- Sender: ({s})\n", .{uuid});
+        }
+        // Discord sender fields
+        if (cc.sender_id) |sid| {
+            try std.fmt.format(w, "- Sender Discord ID: {s}\n", .{sid});
+        }
+        if (cc.sender_username) |uname| {
+            try std.fmt.format(w, "- Sender username: {s}\n", .{uname});
+        }
+        if (cc.sender_display_name) |dname| {
+            try std.fmt.format(w, "- Sender display name: {s}\n", .{dname});
         }
         try w.writeAll("\n");
     }
@@ -1073,6 +1117,28 @@ test "buildSystemPrompt includes telegram group marker guidance for telegram gro
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[NO_REPLY]") != null);
 }
 
+test "buildSystemPrompt includes discord sender identity fields" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "discord",
+            .sender_id = "u-42",
+            .sender_username = "discord-user",
+            .sender_display_name = "Discord User",
+            .group_id = "guild-1",
+            .is_group = true,
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: u-42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender display name: Discord User") != null);
+}
+
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1121,6 +1187,112 @@ test "buildSystemPrompt injects BOOTSTRAP.md when present" {
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### BOOTSTRAP.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "bootstrap-welcome-line") != null);
+}
+
+test "buildSystemPrompt reads bootstrap docs from sqlite provider when workspace files are absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var mem_rt = memory_root.initRuntime(std.testing.allocator, &.{ .backend = "sqlite" }, workspace) orelse
+        return error.TestUnexpectedResult;
+    defer mem_rt.deinit();
+
+    const bootstrap_provider = try bootstrap_mod.createProvider(
+        std.testing.allocator,
+        "sqlite",
+        mem_rt.memory,
+        workspace,
+    );
+    defer bootstrap_provider.deinit();
+
+    try bootstrap_provider.store("AGENTS.md", "sqlite-agent-guidance");
+    try bootstrap_provider.store("BOOTSTRAP.md", "sqlite-bootstrap-line");
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("AGENTS.md", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    const prompt = try buildSystemPrompt(std.testing.allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+        .bootstrap_provider = bootstrap_provider,
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "sqlite-agent-guidance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### BOOTSTRAP.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "sqlite-bootstrap-line") != null);
+}
+
+test "buildSystemPrompt project context stays equivalent across markdown hybrid and sqlite backends" {
+    const backends = [_][]const u8{ "markdown", "hybrid", "sqlite" };
+    var expected_fingerprint: ?u64 = null;
+    var expected_project_context: ?[]u8 = null;
+    defer if (expected_project_context) |value| std.testing.allocator.free(value);
+
+    for (backends) |backend| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(workspace);
+
+        var mem_rt: ?memory_root.MemoryRuntime = null;
+        defer if (mem_rt) |*rt| rt.deinit();
+        if (!bootstrap_mod.backendUsesFiles(backend)) {
+            mem_rt = memory_root.initRuntime(std.testing.allocator, &.{ .backend = backend }, workspace) orelse
+                return error.TestUnexpectedResult;
+        }
+
+        const mem_iface: ?memory_root.Memory = if (mem_rt) |rt| rt.memory else null;
+        const bootstrap_provider = try bootstrap_mod.createProvider(
+            std.testing.allocator,
+            backend,
+            mem_iface,
+            workspace,
+        );
+        defer bootstrap_provider.deinit();
+
+        try bootstrap_provider.store("AGENTS.md", "shared-agent-guidance");
+        try bootstrap_provider.store("SOUL.md", "shared-soul-guidance");
+        try bootstrap_provider.store("BOOTSTRAP.md", "shared-bootstrap-line");
+        try bootstrap_provider.store("MEMORY.md", "shared-memory-line");
+
+        const fingerprint = try workspacePromptFingerprint(
+            std.testing.allocator,
+            workspace,
+            bootstrap_provider,
+        );
+        if (expected_fingerprint) |value| {
+            try std.testing.expectEqual(value, fingerprint);
+        } else {
+            expected_fingerprint = fingerprint;
+        }
+
+        const prompt = try buildSystemPrompt(std.testing.allocator, .{
+            .workspace_dir = workspace,
+            .model_name = "test-model",
+            .tools = &.{},
+            .bootstrap_provider = bootstrap_provider,
+        });
+        defer std.testing.allocator.free(prompt);
+
+        const project_start = std.mem.indexOf(u8, prompt, "## Project Context") orelse
+            return error.TestUnexpectedResult;
+        const attachments_start = std.mem.indexOfPos(u8, prompt, project_start, "## Channel Attachments") orelse
+            return error.TestUnexpectedResult;
+        const project_context = prompt[project_start..attachments_start];
+
+        if (expected_project_context) |value| {
+            try std.testing.expectEqualStrings(value, project_context);
+        } else {
+            expected_project_context = try std.testing.allocator.dupe(u8, project_context);
+        }
+    }
 }
 
 test "buildSystemPrompt injects HEARTBEAT.md when present" {

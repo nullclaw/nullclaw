@@ -56,6 +56,7 @@
 ## 文档导航
 
 - [安装指南](./installation.md)
+- [Termux 指南](./termux.md)
 - [配置指南](./configuration.md)
 - [使用与运维](./usage.md)
 - [架构总览](./architecture.md)
@@ -116,6 +117,7 @@ nullclaw agent -m "你好，nullclaw"
 
 ## 相关页面
 
+- [Termux 指南](./termux.md)
 - [命令参考](./commands.md)
 - [架构总览](./architecture.md)
 - [安全机制](./security.md)

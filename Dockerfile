@@ -34,9 +34,10 @@ RUN --mount=type=cache,target=/root/.cache/zig \
 # ── Stage 2: Config Prep ─────────────────────────────────────
 FROM busybox:1.37 AS config
 
-RUN mkdir -p /nullclaw-data/.nullclaw /nullclaw-data/workspace
+# Keep config.json at the volume root so existing compose volumes remain readable.
+RUN mkdir -p /nullclaw-data/workspace
 
-RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
+RUN cat > /nullclaw-data/config.json << 'EOF'
 {
   "api_key": "",
   "default_provider": "openrouter",
@@ -65,6 +66,7 @@ COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
+ENV NULLCLAW_HOME=/nullclaw-data
 ENV HOME=/nullclaw-data
 ENV NULLCLAW_GATEWAY_PORT=3000
 

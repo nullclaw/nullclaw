@@ -56,6 +56,7 @@ Focus on:
 ## Navigation
 
 - [Installation](./installation.md)
+- [Termux Guide](./termux.md)
 - [Configuration](./configuration.md)
 - [Usage and Operations](./usage.md)
 - [Architecture](./architecture.md)
@@ -94,6 +95,7 @@ If you are building from source instead of Homebrew, start with [Installation](.
 
 ## Related Pages
 
+- [Termux Guide](./termux.md)
 - [Commands](./commands.md)
 - [Development](./development.md)
 - [Architecture](./architecture.md)

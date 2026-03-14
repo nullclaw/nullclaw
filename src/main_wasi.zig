@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const fs_compat = @import("fs_compat.zig");
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_SEARCH_MATCHES: usize = 5;
@@ -181,7 +182,7 @@ fn append_line(path: []const u8, line: []const u8, allocator: std.mem.Allocator)
     const file = try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
     defer file.close();
 
-    const stat = try file.stat();
+    const stat = try fs_compat.stat(file);
     const size = stat.size;
     try file.seekTo(size);
 

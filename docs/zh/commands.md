@@ -106,6 +106,13 @@
 | `nullclaw skills remove <name>` | 移除 skill |
 | `nullclaw skills info <name>` | 查看 skill 元信息 |
 
+### History
+
+| 命令 | 说明 |
+|---|---|
+| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出会话记录 |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定会话的消息详情 |
+
 ## 数据、模型与工作区
 
 ### Memory

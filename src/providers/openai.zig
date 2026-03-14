@@ -363,7 +363,7 @@ pub const OpenAiProvider = struct {
             }
         }
 
-        try buf.appendSlice(allocator, ",\"stream\":true}");
+        try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
         return try buf.toOwnedSlice(allocator);
     }
 
@@ -592,6 +592,7 @@ test "buildStreamingChatRequestBody reasoning model uses max_completion_tokens" 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
 }
 
 test "provider getName returns OpenAI" {

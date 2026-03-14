@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
+const outbound = @import("../outbound.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 const thread_stacks = @import("../thread_stacks.zig");
 
@@ -176,7 +177,7 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage) catch {
+            dispatchOutboundMessage(channel, msg) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -185,6 +186,24 @@ pub fn runOutboundDispatcher(
             _ = stats.channel_not_found.fetchAdd(1, .monotonic);
         }
     }
+}
+
+fn dispatchOutboundMessage(channel: root.Channel, msg: bus.OutboundMessage) !void {
+    if (msg.stage == .final and
+        msg.media.len == 0 and
+        msg.choices.len > 0 and
+        !outbound.has_legacy_attachment_markers(msg.content))
+    {
+        channel.sendRich(msg.chat_id, .{
+            .text = msg.content,
+            .choices = msg.choices,
+        }) catch |err| switch (err) {
+            error.NotSupported => return channel.sendEvent(msg.chat_id, msg.content, &.{}, .final),
+            else => return err,
+        };
+        return;
+    }
+    return channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage);
 }
 
 /// Get names of all enabled (registered) channels.
@@ -399,6 +418,43 @@ const MockChannel = struct {
     }
 };
 
+const MockRichChannel = struct {
+    name_str: []const u8,
+    sent_count: Atomic(u64) = Atomic(u64).init(0),
+    rich_count: Atomic(u64) = Atomic(u64).init(0),
+
+    const vtable = root.Channel.VTable{
+        .start = mockStart,
+        .stop = mockStop,
+        .send = mockSend,
+        .sendRich = mockSendRich,
+        .name = mockName,
+        .healthCheck = mockHealthCheck,
+    };
+
+    fn channel(self: *MockRichChannel) root.Channel {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn mockStart(_: *anyopaque) anyerror!void {}
+    fn mockStop(_: *anyopaque) void {}
+    fn mockSend(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
+        const self: *MockRichChannel = @ptrCast(@alignCast(ctx));
+        _ = self.sent_count.fetchAdd(1, .monotonic);
+    }
+    fn mockSendRich(ctx: *anyopaque, _: []const u8, _: root.Channel.OutboundPayload) anyerror!void {
+        const self: *MockRichChannel = @ptrCast(@alignCast(ctx));
+        _ = self.rich_count.fetchAdd(1, .monotonic);
+    }
+    fn mockName(ctx: *anyopaque) []const u8 {
+        const self: *const MockRichChannel = @ptrCast(@alignCast(ctx));
+        return self.name_str;
+    }
+    fn mockHealthCheck(_: *anyopaque) bool {
+        return true;
+    }
+};
+
 test "DispatchStats init all zero" {
     const stats = DispatchStats{};
     try std.testing.expectEqual(@as(u64, 0), stats.getDispatched());
@@ -450,6 +506,90 @@ test "dispatcher routes chunk stage via sendEvent" {
     try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
     try std.testing.expectEqual(@as(u64, 1), mock_web.chunk_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), mock_web.sent_count.load(.monotonic));
+}
+
+test "dispatcher falls back to sendEvent when structured choices are not supported" {
+    const allocator = std.testing.allocator;
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "yes" },
+        .{ .id = "no", .label = "No", .submit_text = "no" },
+    };
+
+    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundWithChoices(allocator, "telegram", "chat1", "hello", &choices);
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_tg.chunk_count.load(.monotonic));
+}
+
+test "dispatcher prefers sendRich for final messages with structured choices" {
+    const allocator = std.testing.allocator;
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "yes" },
+        .{ .id = "no", .label = "No", .submit_text = "no" },
+    };
+
+    var mock_tg = MockRichChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundWithChoices(allocator, "telegram", "chat1", "hello", &choices);
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 1), mock_tg.rich_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_tg.sent_count.load(.monotonic));
+}
+
+test "dispatcher keeps legacy attachment-marker payloads on sendEvent path" {
+    const allocator = std.testing.allocator;
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "yes" },
+        .{ .id = "no", .label = "No", .submit_text = "no" },
+    };
+
+    var mock_tg = MockRichChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundWithChoices(
+        allocator,
+        "telegram",
+        "chat1",
+        "See this\n[IMAGE:/tmp/photo.png]",
+        &choices,
+    );
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 0), mock_tg.rich_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
 }
 
 test "dispatcher routes to matching account when channel has multiple accounts" {

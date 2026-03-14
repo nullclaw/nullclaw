@@ -12,6 +12,7 @@ pub const ChannelId = enum {
     matrix,
     mattermost,
     whatsapp,
+    teams,
     irc,
     lark,
     dingtalk,
@@ -24,6 +25,7 @@ pub const ChannelId = enum {
     nostr,
     web,
     whatsapp_web,
+    max,
 };
 
 pub const ChannelMeta = struct {
@@ -52,9 +54,10 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .matrix, .key = "matrix", .label = "Matrix", .configured_message = "Matrix configured", .listener_mode = .polling },
     .{ .id = .mattermost, .key = "mattermost", .label = "Mattermost", .configured_message = "Mattermost configured", .listener_mode = .gateway_loop },
     .{ .id = .whatsapp, .key = "whatsapp", .label = "WhatsApp", .configured_message = "WhatsApp configured", .listener_mode = .webhook_only },
+    .{ .id = .teams, .key = "teams", .label = "Teams", .configured_message = "Teams configured", .listener_mode = .webhook_only },
     .{ .id = .irc, .key = "irc", .label = "IRC", .configured_message = "IRC configured", .listener_mode = .gateway_loop },
     .{ .id = .lark, .key = "lark", .label = "Lark", .configured_message = "Lark configured", .listener_mode = .webhook_only },
-    .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .send_only },
+    .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .gateway_loop },
     .{ .id = .signal, .key = "signal", .label = "Signal", .configured_message = "Signal configured", .listener_mode = .polling },
     .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .polling },
     .{ .id = .line, .key = "line", .label = "Line", .configured_message = "Line configured", .listener_mode = .webhook_only },
@@ -64,6 +67,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .nostr, .key = "nostr", .label = "Nostr", .configured_message = "Nostr configured", .listener_mode = .gateway_loop },
     .{ .id = .web, .key = "web", .label = "Web", .configured_message = "Web configured", .listener_mode = .gateway_loop },
     .{ .id = .whatsapp_web, .key = "whatsapp_web", .label = "WhatsApp Web", .configured_message = "WhatsApp Web configured", .listener_mode = .webhook_only },
+    .{ .id = .max, .key = "max", .label = "Max", .configured_message = "Max configured", .listener_mode = .polling },
 };
 
 pub fn isBuildEnabled(channel_id: ChannelId) bool {
@@ -77,6 +81,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .matrix => build_options.enable_channel_matrix,
         .mattermost => build_options.enable_channel_mattermost,
         .whatsapp => build_options.enable_channel_whatsapp,
+        .teams => build_options.enable_channel_teams,
         .irc => build_options.enable_channel_irc,
         .lark => build_options.enable_channel_lark,
         .dingtalk => build_options.enable_channel_dingtalk,
@@ -89,6 +94,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .nostr => build_options.enable_channel_nostr,
         .web => build_options.enable_channel_web,
         .whatsapp_web => build_options.enable_channel_whatsapp_web,
+        .max => build_options.enable_channel_max,
     };
 }
 
@@ -102,6 +108,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "matrix")) return build_options.enable_channel_matrix;
     if (comptime std.mem.eql(u8, key, "mattermost")) return build_options.enable_channel_mattermost;
     if (comptime std.mem.eql(u8, key, "whatsapp")) return build_options.enable_channel_whatsapp;
+    if (comptime std.mem.eql(u8, key, "teams")) return build_options.enable_channel_teams;
     if (comptime std.mem.eql(u8, key, "irc")) return build_options.enable_channel_irc;
     if (comptime std.mem.eql(u8, key, "lark")) return build_options.enable_channel_lark;
     if (comptime std.mem.eql(u8, key, "dingtalk")) return build_options.enable_channel_dingtalk;
@@ -114,6 +121,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "nostr")) return build_options.enable_channel_nostr;
     if (comptime std.mem.eql(u8, key, "web")) return build_options.enable_channel_web;
     if (comptime std.mem.eql(u8, key, "whatsapp_web")) return build_options.enable_channel_whatsapp_web;
+    if (comptime std.mem.eql(u8, key, "max")) return build_options.enable_channel_max;
     return true;
 }
 
@@ -128,6 +136,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .matrix => cfg.channels.matrix.len,
         .mattermost => cfg.channels.mattermost.len,
         .whatsapp => cfg.channels.whatsapp.len,
+        .teams => cfg.channels.teams.len,
         .irc => cfg.channels.irc.len,
         .lark => cfg.channels.lark.len,
         .dingtalk => cfg.channels.dingtalk.len,
@@ -140,6 +149,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .nostr => if (cfg.channels.nostr != null) 1 else 0,
         .web => cfg.channels.web.len,
         .whatsapp_web => cfg.channels.whatsapp_web.len,
+        .max => cfg.channels.max.len,
     };
 }
 

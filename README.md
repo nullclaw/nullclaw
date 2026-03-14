@@ -22,7 +22,7 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
 
 ```
-678 KB binary · <2 ms startup · 5,500+ tests · 50+ providers · 21 channels · Pluggable everything
+678 KB binary · <2 ms startup · 5,500+ tests · 50+ providers · 22 channels · Pluggable everything
 ```
 
 ### Features
@@ -31,7 +31,7 @@ Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributi
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 50+ providers, 21 channels, 30+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 50+ providers, 22 channels, 35+ tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 - **Adaptive Intelligence:** Post-turn quality scoring, keyword-based skill routing, tiered context loading, session digests, and skill evolution tracking — all built-in, zero extra API calls. See [`examples/adaptive-intelligence/`](examples/adaptive-intelligence/).
 
 ### Why nullclaw
@@ -51,7 +51,7 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
 | **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **5,100+** |
+| **Tests** | — | — | — | 1,017 | **5,300+** |
 | **Source Files** | ~400+ | — | — | ~120 | **~230** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
@@ -224,16 +224,16 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
 | **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, WhatsApp Web, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email (IMAP IDLE), Nostr, QQ, MaixCam, Mattermost | Any messaging API |
-| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse | Any persistence backend |
-| **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, pushover, and more | Any capability |
+| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, WhatsApp Web, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email (IMAP IDLE), Nostr, QQ, MaixCam, Mattermost, Max | Any messaging API |
+| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API | Any persistence backend |
+| **Tools** | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, memory_store, memory_recall, memory_forget, memory_list, browser_open, screenshot, composio, http_request, web_fetch, web_search, delegate, schedule, hardware_info, hardware_memory, pushover, message, spawn, git, image, i2c, spi, and more | Any capability |
 | **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
 | **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed), WASM (wasmtime) | Any runtime |
 | **Security** | `Sandbox` | Landlock, Firejail, Bubblewrap, Docker, auto-detect | Any sandbox backend |
 | **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
 | **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
-| **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
+| **Skills** | Loader | TOML/JSON manifests or YAML frontmatter in `SKILL.md` | Community skill packs |
 | **Peripherals** | `Peripheral` | Serial, Arduino, Raspberry Pi GPIO, STM32/Nucleo | Any hardware interface |
 | **Cron** | Scheduler | Cron expressions + one-shot timers with JSON persistence | — |
 | **Turn Scorer** | `TurnScorer` | Weighted signal scoring [-1,+1] per turn | Observer pipeline |
@@ -243,7 +243,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 
 ### Memory System
 
-All custom, zero external dependencies:
+All custom, zero external dependencies for the core path:
 
 | Layer | Implementation |
 |-------|---------------|
@@ -253,6 +253,7 @@ All custom, zero external dependencies:
 | **Embeddings** | `EmbeddingProvider` vtable — OpenAI, custom URL, or noop |
 | **Hygiene** | Automatic archival + purge of stale memories |
 | **Snapshots** | Export/import full memory state for migration |
+| **Engines** | SQLite (default), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API, None |
 
 ```json
 {
@@ -478,6 +479,119 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 }
 ```
 
+Telegram forum topics:
+
+- Topic session isolation is automatic. You do not add a `topic_id` field under `channels.telegram`.
+- The easiest operator flow is:
+  1. define named agent profiles under `agents.list`
+  2. open the target Telegram chat or forum topic
+  3. run `/bind <agent>`
+- To bind a specific Telegram forum topic to a specific agent, use `bindings[].match.peer.id` with the canonical thread form `"<chat_id>:thread:<topic_id>"`.
+- To bind the whole Telegram group as a fallback for all other topics, keep a normal group binding with `"<chat_id>"`.
+- `/bind status` shows the current effective route and the available agent ids.
+- `/bind clear` removes only the exact binding for the current account/chat/topic and falls back to the broader route.
+- `/bind` persists an exact `bindings[]` entry for the current Telegram account and peer.
+- `/bind status` distinguishes an exact local override from an inherited broader fallback.
+- Topic-specific bindings win over group fallback by route priority; the order in `bindings[]` does not matter.
+- Telegram menu visibility for `/bind` is controlled by `channels.telegram.accounts.<id>.binding_commands_enabled`.
+
+Example:
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "coder",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "group", "id": "-1001234567890:thread:42" }
+      }
+    },
+    {
+      "agent_id": "orchestrator",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "group", "id": "-1001234567890" }
+      }
+    }
+  ]
+}
+```
+
+In that setup, topic `42` routes to `coder`, while the rest of the forum falls back to `orchestrator`.
+
+Named agent profiles are configured separately from bindings. Bindings only choose which named agent handles a given chat/topic.
+
+Minimal end-to-end example:
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "orchestrator",
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-4"
+      },
+      {
+        "id": "coder",
+        "provider": "ollama",
+        "model": "qwen2.5-coder:14b",
+        "system_prompt": "You are the coding agent for this topic."
+      }
+    ]
+  },
+  "channels": {
+    "telegram": {
+      "accounts": {
+        "main": {
+          "bot_token": "123456:ABCDEF",
+          "allow_from": ["YOUR_TELEGRAM_USER_ID"],
+          "binding_commands_enabled": true,
+          "topic_commands_enabled": true,
+          "topic_map_command_enabled": true,
+          "commands_menu_mode": "scoped"
+        }
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agent_id": "orchestrator",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "group", "id": "-1001234567890" }
+      }
+    }
+  ]
+}
+```
+
+Operator flow:
+
+- Send `/bind coder` inside the target forum topic.
+- `nullclaw` writes a new exact `bindings[]` entry to `~/.nullclaw/config.json` for that topic and Telegram account.
+- The next message in that topic uses the new routed agent profile.
+- `nullclaw` must have write access to `~/.nullclaw/config.json` for `/bind` to persist changes.
+
+About `account_id`:
+
+- `account_id` identifies the configured Telegram account entry, not a topic and not an agent.
+- In the usual `channels.telegram.accounts` form, the object key becomes the account id. For example, `accounts.main` means `account_id = "main"`, and `accounts.backup` means `account_id = "backup"`.
+- In `bindings`, `match.account_id` limits that binding to one specific Telegram account.
+- If `match.account_id` is omitted, the binding can match any Telegram account for that channel.
+- Use different account ids only when you run multiple Telegram bot accounts/tokens in the same nullclaw instance.
+
+Effect on delivery:
+
+- Incoming Telegram updates are processed by the account that received them.
+- Routing uses that same `account_id`, so `match.account_id = "main"` matches only messages received by `channels.telegram.accounts.main`.
+- Replies go back out through the same Telegram account/runtime that handled the message.
+- Setting one binding to `account_id = "main"` and another to `account_id = "sub"` does not split one chat across two agents automatically; it scopes each binding to a different configured Telegram account.
+
 ### Full Web Search + Shell Access
 
 Use this when you want full web-search provider control plus unrestricted shell command allowlist behavior:
@@ -578,6 +692,8 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
+| `/.well-known/agent.json` | GET | None | A2A Agent Card discovery (public) |
+| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`) |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
 
@@ -597,6 +713,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `channel status` | Show channel health/status |
 | `cron list\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs |
+| `history list\|show` | View session conversation history |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `models list\|info\|benchmark` | Model catalog |
 | `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
@@ -608,7 +725,7 @@ Build and tests are pinned to **Zig 0.15.2**.
 ```bash
 zig build                          # Dev build
 zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 5,100+ tests
+zig build test --summary all       # 5,300+ tests
 ```
 
 ### Channel Flow Coverage
@@ -625,8 +742,8 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 
 ```
 Language:     Zig 0.15.2
-Source files: ~230
-Lines of code: ~175,000
+Source files: ~250
+Lines of code: ~249,000
 Tests:        5,500+
 Binary:       678 KB (ReleaseSmall)
 Peak RSS:     ~1 MB
@@ -647,7 +764,7 @@ src/
   channels/             19 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
   providers/            50+ AI provider integrations
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
-  tools/                33 tool implementations
+  tools/                35+ tool implementations
   security/             Secrets (ChaCha20), sandbox backends (landlock, firejail, ...)
   cron.zig              Cron scheduler with JSON persistence
   health.zig            Component health registry
@@ -683,17 +800,17 @@ Implement a vtable interface, submit a PR:
 - New `Peripheral` -> `src/peripherals.zig`
 - New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
 
-## 中文文档
+## Chinese Docs (中文文档)
 
-- [中文文档总览](docs/zh/README.md)
-- [安装指南](docs/zh/installation.md)
-- [配置指南](docs/zh/configuration.md)
-- [使用与运维](docs/zh/usage.md)
-- [架构总览](docs/zh/architecture.md)
-- [安全机制](docs/zh/security.md)
-- [Gateway API](docs/zh/gateway-api.md)
-- [命令参考](docs/zh/commands.md)
-- [开发指南](docs/zh/development.md)
+- [Chinese docs overview (中文文档总览)](docs/zh/README.md)
+- [Installation guide (安装指南)](docs/zh/installation.md)
+- [Configuration guide (配置指南)](docs/zh/configuration.md)
+- [Usage and operations (使用与运维)](docs/zh/usage.md)
+- [Architecture overview (架构总览)](docs/zh/architecture.md)
+- [Security model (安全机制)](docs/zh/security.md)
+- [Gateway API (中文)](docs/zh/gateway-api.md)
+- [Commands reference (命令参考)](docs/zh/commands.md)
+- [Development guide (开发指南)](docs/zh/development.md)
 
 ## English Docs
 

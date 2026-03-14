@@ -265,6 +265,9 @@ pub const ToolSpec = struct {
 /// Request payload for provider chat calls.
 pub const ChatRequest = struct {
     messages: []const ChatMessage,
+    /// Optional upstream session identifier (for example, the NullClaw session key).
+    /// Stateful providers can use this to scope their own resume/context handling.
+    session_id: ?[]const u8 = null,
     model: []const u8 = "",
     temperature: f64 = 0.7,
     max_tokens: ?u32 = null,

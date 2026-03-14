@@ -9,6 +9,7 @@ const AtomicBool = std.atomic.Value(bool);
 
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
+const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
     thread_interrupt_flag = flag;
@@ -354,6 +355,7 @@ fn curlGetWithProxyAndResolve(
     timeout_secs: []const u8,
     proxy: ?[]const u8,
     resolve_entry: ?[]const u8,
+    max_bytes: usize,
 ) ![]u8 {
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
@@ -410,7 +412,7 @@ fn curlGetWithProxyAndResolve(
         if (cancel_watcher) |t| t.join();
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, max_bytes) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
@@ -446,7 +448,7 @@ pub fn curlGetWithProxy(
     timeout_secs: []const u8,
     proxy: ?[]const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null);
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
 /// HTTP GET via curl subprocess with a pinned host mapping.
@@ -459,12 +461,23 @@ pub fn curlGetWithResolve(
     timeout_secs: []const u8,
     resolve_entry: []const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry);
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
 /// HTTP GET via curl subprocess (no proxy).
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
+}
+
+/// HTTP GET via curl subprocess with a caller-provided response size cap.
+pub fn curlGetMaxBytes(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, null, max_bytes);
 }
 
 /// Read proxy URL from standard environment variables.
@@ -643,6 +656,10 @@ test "curlGet with zero headers compiles and is callable" {
 
 test "curlGetWithResolve compiles and is callable" {
     try std.testing.expect(true);
+}
+
+test "curlGetMaxBytes compiles and is callable" {
+    _ = curlGetMaxBytes;
 }
 
 test "normalizeProxyEnvValue trims surrounding whitespace" {

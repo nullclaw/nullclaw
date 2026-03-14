@@ -190,7 +190,8 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
 }
 
 /// Load a credential for the given provider from ~/.nullclaw/auth.json.
-/// Returns null if the file is missing, the provider is not found, or the token is expired.
+/// Returns null if the file is missing, the provider is not found, or the token
+/// is expired and cannot be refreshed.
 pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAuthToken {
     const home = platform.getHomeDir(allocator) catch return null;
     defer allocator.free(home);
@@ -253,7 +254,7 @@ pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAut
     const token_type = try allocator.dupe(u8, token_type_raw);
     errdefer allocator.free(token_type);
 
-    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at) {
+    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at and refresh_token == null) {
         allocator.free(access_token);
         if (refresh_token) |rt| allocator.free(rt);
         allocator.free(token_type);

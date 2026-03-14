@@ -32,10 +32,10 @@ NullClaw uses a vtable-driven pluggable architecture. Most capabilities are exte
 
 | Subsystem | Interface | Built-in implementations (partial) | Extension approach |
 |---|---|---|---|
-| AI Models | `Provider` | OpenRouter, Anthropic, OpenAI, Ollama, Groq, and more | Add provider implementation + register |
-| Channels | `Channel` | CLI, Telegram, Signal, Discord, Slack, Matrix, WhatsApp, Nostr, and more | Add channel implementation + register |
-| Memory | `Memory` | SQLite (hybrid retrieval), Markdown | Add memory backend |
-| Tools | `Tool` | shell, file_read, file_write, http_request, browser_open, and more | Add tool implementation |
+| AI Models | `Provider` | OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, Venice, and 41+ OpenAI-compatible endpoints | Add provider implementation + register |
+| Channels | `Channel` | CLI, Telegram, Signal, Discord, Slack, Matrix, WhatsApp, Nostr, IRC, Lark, Line, DingTalk, Email, OneBot, QQ, MaixCam, Mattermost, iMessage, Web | Add channel implementation + register |
+| Memory | `Memory` | SQLite (hybrid retrieval), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API, None | Add memory backend |
+| Tools | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, http_request, web_fetch, web_search, delegate, screenshot, browser_open, and 20+ more | Add tool implementation |
 | Observability | `Observer` | Noop, Log, File, Multi | Add observer backend |
 | Runtime | `RuntimeAdapter` | Native, Docker, WASM | Add runtime adapter |
 | Security | `Sandbox` | Landlock, Firejail, Bubblewrap, Docker(auto) | Add sandbox backend |
@@ -52,6 +52,7 @@ NullClaw uses a vtable-driven pluggable architecture. Most capabilities are exte
 | Embeddings | `EmbeddingProvider` vtable (OpenAI/custom/noop) |
 | Data hygiene | Automatic archive and purge |
 | Snapshots | Full export/import migration path |
+| Engines | SQLite (default), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API, None |
 
 ## Practical Constraints
 

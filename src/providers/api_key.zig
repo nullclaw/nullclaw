@@ -170,6 +170,7 @@ test "providerEnvCandidates includes onboarding env hints" {
     const onboard = @import("../onboard.zig");
 
     for (onboard.known_providers) |provider| {
+        if (provider.env_var.len == 0) continue;
         const candidates = providerEnvCandidates(provider.key);
 
         var matched = false;

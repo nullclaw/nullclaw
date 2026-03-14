@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -11,13 +12,15 @@ const isBinaryContent = @import("file_read.zig").isBinaryContent;
 /// Default maximum file size to read (10MB).
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-/// Generate a 3-character hex hash for a line, ignoring leading/trailing whitespace.
-pub fn generateLineHash(line: []const u8) [3]u8 {
+/// Generate a 3-character hex hash for a line, including parent context.
+pub fn generateLineHash(parent: []const u8, current: []const u8) [3]u8 {
     var hasher = std.hash.Fnv1a_32.init();
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    hasher.update(trimmed);
+    const p_trimmed = std.mem.trim(u8, parent, " \t\r\n");
+    const c_trimmed = std.mem.trim(u8, current, " \t\r\n");
+    hasher.update(p_trimmed);
+    hasher.update("|");
+    hasher.update(c_trimmed);
     const hash = hasher.final();
-    // Truncate to 12 bits (3 hex chars: 0x000 to 0xFFF)
     const truncated = hash & 0xFFF;
     var buf: [3]u8 = undefined;
     _ = std.fmt.bufPrint(&buf, "{x:0>3}", .{truncated}) catch unreachable;
@@ -81,7 +84,7 @@ pub const FileReadHashedTool = struct {
         };
         defer file.close();
 
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
         const effective_max_file_size = @min(self.max_file_size, max_usize_u64);
         if (stat.size > effective_max_file_size) {
@@ -116,9 +119,11 @@ pub const FileReadHashedTool = struct {
 
         var line_it = std.mem.splitScalar(u8, contents, '\n');
         var line_num: usize = 1;
+        var last_line: []const u8 = "";
         while (line_it.next()) |line| {
-            const hash = generateLineHash(line);
+            const hash = generateLineHash(last_line, line);
             try output.writer(allocator).print("L{d}:{s}|{s}\n", .{ line_num, hash, line });
+            last_line = line;
             line_num += 1;
         }
 
@@ -128,13 +133,13 @@ pub const FileReadHashedTool = struct {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-test "generateLineHash is deterministic and ignores whitespace" {
-    const h1 = generateLineHash("  return true;  ");
-    const h2 = generateLineHash("return true;");
-    const h3 = generateLineHash("return false;");
+test "generateLineHash is context-aware" {
+    const h1 = generateLineHash("parent1", "child");
+    const h2 = generateLineHash("parent2", "child");
+    const h3 = generateLineHash("parent1", "child");
 
-    try std.testing.expectEqualStrings(&h1, &h2);
-    try std.testing.expect(!std.mem.eql(u8, &h1, &h3));
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+    try std.testing.expectEqualStrings(&h1, &h3);
 }
 
 test "file_read_hashed adds tags to lines" {

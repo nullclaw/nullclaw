@@ -1,0 +1,55 @@
+{
+  "name": "win-guid",
+  "version": "0.2.1",
+  "description": "Windows legacy GUID parser",
+  "type": "module",
+  "exports": "./lib/guid.js",
+  "scripts": {
+    "clean": "del-cli 'lib/**/*.js' 'lib/**/*.js.map' 'lib/**/*.d.ts' 'src/**/*.d.ts'",
+    "compile-src": "tsc -p lib",
+    "compile": "yarn run  compile-src",
+    "format": "biome format",
+    "lint:ts": "biome check",
+    "build": "yarn run clean && yarn run compile",
+    "test": "mocha",
+    "prepublishOnly": "yarn run build",
+    "update-biome": "yarn add -D --exact @biomejs/biome && npx @biomejs/biome migrate --write"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "lib/*.cjs"
+  ],
+  "author": {
+    "name": "Borewit",
+    "url": "https://github.com/Borewit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Borewit/win-guid.git"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.10",
+    "biome": "^0.3.3",
+    "chai": "^6.2.2",
+    "del-cli": "^7.0.0",
+    "mocha": "^11.7.5",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "yarn@4.9.1",
+  "keywords": [
+    "GUID",
+    "Windows",
+    "COM",
+    "CFBF",
+    "registry",
+    "UEFI",
+    "objectGUID",
+    "GPT",
+    "endianness",
+    "OLE",
+    "binary"
+  ]
+}

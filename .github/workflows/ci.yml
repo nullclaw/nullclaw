@@ -3,6 +3,8 @@ name: CI
 env:
   ANDROID_API_LEVEL: 24
   ANDROID_NDK_VERSION: 29.0.14206865
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  ZIG_VERSION: "0.15.2"
 
 on:
   push:
@@ -32,15 +34,13 @@ jobs:
             zig_target: x86_64-windows
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+        run: bash .github/scripts/install-zig.sh "${ZIG_VERSION}"
 
       - name: Cache Zig build outputs
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .zig-cache
@@ -86,7 +86,7 @@ jobs:
 
       - name: Upload binary
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nullclaw-${{ matrix.target }}
           path: ci-artifacts/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}

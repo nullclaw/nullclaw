@@ -18,10 +18,10 @@ NullClaw 采用 vtable 可插拔架构。多数能力通过接口实现并在工
 
 | 子系统 | 接口 | 内置实现（节选） | 扩展方式 |
 |---|---|---|---|
-| AI Models | `Provider` | OpenRouter、Anthropic、OpenAI、Ollama、Groq 等 22+ | 添加 provider 实现并注册 |
-| Channels | `Channel` | CLI、Telegram、Signal、Discord、Slack、Matrix、WhatsApp、Nostr 等 | 添加 channel 实现并注册 |
-| Memory | `Memory` | SQLite（hybrid 检索）、Markdown | 新增 memory backend |
-| Tools | `Tool` | shell、file_read、file_write、http_request、browser_open 等 | 新增 tool 实现 |
+| AI Models | `Provider` | OpenRouter、Anthropic、OpenAI、Azure OpenAI、Gemini、Vertex AI、Ollama、Groq、Mistral、xAI、DeepSeek、Together、Fireworks、Perplexity、Cohere、Bedrock、Venice 等 50+ | 添加 provider 实现并注册 |
+| Channels | `Channel` | CLI、Telegram、Signal、Discord、Slack、Matrix、WhatsApp、Nostr、IRC、Lark、Line、DingTalk、Email、OneBot、QQ、MaixCam、Mattermost、iMessage、Web | 添加 channel 实现并注册 |
+| Memory | `Memory` | SQLite（hybrid 检索）、Markdown、ClickHouse、PostgreSQL、Redis、LanceDB、Lucid、LRU、API、None | 新增 memory backend |
+| Tools | `Tool` | shell、file_read、file_write、file_edit、file_edit_hashed、file_read_hashed、file_append、http_request、web_fetch、web_search、delegate、screenshot、browser_open 等 35+ | 新增 tool 实现 |
 | Observability | `Observer` | Noop、Log、File、Multi | 对接监控系统 |
 | Runtime | `RuntimeAdapter` | Native、Docker、WASM | 新增 runtime adapter |
 | Security | `Sandbox` | Landlock、Firejail、Bubblewrap、Docker(auto) | 新增 sandbox backend |
@@ -38,6 +38,7 @@ NullClaw 采用 vtable 可插拔架构。多数能力通过接口实现并在工
 | EmbeddingProvider | 通过 vtable 接入 OpenAI/自定义/noop |
 | 数据生命周期 | 自动归档 + 清理 |
 | 快照迁移 | 全量导出/导入 memory 状态 |
+| 引擎 | SQLite（默认）、Markdown、ClickHouse、PostgreSQL、Redis、LanceDB、Lucid、LRU、API、None |
 
 ## 架构约束（实战建议）
 

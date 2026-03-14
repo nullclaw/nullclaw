@@ -33,6 +33,15 @@ const PrimaryModelRef = struct {
     model: []const u8,
 };
 
+fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAgentConfig) void {
+    allocator.free(agent_cfg.name);
+    allocator.free(agent_cfg.provider);
+    allocator.free(agent_cfg.model);
+    if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
+    if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+    if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+}
+
 fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
     if (std.mem.startsWith(u8, primary, "custom:")) {
@@ -127,8 +136,32 @@ fn parseNamedAgentObject(
         .provider = try allocator.dupe(u8, resolved_ref.?.provider),
         .model = try allocator.dupe(u8, resolved_ref.?.model),
     };
+    errdefer freeNamedAgentConfig(allocator, &agent_cfg);
     if (item.object.get("system_prompt")) |sp| {
-        if (sp == .string) agent_cfg.system_prompt = try allocator.dupe(u8, sp.string);
+        if (sp == .string) {
+            const val = sp.string;
+            if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
+                const file_content = blk: {
+                    const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
+                        std.log.warn("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                    defer file.close();
+                    break :blk file.readToEndAlloc(allocator, 64 * 1024) catch |err| {
+                        std.log.warn("system_prompt failed to read file '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                };
+                if (file_content) |content| {
+                    agent_cfg.system_prompt = content;
+                    agent_cfg.system_prompt_path = try allocator.dupe(u8, val);
+                } else {
+                    agent_cfg.system_prompt = try allocator.dupe(u8, val);
+                }
+            } else {
+                agent_cfg.system_prompt = try allocator.dupe(u8, val);
+            }
+        }
     }
     if (item.object.get("api_key")) |ak| {
         if (ak == .string) agent_cfg.api_key = try allocator.dupe(u8, ak.string);
@@ -584,12 +617,17 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (agents_val.object.get("list")) |list_val| {
                 if (list_val == .array) {
                     var list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                    errdefer {
+                        for (list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                        list.deinit(self.allocator);
+                    }
                     try list.ensureTotalCapacity(self.allocator, @intCast(list_val.array.items.len));
                     for (list_val.array.items) |item| {
                         if (item == .object) {
                             const name_val = item.object.get("id") orelse item.object.get("name") orelse continue;
                             if (name_val != .string) continue;
-                            const agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
+                            var agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
+                            errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                             try list.append(self.allocator, agent_cfg);
                         }
                     }
@@ -601,11 +639,16 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             // "agents": { "defaults": {...}, "coder": {...}, "researcher": {...} }
             if (self.agents.len == 0) {
                 var named_agent_list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                errdefer {
+                    for (named_agent_list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                    named_agent_list.deinit(self.allocator);
+                }
                 var it = agents_val.object.iterator();
                 while (it.next()) |entry| {
                     const key = entry.key_ptr.*;
                     if (std.mem.eql(u8, key, "defaults") or std.mem.eql(u8, key, "list")) continue;
-                    const agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    var agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                     try named_agent_list.append(self.allocator, agent_cfg);
                 }
                 self.agents = try named_agent_list.toOwnedSlice(self.allocator);
@@ -1598,6 +1641,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // A2A (Agent-to-Agent protocol)
+    if (root.get("a2a")) |a2a| {
+        if (a2a == .object) {
+            if (a2a.object.get("enabled")) |v| {
+                if (v == .bool) self.a2a.enabled = v.bool;
+            }
+            if (a2a.object.get("name")) |v| {
+                if (v == .string) self.a2a.name = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("description")) |v| {
+                if (v == .string) self.a2a.description = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("url")) |v| {
+                if (v == .string) self.a2a.url = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("version")) |v| {
+                if (v == .string) self.a2a.version = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
     // Identity
     if (root.get("identity")) |id| {
         if (id == .object) {
@@ -1816,6 +1880,58 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         if (tun == .object) {
             if (tun.object.get("provider")) |v| {
                 if (v == .string) self.tunnel.provider = try self.allocator.dupe(u8, v.string);
+            }
+            // cloudflare sub-config
+            if (tun.object.get("cloudflare")) |cf| {
+                if (cf == .object) {
+                    var cf_cfg = types.CloudflareTunnelConfig{};
+                    if (cf.object.get("token")) |tok| {
+                        if (tok == .string) cf_cfg.token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    self.tunnel.cloudflare = cf_cfg;
+                }
+            }
+            // ngrok sub-config
+            if (tun.object.get("ngrok")) |ng| {
+                if (ng == .object) {
+                    var ng_cfg = types.NgrokTunnelConfig{};
+                    if (ng.object.get("auth_token")) |tok| {
+                        if (tok == .string) ng_cfg.auth_token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    if (ng.object.get("domain")) |dom| {
+                        if (dom == .string) ng_cfg.domain = try self.allocator.dupe(u8, dom.string);
+                    }
+                    self.tunnel.ngrok = ng_cfg;
+                }
+            }
+            // tailscale sub-config
+            if (tun.object.get("tailscale")) |ts| {
+                if (ts == .object) {
+                    var ts_cfg = types.TailscaleTunnelConfig{};
+                    if (ts.object.get("funnel")) |fnl| {
+                        if (fnl == .bool) ts_cfg.funnel = fnl.bool;
+                    }
+                    if (ts.object.get("hostname")) |hn| {
+                        if (hn == .string) ts_cfg.hostname = try self.allocator.dupe(u8, hn.string);
+                    }
+                    self.tunnel.tailscale = ts_cfg;
+                }
+            }
+            // custom sub-config
+            if (tun.object.get("custom")) |cst| {
+                if (cst == .object) {
+                    var cst_cfg = types.CustomTunnelConfig{};
+                    if (cst.object.get("start_command")) |cmd| {
+                        if (cmd == .string) cst_cfg.start_command = try self.allocator.dupe(u8, cmd.string);
+                    }
+                    if (cst.object.get("health_url")) |hu| {
+                        if (hu == .string) cst_cfg.health_url = try self.allocator.dupe(u8, hu.string);
+                    }
+                    if (cst.object.get("url_pattern")) |up| {
+                        if (up == .string) cst_cfg.url_pattern = try self.allocator.dupe(u8, up.string);
+                    }
+                    self.tunnel.custom = cst_cfg;
+                }
             }
         }
     }

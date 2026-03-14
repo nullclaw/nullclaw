@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -214,7 +215,7 @@ test "file_edit basic replace" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Replaced") != null);
 
     // Verify file contents
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
 }
@@ -296,7 +297,7 @@ test "file_edit replaces only first occurrence" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "dup.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "dup.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("ccc bbb aaa", actual);
 }
@@ -409,7 +410,7 @@ test "file_edit absolute path with allowed_paths works" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
 }
@@ -471,7 +472,7 @@ test "file_edit does not bypass allowed_paths for bootstrap memory edits" {
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("alpha", content);
 
-    const outside_after = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 1024);
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "AGENTS.md", 1024);
     defer std.testing.allocator.free(outside_after);
     try std.testing.expectEqualStrings("outside-before", outside_after);
 }

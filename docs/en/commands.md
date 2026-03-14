@@ -120,6 +120,13 @@ Notes:
 | `nullclaw skills remove <name>` | Remove a skill |
 | `nullclaw skills info <name>` | Show skill metadata |
 
+### `history`
+
+| Command | Purpose |
+|---|---|
+| `nullclaw history list [--limit N] [--offset N] [--json]` | List conversation sessions |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | Show messages for a session |
+
 ## Data, models, and workspace
 
 ### `memory`

@@ -109,9 +109,17 @@ pub const CronAddTool = struct {
 
 /// Load the CronScheduler from persisted state (~/.nullclaw/cron.json).
 /// Shared by cron_add, cron_list, cron_remove, and schedule tools.
+///
+/// Uses strict loading to prevent data loss: if the cron store is corrupt or
+/// unreadable, the error is propagated so callers fail cleanly rather than
+/// silently proceeding with an empty job list (which would overwrite the
+/// persisted jobs on the next saveJobs call).
 pub fn loadScheduler(allocator: std.mem.Allocator) !CronScheduler {
     var scheduler = CronScheduler.init(allocator, 1024, true);
-    cron.loadJobs(&scheduler) catch {};
+    cron.loadJobsStrict(&scheduler) catch |err| {
+        scheduler.deinit();
+        return err;
+    };
     return scheduler;
 }
 

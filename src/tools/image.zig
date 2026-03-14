@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -45,7 +46,7 @@ pub const ImageInfoTool = struct {
     fn executeWithFile(file: std.fs.File, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
         defer file.close();
 
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         if (stat.size > MAX_IMAGE_BYTES) {
             const msg = try std.fmt.allocPrint(
                 allocator,

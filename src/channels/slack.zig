@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const interaction_choices = @import("../interactions/choices.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 
@@ -12,6 +13,72 @@ const invalid_socket: SocketFd = switch (builtin.os.tag) {
     .windows => std.os.windows.ws2_32.INVALID_SOCKET,
     else => -1,
 };
+
+const CALLBACK_VALUE_PREFIX = "ncslack:";
+const DEFAULT_INTERACTION_TTL_SECS: u64 = 900;
+
+const PendingInteractionOption = struct {
+    id: []const u8,
+    label: []const u8,
+    submit_text: []const u8,
+
+    fn deinit(self: *const PendingInteractionOption, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.label);
+        allocator.free(self.submit_text);
+    }
+};
+
+const PendingInteraction = struct {
+    allocator: std.mem.Allocator,
+    created_at: u64,
+    expires_at: u64,
+    account_id: []const u8,
+    target: []const u8,
+    owner_identity: ?[]const u8 = null,
+    options: []PendingInteractionOption,
+
+    fn deinit(self: *const PendingInteraction) void {
+        self.allocator.free(self.account_id);
+        self.allocator.free(self.target);
+        if (self.owner_identity) |owner| self.allocator.free(owner);
+        for (self.options) |opt| opt.deinit(self.allocator);
+        self.allocator.free(self.options);
+    }
+};
+
+pub const CallbackSelection = union(enum) {
+    ok: struct {
+        submit_text: []u8,
+        target: []u8,
+    },
+    not_found,
+    expired,
+    owner_mismatch,
+    invalid_option,
+};
+
+var shared_interactions_mu: std.Thread.Mutex = .{};
+var shared_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty;
+var shared_interaction_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+
+fn sharedInteractionsAllocator() std.mem.Allocator {
+    return if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
+}
+
+fn validateChoices(choices: []const root.Channel.OutboundChoice) bool {
+    if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) {
+        return false;
+    }
+
+    for (choices) |choice| {
+        if (choice.id.len == 0 or choice.id.len > interaction_choices.MAX_ID_LEN) return false;
+        if (choice.label.len == 0 or choice.label.len > interaction_choices.MAX_LABEL_LEN) return false;
+        if (choice.submit_text.len == 0 or choice.submit_text.len > interaction_choices.MAX_SUBMIT_TEXT_LEN) return false;
+    }
+
+    return true;
+}
 
 /// Slack channel — socket/http event pipeline for inbound, chat.postMessage for outbound.
 pub const SlackChannel = struct {
@@ -851,6 +918,193 @@ pub const SlackChannel = struct {
         try body_list.append(self.allocator, '}');
     }
 
+    fn nextInteractionToken(self: *const SlackChannel) ![]u8 {
+        var token_buf: [32]u8 = undefined;
+        const seq = shared_interaction_seq.fetchAdd(1, .monotonic);
+        const token = std.fmt.bufPrint(&token_buf, "{x}", .{seq}) catch unreachable;
+        return self.allocator.dupe(u8, token);
+    }
+
+    fn registerPendingInteraction(
+        self: *SlackChannel,
+        token: []const u8,
+        target: []const u8,
+        owner_identity: ?[]const u8,
+        choices: []const root.Channel.OutboundChoice,
+    ) !void {
+        const interaction_allocator = sharedInteractionsAllocator();
+        const now = root.nowEpochSecs();
+
+        var options = try interaction_allocator.alloc(PendingInteractionOption, choices.len);
+        var built: usize = 0;
+        errdefer {
+            for (options[0..built]) |opt| opt.deinit(interaction_allocator);
+            interaction_allocator.free(options);
+        }
+
+        for (choices, 0..) |choice, i| {
+            options[i] = .{
+                .id = try interaction_allocator.dupe(u8, choice.id),
+                .label = try interaction_allocator.dupe(u8, choice.label),
+                .submit_text = try interaction_allocator.dupe(u8, choice.submit_text),
+            };
+            built += 1;
+        }
+
+        const key = try interaction_allocator.dupe(u8, token);
+        errdefer interaction_allocator.free(key);
+        const target_dup = try interaction_allocator.dupe(u8, target);
+        errdefer interaction_allocator.free(target_dup);
+        const account_id_dup = try interaction_allocator.dupe(u8, self.account_id);
+        errdefer interaction_allocator.free(account_id_dup);
+        const owner_dup = if (owner_identity) |owner|
+            try interaction_allocator.dupe(u8, owner)
+        else
+            null;
+        errdefer if (owner_dup) |owner| interaction_allocator.free(owner);
+
+        shared_interactions_mu.lock();
+        defer shared_interactions_mu.unlock();
+
+        self.expireInteractionsLocked(now);
+
+        try shared_interactions.put(interaction_allocator, key, .{
+            .allocator = interaction_allocator,
+            .created_at = now,
+            .expires_at = now + DEFAULT_INTERACTION_TTL_SECS,
+            .account_id = account_id_dup,
+            .target = target_dup,
+            .owner_identity = owner_dup,
+            .options = options,
+        });
+    }
+
+    fn expireInteractionsLocked(self: *SlackChannel, now: u64) void {
+        _ = self;
+        while (true) {
+            var expired_key: ?[]const u8 = null;
+            var it = shared_interactions.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.expires_at < now) {
+                    expired_key = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = expired_key orelse break;
+            if (shared_interactions.fetchRemove(key)) |removed| {
+                removed.value.deinit();
+                removed.value.allocator.free(@constCast(removed.key));
+            }
+        }
+
+        if (shared_interactions.count() == 0) {
+            shared_interactions.deinit(sharedInteractionsAllocator());
+            shared_interactions = .empty;
+        }
+    }
+
+    pub fn consumeInteractionSelection(
+        self: *SlackChannel,
+        token: []const u8,
+        option_index: usize,
+        sender_identity: []const u8,
+    ) CallbackSelection {
+        shared_interactions_mu.lock();
+        defer shared_interactions_mu.unlock();
+
+        const now = root.nowEpochSecs();
+        self.expireInteractionsLocked(now);
+
+        const interaction = shared_interactions.getPtr(token) orelse return .not_found;
+        if (!std.ascii.eqlIgnoreCase(interaction.account_id, self.account_id)) return .not_found;
+        if (interaction.owner_identity) |owner| {
+            if (!std.ascii.eqlIgnoreCase(owner, sender_identity)) return .owner_mismatch;
+        }
+        if (option_index >= interaction.options.len) return .invalid_option;
+
+        const submit_text = self.allocator.dupe(u8, interaction.options[option_index].submit_text) catch return .invalid_option;
+        errdefer self.allocator.free(submit_text);
+        const target = self.allocator.dupe(u8, interaction.target) catch return .invalid_option;
+        errdefer self.allocator.free(target);
+
+        if (shared_interactions.fetchRemove(token)) |removed| {
+            removed.value.deinit();
+            removed.value.allocator.free(@constCast(removed.key));
+        }
+
+        return .{ .ok = .{
+            .submit_text = submit_text,
+            .target = target,
+        } };
+    }
+
+    fn deinitPendingInteractions(self: *SlackChannel) void {
+        shared_interactions_mu.lock();
+        defer shared_interactions_mu.unlock();
+
+        while (true) {
+            var matching_key: ?[]const u8 = null;
+            var it = shared_interactions.iterator();
+            while (it.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.value_ptr.account_id, self.account_id)) {
+                    matching_key = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = matching_key orelse break;
+            if (shared_interactions.fetchRemove(key)) |removed| {
+                removed.value.deinit();
+                removed.value.allocator.free(@constCast(removed.key));
+            }
+        }
+
+        if (shared_interactions.count() == 0) {
+            shared_interactions.deinit(sharedInteractionsAllocator());
+            shared_interactions = .empty;
+        }
+    }
+
+    fn appendInteractivePostMessageBody(
+        self: *SlackChannel,
+        body_list: *std.ArrayListUnmanaged(u8),
+        actual_channel: []const u8,
+        text: []const u8,
+        token: []const u8,
+        choices: []const root.Channel.OutboundChoice,
+    ) !void {
+        const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+        defer self.allocator.free(mrkdwn_text);
+
+        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
+        try body_list.appendSlice(self.allocator, actual_channel);
+        try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
+        try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
+        if (self.thread_ts) |tts| {
+            try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
+            try body_list.appendSlice(self.allocator, tts);
+            try body_list.append(self.allocator, '"');
+        }
+        try body_list.appendSlice(self.allocator, ",\"blocks\":[{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":");
+        try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
+        try body_list.appendSlice(self.allocator, "}},{\"type\":\"actions\",\"elements\":[");
+        for (choices, 0..) |choice, i| {
+            if (i > 0) try body_list.append(self.allocator, ',');
+            const callback_value = try std.fmt.allocPrint(self.allocator, "{s}{s}:{d}", .{ CALLBACK_VALUE_PREFIX, token, i });
+            defer self.allocator.free(callback_value);
+
+            try body_list.appendSlice(self.allocator, "{\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":");
+            try root.json_util.appendJsonString(body_list, self.allocator, choice.label);
+            try body_list.appendSlice(self.allocator, "},\"value\":");
+            try root.json_util.appendJsonString(body_list, self.allocator, callback_value);
+            try body_list.appendSlice(self.allocator, ",\"action_id\":");
+            try root.json_util.appendJsonString(body_list, self.allocator, choice.id);
+            try body_list.append(self.allocator, '}');
+        }
+        try body_list.appendSlice(self.allocator, "]}]}");
+    }
+
     /// Send a message to a Slack channel via chat.postMessage API.
     /// The target may contain "channel_id:thread_ts" for threaded replies.
     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
@@ -880,6 +1134,38 @@ pub const SlackChannel = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return error.SlackApiError;
         try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
+    }
+
+    pub fn sendRichPayload(self: *SlackChannel, target_channel: []const u8, payload: root.Channel.OutboundPayload) !void {
+        if (payload.attachments.len > 0) return error.NotSupported;
+        if (payload.choices.len == 0) return self.sendMessage(target_channel, payload.text);
+        if (!validateChoices(payload.choices)) return error.InvalidChoices;
+
+        const actual_channel = self.parseTarget(target_channel);
+        const token = try self.nextInteractionToken();
+        defer self.allocator.free(token);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        try self.appendInteractivePostMessageBody(&body_list, actual_channel, payload.text, token, payload.choices);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, API_BASE ++ "/chat.postMessage", body_list.items, &.{auth_header}) catch |err| {
+            log.err("Slack API POST failed: {}", .{err});
+            return error.SlackApiError;
+        };
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
+
+        try self.registerPendingInteraction(token, target_channel, null, payload.choices);
     }
 
     /// Set Slack Assistant thread status (best-effort, errors ignored).
@@ -1015,6 +1301,7 @@ pub const SlackChannel = struct {
             self.allocator.free(api_app_id);
             self.bot_api_app_id = null;
         }
+        self.deinitPendingInteractions();
         self.clearChannelCursors();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
@@ -1026,6 +1313,11 @@ pub const SlackChannel = struct {
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
+    }
+
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichPayload(target, payload);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -1052,6 +1344,7 @@ pub const SlackChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
@@ -1832,6 +2125,33 @@ test "sendMessage payload converts markdown to mrkdwn" {
 
     const mrkdwn_value = parsed.value.object.get("mrkdwn") orelse return error.TestExpectedEqual;
     try std.testing.expect(mrkdwn_value == .bool and mrkdwn_value.bool);
+}
+
+test "slack pending interactions survive across channel instances" {
+    var sender = SlackChannel.init(std.testing.allocator, "tok", null, null, &.{});
+    sender.account_id = "main";
+    defer sender.deinitPendingInteractions();
+
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
+    };
+    try sender.registerPendingInteraction("tok1", "C123:1700.1", null, &choices);
+
+    var receiver = SlackChannel.init(std.testing.allocator, "tok", null, null, &.{});
+    receiver.account_id = "main";
+
+    const result = receiver.consumeInteractionSelection("tok1", 0, "U123");
+    switch (result) {
+        .ok => |selection| {
+            defer std.testing.allocator.free(selection.submit_text);
+            defer std.testing.allocator.free(selection.target);
+            try std.testing.expectEqualStrings("Confirm action", selection.submit_text);
+            try std.testing.expectEqualStrings("C123:1700.1", selection.target);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(receiver.consumeInteractionSelection("tok1", 0, "U123") == .not_found);
 }
 
 test "slack channel interface returns slack name" {

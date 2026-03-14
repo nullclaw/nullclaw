@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -308,7 +309,7 @@ test "file_write creates file" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "8 bytes") != null);
 
     // Verify file contents
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "out.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "out.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("written!", actual);
 }
@@ -329,7 +330,7 @@ test "file_write creates parent dirs" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "a/b/c/deep.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "a/b/c/deep.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("deep", actual);
 }
@@ -351,7 +352,7 @@ test "file_write overwrites existing" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "exist.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "exist.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("new", actual);
 }
@@ -442,7 +443,7 @@ test "file_write blocks symlink target escape outside workspace" {
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
 
-    const outside_actual = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "outside.txt", 1024);
+    const outside_actual = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "outside.txt", 1024);
     defer std.testing.allocator.free(outside_actual);
     try std.testing.expectEqualStrings("safe", outside_actual);
 }
@@ -477,11 +478,11 @@ test "file_write does not mutate outside inode through hard link" {
     try std.testing.expect(result.success);
     try std.testing.expect(result.error_msg == null);
 
-    const workspace_actual = try ws_tmp.dir.readFileAlloc(std.testing.allocator, "hl.txt", 1024);
+    const workspace_actual = try fs_compat.readFileAlloc(ws_tmp.dir, std.testing.allocator, "hl.txt", 1024);
     defer std.testing.allocator.free(workspace_actual);
     try std.testing.expectEqualStrings("PWNED", workspace_actual);
 
-    const outside_actual = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "outside.txt", 1024);
+    const outside_actual = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "outside.txt", 1024);
     defer std.testing.allocator.free(outside_actual);
     try std.testing.expectEqualStrings("SAFE", outside_actual);
 }
@@ -510,7 +511,7 @@ test "file_write keeps symlink and updates target" {
     const link_target = try ws_tmp.dir.readLink("link.txt", &link_buf);
     try std.testing.expectEqualStrings("target.txt", link_target);
 
-    const target_actual = try ws_tmp.dir.readFileAlloc(std.testing.allocator, "target.txt", 1024);
+    const target_actual = try fs_compat.readFileAlloc(ws_tmp.dir, std.testing.allocator, "target.txt", 1024);
     defer std.testing.allocator.free(target_actual);
     try std.testing.expectEqualStrings("new", target_actual);
 }
@@ -638,7 +639,7 @@ test "file_write does not bypass allowed_paths for bootstrap memory writes" {
     defer if (from_mem) |content| std.testing.allocator.free(content);
     try std.testing.expect(from_mem == null);
 
-    const outside_after = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 1024);
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "AGENTS.md", 1024);
     defer std.testing.allocator.free(outside_after);
     try std.testing.expectEqualStrings("outside-before", outside_after);
 }

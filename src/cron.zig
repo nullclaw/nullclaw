@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
+const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
 const Config = @import("config.zig").Config;
 
@@ -241,12 +242,14 @@ fn parseCronField(raw_field: []const u8, min: u8, max: u8, allow_sunday_7: bool,
 
         var range_part = part;
         var step: u8 = 1;
+        var has_step = false;
         if (std.mem.indexOfScalar(u8, part, '/')) |slash_idx| {
             range_part = std.mem.trim(u8, part[0..slash_idx], " \t");
             const step_raw = std.mem.trim(u8, part[slash_idx + 1 ..], " \t");
             if (range_part.len == 0 or step_raw.len == 0) return error.InvalidCronExpression;
             step = std.fmt.parseInt(u8, step_raw, 10) catch return error.InvalidCronExpression;
             if (step == 0) return error.InvalidCronExpression;
+            has_step = true;
         }
 
         var start_raw: u8 = min;
@@ -262,7 +265,12 @@ fn parseCronField(raw_field: []const u8, min: u8, max: u8, allow_sunday_7: bool,
             if (start_raw > end_raw) return error.InvalidCronExpression;
         } else {
             start_raw = try parseCronRawValue(range_part, min, max, allow_sunday_7);
-            end_raw = start_raw;
+            if (has_step) {
+                start_raw = normalizeCronValue(start_raw, allow_sunday_7);
+                end_raw = max;
+            } else {
+                end_raw = start_raw;
+            }
         }
 
         var raw_value = start_raw;
@@ -1117,7 +1125,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
 
-    const content = std.fs.cwd().readFileAlloc(scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return,
         else => switch (policy) {
             .best_effort => return,
@@ -1930,6 +1938,13 @@ test "normalizeExpression 4 fields invalid" {
 
 test "nextRunForCronExpression supports step minutes" {
     try std.testing.expectEqual(@as(i64, 300), try nextRunForCronExpression("*/5 * * * *", 0));
+}
+
+test "nextRunForCronExpression supports anchored step minutes" {
+    try std.testing.expectEqual(@as(i64, 480), try nextRunForCronExpression("8/25 * * * *", 0));
+    try std.testing.expectEqual(@as(i64, 1980), try nextRunForCronExpression("8/25 * * * *", 480));
+    try std.testing.expectEqual(@as(i64, 3480), try nextRunForCronExpression("8/25 * * * *", 1980));
+    try std.testing.expectEqual(@as(i64, 4080), try nextRunForCronExpression("8/25 * * * *", 3480));
 }
 
 test "nextRunForCronExpression supports hourly schedule" {
@@ -2788,6 +2803,25 @@ test "tick reschedules recurring job using cron expression" {
 
     _ = scheduler.tick(0, null);
     try std.testing.expectEqual(@as(i64, 600), scheduler.jobs.items[0].next_run_secs);
+}
+
+test "tick reschedules anchored recurring job using cron expression" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("8/25 * * * *", "echo anchored");
+    scheduler.jobs.items[0].next_run_secs = 480;
+
+    _ = scheduler.tick(480, null);
+    try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expectEqual(@as(i64, 1980), scheduler.jobs.items[0].next_run_secs);
+
+    _ = scheduler.tick(1980, null);
+    try std.testing.expectEqual(@as(i64, 3480), scheduler.jobs.items[0].next_run_secs);
+
+    _ = scheduler.tick(3480, null);
+    try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
 }
 
 test "cron module compiles" {}

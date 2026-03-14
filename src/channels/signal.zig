@@ -36,6 +36,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
 const sse_client = @import("../sse_client.zig");
 const platform = @import("../platform.zig");
 const thread_stacks = @import("../thread_stacks.zig");
@@ -782,7 +783,7 @@ pub const SignalChannel = struct {
         }
 
         for (attachments) |path| {
-            const file_data = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch |err| {
+            const file_data = fs_compat.readFileAlloc(std.fs.cwd(), self.allocator, path, 10 * 1024 * 1024) catch |err| {
                 log.warn("Signal: failed to read attachment {s}: {}", .{ path, err });
                 continue;
             };

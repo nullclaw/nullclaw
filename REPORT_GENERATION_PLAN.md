@@ -1,6 +1,6 @@
 # Report Generation & Delivery — Onderzoeksresultaten + Plan
 
-> **Status:** Zig delivery pipeline KLAAR — nullclaw-rag PDF generatie nog te doen
+> **Status:** Zig delivery pipeline KLAAR, skill KLAAR — nullclaw-rag PDF generatie nog te doen (prio 7)
 > **Datum:** 13 maart 2026
 > **Laatste update:** 13 maart 2026
 > **Doel:** Donna kan op verzoek PDF-rapporten genereren en bezorgen via WhatsApp, e-mail, Telegram of NAS
@@ -110,15 +110,15 @@ Gebruiker: "Maak een performance rapport van afgelopen week"
 - Skill `nas-documents` met `write_file` en `copy_from_workspace` commands
 - NAS gemount op `/mnt/nas/donna/` met `rapporten/` subfolder
 
-### Fase C — Report Generation Tool
+### Fase C — Report Generation Skill ✅ KLAAR
 
-**Nieuw Zig tool:** `report_generate`
-- Parameters: `type`, `period`, `filters`, `delivery` (channel/nas/download)
+**Donna skill:** `report-generation` (geen Zig tool nodig — zelfde patroon als `rag-knowledge`)
+- Script: `scripts/generate_report.py` met commands: `generate`, `status`, `download`
+- Hergebruikt RAG API auth (`auth/rag-knowledge.json`)
 - Flow:
-  1. POST naar nullclaw-rag `/api/v1/reports`
-  2. Download PDF naar temp pad
-  3. Stuur via gekozen kanaal met `[DOCUMENT:]` marker
-  4. Of: kopieer naar NAS pad
+  1. `generate --type=skill_performance --period=7d` → POST + poll + download PDF
+  2. Donna stuurt `[DOCUMENT:/path/to/report.pdf]` via kanaal
+  3. Of: kopieert naar NAS via `nas-documents` skill
 
 ---
 
@@ -133,7 +133,7 @@ Gebruiker: "Maak een performance rapport van afgelopen week"
 | ~~5~~ | ~~E-mail bijlagen~~ | ✅ Klaar | `sendMessageWithMedia()` + MIME + 6 tests |
 | ~~6~~ | ~~NAS delivery~~ | ✅ Klaar | `nas-documents` skill |
 | **7** | **nullclaw-rag: report endpoint + dompdf** | 🔜 TODO | Maakt PDF generatie mogelijk |
-| **8** | **report_generate Zig tool** | 🔜 TODO | Wacht op nullclaw-rag endpoint |
+| ~~8~~ | ~~report-generation skill~~ | ✅ Klaar | Python script + SKILL.md, hergebruikt RAG auth |
 
 ---
 

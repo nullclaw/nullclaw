@@ -63,6 +63,8 @@ nullclaw gateway
 | `nullclaw channel start telegram` | Start a specific channel |
 | `nullclaw migrate openclaw --dry-run` | Dry-run OpenClaw migration |
 | `nullclaw migrate openclaw` | Execute OpenClaw migration |
+| `nullclaw history list [--json]` | List conversation sessions |
+| `nullclaw history show <session_id> [--json]` | Show messages for a session |
 
 ## Service Mode Recommendations
 
@@ -138,6 +140,34 @@ Common causes:
 - Still bound to `127.0.0.1`.
 - Tunnel/reverse proxy not configured.
 - Firewall port not opened.
+
+### 5) Provider returns 429 / "rate limit exceeded"
+
+Common causes:
+
+- Low-quota coding plans may reject tool-heavy agent turns even when plain chat still works.
+- Retry pressure is too aggressive for the current provider plan.
+- There is no configured fallback when the primary provider hits quota/rate limits.
+
+Checks:
+
+- For foreground runs, start with `nullclaw agent --verbose`.
+- For service mode, inspect `~/.nullclaw/logs/daemon.stdout.log` and `~/.nullclaw/logs/daemon.stderr.log`.
+- Run `nullclaw status` to confirm the current provider/model pair.
+
+If the plan is valid but fragile, tune reliability conservatively:
+
+```json
+{
+  "reliability": {
+    "provider_retries": 1,
+    "provider_backoff_ms": 3000,
+    "fallback_providers": ["openrouter"]
+  }
+}
+```
+
+If you have multiple keys for the same provider, add `reliability.api_keys` so NullClaw can rotate them.
 
 ## Post-Change Checklist
 

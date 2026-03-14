@@ -13,6 +13,7 @@ pub const TelegramBotCommandScope = enum {
 
 pub const TelegramBotCommandOptions = struct {
     scope: TelegramBotCommandScope = .default,
+    include_bind_command: bool = true,
     include_topic_command: bool = true,
     include_topics_command: bool = true,
 };
@@ -40,6 +41,7 @@ pub const HELP_TEXT =
     \\
     \\Tasks and agents:
     \\  /subagents, /tasks, /agents, /poll, /focus, /unfocus, /kill, /steer, /tell
+    \\  /bind <agent|clear|status>
     \\
     \\Access and integrations:
     \\  /allowlist, /approve, /context
@@ -77,6 +79,7 @@ const PRIMARY_TELEGRAM_BOT_COMMANDS = [_]TelegramBotCommand{
     .{ .command = "doctor", .description = "Memory diagnostics quick check" },
     .{ .command = "tasks", .description = "List background tasks" },
     .{ .command = "agents", .description = "Show active agents" },
+    .{ .command = "bind", .description = "Bind current chat to an agent" },
     .{ .command = "poll", .description = "Show pending tasks and approvals" },
     .{ .command = "stop", .description = "Stop active background task" },
     .{ .command = "restart", .description = "Restart current session" },
@@ -129,6 +132,7 @@ pub fn buildTelegramBotCommandsJson(
     try out.appendSlice(allocator, "{\"commands\":[");
     var first = true;
     for (PRIMARY_TELEGRAM_BOT_COMMANDS) |cmd| {
+        if (!opts.include_bind_command and std.mem.eql(u8, cmd.command, "bind")) continue;
         try appendTelegramBotCommand(&out, allocator, cmd, first);
         first = false;
     }
@@ -247,6 +251,7 @@ test "telegram bot command payload includes grouped menu commands" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"skill\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"doctor\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"tasks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"bind\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"poll\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topics\"") != null);
@@ -263,6 +268,16 @@ test "buildTelegramBotCommandsJson omits topic commands when disabled" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"menu\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topic\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topics\"") == null);
+}
+
+test "buildTelegramBotCommandsJson omits bind command when disabled" {
+    const json = try buildTelegramBotCommandsJson(std.testing.allocator, .{
+        .include_bind_command = false,
+    });
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"menu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"bind\"") == null);
 }
 
 test "buildTelegramBotCommandsJson omits topic commands in private scope" {

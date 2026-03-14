@@ -31,6 +31,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message payload: `{"message":"..."}` |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
+| `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
 
 ## Quick Examples
 
@@ -60,11 +61,40 @@ curl -X POST \
   http://127.0.0.1:3000/webhook
 ```
 
+### 4) Max webhook delivery
+
+Single-account example:
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Max-Bot-Api-Secret: YOUR_MAX_SECRET" \
+  -d '{"update_type":"bot_started","chat_id":100,"timestamp":1710000000000,"user":{"user_id":42,"first_name":"Igor"}}' \
+  http://127.0.0.1:3000/max
+```
+
+Multi-account example:
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Max-Bot-Api-Secret: YOUR_MAX_SECRET" \
+  -d '{"update_type":"message_created","timestamp":1710000000000,"message":{"sender":{"user_id":42,"first_name":"Igor"},"recipient":{"chat_id":100,"chat_type":"dialog"},"body":{"mid":"m1","text":"ping"}}}' \
+  "http://127.0.0.1:3000/max?account_id=main"
+```
+
+Max webhook notes:
+
+- `nullclaw` routes `/max` to the configured Max account by `account_id` query first, then by `X-Max-Bot-Api-Secret`.
+- If `channels.max[].webhook_secret` is configured, the header is required and must match exactly.
+- Use HTTPS in the configured Max-side webhook URL.
+
 ## Security Guidance
 
 1. Keep `gateway.require_pairing = true`.
 2. Keep gateway on loopback (`127.0.0.1`) and expose externally through tunnel/proxy.
 3. Treat bearer tokens as secrets; do not commit or log them.
+4. Treat Max webhook secrets the same way: randomize them per account and do not reuse one secret across multiple bots.
 
 ## Next Steps
 

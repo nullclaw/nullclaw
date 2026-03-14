@@ -174,7 +174,7 @@ Telegram 示例：
 
 ### `memory`
 
-- `backend`: 建议从 `sqlite` 开始。
+- `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
 - `auto_save`: 开启后会自动持久化会话记忆。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 
@@ -184,6 +184,52 @@ Telegram 示例：
   - `host = "127.0.0.1"`
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
+
+### `tunnel`
+
+隧道服务，用于将本地网关暴露到公网。当没有公网 IP 但需要接收 webhook 回调时使用。
+
+**支持的隧道：**
+
+| 隧道 | 说明 |
+|--------|------|
+| `none` | 不使用隧道（默认） |
+| `cloudflare` | Cloudflare Tunnel |
+| `ngrok` | ngrok 隧道 |
+| `tailscale` | Tailscale Funnel |
+| `custom` | 自定义命令启动隧道 |
+
+**ngrok 示例：**
+
+```json
+{
+  "tunnel": {
+    "provider": "ngrok",
+    "ngrok": {
+      "auth_token": "YOUR_NGROK_AUTH_TOKEN",
+      "domain": "your-domain.ngrok-free.app"
+    }
+  }
+}
+```
+
+**Cloudflare 示例：**
+
+```json
+{
+  "tunnel": {
+    "provider": "cloudflare",
+    "cloudflare": {
+      "token": "YOUR_CLOUDFLARE_TUNNEL_TOKEN"
+    }
+  }
+}
+```
+
+**注意：**
+
+- 隧道会在网关启动前自动启动。
+- 启动后公网 URL 会打印到控制台，同时写入 `daemon_state.json`。
 
 ### `autonomy`
 

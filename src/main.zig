@@ -186,6 +186,12 @@ pub fn main() !void {
         try yc.from_json.run(allocator, args[2..]);
         return;
     }
+    if (comptime builtin.os.tag == .windows) {
+        if (yc.service.isWindowsServiceGatewayArg(args[1])) {
+            try yc.service.runWindowsServiceGateway(allocator);
+            return;
+        }
+    }
 
     const cmd = parseCommand(args[1]) orelse {
         std.debug.print("Unknown command: {s}\n\n", .{args[1]});
@@ -198,7 +204,11 @@ pub fn main() !void {
     switch (cmd) {
         .version => printVersion(),
         .status => try yc.status.run(allocator),
-        .agent => try yc.agent.run(allocator, sub_args),
+        .agent => if (agentHelpRequested(sub_args)) {
+            printAgentUsage();
+        } else {
+            try yc.agent.run(allocator, sub_args);
+        },
         .onboard => try runOnboard(allocator, sub_args),
         .doctor => try yc.doctor.run(allocator),
         .help => printUsage(),
@@ -248,6 +258,44 @@ fn hasVerboseFlag(args: []const []const u8) bool {
     return false;
 }
 
+fn agentHelpRequested(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "-m") or
+            std.mem.eql(u8, arg, "--message") or
+            std.mem.eql(u8, arg, "-s") or
+            std.mem.eql(u8, arg, "--session") or
+            std.mem.eql(u8, arg, "--provider") or
+            std.mem.eql(u8, arg, "--model") or
+            std.mem.eql(u8, arg, "--temperature"))
+        {
+            if (i + 1 < args.len) i += 1;
+        }
+    }
+    return false;
+}
+
+fn gatewayHelpRequested(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--port") or
+            std.mem.eql(u8, arg, "-p") or
+            std.mem.eql(u8, arg, "--host"))
+        {
+            if (i + 1 < args.len) i += 1;
+        }
+    }
+    return false;
+}
+
 fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
     var port: u16 = cfg.gateway.port;
     var host: []const u8 = cfg.gateway.host;
@@ -269,7 +317,45 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
 
 // ── Gateway ──────────────────────────────────────────────────────
 
+fn printGatewayUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw gateway [options]
+        \\
+        \\Start the gateway server (HTTP/WebSocket).
+        \\
+        \\OPTIONS:
+        \\  --port PORT, -p PORT   Override gateway listen port
+        \\  --host HOST            Override gateway listen host
+        \\  --verbose, -v          Enable verbose logging
+        \\  --help, -h             Show this help
+        \\
+    , .{});
+}
+
+fn printAgentUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw agent [options]
+        \\
+        \\Start the AI agent loop.
+        \\
+        \\OPTIONS:
+        \\  -m, --message MESSAGE        Run a single message (non-interactive)
+        \\  -s, --session SESSION         Resume a specific session
+        \\  --provider PROVIDER           Override default provider
+        \\  --model MODEL                 Override default model
+        \\  --temperature TEMP            Override sampling temperature
+        \\  --verbose, -v                 Enable verbose logging
+        \\  --help, -h                    Show this help
+        \\
+    , .{});
+}
+
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (gatewayHelpRequested(sub_args)) {
+        printGatewayUsage();
+        return;
+    }
+
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
@@ -2190,6 +2276,13 @@ fn dispatchChannelStart(
             std.debug.print("Matrix channel is not configured.\n", .{});
             std.process.exit(1);
         },
+        .max => {
+            if (config.channels.maxPrimary()) |max_config| {
+                return runMaxChannel(allocator, args, config, max_config);
+            }
+            std.debug.print("Max channel is not configured.\n", .{});
+            std.process.exit(1);
+        },
         else => return runGatewayChannel(allocator, config, meta.key),
     }
 }
@@ -2718,6 +2811,61 @@ fn runMatrixChannel(
     yc.channel_loop.runMatrixLoop(allocator, config, runtime, &loop_state, &mx);
 }
 
+// ── Max Channel ───────────────────────────────────────────────────
+
+fn runMaxChannel(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    config: *const yc.config.Config,
+    max_config: yc.config.MaxConfig,
+) !void {
+    _ = args;
+    if (!build_options.enable_channel_max) {
+        std.debug.print("Max channel is disabled in this build.\n", .{});
+        std.process.exit(1);
+    }
+
+    var mx = yc.channels.max.MaxChannel.initFromConfig(allocator, max_config);
+
+    if (mx.mode == .webhook) {
+        std.debug.print("nullclaw Max channel configured for webhook delivery.\n", .{});
+        return runGatewayChannel(allocator, config, "max");
+    }
+
+    std.debug.print("nullclaw Max bot starting...\n", .{});
+    std.debug.print("  Provider: {s}\n", .{config.default_provider});
+    std.debug.print("  Account ID: {s}\n", .{mx.account_id});
+    std.debug.print("  Mode: {s}\n", .{@tagName(mx.mode)});
+    std.debug.print("  Group policy: {s}\n", .{mx.group_policy});
+    if (mx.allow_from.len == 0) {
+        std.debug.print("  Allowed users: (none — all messages will be denied)\n", .{});
+    } else if (mx.allow_from.len == 1 and std.mem.eql(u8, mx.allow_from[0], "*")) {
+        std.debug.print("  Allowed users: *\n", .{});
+    } else {
+        std.debug.print("  Allowed users:", .{});
+        for (mx.allow_from) |u| {
+            std.debug.print(" {s}", .{u});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    if (!mx.healthCheck()) {
+        std.debug.print("Max health check failed. Verify bot_token.\n", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
+
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer runtime.deinit();
+
+    var loop_state = yc.channel_loop.MaxLoopState.init();
+    yc.channel_loop.runMaxLoop(allocator, config, runtime, &loop_state, &mx);
+}
+
 // ── Telegram Channel ───────────────────────────────────────────────-
 
 fn sendStandaloneTelegramStartGreeting(
@@ -2742,6 +2890,7 @@ fn sendStandaloneTelegramStartGreeting(
 
 fn handleStandaloneTelegramBuiltinCommand(
     allocator: std.mem.Allocator,
+    config: *const yc.config.Config,
     session_mgr: *yc.session.SessionManager,
     tg: *yc.channels.telegram.TelegramChannel,
     content: []const u8,
@@ -2749,6 +2898,7 @@ fn handleStandaloneTelegramBuiltinCommand(
     sender_identity: []const u8,
     first_name: ?[]const u8,
     model: []const u8,
+    is_group: bool,
     reply_to_id: ?i64,
     message_id: ?i64,
 ) bool {
@@ -2756,6 +2906,37 @@ fn handleStandaloneTelegramBuiltinCommand(
 
     if (control_plane.isSlashName(cmd, "start")) {
         sendStandaloneTelegramStartGreeting(tg, sender, first_name, sender_identity, model, reply_to_id);
+        return true;
+    }
+
+    if (control_plane.isSlashName(cmd, "bind")) {
+        tg.setTaskReaction(sender, message_id, .accepted);
+
+        if (!tg.binding_commands_enabled) {
+            tg.setTaskReaction(sender, message_id, .failed);
+            tg.sendMessageWithReply(sender, "Binding commands are disabled for this Telegram account.", reply_to_id) catch |err| {
+                log.err("failed to send /bind disabled reply: {}", .{err});
+            };
+            return true;
+        }
+
+        tg.setTaskReaction(sender, message_id, .running);
+        const reply = yc.channel_loop.applyTelegramBindingCommand(allocator, config, tg.account_id, sender, is_group, cmd.arg) catch |err| {
+            tg.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to handle /bind command: {}", .{err});
+            tg.sendMessageWithReply(sender, "Failed to update Telegram binding.", reply_to_id) catch |send_err| {
+                log.err("failed to send /bind error reply: {}", .{send_err});
+            };
+            return true;
+        };
+        defer allocator.free(reply);
+
+        tg.sendMessageWithReply(sender, reply, reply_to_id) catch |err| {
+            tg.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to send /bind reply: {}", .{err});
+            return true;
+        };
+        tg.setTaskReaction(sender, message_id, .done);
         return true;
     }
 
@@ -2906,6 +3087,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     tg.streaming_enabled = telegram_config.streaming;
     tg.status_reactions_enabled = telegram_config.status_reactions;
     tg.reaction_emojis = telegram_config.reaction_emojis;
+    tg.binding_commands_enabled = telegram_config.binding_commands_enabled;
     tg.topic_commands_enabled = telegram_config.topic_commands_enabled;
     tg.topic_map_command_enabled = telegram_config.topic_map_command_enabled;
     tg.commands_menu_mode = telegram_config.commands_menu_mode;
@@ -3053,6 +3235,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
             if (handleStandaloneTelegramBuiltinCommand(
                 allocator,
+                &config,
                 &session_mgr,
                 &tg,
                 msg.content,
@@ -3060,6 +3243,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
                 msg.id,
                 msg.first_name,
                 model,
+                msg.is_group,
                 reply_to_id,
                 msg.message_id,
             )) {
@@ -3203,6 +3387,10 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             if (account_id) |id| {
                 std.debug.print("  Account: {s}\n", .{id});
             }
+        } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
+            std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
+            std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
+            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in ~/.nullclaw/auth.json.\n", .{});
         } else {
             std.debug.print("openai-codex: not authenticated\n", .{});
             std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
@@ -3427,7 +3615,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -3481,7 +3669,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 fn printUsage() void {
@@ -3565,6 +3753,31 @@ test "hasJsonFlag detects --json" {
 
     const without_json = [_][]const u8{ "--limit", "10" };
     try std.testing.expect(!hasJsonFlag(&without_json));
+}
+
+test "agentHelpRequested detects standalone help flag" {
+    const args = [_][]const u8{ "--provider", "openrouter", "--help" };
+    try std.testing.expect(agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores message value that matches help flag" {
+    const args = [_][]const u8{ "--message", "--help" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores session value that matches short help flag" {
+    const args = [_][]const u8{ "--session", "-h" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "gatewayHelpRequested detects standalone help flag" {
+    const args = [_][]const u8{ "--port", "8080", "--help" };
+    try std.testing.expect(gatewayHelpRequested(&args));
+}
+
+test "gatewayHelpRequested ignores host value that matches help flag" {
+    const args = [_][]const u8{ "--host", "--help" };
+    try std.testing.expect(!gatewayHelpRequested(&args));
 }
 
 test "writeJsonString wraps and escapes special characters" {
