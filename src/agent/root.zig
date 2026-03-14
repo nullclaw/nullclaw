@@ -2812,7 +2812,10 @@ pub const Agent = struct {
         dirs: *std.ArrayListUnmanaged([]const u8),
         raw_dir: []const u8,
     ) !void {
-        const trimmed = std.mem.trimRight(u8, raw_dir, "/\\");
+        // Strip trailing glob wildcards (e.g. "/home/user/*" -> "/home/user")
+        // so prefix matching works correctly for multimodal allowed_dirs.
+        const deglobbed = std.mem.trimRight(u8, raw_dir, "/*\\");
+        const trimmed = if (deglobbed.len > 0) deglobbed else std.mem.trimRight(u8, raw_dir, "/\\");
         if (trimmed.len == 0) return;
 
         if (!containsMultimodalDir(dirs.items, trimmed)) {
