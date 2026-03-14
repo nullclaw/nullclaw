@@ -1055,7 +1055,9 @@ pub const ImapClient = struct {
 
     /// Enter IDLE mode and wait for new mail or timeout.
     /// Returns the reason IDLE was exited.
-    pub fn idle(self: *ImapClient, stop_requested: *const std.atomic.Value(bool)) !IdleResult {
+    /// If `heartbeat` is provided, it is updated on each socket timeout to signal
+    /// the supervision loop that the thread is alive (not stale) while waiting.
+    pub fn idle(self: *ImapClient, stop_requested: *const std.atomic.Value(bool), heartbeat: ?*std.atomic.Value(i64)) !IdleResult {
         if (self.state != .selected) return error.ImapWrongState;
 
         const tag = self.nextTag();
@@ -1090,6 +1092,9 @@ pub const ImapClient = struct {
 
             const line = self.readLine() catch |err| {
                 if (err == error.ImapTimeout) {
+                    // Signal supervision loop that we're still alive
+                    if (heartbeat) |hb| hb.store(std.time.timestamp(), .release);
+
                     // Check if we've been idling too long
                     const elapsed = std.time.timestamp() - idle_start;
                     if (elapsed >= idle_max_secs) {

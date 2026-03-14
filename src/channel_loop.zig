@@ -1719,7 +1719,7 @@ fn runEmailIdleLoop(
             }
 
             // Enter IDLE — blocks until new mail, timeout renewal, or shutdown
-            const result = imap.idle(&loop_state.stop_requested) catch break :inner;
+            const result = imap.idle(&loop_state.stop_requested, &loop_state.last_activity) catch break :inner;
             switch (result) {
                 .new_mail => continue :inner, // loop back to searchUnseen
                 .renewal => continue :inner, // 25-min renewal
