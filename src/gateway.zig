@@ -2050,7 +2050,40 @@ fn handleWhatsAppWebWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
     }
 
-    const msg_text = jsonStringField(body, "text");
+    const raw_text = jsonStringField(body, "text");
+    const media_type = jsonStringField(body, "media_type");
+    const media_path = jsonStringField(body, "media_path");
+
+    // Build message content: prepend media markers to text if media is attached
+    const msg_text: ?[]const u8 = blk: {
+        if (media_path) |mp| {
+            if (media_type) |mtype| {
+                // Map media type to the appropriate marker
+                const marker = if (std.mem.eql(u8, mtype, "image") or std.mem.eql(u8, mtype, "sticker"))
+                    "[IMAGE:"
+                else if (std.mem.eql(u8, mtype, "audio"))
+                    "[AUDIO:"
+                else if (std.mem.eql(u8, mtype, "video"))
+                    "[VIDEO:"
+                else if (std.mem.eql(u8, mtype, "document"))
+                    "[DOCUMENT:"
+                else
+                    "[FILE:";
+                const text_part = raw_text orelse "";
+                const has_text = text_part.len > 0;
+                // Format: "[MARKER:path]\ntext" or "[MARKER:path]"
+                const content = std.fmt.allocPrint(ctx.req_allocator, "{s}{s}]{s}{s}", .{
+                    marker,
+                    mp,
+                    if (has_text) "\n" else "",
+                    text_part,
+                }) catch break :blk raw_text;
+                break :blk content;
+            }
+        }
+        break :blk raw_text;
+    };
+
     if (msg_text) |mt| {
         const reply_to = reply_to_raw;
         const wa_sender = sender orelse "unknown";
