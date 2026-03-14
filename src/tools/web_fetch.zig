@@ -42,23 +42,29 @@ pub const WebFetchTool = struct {
 
         // Validate URL scheme
         if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-            return ToolResult.fail("Only http:// and https:// URLs are allowed");
+            return ToolResult.fail("Only https:// URLs are allowed");
         }
+
+        const host = net_security.extractHost(url) orelse
+            return ToolResult.fail("Invalid URL: cannot extract host");
 
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
-        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const default_port: u16 = if (is_https) 443 else 80;
         const resolved_port: u16 = uri.port orelse default_port;
 
         // SSRF protection and DNS-rebinding hardening:
         // resolve once, validate global address, and connect directly to it.
-        const host = net_security.extractHost(url) orelse
-            return ToolResult.fail("Invalid URL: cannot extract host");
         const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
             error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
             else => return ToolResult.fail("Unable to verify host safety"),
         };
         defer allocator.free(connect_host);
+
+        if (!is_https) {
+            return ToolResult.fail("Only https:// URLs are allowed");
+        }
 
         // Keep security surface aligned with http_request.
         if (self.allowed_domains.len > 0) {
@@ -452,7 +458,16 @@ test "WebFetchTool non-http url fails" {
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expectEqualStrings("Only http:// and https:// URLs are allowed", result.error_msg.?);
+    try testing.expectEqualStrings("Only https:// URLs are allowed", result.error_msg.?);
+}
+
+test "WebFetchTool remote http blocked" {
+    var wft = WebFetchTool{};
+    const parsed = try root.parseTestArgs("{\"url\":\"http://example.com\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Only https:// URLs are allowed", result.error_msg.?);
 }
 
 test "WebFetchTool localhost blocked" {
