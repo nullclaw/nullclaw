@@ -1,0 +1,52 @@
+{
+  "models": {
+    "providers": {
+      "openrouter": { "api_key": "sk-or-..." }
+    }
+  },
+
+  "agents": {
+    "defaults": {
+      "model": { "primary": "openrouter/anthropic/claude-sonnet-4" },
+
+      "skill_routing_enabled": true,
+      "skill_routing_max_active": 3,
+
+      "session_digest_enabled": true,
+      "session_digest_min_turns": 5,
+      "session_digest_on_reset": true,
+      "session_digest_on_eviction": true,
+
+      "skill_evolution_enabled": true,
+      "skill_evolution_max_per_day": 5,
+      "skill_evolution_cooldown_minutes": 20
+    }
+  },
+
+  "channels": {
+    "email": {
+      "accounts": {
+        "main": {
+          "imap_host": "imap.example.com",
+          "imap_port": 993,
+          "smtp_host": "smtp.example.com",
+          "smtp_port": 587,
+          "username": "assistant@example.com",
+          "password": "YOUR_APP_PASSWORD",
+          "from_address": "assistant@example.com",
+          "allow_from": ["user@example.com"],
+          "polling_interval_secs": 60
+        }
+      }
+    }
+  },
+
+  "memory": {
+    "backend": "sqlite",
+    "auto_save": true
+  },
+
+  "gateway": {
+    "port": 3000
+  }
+}

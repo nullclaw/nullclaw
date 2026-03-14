@@ -22,7 +22,7 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
 
 ```
-678 KB binary · <2 ms startup · 5,100+ tests · 50+ providers · 19 channels · Pluggable everything
+678 KB binary · <2 ms startup · 5,500+ tests · 50+ providers · 21 channels · Pluggable everything
 ```
 
 ### Features
@@ -31,7 +31,8 @@ Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributi
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 50+ providers, 19 channels, 30+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 50+ providers, 21 channels, 30+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Adaptive Intelligence:** Post-turn quality scoring, keyword-based skill routing, tiered context loading, session digests, and skill evolution tracking — all built-in, zero extra API calls. See [`examples/adaptive-intelligence/`](examples/adaptive-intelligence/).
 
 ### Why nullclaw
 
@@ -126,6 +127,16 @@ zig build -Doptimize=ReleaseSmall
 zig build test --summary all
 ```
 
+Optional build flags for additional channels and memory engines:
+
+```bash
+zig build -Doptimize=ReleaseSmall -Dchannels=all              # all 21 channels
+zig build -Doptimize=ReleaseSmall -Dchannels=cli,telegram,email  # only specific channels
+zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,clickhouse  # add ClickHouse engine
+```
+
+Adaptive intelligence features (Turn Scorer, Skill Router, Session Digest, Skill Evolution) are always compiled in and controlled via config flags. See [`examples/adaptive-intelligence/`](examples/adaptive-intelligence/).
+
 Make `nullclaw` available on `PATH`:
 
 macOS/Linux (zsh/bash):
@@ -213,8 +224,8 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
 | **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
-| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
+| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, WhatsApp Web, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email (IMAP IDLE), Nostr, QQ, MaixCam, Mattermost | Any messaging API |
+| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, pushover, and more | Any capability |
 | **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
 | **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed), WASM (wasmtime) | Any runtime |
@@ -225,6 +236,10 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 | **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
 | **Peripherals** | `Peripheral` | Serial, Arduino, Raspberry Pi GPIO, STM32/Nucleo | Any hardware interface |
 | **Cron** | Scheduler | Cron expressions + one-shot timers with JSON persistence | — |
+| **Turn Scorer** | `TurnScorer` | Weighted signal scoring [-1,+1] per turn | Observer pipeline |
+| **Skill Router** | `SkillRouter` | Keyword-based per-turn skill selection (zero API calls) | Custom routing |
+| **Session Digest** | `SessionDigest` | Extractive post-session learning | — |
+| **Skill Evolution** | `SkillEvolution` | Trigger detection + per-skill tracking | — |
 
 ### Memory System
 
@@ -612,7 +627,7 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 Language:     Zig 0.15.2
 Source files: ~230
 Lines of code: ~175,000
-Tests:        5,100+
+Tests:        5,500+
 Binary:       678 KB (ReleaseSmall)
 Peak RSS:     ~1 MB
 Startup:      <2 ms (Apple Silicon)
