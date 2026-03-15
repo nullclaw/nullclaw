@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
+const ToolSpec = root.ToolSpec;
 
 // ─── Tool Call Response Structures ───────────────────────────────────────────
 
@@ -175,6 +176,7 @@ fn appendOllamaImageValue(
 pub const OllamaProvider = struct {
     base_url: []const u8,
     allocator: std.mem.Allocator,
+    native_tools: bool,
 
     const DEFAULT_BASE_URL = "http://localhost:11434";
 
@@ -183,6 +185,7 @@ pub const OllamaProvider = struct {
         return .{
             .base_url = url,
             .allocator = allocator,
+            .native_tools = true,
         };
     }
 
@@ -314,8 +317,9 @@ pub const OllamaProvider = struct {
         return ChatResponse{ .content = text };
     }
 
-    fn supportsNativeToolsImpl(_: *anyopaque) bool {
-        return false;
+    fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools;
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
@@ -376,7 +380,16 @@ fn buildChatRequestBody(
         try buf.append(allocator, '}');
     }
 
-    try buf.appendSlice(allocator, "],\"stream\":false,\"options\":{\"temperature\":");
+    try buf.append(allocator, ']');
+
+    if (request.tools) |tools| {
+        if (tools.len > 0) {
+            try buf.appendSlice(allocator, ",\"tools\":");
+            try root.convertToolsOpenAI(&buf, allocator, tools);
+        }
+    }
+
+    try buf.appendSlice(allocator, ",\"stream\":false,\"options\":{\"temperature\":");
     var temp_buf: [16]u8 = undefined;
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.OllamaApiError;
     try buf.appendSlice(allocator, temp_str);
@@ -440,10 +453,10 @@ test "parseResponse empty content" {
     try std.testing.expectEqualStrings("", result);
 }
 
-test "supportsNativeTools returns false" {
+test "supportsNativeTools returns true" {
     var p = OllamaProvider.init(std.testing.allocator, null);
     const prov = p.provider();
-    try std.testing.expect(!prov.supportsNativeTools());
+    try std.testing.expect(prov.supportsNativeTools());
 }
 
 // ─── Tool Call Tests ─────────────────────────────────────────────────────────
@@ -534,6 +547,38 @@ test "ollama buildChatRequestBody skips HTTP URL image_url" {
     const msg_obj = parsed.value.object.get("messages").?.array.items[0].object;
     // HTTP URLs are not supported by Ollama — should be skipped
     try std.testing.expect(msg_obj.get("images") == null);
+}
+
+test "ollama buildChatRequestBody includes native tools" {
+    const alloc = std.testing.allocator;
+    const tools = &[_]ToolSpec{
+        .{
+            .name = "web_search",
+            .description = "Search the web",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}",
+        },
+    };
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("search for weather in New York"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .model = "qwen3",
+        .tools = tools,
+    }, "qwen3", 0.7);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    const tools_arr = parsed.value.object.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), tools_arr.items.len);
+    const tool_obj = tools_arr.items[0].object;
+    try std.testing.expectEqualStrings("function", tool_obj.get("type").?.string);
+    const function_obj = tool_obj.get("function").?.object;
+    try std.testing.expectEqualStrings("web_search", function_obj.get("name").?.string);
+    try std.testing.expectEqualStrings("Search the web", function_obj.get("description").?.string);
+    try std.testing.expect(function_obj.get("parameters").? == .object);
 }
 
 test "extractToolNameAndArgs with nested tool_call wrapper" {

@@ -20,7 +20,29 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+fn parseApiKeyField(allocator: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
+    return switch (value) {
+        .string => |s| try allocator.dupe(u8, s),
+        .object, .array => try std.json.Stringify.valueAlloc(allocator, value, .{}),
+        else => null,
+    };
+}
+
+const PrimaryModelRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
+
+fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAgentConfig) void {
+    allocator.free(agent_cfg.name);
+    allocator.free(agent_cfg.provider);
+    allocator.free(agent_cfg.model);
+    if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
+    if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+    if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+}
+
+fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
     if (std.mem.startsWith(u8, primary, "custom:")) {
         // The format is "custom:<provider_url>/<model>" where <provider_url> may contain slashes.
@@ -59,11 +81,128 @@ fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, mod
     };
 }
 
+fn parseNamedAgentObject(
+    allocator: std.mem.Allocator,
+    agent_name: []const u8,
+    item: std.json.Value,
+) !?types.NamedAgentConfig {
+    if (item != .object) return null;
+
+    const provider_val = item.object.get("provider");
+    const resolved_ref: ?PrimaryModelRef = blk: {
+        const m = item.object.get("model") orelse break :blk null;
+        if (provider_val) |pv| {
+            if (pv != .string) break :blk null;
+            if (m == .string) {
+                break :blk .{
+                    .provider = pv.string,
+                    .model = m.string,
+                };
+            }
+            if (m == .object) {
+                if (m.object.get("primary")) |mp| {
+                    if (mp == .string) {
+                        break :blk .{
+                            .provider = pv.string,
+                            .model = mp.string,
+                        };
+                    }
+                }
+            }
+            break :blk null;
+        }
+
+        if (m == .string) {
+            if (splitPrimaryModelRef(m.string)) |parsed_ref| {
+                break :blk parsed_ref;
+            }
+            break :blk null;
+        }
+        if (m == .object) {
+            if (m.object.get("primary")) |mp| {
+                if (mp == .string) {
+                    if (splitPrimaryModelRef(mp.string)) |parsed_ref| {
+                        break :blk parsed_ref;
+                    }
+                }
+            }
+        }
+        break :blk null;
+    };
+    if (resolved_ref == null) return null;
+
+    var agent_cfg = types.NamedAgentConfig{
+        .name = try allocator.dupe(u8, agent_name),
+        .provider = try allocator.dupe(u8, resolved_ref.?.provider),
+        .model = try allocator.dupe(u8, resolved_ref.?.model),
+    };
+    errdefer freeNamedAgentConfig(allocator, &agent_cfg);
+    if (item.object.get("system_prompt")) |sp| {
+        if (sp == .string) {
+            const val = sp.string;
+            if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
+                const file_content = blk: {
+                    const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
+                        std.log.warn("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                    defer file.close();
+                    break :blk file.readToEndAlloc(allocator, 64 * 1024) catch |err| {
+                        std.log.warn("system_prompt failed to read file '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                };
+                if (file_content) |content| {
+                    agent_cfg.system_prompt = content;
+                    agent_cfg.system_prompt_path = try allocator.dupe(u8, val);
+                } else {
+                    agent_cfg.system_prompt = try allocator.dupe(u8, val);
+                }
+            } else {
+                agent_cfg.system_prompt = try allocator.dupe(u8, val);
+            }
+        }
+    }
+    if (item.object.get("api_key")) |ak| {
+        if (ak == .string) agent_cfg.api_key = try allocator.dupe(u8, ak.string);
+    }
+    if (item.object.get("temperature")) |t| {
+        if (t == .float) agent_cfg.temperature = t.float;
+        if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
+    }
+    if (item.object.get("max_depth")) |md| {
+        if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
+    }
+    return agent_cfg;
+}
+
 fn parsePeerKind(kind: []const u8) ?agent_routing.ChatType {
     if (std.mem.eql(u8, kind, "direct") or std.mem.eql(u8, kind, "dm")) return .direct;
     if (std.mem.eql(u8, kind, "group")) return .group;
     if (std.mem.eql(u8, kind, "channel")) return .channel;
     return null;
+}
+
+fn parseModelRouteCostClass(raw: []const u8) ?types.ModelRouteCostClass {
+    if (std.ascii.eqlIgnoreCase(raw, "free")) return .free;
+    if (std.ascii.eqlIgnoreCase(raw, "cheap")) return .cheap;
+    if (std.ascii.eqlIgnoreCase(raw, "standard")) return .standard;
+    if (std.ascii.eqlIgnoreCase(raw, "premium")) return .premium;
+    return null;
+}
+
+fn parseModelRouteQuotaClass(raw: []const u8) ?types.ModelRouteQuotaClass {
+    if (std.ascii.eqlIgnoreCase(raw, "unlimited")) return .unlimited;
+    if (std.ascii.eqlIgnoreCase(raw, "normal")) return .normal;
+    if (std.ascii.eqlIgnoreCase(raw, "constrained")) return .constrained;
+    return null;
+}
+
+fn freeModelRouteConfig(allocator: std.mem.Allocator, route: types.ModelRouteConfig) void {
+    allocator.free(route.hint);
+    allocator.free(route.provider);
+    allocator.free(route.model);
+    if (route.api_key) |api_key| allocator.free(api_key);
 }
 
 fn parseAgentBindingsArray(
@@ -344,9 +483,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     }
     if (root.get("reasoning_effort")) |v| {
         if (v == .string) {
-            if (std.mem.eql(u8, v.string, "low") or
+            if (std.mem.eql(u8, v.string, "minimal") or
+                std.mem.eql(u8, v.string, "low") or
                 std.mem.eql(u8, v.string, "medium") or
                 std.mem.eql(u8, v.string, "high") or
+                std.mem.eql(u8, v.string, "xhigh") or
                 std.mem.eql(u8, v.string, "none"))
             {
                 self.reasoning_effort = try self.allocator.dupe(u8, v.string);
@@ -358,6 +499,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     if (root.get("model_routes")) |v| {
         if (v == .array) {
             var list: std.ArrayListUnmanaged(types.ModelRouteConfig) = .empty;
+            errdefer {
+                for (list.items) |route| freeModelRouteConfig(self.allocator, route);
+                list.deinit(self.allocator);
+            }
             try list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
             for (v.array.items) |item| {
                 if (item == .object) {
@@ -365,15 +510,40 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     const provider = item.object.get("provider") orelse continue;
                     const model = item.object.get("model") orelse continue;
                     if (hint != .string or provider != .string or model != .string) continue;
-                    var route = types.ModelRouteConfig{
-                        .hint = try self.allocator.dupe(u8, hint.string),
-                        .provider = try self.allocator.dupe(u8, provider.string),
-                        .model = try self.allocator.dupe(u8, model.string),
-                    };
-                    if (item.object.get("api_key")) |ak| {
-                        if (ak == .string) route.api_key = try self.allocator.dupe(u8, ak.string);
+                    {
+                        const hint_owned = try self.allocator.dupe(u8, hint.string);
+                        errdefer self.allocator.free(hint_owned);
+                        const provider_owned = try self.allocator.dupe(u8, provider.string);
+                        errdefer self.allocator.free(provider_owned);
+                        const model_owned = try self.allocator.dupe(u8, model.string);
+                        errdefer self.allocator.free(model_owned);
+
+                        var route = types.ModelRouteConfig{
+                            .hint = hint_owned,
+                            .provider = provider_owned,
+                            .model = model_owned,
+                        };
+                        errdefer if (route.api_key) |api_key| self.allocator.free(api_key);
+
+                        if (item.object.get("api_key")) |ak| {
+                            if (ak == .string) route.api_key = try self.allocator.dupe(u8, ak.string);
+                        }
+                        if (item.object.get("cost_class")) |cost_class| {
+                            if (cost_class == .string) {
+                                if (parseModelRouteCostClass(cost_class.string)) |parsed_cost_class| {
+                                    route.cost_class = parsed_cost_class;
+                                }
+                            }
+                        }
+                        if (item.object.get("quota_class")) |quota_class| {
+                            if (quota_class == .string) {
+                                if (parseModelRouteQuotaClass(quota_class.string)) |parsed_quota_class| {
+                                    route.quota_class = parsed_quota_class;
+                                }
+                            }
+                        }
+                        try list.append(self.allocator, route);
                     }
-                    try list.append(self.allocator, route);
                 }
             }
             self.model_routes = try list.toOwnedSlice(self.allocator);
@@ -447,50 +617,41 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (agents_val.object.get("list")) |list_val| {
                 if (list_val == .array) {
                     var list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                    errdefer {
+                        for (list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                        list.deinit(self.allocator);
+                    }
                     try list.ensureTotalCapacity(self.allocator, @intCast(list_val.array.items.len));
                     for (list_val.array.items) |item| {
                         if (item == .object) {
-                            // "id" or "name" for the agent name
                             const name_val = item.object.get("id") orelse item.object.get("name") orelse continue;
-                            const provider = item.object.get("provider") orelse continue;
-                            if (name_val != .string or provider != .string) continue;
-
-                            // model can be string or {"primary": "..."}
-                            const model_str: ?[]const u8 = blk: {
-                                const m = item.object.get("model") orelse break :blk null;
-                                if (m == .string) break :blk m.string;
-                                if (m == .object) {
-                                    if (m.object.get("primary")) |mp| {
-                                        if (mp == .string) break :blk mp.string;
-                                    }
-                                }
-                                break :blk null;
-                            };
-                            if (model_str == null) continue;
-
-                            var agent_cfg = types.NamedAgentConfig{
-                                .name = try self.allocator.dupe(u8, name_val.string),
-                                .provider = try self.allocator.dupe(u8, provider.string),
-                                .model = try self.allocator.dupe(u8, model_str.?),
-                            };
-                            if (item.object.get("system_prompt")) |sp| {
-                                if (sp == .string) agent_cfg.system_prompt = try self.allocator.dupe(u8, sp.string);
-                            }
-                            if (item.object.get("api_key")) |ak| {
-                                if (ak == .string) agent_cfg.api_key = try self.allocator.dupe(u8, ak.string);
-                            }
-                            if (item.object.get("temperature")) |t| {
-                                if (t == .float) agent_cfg.temperature = t.float;
-                                if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
-                            }
-                            if (item.object.get("max_depth")) |md| {
-                                if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
-                            }
+                            if (name_val != .string) continue;
+                            var agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
+                            errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                             try list.append(self.allocator, agent_cfg);
                         }
                     }
                     self.agents = try list.toOwnedSlice(self.allocator);
                 }
+            }
+
+            // Also accept the object-of-objects shape:
+            // "agents": { "defaults": {...}, "coder": {...}, "researcher": {...} }
+            if (self.agents.len == 0) {
+                var named_agent_list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                errdefer {
+                    for (named_agent_list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                    named_agent_list.deinit(self.allocator);
+                }
+                var it = agents_val.object.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "defaults") or std.mem.eql(u8, key, "list")) continue;
+                    var agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
+                    try named_agent_list.append(self.allocator, agent_cfg);
+                }
+                self.agents = try named_agent_list.toOwnedSlice(self.allocator);
             }
         }
     }
@@ -627,6 +788,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (aut.object.get("allowed_commands")) |v| {
                 if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
+            }
+            if (aut.object.get("allow_raw_url_chars")) |v| {
+                if (v == .bool) self.autonomy.allow_raw_url_chars = v.bool;
             }
             // forbidden_paths: ignored (removed — path security handled by path_security.zig)
             if (aut.object.get("allowed_paths")) |v| {
@@ -807,6 +971,41 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
+            if (ag.object.get("vision_disabled_models")) |v| {
+                if (v == .array) self.agent.vision_disabled_models = try parseStringArray(self.allocator, v.array);
+            }
+            if (ag.object.get("auto_disable_vision_on_error")) |v| {
+                if (v == .bool) self.agent.auto_disable_vision_on_error = v.bool;
+            }
+            // tool_filter_groups: array of { mode, tools, keywords? }
+            if (ag.object.get("tool_filter_groups")) |fg_val| {
+                if (fg_val == .array) {
+                    var fg_list: std.ArrayListUnmanaged(types.ToolFilterGroup) = .empty;
+                    for (fg_val.array.items) |item| {
+                        if (item != .object) continue;
+                        const mode_val = item.object.get("mode") orelse continue;
+                        if (mode_val != .string) continue;
+                        const mode: types.ToolFilterGroupMode = if (std.mem.eql(u8, mode_val.string, "always"))
+                            .always
+                        else if (std.mem.eql(u8, mode_val.string, "dynamic"))
+                            .dynamic
+                        else
+                            continue;
+
+                        var fg = types.ToolFilterGroup{ .mode = mode };
+
+                        if (item.object.get("tools")) |tv| {
+                            if (tv == .array) fg.tools = try parseStringArray(self.allocator, tv.array);
+                        }
+                        if (item.object.get("keywords")) |kv| {
+                            if (kv == .array) fg.keywords = try parseStringArray(self.allocator, kv.array);
+                        }
+
+                        try fg_list.append(self.allocator, fg);
+                    }
+                    self.agent.tool_filter_groups = try fg_list.toOwnedSlice(self.allocator);
+                }
+            }
         }
     }
 
@@ -824,6 +1023,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
+            }
+            if (tl.object.get("path_env_vars")) |v| {
+                if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
@@ -1200,6 +1402,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (lc.get("purge_after_days")) |v| if (v == .integer) {
                         self.memory.lifecycle.purge_after_days = @intCast(v.integer);
                     };
+                    if (lc.get("preserve_before_purge")) |v| if (v == .bool) {
+                        self.memory.lifecycle.preserve_before_purge = v.bool;
+                    };
                     if (lc.get("conversation_retention_days")) |v| if (v == .integer) {
                         self.memory.lifecycle.conversation_retention_days = @intCast(v.integer);
                     };
@@ -1424,6 +1629,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // A2A (Agent-to-Agent protocol)
+    if (root.get("a2a")) |a2a| {
+        if (a2a == .object) {
+            if (a2a.object.get("enabled")) |v| {
+                if (v == .bool) self.a2a.enabled = v.bool;
+            }
+            if (a2a.object.get("name")) |v| {
+                if (v == .string) self.a2a.name = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("description")) |v| {
+                if (v == .string) self.a2a.description = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("url")) |v| {
+                if (v == .string) self.a2a.url = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("version")) |v| {
+                if (v == .string) self.a2a.version = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
     // Identity
     if (root.get("identity")) |id| {
         if (id == .object) {
@@ -1643,6 +1869,58 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tun.object.get("provider")) |v| {
                 if (v == .string) self.tunnel.provider = try self.allocator.dupe(u8, v.string);
             }
+            // cloudflare sub-config
+            if (tun.object.get("cloudflare")) |cf| {
+                if (cf == .object) {
+                    var cf_cfg = types.CloudflareTunnelConfig{};
+                    if (cf.object.get("token")) |tok| {
+                        if (tok == .string) cf_cfg.token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    self.tunnel.cloudflare = cf_cfg;
+                }
+            }
+            // ngrok sub-config
+            if (tun.object.get("ngrok")) |ng| {
+                if (ng == .object) {
+                    var ng_cfg = types.NgrokTunnelConfig{};
+                    if (ng.object.get("auth_token")) |tok| {
+                        if (tok == .string) ng_cfg.auth_token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    if (ng.object.get("domain")) |dom| {
+                        if (dom == .string) ng_cfg.domain = try self.allocator.dupe(u8, dom.string);
+                    }
+                    self.tunnel.ngrok = ng_cfg;
+                }
+            }
+            // tailscale sub-config
+            if (tun.object.get("tailscale")) |ts| {
+                if (ts == .object) {
+                    var ts_cfg = types.TailscaleTunnelConfig{};
+                    if (ts.object.get("funnel")) |fnl| {
+                        if (fnl == .bool) ts_cfg.funnel = fnl.bool;
+                    }
+                    if (ts.object.get("hostname")) |hn| {
+                        if (hn == .string) ts_cfg.hostname = try self.allocator.dupe(u8, hn.string);
+                    }
+                    self.tunnel.tailscale = ts_cfg;
+                }
+            }
+            // custom sub-config
+            if (tun.object.get("custom")) |cst| {
+                if (cst == .object) {
+                    var cst_cfg = types.CustomTunnelConfig{};
+                    if (cst.object.get("start_command")) |cmd| {
+                        if (cmd == .string) cst_cfg.start_command = try self.allocator.dupe(u8, cmd.string);
+                    }
+                    if (cst.object.get("health_url")) |hu| {
+                        if (hu == .string) cst_cfg.health_url = try self.allocator.dupe(u8, hu.string);
+                    }
+                    if (cst.object.get("url_pattern")) |up| {
+                        if (up == .string) cst_cfg.url_pattern = try self.allocator.dupe(u8, up.string);
+                    }
+                    self.tunnel.custom = cst_cfg;
+                }
+            }
         }
     }
 
@@ -1661,7 +1939,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             .name = try self.allocator.dupe(u8, prov_name),
                         };
                         if (val.object.get("api_key")) |ak| {
-                            if (ak == .string) pe.api_key = try self.allocator.dupe(u8, ak.string);
+                            pe.api_key = try parseApiKeyField(self.allocator, ak);
                         }
                         if (val.object.get("base_url")) |ab| {
                             if (ab == .string) pe.base_url = try self.allocator.dupe(u8, ab.string);

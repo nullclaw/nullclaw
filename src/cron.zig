@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
+const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
 const Config = @import("config.zig").Config;
 
@@ -75,9 +76,11 @@ pub const DeliveryMode = enum {
 pub const DeliveryConfig = struct {
     mode: DeliveryMode = .none,
     channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
     to: ?[]const u8 = null,
     best_effort: bool = true,
     channel_owned: bool = false,
+    account_id_owned: bool = false,
     to_owned: bool = false,
 };
 
@@ -239,12 +242,14 @@ fn parseCronField(raw_field: []const u8, min: u8, max: u8, allow_sunday_7: bool,
 
         var range_part = part;
         var step: u8 = 1;
+        var has_step = false;
         if (std.mem.indexOfScalar(u8, part, '/')) |slash_idx| {
             range_part = std.mem.trim(u8, part[0..slash_idx], " \t");
             const step_raw = std.mem.trim(u8, part[slash_idx + 1 ..], " \t");
             if (range_part.len == 0 or step_raw.len == 0) return error.InvalidCronExpression;
             step = std.fmt.parseInt(u8, step_raw, 10) catch return error.InvalidCronExpression;
             if (step == 0) return error.InvalidCronExpression;
+            has_step = true;
         }
 
         var start_raw: u8 = min;
@@ -260,7 +265,12 @@ fn parseCronField(raw_field: []const u8, min: u8, max: u8, allow_sunday_7: bool,
             if (start_raw > end_raw) return error.InvalidCronExpression;
         } else {
             start_raw = try parseCronRawValue(range_part, min, max, allow_sunday_7);
-            end_raw = start_raw;
+            if (has_step) {
+                start_raw = normalizeCronValue(start_raw, allow_sunday_7);
+                end_raw = max;
+            } else {
+                end_raw = start_raw;
+            }
         }
 
         var raw_value = start_raw;
@@ -427,6 +437,9 @@ pub const CronScheduler = struct {
         if (job.delivery.channel_owned) {
             if (job.delivery.channel) |channel| self.allocator.free(channel);
         }
+        if (job.delivery.account_id_owned) {
+            if (job.delivery.account_id) |account_id| self.allocator.free(account_id);
+        }
         if (job.delivery.to_owned) {
             if (job.delivery.to) |to| self.allocator.free(to);
         }
@@ -509,7 +522,7 @@ pub const CronScheduler = struct {
     }
 
     /// Add a recurring agent job.
-    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8) !*CronJob {
+    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         _ = try normalizeExpression(expression);
@@ -527,6 +540,16 @@ pub const CronScheduler = struct {
             .job_type = .agent,
             .prompt = try self.allocator.dupe(u8, prompt),
             .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .best_effort = delivery.best_effort,
+            },
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
@@ -1102,7 +1125,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
 
-    const content = std.fs.cwd().readFileAlloc(scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return,
         else => switch (policy) {
             .best_effort => return,
@@ -1162,6 +1185,25 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 if (v == .integer) break :blk v.integer;
             }
             break :blk std.time.timestamp() + 60;
+        };
+        const last_run_secs: ?i64 = blk: {
+            if (obj.get("last_run_secs")) |v| {
+                if (v == .integer) break :blk v.integer;
+                if (v == .null) break :blk null;
+            }
+            break :blk null;
+        };
+        const last_status = blk: {
+            if (obj.get("last_status")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    if (std.mem.eql(u8, v.string, "ok")) break :blk "ok";
+                    if (std.mem.eql(u8, v.string, "error")) break :blk "error";
+                    // Backward-compat aliases from older payloads.
+                    if (std.mem.eql(u8, v.string, "success")) break :blk "ok";
+                    if (std.mem.eql(u8, v.string, "failed")) break :blk "error";
+                }
+            }
+            break :blk null;
         };
 
         const paused = blk: {
@@ -1227,6 +1269,12 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk null;
         };
+        const delivery_account_id = blk: {
+            if (obj.get("delivery_account_id")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
         const delivery_to = blk: {
             if (obj.get("delivery_to")) |v| {
                 if (v == .string) break :blk v.string;
@@ -1239,6 +1287,8 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .expression = try scheduler.allocator.dupe(u8, expression),
             .command = try scheduler.allocator.dupe(u8, command),
             .next_run_secs = next_run_secs,
+            .last_run_secs = last_run_secs,
+            .last_status = last_status,
             .paused = paused,
             .one_shot = one_shot,
             .job_type = job_type,
@@ -1249,8 +1299,10 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .delivery = .{
                 .mode = delivery_mode,
                 .channel = if (delivery_channel) |c| try scheduler.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery_account_id) |aid| try scheduler.allocator.dupe(u8, aid) else null,
                 .to = if (delivery_to) |t| try scheduler.allocator.dupe(u8, t) else null,
                 .channel_owned = delivery_channel != null,
+                .account_id_owned = delivery_account_id != null,
                 .to_owned = delivery_to != null,
             },
         });
@@ -1286,7 +1338,10 @@ pub fn deliverResult(
     if (output.len == 0) return false;
 
     const chat_id = delivery.to orelse "default";
-    const msg = try bus.makeOutbound(allocator, channel, chat_id, output);
+    const msg = if (delivery.account_id) |account_id|
+        try bus.makeOutboundWithAccount(allocator, channel, account_id, chat_id, output)
+    else
+        try bus.makeOutbound(allocator, channel, chat_id, output);
     out_bus.publishOutbound(msg) catch |err| {
         // If best_effort, swallow the error after cleaning up
         if (delivery.best_effort) {
@@ -1314,6 +1369,7 @@ const JsonCronJob = struct {
     // Delivery config for notifications
     delivery_mode: ?[]const u8 = null,
     delivery_channel: ?[]const u8 = null,
+    delivery_account_id: ?[]const u8 = null,
     delivery_to: ?[]const u8 = null,
 };
 
@@ -1410,6 +1466,13 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
         try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_channel");
         if (job.delivery.channel) |channel| {
             try json_util.appendJsonString(&buf, scheduler.allocator, channel);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_account_id");
+        if (job.delivery.account_id) |account_id| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, account_id);
         } else {
             try buf.appendSlice(scheduler.allocator, "null");
         }
@@ -1536,12 +1599,12 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
 }
 
 /// CLI: add a recurring agent job.
-pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8) !void {
+pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentJob(expression, prompt, model);
+    const job = try scheduler.addAgentJob(expression, prompt, model, delivery);
     try saveJobs(&scheduler);
 
     log.info("Added agent cron job {s}", .{job.id});
@@ -1621,6 +1684,18 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
     }
 }
 
+fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
+    const cwd = cwd_opt orelse return null;
+    if (cwd.len == 0) return null;
+
+    if (std.fs.path.isAbsolute(cwd)) {
+        std.fs.accessAbsolute(cwd, .{}) catch return null;
+    } else {
+        std.fs.cwd().access(cwd, .{}) catch return null;
+    }
+    return cwd;
+}
+
 pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     var cfg_opt: ?Config = Config.load(allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
@@ -1632,16 +1707,24 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
         scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
     }
     try loadJobs(&scheduler);
+    const run_cwd = resolveRunnableCwd(scheduler.shell_cwd);
+    if (scheduler.shell_cwd != null and run_cwd == null) {
+        log.warn("Cron shell cwd is unavailable; falling back to process cwd for manual run.", .{});
+    }
 
-    if (scheduler.getJob(id)) |job| {
+    if (scheduler.getMutableJob(id)) |job| {
         log.info("Running job '{s}': {s}", .{ id, job.command });
+        const run_at = std.time.timestamp();
         switch (job.job_type) {
             .shell => {
                 const result = std.process.Child.run(.{
                     .allocator = allocator,
                     .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
-                    .cwd = scheduler.shell_cwd,
+                    .cwd = run_cwd,
                 }) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
                     log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
@@ -1652,16 +1735,25 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                     .Exited => |code| code,
                     else => 1,
                 };
+                job.last_run_secs = run_at;
+                job.last_status = if (exit_code == 0) "ok" else "error";
+                try saveJobs(&scheduler);
                 log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, scheduler.shell_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
                     log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
                 defer allocator.free(result.output);
                 if (result.output.len > 0) log.info("{s}", .{result.output});
+                job.last_run_secs = run_at;
+                job.last_status = if (result.success) "ok" else "error";
+                try saveJobs(&scheduler);
                 log.info("Agent job '{s}' completed ({s}).", .{ id, if (result.success) "ok" else "error" });
             },
         }
@@ -1848,6 +1940,13 @@ test "nextRunForCronExpression supports step minutes" {
     try std.testing.expectEqual(@as(i64, 300), try nextRunForCronExpression("*/5 * * * *", 0));
 }
 
+test "nextRunForCronExpression supports anchored step minutes" {
+    try std.testing.expectEqual(@as(i64, 480), try nextRunForCronExpression("8/25 * * * *", 0));
+    try std.testing.expectEqual(@as(i64, 1980), try nextRunForCronExpression("8/25 * * * *", 480));
+    try std.testing.expectEqual(@as(i64, 3480), try nextRunForCronExpression("8/25 * * * *", 1980));
+    try std.testing.expectEqual(@as(i64, 4080), try nextRunForCronExpression("8/25 * * * *", 3480));
+}
+
 test "nextRunForCronExpression supports hourly schedule" {
     try std.testing.expectEqual(@as(i64, 3600), try nextRunForCronExpression("0 * * * *", 0));
 }
@@ -1950,7 +2049,13 @@ test "save and load roundtrip" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    if (scheduler.getMutableJob(recurring.id)) |job| {
+        job.last_run_secs = 1_772_455_140;
+        job.last_status = "ok";
+    } else {
+        return error.TestUnexpectedResult;
+    }
     _ = try scheduler.addOnce("5m", "echo oneshot");
 
     // Save to disk
@@ -1966,7 +2071,78 @@ test "save and load roundtrip" {
     const loaded = scheduler2.listJobs();
     try std.testing.expectEqualStrings("*/10 * * * *", loaded[0].expression);
     try std.testing.expectEqualStrings("echo roundtrip", loaded[0].command);
+    try std.testing.expectEqual(@as(?i64, 1_772_455_140), loaded[0].last_run_secs);
+    try std.testing.expect(loaded[0].last_status != null);
+    try std.testing.expectEqualStrings("ok", loaded[0].last_status.?);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "save and load roundtrip keeps delivery account routing" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/10 * * * *", "echo routed");
+    if (scheduler.getMutableJob(job.id)) |mutable_job| {
+        mutable_job.delivery = .{
+            .mode = .always,
+            .channel = try std.testing.allocator.dupe(u8, "telegram"),
+            .account_id = try std.testing.allocator.dupe(u8, "backup"),
+            .to = try std.testing.allocator.dupe(u8, "chat-42"),
+            .channel_owned = true,
+            .account_id_owned = true,
+            .to_owned = true,
+        };
+    } else {
+        return error.TestUnexpectedResult;
+    }
+
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const loaded_job = loaded.listJobs()[0];
+    try std.testing.expectEqual(DeliveryMode.always, loaded_job.delivery.mode);
+    try std.testing.expect(loaded_job.delivery.channel != null);
+    try std.testing.expectEqualStrings("telegram", loaded_job.delivery.channel.?);
+    try std.testing.expect(loaded_job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", loaded_job.delivery.account_id.?);
+    try std.testing.expect(loaded_job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", loaded_job.delivery.to.?);
+}
+
+test "cliRunJob persists last status and timestamp" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("* * * * *", "echo cli_run_status");
+    const job_id = try std.testing.allocator.dupe(u8, job.id);
+    defer std.testing.allocator.free(job_id);
+    try saveJobs(&scheduler);
+
+    try cliRunJob(std.testing.allocator, job_id);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(loaded_job.last_run_secs != null);
+    try std.testing.expect(loaded_job.last_status != null);
+    try std.testing.expectEqualStrings("ok", loaded_job.last_status.?);
+}
+
+test "resolveRunnableCwd keeps valid cwd" {
+    const resolved = resolveRunnableCwd(".");
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualStrings(".", resolved.?);
+}
+
+test "resolveRunnableCwd returns null for missing cwd" {
+    const resolved = resolveRunnableCwd("__nullclaw_missing_cwd_for_cron_tests__/subdir");
+    try std.testing.expect(resolved == null);
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
@@ -2016,7 +2192,12 @@ test "save and load roundtrip keeps agent fields" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4");
+    _ = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat-42",
+    });
     try saveJobs(&scheduler);
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
@@ -2030,6 +2211,13 @@ test "save and load roundtrip keeps agent fields" {
     try std.testing.expectEqualStrings("Summarize release status", job.prompt.?);
     try std.testing.expect(job.model != null);
     try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expect(job.delivery.channel != null);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expect(job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", job.delivery.account_id.?);
+    try std.testing.expect(job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
 }
 
 test "JobType parse and asStr" {
@@ -2097,7 +2285,7 @@ test "updateJob keeps agent command and prompt in sync" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a");
+    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a", .{});
     const id = scheduler.listJobs()[0].id;
 
     // Back-compat: updating command should update agent prompt.
@@ -2124,7 +2312,7 @@ test "CronScheduler remove frees agent job fields" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free");
+    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free", .{});
     try std.testing.expect(scheduler.removeJob(job.id));
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
@@ -2229,6 +2417,27 @@ test "deliverResult creates correct OutboundMessage" {
     try std.testing.expectEqualStrings("telegram", msg.channel);
     try std.testing.expectEqualStrings("chat123", msg.chat_id);
     try std.testing.expectEqualStrings("job output here", msg.content);
+}
+
+test "deliverResult preserves account routing when delivery account_id is set" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat123",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus);
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expect(msg.account_id != null);
+    try std.testing.expectEqualStrings("backup", msg.account_id.?);
 }
 
 test "deliverResult with mode none does nothing" {
@@ -2447,20 +2656,12 @@ test "agent job delivers result via bus" {
     var test_bus = bus.Bus.init();
     defer test_bus.close();
 
-    // Create an agent-type job with a prompt
-    try scheduler.jobs.append(allocator, .{
-        .id = try allocator.dupe(u8, "agent-1"),
-        .expression = try allocator.dupe(u8, "* * * * *"),
-        .command = try allocator.dupe(u8, "summarize"),
-        .job_type = .agent,
-        .prompt = try allocator.dupe(u8, "Summarize today's news"),
-        .next_run_secs = 0,
-        .delivery = .{
-            .mode = .always,
-            .channel = "discord",
-            .to = "general",
-        },
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize today's news", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "general",
     });
+    job.next_run_secs = 0;
 
     _ = scheduler.tick(std.time.timestamp(), &test_bus);
 
@@ -2602,6 +2803,25 @@ test "tick reschedules recurring job using cron expression" {
 
     _ = scheduler.tick(0, null);
     try std.testing.expectEqual(@as(i64, 600), scheduler.jobs.items[0].next_run_secs);
+}
+
+test "tick reschedules anchored recurring job using cron expression" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("8/25 * * * *", "echo anchored");
+    scheduler.jobs.items[0].next_run_secs = 480;
+
+    _ = scheduler.tick(480, null);
+    try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expectEqual(@as(i64, 1980), scheduler.jobs.items[0].next_run_secs);
+
+    _ = scheduler.tick(1980, null);
+    try std.testing.expectEqual(@as(i64, 3480), scheduler.jobs.items[0].next_run_secs);
+
+    _ = scheduler.tick(3480, null);
+    try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
 }
 
 test "cron module compiles" {}

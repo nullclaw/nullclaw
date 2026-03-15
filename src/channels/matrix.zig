@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const url_percent = @import("../url_percent.zig");
 
 const log = std.log.scoped(.matrix);
 
@@ -520,23 +521,8 @@ fn stripTrailingSlashes(url: []const u8) []const u8 {
     return url[0..end];
 }
 
-fn isUnreserved(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
-}
-
 fn appendUrlEncoded(writer: anytype, text: []const u8) !void {
-    for (text) |c| {
-        if (isUnreserved(c)) {
-            try writer.writeByte(c);
-        } else {
-            var esc: [3]u8 = undefined;
-            const upper = "0123456789ABCDEF";
-            esc[0] = '%';
-            esc[1] = upper[(c >> 4) & 0x0F];
-            esc[2] = upper[c & 0x0F];
-            try writer.writeAll(&esc);
-        }
-    }
+    try url_percent.appendPercentEncodedWriter(writer, text);
 }
 
 fn toOwnedMessages(

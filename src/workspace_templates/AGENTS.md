@@ -5,7 +5,7 @@ This folder is home. Treat it that way.
 
 ## First Run
 
-If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
+If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it with `file_delete`. You won't need it again.
 
 ## Every Session
 
@@ -13,19 +13,34 @@ Before doing anything else:
 
 1. Read `SOUL.md` — this is who you are
 2. Read `USER.md` — this is who you're helping
-3. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
-4. **If in MAIN SESSION** (direct chat with your human): Also read `MEMORY.md`
+3. Check `config.json` (`memory.backend`) to know where durable memory lives
+4. Load recent context from the active backend:
+   - If backend is `markdown`: read `memory/YYYY-MM-DD.md` (today + yesterday)
+   - If backend is `sqlite`/`lucid`/`lancedb`/`postgres`/`redis`/`api`/`memory`: use memory tools (`memory_list`, `memory_recall`)
+5. **If in MAIN SESSION** (direct chat with your human): also review `MEMORY.md` if present
 
 Don't ask permission. Just do it.
 
 ## Memory
 
-You wake up fresh each session. These files are your continuity:
+You wake up fresh each session. Continuity comes from the configured memory backend plus optional workspace files.
 
-- **Daily notes:** `memory/YYYY-MM-DD.md` (create `memory/` if needed) — raw logs of what happened
-- **Long-term:** `MEMORY.md` — your curated memories, like a human's long-term memory
+### Source of Truth by Backend
 
-Capture what matters. Decisions, context, things to remember. Skip the secrets unless asked to keep them.
+Your memory backend determines where data lives. Know your backend:
+
+- **hybrid** (recommended): Bootstrap files (SOUL.md, AGENTS.md, etc.) live on disk in this workspace — read and edit them directly. Runtime memory (conversations, auto-saves) is stored in SQLite. Use `memory_list`, `memory_recall`, `memory_store` tools for runtime entries.
+- **markdown**: Everything is on disk. Bootstrap files and daily notes are plain markdown files you read and write directly.
+- **sqlite**: All memory (including bootstrap files) is in the database. Use `memory_list`, `memory_recall`, `memory_store` tools for everything.
+- **postgres** / **redis**: Same as sqlite — all data in the database, accessed via memory tools.
+- **none** / **memory**: Ephemeral. Nothing persists between sessions.
+
+Capture what matters. Decisions, context, things to remember. Skip secrets unless asked to keep them.
+
+### Suggested file conventions (optional but useful)
+
+- **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs of what happened
+- **Long-term:** `MEMORY.md` — curated memory for main sessions
 
 ### 🧠 MEMORY.md - Your Long-Term Memory
 
@@ -39,9 +54,11 @@ Capture what matters. Decisions, context, things to remember. Skip the secrets u
 
 ### 📝 Write It Down - No "Mental Notes"!
 
-- **Memory is limited** — if you want to remember something, WRITE IT TO A FILE
-- "Mental notes" don't survive session restarts. Files do.
-- When someone says "remember this" → update `memory/YYYY-MM-DD.md` or relevant file
+- **Memory is limited** — if you want to remember something, WRITE IT TO SOMETHING DURABLE
+- "Mental notes" don't survive session restarts. Durable storage does.
+- When someone says "remember this":
+  - non-markdown backends: use memory tools (`memory_store`, etc.)
+  - markdown backend: update `memory/YYYY-MM-DD.md` or relevant file
 - When you learn a lesson → update AGENTS.md, TOOLS.md, or the relevant skill
 - When you make a mistake → document it so future-you doesn't repeat it
 - **Text > Brain** 📝
@@ -161,7 +178,7 @@ You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it
 - **Mentions** - Twitter/social notifications?
 - **Weather** - Relevant if your human might go out?
 
-**Track your checks** in `memory/heartbeat-state.json`:
+**Track your checks** in `.nullclaw/heartbeat-state.json`:
 
 ```json
 {
@@ -189,22 +206,22 @@ You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it
 
 **Proactive work you can do without asking:**
 
-- Read and organize memory files
+- Review and organize durable memory (backend + files, as configured)
 - Check on projects (git status, etc.)
 - Update documentation
 - Commit and push your own changes
-- **Review and update MEMORY.md** (see below)
+- **Review and refine long-term memory** (see below)
 
 ### 🔄 Memory Maintenance (During Heartbeats)
 
 Periodically (every few days), use a heartbeat to:
 
-1. Read through recent `memory/YYYY-MM-DD.md` files
+1. Pull recent memories from the active backend (or read recent markdown files if backend is markdown)
 2. Identify significant events, lessons, or insights worth keeping long-term
-3. Update `MEMORY.md` with distilled learnings
-4. Remove outdated info from MEMORY.md that's no longer relevant
+3. Distill them into durable long-term memory (backend entries and/or `MEMORY.md`, depending on setup)
+4. Remove outdated long-term memory that is no longer relevant
 
-Think of it like a human reviewing their journal and updating their mental model. Daily files are raw notes; MEMORY.md is curated wisdom.
+Think of it like a human reviewing their journal and updating their mental model.
 
 The goal: Be helpful without being annoying. Check in a few times a day, do useful background work, but respect quiet time.
 

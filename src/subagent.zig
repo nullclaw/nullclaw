@@ -10,6 +10,7 @@ const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const providers = @import("providers/root.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 const log = std.log.scoped(.subagent);
 
@@ -50,6 +51,7 @@ pub const TaskRunRequest = struct {
     http_allowed_domains: []const []const u8,
     http_max_response_size: u32,
     tools_config: config_types.ToolsConfig,
+    memory_config: config_types.MemoryConfig,
     max_tool_iterations: u32,
     autonomy: config_types.AutonomyLevel,
     workspace_only: bool,
@@ -57,6 +59,7 @@ pub const TaskRunRequest = struct {
     max_actions_per_hour: u32,
     require_approval_for_medium_risk: bool,
     block_high_risk_commands: bool,
+    allow_raw_url_chars: bool,
     configured_providers: []const config_types.ProviderEntry,
 };
 
@@ -97,11 +100,13 @@ pub const SubagentManager = struct {
     max_actions_per_hour: u32,
     require_approval_for_medium_risk: bool,
     block_high_risk_commands: bool,
+    allow_raw_url_chars: bool,
     configured_providers: []const config_types.ProviderEntry,
     http_enabled: bool,
     http_allowed_domains: []const []const u8,
     http_max_response_size: u32,
     tools_config: config_types.ToolsConfig,
+    memory_config: config_types.MemoryConfig,
     task_runner: ?TaskRunnerFn = null,
 
     pub fn init(
@@ -129,11 +134,13 @@ pub const SubagentManager = struct {
             .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
             .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
             .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+            .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
             .configured_providers = cfg.providers,
             .http_enabled = cfg.http_request.enabled,
             .http_allowed_domains = cfg.http_request.allowed_domains,
             .http_max_response_size = cfg.http_request.max_response_size,
             .tools_config = cfg.tools,
+            .memory_config = cfg.memory,
         };
     }
 
@@ -228,7 +235,7 @@ pub const SubagentManager = struct {
             .agent_name = agent_name_copy,
         };
 
-        state.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, subagentThreadFn, .{ctx});
+        state.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, subagentThreadFn, .{ctx});
 
         return task_id;
     }
@@ -373,6 +380,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .http_allowed_domains = ctx.manager.http_allowed_domains,
             .http_max_response_size = ctx.manager.http_max_response_size,
             .tools_config = ctx.manager.tools_config,
+            .memory_config = ctx.manager.memory_config,
             .max_tool_iterations = ctx.manager.config.max_iterations,
             .autonomy = ctx.manager.autonomy,
             .workspace_only = ctx.manager.workspace_only,
@@ -380,6 +388,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .max_actions_per_hour = ctx.manager.max_actions_per_hour,
             .require_approval_for_medium_risk = ctx.manager.require_approval_for_medium_risk,
             .block_high_risk_commands = ctx.manager.block_high_risk_commands,
+            .allow_raw_url_chars = ctx.manager.allow_raw_url_chars,
             .configured_providers = ctx.manager.configured_providers,
         };
 

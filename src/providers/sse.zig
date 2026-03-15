@@ -1,6 +1,171 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
+const fs_compat = @import("../fs_compat.zig");
 const http_util = @import("../http_util.zig");
+const platform = @import("../platform.zig");
+const error_classify = @import("error_classify.zig");
+const verbose = @import("../verbose.zig");
+const log = std.log.scoped(.provider_sse);
+
+var curl_fail_fast_arg_mutex: std.Thread.Mutex = .{};
+var curl_fail_with_body_supported_cache: ?bool = null;
+
+fn finalizeStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    stream_usage: ?root.TokenUsage,
+) !root.StreamChatResult {
+    const content = if (accumulated.len > 0)
+        try allocator.dupe(u8, accumulated)
+    else
+        null;
+
+    var usage = stream_usage orelse root.TokenUsage{};
+    if (usage.completion_tokens == 0) {
+        usage.completion_tokens = @intCast((accumulated.len + 3) / 4);
+    }
+
+    return .{
+        .content = content,
+        .usage = usage,
+        .model = "",
+    };
+}
+
+fn parseCurlVersionComponent(component: []const u8) ?u32 {
+    var end: usize = 0;
+    while (end < component.len and std.ascii.isDigit(component[end])) : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, component[0..end], 10) catch null;
+}
+
+fn parseCurlVersionTriplet(version_line: []const u8) ?[3]u32 {
+    const prefix = "curl ";
+    if (!std.mem.startsWith(u8, version_line, prefix)) return null;
+
+    const version_tail = version_line[prefix.len..];
+    const version_end = std.mem.indexOfScalar(u8, version_tail, ' ') orelse version_tail.len;
+    const version_token = version_tail[0..version_end];
+
+    var parts = std.mem.splitScalar(u8, version_token, '.');
+    const major = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
+    const minor = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
+    const patch = parseCurlVersionComponent(parts.next() orelse return null) orelse return null;
+    return .{ major, minor, patch };
+}
+
+fn curlVersionSupportsFailWithBody(version_line: []const u8) bool {
+    const version = parseCurlVersionTriplet(version_line) orelse return false;
+    if (version[0] != 7) return version[0] > 7;
+    if (version[1] != 76) return version[1] > 76;
+    return version[2] >= 0;
+}
+
+fn detectCurlFailWithBodySupport(allocator: std.mem.Allocator) bool {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "curl", "--version" },
+        .max_output_bytes = 1024,
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
+    var line_it = std.mem.splitScalar(u8, trimmed, '\n');
+    return curlVersionSupportsFailWithBody(line_it.first());
+}
+
+/// Prefer `--fail-with-body` so JSON API errors remain classifiable, but fall
+/// back to `-f` on curl releases older than 7.76.0 where the newer flag fails.
+pub fn curlFailFastArg(allocator: std.mem.Allocator) []const u8 {
+    curl_fail_fast_arg_mutex.lock();
+    defer curl_fail_fast_arg_mutex.unlock();
+
+    if (curl_fail_with_body_supported_cache == null) {
+        curl_fail_with_body_supported_cache = detectCurlFailWithBodySupport(allocator);
+    }
+
+    return if (curl_fail_with_body_supported_cache.?) "--fail-with-body" else "-f";
+}
+
+const CurlBodyArg = struct {
+    arg: []const u8,
+    temp_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    temp_path_len: usize = 0,
+    uses_temp_file: bool = false,
+
+    fn deinit(self: *const CurlBodyArg, allocator: std.mem.Allocator) void {
+        if (!self.uses_temp_file) return;
+        std.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
+        allocator.free(self.arg);
+    }
+};
+
+fn prepareCurlBodyArg(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    log_enabled: bool,
+) !CurlBodyArg {
+    if (builtin.os.tag != .windows) {
+        return .{ .arg = body };
+    }
+
+    const debug_log = std.log.scoped(.sse);
+    var prepared: CurlBodyArg = .{ .arg = body };
+
+    const tmp_dir_path = platform.getTempDir(allocator) catch
+        return error.TempDirNotFound;
+    defer allocator.free(tmp_dir_path);
+
+    var tmp_dir = std.fs.openDirAbsolute(tmp_dir_path, .{}) catch
+        return error.TempDirNotFound;
+    defer tmp_dir.close();
+
+    const body_path = std.fmt.bufPrint(
+        &prepared.temp_path_buf,
+        "{s}{s}sse_body_{d}.tmp",
+        .{ tmp_dir_path, std.fs.path.sep_str, std.time.timestamp() },
+    ) catch return error.PathTooLong;
+    prepared.temp_path_len = body_path.len;
+    errdefer std.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
+
+    var tmp_file = tmp_dir.createFile(
+        body_path[tmp_dir_path.len + 1 ..],
+        .{ .truncate = true, .exclusive = false },
+    ) catch return error.TempFileCreateFailed;
+
+    tmp_file.writeAll(body) catch {
+        tmp_file.close();
+        return error.TempFileWriteFailed;
+    };
+    tmp_file.close();
+
+    if (log_enabled) {
+        debug_log.info("Using temp file for curl body: {s}, body_len={d}", .{ body_path, body.len });
+    }
+
+    const verify_file = std.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
+    defer verify_file.close();
+    const verify_stat = fs_compat.stat(verify_file) catch return error.TempFileCreateFailed;
+    if (log_enabled) {
+        debug_log.info("Temp body file size: {d} bytes", .{verify_stat.size});
+    }
+
+    for (prepared.temp_path_buf[0..prepared.temp_path_len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+
+    prepared.arg = try std.fmt.allocPrint(allocator, "@{s}", .{prepared.temp_path_buf[0..prepared.temp_path_len]});
+    errdefer allocator.free(prepared.arg);
+    prepared.uses_temp_file = true;
+    return prepared;
+}
 
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
@@ -8,6 +173,8 @@ pub const SseLineResult = union(enum) {
     delta: []const u8,
     /// Stream is complete ([DONE] sentinel).
     done: void,
+    /// Token usage from a stream chunk.
+    usage: root.TokenUsage,
     /// Line should be skipped (empty, comment, or no content).
     skip: void,
 };
@@ -24,15 +191,53 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
 
-    const prefix = "data: ";
+    // SSE uses "data:" with an optional single leading space before the value.
+    const prefix = "data:";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
 
-    const data = trimmed[prefix.len..];
+    const data = if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
+        trimmed[prefix.len + 1 ..]
+    else
+        trimmed[prefix.len..];
+
+    if (data.len == 0) return .skip;
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
-    const content = try extractDeltaContent(allocator, data) orelse return .skip;
+    const content = try extractDeltaContent(allocator, data) orelse {
+        // No content delta — check for usage data (sent in the final chunk).
+        if (extractStreamUsage(data)) |u| return .{ .usage = u };
+        return .skip;
+    };
     return .{ .delta = content };
+}
+
+/// Extract `usage` object from an OpenAI-compatible streaming chunk.
+/// The final chunk typically has `choices:[]` and a top-level `usage` object.
+fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const alloc = fba.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, json_str, .{}) catch
+        return null;
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    const usage_val = obj.get("usage") orelse return null;
+    if (usage_val != .object) return null;
+
+    var usage = root.TokenUsage{};
+    if (usage_val.object.get("prompt_tokens")) |v| {
+        if (v == .integer) usage.prompt_tokens = @intCast(v.integer);
+    }
+    if (usage_val.object.get("completion_tokens")) |v| {
+        if (v == .integer) usage.completion_tokens = @intCast(v.integer);
+    }
+    if (usage_val.object.get("total_tokens")) |v| {
+        if (v == .integer) usage.total_tokens = @intCast(v.integer);
+    }
+    return usage;
 }
 
 /// Extract `choices[0].delta.content` from an SSE JSON payload.
@@ -61,7 +266,8 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
 
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
-/// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
+/// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
+/// `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
 /// For each SSE delta, calls `callback(ctx, chunk)`.
 /// Returns accumulated result after stream completes.
 pub fn curlStream(
@@ -74,6 +280,10 @@ pub fn curlStream(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
+    // Check verbose mode once at function start
+    const log_enabled = verbose.isVerbose();
+    const debug_log = std.log.scoped(.sse);
+
     // Build argv on stack (max 32 args)
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
@@ -84,7 +294,7 @@ pub fn curlStream(
     argc += 1;
     argv_buf[argc] = "--no-buffer";
     argc += 1;
-    argv_buf[argc] = "--fail-with-body";
+    argv_buf[argc] = curlFailFastArg(allocator);
     argc += 1;
 
     var timeout_buf: [32]u8 = undefined;
@@ -130,18 +340,57 @@ pub fn curlStream(
         argc += 1;
     }
 
-    argv_buf[argc] = "-d";
-    argc += 1;
-    argv_buf[argc] = body;
+    // On Windows, command line length is limited to ~32767 chars.
+    // Use a temp file there to avoid NameTooLong; keep other platforms in-memory.
+    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
+    defer prepared_body.deinit(allocator);
+
+    if (prepared_body.uses_temp_file) {
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+    } else {
+        argv_buf[argc] = "-d";
+        argc += 1;
+    }
+    argv_buf[argc] = prepared_body.arg;
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
+
+    // Debug: log the curl command
+    if (log_enabled) {
+        debug_log.info("curl argc={d}, body_len={d}, used_temp_file={}, body_arg={s}", .{ argc, body.len, prepared_body.uses_temp_file, prepared_body.arg });
+    }
+
+    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd_buf.deinit(allocator);
+    for (argv_buf[0..argc], 0..) |arg, i| {
+        if (i > 0) cmd_buf.append(allocator, ' ') catch {};
+        // Quote arguments that contain spaces or special chars for easy copy-paste
+        if (std.mem.indexOfAny(u8, arg, " \t\"'") != null or std.mem.startsWith(u8, arg, "@")) {
+            cmd_buf.append(allocator, '"') catch {};
+            cmd_buf.appendSlice(allocator, arg) catch {};
+            cmd_buf.append(allocator, '"') catch {};
+        } else {
+            cmd_buf.appendSlice(allocator, arg) catch {};
+        }
+    }
+    if (log_enabled) {
+        debug_log.info("curl command: {s}", .{cmd_buf.items});
+    }
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
+    if (log_enabled) {
+        debug_log.info("spawning curl process...", .{});
+    }
     try child.spawn();
+    if (log_enabled) {
+        const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
+        debug_log.info("curl process spawned, pid={d}", .{pid});
+    }
 
     // Read stdout line by line, parse SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
@@ -150,16 +399,61 @@ pub fn curlStream(
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
-    const file = child.stdout.?;
+    const stdout_file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
     var saw_done = false;
+    var total_stdout: usize = 0;
+    var stream_usage: ?root.TokenUsage = null;
 
     outer: while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
+        const n = stdout_file.read(&read_buf) catch |err| {
+            if (log_enabled) {
+                debug_log.info("stdout read error: {}", .{err});
+            }
+            break;
+        };
+        if (n == 0) {
+            if (log_enabled) {
+                debug_log.info("stdout read returned 0 bytes (EOF)", .{});
+            }
+            break;
+        }
+        total_stdout += n;
+
+        if (log_enabled) {
+            debug_log.info("stdout read {d} bytes: {s}", .{ n, read_buf[0..n] });
+        }
+
+        // Check if this is JSON (starts with '{')
+        if (total_stdout == n and read_buf[0] == '{') {
+            if (log_enabled) {
+                debug_log.info("Detected JSON response, not SSE", .{});
+            }
+            // This is a JSON error, not SSE
+            const json_response = try allocator.dupe(u8, read_buf[0..n]);
+            defer allocator.free(json_response);
+
+            // Try to classify the error
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
+            if (parsed) |p| {
+                defer p.deinit();
+                if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                    _ = child.wait() catch {};
+                    return error_classify.kindToError(kind);
+                }
+            }
+
+            // Return a meaningful error
+            _ = child.wait() catch {};
+            debug_log.err("Server returned JSON error: {s}", .{json_response});
+            return error.ServerError;
+        }
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
+                if (log_enabled) {
+                    debug_log.info("parsing SSE line: {s}", .{line_buf.items});
+                }
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
                     continue;
@@ -171,7 +465,11 @@ pub fn curlStream(
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
+                    .usage => |u| stream_usage = u,
                     .done => {
+                        if (log_enabled) {
+                            debug_log.info("SSE stream done", .{});
+                        }
                         saw_done = true;
                         break :outer;
                     },
@@ -181,6 +479,10 @@ pub fn curlStream(
                 try line_buf.append(allocator, byte);
             }
         }
+    }
+
+    if (log_enabled) {
+        debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
     }
 
     // Parse a trailing line when the stream ends without a final '\n'.
@@ -194,6 +496,7 @@ pub fn curlStream(
                     try accumulated.appendSlice(allocator, text);
                     callback(ctx, root.StreamChunk.textDelta(text));
                 },
+                .usage => |u| stream_usage = u,
                 .done => {},
                 .skip => {},
             }
@@ -202,29 +505,50 @@ pub fn curlStream(
 
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
-        const n = file.read(&read_buf) catch break;
+        const n = stdout_file.read(&read_buf) catch break;
         if (n == 0) break;
+        if (log_enabled) {
+            debug_log.info("drained {d} more stdout bytes", .{n});
+        }
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    if (log_enabled) {
+        debug_log.info("waiting for curl process to exit...", .{});
+    }
+    const term = child.wait() catch |err| {
+        log.err("curlStream child.wait failed: {}", .{err});
+        if (saw_done) {
+            log.warn("curlStream proceeding despite wait failure after receiving stream data", .{});
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+        }
+        return error.CurlWaitError;
+    };
+    if (log_enabled) {
+        debug_log.info("curl process terminated: {}", .{term});
+    }
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (saw_done) {
+                log.warn("curlStream exit code {d} after stream data; returning accumulated output", .{code});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (saw_done) {
+                log.warn("curlStream abnormal termination after stream data; returning accumulated output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+            }
+            return error.CurlFailed;
+        },
     }
 
     // Signal stream completion only after curl exits successfully.
     callback(ctx, root.StreamChunk.finalChunk());
-
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
-        .model = "",
-    };
+    return finalizeStreamResult(allocator, accumulated.items, stream_usage);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -380,9 +704,17 @@ pub fn curlStreamAnthropic(
         argc += 1;
     }
 
-    argv_buf[argc] = "-d";
+    const log_enabled = verbose.isVerbose();
+    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
+    defer prepared_body.deinit(allocator);
+
+    if (prepared_body.uses_temp_file) {
+        argv_buf[argc] = "--data-binary";
+    } else {
+        argv_buf[argc] = "-d";
+    }
     argc += 1;
-    argv_buf[argc] = body;
+    argv_buf[argc] = prepared_body.arg;
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
@@ -401,7 +733,8 @@ pub fn curlStreamAnthropic(
     defer line_buf.deinit(allocator);
 
     var current_event: []const u8 = "";
-    var output_tokens: u32 = 0;
+    var anthropic_usage: root.TokenUsage = .{};
+    var saw_done = false;
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
@@ -427,8 +760,9 @@ pub fn curlStreamAnthropic(
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
-                    .usage => |tokens| output_tokens = tokens,
+                    .usage => |tokens| anthropic_usage.completion_tokens = tokens,
                     .done => {
+                        saw_done = true;
                         line_buf.clearRetainingCapacity();
                         break :outer;
                     },
@@ -444,37 +778,42 @@ pub fn curlStreamAnthropic(
     // Free owned event string
     if (current_event.len > 0) allocator.free(@constCast(current_event));
 
-    // Send final chunk
-    callback(ctx, root.StreamChunk.finalChunk());
-
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curlStreamAnthropic child.wait failed: {}", .{err});
+        if (saw_done) {
+            log.warn("curlStreamAnthropic proceeding despite wait failure after receiving stream data", .{});
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+        }
+        return error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic exit code {d} after stream data; returning accumulated output", .{code});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic abnormal termination after stream data; returning accumulated output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+            }
+            return error.CurlFailed;
+        },
     }
 
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    // Use actual output_tokens if reported, otherwise estimate
-    const completion_tokens = if (output_tokens > 0)
-        output_tokens
-    else
-        @as(u32, @intCast((accumulated.items.len + 3) / 4));
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = completion_tokens },
-        .model = "",
-    };
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -493,9 +832,54 @@ test "parseSseLine valid delta" {
     }
 }
 
+test "parseSseLine valid delta without optional space" {
+    const allocator = std.testing.allocator;
+    const result = try parseSseLine(allocator, "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
+    switch (result) {
+        .delta => |text| {
+            defer allocator.free(text);
+            try std.testing.expectEqualStrings("Hello", text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "prepareCurlBodyArg uses temp file only on Windows" {
+    const allocator = std.testing.allocator;
+    const body = [_]u8{'x'} ** 4096;
+    var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
+    defer prepared.deinit(allocator);
+
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(prepared.uses_temp_file);
+        try std.testing.expect(std.mem.startsWith(u8, prepared.arg, "@"));
+    } else {
+        try std.testing.expect(!prepared.uses_temp_file);
+        try std.testing.expectEqualStrings(body[0..], prepared.arg);
+    }
+}
+
 test "parseSseLine DONE sentinel" {
     const result = try parseSseLine(std.testing.allocator, "data: [DONE]");
     try std.testing.expect(result == .done);
+}
+
+test "parseSseLine DONE sentinel without optional space" {
+    const result = try parseSseLine(std.testing.allocator, "data:[DONE]");
+    try std.testing.expect(result == .done);
+}
+
+test "curlVersionSupportsFailWithBody rejects curl older than 7.76.0" {
+    try std.testing.expect(!curlVersionSupportsFailWithBody("curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0"));
+}
+
+test "curlVersionSupportsFailWithBody accepts curl 7.76.0 and newer" {
+    try std.testing.expect(curlVersionSupportsFailWithBody("curl 7.76.0 (x86_64-pc-linux-gnu) libcurl/7.76.0"));
+    try std.testing.expect(curlVersionSupportsFailWithBody("curl 8.17.0 (x86_64-alpine-linux-musl) libcurl/8.17.0"));
+}
+
+test "curlVersionSupportsFailWithBody tolerates suffixes in version token" {
+    try std.testing.expect(curlVersionSupportsFailWithBody("curl 8.17.0-DEV (x86_64) libcurl/8.17.0"));
 }
 
 test "parseSseLine empty line" {
@@ -505,6 +889,11 @@ test "parseSseLine empty line" {
 
 test "parseSseLine comment" {
     const result = try parseSseLine(std.testing.allocator, ":keep-alive");
+    try std.testing.expect(result == .skip);
+}
+
+test "parseSseLine empty data field" {
+    const result = try parseSseLine(std.testing.allocator, "data:");
     try std.testing.expect(result == .skip);
 }
 
@@ -624,4 +1013,37 @@ test "extractAnthropicUsage correct JSON returns token count" {
     const json = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":57}}";
     const result = (try extractAnthropicUsage(json)).?;
     try std.testing.expect(result == 57);
+}
+
+// ── Stream Usage Extraction Tests ───────────────────────────────
+
+test "extractStreamUsage returns full usage from final chunk" {
+    const json = "{\"id\":\"chatcmpl-abc\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":263,\"total_tokens\":363}}";
+    const usage = extractStreamUsage(json).?;
+    try std.testing.expectEqual(@as(u32, 100), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 263), usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 363), usage.total_tokens);
+}
+
+test "extractStreamUsage returns null for chunk without usage" {
+    const json = "{\"id\":\"chatcmpl-abc\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+    try std.testing.expect(extractStreamUsage(json) == null);
+}
+
+test "extractStreamUsage returns null for invalid JSON" {
+    try std.testing.expect(extractStreamUsage("not-json{{{") == null);
+}
+
+test "parseSseLine extracts usage from final chunk" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"id\":\"chatcmpl-abc\",\"choices\":[],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":20,\"total_tokens\":70}}";
+    const result = try parseSseLine(allocator, line);
+    switch (result) {
+        .usage => |u| {
+            try std.testing.expectEqual(@as(u32, 50), u.prompt_tokens);
+            try std.testing.expectEqual(@as(u32, 20), u.completion_tokens);
+            try std.testing.expectEqual(@as(u32, 70), u.total_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

@@ -123,7 +123,8 @@ pub fn buildSummarizationPrompt(
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator,
+    try buf.appendSlice(
+        allocator,
         "Summarize the following conversation concisely, preserving key facts " ++
             "and important details. Extract any long-lived knowledge as bullet " ++
             "points prefixed with \"Key fact: \".\n" ++

@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+const fs_compat = @import("../fs_compat.zig");
 const urlEncode = @import("web_search_providers/common.zig").urlEncode;
 const http_util = @import("../http_util.zig");
 
@@ -131,7 +132,7 @@ pub const PushoverTool = struct {
         const env_path = try std.fmt.allocPrint(allocator, "{s}/.env", .{self.workspace_dir});
         defer allocator.free(env_path);
 
-        const content = std.fs.cwd().readFileAlloc(allocator, env_path, 1_048_576) catch
+        const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, env_path, 1_048_576) catch
             return error.EnvFileNotFound;
         defer allocator.free(content);
 

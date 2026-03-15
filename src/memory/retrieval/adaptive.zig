@@ -107,8 +107,9 @@ pub fn analyzeQuery(query: []const u8, config: AdaptiveConfig) QueryAnalysis {
 /// Check if query starts with a question word.
 fn isQuestionQuery(query: []const u8) bool {
     const question_prefixes = [_][]const u8{
-        "what ", "how ", "why ", "when ", "where ", "who ",
-        "which ", "can ", "could ", "does ", "do ", "is ", "are ",
+        "what ",  "how ", "why ",   "when ", "where ", "who ",
+        "which ", "can ", "could ", "does ", "do ",    "is ",
+        "are ",
     };
 
     // Build a lowercase prefix to compare (enough for the longest question word)

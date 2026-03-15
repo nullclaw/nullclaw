@@ -12,6 +12,7 @@ COPY src/ src/
 COPY vendor/sqlite3/ vendor/sqlite3/
 
 ARG TARGETARCH
+ARG VERSION=dev
 RUN --mount=type=cache,target=/root/.cache/zig \
     --mount=type=cache,target=/app/.zig-cache \
     set -eu; \
@@ -28,14 +29,15 @@ RUN --mount=type=cache,target=/root/.cache/zig \
       arm64) zig_target="aarch64-linux-musl" ;; \
       *) echo "Unsupported TARGETARCH: ${arch}" >&2; exit 1 ;; \
     esac; \
-    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall -Dversion="${VERSION}"
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
 FROM busybox:1.37 AS config
 
-RUN mkdir -p /nullclaw-data/.nullclaw /nullclaw-data/workspace
+# Keep config.json at the volume root so existing compose volumes remain readable.
+RUN mkdir -p /nullclaw-data/workspace
 
-RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
+RUN cat > /nullclaw-data/config.json << 'EOF'
 {
   "api_key": "",
   "default_provider": "openrouter",
@@ -64,6 +66,7 @@ COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
+ENV NULLCLAW_HOME=/nullclaw-data
 ENV HOME=/nullclaw-data
 ENV NULLCLAW_GATEWAY_PORT=3000
 

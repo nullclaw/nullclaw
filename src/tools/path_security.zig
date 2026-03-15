@@ -4,7 +4,7 @@
 //! Extracted from file_edit.zig to eliminate cross-imports between tool files.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const path_prefix = @import("../path_prefix.zig");
 
 /// System-critical prefixes (Unix) — always blocked even if they match allowed_paths.
 const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
@@ -43,40 +43,7 @@ else
 
 /// Check whether a directory-style prefix matches (exact or followed by a path separator).
 pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (builtin.os.tag == .windows) {
-        const norm_path = normalizeWindowsPrefix(path);
-        const norm_prefix = normalizeWindowsPrefix(prefix);
-        if (!windowsPrefixEquals(norm_path, norm_prefix)) return false;
-        if (norm_path.len == norm_prefix.len) return true;
-        return isWindowsPathSeparator(norm_path[norm_prefix.len]);
-    } else {
-        if (!std.mem.startsWith(u8, path, prefix)) return false;
-        if (path.len == prefix.len) return true;
-        const c = path[prefix.len];
-        return c == '/' or c == '\\';
-    }
-}
-
-fn normalizeWindowsPrefix(path: []const u8) []const u8 {
-    // std.fs.realpath on Windows may produce verbatim paths (\\?\C:\...).
-    if (path.len >= 4 and path[0] == '\\' and path[1] == '\\' and path[2] == '?' and path[3] == '\\') {
-        return path[4..];
-    }
-    return path;
-}
-
-fn isWindowsPathSeparator(c: u8) bool {
-    return c == '\\' or c == '/';
-}
-
-fn windowsPrefixEquals(path: []const u8, prefix: []const u8) bool {
-    if (path.len < prefix.len) return false;
-    for (prefix, 0..) |pc, i| {
-        const c = path[i];
-        if (isWindowsPathSeparator(c) and isWindowsPathSeparator(pc)) continue;
-        if (std.ascii.toLower(c) != std.ascii.toLower(pc)) return false;
-    }
-    return true;
+    return path_prefix.pathStartsWith(path, prefix);
 }
 
 /// Check whether a **resolved** absolute path is allowed by the policy:

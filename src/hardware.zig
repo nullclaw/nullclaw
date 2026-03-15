@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 // Hardware discovery -- USB device enumeration and introspection.
 //
@@ -377,7 +378,7 @@ pub fn startHotplugMonitor(monitor: *HotplugMonitor) !void {
     switch (comptime builtin.os.tag) {
         .linux => {
             monitor.running = std.atomic.Value(bool).init(true);
-            monitor.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, runLinuxMonitor, .{monitor});
+            monitor.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE }, runLinuxMonitor, .{monitor});
         },
         .macos => {
             std.log.info("hotplug monitoring not available on macOS", .{});

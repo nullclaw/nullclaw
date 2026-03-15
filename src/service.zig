@@ -6,10 +6,64 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
+const Config = @import("config.zig").Config;
+const daemon = @import("daemon.zig");
+const http_util = @import("http_util.zig");
+const providers = @import("providers/root.zig");
 
 const SERVICE_LABEL = "com.nullclaw.daemon";
 const WINDOWS_SERVICE_NAME = "nullclaw";
 const WINDOWS_SERVICE_DISPLAY_NAME = "nullclaw gateway runtime";
+pub const WINDOWS_SERVICE_GATEWAY_ARG = "__windows-service-gateway";
+
+const windows = std.os.windows;
+const WINDOWS_SERVICE_NAME_W = std.unicode.utf8ToUtf16LeStringLiteral(WINDOWS_SERVICE_NAME);
+
+const WindowsServiceStatusHandle = ?*opaque {};
+const WindowsServiceMainProc = *const fn (windows.DWORD, [*]?[*:0]u16) callconv(.winapi) void;
+const WindowsServiceControlProc = *const fn (windows.DWORD) callconv(.winapi) void;
+const WindowsServiceTableEntry = extern struct {
+    service_name: ?[*:0]const u16,
+    service_proc: ?WindowsServiceMainProc,
+};
+const WindowsServiceStatus = extern struct {
+    service_type: windows.DWORD,
+    current_state: windows.DWORD,
+    controls_accepted: windows.DWORD,
+    win32_exit_code: windows.DWORD,
+    service_specific_exit_code: windows.DWORD,
+    checkpoint: windows.DWORD,
+    wait_hint_ms: windows.DWORD,
+};
+
+const SERVICE_WIN32_OWN_PROCESS: windows.DWORD = 0x00000010;
+const SERVICE_STOPPED: windows.DWORD = 0x00000001;
+const SERVICE_START_PENDING: windows.DWORD = 0x00000002;
+const SERVICE_STOP_PENDING: windows.DWORD = 0x00000003;
+const SERVICE_RUNNING: windows.DWORD = 0x00000004;
+const SERVICE_ACCEPT_STOP: windows.DWORD = 0x00000001;
+const SERVICE_ACCEPT_SHUTDOWN: windows.DWORD = 0x00000004;
+const SERVICE_CONTROL_STOP: windows.DWORD = 0x00000001;
+const SERVICE_CONTROL_INTERROGATE: windows.DWORD = 0x00000004;
+const SERVICE_CONTROL_SHUTDOWN: windows.DWORD = 0x00000005;
+const SERVICE_NO_ERROR: windows.DWORD = 0;
+const SERVICE_GENERIC_FAILURE: windows.DWORD = 1;
+
+extern "advapi32" fn StartServiceCtrlDispatcherW(start_table: [*]const WindowsServiceTableEntry) callconv(.winapi) windows.BOOL;
+extern "advapi32" fn RegisterServiceCtrlHandlerW(service_name: [*:0]const u16, handler_proc: WindowsServiceControlProc) callconv(.winapi) WindowsServiceStatusHandle;
+extern "advapi32" fn SetServiceStatus(status_handle: WindowsServiceStatusHandle, status: *const WindowsServiceStatus) callconv(.winapi) windows.BOOL;
+
+var windows_service_status_handle: WindowsServiceStatusHandle = null;
+var windows_service_status = WindowsServiceStatus{
+    .service_type = SERVICE_WIN32_OWN_PROCESS,
+    .current_state = SERVICE_STOPPED,
+    .controls_accepted = 0,
+    .win32_exit_code = SERVICE_NO_ERROR,
+    .service_specific_exit_code = 0,
+    .checkpoint = 0,
+    .wait_hint_ms = 0,
+};
+var windows_service_checkpoint: windows.DWORD = 1;
 
 pub const ServiceCommand = enum {
     install,
@@ -28,6 +82,32 @@ pub const ServiceError = error{
     SystemctlUnavailable,
     SystemdUserUnavailable,
 };
+
+pub fn isWindowsServiceGatewayArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, WINDOWS_SERVICE_GATEWAY_ARG);
+}
+
+pub fn runWindowsServiceGateway(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    if (comptime builtin.os.tag != .windows) return error.UnsupportedPlatform;
+
+    resetWindowsServiceState();
+
+    const table = [_]WindowsServiceTableEntry{
+        .{
+            .service_name = WINDOWS_SERVICE_NAME_W,
+            .service_proc = windowsServiceMain,
+        },
+        .{
+            .service_name = null,
+            .service_proc = null,
+        },
+    };
+
+    if (StartServiceCtrlDispatcherW(&table) == 0) {
+        return error.CommandFailed;
+    }
+}
 
 /// Handle a service management command.
 pub fn handleCommand(
@@ -210,6 +290,8 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
     // Get current executable path
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
 
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
@@ -247,12 +329,45 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
         \\  <string>{s}</string>
         \\</dict>
         \\</plist>
-    , .{ SERVICE_LABEL, xmlEscape(exe_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
+    , .{ SERVICE_LABEL, xmlEscape(service_exe_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(plist, .{});
     defer file.close();
     try file.writeAll(content);
+}
+
+fn resolveServiceExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
+    if (try preferredHomebrewShimPath(allocator, exe_path)) |candidate| {
+        std.fs.accessAbsolute(candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                allocator.free(candidate);
+                return allocator.dupe(u8, exe_path);
+            },
+            else => {
+                allocator.free(candidate);
+                return err;
+            },
+        };
+        return candidate;
+    }
+    return allocator.dupe(u8, exe_path);
+}
+
+fn preferredHomebrewShimPath(allocator: std.mem.Allocator, exe_path: []const u8) !?[]u8 {
+    if (!std.mem.endsWith(u8, exe_path, "/bin/nullclaw")) {
+        return null;
+    }
+
+    const cellar_marker = "/Cellar/nullclaw/";
+    const cellar_index = std.mem.indexOf(u8, exe_path, cellar_marker) orelse return null;
+    if (cellar_index == 0) {
+        return null;
+    }
+
+    // selfExePath uses POSIX separators for Homebrew installs even when tests run on Windows.
+    const candidate = try std.fmt.allocPrint(allocator, "{s}/bin/nullclaw", .{exe_path[0..cellar_index]});
+    return candidate;
 }
 
 fn installLinux(allocator: std.mem.Allocator) !void {
@@ -267,6 +382,8 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
 
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
@@ -287,7 +404,7 @@ fn installLinux(allocator: std.mem.Allocator) !void {
         \\
         \\[Install]
         \\WantedBy=default.target
-    , .{ exe_path, config_dir });
+    , .{ service_exe_path, config_dir });
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(unit, .{});
@@ -301,7 +418,7 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 fn installWindows(allocator: std.mem.Allocator) !void {
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
-    const bin_path = try std.fmt.allocPrint(allocator, "\"{s}\" gateway", .{exe_path});
+    const bin_path = try windowsServiceBinPath(allocator, exe_path);
     defer allocator.free(bin_path);
 
     const create = try runCaptureStatus(allocator, &.{
@@ -525,6 +642,93 @@ fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     return stdout;
 }
 
+fn windowsServiceBinPath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\"{s}\" {s}", .{ exe_path, WINDOWS_SERVICE_GATEWAY_ARG });
+}
+
+fn resetWindowsServiceState() void {
+    windows_service_status_handle = null;
+    windows_service_checkpoint = 1;
+    windows_service_status = .{
+        .service_type = SERVICE_WIN32_OWN_PROCESS,
+        .current_state = SERVICE_STOPPED,
+        .controls_accepted = 0,
+        .win32_exit_code = SERVICE_NO_ERROR,
+        .service_specific_exit_code = 0,
+        .checkpoint = 0,
+        .wait_hint_ms = 0,
+    };
+}
+
+fn updateWindowsServiceStatus(current_state: windows.DWORD, win32_exit_code: windows.DWORD, wait_hint_ms: windows.DWORD) void {
+    const handle = windows_service_status_handle orelse return;
+
+    windows_service_status.current_state = current_state;
+    windows_service_status.win32_exit_code = win32_exit_code;
+    windows_service_status.service_specific_exit_code = 0;
+    windows_service_status.wait_hint_ms = wait_hint_ms;
+    windows_service_status.controls_accepted = switch (current_state) {
+        SERVICE_RUNNING => SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+        else => 0,
+    };
+    windows_service_status.checkpoint = switch (current_state) {
+        SERVICE_START_PENDING, SERVICE_STOP_PENDING => blk: {
+            const checkpoint = windows_service_checkpoint;
+            windows_service_checkpoint += 1;
+            break :blk checkpoint;
+        },
+        else => 0,
+    };
+
+    _ = SetServiceStatus(handle, &windows_service_status);
+}
+
+fn applyServiceRuntimeProviderOverrides(config: *const Config) !void {
+    try http_util.setProxyOverride(config.http_request.proxy);
+    try providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars);
+}
+
+fn runWindowsServiceGatewayProcess(allocator: std.mem.Allocator) !void {
+    var cfg = try Config.load(allocator);
+    defer cfg.deinit();
+
+    try cfg.validate();
+    try applyServiceRuntimeProviderOverrides(&cfg);
+
+    updateWindowsServiceStatus(SERVICE_RUNNING, SERVICE_NO_ERROR, 0);
+    try daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
+}
+
+fn windowsServiceMain(_: windows.DWORD, _: [*]?[*:0]u16) callconv(.winapi) void {
+    windows_service_status_handle = RegisterServiceCtrlHandlerW(WINDOWS_SERVICE_NAME_W, windowsServiceControlHandler);
+    if (windows_service_status_handle == null) return;
+
+    updateWindowsServiceStatus(SERVICE_START_PENDING, SERVICE_NO_ERROR, 10_000);
+
+    runWindowsServiceGatewayProcess(std.heap.smp_allocator) catch {
+        updateWindowsServiceStatus(SERVICE_STOPPED, SERVICE_GENERIC_FAILURE, 0);
+        return;
+    };
+
+    updateWindowsServiceStatus(SERVICE_STOPPED, SERVICE_NO_ERROR, 0);
+}
+
+fn windowsServiceControlHandler(control: windows.DWORD) callconv(.winapi) void {
+    switch (control) {
+        SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN => {
+            daemon.requestShutdown();
+            // The control handler should transition to STOP_PENDING and return;
+            // ServiceMain reports STOPPED once the daemon has actually exited.
+            updateWindowsServiceStatus(SERVICE_STOP_PENDING, SERVICE_NO_ERROR, 30_000);
+        },
+        SERVICE_CONTROL_INTERROGATE => {
+            const handle = windows_service_status_handle orelse return;
+            _ = SetServiceStatus(handle, &windows_service_status);
+        },
+        else => {},
+    }
+}
+
 // ── XML escape ───────────────────────────────────────────────────
 
 fn xmlEscape(input: []const u8) []const u8 {
@@ -556,6 +760,32 @@ test "linuxServiceFile contains service suffix" {
 test "xmlEscape returns input for safe strings" {
     const input = "/usr/local/bin/nullclaw";
     try std.testing.expectEqualStrings(input, xmlEscape(input));
+}
+
+test "preferredHomebrewShimPath resolves Apple Silicon Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Intel Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/usr/local/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/usr/local/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Linux Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/home/linuxbrew/.linuxbrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/home/linuxbrew/.linuxbrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath ignores non-Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/Applications/nullclaw/bin/nullclaw")) == null);
+}
+
+test "preferredHomebrewShimPath ignores non-executable Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/share/nullclaw.txt")) == null);
 }
 
 test "runChecked succeeds for true command" {
@@ -613,4 +843,16 @@ test "windowsServiceState parses common states" {
     try std.testing.expectEqualStrings("stopped", windowsServiceState("STATE              : 1  STOPPED"));
     try std.testing.expectEqualStrings("start_pending", windowsServiceState("STATE              : 2  START_PENDING"));
     try std.testing.expectEqualStrings("unknown", windowsServiceState("STATE              : ?"));
+}
+
+test "windowsServiceBinPath uses hidden service gateway entrypoint" {
+    const bin_path = try windowsServiceBinPath(std.testing.allocator, "C:\\Program Files\\nullclaw\\nullclaw.exe");
+    defer std.testing.allocator.free(bin_path);
+
+    try std.testing.expectEqualStrings("\"C:\\Program Files\\nullclaw\\nullclaw.exe\" __windows-service-gateway", bin_path);
+}
+
+test "isWindowsServiceGatewayArg matches hidden service sentinel" {
+    try std.testing.expect(isWindowsServiceGatewayArg("__windows-service-gateway"));
+    try std.testing.expect(!isWindowsServiceGatewayArg("gateway"));
 }

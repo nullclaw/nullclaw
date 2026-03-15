@@ -28,7 +28,8 @@ This keeps secrets and network in the host while agent logic stays swappable as 
 From repository root:
 
 ```bash
-zig build-lib examples/edge/cloudflare-worker/agent_core.zig \
+mkdir -p examples/edge/cloudflare-worker/dist
+zig build-exe examples/edge/cloudflare-worker/agent_core.zig \
   -target wasm32-freestanding \
   -fno-entry \
   -rdynamic \

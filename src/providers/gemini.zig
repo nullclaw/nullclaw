@@ -1,9 +1,11 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
+const sse = @import("sse.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -20,6 +22,82 @@ fn parseExpiresIn(v: std.json.Value) ?i64 {
         },
         else => null,
     };
+}
+
+fn parseTokenCount(v: std.json.Value) ?u32 {
+    return switch (v) {
+        .integer => |i| blk: {
+            if (i < 0) break :blk null;
+            break :blk std.math.cast(u32, i) orelse std.math.maxInt(u32);
+        },
+        .float => |f| blk: {
+            if (!std.math.isFinite(f) or f < 0) break :blk null;
+            const max_u32_f = @as(f64, @floatFromInt(std.math.maxInt(u32)));
+            if (f > max_u32_f) break :blk std.math.maxInt(u32);
+            break :blk @intFromFloat(f);
+        },
+        else => null,
+    };
+}
+
+fn normalizeTokenUsage(usage: *root.TokenUsage) void {
+    if (usage.total_tokens == 0 and (usage.prompt_tokens > 0 or usage.completion_tokens > 0)) {
+        usage.total_tokens = usage.prompt_tokens +| usage.completion_tokens;
+    }
+    if (usage.completion_tokens == 0 and usage.total_tokens > usage.prompt_tokens) {
+        usage.completion_tokens = usage.total_tokens - usage.prompt_tokens;
+    }
+}
+
+fn parseUsageMetadataValue(v: std.json.Value) ?root.TokenUsage {
+    if (v != .object) return null;
+    const usage_obj = v.object;
+
+    var usage = root.TokenUsage{};
+    var found = false;
+
+    if (usage_obj.get("promptTokenCount")) |count| {
+        if (parseTokenCount(count)) |parsed| {
+            usage.prompt_tokens = parsed;
+            found = true;
+        }
+    }
+    if (usage_obj.get("candidatesTokenCount")) |count| {
+        if (parseTokenCount(count)) |parsed| {
+            usage.completion_tokens = parsed;
+            found = true;
+        }
+    }
+    if (usage_obj.get("totalTokenCount")) |count| {
+        if (parseTokenCount(count)) |parsed| {
+            usage.total_tokens = parsed;
+            found = true;
+        }
+    }
+
+    if (!found) return null;
+    normalizeTokenUsage(&usage);
+    return usage;
+}
+
+pub fn extractGeminiUsageMetadata(allocator: std.mem.Allocator, json_str: []const u8) !?root.TokenUsage {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
+        return error.InvalidSseJson;
+    defer parsed.deinit();
+
+    const usage_val = parsed.value.object.get("usageMetadata") orelse return null;
+    return parseUsageMetadataValue(usage_val);
+}
+
+fn extractGeminiUsageFromSseLine(allocator: std.mem.Allocator, line: []const u8) !?root.TokenUsage {
+    const trimmed = std.mem.trimRight(u8, line, "\r");
+    if (trimmed.len == 0 or trimmed[0] == ':') return null;
+
+    const prefix = "data: ";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    const data = trimmed[prefix.len..];
+
+    return try extractGeminiUsageMetadata(allocator, data);
 }
 
 fn isFormUrlencodedUnreserved(c: u8) bool {
@@ -199,13 +277,11 @@ pub fn refreshOAuthToken(allocator: std.mem.Allocator, refresh_token: []const u8
     defer allocator.free(body);
 
     const url = "https://oauth2.googleapis.com/token";
-    const headers = &[_][]const u8{"Content-Type: application/x-www-form-urlencoded"};
 
-    const resp_body = root.curlPostTimed(
+    const resp_body = root.curlPostFormTimed(
         allocator,
         url,
         body,
-        headers,
         OAUTH_REFRESH_TIMEOUT_SECS,
     ) catch return error.RefreshFailed;
     defer allocator.free(resp_body);
@@ -519,37 +595,74 @@ pub const GeminiProvider = struct {
         }
     }
 
-    /// Parse text content from a Gemini generateContent response.
-    pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    /// Parse text and token usage from a Gemini generateContent response.
+    pub fn parseChatResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
         const root_obj = parsed.value.object;
 
         // Check for error first
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("gemini", sanitized orelse summary);
+            return mapped_err;
         }
 
-        // Extract text from candidates
+        var usage = root.TokenUsage{};
+        if (root_obj.get("usageMetadata")) |usage_val| {
+            if (parseUsageMetadataValue(usage_val)) |parsed_usage| {
+                usage = parsed_usage;
+            }
+        }
+
+        // Extract text and thinking from candidates.
+        // Parts with "thought": true are reasoning traces; all others are visible content.
         if (root_obj.get("candidates")) |candidates| {
             if (candidates.array.items.len > 0) {
                 const candidate = candidates.array.items[0].object;
                 if (candidate.get("content")) |content| {
                     if (content.object.get("parts")) |parts| {
-                        if (parts.array.items.len > 0) {
-                            const part = parts.array.items[0].object;
+                        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer text_buf.deinit(allocator);
+                        var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer thought_buf.deinit(allocator);
+
+                        for (parts.array.items) |part_val| {
+                            const part = part_val.object;
+                            const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
                             if (part.get("text")) |text| {
-                                if (text == .string) {
-                                    return try allocator.dupe(u8, text.string);
+                                if (text == .string and text.string.len > 0) {
+                                    const buf = if (is_thought) &thought_buf else &text_buf;
+                                    if (buf.items.len > 0) try buf.append(allocator, '\n');
+                                    try buf.appendSlice(allocator, text.string);
                                 }
                             }
                         }
+
+                        if (text_buf.items.len == 0 and thought_buf.items.len == 0)
+                            return error.NoResponseContent;
+
+                        return .{
+                            .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
+                            .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
+                            .usage = usage,
+                        };
                     }
                 }
             }
         }
 
         return error.NoResponseContent;
+    }
+
+    /// Parse text content from a Gemini generateContent response.
+    pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+        const parsed = try parseChatResponse(allocator, body);
+        return parsed.content orelse error.NoResponseContent;
     }
 
     /// Result of parsing a single Gemini SSE line.
@@ -615,7 +728,8 @@ pub const GeminiProvider = struct {
 
     /// Run curl in SSE streaming mode for Gemini and parse output line by line.
     ///
-    /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
+    /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast
+    /// flag: `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
     /// For each SSE delta, calls `callback(ctx, chunk)`.
     /// Returns accumulated result after stream completes.
     /// Stream ends when curl connection closes (no [DONE] sentinel).
@@ -638,7 +752,7 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
-        argv_buf[argc] = "--fail-with-body";
+        argv_buf[argc] = sse.curlFailFastArg(allocator);
         argc += 1;
 
         var timeout_buf: [32]u8 = undefined;
@@ -677,18 +791,35 @@ pub const GeminiProvider = struct {
             argc += 1;
         }
 
-        argv_buf[argc] = "-d";
+        argv_buf[argc] = "--data-binary";
         argc += 1;
-        argv_buf[argc] = body;
+        argv_buf[argc] = "@-";
         argc += 1;
         argv_buf[argc] = url;
         argc += 1;
 
         var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
 
         try child.spawn();
+
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(body) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.GeminiApiError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.GeminiApiError;
+        }
 
         // Read stdout line by line, parse SSE events
         var accumulated: std.ArrayListUnmanaged(u8) = .empty;
@@ -697,6 +828,7 @@ pub const GeminiProvider = struct {
         var line_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer line_buf.deinit(allocator);
 
+        var stream_usage = root.TokenUsage{};
         const file = child.stdout.?;
         var read_buf: [4096]u8 = undefined;
 
@@ -706,6 +838,9 @@ pub const GeminiProvider = struct {
 
             for (read_buf[0..n]) |byte| {
                 if (byte == '\n') {
+                    if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
+                        stream_usage = usage;
+                    }
                     const result = parseGeminiSseLine(allocator, line_buf.items) catch {
                         line_buf.clearRetainingCapacity();
                         continue;
@@ -728,6 +863,9 @@ pub const GeminiProvider = struct {
 
         // Parse trailing line if stream ended without final newline.
         if (line_buf.items.len > 0) {
+            if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
+                stream_usage = usage;
+            }
             const trailing = parseGeminiSseLine(allocator, line_buf.items) catch null;
             line_buf.clearRetainingCapacity();
             if (trailing) |result| {
@@ -763,9 +901,16 @@ pub const GeminiProvider = struct {
         else
             null;
 
+        if (stream_usage.prompt_tokens == 0 and stream_usage.completion_tokens == 0 and stream_usage.total_tokens == 0) {
+            stream_usage.completion_tokens = @intCast((accumulated.items.len + 3) / 4);
+            stream_usage.total_tokens = stream_usage.completion_tokens;
+        } else {
+            normalizeTokenUsage(&stream_usage);
+        }
+
         return .{
             .content = content,
-            .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
+            .usage = stream_usage,
             .model = "",
         };
     }
@@ -831,7 +976,7 @@ pub const GeminiProvider = struct {
         const url = try buildUrl(allocator, model, auth);
         defer allocator.free(url);
 
-        const body = try buildChatRequestBody(allocator, request, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         const resp_body = if (auth.isApiKey())
@@ -843,8 +988,7 @@ pub const GeminiProvider = struct {
         };
         defer allocator.free(resp_body);
 
-        const text = try parseResponse(allocator, resp_body);
-        return ChatResponse{ .content = text };
+        return try parseChatResponse(allocator, resp_body);
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -892,7 +1036,7 @@ pub const GeminiProvider = struct {
         const url = try buildStreamUrl(allocator, model, auth);
         defer allocator.free(url);
 
-        const body = try buildChatRequestBody(allocator, request, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         if (auth.isApiKey()) {
@@ -911,6 +1055,7 @@ pub const GeminiProvider = struct {
 fn buildChatRequestBody(
     allocator: std.mem.Allocator,
     request: ChatRequest,
+    model: []const u8,
     temperature: f64,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -993,6 +1138,8 @@ fn buildChatRequestBody(
     var max_buf: [16]u8 = undefined;
     const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_output_tokens}) catch return error.GeminiApiError;
     try buf.appendSlice(allocator, max_str);
+
+    try root.appendGeminiThinkingConfig(&buf, allocator, model, request.reasoning_effort);
     try buf.appendSlice(allocator, "}}");
 
     return try buf.toOwnedSlice(allocator);
@@ -1089,11 +1236,38 @@ test "parseResponse extracts text" {
     try std.testing.expectEqualStrings("Hello there!", result);
 }
 
+test "parseChatResponse extracts usageMetadata token counts" {
+    const body =
+        \\{"candidates":[{"content":{"parts":[{"text":"Hello there!"}]}}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":34,"totalTokenCount":46}}
+    ;
+    const response = try GeminiProvider.parseChatResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(response.content.?);
+    try std.testing.expectEqualStrings("Hello there!", response.content.?);
+    try std.testing.expectEqual(@as(u32, 12), response.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 34), response.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 46), response.usage.total_tokens);
+}
+
+test "extractGeminiUsageMetadata derives missing total from prompt and completion" {
+    const json =
+        \\{"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":5}}
+    ;
+    const usage = (try extractGeminiUsageMetadata(std.testing.allocator, json)).?;
+    try std.testing.expectEqual(@as(u32, 7), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 5), usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 12), usage.total_tokens);
+}
+
 test "parseResponse error response" {
     const body =
         \\{"error":{"message":"Invalid API key"}}
     ;
+    root.clearLastApiErrorDetail();
     try std.testing.expectError(error.ApiError, GeminiProvider.parseResponse(std.testing.allocator, body));
+    const detail = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "gemini:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "message=Invalid API key") != null);
 }
 
 test "parseResponse classifies rate-limit errors" {
@@ -1140,13 +1314,45 @@ test "parseResponse no text field fails" {
     try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
 }
 
-test "parseResponse multiple parts returns first text" {
+test "parseResponse multiple parts concatenates visible text" {
     const body =
         \\{"candidates":[{"content":{"parts":[{"text":"First"},{"text":"Second"}]}}]}
     ;
     const result = try GeminiProvider.parseResponse(std.testing.allocator, body);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("First", result);
+    try std.testing.expectEqualStrings("First\nSecond", result);
+}
+
+test "parseChatResponse separates thought parts into reasoning_content" {
+    const body =
+        \\{"candidates":[{"content":{"parts":[{"thought":true,"text":"My reasoning trace"},{"text":"Visible answer"}]}}]}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try GeminiProvider.parseChatResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expectEqualStrings("Visible answer", response.content.?);
+    try std.testing.expectEqualStrings("My reasoning trace", response.reasoning_content.?);
+}
+
+test "parseChatResponse thought only leaves content null" {
+    const body =
+        \\{"candidates":[{"content":{"parts":[{"thought":true,"text":"only thinking"}]}}]}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try GeminiProvider.parseChatResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expect(response.content == null);
+    try std.testing.expectEqualStrings("only thinking", response.reasoning_content.?);
 }
 
 test "provider rejects whitespace key" {
@@ -1216,6 +1422,14 @@ test "parseGeminiSseLine valid delta" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "extractGeminiUsageFromSseLine parses usageMetadata" {
+    const line = "data: {\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":9,\"totalTokenCount\":12}}";
+    const usage = (try extractGeminiUsageFromSseLine(std.testing.allocator, line)).?;
+    try std.testing.expectEqual(@as(u32, 3), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 9), usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 12), usage.total_tokens);
 }
 
 test "parseGeminiSseLine empty line" {
@@ -1371,7 +1585,7 @@ test "gemini buildChatRequestBody plain text" {
     var msgs = [_]root.ChatMessage{
         root.ChatMessage.user("Hello"),
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
     // Verify valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1391,7 +1605,7 @@ test "gemini buildChatRequestBody honors request max_tokens override" {
     const body = try buildChatRequestBody(alloc, .{
         .messages = &msgs,
         .max_tokens = 2048,
-    }, 0.7);
+    }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1400,6 +1614,42 @@ test "gemini buildChatRequestBody honors request max_tokens override" {
     const max_output = generation_config.get("maxOutputTokens").?;
     try std.testing.expect(max_output == .integer);
     try std.testing.expectEqual(@as(i64, 2048), max_output.integer);
+}
+
+test "gemini buildChatRequestBody maps reasoning_effort to thinkingLevel on gemini-3 flash" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .reasoning_effort = "medium",
+    }, "gemini-3.1-flash", 0.7);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const generation_config = parsed.value.object.get("generationConfig").?.object;
+    const thinking = generation_config.get("thinkingConfig").?.object;
+    try std.testing.expectEqualStrings("medium", thinking.get("thinkingLevel").?.string);
+}
+
+test "gemini buildChatRequestBody maps reasoning_effort to thinkingBudget on gemini-2.5" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .reasoning_effort = "high",
+    }, "gemini-2.5-pro", 0.7);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const generation_config = parsed.value.object.get("generationConfig").?.object;
+    const thinking = generation_config.get("thinkingConfig").?.object;
+    try std.testing.expectEqual(@as(i64, 24576), thinking.get("thinkingBudget").?.integer);
 }
 
 test "gemini buildChatRequestBody with content_parts inlineData" {
@@ -1411,7 +1661,7 @@ test "gemini buildChatRequestBody with content_parts inlineData" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "What is this?", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -1434,7 +1684,7 @@ test "gemini buildChatRequestBody with image_url special chars" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
     // Must produce valid JSON despite special chars in URL
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1593,7 +1843,7 @@ test "writeCredentialsJson produces valid JSON" {
     try std.testing.expect(obj.get("expires_at").?.integer == 1999999999);
 
     if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const mode = stat.mode & 0o777;
         // Respect process umask: require owner rw and forbid executable bits.
         try std.testing.expect((mode & 0o600) == 0o600);

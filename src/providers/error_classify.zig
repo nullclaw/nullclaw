@@ -96,7 +96,8 @@ pub fn isVisionUnsupportedText(text: []const u8) bool {
         containsAsciiFold(text, "image input not supported") or
         containsAsciiFold(text, "no endpoints found that support image input") or
         containsAsciiFold(text, "vision not supported") or
-        containsAsciiFold(text, "multimodal not supported"))
+        containsAsciiFold(text, "multimodal not supported") or
+        containsAsciiFold(text, "not a multimodal model"))
     {
         return true;
     }
@@ -113,6 +114,155 @@ fn parseStatusCode(value: std.json.Value) ?u16 {
         .string => |s| std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t\r\n"), 10) catch null,
         else => null,
     };
+}
+
+fn extractErrorFields(root_obj: anytype) ?struct {
+    status: ?u16,
+    code: ?[]const u8,
+    type_name: ?[]const u8,
+    message: ?[]const u8,
+} {
+    var status: ?u16 = null;
+    var code: ?[]const u8 = null;
+    var type_name: ?[]const u8 = null;
+    var message: ?[]const u8 = null;
+    var has_error_signal = false;
+
+    if (root_obj.get("error")) |err_value| {
+        has_error_signal = true;
+        if (err_value == .string) {
+            message = err_value.string;
+        } else if (err_value == .object) {
+            const err_obj = err_value.object;
+
+            if (err_obj.get("status")) |v| {
+                status = parseStatusCode(v);
+            }
+
+            if (err_obj.get("code")) |v| {
+                switch (v) {
+                    .string => |s| {
+                        code = s;
+                        if (status == null) status = parseStatusCode(v);
+                    },
+                    .integer => {
+                        if (status == null) status = parseStatusCode(v);
+                    },
+                    else => {},
+                }
+            }
+
+            if (err_obj.get("type")) |v| {
+                if (v == .string) type_name = v.string;
+            }
+            if (err_obj.get("message")) |v| {
+                if (v == .string) message = v.string;
+            }
+        }
+    }
+
+    if (message == null) {
+        if (root_obj.get("message")) |v| {
+            if (v == .string) message = v.string;
+        }
+    }
+
+    if (status == null) {
+        if (root_obj.get("status")) |v| {
+            status = parseStatusCode(v);
+            if (status != null) has_error_signal = true;
+        }
+    }
+
+    if (code == null) {
+        if (root_obj.get("code")) |v| {
+            has_error_signal = true;
+            switch (v) {
+                .string => |s| code = s,
+                .integer => {
+                    if (status == null) status = parseStatusCode(v);
+                },
+                else => {},
+            }
+        }
+    }
+
+    if (type_name == null) {
+        if (root_obj.get("type")) |v| {
+            if (v == .string) {
+                type_name = v.string;
+                if (containsAsciiFold(v.string, "error")) has_error_signal = true;
+            }
+        }
+    }
+
+    if (!has_error_signal and message == null and status == null and code == null and type_name == null) {
+        return null;
+    }
+
+    return .{
+        .status = status,
+        .code = code,
+        .type_name = type_name,
+        .message = message,
+    };
+}
+
+fn appendBounded(out: []u8, idx: *usize, text: []const u8) void {
+    if (text.len == 0 or idx.* >= out.len) return;
+    const n = @min(out.len - idx.*, text.len);
+    @memcpy(out[idx.* .. idx.* + n], text[0..n]);
+    idx.* += n;
+}
+
+fn appendFieldPrefix(out: []u8, idx: *usize, wrote_any: *bool, name: []const u8) void {
+    if (wrote_any.*) appendBounded(out, idx, " ");
+    appendBounded(out, idx, name);
+    appendBounded(out, idx, "=");
+    wrote_any.* = true;
+}
+
+fn appendMessageValue(out: []u8, idx: *usize, raw: []const u8) void {
+    for (raw) |c| {
+        if (idx.* >= out.len) break;
+        out[idx.*] = switch (c) {
+            '\r', '\n', '\t' => ' ',
+            else => c,
+        };
+        idx.* += 1;
+    }
+}
+
+/// Build a compact summary for known provider API errors.
+/// Returns null when the payload does not look like an error envelope.
+pub fn summarizeKnownApiError(root_obj: anytype, out: []u8) ?[]const u8 {
+    if (out.len == 0) return null;
+    const fields = extractErrorFields(root_obj) orelse return null;
+
+    var idx: usize = 0;
+    var wrote_any = false;
+
+    if (fields.status) |status| {
+        appendFieldPrefix(out, &idx, &wrote_any, "status");
+        var status_buf: [16]u8 = undefined;
+        const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch "0";
+        appendBounded(out, &idx, status_str);
+    }
+    if (fields.code) |code| {
+        appendFieldPrefix(out, &idx, &wrote_any, "code");
+        appendBounded(out, &idx, std.mem.trim(u8, code, " \t\r\n"));
+    }
+    if (fields.type_name) |type_name| {
+        appendFieldPrefix(out, &idx, &wrote_any, "type");
+        appendBounded(out, &idx, std.mem.trim(u8, type_name, " \t\r\n"));
+    }
+    if (fields.message) |message| {
+        appendFieldPrefix(out, &idx, &wrote_any, "message");
+        appendMessageValue(out, &idx, std.mem.trim(u8, message, " \t\r\n"));
+    }
+
+    if (!wrote_any or idx == 0) return null;
+    return out[0..idx];
 }
 
 fn classifyFromFields(
@@ -270,4 +420,26 @@ test "classifyKnownApiError returns null for non-error payload" {
     defer parsed.deinit();
 
     try std.testing.expect(classifyKnownApiError(parsed.value.object) == null);
+}
+
+test "summarizeKnownApiError captures status code and message" {
+    const body =
+        \\{"error":{"code":503,"message":"This model is currently experiencing high demand.","status":"UNAVAILABLE"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    var buf: [512]u8 = undefined;
+    const summary = summarizeKnownApiError(parsed.value.object, &buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, summary, "status=503") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "message=This model is currently experiencing high demand.") != null);
+}
+
+test "summarizeKnownApiError returns null for non-error payload" {
+    const body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    var buf: [128]u8 = undefined;
+    try std.testing.expect(summarizeKnownApiError(parsed.value.object, &buf) == null);
 }

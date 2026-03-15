@@ -74,7 +74,13 @@ pub const OpenRouterProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("openrouter", sanitized orelse summary);
+            return mapped_err;
         }
 
         if (root_obj.get("choices")) |choices| {
@@ -99,7 +105,13 @@ pub const OpenRouterProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("openrouter", sanitized orelse summary);
+            return mapped_err;
         }
 
         if (root_obj.get("choices")) |choices| {
@@ -108,9 +120,28 @@ pub const OpenRouterProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                var reasoning_content: ?[]const u8 = null;
                 if (msg_obj.get("content")) |c| {
                     if (c == .string) {
-                        content = try allocator.dupe(u8, c.string);
+                        const split = try root.splitThinkContent(allocator, c.string);
+                        content = split.visible;
+                        reasoning_content = split.reasoning;
+                    }
+                }
+
+                // OpenRouter also exposes reasoning in dedicated fields.
+                // reasoning_content: Kimi K2.5, DeepSeek-R1 native field.
+                // reasoning: OpenRouter unified alias (same content, different key).
+                if (reasoning_content == null) {
+                    if (msg_obj.get("reasoning_content")) |rc| {
+                        if (rc == .string and rc.string.len > 0)
+                            reasoning_content = try allocator.dupe(u8, rc.string);
+                    }
+                }
+                if (reasoning_content == null) {
+                    if (msg_obj.get("reasoning")) |rc| {
+                        if (rc == .string and rc.string.len > 0)
+                            reasoning_content = try allocator.dupe(u8, rc.string);
                     }
                 }
 
@@ -154,6 +185,7 @@ pub const OpenRouterProvider = struct {
 
                 return .{
                     .content = content,
+                    .reasoning_content = reasoning_content,
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,
@@ -426,6 +458,7 @@ pub const OpenRouterProvider = struct {
 
         try buf.append(allocator, ']');
         try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+        try appendOpenRouterReasoning(&buf, allocator, request.reasoning_effort);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
@@ -468,6 +501,7 @@ pub const OpenRouterProvider = struct {
 
         try buf.append(allocator, ']');
         try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+        try appendOpenRouterReasoning(&buf, allocator, request.reasoning_effort);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
@@ -481,6 +515,22 @@ pub const OpenRouterProvider = struct {
         return try buf.toOwnedSlice(allocator);
     }
 };
+
+/// Append OpenRouter's unified reasoning parameter when reasoning_effort is set.
+/// OpenRouter models like Kimi K2.5 use {"reasoning":{"effort":"high"}} to include
+/// the reasoning trace in the response, regardless of whether they recognize
+/// the top-level reasoning_effort field that appendGenerationFields emits for o-series models.
+fn appendOpenRouterReasoning(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    reasoning_effort: ?[]const u8,
+) !void {
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse return;
+    if (std.mem.eql(u8, effort, "none")) return;
+    try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
+    try root.appendJsonString(buf, allocator, effort);
+    try buf.append(allocator, '}');
+}
 
 /// HTTP GET via curl subprocess with auth header.
 fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) ![]u8 {
@@ -703,6 +753,25 @@ test "buildChatRequestBody o3 uses max_completion_tokens" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
 }
 
+test "buildChatRequestBody escapes OpenRouter reasoning effort value" {
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .model = "openrouter/custom",
+        .reasoning_effort = "high\"},\"pwned\":true,\"x\":\"",
+    };
+    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "openrouter/custom", 0.7);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const reasoning = parsed.value.object.get("reasoning").?.object;
+    try std.testing.expectEqualStrings("high\"},\"pwned\":true,\"x\":\"", reasoning.get("effort").?.string);
+    try std.testing.expect(parsed.value.object.get("pwned") == null);
+}
+
 test "chatWithHistory fails without key" {
     var p = OpenRouterProvider.init(std.testing.allocator, null);
     const messages = &[_]ChatMessage{
@@ -776,3 +845,51 @@ test "streamChatImpl fails without key" {
 }
 
 fn testCallback(_: *anyopaque, _: root.StreamChunk) void {}
+
+test "parseNativeResponse extracts think tags into reasoning_content" {
+    const body =
+        \\{"choices":[{"message":{"content":"<think>step by step</think>Final answer"}}],"model":"kimi-k2","usage":{"prompt_tokens":5,"completion_tokens":10,"total_tokens":15}}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expectEqualStrings("Final answer", response.content.?);
+    try std.testing.expectEqualStrings("step by step", response.reasoning_content.?);
+}
+
+test "parseNativeResponse reads native reasoning_content field" {
+    const body =
+        \\{"choices":[{"message":{"content":"The answer is 42","reasoning_content":"I computed this"}}],"model":"deepseek-r1","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expectEqualStrings("The answer is 42", response.content.?);
+    try std.testing.expectEqualStrings("I computed this", response.reasoning_content.?);
+}
+
+test "parseNativeResponse no think tags leaves reasoning_content null" {
+    const body =
+        \\{"choices":[{"message":{"content":"Plain response"}}],"model":"gpt-4o","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expectEqualStrings("Plain response", response.content.?);
+    try std.testing.expect(response.reasoning_content == null);
+}

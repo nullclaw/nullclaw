@@ -194,7 +194,9 @@ fn eqlLowercase(input: []const u8, kw: []const u8) bool {
 }
 
 /// Maximum tool output length before truncation.
-const MAX_TOOL_OUTPUT_CHARS: usize = 10_000;
+/// Set high enough to accommodate paginated MCP tool responses (e.g. full
+/// task lists from Vikunja) while still bounding pathological cases.
+const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
 
 /// Scrub credentials from tool execution output and truncate if too long.
 /// Returns an owned slice. Caller must free.
@@ -384,12 +386,12 @@ test "scrubSecretPatterns no false positives on normal text" {
 
 test "scrubToolOutput truncates long output" {
     const allocator = std.testing.allocator;
-    const long = try allocator.alloc(u8, 15_000);
+    const long = try allocator.alloc(u8, 110_000);
     defer allocator.free(long);
     @memset(long, 'x');
     const result = try scrubToolOutput(allocator, long);
     defer allocator.free(result);
-    try std.testing.expect(result.len < 15_000);
+    try std.testing.expect(result.len < 110_000);
     try std.testing.expect(std.mem.endsWith(u8, result, "[output truncated]"));
 }
 

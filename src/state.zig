@@ -7,6 +7,7 @@
 const std = @import("std");
 const json_util = @import("json_util.zig");
 const Allocator = std.mem.Allocator;
+const thread_stacks = @import("thread_stacks.zig");
 
 /// Runtime state persisted to disk.
 pub const State = struct {
@@ -343,7 +344,7 @@ test "StateManager concurrent setLastChannel" {
     const num_threads = 4;
     var threads: [num_threads]std.Thread = undefined;
     for (0..num_threads) |i| {
-        threads[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        threads[i] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(m: *StateManager, tid: usize) void {
                 for (0..50) |_| {
                     var ch_buf: [16]u8 = undefined;

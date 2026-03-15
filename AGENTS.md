@@ -158,12 +158,15 @@ When uncertain, classify as higher risk.
 
 Apply these naming rules consistently:
 
-- All identifiers: `snake_case` for functions, variables, fields, modules, files.
-- Types, structs, enums, unions: `PascalCase` (e.g., `AnthropicProvider`, `BrowserTool`).
-- Constants and comptime values: `SCREAMING_SNAKE_CASE` or `PascalCase` depending on context.
+- Functions and methods: `camelCase` (e.g., `parseCommand`, `buildSimpleRequestBody`, `healthCheck`). This follows standard Zig convention.
+- Variables, fields, modules, files: `snake_case` (e.g., `workspace_dir`, `bot_user_id`, `config_parse.zig`).
+- Types, structs, enums, unions: `PascalCase` (e.g., `AnthropicProvider`, `BrowserTool`, `CommandRiskLevel`).
+- Value constants (numeric limits, URLs, timeouts): `SCREAMING_SNAKE_CASE` (e.g., `MAX_BODY_SIZE`, `DEFAULT_BASE_URL`, `KEY_LEN`).
+- Comptime array/table constants: `snake_case` (e.g., `high_risk_commands`, `compat_providers`, `default_allowed_commands`).
 - Vtable implementer naming: `<Name>Provider`, `<Name>Channel`, `<Name>Tool`, `<Name>Memory`, `<Name>Sandbox`.
-- Factory registration keys: stable, lowercase, user-facing (e.g., `"openai"`, `"telegram"`, `"shell"`).
-- Tests: named by behavior (`subject_expected_behavior`), fixtures use neutral names.
+- Vtable function-pointer fields: `camelCase` for new vtables (e.g., `chatWithSystem`, `supportsNativeTools`, `getName`). Note: some older vtable fields use `snake_case` (`supports_streaming`, `record_event`); prefer `camelCase` for new additions and consolidate over time.
+- Factory registration keys: stable, lowercase, user-facing (e.g., `"openai"`, `"telegram"`, `"shell"`). Use hyphens for multi-word keys (e.g., `"together-ai"`, `"aws-bedrock"`).
+- Tests: named with space-separated descriptive phrases as the test block string (e.g., `"command risk low for read commands"`, `"pushover execute missing message"`). Prefix with the subject or subsystem when helpful. Fixtures use neutral names.
 
 ### 6.2 Architecture Boundary Contract (Required)
 
@@ -220,6 +223,8 @@ For release changes:
 ```bash
 zig build -Doptimize=ReleaseSmall  # must compile clean
 ```
+
+Before any version bump, release branch, or tag work: read `RELEASING.md` and follow it exactly. Do not tag feature branches.
 
 Additional expectations by change type:
 

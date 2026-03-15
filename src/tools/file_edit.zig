@@ -1,10 +1,13 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const bootstrap_mod = @import("../bootstrap/root.zig");
+const memory_root = @import("../memory/root.zig");
 
 /// Default maximum file size to read for editing (10MB).
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -14,6 +17,8 @@ pub const FileEditTool = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
     max_file_size: usize = DEFAULT_MAX_FILE_SIZE,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+    backend_name: []const u8 = "hybrid",
 
     pub const tool_name = "file_edit";
     pub const tool_description = "Find and replace text in a file";
@@ -54,18 +59,57 @@ pub const FileEditTool = struct {
         };
         defer allocator.free(full_path);
 
+        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+        defer if (ws_resolved) |wr| allocator.free(wr);
+        const ws_path = ws_resolved orelse "";
+        const bootstrap_filename = bootstrapRootFilename(path);
+
+        // Intercept bootstrap file edits for non-file backends.
+        if (bootstrap_filename) |filename| {
+            if (self.bootstrap_provider) |bp| {
+                if (!bootstrap_mod.backendUsesFiles(self.backend_name)) {
+                    const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+                    const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
+                        const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    };
+                    defer allocator.free(resolved_ancestor);
+
+                    if (!isResolvedPathAllowed(allocator, resolved_ancestor, ws_path, self.allowed_paths)) {
+                        return ToolResult.fail("Path is outside allowed areas");
+                    }
+
+                    const existing = try bp.load(allocator, filename) orelse
+                        return ToolResult.fail("File not found in memory backend");
+                    defer allocator.free(existing);
+
+                    if (old_text.len == 0)
+                        return ToolResult.fail("old_text must not be empty");
+
+                    const pos = std.mem.indexOf(u8, existing, old_text) orelse
+                        return ToolResult.fail("old_text not found in file");
+
+                    const before = existing[0..pos];
+                    const after = existing[pos + old_text.len ..];
+                    const new_contents = try std.mem.concat(allocator, u8, &.{ before, new_text, after });
+                    defer allocator.free(new_contents);
+
+                    try bp.store(filename, new_contents);
+                    const msg = try std.fmt.allocPrint(allocator, "Replaced {d} bytes with {d} bytes in {s} (memory backend)", .{ old_text.len, new_text.len, path });
+                    return ToolResult{ .success = true, .output = msg };
+                }
+            }
+        }
+
         // Resolve to catch symlink escapes
         const resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {}", .{err});
+            const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(resolved);
 
         // Validate against workspace + allowed_paths + system blocklist
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-
-        if (!isResolvedPathAllowed(allocator, resolved, ws_resolved orelse "", self.allowed_paths)) {
+        if (!isResolvedPathAllowed(allocator, resolved, ws_path, self.allowed_paths)) {
             return ToolResult.fail("Path is outside allowed areas");
         }
 
@@ -115,6 +159,25 @@ pub const FileEditTool = struct {
     }
 };
 
+fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(path) orelse return err;
+            if (std.mem.eql(u8, parent, path)) return err;
+            return resolveNearestExistingAncestor(allocator, parent);
+        },
+        else => return err,
+    };
+}
+
+fn bootstrapRootFilename(path: []const u8) ?[]const u8 {
+    if (std.fs.path.isAbsolute(path)) return null;
+    const basename = std.fs.path.basename(path);
+    if (!std.mem.eql(u8, basename, path)) return null;
+    if (!bootstrap_mod.isBootstrapFilename(basename)) return null;
+    return basename;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "file_edit tool name" {
@@ -152,7 +215,7 @@ test "file_edit basic replace" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Replaced") != null);
 
     // Verify file contents
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
 }
@@ -175,6 +238,25 @@ test "file_edit old_text not found" {
 
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not found") != null);
+}
+
+test "file_edit nonexistent file error includes requested path" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var ft = FileEditTool{ .workspace_dir = ws_path };
+    const t = ft.tool();
+    const parsed = try root.parseTestArgs("{\"path\": \"missing.txt\", \"old_text\": \"old\", \"new_text\": \"new\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "missing.txt") != null);
 }
 
 test "file_edit empty file returns not found" {
@@ -215,7 +297,7 @@ test "file_edit replaces only first occurrence" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "dup.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "dup.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("ccc bbb aaa", actual);
 }
@@ -328,7 +410,69 @@ test "file_edit absolute path with allowed_paths works" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
+}
+
+test "file_edit does not bypass allowed_paths for bootstrap memory edits" {
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+
+    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(outside_path);
+
+    try outside_tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "outside-before" });
+    const outside_file = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "AGENTS.md" });
+    defer std.testing.allocator.free(outside_file);
+
+    var escaped_buf: [1024]u8 = undefined;
+    var esc_len: usize = 0;
+    for (outside_file) |c| {
+        if (c == '\\') {
+            escaped_buf[esc_len] = '\\';
+            esc_len += 1;
+        }
+        escaped_buf[esc_len] = c;
+        esc_len += 1;
+    }
+
+    const json_args = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"path\":\"{s}\",\"old_text\":\"outside-before\",\"new_text\":\"outside-after\"}}",
+        .{escaped_buf[0..esc_len]},
+    );
+    defer std.testing.allocator.free(json_args);
+
+    var lru = memory_root.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), null);
+    try bp_impl.provider().store("AGENTS.md", "alpha");
+
+    var ft = FileEditTool{
+        .workspace_dir = ws_path,
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = bp_impl.provider(),
+        .backend_name = "sqlite",
+    };
+    const t = ft.tool();
+    const parsed = try root.parseTestArgs(json_args);
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
+
+    const content = try bp_impl.provider().load(std.testing.allocator, "AGENTS.md") orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("alpha", content);
+
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "AGENTS.md", 1024);
+    defer std.testing.allocator.free(outside_after);
+    try std.testing.expectEqualStrings("outside-before", outside_after);
 }

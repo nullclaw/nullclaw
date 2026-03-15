@@ -4,6 +4,7 @@
 //! and the same path safety checks as file_edit.
 
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -180,7 +181,7 @@ test "FileAppendTool appends to existing file" {
     try testing.expect(result.success);
     try testing.expect(std.mem.indexOf(u8, result.output, "Appended") != null);
 
-    const actual = try tmp_dir.dir.readFileAlloc(testing.allocator, "log.txt", 4096);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, testing.allocator, "log.txt", 4096);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("line1line2", actual);
 }
@@ -201,7 +202,7 @@ test "FileAppendTool creates new file" {
 
     try testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(testing.allocator, "new.txt", 4096);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, testing.allocator, "new.txt", 4096);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("hello", actual);
 }
@@ -223,7 +224,7 @@ test "FileAppendTool appends to empty file" {
 
     try testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(testing.allocator, "empty.txt", 4096);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, testing.allocator, "empty.txt", 4096);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("data", actual);
 }
@@ -252,7 +253,7 @@ test "FileAppendTool multiple appends" {
     defer if (r2.error_msg) |e| testing.allocator.free(e);
     try testing.expect(r2.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(testing.allocator, "multi.txt", 4096);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, testing.allocator, "multi.txt", 4096);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("ABC", actual);
 }

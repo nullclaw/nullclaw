@@ -141,6 +141,7 @@ pub const RedisConfig = struct {
     db_index: u8 = 0,
     key_prefix: []const u8 = "nullclaw",
     ttl_seconds: ?u32 = null,
+    instance_id: []const u8 = "",
 };
 
 // ── RedisMemory ─────────────────────────────────────────────────────
@@ -154,6 +155,7 @@ pub const RedisMemory = struct {
     db_index: u8,
     key_prefix: []const u8,
     ttl_seconds: ?u32,
+    instance_id: []const u8 = "",
     owns_self: bool = false,
 
     const Self = @This();
@@ -167,6 +169,7 @@ pub const RedisMemory = struct {
             .db_index = config.db_index,
             .key_prefix = config.key_prefix,
             .ttl_seconds = config.ttl_seconds,
+            .instance_id = config.instance_id,
         };
 
         try self_.connect();
@@ -271,10 +274,16 @@ pub const RedisMemory = struct {
     // ── Key helpers ────────────────────────────────────────────────
 
     fn prefixedKey(self: *Self, comptime suffix: []const u8, key: []const u8) ![]u8 {
+        if (self.instance_id.len > 0) {
+            return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}:{s}", .{ self.key_prefix, self.instance_id, suffix, key });
+        }
         return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}", .{ self.key_prefix, suffix, key });
     }
 
     fn prefixedSimple(self: *Self, comptime suffix: []const u8) ![]u8 {
+        if (self.instance_id.len > 0) {
+            return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}", .{ self.key_prefix, self.instance_id, suffix });
+        }
         return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ self.key_prefix, suffix });
     }
 
@@ -346,10 +355,10 @@ pub const RedisMemory = struct {
         // HSET {entry_key} id {id} content {content} category {cat} session_id {sid} created_at {ts} updated_at {ts}
         const sid = session_id orelse "";
         var resp = try self_.sendCommand(&.{
-            "HSET",     entry_key,
-            "id",       id,
-            "content",  content,
-            "category", cat_str,
+            "HSET",       entry_key,
+            "id",         id,
+            "content",    content,
+            "category",   cat_str,
             "session_id", sid,
             "created_at", now,
             "updated_at", now,

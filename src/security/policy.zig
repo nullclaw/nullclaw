@@ -9,6 +9,8 @@ pub const AutonomyLevel = enum {
     supervised,
     /// Full: autonomous execution within policy bounds
     full,
+    /// YOLO: bypasses all security checks (allowlist, syntax, risk, approval, rate limiting)
+    yolo,
 
     pub fn default() AutonomyLevel {
         return .supervised;
@@ -19,6 +21,7 @@ pub const AutonomyLevel = enum {
             .read_only => "readonly",
             .supervised => "supervised",
             .full => "full",
+            .yolo => "yolo",
         };
     }
 
@@ -26,6 +29,7 @@ pub const AutonomyLevel = enum {
         if (std.mem.eql(u8, s, "readonly") or std.mem.eql(u8, s, "read_only")) return .read_only;
         if (std.mem.eql(u8, s, "supervised")) return .supervised;
         if (std.mem.eql(u8, s, "full")) return .full;
+        if (std.mem.eql(u8, s, "yolo")) return .yolo;
         return null;
     }
 };
@@ -59,6 +63,21 @@ pub const default_allowed_commands = [_][]const u8{
     "git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail",
 };
 
+pub const full_autonomy_default_allowed_commands = [_][]const u8{"*"};
+
+/// Resolve command allowlist defaults from autonomy level and configured list.
+/// - explicit config always wins
+/// - full autonomy + empty list => wildcard
+/// - other modes + empty list => conservative default list
+pub fn resolveAllowedCommands(
+    autonomy: AutonomyLevel,
+    configured: []const []const u8,
+) []const []const u8 {
+    if (configured.len > 0) return configured;
+    if (autonomy == .full) return &full_autonomy_default_allowed_commands;
+    return &default_allowed_commands;
+}
+
 /// Security policy enforced on all tool executions
 pub const SecurityPolicy = struct {
     autonomy: AutonomyLevel = .supervised,
@@ -68,6 +87,9 @@ pub const SecurityPolicy = struct {
     max_actions_per_hour: u32 = 20,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
+    /// When true, skip the single-`&` check entirely so that bare
+    /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
+    allow_raw_url_chars: bool = false,
     tracker: ?*RateTracker = null,
 
     /// Classify command risk level.
@@ -96,6 +118,10 @@ pub const SecurityPolicy = struct {
             const lower_base = lowerBuf(base);
             const joined_lower = lowerBuf(cmd_part);
 
+            // One explicit escape hatch for onboarding lifecycle:
+            // deleting only BOOTSTRAP.md via rm/trash is considered low risk.
+            if (isSafeBootstrapDeleteCommandSegment(cmd_part)) continue;
+
             // High-risk commands
             if (isHighRiskCommand(lower_base.slice())) return .high;
 
@@ -123,6 +149,7 @@ pub const SecurityPolicy = struct {
         command: []const u8,
         approved: bool,
     ) error{ CommandNotAllowed, HighRiskBlocked, ApprovalRequired }!CommandRiskLevel {
+        if (self.autonomy == .yolo) return .low;
         if (!self.isCommandAllowed(command)) {
             return error.CommandNotAllowed;
         }
@@ -151,6 +178,7 @@ pub const SecurityPolicy = struct {
 
     /// Check if a shell command is allowed.
     pub fn isCommandAllowed(self: *const SecurityPolicy, command: []const u8) bool {
+        if (self.autonomy == .yolo) return true;
         if (self.autonomy == .read_only) return false;
 
         // Reject oversized commands — never silently truncate
@@ -181,11 +209,13 @@ pub const SecurityPolicy = struct {
             }
         }
 
-        // Block single & background chaining (&& is allowed)
-        if (containsSingleAmpersand(command)) return false;
+        // Block single & background chaining (&& is allowed).
+        // allow_raw_url_chars bypasses this check entirely so that
+        // bare & in URLs like https://...?a=1&b=2 is permitted.
+        if (!self.allow_raw_url_chars and containsSingleAmpersand(command)) return false;
 
-        // Block output redirections
-        if (std.mem.indexOfScalar(u8, command, '>') != null) return false;
+        // Block output redirections except null-sink redirects (`/dev/null` / `NUL`).
+        if (containsUnsafeRedirection(command)) return false;
 
         var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
         const norm_len = normalizeCommand(command, &normalized);
@@ -207,6 +237,12 @@ pub const SecurityPolicy = struct {
 
             has_cmd = true;
 
+            // Allow only the narrow onboarding lifecycle delete command:
+            // rm/trash BOOTSTRAP.md (single safe target only).
+            if (isSafeBootstrapDeleteCommandSegment(cmd_part)) {
+                continue;
+            }
+
             var found = false;
             for (self.allowed_commands) |raw_allowed| {
                 const allowed = std.mem.trim(u8, raw_allowed, " \t\r\n");
@@ -219,7 +255,7 @@ pub const SecurityPolicy = struct {
             if (!found) return false;
 
             // Block dangerous arguments for specific commands
-            if (!isArgsSafe(base_cmd, cmd_part)) return false;
+            if (!isArgsSafe(self, base_cmd, cmd_part)) return false;
         }
 
         return has_cmd;
@@ -233,6 +269,7 @@ pub const SecurityPolicy = struct {
     /// Record an action and check if the rate limit has been exceeded.
     /// Returns true if the action is allowed, false if rate-limited.
     pub fn recordAction(self: *const SecurityPolicy) !bool {
+        if (self.autonomy == .yolo) return true;
         if (self.tracker) |tracker| {
             return tracker.recordAction();
         }
@@ -241,6 +278,7 @@ pub const SecurityPolicy = struct {
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn isRateLimited(self: *const SecurityPolicy) bool {
+        if (self.autonomy == .yolo) return false;
         if (self.tracker) |tracker| {
             return tracker.isLimited();
         }
@@ -293,13 +331,136 @@ fn replacePair(buf: []u8, pat: *const [2]u8) void {
 /// Detect a single `&` operator (background/chain). `&&` is allowed.
 /// We treat any standalone `&` as unsafe because it enables background
 /// process chaining that can escape foreground timeout expectations.
+/// Quote-aware: `&` inside single or double quotes (e.g. URLs) is safe.
 fn containsSingleAmpersand(s: []const u8) bool {
     if (s.len == 0) return false;
+    var in_single_quote = false;
+    var in_double_quote = false;
+    var escaped = false;
     for (s, 0..) |b, i| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        // In shell parsing, backslash escapes the next character everywhere
+        // except inside single quotes.
+        if (b == '\\' and !in_single_quote) {
+            escaped = true;
+            continue;
+        }
+
+        if (b == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if (b == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if (in_single_quote or in_double_quote) continue;
         if (b != '&') continue;
         const prev_is_amp = i > 0 and s[i - 1] == '&';
         const next_is_amp = i + 1 < s.len and s[i + 1] == '&';
         if (!prev_is_amp and !next_is_amp) return true;
+    }
+    return false;
+}
+
+/// Detect unsafe output redirections.
+/// Allows redirects to null sinks only:
+/// - `/dev/null` (POSIX)
+/// - `NUL` (Windows device path)
+/// Quote-aware: ignores `>` inside quoted strings.
+fn containsUnsafeRedirection(s: []const u8) bool {
+    if (s.len == 0) return false;
+
+    var in_single_quote = false;
+    var in_double_quote = false;
+    var escaped = false;
+
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const b = s[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        if (b == '\\' and !in_single_quote) {
+            escaped = true;
+            continue;
+        }
+
+        if (b == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if (b == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+
+        if (in_single_quote or in_double_quote) continue;
+        if (b != '>') continue;
+
+        // Skip optional `>` for append redirection (`>>`).
+        var target_start = i + 1;
+        if (target_start < s.len and s[target_start] == '>') {
+            target_start += 1;
+        }
+
+        while (target_start < s.len and (s[target_start] == ' ' or s[target_start] == '\t')) : (target_start += 1) {}
+        if (target_start >= s.len) return true;
+
+        // File descriptor duplication (e.g. `2>&1`) is not allowed.
+        if (s[target_start] == '&') return true;
+
+        // Parse redirect target token, honoring quotes.
+        var target_end = target_start;
+        var target_in_single = false;
+        var target_in_double = false;
+        var target_escaped = false;
+        while (target_end < s.len) : (target_end += 1) {
+            const tb = s[target_end];
+            if (target_escaped) {
+                target_escaped = false;
+                continue;
+            }
+            if (tb == '\\' and !target_in_single) {
+                target_escaped = true;
+                continue;
+            }
+            if (tb == '\'' and !target_in_double) {
+                target_in_single = !target_in_single;
+                continue;
+            }
+            if (tb == '"' and !target_in_single) {
+                target_in_double = !target_in_double;
+                continue;
+            }
+
+            if (!target_in_single and !target_in_double and
+                (tb == ' ' or tb == '\t' or tb == '\n' or tb == ';' or tb == '|' or tb == '&'))
+            {
+                break;
+            }
+        }
+
+        const target = trimMatchingQuotes(std.mem.trim(u8, s[target_start..target_end], " \t"));
+        if (!isNullSinkTarget(target)) return true;
+
+        if (target_end == 0) continue;
+        i = target_end - 1;
+    }
+
+    return false;
+}
+
+fn isNullSinkTarget(target: []const u8) bool {
+    if (std.mem.eql(u8, target, "/dev/null")) return true;
+    if (comptime @import("builtin").os.tag == .windows) {
+        if (std.ascii.eqlIgnoreCase(target, "nul")) return true;
     }
     return false;
 }
@@ -389,7 +550,29 @@ fn isCargoMediumVerb(verb: []const u8) bool {
 }
 
 /// Check for dangerous arguments that allow sub-command execution.
-fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
+fn hasParentTraversalSegment(path: []const u8) bool {
+    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+    while (iter.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return true;
+    }
+    return false;
+}
+
+fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool {
+    const trimmed = trimMatchingQuotes(std.mem.trim(u8, raw_arg, " \t"));
+
+    // Per `git -C <path>`, an empty path is a no-op on cwd.
+    if (trimmed.len == 0) return true;
+
+    if (!self.workspace_only) return true;
+
+    // Keep git `-C` scoped to the workspace when workspace_only is enabled.
+    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (hasParentTraversalSegment(trimmed)) return false;
+    return true;
+}
+
+fn isArgsSafe(self: *const SecurityPolicy, base_cmd: []const u8, full_cmd: []const u8) bool {
     const lower_base = lowerBuf(base_cmd);
     const lower_cmd = lowerBuf(full_cmd);
     const base = lower_base.slice();
@@ -407,23 +590,114 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
     }
 
     if (std.mem.eql(u8, base, "git")) {
-        // git config, alias, and -c can set dangerous options
+        // Git keeps `-c` and `-C` case-sensitive: `-c` injects config,
+        // `-C` changes directory. We must preserve that distinction while
+        // keeping workspace_only protection intact for `-C`.
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
-        _ = iter.next(); // skip "git" itself
+        _ = iter.next(); // skip lowercased "git" itself
+        var orig_iter = std.mem.tokenizeScalar(u8, full_cmd, ' ');
+        _ = orig_iter.next(); // skip original "git" itself
+        var expect_change_dir_arg = false;
         while (iter.next()) |arg| {
+            const orig_arg = orig_iter.next() orelse arg;
+
+            if (expect_change_dir_arg) {
+                if (!isSafeGitChangeDirArg(self, orig_arg)) return false;
+                expect_change_dir_arg = false;
+                continue;
+            }
+
             if (std.mem.eql(u8, arg, "config") or
                 std.mem.startsWith(u8, arg, "config.") or
                 std.mem.eql(u8, arg, "alias") or
                 std.mem.startsWith(u8, arg, "alias.") or
-                std.mem.eql(u8, arg, "-c"))
+                std.mem.eql(u8, orig_arg, "-c") or
+                std.mem.startsWith(u8, orig_arg, "-c") or
+                std.mem.eql(u8, arg, "--config-env") or
+                std.mem.startsWith(u8, arg, "--config-env="))
             {
                 return false;
             }
+
+            if (std.mem.eql(u8, orig_arg, "-C")) {
+                expect_change_dir_arg = true;
+                continue;
+            }
+            if (std.mem.startsWith(u8, orig_arg, "-C") and orig_arg.len > 2) {
+                if (!isSafeGitChangeDirArg(self, orig_arg[2..])) return false;
+            }
+        }
+
+        if (expect_change_dir_arg) {
+            return false;
         }
         return true;
     }
 
     return true;
+}
+
+fn trimMatchingQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2) {
+        if ((s[0] == '\'' and s[s.len - 1] == '\'') or
+            (s[0] == '"' and s[s.len - 1] == '"'))
+        {
+            return s[1 .. s.len - 1];
+        }
+    }
+    return s;
+}
+
+fn isSafeBootstrapDeleteTarget(raw_arg: []const u8) bool {
+    const trimmed = trimMatchingQuotes(std.mem.trim(u8, raw_arg, " \t"));
+    if (trimmed.len == 0) return false;
+
+    // No absolute paths, traversal, or globs.
+    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (containsStr(trimmed, "..")) return false;
+    if (containsStr(trimmed, "*") or containsStr(trimmed, "?") or
+        containsStr(trimmed, "[") or containsStr(trimmed, "]"))
+    {
+        return false;
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "BOOTSTRAP.md")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "./BOOTSTRAP.md")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, ".\\BOOTSTRAP.md")) return true;
+    return false;
+}
+
+fn isSafeBootstrapDeleteCommandSegment(cmd_part: []const u8) bool {
+    const trimmed = std.mem.trim(u8, cmd_part, " \t");
+    if (trimmed.len == 0) return false;
+
+    var words = std.mem.tokenizeAny(u8, trimmed, " \t");
+    const first = words.next() orelse return false;
+    const base = lowerBuf(extractBasename(first)).slice();
+    const is_delete_tool = std.mem.eql(u8, base, "rm") or
+        std.mem.eql(u8, base, "trash") or
+        std.mem.eql(u8, base, "trash-put") or
+        std.mem.eql(u8, base, "del");
+    if (!is_delete_tool) return false;
+
+    var saw_target = false;
+    var options_done = false;
+    while (words.next()) |raw_arg| {
+        const arg = std.mem.trim(u8, raw_arg, " \t");
+        if (arg.len == 0) continue;
+
+        if (!options_done and std.mem.eql(u8, arg, "--")) {
+            options_done = true;
+            continue;
+        }
+        if (!options_done and arg[0] == '-') continue;
+        if (!options_done and std.mem.eql(u8, base, "del") and arg[0] == '/') continue;
+
+        if (!isSafeBootstrapDeleteTarget(arg)) return false;
+        saw_target = true;
+    }
+
+    return saw_target;
 }
 
 /// Allowlist entry formats:
@@ -518,6 +792,26 @@ test "allowed commands basic" {
     try std.testing.expect(p.isCommandAllowed("grep -r pattern ."));
 }
 
+test "bootstrap delete command is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("rm BOOTSTRAP.md"));
+    try std.testing.expect(p.isCommandAllowed("rm -f -- ./BOOTSTRAP.md"));
+    try std.testing.expect(p.isCommandAllowed("trash BOOTSTRAP.md"));
+}
+
+test "bootstrap delete command remains narrow and safe" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("rm BOOTSTRAP.md README.md"));
+    try std.testing.expect(!p.isCommandAllowed("rm ../BOOTSTRAP.md"));
+    try std.testing.expect(!p.isCommandAllowed("rm /tmp/BOOTSTRAP.md"));
+}
+
+test "bootstrap delete command risk and validation" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.low, p.commandRiskLevel("rm BOOTSTRAP.md"));
+    try std.testing.expectEqual(CommandRiskLevel.low, try p.validateCommandExecution("rm BOOTSTRAP.md", false));
+}
+
 test "blocked commands basic" {
     const p = SecurityPolicy{};
     try std.testing.expect(!p.isCommandAllowed("rm -rf /"));
@@ -577,6 +871,23 @@ test "command injection redirect blocked" {
     const p = SecurityPolicy{};
     try std.testing.expect(!p.isCommandAllowed("echo secret > /etc/crontab"));
     try std.testing.expect(!p.isCommandAllowed("ls >> /tmp/exfil.txt"));
+}
+
+test "null sink redirect is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo ok >/dev/null"));
+    try std.testing.expect(p.isCommandAllowed("echo ok 2>/dev/null"));
+    try std.testing.expect(p.isCommandAllowed("echo ok >\"/dev/null\""));
+    if (comptime @import("builtin").os.tag == .windows) {
+        try std.testing.expect(p.isCommandAllowed("echo ok >NUL"));
+    } else {
+        try std.testing.expect(!p.isCommandAllowed("echo ok >NUL"));
+    }
+}
+
+test "quoted greater-than is not treated as redirection" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo \"a > b\""));
 }
 
 test "command injection dollar brace blocked" {
@@ -893,6 +1204,25 @@ test "default allowed commands includes expected tools" {
     try std.testing.expect(found_ls);
 }
 
+test "resolveAllowedCommands full autonomy defaults to wildcard when unset" {
+    const resolved = resolveAllowedCommands(.full, &.{});
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("*", resolved[0]);
+}
+
+test "resolveAllowedCommands supervised defaults to conservative set when unset" {
+    const resolved = resolveAllowedCommands(.supervised, &.{});
+    try std.testing.expectEqualStrings("git", resolved[0]);
+    try std.testing.expect(resolved.len >= 1);
+}
+
+test "resolveAllowedCommands preserves explicit configured list" {
+    const custom = [_][]const u8{"taskkill"};
+    const resolved = resolveAllowedCommands(.full, &custom);
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("taskkill", resolved[0]);
+}
+
 test "blocks single ampersand background chaining" {
     var p = SecurityPolicy{ .autonomy = .supervised };
     p.allowed_commands = &.{"ls"};
@@ -988,6 +1318,23 @@ test "containsSingleAmpersand detects correctly" {
     try std.testing.expect(!containsSingleAmpersand(""));
 }
 
+test "containsSingleAmpersand_skips_quoted_ampersands" {
+    // & inside double quotes is safe (not a shell operator)
+    try std.testing.expect(!containsSingleAmpersand("curl \"https://example.com?a=1&b=2\""));
+    // & inside single quotes is safe
+    try std.testing.expect(!containsSingleAmpersand("curl 'https://example.com?a=1&b=2'"));
+    // & outside quotes is still detected
+    try std.testing.expect(containsSingleAmpersand("curl https://example.com?a=1&b=2"));
+    // Mixed: & inside quotes safe, unquoted & detected
+    try std.testing.expect(containsSingleAmpersand("curl \"https://example.com?a=1&b=2\" & echo done"));
+    // Fully quoted URL with multiple & is safe
+    try std.testing.expect(!containsSingleAmpersand("curl \"https://api.example.com/search?q=test&page=1&limit=10\""));
+    // Escaped quote outside quotes must not start a quoted region.
+    try std.testing.expect(containsSingleAmpersand("echo \\\" & echo done"));
+    // Escaped ampersand is a literal character and must not be treated as operator.
+    try std.testing.expect(!containsSingleAmpersand("echo \\& literal"));
+}
+
 // ── Argument safety tests ───────────────────────────────────
 
 test "find -exec is blocked" {
@@ -1007,6 +1354,7 @@ test "git config is blocked" {
     try std.testing.expect(!p.isCommandAllowed("git config core.editor \"rm -rf /\""));
     try std.testing.expect(!p.isCommandAllowed("git alias.st status"));
     try std.testing.expect(!p.isCommandAllowed("git -c core.editor=calc.exe commit"));
+    try std.testing.expect(!p.isCommandAllowed("git --config-env=core.editor=EVIL_EDITOR status"));
 }
 
 test "git status is allowed" {
@@ -1014,6 +1362,21 @@ test "git status is allowed" {
     try std.testing.expect(p.isCommandAllowed("git status"));
     try std.testing.expect(p.isCommandAllowed("git add ."));
     try std.testing.expect(p.isCommandAllowed("git log"));
+}
+
+test "git -C stays workspace-scoped while lowercase -c remains blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("git -C . status"));
+    try std.testing.expect(p.isCommandAllowed("git -C ./repo log"));
+    try std.testing.expect(p.isCommandAllowed("git -Crepo status"));
+    try std.testing.expect(!p.isCommandAllowed("git -C /tmp/repo log"));
+    try std.testing.expect(!p.isCommandAllowed("git -C ../repo log"));
+    try std.testing.expect(!p.isCommandAllowed("git -c core.editor=calc.exe commit"));
+}
+
+test "git -C absolute paths are allowed when workspace_only is disabled" {
+    const p = SecurityPolicy{ .workspace_only = false };
+    try std.testing.expect(p.isCommandAllowed("git -C /tmp/repo log"));
 }
 
 test "echo hello | tee /tmp/out is blocked" {
@@ -1159,6 +1522,89 @@ test "validateCommandExecution rejects oversized command" {
     try std.testing.expectError(error.CommandNotAllowed, result);
 }
 
+// ── URL special chars (? and &) in commands ─────────────────────
+
+test "quoted_url_with_ampersand_passes_wildcard_allowlist" {
+    // Core bug scenario: curl with a quoted URL containing ? and &
+    // should pass when the allowlist is ["*"].
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    // Double-quoted URL: & is inside quotes so not a shell operator
+    try std.testing.expect(p.isCommandAllowed("curl \"https://api.example.com/search?q=test&page=1\""));
+    // Single-quoted URL
+    try std.testing.expect(p.isCommandAllowed("curl 'https://api.example.com/search?q=test&page=1'"));
+    // ? alone in a URL (no &) was never blocked for non-rm commands
+    try std.testing.expect(p.isCommandAllowed("curl \"https://example.com?key=value\""));
+}
+
+test "unquoted_url_with_ampersand_blocked_by_default" {
+    // Without quotes, bare & is ambiguous and treated as a shell operator
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(!p.isCommandAllowed("curl https://example.com?a=1&b=2"));
+}
+
+test "escaped_quote_does_not_mask_background_ampersand" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(!p.isCommandAllowed("echo \\\" & touch /tmp/pwned"));
+}
+
+test "allow_raw_url_chars_permits_bare_ampersand" {
+    // With allow_raw_url_chars enabled, bare & in URLs is allowed
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .allow_raw_url_chars = true,
+    };
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com?a=1&b=2"));
+    try std.testing.expect(p.isCommandAllowed("curl https://api.example.com/search?q=test&page=1&limit=10"));
+}
+
+test "allow_raw_url_chars_still_enforces_other_safety_checks" {
+    // allow_raw_url_chars only relaxes the & check; other guards remain
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .allow_raw_url_chars = true,
+    };
+    // Subshell injection still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl $(cat /etc/passwd)"));
+    // Backtick injection still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl `whoami`"));
+    // Output redirection still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl https://example.com > /tmp/out"));
+    // Process substitution still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl <(echo evil)"));
+}
+
+test "allow_raw_url_chars_defaults_to_false" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.allow_raw_url_chars);
+}
+
+test "dash_G_workaround_avoids_special_chars" {
+    // Demonstrates that the -G approach (curl -G url -d key=val)
+    // never needed the fix because it avoids ? and & in the command
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(p.isCommandAllowed("curl -G \"https://api.example.com/search\" -d \"q=test\" -d \"page=1\""));
+}
+
 test "command at MAX_ANALYSIS_LEN minus one is still analyzed" {
     const p = SecurityPolicy{};
     var buf: [MAX_ANALYSIS_LEN - 1]u8 = undefined;
@@ -1188,6 +1634,18 @@ test "full autonomy wildcard end-to-end: validateCommandExecution passes" {
     try std.testing.expectEqual(CommandRiskLevel.low, risk3);
 }
 
+test "wildcard policy allows stderr redirect to dev null for shell workflows" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+    };
+
+    try std.testing.expect(p.isCommandAllowed("find ~ -maxdepth 2 -name \"secrets.json\" -o -name \".env\" 2>/dev/null | head -5"));
+    try std.testing.expect(!p.isCommandAllowed("find ~ -maxdepth 2 -name \"secrets.json\" 2>/tmp/leak.log"));
+}
+
 test "full autonomy wildcard: arbitrary commands allowed" {
     var p = SecurityPolicy{
         .autonomy = .full,
@@ -1199,4 +1657,66 @@ test "full autonomy wildcard: arbitrary commands allowed" {
     try std.testing.expect(p.isCommandAllowed("cargo build --release"));
     try std.testing.expect(p.isCommandAllowed("make all"));
     try std.testing.expect(p.isCommandAllowed("zig build test"));
+}
+
+// ── YOLO autonomy level tests ───────────────────────────────────
+
+test "yolo fromString returns yolo" {
+    try std.testing.expectEqual(AutonomyLevel.yolo, AutonomyLevel.fromString("yolo").?);
+}
+
+test "yolo toString returns yolo" {
+    try std.testing.expectEqualStrings("yolo", AutonomyLevel.yolo.toString());
+}
+
+test "yolo isCommandAllowed bypasses all syntax checks" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    // Subshell expansion — blocked by full, allowed by yolo
+    try std.testing.expect(p.isCommandAllowed("echo $(whoami)"));
+    // Backtick expansion
+    try std.testing.expect(p.isCommandAllowed("echo `id`"));
+    // Output redirection
+    try std.testing.expect(p.isCommandAllowed("echo hi > /tmp/out"));
+    // Background &
+    try std.testing.expect(p.isCommandAllowed("sleep 1 &"));
+    // Process substitution
+    try std.testing.expect(p.isCommandAllowed("diff <(ls) <(ls /tmp)"));
+}
+
+test "yolo validateCommandExecution returns low for all commands" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    // High-risk command — yolo bypasses entirely
+    const risk1 = try p.validateCommandExecution("sudo rm -rf /", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk1);
+    // Command not on any allowlist — yolo bypasses
+    const risk2 = try p.validateCommandExecution("python3 exploit.py", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk2);
+}
+
+test "yolo canAct returns true" {
+    const p = SecurityPolicy{ .autonomy = .yolo };
+    try std.testing.expect(p.canAct());
+}
+
+test "yolo recordAction bypasses rate limiting" {
+    var tracker = RateTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    var p = SecurityPolicy{
+        .autonomy = .yolo,
+        .tracker = &tracker,
+    };
+    try std.testing.expect(try p.recordAction());
+    try std.testing.expect(try p.recordAction());
+    try std.testing.expect(try p.recordAction());
+}
+
+test "yolo isRateLimited always false" {
+    var tracker = RateTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    var p = SecurityPolicy{
+        .autonomy = .yolo,
+        .tracker = &tracker,
+    };
+    _ = try tracker.recordAction();
+    try std.testing.expect(p.isRateLimited() == false);
 }

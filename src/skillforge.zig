@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_miniparse = @import("json_miniparse.zig");
 
 // SkillForge -- skill auto-discovery, evaluation, and integration engine.
 //
@@ -183,53 +184,12 @@ fn parseGitHubSearchResults(allocator: std.mem.Allocator, body: []const u8, cand
 
 /// Extract a JSON string value for a given key from a JSON fragment.
 fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
-
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    // Skip whitespace and colon
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or
-        after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1)
-    {}
-
-    if (i >= after_key.len or after_key[i] != '"') return null;
-    i += 1; // skip opening quote
-
-    const start = i;
-    while (i < after_key.len) : (i += 1) {
-        if (after_key[i] == '\\' and i + 1 < after_key.len) {
-            i += 1;
-            continue;
-        }
-        if (after_key[i] == '"') {
-            return after_key[start..i];
-        }
-    }
-    return null;
+    return json_miniparse.parseStringField(json, key);
 }
 
 /// Extract a JSON integer value for a given key.
 fn extractJsonNumber(json: []const u8, key: []const u8) u64 {
-    var needle_buf: [256]u8 = undefined;
-    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return 0;
-
-    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return 0;
-    const after_key = json[key_pos + quoted_key.len ..];
-
-    // Skip whitespace and colon
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or
-        after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1)
-    {}
-
-    // Parse number
-    const start = i;
-    while (i < after_key.len and after_key[i] >= '0' and after_key[i] <= '9') : (i += 1) {}
-    if (i == start) return 0;
-    return std.fmt.parseInt(u64, after_key[start..i], 10) catch 0;
+    return json_miniparse.parseUintField(json, key) orelse 0;
 }
 
 /// Build the GitHub search URL for a query.

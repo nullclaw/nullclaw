@@ -27,6 +27,7 @@ pub const lancedb = if (build_options.enable_memory_lancedb) @import("engines/la
     pub const LanceDbMemory = struct {};
 };
 pub const api = @import("engines/api.zig");
+pub const clickhouse = @import("engines/clickhouse.zig");
 pub const registry = @import("engines/registry.zig");
 
 // retrieval/ (Layer B: Retrieval Engine)
@@ -70,6 +71,7 @@ pub const InMemoryLruMemory = memory_lru.InMemoryLruMemory;
 pub const LucidMemory = lucid.LucidMemory;
 pub const PostgresMemory = if (build_options.enable_postgres) postgres.PostgresMemory else struct {};
 pub const RedisMemory = redis.RedisMemory;
+pub const ClickHouseMemory = clickhouse.ClickHouseMemory;
 pub const LanceDbMemory = lancedb.LanceDbMemory;
 pub const ApiMemory = api.ApiMemory;
 pub const ResponseCache = cache.ResponseCache;
@@ -152,6 +154,41 @@ pub fn freeMessages(allocator: std.mem.Allocator, messages: []MessageEntry) void
     allocator.free(messages);
 }
 
+/// Session summary for listing sessions.
+pub const SessionInfo = struct {
+    session_id: []const u8,
+    message_count: u64,
+    first_message_at: []const u8,
+    last_message_at: []const u8,
+
+    pub fn deinit(self: SessionInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.first_message_at);
+        allocator.free(self.last_message_at);
+    }
+};
+
+pub fn freeSessionInfos(allocator: std.mem.Allocator, infos: []SessionInfo) void {
+    for (infos) |info| info.deinit(allocator);
+    allocator.free(infos);
+}
+
+/// Message with timestamp for detailed history.
+pub const DetailedMessageEntry = struct {
+    role: []const u8,
+    content: []const u8,
+    created_at: []const u8,
+};
+
+pub fn freeDetailedMessages(allocator: std.mem.Allocator, entries: []DetailedMessageEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.role);
+        allocator.free(entry.content);
+        allocator.free(entry.created_at);
+    }
+    allocator.free(entries);
+}
+
 // ── SessionStore vtable interface ─────────────────────────────────
 
 pub const SessionStore = struct {
@@ -163,6 +200,12 @@ pub const SessionStore = struct {
         loadMessages: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]MessageEntry,
         clearMessages: *const fn (ptr: *anyopaque, session_id: []const u8) anyerror!void,
         clearAutoSaved: *const fn (ptr: *anyopaque, session_id: ?[]const u8) anyerror!void,
+        saveUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void = null,
+        loadUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!?u64 = null,
+        countSessions: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
+        listSessions: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]SessionInfo = null,
+        countDetailedMessages: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!u64 = null,
+        loadMessagesDetailed: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]DetailedMessageEntry = null,
     };
 
     pub fn saveMessage(self: SessionStore, session_id: []const u8, role: []const u8, content: []const u8) !void {
@@ -179,6 +222,36 @@ pub const SessionStore = struct {
 
     pub fn clearAutoSaved(self: SessionStore, session_id: ?[]const u8) !void {
         return self.vtable.clearAutoSaved(self.ptr, session_id);
+    }
+
+    pub fn saveUsage(self: SessionStore, session_id: []const u8, total_tokens: u64) !void {
+        const func = self.vtable.saveUsage orelse return error.NotSupported;
+        return func(self.ptr, session_id, total_tokens);
+    }
+
+    pub fn loadUsage(self: SessionStore, session_id: []const u8) !?u64 {
+        const func = self.vtable.loadUsage orelse return null;
+        return func(self.ptr, session_id);
+    }
+
+    pub fn countSessions(self: SessionStore) !u64 {
+        const func = self.vtable.countSessions orelse return error.NotSupported;
+        return func(self.ptr);
+    }
+
+    pub fn listSessions(self: SessionStore, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]SessionInfo {
+        const func = self.vtable.listSessions orelse return error.NotSupported;
+        return func(self.ptr, allocator, limit, offset);
+    }
+
+    pub fn countDetailedMessages(self: SessionStore, session_id: []const u8) !u64 {
+        const func = self.vtable.countDetailedMessages orelse return error.NotSupported;
+        return func(self.ptr, session_id);
+    }
+
+    pub fn loadMessagesDetailed(self: SessionStore, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) ![]DetailedMessageEntry {
+        const func = self.vtable.loadMessagesDetailed orelse return error.NotSupported;
+        return func(self.ptr, allocator, session_id, limit, offset);
     }
 };
 
@@ -275,11 +348,11 @@ pub fn promptBootstrapMemoryKey(filename: []const u8) ?[]const u8 {
     return null;
 }
 
-/// markdown backend keeps bootstrap identity in workspace files;
+/// markdown and hybrid backends keep bootstrap identity in workspace files;
 /// all other backends use backend-native key/value entries.
 pub fn usesWorkspaceBootstrapFiles(memory_backend: ?[]const u8) bool {
     const backend = memory_backend orelse return true;
-    return std.mem.eql(u8, backend, "markdown");
+    return std.mem.eql(u8, backend, "markdown") or std.mem.eql(u8, backend, "hybrid");
 }
 
 pub fn isInternalMemoryKey(key: []const u8) bool {
@@ -494,35 +567,16 @@ pub const MemoryRuntime = struct {
     /// Embeds the content and upserts into the vector store.
     /// Errors are caught and logged, never propagated.
     pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
-        // Durable mode: enqueue and return (drain happens at turn boundaries / shutdown).
-        if (self._outbox) |ob| {
-            ob.enqueue(key, "upsert") catch |err| {
-                log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
-            };
-            return;
-        }
-
-        const provider = self._embedding_provider orelse return;
-        const vs = self._vector_store orelse return;
-
-        // Check circuit breaker
-        if (self._circuit_breaker) |cb| {
-            if (!cb.allow()) return;
-        }
-
-        const emb = provider.embed(allocator, content) catch |err| {
-            log.warn("vector sync embed failed for key '{s}': {}", .{ key, err });
-            if (self._circuit_breaker) |cb| cb.recordFailure();
-            return;
-        };
-        defer allocator.free(emb);
-
-        if (self._circuit_breaker) |cb| cb.recordSuccess();
-        if (emb.len == 0) return;
-
-        vs.upsert(key, emb) catch |err| {
-            log.warn("vector sync upsert failed for key '{s}': {}", .{ key, err });
-        };
+        syncVectorUpsertWithComponents(
+            allocator,
+            key,
+            content,
+            self._outbox,
+            self._embedding_provider,
+            self._vector_store,
+            self._circuit_breaker,
+            "",
+        );
     }
 
     /// Drain the durable outbox (if configured).
@@ -650,6 +704,72 @@ pub const MemoryRuntime = struct {
     }
 };
 
+const HygienePreserveSyncCtx = struct {
+    outbox: ?*outbox.VectorOutbox = null,
+    embed_provider: ?embeddings.EmbeddingProvider = null,
+    vector_store: ?vector_store.VectorStore = null,
+    circuit_breaker: ?*circuit_breaker.CircuitBreaker = null,
+};
+
+fn syncVectorUpsertWithComponents(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    content: []const u8,
+    outbox_inst: ?*outbox.VectorOutbox,
+    embed_provider: ?embeddings.EmbeddingProvider,
+    vector_store_inst: ?vector_store.VectorStore,
+    circuit_breaker_inst: ?*circuit_breaker.CircuitBreaker,
+    log_prefix: []const u8,
+) void {
+    // Durable mode: enqueue and return.
+    if (outbox_inst) |ob| {
+        ob.enqueue(key, "upsert") catch |err| {
+            log.warn("{s}outbox enqueue failed for key '{s}': {}", .{ log_prefix, key, err });
+        };
+        return;
+    }
+
+    const provider = embed_provider orelse return;
+    const vs = vector_store_inst orelse return;
+
+    if (circuit_breaker_inst) |cb| {
+        if (!cb.allow()) return;
+    }
+
+    const emb = provider.embed(allocator, content) catch |err| {
+        log.warn("{s}vector sync embed failed for key '{s}': {}", .{ log_prefix, key, err });
+        if (circuit_breaker_inst) |cb| cb.recordFailure();
+        return;
+    };
+    defer allocator.free(emb);
+
+    if (circuit_breaker_inst) |cb| cb.recordSuccess();
+    if (emb.len == 0) return;
+
+    vs.upsert(key, emb) catch |err| {
+        log.warn("{s}vector sync upsert failed for key '{s}': {}", .{ log_prefix, key, err });
+    };
+}
+
+fn syncPreservedChunkToVector(
+    ctx_ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    content: []const u8,
+) void {
+    const ctx: *HygienePreserveSyncCtx = @ptrCast(@alignCast(ctx_ptr));
+    syncVectorUpsertWithComponents(
+        allocator,
+        key,
+        content,
+        ctx.outbox,
+        ctx.embed_provider,
+        ctx.vector_store,
+        ctx.circuit_breaker,
+        "hygiene ",
+    );
+}
+
 /// Create a MemoryRuntime from a MemoryConfig and workspace directory.
 /// Goes through the registry to find the backend, resolve paths, and
 /// create the instance. Returns null on any error (unknown backend,
@@ -680,7 +800,8 @@ pub fn initRuntime(
     const pg_cfg: ?config_types.MemoryPostgresConfig = if (std.mem.eql(u8, config.backend, "postgres")) config.postgres else null;
     const redis_cfg: ?config_types.MemoryRedisConfig = if (std.mem.eql(u8, config.backend, "redis")) config.redis else null;
     const api_cfg: ?config_types.MemoryApiConfig = if (std.mem.eql(u8, config.backend, "api")) config.api else null;
-    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg, redis_cfg, api_cfg) catch |err| {
+    const clickhouse_cfg: ?config_types.MemoryClickHouseConfig = if (std.mem.eql(u8, config.backend, "clickhouse")) config.clickhouse else null;
+    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg, redis_cfg, api_cfg, clickhouse_cfg) catch |err| {
         log.warn("memory path resolution failed for backend '{s}': {}", .{ config.backend, err });
         return null;
     };
@@ -703,25 +824,6 @@ pub fn initRuntime(
         if (snapshot.shouldHydrate(allocator, instance.memory, workspace_dir)) {
             _ = snapshot.hydrateFromSnapshot(allocator, instance.memory, workspace_dir) catch |e| {
                 log.warn("snapshot hydration failed: {}", .{e});
-            };
-        }
-    }
-
-    // ── Lifecycle: hygiene ──
-    if (config.lifecycle.hygiene_enabled) {
-        const hygiene_cfg = hygiene.HygieneConfig{
-            .hygiene_enabled = true,
-            .archive_after_days = config.lifecycle.archive_after_days,
-            .purge_after_days = config.lifecycle.purge_after_days,
-            .conversation_retention_days = config.lifecycle.conversation_retention_days,
-            .workspace_dir = workspace_dir,
-        };
-        const report = hygiene.runIfDue(allocator, hygiene_cfg, instance.memory);
-
-        // Snapshot after hygiene if configured and hygiene did work
-        if (config.lifecycle.snapshot_on_hygiene and report.totalActions() > 0) {
-            _ = snapshot.exportSnapshot(allocator, instance.memory, workspace_dir) catch |e| {
-                log.warn("snapshot export after hygiene failed: {}", .{e});
             };
         }
     }
@@ -990,6 +1092,40 @@ pub fn initRuntime(
         // 5. Wire into retrieval engine
         if (engine) |eng| {
             eng.setVectorSearch(embed_provider.?, vs_iface.?, cb, config.search.query.hybrid);
+        }
+    }
+
+    // ── Lifecycle: hygiene ──
+    if (config.lifecycle.hygiene_enabled) {
+        var preserve_sync_ctx = HygienePreserveSyncCtx{
+            .outbox = outbox_inst,
+            .embed_provider = embed_provider,
+            .vector_store = vs_iface,
+            .circuit_breaker = cb_inst,
+        };
+        const preserve_sync_hook: ?hygiene.PreserveSyncHook = if (config.lifecycle.preserve_before_purge and
+            (outbox_inst != null or (embed_provider != null and vs_iface != null)))
+            .{
+                .ptr = @ptrCast(&preserve_sync_ctx),
+                .callback = syncPreservedChunkToVector,
+            }
+        else
+            null;
+        const hygiene_cfg = hygiene.HygieneConfig{
+            .hygiene_enabled = true,
+            .archive_after_days = config.lifecycle.archive_after_days,
+            .purge_after_days = config.lifecycle.purge_after_days,
+            .preserve_before_purge = config.lifecycle.preserve_before_purge,
+            .conversation_retention_days = config.lifecycle.conversation_retention_days,
+            .workspace_dir = workspace_dir,
+        };
+        const report = hygiene.runIfDue(allocator, hygiene_cfg, instance.memory, preserve_sync_hook);
+
+        // Snapshot after hygiene if configured and hygiene did work
+        if (config.lifecycle.snapshot_on_hygiene and report.totalActions() > 0) {
+            _ = snapshot.exportSnapshot(allocator, instance.memory, workspace_dir) catch |e| {
+                log.warn("snapshot export after hygiene failed: {}", .{e});
+            };
         }
     }
 
@@ -1276,12 +1412,21 @@ test "SessionStore delegates through vtable" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.call_count += 1;
         }
+        fn implSaveUsage(ptr: *anyopaque, _: []const u8, _: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+        }
+        fn implLoadUsage(_: *anyopaque, _: []const u8) anyerror!?u64 {
+            return 42;
+        }
 
         const sess_vtable = SessionStore.VTable{
             .saveMessage = &implSaveMessage,
             .loadMessages = &implLoadMessages,
             .clearMessages = &implClearMessages,
             .clearAutoSaved = &implClearAutoSaved,
+            .saveUsage = &implSaveUsage,
+            .loadUsage = &implLoadUsage,
         };
     };
 
@@ -1300,6 +1445,12 @@ test "SessionStore delegates through vtable" {
 
     try store.clearAutoSaved(null);
     try std.testing.expectEqual(@as(usize, 3), mock.call_count);
+
+    try store.saveUsage("s1", 7);
+    try std.testing.expectEqual(@as(usize, 4), mock.call_count);
+
+    const usage = try store.loadUsage("s1");
+    try std.testing.expectEqual(@as(?u64, 42), usage);
 }
 
 test "freeMessages frees all entries" {
@@ -1798,6 +1949,53 @@ test "deleteFromVectorStore enqueues delete when durable outbox is active" {
     try std.testing.expectEqual(@as(usize, 1), try ob.pendingCount());
 }
 
+test "initRuntime hygiene preserve enqueues vector sync when durable outbox is active" {
+    if (!build_options.enable_memory_sqlite) return;
+
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
+    const archive_path = try std.fs.path.join(std.testing.allocator, &.{ ws.path, "memory", "archive" });
+    defer std.testing.allocator.free(archive_path);
+    try std.fs.cwd().makePath(archive_path);
+
+    var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
+    defer archive_dir.close();
+
+    var file = try archive_dir.createFile("old-memory.md", .{});
+    defer file.close();
+    try file.writeAll("Archived markdown content that should be preserved and vector-synced.");
+    try file.updateTimes(0, 0);
+
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+            .sync = .{
+                .mode = "durable_outbox",
+            },
+        },
+        .lifecycle = .{
+            .hygiene_enabled = true,
+            .archive_after_days = 0,
+            .purge_after_days = 1,
+            .preserve_before_purge = true,
+            .conversation_retention_days = 0,
+        },
+    }, ws.path) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect((archive_dir.statFile("old-memory.md") catch null) == null);
+
+    const preserved = try rt.memory.list(std.testing.allocator, .{ .custom = "archive" }, null);
+    defer freeEntries(std.testing.allocator, preserved);
+    try std.testing.expect(preserved.len > 0);
+
+    const ob = rt._outbox orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try ob.pendingCount() > 0);
+}
+
 test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
     var backend = none.NoneMemory.init();
     defer backend.deinit();
@@ -1861,6 +2059,7 @@ test {
     _ = postgres;
     _ = redis;
     _ = lancedb;
+    _ = clickhouse;
     _ = registry;
     _ = @import("engines/contract_test.zig");
 

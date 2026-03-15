@@ -17,6 +17,8 @@ const MaxTokensEntry = struct {
 
 // High-signal model defaults used in onboarding/catalog flows.
 const MODEL_MAX_TOKENS = [_]MaxTokensEntry{
+    .{ .key = "gpt-4", .tokens = 4_096 },
+    .{ .key = "gpt-4-32k", .tokens = 4_096 },
     .{ .key = "claude-opus-4-6", .tokens = 8192 },
     .{ .key = "claude-opus-4.6", .tokens = 8192 },
     .{ .key = "claude-sonnet-4-6", .tokens = 8192 },
@@ -98,6 +100,12 @@ fn stripKnownSuffix(model_id: []const u8) []const u8 {
     return model_id;
 }
 
+fn isLegacyGpt4Model(model_id: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(model_id, "gpt-4") or
+        std.ascii.eqlIgnoreCase(model_id, "gpt-4-0314") or
+        std.ascii.eqlIgnoreCase(model_id, "gpt-4-0613");
+}
+
 fn lookupTable(table: []const MaxTokensEntry, key: []const u8) ?u32 {
     for (table) |entry| {
         if (std.ascii.eqlIgnoreCase(entry.key, key)) return entry.tokens;
@@ -116,6 +124,13 @@ fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, mod
 }
 
 fn inferFromModelPattern(model_id: []const u8) ?u32 {
+    if (startsWithIgnoreCase(model_id, "gpt-4-32k")) return 4_096;
+
+    // Keep strict legacy ceilings without penalizing turbo/preview descendants.
+    if (isLegacyGpt4Model(model_id)) {
+        return 4_096;
+    }
+
     if (std.mem.indexOf(u8, model_id, "k2p5") != null) return 32_768;
 
     if (startsWithIgnoreCase(model_id, "kimi-coding") or startsWithIgnoreCase(model_id, "kimi-k2")) {
@@ -190,9 +205,17 @@ test "resolveMaxTokens honors explicit override first" {
 }
 
 test "lookupModelMaxTokens resolves model and nested provider refs" {
+    try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4"));
+    try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4-32k"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4.1-mini"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4-turbo"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openrouter/anthropic/claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u32, 32_768), lookupModelMaxTokens("qianfan/custom-model"));
+}
+
+test "lookupModelMaxTokens keeps legacy and turbo gpt-4 variants distinct" {
+    try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4-0613"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4-turbo-preview"));
 }
 
 test "lookupModelMaxTokens strips date suffixes and latest aliases" {

@@ -192,9 +192,10 @@ pub const PgvectorVectorStore = struct {
         const key_z = try alloc.dupeZ(u8, key);
         defer alloc.free(key_z);
 
-        const sql = try std.fmt.allocPrintZ(alloc,
+        const sql = try std.fmt.allocPrintZ(
+            alloc,
             "INSERT INTO {s} (key, embedding, updated_at) VALUES ($1, $2, now()) " ++
-            "ON CONFLICT (key) DO UPDATE SET embedding = $2, updated_at = now()",
+                "ON CONFLICT (key) DO UPDATE SET embedding = $2, updated_at = now()",
             .{self.table_name},
         );
         defer alloc.free(sql);
@@ -222,9 +223,10 @@ pub const PgvectorVectorStore = struct {
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
 
         // Use 1 - cosine_distance as similarity score
-        const sql = try std.fmt.allocPrintZ(alloc,
+        const sql = try std.fmt.allocPrintZ(
+            alloc,
             "SELECT key, 1 - (embedding <=> $1::vector) AS similarity " ++
-            "FROM {s} ORDER BY embedding <=> $1::vector LIMIT $2",
+                "FROM {s} ORDER BY embedding <=> $1::vector LIMIT $2",
             .{self.table_name},
         );
         defer alloc.free(sql);

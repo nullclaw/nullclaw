@@ -32,7 +32,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
     try w.print("Heartbeat:   {s}\n", .{
         if (cfg.heartbeat_enabled) "enabled" else "disabled",
     });
-    try w.print("Security:    workspace_only={s}, max_actions/hr={d}\n", .{
+    try w.print("Security:    autonomy={s}, workspace_only={s}, max_actions/hr={d}\n", .{
+        cfg.autonomy.level.toString(),
         if (cfg.workspace_only) "yes" else "no",
         cfg.max_actions_per_hour,
     });

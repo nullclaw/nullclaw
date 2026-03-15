@@ -10,6 +10,7 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
+const fs_compat = @import("fs_compat.zig");
 const memory_root = @import("memory/root.zig");
 const migrate_mod = @import("memory/lifecycle/migrate.zig");
 
@@ -397,7 +398,7 @@ fn readOpenclawMarkdownEntries(
     const core_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{source});
     defer allocator.free(core_path);
 
-    if (std.fs.cwd().readFileAlloc(allocator, core_path, 1024 * 1024)) |content| {
+    if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, core_path, 1024 * 1024)) |content| {
         defer allocator.free(content);
         const count = try parseMarkdownFile(allocator, content, "core", "openclaw_core", entries);
         stats.from_markdown += count;
@@ -415,7 +416,7 @@ fn readOpenclawMarkdownEntries(
             if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
             const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ daily_dir, entry.name });
             defer allocator.free(fpath);
-            if (std.fs.cwd().readFileAlloc(allocator, fpath, 1024 * 1024)) |content| {
+            if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, fpath, 1024 * 1024)) |content| {
                 defer allocator.free(content);
                 const stem = entry.name[0 .. entry.name.len - 3];
                 const count = try parseMarkdownFile(allocator, content, "daily", stem, entries);
@@ -707,7 +708,7 @@ test "migrateOpenclawConfig copies and normalizes config json" {
     const migrated = try migrateOpenclawConfig(std.testing.allocator, workspace_abs, target_cfg_path, false);
     try std.testing.expect(migrated);
 
-    const migrated_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, target_cfg_path, 64 * 1024);
+    const migrated_bytes = try fs_compat.readFileAlloc(std.fs.cwd(), std.testing.allocator, target_cfg_path, 64 * 1024);
     defer std.testing.allocator.free(migrated_bytes);
     try std.testing.expect(std.mem.indexOf(u8, migrated_bytes, "\"gateway_port\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, migrated_bytes, "\"http_request\"") != null);
@@ -799,7 +800,7 @@ test "backup and restore roundtrip" {
     try copyFileAbsolute(src_path, backup_path);
 
     // Verify backup content matches
-    const backup_content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, backup_name, 4096);
+    const backup_content = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, backup_name, 4096);
     defer std.testing.allocator.free(backup_content);
     try std.testing.expectEqualStrings(content, backup_content);
 
@@ -812,7 +813,7 @@ test "backup and restore roundtrip" {
     try restoreBackup(backup_path, src_path);
 
     // Verify restored content
-    const restored = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.db", 4096);
+    const restored = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.db", 4096);
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings(content, restored);
 }

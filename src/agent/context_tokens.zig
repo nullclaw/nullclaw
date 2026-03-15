@@ -17,6 +17,8 @@ const ContextWindowEntry = struct {
 
 // Model-specific defaults for high-signal IDs used by onboarding/catalog flows.
 const MODEL_WINDOWS = [_]ContextWindowEntry{
+    .{ .key = "gpt-4", .tokens = 8_192 },
+    .{ .key = "gpt-4-32k", .tokens = 32_768 },
     .{ .key = "claude-opus-4-6", .tokens = 200_000 },
     .{ .key = "claude-opus-4.6", .tokens = 200_000 },
     .{ .key = "claude-sonnet-4-6", .tokens = 200_000 },
@@ -91,6 +93,12 @@ fn stripKnownSuffix(model_id: []const u8) []const u8 {
     return model_id;
 }
 
+fn isLegacyGpt4Model(model_id: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(model_id, "gpt-4") or
+        std.ascii.eqlIgnoreCase(model_id, "gpt-4-0314") or
+        std.ascii.eqlIgnoreCase(model_id, "gpt-4-0613");
+}
+
 fn lookupTable(table: []const ContextWindowEntry, key: []const u8) ?u64 {
     for (table) |entry| {
         if (std.ascii.eqlIgnoreCase(entry.key, key)) return entry.tokens;
@@ -109,6 +117,13 @@ fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, mod
 }
 
 fn inferFromModelPattern(model_id: []const u8) ?u64 {
+    if (startsWithIgnoreCase(model_id, "gpt-4-32k")) return 32_768;
+
+    // Keep strict legacy ceilings without penalizing turbo/preview descendants.
+    if (isLegacyGpt4Model(model_id)) {
+        return 8_192;
+    }
+
     if (std.mem.indexOf(u8, model_id, "32768") != null) return 32_768;
 
     if (startsWithIgnoreCase(model_id, "claude-")) return 200_000;
@@ -180,9 +195,17 @@ test "resolveContextTokens honors explicit override first" {
 }
 
 test "lookupContextTokens resolves known model ids" {
+    try std.testing.expectEqual(@as(?u64, 8_192), lookupContextTokens("openai/gpt-4"));
+    try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("openai/gpt-4-32k"));
     try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4.1-mini"));
+    try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4-turbo"));
     try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("mixtral-8x7b-32768"));
+}
+
+test "lookupContextTokens keeps legacy and turbo gpt-4 variants distinct" {
+    try std.testing.expectEqual(@as(?u64, 8_192), lookupContextTokens("openai/gpt-4-0613"));
+    try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4-turbo-preview"));
 }
 
 test "lookupContextTokens handles nested provider refs" {

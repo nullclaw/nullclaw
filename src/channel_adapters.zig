@@ -4,6 +4,7 @@ const channel_loop = @import("channel_loop.zig");
 const channels_root = @import("channels/root.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const max_mod = @import("channels/max.zig");
 const agent_routing = @import("agent_routing.zig");
 
 pub const PollingSpawnFn = *const fn (
@@ -49,6 +50,10 @@ pub const polling_descriptors = [_]PollingDescriptor{
         .channel_name = "matrix",
         .spawn = channel_loop.spawnMatrixPolling,
     },
+    .{
+        .channel_name = "max",
+        .spawn = channel_loop.spawnMaxPolling,
+    },
 };
 
 pub fn findPollingDescriptor(channel_name: []const u8) ?*const PollingDescriptor {
@@ -69,6 +74,8 @@ pub const InboundMetadata = struct {
     thread_id: ?[]const u8 = null,
     is_dm: ?bool = null,
     is_group: ?bool = null,
+    sender_username: ?[]const u8 = null,
+    sender_display_name: ?[]const u8 = null,
 };
 
 pub const InboundRouteInput = struct {
@@ -160,9 +167,13 @@ fn deriveDiscordPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_rou
 
 fn deriveSlackPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
     const is_dm = meta.is_dm orelse (input.chat_id.len > 0 and input.chat_id[0] == 'D');
+    var channel_id = meta.channel_id orelse input.chat_id;
+    if (std.mem.indexOfScalar(u8, channel_id, ':')) |idx| {
+        if (idx > 0) channel_id = channel_id[0..idx];
+    }
     return .{
         .kind = if (is_dm) .direct else .channel,
-        .id = if (is_dm) input.sender_id else input.chat_id,
+        .id = if (is_dm) input.sender_id else channel_id,
     };
 }
 
@@ -213,6 +224,33 @@ fn deriveIMessagePeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_ro
 
 fn deriveMaixcamPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routing.PeerRef {
     return .{ .kind = .direct, .id = input.chat_id };
+}
+
+fn defaultMaxAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.maxPrimary()) |mc| return mc.account_id;
+    return null;
+}
+
+fn deriveMaxPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    const is_group = meta.is_group orelse false;
+    return .{
+        .kind = if (is_group) .group else .direct,
+        .id = if (is_group) input.chat_id else input.sender_id,
+    };
+}
+
+fn defaultTeamsAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.teamsPrimary()) |tc| return tc.account_id;
+    return null;
+}
+
+fn deriveTeamsPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    // Teams personal chats are direct; channel/group chats use the conversation id
+    const is_dm = meta.is_dm orelse (meta.peer_kind == null or meta.peer_kind.? == .direct);
+    return .{
+        .kind = if (is_dm) .direct else .channel,
+        .id = if (is_dm) input.sender_id else input.chat_id,
+    };
 }
 
 fn defaultWebAccount(config: *const Config, _: []const u8) ?[]const u8 {
@@ -280,6 +318,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .derive_peer = deriveMaixcamPeer,
     },
     .{
+        .channel_name = "teams",
+        .default_account_id = defaultTeamsAccount,
+        .derive_peer = deriveTeamsPeer,
+    },
+    .{
         .channel_name = "web",
         .default_account_id = defaultWebAccount,
         .derive_peer = deriveWebPeer,
@@ -288,6 +331,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .channel_name = "whatsapp_web",
         .default_account_id = defaultWhatsAppWebAccount,
         .derive_peer = deriveWhatsAppWebPeer,
+    },
+    .{
+        .channel_name = "max",
+        .default_account_id = defaultMaxAccount,
+        .derive_peer = deriveMaxPeer,
     },
 };
 
@@ -306,6 +354,7 @@ test "findPollingDescriptor returns known polling adapters" {
     try std.testing.expect(findPollingDescriptor("telegram") != null);
     try std.testing.expect(findPollingDescriptor("signal") != null);
     try std.testing.expect(findPollingDescriptor("matrix") != null);
+    try std.testing.expect(findPollingDescriptor("max") != null);
     try std.testing.expect(findPollingDescriptor("discord") == null);
 }
 

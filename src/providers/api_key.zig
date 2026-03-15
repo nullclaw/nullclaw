@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_mod = @import("../config_types.zig");
+const provider_names = @import("../provider_names.zig");
 
 /// Resolve API key for a provider from config and environment variables.
 ///
@@ -59,13 +60,14 @@ pub fn resolveApiKey(
 }
 
 fn providerEnvCandidates(name: []const u8) [3][]const u8 {
+    const canonical = provider_names.canonicalProviderNameIgnoreCase(name);
     const map = std.StaticStringMap([3][]const u8).initComptime(.{
         .{ "anthropic", .{ "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "" } },
         .{ "openrouter", .{ "OPENROUTER_API_KEY", "", "" } },
         .{ "openai", .{ "OPENAI_API_KEY", "", "" } },
+        .{ "azure", .{ "AZURE_OPENAI_API_KEY", "", "" } },
         .{ "gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
-        .{ "google", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
-        .{ "google-gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
+        .{ "vertex", .{ "VERTEX_API_KEY", "VERTEX_OAUTH_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN" } },
         .{ "groq", .{ "GROQ_API_KEY", "", "" } },
         .{ "mistral", .{ "MISTRAL_API_KEY", "", "" } },
         .{ "deepseek", .{ "DEEPSEEK_API_KEY", "", "" } },
@@ -109,10 +111,9 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "lmstudio", .{ "API_KEY", "", "" } },
         .{ "lm-studio", .{ "API_KEY", "", "" } },
         .{ "claude-cli", .{ "ANTHROPIC_API_KEY", "", "" } },
-        .{ "claude-code", .{ "ANTHROPIC_API_KEY", "", "" } },
         .{ "codex-cli", .{ "OPENAI_API_KEY", "", "" } },
     });
-    return map.get(name) orelse .{ "", "", "" };
+    return map.get(canonical) orelse .{ "", "", "" };
 }
 
 /// Resolve API key with config providers as first priority, then env vars:
@@ -125,7 +126,7 @@ pub fn resolveApiKeyFromConfig(
     providers: []const config_mod.ProviderEntry,
 ) !?[]u8 {
     for (providers) |e| {
-        if (std.mem.eql(u8, e.name, provider_name)) {
+        if (provider_names.providerNamesMatch(e.name, provider_name)) {
             if (e.api_key) |k| return try allocator.dupe(u8, k);
         }
     }
@@ -154,10 +155,22 @@ test "astrai env candidate is ASTRAI_API_KEY" {
     try std.testing.expectEqualStrings("ASTRAI_API_KEY", candidates[0]);
 }
 
+test "vertex env candidate is VERTEX_API_KEY" {
+    const candidates = providerEnvCandidates("vertex");
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", candidates[0]);
+}
+
+test "azure aliases share Azure env candidate" {
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure")[0]);
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure-openai")[0]);
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure_openai")[0]);
+}
+
 test "providerEnvCandidates includes onboarding env hints" {
     const onboard = @import("../onboard.zig");
 
     for (onboard.known_providers) |provider| {
+        if (provider.env_var.len == 0) continue;
         const candidates = providerEnvCandidates(provider.key);
 
         var matched = false;
@@ -181,6 +194,15 @@ test "resolveApiKeyFromConfig finds key from providers" {
     const result = try resolveApiKeyFromConfig(std.testing.allocator, "groq", &entries);
     defer if (result) |r| std.testing.allocator.free(r);
     try std.testing.expectEqualStrings("gsk_test", result.?);
+}
+
+test "resolveApiKeyFromConfig matches provider aliases" {
+    const entries = [_]config_mod.ProviderEntry{
+        .{ .name = "azure", .api_key = "azure-test" },
+    };
+    const result = try resolveApiKeyFromConfig(std.testing.allocator, "azure-openai", &entries);
+    defer if (result) |r| std.testing.allocator.free(r);
+    try std.testing.expectEqualStrings("azure-test", result.?);
 }
 
 test "resolveApiKeyFromConfig falls through to env for missing provider" {

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -210,6 +211,31 @@ pub const DiscordChannel = struct {
         return false;
     }
 
+    fn isReplyToBot(d_obj: std.json.ObjectMap, bot_user_id: []const u8) bool {
+        if (bot_user_id.len == 0) return false;
+        const message_type = d_obj.get("type") orelse return false;
+        switch (message_type) {
+            .integer => |value| if (value != 19) return false,
+            else => return false,
+        }
+        const referenced_message = d_obj.get("referenced_message") orelse return false;
+        const referenced_obj = switch (referenced_message) {
+            .object => |o| o,
+            else => return false,
+        };
+        const author_val = referenced_obj.get("author") orelse return false;
+        const author_obj = switch (author_val) {
+            .object => |o| o,
+            else => return false,
+        };
+        const author_id_val = author_obj.get("id") orelse return false;
+        const author_id = switch (author_id_val) {
+            .string => |s| s,
+            else => return false,
+        };
+        return std.mem.eql(u8, author_id, bot_user_id);
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to a Discord channel via REST API.
@@ -254,7 +280,7 @@ pub const DiscordChannel = struct {
             .channel_id = key_copy,
         };
 
-        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        task.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, typingLoop, .{task});
         errdefer {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
@@ -344,7 +370,7 @@ pub const DiscordChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         self.running.store(true, .release);
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayLoop, .{self});
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -465,7 +491,7 @@ pub const DiscordChannel = struct {
         // double-deinit with the defer block below once spawn succeeds).
         self.heartbeat_stop.store(false, .release);
         self.heartbeat_interval_ms.store(0, .release);
-        const hbt = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatLoop, .{ self, &ws }) catch |err| {
+        const hbt = std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, heartbeatLoop, .{ self, &ws }) catch |err| {
             ws.deinit();
             return err;
         };
@@ -810,6 +836,18 @@ pub const DiscordChannel = struct {
             return;
         };
 
+        // Extract author.username
+        const author_username: ?[]const u8 = if (author_obj.get("username")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
+        // Extract author.global_name (Discord display name)
+        const author_display_name: ?[]const u8 = if (author_obj.get("global_name")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
         // Extract author.bot (defaults to false if absent)
         const author_is_bot: bool = if (author_obj.get("bot")) |v| switch (v) {
             .bool => |b| b,
@@ -824,7 +862,7 @@ pub const DiscordChannel = struct {
         // Filter 2: require_mention for guild (non-DM) messages
         if (self.require_mention and guild_id != null) {
             const bot_uid = self.bot_user_id orelse "";
-            if (!isMentioned(content, bot_uid)) {
+            if (!isMentioned(content, bot_uid) and !isReplyToBot(d_obj, bot_uid)) {
                 return;
             }
         }
@@ -906,6 +944,14 @@ pub const DiscordChannel = struct {
         if (guild_id) |gid| {
             try mw.writeAll(",\"guild_id\":");
             try root.appendJsonStringW(mw, gid);
+        }
+        if (author_username) |uname| {
+            try mw.writeAll(",\"sender_username\":");
+            try root.appendJsonStringW(mw, uname);
+        }
+        if (author_display_name) |dname| {
+            try mw.writeAll(",\"sender_display_name\":");
+            try root.appendJsonStringW(mw, dname);
         }
         try mw.writeByte('}');
 
@@ -1152,7 +1198,7 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     ch.setBus(&event_bus);
 
     const msg_json =
-        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","username":"discord-user","global_name":"Discord User","bot":false}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();
@@ -1174,9 +1220,13 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expect(meta.value.object.get("account_id") != null);
     try std.testing.expect(meta.value.object.get("is_dm") != null);
     try std.testing.expect(meta.value.object.get("guild_id") != null);
+    try std.testing.expect(meta.value.object.get("sender_username") != null);
+    try std.testing.expect(meta.value.object.get("sender_display_name") != null);
     try std.testing.expectEqualStrings("dc-main", meta.value.object.get("account_id").?.string);
     try std.testing.expect(!meta.value.object.get("is_dm").?.bool);
     try std.testing.expectEqualStrings("g-1", meta.value.object.get("guild_id").?.string);
+    try std.testing.expectEqualStrings("discord-user", meta.value.object.get("sender_username").?.string);
+    try std.testing.expectEqualStrings("Discord User", meta.value.object.get("sender_display_name").?.string);
 }
 
 test "discord handleMessageCreate sets is_dm metadata for direct messages" {
@@ -1227,6 +1277,81 @@ test "discord handleMessageCreate require_mention blocks unmentioned guild messa
 
     const msg_json =
         \\{"d":{"channel_id":"c-2","guild_id":"g-2","content":"plain text","author":{"id":"u-2","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate require_mention accepts reply to bot message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-2","guild_id":"g-2","type":19,"content":"reply text","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"bot-1","bot":true}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), event_bus.inboundDepth());
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+}
+
+test "discord handleMessageCreate require_mention still blocks reply to non-bot message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-2","guild_id":"g-2","type":19,"content":"reply text","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"other-user","bot":false}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate require_mention ignores non-reply references to bot message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-2","guild_id":"g-2","type":21,"content":"","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"bot-1","bot":true}}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();

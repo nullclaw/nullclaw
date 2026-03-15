@@ -24,6 +24,8 @@ pub const ResponseCache = struct {
             return error.SqliteOpenFailed;
         }
 
+        const use_wal = sqlite_mod.shouldUseWal(db_path);
+
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path, &db);
         if (rc != c.SQLITE_OK) {
@@ -36,6 +38,7 @@ pub const ResponseCache = struct {
             .ttl_minutes = @intCast(ttl_minutes),
             .max_entries = max_entries,
         };
+        self_.configurePragmas(use_wal);
         try self_.migrate();
         return self_;
     }
@@ -47,12 +50,27 @@ pub const ResponseCache = struct {
         }
     }
 
+    fn configurePragmas(self: *Self, use_wal: bool) void {
+        const journal_pragma: [:0]const u8 = if (use_wal)
+            "PRAGMA journal_mode = WAL;"
+        else
+            "PRAGMA journal_mode = DELETE;";
+        const pragmas = [_][:0]const u8{
+            journal_pragma,
+            "PRAGMA synchronous  = NORMAL;",
+            "PRAGMA temp_store   = MEMORY;",
+        };
+        for (pragmas) |pragma| {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, pragma, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                if (err_msg) |msg| c.sqlite3_free(msg);
+            }
+        }
+    }
+
     fn migrate(self: *Self) !void {
         const sql =
-            \\PRAGMA journal_mode = WAL;
-            \\PRAGMA synchronous  = NORMAL;
-            \\PRAGMA temp_store   = MEMORY;
-            \\
             \\CREATE TABLE IF NOT EXISTS response_cache (
             \\  prompt_hash TEXT PRIMARY KEY,
             \\  model       TEXT NOT NULL,

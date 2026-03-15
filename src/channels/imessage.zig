@@ -5,6 +5,7 @@ const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
 const platform = @import("../platform.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.imessage);
 
@@ -410,7 +411,7 @@ pub const IMessageChannel = struct {
         if (builtin.is_test) return;
         if (builtin.os.tag != .macos) return;
 
-        self.poll_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, pollLoop, .{self});
+        self.poll_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE }, pollLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {

@@ -8,23 +8,25 @@ const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
+threadlocal var tls_schedule_account_id: ?[]const u8 = null;
 threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
 
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional: chat_id for Telegram delivery";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional delivery params: channel, account_id, chat_id.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification (e.g. Telegram chat_id)"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
 
     /// Set the context for the current turn (called before agent.turn).
-    pub fn setContext(self: *ScheduleTool, channel: ?[]const u8, chat_id: ?[]const u8) void {
+    pub fn setContext(self: *ScheduleTool, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8) void {
         _ = self;
         tls_schedule_channel = channel;
+        tls_schedule_account_id = account_id;
         tls_schedule_chat_id = chat_id;
     }
 
@@ -40,9 +42,24 @@ pub const ScheduleTool = struct {
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing 'action' parameter");
 
+        const explicit_channel = root.getString(args, "channel");
+        const explicit_account_id = root.getString(args, "account_id");
+        const explicit_chat_id = root.getString(args, "chat_id");
+
         // Prefer explicit args; otherwise use per-thread context injected by channel_loop.
-        const chat_id = root.getString(args, "chat_id") orelse tls_schedule_chat_id;
-        const delivery_channel = tls_schedule_channel orelse "telegram";
+        const chat_id = explicit_chat_id orelse tls_schedule_chat_id;
+        const delivery_channel = explicit_channel orelse tls_schedule_channel orelse "telegram";
+        const delivery_account_id = explicit_account_id orelse tls_schedule_account_id;
+
+        if (explicit_channel) |channel| {
+            if (explicit_chat_id == null and tls_schedule_chat_id != null) {
+                if (tls_schedule_channel) |current_channel| {
+                    if (!std.mem.eql(u8, channel, current_channel)) {
+                        return ToolResult.fail("When overriding 'channel', also provide 'chat_id' for the target conversation");
+                    }
+                }
+            }
+        }
 
         if (std.mem.eql(u8, action, "list")) {
             var scheduler = loadScheduler(allocator) catch {
@@ -132,8 +149,10 @@ pub const ScheduleTool = struct {
                 job.delivery = .{
                     .mode = .always,
                     .channel = try allocator.dupe(u8, delivery_channel),
+                    .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
                     .to = try allocator.dupe(u8, cid),
                     .channel_owned = true,
+                    .account_id_owned = delivery_account_id != null,
                     .to_owned = true,
                 };
             }
@@ -169,8 +188,10 @@ pub const ScheduleTool = struct {
                 job.delivery = .{
                     .mode = .always,
                     .channel = try allocator.dupe(u8, delivery_channel),
+                    .account_id = if (delivery_account_id) |aid| try allocator.dupe(u8, aid) else null,
                     .to = try allocator.dupe(u8, cid),
                     .channel_owned = true,
+                    .account_id_owned = delivery_account_id != null,
                     .to_owned = true,
                 };
             }
@@ -279,6 +300,21 @@ test "schedule create with expression" {
     if (result.success) {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Created job") != null);
     }
+}
+
+test "schedule create rejects cross-channel override without explicit chat_id" {
+    var st = ScheduleTool{};
+    st.setContext("telegram", "main", "chat-123");
+    defer st.setContext(null, null, null);
+
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"create\", \"expression\": \"*/5 * * * *\", \"command\": \"echo hello\", \"channel\": \"signal\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "chat_id") != null);
 }
 
 // ── Additional schedule tests ───────────────────────────────────

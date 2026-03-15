@@ -8,6 +8,7 @@
 //! or message history storage.
 
 const std = @import("std");
+const fs_compat = @import("fs_compat.zig");
 const providers = @import("providers/root.zig");
 const ChatMessage = providers.ChatMessage;
 const ContentPart = providers.ContentPart;
@@ -28,6 +29,9 @@ pub const MultimodalConfig = struct {
     /// Directories from which local image reads are allowed.
     /// If empty, all local file reads are rejected (only URLs pass through).
     allowed_dirs: []const []const u8 = &.{},
+    /// When true, skip the allowed_dirs check entirely (yolo mode).
+    /// File size and MIME validation still apply.
+    skip_dir_check: bool = false,
 };
 
 pub const default_config = MultimodalConfig{};
@@ -166,22 +170,24 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
     };
     defer allocator.free(resolved);
 
-    // Verify the resolved path is within an allowed directory
-    if (config.allowed_dirs.len == 0) return error.LocalReadNotAllowed;
-    const allowed = blk: {
-        for (config.allowed_dirs) |dir| {
-            const trimmed = std.mem.trimRight(u8, dir, "/\\");
-            if (trimmed.len == 0) continue;
-            if (path_security.pathStartsWith(resolved, trimmed)) break :blk true;
+    // Verify the resolved path is within an allowed directory (skipped in yolo mode).
+    if (!config.skip_dir_check) {
+        if (config.allowed_dirs.len == 0) return error.LocalReadNotAllowed;
+        const allowed = blk: {
+            for (config.allowed_dirs) |dir| {
+                const trimmed = std.mem.trimRight(u8, dir, "/\\");
+                if (trimmed.len == 0) continue;
+                if (path_security.pathStartsWith(resolved, trimmed)) break :blk true;
 
-            // Compare against canonicalized allowed dir too (/var -> /private/var on macOS).
-            const canonical = std.fs.realpathAlloc(allocator, trimmed) catch continue;
-            defer allocator.free(canonical);
-            if (path_security.pathStartsWith(resolved, canonical)) break :blk true;
-        }
-        break :blk false;
-    };
-    if (!allowed) return error.PathNotAllowed;
+                // Compare against canonicalized allowed dir too (/var -> /private/var on macOS).
+                const canonical = std.fs.realpathAlloc(allocator, trimmed) catch continue;
+                defer allocator.free(canonical);
+                if (path_security.pathStartsWith(resolved, canonical)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!allowed) return error.PathNotAllowed;
+    }
 
     const file = std.fs.openFileAbsolute(resolved, .{}) catch return error.PathNotFound;
     return readFromFile(allocator, file, config.max_image_size_bytes);
@@ -190,11 +196,13 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
 fn readFromFile(allocator: std.mem.Allocator, file: std.fs.File, max_size: u64) !ImageData {
     defer file.close();
 
-    const stat = try file.stat();
-    if (stat.size > max_size)
+    const stat = try fs_compat.stat(file);
+    const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
+    const effective_max_size = @min(max_size, max_usize_u64);
+    if (stat.size > effective_max_size)
         return error.ImageTooLarge;
 
-    const data = try file.readToEndAlloc(allocator, @intCast(max_size));
+    const data = try file.readToEndAlloc(allocator, @intCast(effective_max_size));
     errdefer allocator.free(data);
 
     const mime = detectMimeType(data) orelse return error.UnknownImageFormat;
@@ -412,6 +420,52 @@ pub fn countImageMarkersInLastUser(messages: []const ChatMessage) usize {
     return 0;
 }
 
+/// Strip image markers from messages and return modified copy.
+/// Used when the model does not support vision - images are replaced with placeholder text.
+pub fn stripImageMarkers(arena: std.mem.Allocator, messages: []const ChatMessage) ![]ChatMessage {
+    const result = try arena.alloc(ChatMessage, messages.len);
+
+    var last_user_idx: ?usize = null;
+    for (0..messages.len) |j| {
+        const idx = messages.len - 1 - j;
+        if (messages[idx].role == .user) {
+            last_user_idx = idx;
+            break;
+        }
+    }
+
+    for (messages, 0..) |msg, i| {
+        if (msg.role != .user or i != (last_user_idx orelse messages.len)) {
+            result[i] = msg;
+            continue;
+        }
+
+        const marker_count = countImageMarkersInText(msg.content);
+        if (marker_count == 0) {
+            result[i] = msg;
+            continue;
+        }
+
+        const parsed = try parseImageMarkers(arena, msg.content);
+        const separator: []const u8 = if (parsed.cleaned_text.len > 0) "\n\n" else "";
+        const note = try std.fmt.allocPrint(
+            arena,
+            "[{d} image(s) omitted because the current model does not support vision]",
+            .{marker_count},
+        );
+        const final_content = try std.mem.concat(arena, u8, &.{ parsed.cleaned_text, separator, note });
+        result[i] = .{
+            .role = msg.role,
+            .content = final_content,
+            .name = msg.name,
+            .tool_call_id = msg.tool_call_id,
+            .content_parts = null,
+        };
+    }
+
+    return result;
+}
+
 fn countImageMarkersInText(content: []const u8) usize {
     var count: usize = 0;
     var cursor: usize = 0;
@@ -505,6 +559,24 @@ test "parseImageMarkers case insensitive" {
         std.testing.allocator.free(parsed.refs);
     }
     try std.testing.expectEqual(@as(usize, 3), parsed.refs.len);
+}
+
+test "stripImageMarkers removes refs from most recent user message" {
+    const allocator = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "Older [IMAGE:/tmp/keep.png]" },
+        .{ .role = .assistant, .content = "ack" },
+        .{ .role = .user, .content = "Inspect [IMAGE:/tmp/a.png] and [IMAGE:/tmp/b.png]" },
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+
+    const stripped = try stripImageMarkers(arena_impl.allocator(), &messages);
+    try std.testing.expectEqual(@as(usize, 3), stripped.len);
+    try std.testing.expect(std.mem.indexOf(u8, stripped[0].content, "[IMAGE:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped[2].content, "[IMAGE:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped[2].content, "2 image(s) omitted") != null);
 }
 
 test "parseImageMarkers invalid marker kept" {
@@ -783,6 +855,30 @@ test "readLocalImage rejects when no allowed_dirs" {
 
     const err = readLocalImage(std.testing.allocator, file_path, .{});
     try std.testing.expectError(error.LocalReadNotAllowed, err);
+}
+
+test "readLocalImage allows any path when skip_dir_check is set" {
+    // Create a real temp file with valid PNG header
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const png_header = "\x89PNG\x0d\x0a\x1a\x0a";
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.png", .data = png_header });
+
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "test.png" });
+    defer std.testing.allocator.free(file_path);
+
+    // With empty allowed_dirs and skip_dir_check=true, read should succeed
+    const result = try readLocalImage(std.testing.allocator, file_path, .{
+        .allowed_dirs = &.{},
+        .skip_dir_check = true,
+    });
+    defer std.testing.allocator.free(result.data);
+
+    try std.testing.expectEqualStrings("image/png", result.mime_type);
+    try std.testing.expect(result.data.len > 0);
 }
 
 test "prepareMessagesForProvider does not delete nullclaw temp image files" {

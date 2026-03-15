@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
+const codex_support = @import("codex_support.zig");
 const onboard = @import("onboard.zig");
 const providers = @import("providers/root.zig");
 
@@ -158,6 +159,24 @@ fn probeCliProvider(
     model: []const u8,
     timeout_secs: u64,
 ) ProbeResult {
+    if (kind == .codex_cli_provider) {
+        const result = codex_support.probeCodexCli(allocator);
+        return .{
+            .provider = provider,
+            .model = model,
+            .live_ok = result.live_ok,
+            .reason = result.reason,
+            .status_code = if (result.live_ok)
+                200
+            else if (std.mem.eql(u8, result.reason, "codex_cli_missing"))
+                404
+            else if (std.mem.eql(u8, result.reason, "codex_cli_not_authenticated"))
+                401
+            else
+                null,
+        };
+    }
+
     const argv = switch (kind) {
         .claude_cli_provider => &[_][]const u8{
             "claude",
@@ -168,11 +187,6 @@ fn probeCliProvider(
             "--model",
             model,
             "--verbose",
-        },
-        .codex_cli_provider => &[_][]const u8{
-            "codex",
-            "--quiet",
-            "health",
         },
         else => unreachable,
     };
@@ -321,6 +335,23 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
+    if (provider_kind == .openai_codex_provider) {
+        const result = codex_support.probeOpenAiCodex(allocator);
+        try writeProbeResult(.{
+            .provider = provider,
+            .model = model,
+            .live_ok = result.live_ok,
+            .reason = result.reason,
+            .status_code = if (result.live_ok)
+                200
+            else if (std.mem.eql(u8, result.reason, "codex_auth_missing"))
+                401
+            else
+                null,
+        });
+        return;
+    }
+
     var holder = providers.ProviderHolder.fromConfig(
         allocator,
         provider,
@@ -369,6 +400,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 test "providerRequiresApiKey marks local providers as keyless" {
     try std.testing.expect(!providerRequiresApiKey("ollama", null));
     try std.testing.expect(!providerRequiresApiKey("claude-cli", null));
+    try std.testing.expect(!providerRequiresApiKey("codex-cli", null));
+    try std.testing.expect(!providerRequiresApiKey("openai-codex", null));
     try std.testing.expect(providerRequiresApiKey("openai", null));
     try std.testing.expect(!providerRequiresApiKey("lmstudio", null));
     try std.testing.expect(!providerRequiresApiKey("custom:http://127.0.0.1:8080/v1", null));

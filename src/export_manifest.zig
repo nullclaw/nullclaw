@@ -107,7 +107,7 @@ pub fn run() !void {
         \\        "description": "Your provider API key",
         \\        "type": "secret",
         \\        "required": true,
-        \\        "condition": { "step": "provider", "not_in": "ollama,lm-studio,claude-cli,codex-cli" }
+        \\        "condition": { "step": "provider", "not_in": "ollama,lm-studio,claude-cli,codex-cli,openai-codex" }
         \\      },
         \\
     );
@@ -133,6 +133,8 @@ pub fn run() !void {
         \\        "description": "How the agent stores conversation history",
         \\        "type": "select",
         \\        "required": true,
+        \\        "group": "settings",
+        \\        "advanced": true,
         \\        "default_value": "sqlite",
         \\        "options": [
         \\
@@ -164,6 +166,8 @@ pub fn run() !void {
         \\        "description": "Expose your agent to the internet",
         \\        "type": "select",
         \\        "required": true,
+        \\        "group": "settings",
+        \\        "advanced": true,
         \\        "default_value": "none",
         \\        "options": [
         \\
@@ -195,6 +199,8 @@ pub fn run() !void {
         \\        "description": "How much freedom the agent has",
         \\        "type": "select",
         \\        "required": true,
+        \\        "group": "settings",
+        \\        "advanced": true,
         \\        "default_value": "supervised",
         \\        "options": [
         \\
@@ -218,44 +224,7 @@ pub fn run() !void {
         \\
     );
 
-    // Step 7: channels (multi_select, all selected by default)
-    try out.writeAll(
-        \\      {
-        \\        "id": "channels",
-        \\        "title": "Channels",
-        \\        "description": "Messaging channels to enable",
-        \\        "type": "multi_select",
-        \\        "required": false,
-        \\        "default_value": "
-    );
-    // Build comma-separated default_value of all channel keys
-    for (channel_catalog.known_channels, 0..) |ch, i| {
-        if (i > 0) try out.writeAll(",");
-        try out.writeAll(ch.key);
-    }
-    try out.writeAll(
-        \\",
-        \\        "options": [
-        \\
-    );
-    for (channel_catalog.known_channels, 0..) |ch, i| {
-        try out.writeAll("          { \"value\": \"");
-        try out.writeAll(ch.key);
-        try out.writeAll("\", \"label\": \"");
-        try out.writeAll(ch.label);
-        try out.writeAll("\" }");
-        if (i < channel_catalog.known_channels.len - 1) {
-            try out.writeAll(",");
-        }
-        try out.writeAll("\n");
-    }
-    try out.writeAll(
-        \\        ]
-        \\      },
-        \\
-    );
-
-    // Step 8: gateway_port (number, default: 3000)
+    // Step 7: gateway_port (number, default: 3000)
     try out.writeAll(
         \\      {
         \\        "id": "gateway_port",
@@ -263,6 +232,8 @@ pub fn run() !void {
         \\        "description": "HTTP gateway listen port",
         \\        "type": "number",
         \\        "required": true,
+        \\        "group": "settings",
+        \\        "advanced": true,
         \\        "default_value": "3000"
         \\      }
         \\
@@ -291,7 +262,7 @@ pub fn run() !void {
 test "export_manifest produces valid structure" {
     // Verify the data sources are accessible and have expected counts
     try std.testing.expect(onboard.known_providers.len >= 29);
-    try std.testing.expect(onboard.wizard_memory_backend_order.len == 9);
+    try std.testing.expect(onboard.wizard_memory_backend_order.len == 10);
     try std.testing.expect(onboard.tunnel_options.len == 4);
     try std.testing.expect(onboard.autonomy_options.len == 3);
     try std.testing.expect(channel_catalog.known_channels.len >= 20);
@@ -299,6 +270,6 @@ test "export_manifest produces valid structure" {
     // Verify first provider
     try std.testing.expectEqualStrings("openrouter", onboard.known_providers[0].key);
 
-    // Verify memory backends start with sqlite
-    try std.testing.expectEqualStrings("sqlite", onboard.wizard_memory_backend_order[0]);
+    // Verify memory backends start with hybrid
+    try std.testing.expectEqualStrings("hybrid", onboard.wizard_memory_backend_order[0]);
 }

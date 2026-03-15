@@ -13,6 +13,8 @@ const core_tool_names = [_][]const u8{
     "file_read",
     "file_write",
     "file_edit",
+    "file_read_hashed",
+    "file_edit_hashed",
     "git",
     "image_info",
     "memory_store",
@@ -202,7 +204,7 @@ pub fn buildManifestJson(
     const runtime_loaded_names = if (runtime_tools) |tools|
         try collectRuntimeToolNames(allocator, cfg_opt, tools)
     else
-        try allocator.alloc([]const u8, 0);
+        try collectRuntimeToolNames(allocator, cfg_opt, null);
     defer allocator.free(runtime_loaded_names);
 
     const estimated_tool_names = if (runtime_tools == null)
@@ -422,6 +424,15 @@ test "buildManifestJson emits core sections" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"channels\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"memory_engines\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_read_hashed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_edit_hashed\"") != null);
+}
+
+test "buildManifestJson includes runtime_loaded when runtime tools are unavailable" {
+    const manifest = try buildManifestJson(std.testing.allocator, null, null);
+    defer std.testing.allocator.free(manifest);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"runtime_loaded\": [\"shell\"") != null);
 }
 
 test "buildSummaryText includes availability sections" {

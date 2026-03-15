@@ -70,7 +70,7 @@ pub const CronRunTool = struct {
             else => 1,
         };
         const success = exit_code == 0;
-        const status_str: []const u8 = if (success) "success" else "error";
+        const status_str: []const u8 = if (success) "ok" else "error";
 
         // Update job last_run and last_status
         if (scheduler.getMutableJob(job_id)) |job| {
@@ -153,4 +153,12 @@ test "cron_run_executes_command" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "hello") != null);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try cron.loadJobsStrict(&loaded);
+    const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(loaded_job.last_run_secs != null);
+    try std.testing.expect(loaded_job.last_status != null);
+    try std.testing.expectEqualStrings("ok", loaded_job.last_status.?);
 }

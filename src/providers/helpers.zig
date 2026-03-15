@@ -5,6 +5,92 @@ const config_types = @import("../config_types.zig");
 const root = @import("root.zig");
 const ToolSpec = root.ToolSpec;
 
+// ── Think-block parsing ───────────────────────────────────────────────────
+
+const think_open_tag = "<think>";
+const think_close_tag = "</think>";
+
+/// Result of splitting a response text at <think>…</think> blocks.
+pub const SplitThinkContent = struct {
+    /// Text outside think blocks (the user-visible answer).
+    visible: []const u8,
+    /// Concatenated content of all think blocks, or null if none were present.
+    reasoning: ?[]const u8,
+};
+
+fn scanThinkContent(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    visible_out: *std.ArrayListUnmanaged(u8),
+    reasoning_out: ?*std.ArrayListUnmanaged(u8),
+) !void {
+    var i: usize = 0;
+    var depth: usize = 0;
+    while (i < text.len) {
+        if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
+            depth += 1;
+            i += think_open_tag.len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
+            if (depth > 0) depth -= 1;
+            i += think_close_tag.len;
+            continue;
+        }
+        if (depth == 0) {
+            try visible_out.append(allocator, text[i]);
+        } else if (reasoning_out) |reasoning_buf| {
+            try reasoning_buf.append(allocator, text[i]);
+        }
+        i += 1;
+    }
+}
+
+/// Split `text` into visible content and reasoning extracted from <think>…</think> blocks.
+/// Both returned slices are caller-owned (allocated with `allocator`).
+pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitThinkContent {
+    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+        return .{
+            .visible = try allocator.dupe(u8, text),
+            .reasoning = null,
+        };
+    }
+
+    var visible_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer visible_buf.deinit(allocator);
+    var reasoning_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer reasoning_buf.deinit(allocator);
+
+    try scanThinkContent(allocator, text, &visible_buf, &reasoning_buf);
+
+    const visible_trimmed = std.mem.trim(u8, visible_buf.items, " \t\r\n");
+    const visible = try allocator.dupe(u8, visible_trimmed);
+    errdefer allocator.free(visible);
+
+    const reasoning_trimmed = std.mem.trim(u8, reasoning_buf.items, " \t\r\n");
+    const reasoning = if (reasoning_trimmed.len > 0) try allocator.dupe(u8, reasoning_trimmed) else null;
+
+    return .{ .visible = visible, .reasoning = reasoning };
+}
+
+/// Strip all <think>…</think> blocks from `text`. Returns caller-owned slice.
+pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+        return allocator.dupe(u8, text);
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try scanThinkContent(allocator, text, &out, null);
+
+    const cleaned = try out.toOwnedSlice(allocator);
+    const trimmed = std.mem.trim(u8, cleaned, " \t\r\n");
+    if (trimmed.ptr == cleaned.ptr and trimmed.len == cleaned.len) return cleaned;
+    defer allocator.free(cleaned);
+    return allocator.dupe(u8, trimmed);
+}
+
 /// Extract api_key from a config-like struct (supports both Config.defaultProviderKey() and plain .api_key field).
 fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
     const T = @TypeOf(cfg);
@@ -95,6 +181,7 @@ pub fn providerUrl(provider_name: []const u8) []const u8 {
         .{ "ollama", "http://localhost:11434/api/chat" },
         .{ "gemini", "https://generativelanguage.googleapis.com/v1beta" },
         .{ "google", "https://generativelanguage.googleapis.com/v1beta" },
+        .{ "vertex", "https://aiplatform.googleapis.com/v1" },
     });
     return map.get(provider_name) orelse "https://openrouter.ai/api/v1/chat/completions";
 }
@@ -141,7 +228,10 @@ pub fn isReasoningModel(model: []const u8) bool {
 /// - non-reasoning: `temperature` + optional `max_tokens`
 /// - reasoning + reasoning_effort=="none": `temperature` + `max_completion_tokens`
 /// - reasoning (otherwise): `max_completion_tokens` only (no temperature)
-/// Always emits `reasoning_effort` when set on a reasoning model.
+/// Always emits normalized `reasoning_effort` when set on a reasoning model.
+/// OpenAI-compatible reasoning values are normalized as:
+/// - `minimal` -> `low`
+/// - `xhigh` -> `high`
 pub fn appendGenerationFields(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -166,8 +256,10 @@ pub fn appendGenerationFields(
         return;
     }
 
+    const normalized_effort = normalizeOpenAiReasoningEffort(reasoning_effort);
+
     // Reasoning model: temperature only if reasoning_effort == "none"
-    const effort_is_none = if (reasoning_effort) |re| std.mem.eql(u8, re, "none") else false;
+    const effort_is_none = if (normalized_effort) |re| std.mem.eql(u8, re, "none") else false;
     if (effort_is_none) {
         try buf.appendSlice(allocator, ",\"temperature\":");
         var temp_buf: [16]u8 = undefined;
@@ -184,10 +276,160 @@ pub fn appendGenerationFields(
     }
 
     // Emit reasoning_effort when set (JSON-escaped for safety)
-    if (reasoning_effort) |re| {
+    if (normalized_effort) |re| {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":");
         try json_util.appendJsonString(buf, allocator, re);
     }
+}
+
+pub fn normalizeOpenAiReasoningEffort(reasoning_effort: ?[]const u8) ?[]const u8 {
+    const raw = reasoning_effort orelse return null;
+    if (std.ascii.eqlIgnoreCase(raw, "none")) return "none";
+    if (std.ascii.eqlIgnoreCase(raw, "minimal")) return "low";
+    if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
+    if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
+    if (std.ascii.eqlIgnoreCase(raw, "high") or std.ascii.eqlIgnoreCase(raw, "xhigh")) return "high";
+    return raw;
+}
+
+const GeminiReasoningEffort = enum {
+    none,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+};
+
+const GeminiThinkingProfile = union(enum) {
+    level: []const u8,
+    budget: u32,
+};
+
+const GeminiThinkingTarget = enum {
+    gemini_api,
+    vertex_ai,
+};
+
+fn parseGeminiReasoningEffort(reasoning_effort: ?[]const u8) ?GeminiReasoningEffort {
+    const raw = reasoning_effort orelse return null;
+    if (std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "none")) return .none;
+    if (std.ascii.eqlIgnoreCase(raw, "minimal")) return .minimal;
+    if (std.ascii.eqlIgnoreCase(raw, "low")) return .low;
+    if (std.ascii.eqlIgnoreCase(raw, "medium")) return .medium;
+    if (std.ascii.eqlIgnoreCase(raw, "high")) return .high;
+    if (std.ascii.eqlIgnoreCase(raw, "xhigh")) return .xhigh;
+    return null;
+}
+
+fn geminiThinkingProfile(model: []const u8, reasoning_effort: ?[]const u8) ?GeminiThinkingProfile {
+    const effort = parseGeminiReasoningEffort(reasoning_effort) orelse return null;
+
+    var lower_buf: [160]u8 = undefined;
+    const lower_len = @min(model.len, lower_buf.len);
+    for (model[0..lower_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..lower_len];
+
+    const is_gemini_3 = std.mem.indexOf(u8, lower, "gemini-3") != null;
+    const is_gemini_25 = std.mem.indexOf(u8, lower, "gemini-2.5") != null;
+    const is_flash = std.mem.indexOf(u8, lower, "flash") != null;
+    const is_pro = std.mem.indexOf(u8, lower, "pro") != null;
+
+    // Gemini 3 family: use thinking levels.
+    // Gemini 3 Pro supports only low/high, while Flash supports minimal/low/medium/high.
+    if (is_gemini_3) {
+        if (is_flash) {
+            return .{
+                .level = switch (effort) {
+                    .none => "minimal",
+                    .minimal => "minimal",
+                    .low => "low",
+                    .medium => "medium",
+                    .high, .xhigh => "high",
+                },
+            };
+        }
+        return .{
+            .level = switch (effort) {
+                .high, .xhigh => "high",
+                .none, .minimal, .low, .medium => "low",
+            },
+        };
+    }
+
+    // Gemini 2.5 family: use thinking budget.
+    if (is_gemini_25) {
+        return switch (effort) {
+            .none => if (is_pro) null else .{ .budget = 0 },
+            .minimal, .low => .{ .budget = 1024 },
+            .medium => .{ .budget = 8192 },
+            .high, .xhigh => .{ .budget = 24576 },
+        };
+    }
+
+    return null;
+}
+
+/// Append Gemini/Vertex thinking controls under generationConfig when reasoning effort is set.
+/// Mapping:
+/// - Gemini 3 models => `thinkingConfig.thinkingLevel`
+/// - Gemini 2.5 models => `thinkingConfig.thinkingBudget`
+pub fn appendGeminiThinkingConfig(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+) !void {
+    return appendThinkingConfigForTarget(buf, allocator, model, reasoning_effort, .gemini_api);
+}
+
+/// Append Vertex thinking controls under generationConfig when reasoning effort is set.
+/// Vertex expects enum-style uppercase values for `thinkingLevel`.
+pub fn appendVertexThinkingConfig(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+) !void {
+    return appendThinkingConfigForTarget(buf, allocator, model, reasoning_effort, .vertex_ai);
+}
+
+fn normalizeVertexThinkingLevel(level: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(level, "minimal")) return "MINIMAL";
+    if (std.ascii.eqlIgnoreCase(level, "low")) return "LOW";
+    if (std.ascii.eqlIgnoreCase(level, "medium")) return "MEDIUM";
+    return "HIGH";
+}
+
+fn appendThinkingConfigForTarget(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+    target: GeminiThinkingTarget,
+) !void {
+    const profile = geminiThinkingProfile(model, reasoning_effort) orelse return;
+
+    try buf.appendSlice(allocator, ",\"thinkingConfig\":{\"includeThoughts\":true,");
+    switch (profile) {
+        .level => |level| {
+            try buf.appendSlice(allocator, "\"thinkingLevel\":");
+            const out_level = switch (target) {
+                .gemini_api => level,
+                .vertex_ai => normalizeVertexThinkingLevel(level),
+            };
+            try json_util.appendJsonString(buf, allocator, out_level);
+        },
+        .budget => |budget| {
+            try buf.appendSlice(allocator, "\"thinkingBudget\":");
+            var budget_buf: [16]u8 = undefined;
+            const budget_str = std.fmt.bufPrint(&budget_buf, "{d}", .{budget}) catch return error.FormatError;
+            try buf.appendSlice(allocator, budget_str);
+        },
+    }
+    try buf.append(allocator, '}');
 }
 
 /// Serialize a single message's content field (plain string or multimodal content parts array).
@@ -297,6 +539,21 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
         return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, timeout_str);
     }
     return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, null);
+}
+
+/// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
+/// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
+pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, timeout_secs: u64) ![]u8 {
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
+    if (timeout_secs > 0) {
+        var timeout_buf: [32]u8 = undefined;
+        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch
+            return http_util.curlPostFormWithProxy(allocator, url, body, proxy, null);
+        return http_util.curlPostFormWithProxy(allocator, url, body, proxy, timeout_str);
+    }
+    return http_util.curlPostFormWithProxy(allocator, url, body, proxy, null);
 }
 
 /// Extract text content from a provider JSON response.
@@ -557,4 +814,120 @@ test "serializeMessageContent with image_url part" {
     const img_obj = arr.items[0].object.get("image_url").?.object;
     try std.testing.expectEqualStrings("https://example.com/cat.jpg", img_obj.get("url").?.string);
     try std.testing.expectEqualStrings("auto", img_obj.get("detail").?.string);
+}
+
+test "appendGenerationFields normalizes minimal reasoning effort for gpt-5" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"model\":\"gpt-5\"");
+    try appendGenerationFields(&buf, alloc, "gpt-5", 0.2, 4096, "minimal");
+    try buf.append(alloc, '}');
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("low", obj.get("reasoning_effort").?.string);
+    try std.testing.expect(obj.get("temperature") == null);
+    try std.testing.expectEqual(@as(i64, 4096), obj.get("max_completion_tokens").?.integer);
+}
+
+test "appendGenerationFields normalizes xhigh reasoning effort for gpt-5" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"model\":\"gpt-5\"");
+    try appendGenerationFields(&buf, alloc, "gpt-5", 0.2, 2048, "xhigh");
+    try buf.append(alloc, '}');
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("high", obj.get("reasoning_effort").?.string);
+    try std.testing.expect(obj.get("temperature") == null);
+    try std.testing.expectEqual(@as(i64, 2048), obj.get("max_completion_tokens").?.integer);
+}
+
+test "appendGeminiThinkingConfig uses thinkingLevel for gemini-3 flash" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-3.1-flash", "medium");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    const thinking = cfg.get("thinkingConfig").?.object;
+    try std.testing.expectEqualStrings("medium", thinking.get("thinkingLevel").?.string);
+    try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+}
+
+test "appendGeminiThinkingConfig maps unsupported gemini-3 pro medium to low level" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-3.1-pro-preview", "medium");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    const thinking = cfg.get("thinkingConfig").?.object;
+    try std.testing.expectEqualStrings("low", thinking.get("thinkingLevel").?.string);
+}
+
+test "appendGeminiThinkingConfig uses thinkingBudget for gemini-2.5 flash" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-2.5-flash", "high");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    const thinking = cfg.get("thinkingConfig").?.object;
+    try std.testing.expectEqual(@as(i64, 24576), thinking.get("thinkingBudget").?.integer);
+    try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+}
+
+test "appendGeminiThinkingConfig omits none budget for gemini-2.5 pro" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-2.5-pro", "none");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    try std.testing.expect(cfg.get("thinkingConfig") == null);
+}
+
+test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendVertexThinkingConfig(&buf, alloc, "gemini-3.1-flash", "medium");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    const thinking = cfg.get("thinkingConfig").?.object;
+    try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
+    try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
 }

@@ -523,100 +523,101 @@ fn isStopWord(word: []const u8) bool {
 }
 
 const stop_words_en = std.StaticStringMap(void).initComptime(.{
-    .{"the"}, .{"a"},    .{"an"},    .{"is"},     .{"are"},   .{"was"},
-    .{"were"}, .{"be"},   .{"been"},  .{"being"},  .{"have"},  .{"has"},
-    .{"had"}, .{"do"},   .{"does"},  .{"did"},    .{"will"},  .{"would"},
-    .{"could"}, .{"should"}, .{"may"}, .{"might"}, .{"shall"}, .{"can"},
-    .{"need"}, .{"dare"}, .{"ought"}, .{"used"},   .{"to"},    .{"of"},
-    .{"in"},  .{"for"},  .{"on"},    .{"with"},   .{"at"},    .{"by"},
-    .{"from"}, .{"as"},   .{"into"},  .{"through"}, .{"during"}, .{"before"},
-    .{"after"}, .{"above"}, .{"below"}, .{"between"}, .{"out"},  .{"off"},
-    .{"over"}, .{"under"}, .{"again"}, .{"further"}, .{"then"}, .{"once"},
-    .{"it"},  .{"its"},  .{"this"},  .{"that"},   .{"these"}, .{"those"},
-    .{"i"},   .{"me"},   .{"my"},    .{"we"},     .{"our"},   .{"you"},
-    .{"your"}, .{"he"},   .{"him"},   .{"his"},    .{"she"},   .{"her"},
-    .{"they"}, .{"them"}, .{"their"}, .{"what"},   .{"which"}, .{"who"},
-    .{"whom"}, .{"and"},  .{"but"},   .{"or"},     .{"nor"},   .{"not"},
-    .{"so"},  .{"very"}, .{"just"},  .{"about"},  .{"up"},    .{"if"},
-    .{"how"}, .{"when"}, .{"where"}, .{"why"},    .{"also"},  .{"too"},
-    .{"quite"}, .{"really"}, .{"all"}, .{"any"}, .{"some"}, .{"each"},
+    .{"the"},   .{"a"},         .{"an"},        .{"is"},         .{"are"},      .{"was"},
+    .{"were"},  .{"be"},        .{"been"},      .{"being"},      .{"have"},     .{"has"},
+    .{"had"},   .{"do"},        .{"does"},      .{"did"},        .{"will"},     .{"would"},
+    .{"could"}, .{"should"},    .{"may"},       .{"might"},      .{"shall"},    .{"can"},
+    .{"need"},  .{"dare"},      .{"ought"},     .{"used"},       .{"to"},       .{"of"},
+    .{"in"},    .{"for"},       .{"on"},        .{"with"},       .{"at"},       .{"by"},
+    .{"from"},  .{"as"},        .{"into"},      .{"through"},    .{"during"},   .{"before"},
+    .{"after"}, .{"above"},     .{"below"},     .{"between"},    .{"out"},      .{"off"},
+    .{"over"},  .{"under"},     .{"again"},     .{"further"},    .{"then"},     .{"once"},
+    .{"it"},    .{"its"},       .{"this"},      .{"that"},       .{"these"},    .{"those"},
+    .{"i"},     .{"me"},        .{"my"},        .{"we"},         .{"our"},      .{"you"},
+    .{"your"},  .{"he"},        .{"him"},       .{"his"},        .{"she"},      .{"her"},
+    .{"they"},  .{"them"},      .{"their"},     .{"what"},       .{"which"},    .{"who"},
+    .{"whom"},  .{"and"},       .{"but"},       .{"or"},         .{"nor"},      .{"not"},
+    .{"so"},    .{"very"},      .{"just"},      .{"about"},      .{"up"},       .{"if"},
+    .{"how"},   .{"when"},      .{"where"},     .{"why"},        .{"also"},     .{"too"},
+    .{"quite"}, .{"really"},    .{"all"},       .{"any"},        .{"some"},     .{"each"},
     .{"every"}, .{"must"},
     // Time references (vague)
-    .{"yesterday"}, .{"today"}, .{"tomorrow"}, .{"earlier"}, .{"later"},
-    .{"recently"}, .{"ago"}, .{"now"},
+         .{"yesterday"}, .{"today"},      .{"tomorrow"}, .{"earlier"},
+    .{"later"}, .{"recently"},  .{"ago"},       .{"now"},
     // Vague references
-    .{"thing"}, .{"things"}, .{"stuff"}, .{"something"}, .{"anything"},
-    .{"everything"}, .{"nothing"},
+           .{"thing"},    .{"things"},
+    .{"stuff"}, .{"something"}, .{"anything"},  .{"everything"}, .{"nothing"},
     // Question/request words
-    .{"please"}, .{"help"}, .{"find"}, .{"show"}, .{"get"}, .{"tell"}, .{"give"},
+     .{"please"},
+    .{"help"},  .{"find"},      .{"show"},      .{"get"},        .{"tell"},     .{"give"},
 });
 
 const stop_words_zh = std.StaticStringMap(void).initComptime(.{
-    .{"\xe6\x88\x91"},     // 我
+    .{"\xe6\x88\x91"}, // 我
     .{"\xe6\x88\x91\xe4\xbb\xac"}, // 我们
-    .{"\xe4\xbd\xa0"},     // 你
+    .{"\xe4\xbd\xa0"}, // 你
     .{"\xe4\xbd\xa0\xe4\xbb\xac"}, // 你们
-    .{"\xe4\xbb\x96"},     // 他
-    .{"\xe5\xa5\xb9"},     // 她
-    .{"\xe5\xae\x83"},     // 它
+    .{"\xe4\xbb\x96"}, // 他
+    .{"\xe5\xa5\xb9"}, // 她
+    .{"\xe5\xae\x83"}, // 它
     .{"\xe4\xbb\x96\xe4\xbb\xac"}, // 他们
-    .{"\xe8\xbf\x99"},     // 这
-    .{"\xe9\x82\xa3"},     // 那
+    .{"\xe8\xbf\x99"}, // 这
+    .{"\xe9\x82\xa3"}, // 那
     .{"\xe8\xbf\x99\xe4\xb8\xaa"}, // 这个
     .{"\xe9\x82\xa3\xe4\xb8\xaa"}, // 那个
     .{"\xe8\xbf\x99\xe4\xba\x9b"}, // 这些
     .{"\xe9\x82\xa3\xe4\xba\x9b"}, // 那些
-    .{"\xe7\x9a\x84"},     // 的
-    .{"\xe4\xba\x86"},     // 了
-    .{"\xe7\x9d\x80"},     // 着
-    .{"\xe8\xbf\x87"},     // 过
-    .{"\xe5\xbe\x97"},     // 得
-    .{"\xe5\x9c\xb0"},     // 地
-    .{"\xe5\x90\x97"},     // 吗
-    .{"\xe5\x91\xa2"},     // 呢
-    .{"\xe5\x90\xa7"},     // 吧
-    .{"\xe5\x95\x8a"},     // 啊
-    .{"\xe5\x91\x80"},     // 呀
-    .{"\xe5\x98\x9b"},     // 嘛
-    .{"\xe5\x95\xa6"},     // 啦
-    .{"\xe6\x98\xaf"},     // 是
-    .{"\xe6\x9c\x89"},     // 有
-    .{"\xe5\x9c\xa8"},     // 在
-    .{"\xe8\xa2\xab"},     // 被
-    .{"\xe6\x8a\x8a"},     // 把
-    .{"\xe7\xbb\x99"},     // 给
-    .{"\xe8\xae\xa9"},     // 让
-    .{"\xe7\x94\xa8"},     // 用
-    .{"\xe5\x88\xb0"},     // 到
-    .{"\xe5\x8e\xbb"},     // 去
-    .{"\xe6\x9d\xa5"},     // 来
-    .{"\xe5\x81\x9a"},     // 做
-    .{"\xe8\xaf\xb4"},     // 说
-    .{"\xe7\x9c\x8b"},     // 看
-    .{"\xe6\x89\xbe"},     // 找
-    .{"\xe6\x83\xb3"},     // 想
-    .{"\xe8\xa6\x81"},     // 要
-    .{"\xe8\x83\xbd"},     // 能
-    .{"\xe4\xbc\x9a"},     // 会
+    .{"\xe7\x9a\x84"}, // 的
+    .{"\xe4\xba\x86"}, // 了
+    .{"\xe7\x9d\x80"}, // 着
+    .{"\xe8\xbf\x87"}, // 过
+    .{"\xe5\xbe\x97"}, // 得
+    .{"\xe5\x9c\xb0"}, // 地
+    .{"\xe5\x90\x97"}, // 吗
+    .{"\xe5\x91\xa2"}, // 呢
+    .{"\xe5\x90\xa7"}, // 吧
+    .{"\xe5\x95\x8a"}, // 啊
+    .{"\xe5\x91\x80"}, // 呀
+    .{"\xe5\x98\x9b"}, // 嘛
+    .{"\xe5\x95\xa6"}, // 啦
+    .{"\xe6\x98\xaf"}, // 是
+    .{"\xe6\x9c\x89"}, // 有
+    .{"\xe5\x9c\xa8"}, // 在
+    .{"\xe8\xa2\xab"}, // 被
+    .{"\xe6\x8a\x8a"}, // 把
+    .{"\xe7\xbb\x99"}, // 给
+    .{"\xe8\xae\xa9"}, // 让
+    .{"\xe7\x94\xa8"}, // 用
+    .{"\xe5\x88\xb0"}, // 到
+    .{"\xe5\x8e\xbb"}, // 去
+    .{"\xe6\x9d\xa5"}, // 来
+    .{"\xe5\x81\x9a"}, // 做
+    .{"\xe8\xaf\xb4"}, // 说
+    .{"\xe7\x9c\x8b"}, // 看
+    .{"\xe6\x89\xbe"}, // 找
+    .{"\xe6\x83\xb3"}, // 想
+    .{"\xe8\xa6\x81"}, // 要
+    .{"\xe8\x83\xbd"}, // 能
+    .{"\xe4\xbc\x9a"}, // 会
     .{"\xe5\x8f\xaf\xe4\xbb\xa5"}, // 可以
-    .{"\xe5\x92\x8c"},     // 和
-    .{"\xe4\xb8\x8e"},     // 与
-    .{"\xe6\x88\x96"},     // 或
-    .{"\xe4\xbd\x86"},     // 但
+    .{"\xe5\x92\x8c"}, // 和
+    .{"\xe4\xb8\x8e"}, // 与
+    .{"\xe6\x88\x96"}, // 或
+    .{"\xe4\xbd\x86"}, // 但
     .{"\xe4\xbd\x86\xe6\x98\xaf"}, // 但是
     .{"\xe5\x9b\xa0\xe4\xb8\xba"}, // 因为
     .{"\xe6\x89\x80\xe4\xbb\xa5"}, // 所以
     .{"\xe5\xa6\x82\xe6\x9e\x9c"}, // 如果
     .{"\xe8\x99\xbd\xe7\x84\xb6"}, // 虽然
-    .{"\xe8\x80\x8c"},     // 而
-    .{"\xe4\xb9\x9f"},     // 也
-    .{"\xe9\x83\xbd"},     // 都
-    .{"\xe5\xb0\xb1"},     // 就
-    .{"\xe8\xbf\x98"},     // 还
-    .{"\xe5\x8f\x88"},     // 又
-    .{"\xe5\x86\x8d"},     // 再
-    .{"\xe6\x89\x8d"},     // 才
-    .{"\xe5\x8f\xaa"},     // 只
+    .{"\xe8\x80\x8c"}, // 而
+    .{"\xe4\xb9\x9f"}, // 也
+    .{"\xe9\x83\xbd"}, // 都
+    .{"\xe5\xb0\xb1"}, // 就
+    .{"\xe8\xbf\x98"}, // 还
+    .{"\xe5\x8f\x88"}, // 又
+    .{"\xe5\x86\x8d"}, // 再
+    .{"\xe6\x89\x8d"}, // 才
+    .{"\xe5\x8f\xaa"}, // 只
     .{"\xe4\xb9\x8b\xe5\x89\x8d"}, // 之前
     .{"\xe4\xbb\xa5\xe5\x89\x8d"}, // 以前
     .{"\xe4\xb9\x8b\xe5\x90\x8e"}, // 之后
@@ -629,41 +630,41 @@ const stop_words_zh = std.StaticStringMap(void).initComptime(.{
     .{"\xe6\x9c\x80\xe8\xbf\x91"}, // 最近
     .{"\xe4\xb8\x9c\xe8\xa5\xbf"}, // 东西
     .{"\xe4\xba\x8b\xe6\x83\x85"}, // 事情
-    .{"\xe4\xba\x8b"},     // 事
+    .{"\xe4\xba\x8b"}, // 事
     .{"\xe4\xbb\x80\xe4\xb9\x88"}, // 什么
     .{"\xe5\x93\xaa\xe4\xb8\xaa"}, // 哪个
     .{"\xe5\x93\xaa\xe4\xba\x9b"}, // 哪些
     .{"\xe6\x80\x8e\xe4\xb9\x88"}, // 怎么
     .{"\xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88"}, // 为什么
     .{"\xe5\xa4\x9a\xe5\xb0\x91"}, // 多少
-    .{"\xe8\xaf\xb7"},     // 请
-    .{"\xe5\xb8\xae"},     // 帮
+    .{"\xe8\xaf\xb7"}, // 请
+    .{"\xe5\xb8\xae"}, // 帮
     .{"\xe5\xb8\xae\xe5\xbf\x99"}, // 帮忙
     .{"\xe5\x91\x8a\xe8\xaf\x89"}, // 告诉
 });
 
 const stop_words_ko = std.StaticStringMap(void).initComptime(.{
     // Particles
-    .{"\xec\x9d\x80"},         // 은
-    .{"\xeb\x8a\x94"},         // 는
-    .{"\xec\x9d\xb4"},         // 이
-    .{"\xea\xb0\x80"},         // 가
-    .{"\xec\x9d\x84"},         // 을
-    .{"\xeb\xa5\xbc"},         // 를
-    .{"\xec\x9d\x98"},         // 의
-    .{"\xec\x97\x90"},         // 에
+    .{"\xec\x9d\x80"}, // 은
+    .{"\xeb\x8a\x94"}, // 는
+    .{"\xec\x9d\xb4"}, // 이
+    .{"\xea\xb0\x80"}, // 가
+    .{"\xec\x9d\x84"}, // 을
+    .{"\xeb\xa5\xbc"}, // 를
+    .{"\xec\x9d\x98"}, // 의
+    .{"\xec\x97\x90"}, // 에
     .{"\xec\x97\x90\xec\x84\x9c"}, // 에서
-    .{"\xeb\xa1\x9c"},         // 로
+    .{"\xeb\xa1\x9c"}, // 로
     .{"\xec\x9c\xbc\xeb\xa1\x9c"}, // 으로
-    .{"\xec\x99\x80"},         // 와
-    .{"\xea\xb3\xbc"},         // 과
-    .{"\xeb\x8f\x84"},         // 도
-    .{"\xeb\xa7\x8c"},         // 만
+    .{"\xec\x99\x80"}, // 와
+    .{"\xea\xb3\xbc"}, // 과
+    .{"\xeb\x8f\x84"}, // 도
+    .{"\xeb\xa7\x8c"}, // 만
     .{"\xea\xb9\x8c\xec\xa7\x80"}, // 까지
     .{"\xeb\xb6\x80\xed\x84\xb0"}, // 부터
     .{"\xed\x95\x9c\xed\x85\x8c"}, // 한테
     .{"\xec\x97\x90\xea\xb2\x8c"}, // 에게
-    .{"\xea\xbb\x98"},         // 께
+    .{"\xea\xbb\x98"}, // 께
     .{"\xec\xb2\x98\xeb\x9f\xbc"}, // 처럼
     .{"\xea\xb0\x99\xec\x9d\xb4"}, // 같이
     .{"\xeb\xb3\xb4\xeb\x8b\xa4"}, // 보다
@@ -671,15 +672,15 @@ const stop_words_ko = std.StaticStringMap(void).initComptime(.{
     .{"\xeb\xb0\x96\xec\x97\x90"}, // 밖에
     .{"\xeb\x8c\x80\xeb\xa1\x9c"}, // 대로
     // Pronouns
-    .{"\xeb\x82\x98"},         // 나
+    .{"\xeb\x82\x98"}, // 나
     .{"\xeb\x82\x98\xeb\x8a\x94"}, // 나는
     .{"\xeb\x82\xb4\xea\xb0\x80"}, // 내가
     .{"\xeb\x82\x98\xeb\xa5\xbc"}, // 나를
-    .{"\xeb\x84\x88"},         // 너
+    .{"\xeb\x84\x88"}, // 너
     .{"\xec\x9a\xb0\xeb\xa6\xac"}, // 우리
-    .{"\xec\xa0\x80"},         // 저
+    .{"\xec\xa0\x80"}, // 저
     .{"\xec\xa0\x80\xed\x9d\xac"}, // 저희
-    .{"\xea\xb7\xb8"},         // 그
+    .{"\xea\xb7\xb8"}, // 그
     .{"\xea\xb7\xb8\xeb\x85\x80"}, // 그녀
     .{"\xea\xb7\xb8\xeb\x93\xa4"}, // 그들
     .{"\xec\x9d\xb4\xea\xb2\x83"}, // 이것
@@ -700,53 +701,53 @@ const stop_words_ko = std.StaticStringMap(void).initComptime(.{
     .{"\xec\x98\xa4\xeb\x8b\xa4"}, // 오다
     .{"\xea\xb0\x80\xeb\x8b\xa4"}, // 가다
     // Nouns (vague)
-    .{"\xea\xb2\x83"},         // 것
-    .{"\xea\xb1\xb0"},         // 거
-    .{"\xeb\x93\xb1"},         // 등
-    .{"\xec\x88\x98"},         // 수
-    .{"\xeb\x95\x8c"},         // 때
-    .{"\xea\xb3\xb3"},         // 곳
-    .{"\xec\xa4\x91"},         // 중
-    .{"\xeb\xb6\x84"},         // 분
+    .{"\xea\xb2\x83"}, // 것
+    .{"\xea\xb1\xb0"}, // 거
+    .{"\xeb\x93\xb1"}, // 등
+    .{"\xec\x88\x98"}, // 수
+    .{"\xeb\x95\x8c"}, // 때
+    .{"\xea\xb3\xb3"}, // 곳
+    .{"\xec\xa4\x91"}, // 중
+    .{"\xeb\xb6\x84"}, // 분
     // Adverbs
-    .{"\xec\x9e\x98"},         // 잘
-    .{"\xeb\x8d\x94"},         // 더
-    .{"\xeb\x98\x90"},         // 또
+    .{"\xec\x9e\x98"}, // 잘
+    .{"\xeb\x8d\x94"}, // 더
+    .{"\xeb\x98\x90"}, // 또
     .{"\xeb\xa7\xa4\xec\x9a\xb0"}, // 매우
     .{"\xec\xa0\x95\xeb\xa7\x90"}, // 정말
     .{"\xec\x95\x84\xec\xa3\xbc"}, // 아주
     .{"\xeb\xa7\x8e\xec\x9d\xb4"}, // 많이
     .{"\xeb\x84\x88\xeb\xac\xb4"}, // 너무
-    .{"\xec\xa2\x80"},         // 좀
+    .{"\xec\xa2\x80"}, // 좀
     // Conjunctions
     .{"\xea\xb7\xb8\xeb\xa6\xac\xea\xb3\xa0"}, // 그리고
     .{"\xed\x95\x98\xec\xa7\x80\xeb\xa7\x8c"}, // 하지만
     .{"\xea\xb7\xb8\xeb\x9e\x98\xec\x84\x9c"}, // 그래서
     .{"\xea\xb7\xb8\xeb\x9f\xb0\xeb\x8d\xb0"}, // 그런데
     .{"\xea\xb7\xb8\xeb\x9f\xac\xeb\x82\x98"}, // 그러나
-    .{"\xeb\x98\x90\xeb\x8a\x94"},     // 또는
+    .{"\xeb\x98\x90\xeb\x8a\x94"}, // 또는
     .{"\xea\xb7\xb8\xeb\x9f\xac\xeb\xa9\xb4"}, // 그러면
     // Question words
-    .{"\xec\x99\x9c"},         // 왜
+    .{"\xec\x99\x9c"}, // 왜
     .{"\xec\x96\xb4\xeb\x96\xbb\xea\xb2\x8c"}, // 어떻게
-    .{"\xeb\xad\x90"},         // 뭐
-    .{"\xec\x96\xb8\xec\xa0\x9c"},     // 언제
-    .{"\xec\x96\xb4\xeb\x94\x94"},     // 어디
-    .{"\xeb\x88\x84\xea\xb5\xac"},     // 누구
-    .{"\xeb\xac\xb4\xec\x97\x87"},     // 무엇
-    .{"\xec\x96\xb4\xeb\x96\xa4"},     // 어떤
+    .{"\xeb\xad\x90"}, // 뭐
+    .{"\xec\x96\xb8\xec\xa0\x9c"}, // 언제
+    .{"\xec\x96\xb4\xeb\x94\x94"}, // 어디
+    .{"\xeb\x88\x84\xea\xb5\xac"}, // 누구
+    .{"\xeb\xac\xb4\xec\x97\x87"}, // 무엇
+    .{"\xec\x96\xb4\xeb\x96\xa4"}, // 어떤
     // Time (vague)
-    .{"\xec\x96\xb4\xec\xa0\x9c"},     // 어제
-    .{"\xec\x98\xa4\xeb\x8a\x98"},     // 오늘
-    .{"\xeb\x82\xb4\xec\x9d\xbc"},     // 내일
-    .{"\xec\xb5\x9c\xea\xb7\xbc"},     // 최근
-    .{"\xec\xa7\x80\xea\xb8\x88"},     // 지금
-    .{"\xec\x95\x84\xea\xb9\x8c"},     // 아까
-    .{"\xeb\x82\x98\xec\xa4\x91"},     // 나중
-    .{"\xec\xa0\x84\xec\x97\x90"},     // 전에
+    .{"\xec\x96\xb4\xec\xa0\x9c"}, // 어제
+    .{"\xec\x98\xa4\xeb\x8a\x98"}, // 오늘
+    .{"\xeb\x82\xb4\xec\x9d\xbc"}, // 내일
+    .{"\xec\xb5\x9c\xea\xb7\xbc"}, // 최근
+    .{"\xec\xa7\x80\xea\xb8\x88"}, // 지금
+    .{"\xec\x95\x84\xea\xb9\x8c"}, // 아까
+    .{"\xeb\x82\x98\xec\xa4\x91"}, // 나중
+    .{"\xec\xa0\x84\xec\x97\x90"}, // 전에
     // Request words
-    .{"\xec\xa0\x9c\xeb\xb0\x9c"},     // 제발
-    .{"\xeb\xb6\x80\xed\x83\x81"},     // 부탁
+    .{"\xec\xa0\x9c\xeb\xb0\x9c"}, // 제발
+    .{"\xeb\xb6\x80\xed\x83\x81"}, // 부탁
 });
 
 const stop_words_ja = std.StaticStringMap(void).initComptime(.{
@@ -768,7 +769,7 @@ const stop_words_ja = std.StaticStringMap(void).initComptime(.{
     .{"\xe3\x81\x82\xe3\x82\x8b"}, // ある
     .{"\xe3\x81\xaa\xe3\x82\x8b"}, // なる
     .{"\xe3\x81\xa7\xe3\x81\x8d\xe3\x82\x8b"}, // できる
-    .{"\xe3\x81\xae"},         // の
+    .{"\xe3\x81\xae"}, // の
     .{"\xe3\x81\x93\xe3\x81\xa8"}, // こと
     .{"\xe3\x82\x82\xe3\x81\xae"}, // もの
     .{"\xe3\x81\x9f\xe3\x82\x81"}, // ため
@@ -782,37 +783,33 @@ const stop_words_ja = std.StaticStringMap(void).initComptime(.{
     .{"\xe3\x81\xa0\xe3\x81\x91"}, // だけ
     .{"\xe3\x81\xaa\xe3\x81\x9c"}, // なぜ
     .{"\xe3\x81\xa9\xe3\x81\x86"}, // どう
-    .{"\xe4\xbd\x95"},         // 何
+    .{"\xe4\xbd\x95"}, // 何
     .{"\xe3\x81\x84\xe3\x81\xa4"}, // いつ
     .{"\xe3\x81\xa9\xe3\x81\x93"}, // どこ
-    .{"\xe8\xaa\xb0"},         // 誰
+    .{"\xe8\xaa\xb0"}, // 誰
     .{"\xe3\x81\xa9\xe3\x82\x8c"}, // どれ
     .{"\xe6\x98\xa8\xe6\x97\xa5"}, // 昨日
     .{"\xe4\xbb\x8a\xe6\x97\xa5"}, // 今日
     .{"\xe6\x98\x8e\xe6\x97\xa5"}, // 明日
     .{"\xe6\x9c\x80\xe8\xbf\x91"}, // 最近
-    .{"\xe4\xbb\x8a"},         // 今
+    .{"\xe4\xbb\x8a"}, // 今
     .{"\xe3\x81\x95\xe3\x81\xa3\xe3\x81\x8d"}, // さっき
-    .{"\xe5\x89\x8d"},         // 前
-    .{"\xe5\xbe\x8c"},         // 後
+    .{"\xe5\x89\x8d"}, // 前
+    .{"\xe5\xbe\x8c"}, // 後
 });
 
 const stop_words_es = std.StaticStringMap(void).initComptime(.{
-    .{"el"}, .{"la"}, .{"los"}, .{"las"}, .{"un"}, .{"una"},
-    .{"unos"}, .{"unas"}, .{"este"}, .{"esta"}, .{"ese"}, .{"esa"},
-    .{"yo"}, .{"me"}, .{"mi"}, .{"nosotros"}, .{"nosotras"},
-    .{"tu"}, .{"tus"}, .{"usted"}, .{"ustedes"}, .{"ellos"}, .{"ellas"},
-    .{"de"}, .{"del"}, .{"a"}, .{"en"}, .{"con"}, .{"por"},
-    .{"para"}, .{"sobre"}, .{"entre"}, .{"y"}, .{"o"}, .{"pero"},
-    .{"si"}, .{"porque"}, .{"como"},
-    .{"es"}, .{"son"}, .{"fue"}, .{"fueron"}, .{"ser"}, .{"estar"},
-    .{"haber"}, .{"tener"}, .{"hacer"},
-    .{"ayer"}, .{"hoy"},
-    .{"antes"},
-    .{"ahora"}, .{"recientemente"},
-    .{"que"},
-    .{"cuando"}, .{"donde"},
-    .{"favor"}, .{"ayuda"},
+    .{"el"},     .{"la"},    .{"los"},     .{"las"},           .{"un"},       .{"una"},
+    .{"unos"},   .{"unas"},  .{"este"},    .{"esta"},          .{"ese"},      .{"esa"},
+    .{"yo"},     .{"me"},    .{"mi"},      .{"nosotros"},      .{"nosotras"}, .{"tu"},
+    .{"tus"},    .{"usted"}, .{"ustedes"}, .{"ellos"},         .{"ellas"},    .{"de"},
+    .{"del"},    .{"a"},     .{"en"},      .{"con"},           .{"por"},      .{"para"},
+    .{"sobre"},  .{"entre"}, .{"y"},       .{"o"},             .{"pero"},     .{"si"},
+    .{"porque"}, .{"como"},  .{"es"},      .{"son"},           .{"fue"},      .{"fueron"},
+    .{"ser"},    .{"estar"}, .{"haber"},   .{"tener"},         .{"hacer"},    .{"ayer"},
+    .{"hoy"},    .{"antes"}, .{"ahora"},   .{"recientemente"}, .{"que"},      .{"cuando"},
+    .{"donde"},  .{"favor"},
+    .{"ayuda"},
     // Accented forms
     .{"ma\xc3\xb1\x61na"}, // mañana
     .{"despu\xc3\xa9s"}, // después
@@ -825,19 +822,16 @@ const stop_words_es = std.StaticStringMap(void).initComptime(.{
 });
 
 const stop_words_pt = std.StaticStringMap(void).initComptime(.{
-    .{"o"}, .{"a"}, .{"os"}, .{"as"}, .{"um"}, .{"uma"},
-    .{"uns"}, .{"umas"}, .{"este"}, .{"esta"}, .{"esse"}, .{"essa"},
-    .{"eu"}, .{"me"}, .{"meu"}, .{"minha"},
-    .{"nos"},
-    .{"ele"}, .{"ela"}, .{"eles"}, .{"elas"},
-    .{"de"}, .{"do"}, .{"da"}, .{"em"}, .{"com"}, .{"por"},
-    .{"para"}, .{"sobre"}, .{"entre"}, .{"e"}, .{"ou"}, .{"mas"},
-    .{"se"}, .{"porque"}, .{"como"},
-    .{"foi"}, .{"foram"}, .{"ser"}, .{"estar"}, .{"ter"}, .{"fazer"},
-    .{"ontem"}, .{"hoje"},
-    .{"antes"}, .{"depois"}, .{"agora"}, .{"recentemente"},
-    .{"que"}, .{"quando"}, .{"onde"},
-    .{"favor"}, .{"ajuda"},
+    .{"o"},     .{"a"},      .{"os"},    .{"as"},     .{"um"},     .{"uma"},
+    .{"uns"},   .{"umas"},   .{"este"},  .{"esta"},   .{"esse"},   .{"essa"},
+    .{"eu"},    .{"me"},     .{"meu"},   .{"minha"},  .{"nos"},    .{"ele"},
+    .{"ela"},   .{"eles"},   .{"elas"},  .{"de"},     .{"do"},     .{"da"},
+    .{"em"},    .{"com"},    .{"por"},   .{"para"},   .{"sobre"},  .{"entre"},
+    .{"e"},     .{"ou"},     .{"mas"},   .{"se"},     .{"porque"}, .{"como"},
+    .{"foi"},   .{"foram"},  .{"ser"},   .{"estar"},  .{"ter"},    .{"fazer"},
+    .{"ontem"}, .{"hoje"},   .{"antes"}, .{"depois"}, .{"agora"},  .{"recentemente"},
+    .{"que"},   .{"quando"}, .{"onde"},  .{"favor"},
+    .{"ajuda"},
     // Accented forms
     .{"n\xc3\xb3s"}, // nós
     .{"voc\xc3\xaa"}, // você
@@ -850,55 +844,55 @@ const stop_words_pt = std.StaticStringMap(void).initComptime(.{
 });
 
 const stop_words_ar = std.StaticStringMap(void).initComptime(.{
-    .{"\xd8\xa7\xd9\x84"},             // ال
-    .{"\xd9\x88"},                     // و
-    .{"\xd8\xa3\xd9\x88"},             // أو
-    .{"\xd9\x84\xd9\x83\xd9\x86"},     // لكن
-    .{"\xd8\xab\xd9\x85"},             // ثم
-    .{"\xd8\xa8\xd9\x84"},             // بل
-    .{"\xd8\xa3\xd9\x86\xd8\xa7"},     // أنا
-    .{"\xd9\x86\xd8\xad\xd9\x86"},     // نحن
-    .{"\xd9\x87\xd9\x88"},             // هو
-    .{"\xd9\x87\xd9\x8a"},             // هي
-    .{"\xd9\x87\xd9\x85"},             // هم
-    .{"\xd9\x87\xd8\xb0\xd8\xa7"},     // هذا
-    .{"\xd9\x87\xd8\xb0\xd9\x87"},     // هذه
-    .{"\xd8\xb0\xd9\x84\xd9\x83"},     // ذلك
-    .{"\xd8\xaa\xd9\x84\xd9\x83"},     // تلك
-    .{"\xd9\x87\xd9\x86\xd8\xa7"},     // هنا
+    .{"\xd8\xa7\xd9\x84"}, // ال
+    .{"\xd9\x88"}, // و
+    .{"\xd8\xa3\xd9\x88"}, // أو
+    .{"\xd9\x84\xd9\x83\xd9\x86"}, // لكن
+    .{"\xd8\xab\xd9\x85"}, // ثم
+    .{"\xd8\xa8\xd9\x84"}, // بل
+    .{"\xd8\xa3\xd9\x86\xd8\xa7"}, // أنا
+    .{"\xd9\x86\xd8\xad\xd9\x86"}, // نحن
+    .{"\xd9\x87\xd9\x88"}, // هو
+    .{"\xd9\x87\xd9\x8a"}, // هي
+    .{"\xd9\x87\xd9\x85"}, // هم
+    .{"\xd9\x87\xd8\xb0\xd8\xa7"}, // هذا
+    .{"\xd9\x87\xd8\xb0\xd9\x87"}, // هذه
+    .{"\xd8\xb0\xd9\x84\xd9\x83"}, // ذلك
+    .{"\xd8\xaa\xd9\x84\xd9\x83"}, // تلك
+    .{"\xd9\x87\xd9\x86\xd8\xa7"}, // هنا
     .{"\xd9\x87\xd9\x86\xd8\xa7\xd9\x83"}, // هناك
-    .{"\xd9\x85\xd9\x86"},             // من
-    .{"\xd8\xa5\xd9\x84\xd9\x89"},     // إلى
-    .{"\xd8\xa7\xd9\x84\xd9\x89"},     // الى
-    .{"\xd9\x81\xd9\x8a"},             // في
-    .{"\xd8\xb9\xd9\x84\xd9\x89"},     // على
-    .{"\xd8\xb9\xd9\x86"},             // عن
-    .{"\xd9\x85\xd8\xb9"},             // مع
-    .{"\xd8\xa8\xd9\x8a\xd9\x86"},     // بين
-    .{"\xd9\x84"},                     // ل
-    .{"\xd8\xa8"},                     // ب
-    .{"\xd9\x83"},                     // ك
-    .{"\xd9\x83\xd8\xa7\xd9\x86"},     // كان
+    .{"\xd9\x85\xd9\x86"}, // من
+    .{"\xd8\xa5\xd9\x84\xd9\x89"}, // إلى
+    .{"\xd8\xa7\xd9\x84\xd9\x89"}, // الى
+    .{"\xd9\x81\xd9\x8a"}, // في
+    .{"\xd8\xb9\xd9\x84\xd9\x89"}, // على
+    .{"\xd8\xb9\xd9\x86"}, // عن
+    .{"\xd9\x85\xd8\xb9"}, // مع
+    .{"\xd8\xa8\xd9\x8a\xd9\x86"}, // بين
+    .{"\xd9\x84"}, // ل
+    .{"\xd8\xa8"}, // ب
+    .{"\xd9\x83"}, // ك
+    .{"\xd9\x83\xd8\xa7\xd9\x86"}, // كان
     .{"\xd9\x83\xd8\xa7\xd9\x86\xd8\xaa"}, // كانت
     .{"\xd9\x8a\xd9\x83\xd9\x88\xd9\x86"}, // يكون
     .{"\xd8\xaa\xd9\x83\xd9\x88\xd9\x86"}, // تكون
-    .{"\xd8\xb5\xd8\xa7\xd8\xb1"},     // صار
+    .{"\xd8\xb5\xd8\xa7\xd8\xb1"}, // صار
     .{"\xd8\xa3\xd8\xb5\xd8\xa8\xd8\xad"}, // أصبح
     .{"\xd9\x8a\xd9\x85\xd9\x83\xd9\x86"}, // يمكن
     .{"\xd9\x85\xd9\x85\xd9\x83\xd9\x86"}, // ممكن
     .{"\xd8\xa8\xd8\xa7\xd9\x84\xd8\xa3\xd9\x85\xd8\xb3"}, // بالأمس
-    .{"\xd8\xa7\xd9\x85\xd8\xb3"},     // امس
+    .{"\xd8\xa7\xd9\x85\xd8\xb3"}, // امس
     .{"\xd8\xa7\xd9\x84\xd9\x8a\xd9\x88\xd9\x85"}, // اليوم
-    .{"\xd8\xba\xd8\xaf\xd8\xa7"},     // غدا
+    .{"\xd8\xba\xd8\xaf\xd8\xa7"}, // غدا
     .{"\xd8\xa7\xd9\x84\xd8\xa2\xd9\x86"}, // الآن
-    .{"\xd9\x82\xd8\xa8\xd9\x84"},     // قبل
-    .{"\xd8\xa8\xd8\xb9\xd8\xaf"},     // بعد
+    .{"\xd9\x82\xd8\xa8\xd9\x84"}, // قبل
+    .{"\xd8\xa8\xd8\xb9\xd8\xaf"}, // بعد
     .{"\xd9\x84\xd9\x85\xd8\xa7\xd8\xb0\xd8\xa7"}, // لماذا
-    .{"\xd9\x83\xd9\x8a\xd9\x81"},     // كيف
+    .{"\xd9\x83\xd9\x8a\xd9\x81"}, // كيف
     .{"\xd9\x85\xd8\xa7\xd8\xb0\xd8\xa7"}, // ماذا
-    .{"\xd9\x85\xd8\xaa\xd9\x89"},     // متى
-    .{"\xd8\xa3\xd9\x8a\xd9\x86"},     // أين
-    .{"\xd9\x87\xd9\x84"},             // هل
+    .{"\xd9\x85\xd8\xaa\xd9\x89"}, // متى
+    .{"\xd8\xa3\xd9\x8a\xd9\x86"}, // أين
+    .{"\xd9\x87\xd9\x84"}, // هل
 });
 
 // ── Validity check ──────────────────────────────────────────────────

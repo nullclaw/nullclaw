@@ -37,7 +37,7 @@ pub const TunnelProvider = enum {
 // ── Tunnel Config (extended) ────────────────────────────────────
 
 pub const CloudflareTunnelConfig = struct {
-    token: []const u8,
+    token: ?[]const u8 = null,
 };
 
 pub const TailscaleTunnelConfig = struct {
@@ -46,12 +46,12 @@ pub const TailscaleTunnelConfig = struct {
 };
 
 pub const NgrokTunnelConfig = struct {
-    auth_token: []const u8,
+    auth_token: ?[]const u8 = null,
     domain: ?[]const u8 = null,
 };
 
 pub const CustomTunnelConfig = struct {
-    start_command: []const u8,
+    start_command: ?[]const u8 = null,
     health_url: ?[]const u8 = null,
     url_pattern: ?[]const u8 = null,
 };
@@ -897,9 +897,10 @@ pub fn createTunnel(cfg: TunnelFullConfig) CreateTunnelError!?Tunnel {
         .none => null,
         .cloudflare => blk: {
             const cf = cfg.cloudflare orelse return CreateTunnelError.MissingCloudflareConfig;
+            const token = cf.token orelse return CreateTunnelError.MissingCloudflareConfig;
             break :blk Tunnel{
                 .provider = .cloudflare,
-                .cloudflare_token = cf.token,
+                .cloudflare_token = token,
             };
         },
         .tailscale => blk: {
@@ -912,17 +913,19 @@ pub fn createTunnel(cfg: TunnelFullConfig) CreateTunnelError!?Tunnel {
         },
         .ngrok => blk: {
             const ng = cfg.ngrok orelse return CreateTunnelError.MissingNgrokConfig;
+            const auth_token = ng.auth_token orelse return CreateTunnelError.MissingNgrokConfig;
             break :blk Tunnel{
                 .provider = .ngrok,
-                .ngrok_auth_token = ng.auth_token,
+                .ngrok_auth_token = auth_token,
                 .ngrok_domain = ng.domain,
             };
         },
         .custom => blk: {
             const cu = cfg.custom orelse return CreateTunnelError.MissingCustomConfig;
+            const start_command = cu.start_command orelse return CreateTunnelError.MissingCustomConfig;
             break :blk Tunnel{
                 .provider = .custom,
-                .custom_start_command = cu.start_command,
+                .custom_start_command = start_command,
                 .custom_health_url = cu.health_url,
                 .custom_url_pattern = cu.url_pattern,
             };

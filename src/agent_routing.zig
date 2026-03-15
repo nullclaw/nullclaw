@@ -282,6 +282,39 @@ fn hasMatchingRole(binding_roles: []const []const u8, member_roles: []const []co
     return false;
 }
 
+fn firstMatchingBinding(
+    candidates: []const AgentBinding,
+    input: RouteInput,
+    check_peer: ?PeerRef,
+    matched_by: MatchedBy,
+) ?AgentBinding {
+    // Within the same routing tier, prefer bindings scoped to the current
+    // account before broader unscoped fallbacks.
+    for ([_]bool{ true, false }) |prefer_account_scoped| {
+        for (candidates) |binding| {
+            if (prefer_account_scoped != (binding.match.account_id != null)) continue;
+
+            const matches = switch (matched_by) {
+                .peer, .parent_peer => binding.match.peer != null and allConstraintsMatch(binding, input, check_peer),
+                .guild_roles => binding.match.guild_id != null and
+                    binding.match.roles.len > 0 and
+                    allConstraintsMatch(binding, input, check_peer),
+                .guild => binding.match.guild_id != null and
+                    binding.match.roles.len == 0 and
+                    allConstraintsMatch(binding, input, check_peer),
+                .team => binding.match.team_id != null and allConstraintsMatch(binding, input, check_peer),
+                .account => binding.match.account_id != null and isAccountOnly(binding),
+                .channel_only => isChannelOnly(binding),
+                .default => false,
+            };
+
+            if (matches) return binding;
+        }
+    }
+
+    return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Route resolution
 // ═══════════════════════════════════════════════════════════════════════════
@@ -309,67 +342,49 @@ pub fn resolveRoute(
 
     // Tier 1: peer match — binding has a peer constraint that matches input.peer
     if (input.peer) |ip| {
-        for (candidates.items) |b| {
-            if (b.match.peer != null and allConstraintsMatch(b, input, ip)) {
-                return buildRoute(allocator, b.agent_id, input, .peer);
-            }
+        if (firstMatchingBinding(candidates.items, input, ip, .peer)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .peer);
         }
     }
 
     // Tier 2: parent_peer match — binding peer matches input.parent_peer
     if (input.parent_peer) |pp| {
         if (pp.id.len > 0) {
-            for (candidates.items) |b| {
-                if (b.match.peer != null and allConstraintsMatch(b, input, pp)) {
-                    return buildRoute(allocator, b.agent_id, input, .parent_peer);
-                }
+            if (firstMatchingBinding(candidates.items, input, pp, .parent_peer)) |binding| {
+                return buildRoute(allocator, binding.agent_id, input, .parent_peer);
             }
         }
     }
 
     // Tier 3: guild_id + roles match
     if (input.guild_id != null and input.member_role_ids.len > 0) {
-        for (candidates.items) |b| {
-            if (b.match.guild_id != null and b.match.roles.len > 0 and
-                allConstraintsMatch(b, input, input.peer))
-            {
-                return buildRoute(allocator, b.agent_id, input, .guild_roles);
-            }
+        if (firstMatchingBinding(candidates.items, input, input.peer, .guild_roles)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .guild_roles);
         }
     }
 
     // Tier 4: guild_id only (no roles on binding)
     if (input.guild_id != null) {
-        for (candidates.items) |b| {
-            if (b.match.guild_id != null and b.match.roles.len == 0 and
-                allConstraintsMatch(b, input, input.peer))
-            {
-                return buildRoute(allocator, b.agent_id, input, .guild);
-            }
+        if (firstMatchingBinding(candidates.items, input, input.peer, .guild)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .guild);
         }
     }
 
     // Tier 5: team_id match
     if (input.team_id != null) {
-        for (candidates.items) |b| {
-            if (b.match.team_id != null and allConstraintsMatch(b, input, input.peer)) {
-                return buildRoute(allocator, b.agent_id, input, .team);
-            }
+        if (firstMatchingBinding(candidates.items, input, input.peer, .team)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .team);
         }
     }
 
     // Tier 6: account only (channel + account_id, no peer/guild/team/roles)
-    for (candidates.items) |b| {
-        if (b.match.account_id != null and isAccountOnly(b)) {
-            return buildRoute(allocator, b.agent_id, input, .account);
-        }
+    if (firstMatchingBinding(candidates.items, input, input.peer, .account)) |binding| {
+        return buildRoute(allocator, binding.agent_id, input, .account);
     }
 
     // Tier 7: channel only (no account_id/peer/guild/team/roles)
-    for (candidates.items) |b| {
-        if (isChannelOnly(b)) {
-            return buildRoute(allocator, b.agent_id, input, .channel_only);
-        }
+    if (firstMatchingBinding(candidates.items, input, input.peer, .channel_only)) |binding| {
+        return buildRoute(allocator, binding.agent_id, input, .channel_only);
     }
 
     // No match — use default agent.
@@ -1010,6 +1025,38 @@ test "resolveRoute — peer binding wins over account binding" {
     defer allocator.free(route.session_key);
     defer allocator.free(route.main_session_key);
     try std.testing.expectEqualStrings("a", route.agent_id);
+    try std.testing.expectEqual(MatchedBy.peer, route.matched_by);
+}
+
+test "resolveRoute — account scoped peer binding beats unscoped peer fallback regardless of order" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "fallback",
+            .match = .{
+                .channel = "telegram",
+                .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+            },
+        },
+        .{
+            .agent_id = "exact",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+            },
+        },
+    };
+
+    const route = try resolveRoute(allocator, .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    try std.testing.expectEqualStrings("exact", route.agent_id);
     try std.testing.expectEqual(MatchedBy.peer, route.matched_by);
 }
 

@@ -14,7 +14,11 @@ const Config = @import("config.zig").Config;
 const channel_catalog = @import("channel_catalog.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
+const fs_compat = @import("fs_compat.zig");
 const builtin = @import("builtin");
+const bootstrap_mod = @import("bootstrap/root.zig");
+const BootstrapProvider = bootstrap_mod.BootstrapProvider;
+const memory_root = @import("memory/root.zig");
 
 /// Staleness thresholds (seconds).
 const DAEMON_STALE_SECONDS: i64 = 30;
@@ -317,9 +321,24 @@ pub fn checkWorkspace(
         }
     }
 
-    // Key workspace files
-    checkFileExists(allocator, ws, "SOUL.md", cat, items) catch {};
-    checkFileExists(allocator, ws, "AGENTS.md", cat, items) catch {};
+    // Key workspace files — use bootstrap provider when available.
+    var mem_rt: ?memory_root.MemoryRuntime = null;
+    if (!memory_root.usesWorkspaceBootstrapFiles(config.memory.backend)) {
+        mem_rt = memory_root.initRuntime(allocator, &config.memory, config.workspace_dir);
+    }
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?memory_root.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    const bp: ?BootstrapProvider = bootstrap_mod.createProvider(
+        allocator,
+        config.memory.backend,
+        mem_opt,
+        config.workspace_dir,
+    ) catch null;
+    defer if (bp) |p| p.deinit();
+
+    checkFileExists(allocator, ws, "SOUL.md", cat, items, bp) catch {};
+    checkFileExists(allocator, ws, "AGENTS.md", cat, items, bp) catch {};
 }
 
 fn checkFileExists(
@@ -328,7 +347,31 @@ fn checkFileExists(
     name: []const u8,
     cat: []const u8,
     items: *std.ArrayList(DiagItem),
+    bootstrap_provider: ?BootstrapProvider,
 ) !void {
+    // Use bootstrap provider when available.
+    if (bootstrap_provider) |bp| {
+        if (bp.exists(name)) {
+            if (std.mem.eql(u8, name, "SOUL.md")) {
+                try items.append(allocator, DiagItem.ok(cat, "SOUL.md present"));
+            } else if (std.mem.eql(u8, name, "AGENTS.md")) {
+                try items.append(allocator, DiagItem.ok(cat, "AGENTS.md present"));
+            } else {
+                try items.append(allocator, DiagItem.ok(cat, "file present"));
+            }
+        } else {
+            if (std.mem.eql(u8, name, "SOUL.md")) {
+                try items.append(allocator, DiagItem.warn(cat, "SOUL.md not found (optional)"));
+            } else if (std.mem.eql(u8, name, "AGENTS.md")) {
+                try items.append(allocator, DiagItem.warn(cat, "AGENTS.md not found (optional)"));
+            } else {
+                try items.append(allocator, DiagItem.warn(cat, "file not found (optional)"));
+            }
+        }
+        return;
+    }
+
+    // Fallback: direct filesystem check.
     const dir = std.fs.openDirAbsolute(base_dir, .{}) catch return;
     var d = dir;
     defer d.close();
@@ -405,7 +448,7 @@ pub fn checkDaemonState(
     const state_path = try daemon.stateFilePath(allocator, config);
     defer allocator.free(state_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, state_path, 1024 * 1024) catch {
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 1024 * 1024) catch {
         try items.append(allocator, DiagItem.err(cat, try std.fmt.allocPrint(
             allocator,
             "state file not found: {s} -- is the daemon running?",

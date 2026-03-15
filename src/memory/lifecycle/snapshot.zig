@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
 const json_util = @import("../../json_util.zig");
 const Memory = root.Memory;
@@ -77,7 +78,7 @@ pub fn hydrateFromSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_
     defer allocator.free(snapshot_path);
 
     // Read snapshot file
-    const content = std.fs.cwd().readFileAlloc(allocator, snapshot_path, 10 * 1024 * 1024) catch return 0;
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, snapshot_path, 10 * 1024 * 1024) catch return 0;
     defer allocator.free(content);
 
     if (content.len == 0) return 0;

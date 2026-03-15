@@ -107,7 +107,13 @@ pub const AnthropicProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("anthropic", sanitized orelse summary);
+            return mapped_err;
         }
 
         if (root_obj.get("content")) |content_arr| {
@@ -135,11 +141,20 @@ pub const AnthropicProvider = struct {
         const root_obj = parsed.value.object;
 
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("anthropic", sanitized orelse summary);
+            return mapped_err;
         }
 
         var text_parts: std.ArrayListUnmanaged(u8) = .empty;
         defer text_parts.deinit(allocator);
+
+        var thinking_parts: std.ArrayListUnmanaged(u8) = .empty;
+        defer thinking_parts.deinit(allocator);
 
         var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
 
@@ -148,7 +163,16 @@ pub const AnthropicProvider = struct {
                 const obj = block.object;
                 const kind = if (obj.get("type")) |t| (if (t == .string) t.string else "") else "";
 
-                if (std.mem.eql(u8, kind, "text")) {
+                if (std.mem.eql(u8, kind, "thinking")) {
+                    if (obj.get("thinking")) |thinking| {
+                        if (thinking == .string and thinking.string.len > 0) {
+                            if (thinking_parts.items.len > 0) {
+                                try thinking_parts.append(allocator, '\n');
+                            }
+                            try thinking_parts.appendSlice(allocator, thinking.string);
+                        }
+                    }
+                } else if (std.mem.eql(u8, kind, "text")) {
                     if (obj.get("text")) |text| {
                         if (text == .string) {
                             const trimmed = std.mem.trim(u8, text.string, " \t\r\n");
@@ -198,6 +222,7 @@ pub const AnthropicProvider = struct {
 
         return .{
             .content = if (text_parts.items.len > 0) try text_parts.toOwnedSlice(allocator) else null,
+            .reasoning_content = if (thinking_parts.items.len > 0) try thinking_parts.toOwnedSlice(allocator) else null,
             .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
             .usage = usage,
             .model = try allocator.dupe(u8, model_str),
@@ -465,6 +490,7 @@ fn buildChatRequestBody(
             try root.convertToolsAnthropic(&buf, allocator, tools);
         }
     }
+    try appendAnthropicThinkingConfig(&buf, allocator, max_tokens, request.reasoning_effort);
 
     try buf.append(allocator, '}');
     return try buf.toOwnedSlice(allocator);
@@ -531,9 +557,35 @@ fn buildStreamingChatRequestBody(
             try root.convertToolsAnthropic(&buf, allocator, tools);
         }
     }
+    try appendAnthropicThinkingConfig(&buf, allocator, max_tokens, request.reasoning_effort);
 
     try buf.appendSlice(allocator, ",\"stream\":true}");
     return try buf.toOwnedSlice(allocator);
+}
+
+fn appendAnthropicThinkingConfig(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    max_tokens: u32,
+    reasoning_effort: ?[]const u8,
+) !void {
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse return;
+    if (std.ascii.eqlIgnoreCase(effort, "none")) return;
+
+    // Anthropic extended thinking requires a budget. Keep a conservative floor
+    // and never exceed output budget.
+    const budget: u32 = if (std.ascii.eqlIgnoreCase(effort, "low"))
+        @min(max_tokens, 1024)
+    else if (std.ascii.eqlIgnoreCase(effort, "medium"))
+        @min(max_tokens, 4096)
+    else
+        @min(max_tokens, 8192);
+
+    try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":");
+    var budget_buf: [16]u8 = undefined;
+    const budget_str = std.fmt.bufPrint(&budget_buf, "{d}", .{budget}) catch return error.AnthropicApiError;
+    try buf.appendSlice(allocator, budget_str);
+    try buf.append(allocator, '}');
 }
 
 /// HTTP POST with OAuth-specific headers (anthropic-beta, user-agent).
@@ -549,19 +601,40 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
     }
 
     try argv.appendSlice(allocator, &.{
-        "-H", "Content-Type: application/json",   "-H", auth_hdr,
-        "-H", version_hdr,                        "-H", "anthropic-beta: oauth-2025-04-20",
-        "-A", "claude-cli/2.1.2 (external, cli)", "-d", body,
+        "-H", "Content-Type: application/json",   "-H",            auth_hdr,
+        "-H", version_hdr,                        "-H",            "anthropic-beta: oauth-2025-04-20",
+        "-A", "claude-cli/2.1.2 (external, cli)", "--data-binary", "@-",
         url,
     });
 
     var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlWriteError;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
@@ -858,6 +931,36 @@ test "provider getName returns Anthropic" {
     try std.testing.expectEqualStrings("Anthropic", prov.getName());
 }
 
+test "parseNativeResponse thinking block populates reasoning_content" {
+    const body =
+        \\{"content":[{"type":"thinking","thinking":"I should reason carefully"},{"type":"text","text":"Here is my answer"}],"model":"claude-opus-4-5-20250514"}
+    ;
+    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c_val| std.testing.allocator.free(c_val);
+        if (response.reasoning_content) |rc| std.testing.allocator.free(rc);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expectEqualStrings("Here is my answer", response.content.?);
+    try std.testing.expectEqualStrings("I should reason carefully", response.reasoning_content.?);
+}
+
+test "parseNativeResponse thinking block only no visible text" {
+    const body =
+        \\{"content":[{"type":"thinking","thinking":"silent reasoning"}],"model":"m"}
+    ;
+    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c_val| std.testing.allocator.free(c_val);
+        if (response.reasoning_content) |rc| std.testing.allocator.free(rc);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(response.content == null);
+    try std.testing.expectEqualStrings("silent reasoning", response.reasoning_content.?);
+}
+
 test "parseNativeResponse usage missing defaults to zero" {
     const body =
         \\{"content":[{"type":"text","text":"Hi"}],"model":"m"}
@@ -896,6 +999,39 @@ test "buildChatRequestBody defaults max_tokens to runtime fallback" {
     const max_tokens = parsed.value.object.get("max_tokens").?;
     try std.testing.expect(max_tokens == .integer);
     try std.testing.expectEqual(@as(i64, config_types.DEFAULT_MODEL_MAX_TOKENS), max_tokens.integer);
+}
+
+test "buildChatRequestBody emits thinking config when reasoning_effort is set" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .reasoning_effort = "high",
+    };
+
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"budget_tokens\":") != null);
+}
+
+test "buildChatRequestBody omits thinking config when reasoning_effort is none" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .reasoning_effort = "none",
+    };
+
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
 }
 
 test "buildStreamingChatRequestBody contains same messages as non-streaming" {

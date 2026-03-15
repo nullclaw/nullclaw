@@ -5,6 +5,19 @@
     "providers": {
       "openrouter": {
         "api_key": "YOUR_OPENROUTER_API_KEY"
+      },
+      "azure": {
+        "api_key": "YOUR_AZURE_OPENAI_API_KEY",
+        "base_url": "https://your-resource.openai.azure.com"
+      },
+      "vertex": {
+        "api_key": {
+          "type": "service_account",
+          "project_id": "YOUR_GCP_PROJECT",
+          "client_email": "YOUR_SERVICE_ACCOUNT_EMAIL",
+          "private_key": "-----BEGIN PRIVATE KEY-----\\nYOUR_PRIVATE_KEY\\n-----END PRIVATE KEY-----\\n"
+        },
+        "base_url": "https://aiplatform.googleapis.com/v1/projects/YOUR_GCP_PROJECT/locations/global/publishers/google/models"
       }
     }
   },
@@ -114,6 +127,7 @@
       "hygiene_enabled": true,
       "archive_after_days": 7,
       "purge_after_days": 30,
+      "preserve_before_purge": true,
       "conversation_retention_days": 30,
       "snapshot_enabled": false,
       "snapshot_on_hygiene": false,
@@ -176,13 +190,42 @@
   "autonomy": {
     "level": "supervised",
     "workspace_only": true,
-    "max_actions_per_hour": 20
+    "max_actions_per_hour": 20,
+    "allow_raw_url_chars": false
   },
 
   "gateway": {
     "port": 3000,
     "host": "127.0.0.1",
     "require_pairing": true
+  },
+
+  "tunnel": {
+    "provider": "none",
+    "ngrok": {
+      "auth_token": "YOUR_NGROK_AUTH_TOKEN",
+      "domain": "your-domain.ngrok-free.app"
+    },
+    "cloudflare": {
+      "token": "YOUR_CLOUDFLARE_TUNNEL_TOKEN"
+    },
+    "tailscale": {
+      "funnel": false,
+      "hostname": "your-hostname.ts.net"
+    },
+    "custom": {
+      "start_command": "/path/to/tunnel-start.sh",
+      "health_url": "http://localhost:4040/api/tunnels",
+      "url_pattern": "https://[a-z0-9-]+\\.[a-z]+"
+    }
+  },
+
+  "a2a": {
+    "enabled": false,
+    "name": "NullClaw",
+    "description": "AI assistant",
+    "url": "https://agent.example.com",
+    "version": "1.0.0"
   },
 
   "security": {

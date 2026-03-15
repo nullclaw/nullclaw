@@ -12,7 +12,7 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 # Requires exactly Zig 0.15.2 (verify: zig version)
 zig build                           # dev build
 zig build -Doptimize=ReleaseSmall   # release build (target: <1 MB binary)
-zig build test --summary all        # run all 3,371+ tests (must pass with 0 leaks)
+zig build test --summary all        # run all 5,300+ tests (must pass with 0 leaks)
 zig fmt src/                        # format all source files
 zig fmt --check src/                # check formatting (used by pre-commit hook)
 ```
@@ -65,7 +65,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 
 ### Key Entry Points
 
-- `src/main.zig` - CLI command routing (`agent`, `gateway`, `onboard`, `doctor`, `status`, `service`, `cron`, `channel`, `memory`, `skills`, `hardware`, `migrate`, `workspace`, `capabilities`, `models`, `auth`, `update`)
+- `src/main.zig` - CLI command routing (`agent`, `gateway`, `onboard`, `doctor`, `status`, `service`, `cron`, `channel`, `memory`, `skills`, `hardware`, `migrate`, `workspace`, `capabilities`, `models`, `auth`, `update`, `history`)
 - `src/root.zig` - Module hierarchy and public API exports (also serves as library root)
 - `src/config.zig` - JSON config loading (~30 sub-config structs from `config_types.zig`, loads from `~/.nullclaw/config.json`)
 - `src/agent.zig` - Agent orchestration (delegates to `src/agent/root.zig`)
@@ -77,7 +77,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 - `src/providers/` - AI model providers. 9 core implementations + 41+ OpenAI-compatible services via `compatible.zig`. Factory in `factory.zig`, single source of truth for provider URLs and auth styles.
 - `src/channels/` - Messaging channels. Each implements `Channel.VTable` (`start`, `stop`, `send`, `name`, `healthCheck`). Factory in `root.zig`.
 - `src/tools/` - Tool implementations. Each implements `Tool.VTable` (`execute`, `name`, `description`, `parameters_json`). Tools receive args as `JsonObjectMap` and return `ToolResult`. Factory in `root.zig`.
-- `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
+- `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, ClickHouse, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
 - `src/security/` - Policy enforcement (`policy.zig`), pairing (`pairing.zig`), encrypted secrets (`secrets.zig`), sandbox backends (`landlock.zig`, `firejail.zig`, `bubblewrap.zig`, `docker.zig`, `detect.zig`).
 - `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Config defaults are `max_tool_iterations = 1000` and `max_history_messages = 100` (see `src/config_types.zig`).
 

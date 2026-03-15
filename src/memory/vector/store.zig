@@ -221,7 +221,7 @@ fn mix64(x_raw: u64) u64 {
 
 fn projectionCoeff(bit_idx: u32, dim_idx: usize) f64 {
     const seed_a = @as(u64, bit_idx) *% 0x9E3779B185EBCA87;
-    const dim_u64 = @as(u64, @truncate(dim_idx));
+    const dim_u64: u64 = @intCast(dim_idx);
     const seed_b = dim_u64 *% 0xC2B2AE3D27D4EB4F;
     const hashed = mix64(seed_a ^ seed_b ^ 0xD6E8FEB86659FD93);
     const unit = @as(f64, @floatFromInt(hashed & 0xFFFF)) / 65535.0;

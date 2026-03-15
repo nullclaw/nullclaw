@@ -1,4 +1,6 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
+const codex_support = @import("../codex_support.zig");
 const root = @import("root.zig");
 
 const Provider = root.Provider;
@@ -6,19 +8,19 @@ const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const ChatMessage = root.ChatMessage;
 
-/// Provider that delegates to the `codex` CLI (OpenAI Codex).
+/// Provider that delegates to the local `codex` CLI.
 ///
-/// Runs `codex --quiet <prompt>` and reads stdout as plain text.
+/// Runs `codex exec` non-interactively and reads the final assistant message
+/// from the `--output-last-message` file.
 pub const CodexCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
 
-    const DEFAULT_MODEL = "codex-mini-latest";
-    const CLI_NAME = "codex";
+    pub const DEFAULT_MODEL = codex_support.DEFAULT_CODEX_MODEL;
     const TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !CodexCliProvider {
-        try checkCliAvailable(allocator, CLI_NAME);
+        try checkCliAvailable(allocator);
         return .{
             .allocator = allocator,
             .model = model orelse DEFAULT_MODEL,
@@ -43,32 +45,35 @@ pub const CodexCliProvider = struct {
     };
 
     fn chatWithSystemImpl(
-        _: *anyopaque,
+        ptr: *anyopaque,
         allocator: std.mem.Allocator,
         system_prompt: ?[]const u8,
         message: []const u8,
-        _: []const u8,
+        model: []const u8,
         _: f64,
     ) anyerror![]const u8 {
+        const self: *CodexCliProvider = @ptrCast(@alignCast(ptr));
         const prompt = if (system_prompt) |sys|
             try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ sys, message })
         else
             try allocator.dupe(u8, message);
         defer allocator.free(prompt);
 
-        return runCodex(allocator, prompt);
+        return runCodex(allocator, effectiveModel(model, self.model), prompt);
     }
 
     fn chatImpl(
-        _: *anyopaque,
+        ptr: *anyopaque,
         allocator: std.mem.Allocator,
         request: ChatRequest,
-        _: []const u8,
+        model: []const u8,
         _: f64,
     ) anyerror!ChatResponse {
+        const self: *CodexCliProvider = @ptrCast(@alignCast(ptr));
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const content = try runCodex(allocator, prompt);
-        return ChatResponse{ .content = content, .model = try allocator.dupe(u8, "codex-cli") };
+        const resolved_model = effectiveModel(model, self.model);
+        const content = try runCodex(allocator, resolved_model, prompt);
+        return ChatResponse{ .content = content, .model = try allocator.dupe(u8, resolved_model) };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -85,39 +90,54 @@ pub const CodexCliProvider = struct {
 
     fn deinitImpl(_: *anyopaque) void {}
 
-    /// Run the codex CLI and return stdout as plain text.
-    fn runCodex(allocator: std.mem.Allocator, prompt: []const u8) ![]const u8 {
+    /// Run `codex exec` and return the final assistant message as plain text.
+    fn runCodex(allocator: std.mem.Allocator, model: []const u8, prompt: []const u8) ![]const u8 {
+        const cli_path = codex_support.resolveCodexCommand(allocator) orelse return error.CliNotFound;
+        defer allocator.free(cli_path);
+
+        const output_path = try makeOutputPath(allocator);
+        defer {
+            std.fs.deleteFileAbsolute(output_path) catch {};
+            allocator.free(output_path);
+        }
+
         const argv = [_][]const u8{
-            CLI_NAME,
-            "--quiet",
+            cli_path,
+            "exec",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "-m",
+            model,
+            "-o",
+            output_path,
             prompt,
         };
 
         var child = std.process.Child.init(&argv, allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
 
         try child.spawn();
-
-        const max_output: usize = 4 * 1024 * 1024;
-        const stdout_result = child.stdout.?.readToEndAlloc(allocator, max_output) catch |err| {
-            _ = child.wait() catch {};
-            return err;
-        };
 
         const term = try child.wait();
         switch (term) {
             .Exited => |code| {
                 if (code != 0) {
-                    allocator.free(stdout_result);
                     return error.CliProcessFailed;
                 }
             },
             else => {
-                allocator.free(stdout_result);
                 return error.CliProcessFailed;
             },
         }
+
+        const file = try std.fs.openFileAbsolute(output_path, .{});
+        defer file.close();
+
+        const max_output: usize = 4 * 1024 * 1024;
+        const stdout_result = try file.readToEndAlloc(allocator, max_output);
 
         // Trim trailing whitespace
         const trimmed = std.mem.trimRight(u8, stdout_result, " \t\r\n");
@@ -131,7 +151,7 @@ pub const CodexCliProvider = struct {
 
     /// Health check: run `codex --version` and verify exit code 0.
     fn healthCheck(allocator: std.mem.Allocator) !void {
-        try checkCliVersion(allocator, CLI_NAME);
+        try checkCliVersion(allocator);
     }
 };
 
@@ -139,9 +159,18 @@ pub const CodexCliProvider = struct {
 // Shared helpers
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Check if a CLI tool is available in PATH using `which`.
-fn checkCliAvailable(allocator: std.mem.Allocator, cli_name: []const u8) !void {
-    const argv = [_][]const u8{ "which", cli_name };
+/// Resolve the codex CLI and ensure it exists.
+fn checkCliAvailable(allocator: std.mem.Allocator) !void {
+    const cli_path = codex_support.resolveCodexCommand(allocator) orelse return error.CliNotFound;
+    allocator.free(cli_path);
+}
+
+/// Run `codex --version` and verify exit code 0.
+fn checkCliVersion(allocator: std.mem.Allocator) !void {
+    const cli_path = codex_support.resolveCodexCommand(allocator) orelse return error.CliNotFound;
+    defer allocator.free(cli_path);
+
+    const argv = [_][]const u8{ cli_path, "--version" };
     var child = std.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -160,25 +189,27 @@ fn checkCliAvailable(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     }
 }
 
-/// Run `<cli> --version` and verify exit code 0.
-fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {
-    const argv = [_][]const u8{ cli_name, "--version" };
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    const out = child.stdout.?.readToEndAlloc(allocator, 4096) catch {
-        _ = child.wait() catch {};
-        return error.CliNotFound;
-    };
-    allocator.free(out);
-    const term = try child.wait();
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) return error.CliNotFound;
-        },
-        else => return error.CliNotFound,
-    }
+fn effectiveModel(requested_model: []const u8, configured_model: []const u8) []const u8 {
+    const requested = std.mem.trim(u8, requested_model, " \t\r\n");
+    if (requested.len > 0) return requested;
+
+    const configured = std.mem.trim(u8, configured_model, " \t\r\n");
+    if (configured.len > 0) return configured;
+
+    return CodexCliProvider.DEFAULT_MODEL;
+}
+
+fn makeOutputPath(allocator: std.mem.Allocator) ![]u8 {
+    const tmp_dir = try platform.getTempDir(allocator);
+    defer allocator.free(tmp_dir);
+
+    const filename = try std.fmt.allocPrint(allocator, "nullclaw_codex_{d}_{x}.txt", .{
+        std.time.milliTimestamp(),
+        std.crypto.random.int(u64),
+    });
+    defer allocator.free(filename);
+
+    return std.fs.path.join(allocator, &.{ tmp_dir, filename });
 }
 
 /// Extract the content of the last user message from a message slice.
@@ -216,9 +247,12 @@ test "CodexCliProvider supportsNativeTools returns false" {
     try std.testing.expect(!vtable.supportsNativeTools(@ptrCast(&dummy)));
 }
 
-test "CodexCliProvider checkCliAvailable returns CliNotFound for missing binary" {
-    const result = checkCliAvailable(std.testing.allocator, "nonexistent_binary_xyzzy_codex_99999");
-    try std.testing.expectError(error.CliNotFound, result);
+test "effectiveModel prefers explicit override" {
+    try std.testing.expectEqualStrings("gpt-5.2-codex", effectiveModel("gpt-5.2-codex", "gpt-5.4"));
+}
+
+test "effectiveModel falls back to configured model" {
+    try std.testing.expectEqualStrings("gpt-5.4", effectiveModel("", "gpt-5.4"));
 }
 
 test "extractLastUserMessage finds last user" {
@@ -245,6 +279,6 @@ test "extractLastUserMessage empty messages" {
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
 }
 
-test "CodexCliProvider default model is codex-mini-latest" {
-    try std.testing.expectEqualStrings("codex-mini-latest", CodexCliProvider.DEFAULT_MODEL);
+test "CodexCliProvider default model is gpt-5.4" {
+    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, CodexCliProvider.DEFAULT_MODEL);
 }

@@ -40,13 +40,19 @@ fn hashWithCanonicalLineEndings(bytes: []const u8) [std.crypto.hash.sha2.Sha256.
     return digest;
 }
 
+fn readFileAllocCompat(dir: std.fs.Dir, allocator: std.mem.Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
+    const file = try dir.openFile(sub_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(allocator, max_bytes);
+}
+
 fn verifyVendoredSqliteHashes(b: *std.Build) !void {
     const max_vendor_file_size = 16 * 1024 * 1024;
     for (VENDORED_SQLITE_HASHES) |entry| {
         const file_path = b.pathFromRoot(entry.path);
         defer b.allocator.free(file_path);
 
-        const bytes = std.fs.cwd().readFileAlloc(b.allocator, file_path, max_vendor_file_size) catch |err| {
+        const bytes = readFileAllocCompat(std.fs.cwd(), b.allocator, file_path, max_vendor_file_size) catch |err| {
             std.log.err("failed to read {s}: {s}", .{ file_path, @errorName(err) });
             return err;
         };
@@ -73,6 +79,7 @@ const ChannelSelection = struct {
     enable_channel_slack: bool = false,
     enable_channel_whatsapp: bool = false,
     enable_channel_whatsapp_web: bool = false,
+    enable_channel_teams: bool = false,
     enable_channel_matrix: bool = false,
     enable_channel_mattermost: bool = false,
     enable_channel_irc: bool = false,
@@ -87,6 +94,7 @@ const ChannelSelection = struct {
     enable_channel_signal: bool = false,
     enable_channel_nostr: bool = false,
     enable_channel_web: bool = false,
+    enable_channel_max: bool = false,
 
     fn enableAll(self: *ChannelSelection) void {
         self.enable_channel_cli = true;
@@ -96,6 +104,7 @@ const ChannelSelection = struct {
         self.enable_channel_whatsapp = true;
         // Keep WhatsApp Web bridge optional to avoid baseline feature bloat.
         self.enable_channel_whatsapp_web = false;
+        self.enable_channel_teams = true;
         self.enable_channel_matrix = true;
         self.enable_channel_mattermost = true;
         self.enable_channel_irc = true;
@@ -110,6 +119,7 @@ const ChannelSelection = struct {
         self.enable_channel_signal = true;
         self.enable_channel_nostr = true;
         self.enable_channel_web = true;
+        self.enable_channel_max = true;
     }
 };
 
@@ -155,6 +165,12 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_whatsapp = true;
         } else if (std.mem.eql(u8, token, "whatsapp-web") or std.mem.eql(u8, token, "whatsapp_web")) {
             selection.enable_channel_whatsapp_web = true;
+        } else if (std.mem.eql(u8, token, "teams")) {
+            selection.enable_channel_teams = true;
+        } else if (std.mem.eql(u8, token, "whatsapp-web") or std.mem.eql(u8, token, "whatsapp_web")) {
+            selection.enable_channel_whatsapp_web = true;
+        } else if (std.mem.eql(u8, token, "teams")) {
+            selection.enable_channel_teams = true;
         } else if (std.mem.eql(u8, token, "matrix")) {
             selection.enable_channel_matrix = true;
         } else if (std.mem.eql(u8, token, "mattermost")) {
@@ -183,6 +199,8 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_nostr = true;
         } else if (std.mem.eql(u8, token, "web")) {
             selection.enable_channel_web = true;
+        } else if (std.mem.eql(u8, token, "max")) {
+            selection.enable_channel_max = true;
         } else {
             std.log.err("unknown channel '{s}' in -Dchannels list", .{token});
             return error.InvalidChannelsOption;
@@ -215,6 +233,7 @@ const EngineSelection = struct {
     enable_memory_redis: bool = false,
     enable_memory_lancedb: bool = false,
     enable_postgres: bool = false,
+    enable_memory_clickhouse: bool = false,
 
     fn enableBase(self: *EngineSelection) void {
         self.enable_memory_none = true;
@@ -229,6 +248,7 @@ const EngineSelection = struct {
         self.enable_memory_redis = true;
         self.enable_memory_lancedb = true;
         self.enable_postgres = true;
+        self.enable_memory_clickhouse = true;
     }
 
     fn finalize(self: *EngineSelection) void {
@@ -245,7 +265,8 @@ const EngineSelection = struct {
             self.enable_memory_lucid or
             self.enable_memory_redis or
             self.enable_memory_lancedb or
-            self.enable_postgres;
+            self.enable_postgres or
+            self.enable_memory_clickhouse;
     }
 };
 
@@ -296,6 +317,8 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
             selection.enable_memory_lancedb = true;
         } else if (std.mem.eql(u8, token, "postgres")) {
             selection.enable_postgres = true;
+        } else if (std.mem.eql(u8, token, "clickhouse")) {
+            selection.enable_memory_clickhouse = true;
         } else {
             std.log.err("unknown engine '{s}' in -Dengines list", .{token});
             return error.InvalidEnginesOption;
@@ -316,16 +339,43 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
     return selection;
 }
 
+fn envExists(name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return false;
+    std.heap.page_allocator.free(value);
+    return true;
+}
+
+fn ensureAndroidBuildEnvironment(b: *std.Build) void {
+    if (envExists("TERMUX_VERSION")) return;
+    if (b.libc_file != null) return;
+
+    const has_android_sdk_or_ndk =
+        envExists("ANDROID_NDK_HOME") or
+        envExists("ANDROID_NDK_ROOT") or
+        envExists("ANDROID_HOME") or
+        envExists("ANDROID_SDK_ROOT");
+
+    std.log.err("Android cross-builds need a Zig libc/sysroot file passed via --libc (or ZIG_LIBC).", .{});
+    if (has_android_sdk_or_ndk) {
+        std.log.err("An Android SDK/NDK environment was detected, but Zig still needs --libc pointing at the generated libc/sysroot file.", .{});
+    } else {
+        std.log.err("Install the Android NDK, generate a libc/sysroot file for the target, and pass it with --libc.", .{});
+    }
+    std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
+    std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.15.2.", .{});
+    std.process.exit(1);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.3";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "dev";
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|whatsapp-web|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|whatsapp-web|teams|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web|max (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -337,7 +387,7 @@ pub fn build(b: *std.Build) void {
     const engines_raw = b.option(
         []const u8,
         "engines",
-        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres (default: base,sqlite)",
+        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres|clickhouse (default: base,sqlite)",
     );
     const engines = if (engines_raw) |raw| blk: {
         const parsed = parseEnginesOption(raw) catch {
@@ -356,12 +406,14 @@ pub fn build(b: *std.Build) void {
     const enable_memory_redis = engines.enable_memory_redis;
     const enable_memory_lancedb = engines.enable_memory_lancedb;
     const enable_postgres = engines.enable_postgres;
+    const enable_memory_clickhouse = engines.enable_memory_clickhouse;
     const enable_channel_cli = channels.enable_channel_cli;
     const enable_channel_telegram = channels.enable_channel_telegram;
     const enable_channel_discord = channels.enable_channel_discord;
     const enable_channel_slack = channels.enable_channel_slack;
     const enable_channel_whatsapp = channels.enable_channel_whatsapp;
     const enable_channel_whatsapp_web = channels.enable_channel_whatsapp_web;
+    const enable_channel_teams = channels.enable_channel_teams;
     const enable_channel_matrix = channels.enable_channel_matrix;
     const enable_channel_mattermost = channels.enable_channel_mattermost;
     const enable_channel_irc = channels.enable_channel_irc;
@@ -376,6 +428,11 @@ pub fn build(b: *std.Build) void {
     const enable_channel_signal = channels.enable_channel_signal;
     const enable_channel_nostr = channels.enable_channel_nostr;
     const enable_channel_web = channels.enable_channel_web;
+    const enable_channel_max = channels.enable_channel_max;
+
+    if (target.result.abi == .android) {
+        ensureAndroidBuildEnvironment(b);
+    }
 
     const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
     const effective_enable_memory_lucid = enable_sqlite and enable_memory_lucid;
@@ -410,12 +467,14 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_memory_lucid", effective_enable_memory_lucid);
     build_options.addOption(bool, "enable_memory_redis", enable_memory_redis);
     build_options.addOption(bool, "enable_memory_lancedb", effective_enable_memory_lancedb);
+    build_options.addOption(bool, "enable_memory_clickhouse", enable_memory_clickhouse);
     build_options.addOption(bool, "enable_channel_cli", enable_channel_cli);
     build_options.addOption(bool, "enable_channel_telegram", enable_channel_telegram);
     build_options.addOption(bool, "enable_channel_discord", enable_channel_discord);
     build_options.addOption(bool, "enable_channel_slack", enable_channel_slack);
     build_options.addOption(bool, "enable_channel_whatsapp", enable_channel_whatsapp);
     build_options.addOption(bool, "enable_channel_whatsapp_web", enable_channel_whatsapp_web);
+    build_options.addOption(bool, "enable_channel_teams", enable_channel_teams);
     build_options.addOption(bool, "enable_channel_matrix", enable_channel_matrix);
     build_options.addOption(bool, "enable_channel_mattermost", enable_channel_mattermost);
     build_options.addOption(bool, "enable_channel_irc", enable_channel_irc);
@@ -430,6 +489,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_signal", enable_channel_signal);
     build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
+    build_options.addOption(bool, "enable_channel_max", enable_channel_max);
     const build_options_module = build_options.createModule();
 
     // ---------- library module (importable by consumers) ----------

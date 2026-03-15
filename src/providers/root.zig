@@ -7,6 +7,7 @@ pub const anthropic = @import("anthropic.zig");
 pub const openai = @import("openai.zig");
 pub const ollama = @import("ollama.zig");
 pub const gemini = @import("gemini.zig");
+pub const vertex = @import("vertex.zig");
 pub const openrouter = @import("openrouter.zig");
 pub const compatible = @import("compatible.zig");
 pub const reliable = @import("reliable.zig");
@@ -16,6 +17,7 @@ pub const claude_cli = @import("claude_cli.zig");
 pub const codex_cli = @import("codex_cli.zig");
 pub const openai_codex = @import("openai_codex.zig");
 pub const runtime_bundle = @import("runtime_bundle.zig");
+pub const api_error_details = @import("api_error_details.zig");
 
 // Extracted sub-modules
 pub const scrub = @import("scrub.zig");
@@ -28,6 +30,9 @@ pub const scrubSecretPatterns = scrub.scrubSecretPatterns;
 pub const scrubToolOutput = scrub.scrubToolOutput;
 pub const sanitizeApiError = scrub.sanitizeApiError;
 pub const setApiErrorLimitOverride = scrub.setApiErrorLimitOverride;
+pub const clearLastApiErrorDetail = api_error_details.clear;
+pub const setLastApiErrorDetail = api_error_details.set;
+pub const snapshotLastApiErrorDetail = api_error_details.snapshot;
 
 // Re-exports from api_key.zig
 pub const resolveApiKey = api_key.resolveApiKey;
@@ -49,12 +54,19 @@ pub const buildRequestBody = helpers.buildRequestBody;
 pub const buildRequestBodyWithSystem = helpers.buildRequestBodyWithSystem;
 pub const isReasoningModel = helpers.isReasoningModel;
 pub const appendGenerationFields = helpers.appendGenerationFields;
+pub const appendGeminiThinkingConfig = helpers.appendGeminiThinkingConfig;
+pub const appendVertexThinkingConfig = helpers.appendVertexThinkingConfig;
 pub const convertToolsOpenAI = helpers.convertToolsOpenAI;
 pub const serializeMessageContent = helpers.serializeMessageContent;
 pub const serializeContentPart = helpers.serializeContentPart;
 pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const curlPostTimed = helpers.curlPostTimed;
+pub const curlPostFormTimed = helpers.curlPostFormTimed;
 pub const extractContent = helpers.extractContent;
+pub const SplitThinkContent = helpers.SplitThinkContent;
+pub const splitThinkContent = helpers.splitThinkContent;
+pub const stripThinkBlocks = helpers.stripThinkBlocks;
+pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
 
 // Direct re-exports from utility modules
 pub const appendJsonString = json_util.appendJsonString;
@@ -253,6 +265,9 @@ pub const ToolSpec = struct {
 /// Request payload for provider chat calls.
 pub const ChatRequest = struct {
     messages: []const ChatMessage,
+    /// Optional upstream session identifier (for example, the NullClaw session key).
+    /// Stateful providers can use this to scope their own resume/context handling.
+    session_id: ?[]const u8 = null,
     model: []const u8 = "",
     temperature: f64 = 0.7,
     max_tokens: ?u32 = null,

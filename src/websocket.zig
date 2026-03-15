@@ -1,6 +1,6 @@
-//! Generic RFC 6455 WebSocket client over TLS.
-//! Used by Discord, Lark, DingTalk, QQ gateway channels.
-//! All connections are TLS-only (wss://).
+//! Generic RFC 6455 WebSocket client.
+//! Used by Discord, Lark, DingTalk, QQ gateway channels and OneBot.
+//! Supports both `wss://` and `ws://` transports.
 
 const std = @import("std");
 
@@ -39,7 +39,6 @@ pub const TlsState = struct {
     write_buf: []u8,
     tls_read_buf: []u8,
     tls_write_buf: []u8,
-    scratch: [4096]u8 = undefined,
 
     pub fn deinit(self: *TlsState, allocator: std.mem.Allocator) void {
         allocator.free(self.read_buf);
@@ -55,8 +54,13 @@ pub const TlsState = struct {
 pub const WsClient = struct {
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
-    tls: *TlsState,
+    tls: ?*TlsState,
     write_mu: std.Thread.Mutex,
+
+    pub const Message = struct {
+        opcode: Opcode,
+        payload: []u8,
+    };
 
     /// Connect to wss://host:port/path.
     /// `extra_headers`: additional HTTP request headers (without trailing CRLF).
@@ -120,7 +124,50 @@ pub const WsClient = struct {
             tls_options,
         ) catch return error.TlsInitializationFailed;
 
-        // HTTP Upgrade handshake
+        var client = WsClient{
+            .allocator = allocator,
+            .stream = stream,
+            .tls = tls_state,
+            .write_mu = .{},
+        };
+        errdefer client.deinit();
+
+        try client.performHandshake(host, path, extra_headers);
+        return client;
+    }
+
+    /// Connect to ws://host:port/path without TLS.
+    pub fn connectPlain(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        path: []const u8,
+        extra_headers: []const []const u8,
+    ) !WsClient {
+        const addr_list = try std.net.getAddressList(allocator, host, port);
+        defer addr_list.deinit();
+        if (addr_list.addrs.len == 0) return error.DnsResolutionFailed;
+        const stream = try std.net.tcpConnectToAddress(addr_list.addrs[0]);
+        errdefer stream.close();
+
+        var client = WsClient{
+            .allocator = allocator,
+            .stream = stream,
+            .tls = null,
+            .write_mu = .{},
+        };
+        errdefer client.deinit();
+
+        try client.performHandshake(host, path, extra_headers);
+        return client;
+    }
+
+    fn performHandshake(
+        self: *WsClient,
+        host: []const u8,
+        path: []const u8,
+        extra_headers: []const []const u8,
+    ) !void {
         var key_raw: [16]u8 = undefined;
         std.crypto.random.bytes(&key_raw);
         var key_b64: [24]u8 = undefined;
@@ -139,27 +186,21 @@ pub const WsClient = struct {
             try rw.print("{s}\r\n", .{hdr});
         }
         try rw.writeAll("\r\n");
-        const req = req_fbs.getWritten();
 
-        try tls_state.tls_client.writer.writeAll(req);
-        try tls_state.tls_client.writer.flush();
-        try tls_state.stream_writer.interface.flush();
+        try self.writeTransport(req_fbs.getWritten());
+        try self.flushTransport();
 
-        // Read HTTP 101 response headers byte-by-byte to avoid consuming
-        // any WebSocket frame data that follows the headers in the same TLS
-        // record. Servers like Mattermost (behind Caddy) may send the first
-        // WS frame immediately after the 101 response.
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         var headers_complete = false;
         while (resp_len < resp_buf.len) {
-            // Use take(1) which always fills the internal buffer first,
-            // then returns a pointer into it — consuming exactly one byte.
-            const byte_ptr = tls_state.tls_client.reader.take(1) catch
-                return error.WsHandshakeFailed;
-            resp_buf[resp_len] = byte_ptr[0];
+            if (self.tls) |tls| {
+                const byte_ptr = tls.tls_client.reader.take(1) catch return error.WsHandshakeFailed;
+                resp_buf[resp_len] = byte_ptr[0];
+            } else {
+                self.readExact(resp_buf[resp_len .. resp_len + 1]) catch return error.WsHandshakeFailed;
+            }
             resp_len += 1;
-            // Check for end-of-headers marker
             if (resp_len >= 4 and
                 resp_buf[resp_len - 4] == '\r' and
                 resp_buf[resp_len - 3] == '\n' and
@@ -174,25 +215,18 @@ pub const WsClient = struct {
             log.err("WS handshake: header block exceeded {d} bytes", .{resp_buf.len});
             return error.WsHandshakeFailed;
         }
+
         const resp = resp_buf[0..resp_len];
         if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {
             log.err("WS handshake: unexpected response: {s}", .{resp[0..@min(resp_len, 80)]});
             return error.WsHandshakeFailed;
         }
 
-        // Verify Sec-WebSocket-Accept
         const expected = computeAcceptKey(&key_b64);
         if (std.mem.indexOf(u8, resp, &expected) == null) {
             log.err("WS handshake: invalid Sec-WebSocket-Accept", .{});
             return error.WsHandshakeFailed;
         }
-
-        return WsClient{
-            .allocator = allocator,
-            .stream = stream,
-            .tls = tls_state,
-            .write_mu = .{},
-        };
     }
 
     /// Compute expected Sec-WebSocket-Accept: base64(SHA1(key_b64 + WS_MAGIC)).
@@ -207,16 +241,37 @@ pub const WsClient = struct {
         return result;
     }
 
-    /// Read exactly buf.len bytes from TLS.
+    /// Read exactly buf.len bytes from the transport (TLS or plain socket).
     fn readExact(self: *WsClient, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
-            var rd: [1][]u8 = .{buf[total..]};
-            const n = self.tls.tls_client.reader.readVec(&rd) catch |err| switch (err) {
-                error.EndOfStream => return error.ConnectionClosed,
-                else => |e| return e,
+            const n = if (self.tls) |tls| blk: {
+                var rd: [1][]u8 = .{buf[total..]};
+                break :blk tls.tls_client.reader.readVec(&rd) catch |err| switch (err) {
+                    error.EndOfStream => return error.ConnectionClosed,
+                    else => |e| return e,
+                };
+            } else blk: {
+                const bytes = self.stream.read(buf[total..]) catch |e| return e;
+                if (bytes == 0) return error.ConnectionClosed;
+                break :blk bytes;
             };
             total += n;
+        }
+    }
+
+    fn writeTransport(self: *WsClient, bytes: []const u8) !void {
+        if (self.tls) |tls| {
+            try tls.tls_client.writer.writeAll(bytes);
+            return;
+        }
+        try self.stream.writeAll(bytes);
+    }
+
+    fn flushTransport(self: *WsClient) !void {
+        if (self.tls) |tls| {
+            try tls.tls_client.writer.flush();
+            try tls.stream_writer.interface.flush();
         }
     }
 
@@ -321,22 +376,21 @@ pub const WsClient = struct {
         @memcpy(header[hlen..][0..4], &mask);
         hlen += 4;
 
-        try self.tls.tls_client.writer.writeAll(header[0..hlen]);
+        try self.writeTransport(header[0..hlen]);
 
         // Write masked payload in chunks
-        const chunk_buf = &self.tls.scratch;
+        var chunk_buf: [4096]u8 = undefined;
         var offset: usize = 0;
         while (offset < plen) {
             const chunk_len = @min(plen - offset, chunk_buf.len);
             for (0..chunk_len) |i| {
                 chunk_buf[i] = payload[offset + i] ^ mask[(offset + i) % 4];
             }
-            try self.tls.tls_client.writer.writeAll(chunk_buf[0..chunk_len]);
+            try self.writeTransport(chunk_buf[0..chunk_len]);
             offset += chunk_len;
         }
 
-        try self.tls.tls_client.writer.flush();
-        try self.tls.stream_writer.interface.flush();
+        try self.flushTransport();
     }
 
     /// Send a text frame (acquires write_mu).
@@ -344,6 +398,13 @@ pub const WsClient = struct {
         self.write_mu.lock();
         defer self.write_mu.unlock();
         try self.writeFrameLocked(.text, text);
+    }
+
+    /// Send a binary frame (acquires write_mu).
+    pub fn writeBinary(self: *WsClient, payload: []const u8) !void {
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
+        try self.writeFrameLocked(.binary, payload);
     }
 
     /// Send a close frame (acquires write_mu, ignores errors).
@@ -389,11 +450,74 @@ pub const WsClient = struct {
         }
     }
 
+    /// Read a complete text or binary message, aggregating continuation frames.
+    /// Returns heap-allocated payload (caller frees) or null on graceful close.
+    pub fn readMessage(self: *WsClient) !?Message {
+        var message: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer message.deinit(self.allocator);
+        var message_opcode: ?Opcode = null;
+
+        while (true) {
+            const maybe_frame = try self.readFrame();
+            if (maybe_frame == null) {
+                message.deinit(self.allocator);
+                return null;
+            }
+            const frame = maybe_frame.?;
+            defer if (frame.payload.len > 0) self.allocator.free(frame.payload);
+
+            switch (frame.opcode) {
+                .text, .binary => {
+                    if (message_opcode == null) {
+                        message_opcode = frame.opcode;
+                    } else if (message_opcode.? != frame.opcode) {
+                        message.deinit(self.allocator);
+                        return error.WsProtocolError;
+                    }
+                    try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
+                    if (frame.fin) {
+                        const payload = try message.toOwnedSlice(self.allocator);
+                        return .{
+                            .opcode = message_opcode.?,
+                            .payload = payload,
+                        };
+                    }
+                },
+                .continuation => {
+                    if (message_opcode == null) {
+                        message.deinit(self.allocator);
+                        return error.WsProtocolError;
+                    }
+                    try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
+                    if (frame.fin) {
+                        const payload = try message.toOwnedSlice(self.allocator);
+                        return .{
+                            .opcode = message_opcode.?,
+                            .payload = payload,
+                        };
+                    }
+                },
+                .ping => {}, // auto-handled inside readFrame
+                else => {},
+            }
+        }
+    }
+
     pub fn deinit(self: *WsClient) void {
-        self.tls.tls_client.end() catch |err| {
-            log.warn("TLS close_notify failed: {}", .{err});
-        };
-        self.tls.deinit(self.allocator);
+        if (self.tls) |tls| {
+            tls.tls_client.end() catch |err| {
+                log.warn("TLS close_notify failed: {}", .{err});
+            };
+            tls.deinit(self.allocator);
+        }
         self.stream.close();
     }
 };
@@ -497,6 +621,16 @@ test "ws accept key known value" {
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     const accept = WsClient.computeAcceptKey(key);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &accept);
+}
+
+test "ws connectPlain compiles with nullable tls transport" {
+    const client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .tls = null,
+        .write_mu = .{},
+    };
+    try std.testing.expect(client.tls == null);
 }
 
 test "ws accept key length" {
@@ -757,4 +891,93 @@ test "ws buildFrame zero-len payload close" {
     try std.testing.expectEqual(@as(usize, 6), n); // 2 header + 4 mask
     try std.testing.expectEqual(@as(u8, 0x88), buf[0]); // close
     try std.testing.expectEqual(@as(u8, 0x80), buf[1]); // MASK=1, len=0
+}
+
+// Regression: v2026.3.12 applied a blanket `n == 0 → ConnectionClosed` check
+// to both TLS and plain socket paths. TLS readVec may return 0 while it
+// refills its internal buffer or processes post-handshake records, so only
+// plain sockets should treat a zero-byte read as EOF.
+
+fn fake_tls_test_stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    return error.EndOfStream;
+}
+
+fn fake_tls_read_vec_zero_then_byte(reader: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    if (reader.seek == 0 and reader.end == 0) {
+        // Mimic std.crypto.tls.Client.readVec buffering internal TLS records
+        // before returning any application bytes to the caller.
+        reader.seek = 1;
+        reader.end = 1;
+        return 0;
+    }
+    data[0][0] = 'Z';
+    return 1;
+}
+
+test "ws readExact TLS tolerates transient zero readVec return" {
+    var tls_reader_storage = [_]u8{0};
+    var tls_state: TlsState = undefined;
+    tls_state.tls_client = undefined;
+    tls_state.tls_client.reader = .{
+        .buffer = &tls_reader_storage,
+        .seek = 0,
+        .end = 0,
+        .vtable = &.{
+            .stream = fake_tls_test_stream,
+            .readVec = fake_tls_read_vec_zero_then_byte,
+        },
+    };
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .tls = &tls_state,
+        .write_mu = .{},
+    };
+
+    var buf: [1]u8 = undefined;
+    try client.readExact(&buf);
+    try std.testing.expectEqual(@as(u8, 'Z'), buf[0]);
+}
+
+test "ws readExact plain returns ConnectionClosed on immediate EOF" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const fds = try std.posix.pipe();
+    std.posix.close(fds[1]); // close write end → read returns 0
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = fds[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer std.posix.close(fds[0]);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf));
+}
+
+test "ws readExact plain reads data then ConnectionClosed on EOF" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const fds = try std.posix.pipe();
+
+    _ = try std.posix.write(fds[1], "OK");
+    std.posix.close(fds[1]);
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = fds[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer std.posix.close(fds[0]);
+
+    // First read succeeds
+    var buf: [2]u8 = undefined;
+    try client.readExact(&buf);
+    try std.testing.expectEqualStrings("OK", &buf);
+
+    // Next read hits EOF
+    var buf2: [1]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf2));
 }

@@ -10,6 +10,7 @@ const RetrievalCandidate = retrieval.RetrievalCandidate;
 const RetrievalSourceAdapter = retrieval.RetrievalSourceAdapter;
 const SourceCapabilities = retrieval.SourceCapabilities;
 const config_types = @import("../../config_types.zig");
+const fs_compat = @import("../../fs_compat.zig");
 const process_util = @import("../../tools/process_util.zig");
 const root = @import("../root.zig");
 const log = std.log.scoped(.qmd);
@@ -276,7 +277,7 @@ pub const QmdAdapter = struct {
 
             // Check if existing file has same content hash (skip redundant writes)
             const skip = blk: {
-                const existing = std.fs.cwd().readFileAlloc(allocator, file_path, 1024 * 1024) catch break :blk false;
+                const existing = fs_compat.readFileAlloc(std.fs.cwd(), allocator, file_path, 1024 * 1024) catch break :blk false;
                 defer allocator.free(existing);
                 break :blk std.hash.Fnv1a_32.hash(existing) == new_hash;
             };
@@ -550,7 +551,7 @@ test "exportSessions with mock session store writes files" {
     try std.testing.expect(mock.call_count >= 1);
 
     // Verify file was created
-    const content = try tmp.dir.readFileAlloc(allocator, "session-1.md", 4096);
+    const content = try fs_compat.readFileAlloc(tmp.dir, allocator, "session-1.md", 4096);
     defer allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "Session: session-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "**User**: Hello") != null);

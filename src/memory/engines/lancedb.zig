@@ -51,6 +51,8 @@ pub const LanceDbMemory = struct {
         embedder: ?EmbeddingProvider,
         config: LanceDbConfig,
     ) !Self {
+        const use_wal = sqlite_mod.shouldUseWal(db_path);
+
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path, &db);
         if (rc != c.SQLITE_OK) {
@@ -64,16 +66,35 @@ pub const LanceDbMemory = struct {
             .embedder = embedder,
             .config = config,
         };
+        self_.configurePragmas(use_wal);
         try self_.migrate();
         return self_;
     }
 
+    fn configurePragmas(self: *Self, use_wal: bool) void {
+        const journal_pragma: [:0]const u8 = if (use_wal)
+            "PRAGMA journal_mode = WAL;"
+        else
+            "PRAGMA journal_mode = DELETE;";
+        const pragmas = [_][:0]const u8{
+            journal_pragma,
+            "PRAGMA synchronous  = NORMAL;",
+            "PRAGMA temp_store   = MEMORY;",
+        };
+        for (pragmas) |pragma| {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, pragma, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                if (err_msg) |msg| {
+                    log.err("pragma failed: {s}", .{std.mem.span(msg)});
+                    c.sqlite3_free(msg);
+                }
+            }
+        }
+    }
+
     fn migrate(self: *Self) !void {
         const sql =
-            \\PRAGMA journal_mode = WAL;
-            \\PRAGMA synchronous  = NORMAL;
-            \\PRAGMA temp_store   = MEMORY;
-            \\
             \\CREATE TABLE IF NOT EXISTS lancedb_memories (
             \\  id         TEXT PRIMARY KEY,
             \\  key        TEXT UNIQUE NOT NULL,
