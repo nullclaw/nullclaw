@@ -13,6 +13,7 @@
 //   WA_GROUP_ALLOW_FROM   - Comma-separated group phone allowlist (falls back to WA_ALLOW_FROM)
 
 const http = require("http");
+const https = require("https");
 const path = require("path");
 const fs = require("fs");
 const qrcodeTerminal = require("qrcode-terminal");
@@ -279,18 +280,22 @@ function hasMedia(message) {
 
 function forwardToGateway(payload) {
   const url = new URL("/whatsapp_web", GATEWAY_URL);
+  const transport = url.protocol === "https:" ? https : http;
   const options = {
     hostname: url.hostname,
-    port: url.port || 80,
-    path: url.pathname,
+    port: url.port || (url.protocol === "https:" ? 443 : 80),
+    path: `${url.pathname}${url.search}`,
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(payload),
     },
   };
+  if (AUTH_TOKEN) {
+    options.headers.Authorization = `Bearer ${AUTH_TOKEN}`;
+  }
 
-  const req = http.request(options, (res) => {
+  const req = transport.request(options, (res) => {
     if (res.statusCode !== 200) {
       console.log(`[nullclaw-wa-web] Gateway returned ${res.statusCode}`);
     }
