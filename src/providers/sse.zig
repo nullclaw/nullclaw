@@ -241,6 +241,14 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
 }
 
 /// Extract `choices[0].delta.content` from an SSE JSON payload.
+/// Falls back to `delta.reasoning_content` when `content` is absent or empty.
+/// This handles reasoning models (e.g. glm-5, kimi-k2.5) that emit their
+/// thinking in `reasoning_content` with `"content": ""` during the think phase.
+///
+/// When falling back to `reasoning_content`, the text is wrapped in
+/// `<think>...</think>` tags so that the downstream ThinkStripStreamCallback
+/// suppresses it from the visible output — users see only the final answer.
+///
 /// Returns owned slice or null if no content found.
 pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
@@ -257,11 +265,24 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     const delta = first.object.get("delta") orelse return null;
     if (delta != .object) return null;
 
-    const content = delta.object.get("content") orelse return null;
-    if (content != .string) return null;
-    if (content.string.len == 0) return null;
+    // Primary: use content if non-empty.
+    if (delta.object.get("content")) |content| {
+        if (content == .string and content.string.len > 0) {
+            return try allocator.dupe(u8, content.string);
+        }
+    }
 
-    return try allocator.dupe(u8, content.string);
+    // Fallback: reasoning models (glm-5, kimi-k2.5, etc.) emit thinking in
+    // `reasoning_content` while `content` is "" or absent during the think phase.
+    // Wrap in <think>...</think> so the ThinkStripStreamCallback suppresses the
+    // raw reasoning from the visible stream — only the final answer content is shown.
+    if (delta.object.get("reasoning_content")) |rc| {
+        if (rc == .string and rc.string.len > 0) {
+            return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{rc.string});
+        }
+    }
+
+    return null;
 }
 
 /// Run curl in SSE streaming mode and parse output line by line.
@@ -925,6 +946,36 @@ test "extractDeltaContent without content" {
 
 test "extractDeltaContent empty content" {
     const result = try extractDeltaContent(std.testing.allocator, "{\"choices\":[{\"delta\":{\"content\":\"\"}}]}");
+    try std.testing.expect(result == null);
+}
+
+test "extractDeltaContent reasoning_content fallback when content empty" {
+    // Regression: glm-5/kimi-k2.5 emit reasoning in reasoning_content with content:"".
+    // extractDeltaContent must fall back to reasoning_content so the stream is non-empty.
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"thinking...\"}}]}")).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<think>thinking...</think>", result);
+}
+
+test "extractDeltaContent reasoning_content fallback when content absent" {
+    // Regression: some reasoning model chunks have no content key at all.
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"step 1\"}}]}")).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<think>step 1</think>", result);
+}
+
+test "extractDeltaContent content takes precedence over reasoning_content" {
+    // When both are present and content is non-empty, content wins.
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"answer\",\"reasoning_content\":\"thinking...\"}}]}")).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("answer", result);
+}
+
+test "extractDeltaContent empty reasoning_content returns null" {
+    const result = try extractDeltaContent(std.testing.allocator, "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"\"}}]}");
     try std.testing.expect(result == null);
 }
 

@@ -793,12 +793,41 @@ pub const OpenAiCompatibleProvider = struct {
                 .{ self.name, request_text_bytes, self.max_streaming_prompt_bytes.? },
             );
             const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-            if (fallback.content) |text| {
-                callback(callback_ctx, root.StreamChunk.textDelta(text));
+            // Emit visible content. For reasoning models (e.g. glm-5, kimi-k2.5)
+            // `content` may be null while `reasoning_content` holds the answer;
+            // strip think-blocks and emit whichever is non-empty.
+            const emit_text: ?[]const u8 = if (fallback.content) |c| c else fallback.reasoning_content;
+            if (emit_text) |text| {
+                const stripped = try stripThinkBlocks(allocator, text);
+                defer allocator.free(stripped);
+                if (stripped.len > 0)
+                    callback(callback_ctx, root.StreamChunk.textDelta(stripped));
             }
             callback(callback_ctx, root.StreamChunk.finalChunk());
+            // Build the returned content: prefer stripped content, fall back to stripped reasoning.
+            const returned_content: ?[]const u8 = blk: {
+                if (fallback.content) |c| {
+                    const s = try stripThinkBlocks(allocator, c);
+                    if (s.len > 0) break :blk s;
+                    allocator.free(s);
+                }
+                if (fallback.reasoning_content) |rc| {
+                    const s = try stripThinkBlocks(allocator, rc);
+                    if (s.len > 0) break :blk s;
+                    allocator.free(s);
+                }
+                break :blk null;
+            };
+            if (fallback.content) |c| if (c.len > 0) allocator.free(c);
+            if (fallback.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+            for (fallback.tool_calls) |tc| {
+                if (tc.id.len > 0) allocator.free(tc.id);
+                if (tc.name.len > 0) allocator.free(tc.name);
+                if (tc.arguments.len > 0) allocator.free(tc.arguments);
+            }
+            if (fallback.tool_calls.len > 0) allocator.free(fallback.tool_calls);
             return .{
-                .content = fallback.content,
+                .content = returned_content,
                 .usage = fallback.usage,
                 .model = fallback.model,
             };
@@ -860,12 +889,41 @@ pub const OpenAiCompatibleProvider = struct {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
                 const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-                if (fallback.content) |text| {
-                    callback(callback_ctx, root.StreamChunk.textDelta(text));
+                // Emit visible content. For reasoning models (e.g. glm-5, kimi-k2.5)
+                // `content` may be null while `reasoning_content` holds the answer;
+                // strip think-blocks and emit whichever is non-empty.
+                const emit_text: ?[]const u8 = if (fallback.content) |c| c else fallback.reasoning_content;
+                if (emit_text) |text| {
+                    const stripped = try stripThinkBlocks(allocator, text);
+                    defer allocator.free(stripped);
+                    if (stripped.len > 0)
+                        callback(callback_ctx, root.StreamChunk.textDelta(stripped));
                 }
                 callback(callback_ctx, root.StreamChunk.finalChunk());
+                // Build the returned content: prefer stripped content, fall back to stripped reasoning.
+                const returned_content: ?[]const u8 = blk: {
+                    if (fallback.content) |c| {
+                        const s = try stripThinkBlocks(allocator, c);
+                        if (s.len > 0) break :blk s;
+                        allocator.free(s);
+                    }
+                    if (fallback.reasoning_content) |rc| {
+                        const s = try stripThinkBlocks(allocator, rc);
+                        if (s.len > 0) break :blk s;
+                        allocator.free(s);
+                    }
+                    break :blk null;
+                };
+                if (fallback.content) |c| if (c.len > 0) allocator.free(c);
+                if (fallback.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+                for (fallback.tool_calls) |tc| {
+                    if (tc.id.len > 0) allocator.free(tc.id);
+                    if (tc.name.len > 0) allocator.free(tc.name);
+                    if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                }
+                if (fallback.tool_calls.len > 0) allocator.free(fallback.tool_calls);
                 return .{
-                    .content = fallback.content,
+                    .content = returned_content,
                     .usage = fallback.usage,
                     .model = fallback.model,
                 };
