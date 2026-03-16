@@ -832,3 +832,57 @@ test "compat_providers table count" {
     // Verify we have the expected number of entries (guard against accidental deletions).
     try std.testing.expect(compat_providers.len >= 89);
 }
+
+test "fromConfig threads max_streaming_prompt_bytes to azure branch" {
+    // GAP-13: The azure branch (azure_openai_provider) must thread the limit
+    // through to the underlying compatible provider just like the compatible_provider
+    // branch does.
+    const alloc = std.testing.allocator;
+    // null → no limit
+    var h1 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, null);
+    defer h1.deinit();
+    try std.testing.expect(h1 == .compatible);
+    try std.testing.expectEqual(@as(?usize, null), h1.compatible.max_streaming_prompt_bytes);
+    // non-null → limit applied
+    var h2 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, 65536);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 65536), h2.compatible.max_streaming_prompt_bytes);
+}
+
+test "fromConfig threads max_streaming_prompt_bytes to unknown-with-base-url branch" {
+    // GAP-14: The unknown branch falls back to an OpenAI-compatible provider
+    // when base_url is set. That provider must also receive the limit.
+    const alloc = std.testing.allocator;
+    // null → no limit
+    var h1 = ProviderHolder.fromConfig(alloc, "my-local-llm", "key", "http://localhost:9999/v1", true, null, null);
+    defer h1.deinit();
+    try std.testing.expect(h1 == .compatible);
+    try std.testing.expectEqual(@as(?usize, null), h1.compatible.max_streaming_prompt_bytes);
+    // non-null → limit applied
+    var h2 = ProviderHolder.fromConfig(alloc, "my-local-llm", "key", "http://localhost:9999/v1", true, null, 8192);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 8192), h2.compatible.max_streaming_prompt_bytes);
+}
+
+test "fromConfig threads max_streaming_prompt_bytes zero value" {
+    // GAP-15: A limit of 0 must be treated as "always skip streaming" (not as
+    // null / no-limit).  The value 0 is semantically valid: every request is
+    // at or above zero bytes.
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "groq", "key", null, true, null, 0);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqual(@as(?usize, 0), h.compatible.max_streaming_prompt_bytes);
+    // Azure branch
+    var h2 = ProviderHolder.fromConfig(alloc, "azure", "key", "https://res.openai.azure.com", true, null, 0);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 0), h2.compatible.max_streaming_prompt_bytes);
+    // Unknown-with-base-url branch
+    var h3 = ProviderHolder.fromConfig(alloc, "custom-llm", "key", "http://localhost:7777/v1", true, null, 0);
+    defer h3.deinit();
+    try std.testing.expect(h3 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 0), h3.compatible.max_streaming_prompt_bytes);
+}

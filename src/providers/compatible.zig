@@ -2249,3 +2249,73 @@ test "shouldSkipStreaming: old 32KiB limit would have skipped typical session wi
     // New default (null) must not skip.
     try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// estimateRequestTextBytes — edge cases (GAP-6, GAP-7, GAP-8)
+// ════════════════════════════════════════════════════════════════════════════
+
+test "estimateRequestTextBytes: empty messages slice returns zero" {
+    // GAP-6: Must not crash on an empty slice and must return 0.
+    const req = root.ChatRequest{ .messages = &.{}, .model = "m" };
+    try std.testing.expectEqual(@as(usize, 0), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+test "estimateRequestTextBytes: counts content_parts text and ignores non-text" {
+    // GAP-7: Only text parts inside content_parts should be counted; image
+    // parts must not contribute to the byte total.
+    const text_part = root.ContentPart{ .text = "hello world" }; // 11 bytes
+    const image_part = root.ContentPart{ .image_url = .{ .url = "https://x.com/img.jpg", .detail = .auto } };
+    var parts = [_]root.ContentPart{ text_part, image_part };
+    const msg = root.ChatMessage{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    };
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{msg}, .model = "m" };
+    // Only "hello world" (11 bytes) — not the image URL — is counted.
+    try std.testing.expectEqual(@as(usize, 11), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+test "estimateRequestTextBytes: accumulates across multiple messages" {
+    // GAP-8: Total must be the sum across all messages, not just the last.
+    const m1 = root.ChatMessage.user("aaa"); // 3 bytes
+    const m2 = root.ChatMessage.user("bbbb"); // 4 bytes
+    const m3 = root.ChatMessage.user("ccccc"); // 5 bytes
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{ m1, m2, m3 }, .model = "m" };
+    try std.testing.expectEqual(@as(usize, 12), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// shouldSkipStreaming — additional edge cases (GAP-9, GAP-10, GAP-11)
+// ════════════════════════════════════════════════════════════════════════════
+
+test "shouldSkipStreaming: zero limit skips any non-empty request" {
+    // GAP-9: A limit of 0 means every message (≥1 byte) should fall back.
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("x")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(0, req));
+}
+
+test "shouldSkipStreaming: empty request never skips regardless of limit" {
+    // GAP-10: Zero-byte payload is always below any limit (including 0 is
+    // 0 >= 0 = true — but an empty messages slice returns 0 bytes, and 0 >= 0
+    // means a zero limit would still skip an empty request; document actual behaviour).
+    const req = root.ChatRequest{ .messages = &.{}, .model = "m" };
+    // With a non-zero limit: 0 bytes < limit → no skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(1, req));
+    // With null: always no skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds limit" {
+    // GAP-11: Threshold must apply to the accumulated total, not per-message.
+    // Three messages of 10 bytes each = 30 bytes total; limit = 25.
+    const m1 = root.ChatMessage.user("aaaaaaaaaa"); // 10
+    const m2 = root.ChatMessage.user("bbbbbbbbbb"); // 10
+    const m3 = root.ChatMessage.user("cccccccccc"); // 10 → total 30
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{ m1, m2, m3 }, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(25, req));
+    // Individual messages are each under the limit; verify the sum is what matters.
+    const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
+}

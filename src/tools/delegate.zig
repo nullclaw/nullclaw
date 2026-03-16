@@ -197,7 +197,13 @@ pub const DelegateTool = struct {
             base_url,
             native_tools,
             user_agent,
-            null, // max_streaming_prompt_bytes: no limit for delegate calls
+            // GAP-19: max_streaming_prompt_bytes is intentionally null here.
+            // The delegate tool performs short, single-turn completions where
+            // token volumes are small and streaming is not used.  Passing null
+            // means "no limit" (always stream), which is correct for this path.
+            // If a named agent config with a provider entry is used the field
+            // will be threaded through via the agent config resolution above.
+            null,
         );
         defer provider_holder.deinit();
         return provider_holder.provider().chatWithSystem(

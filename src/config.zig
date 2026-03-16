@@ -696,6 +696,13 @@ pub const Config = struct {
                         has_field = true;
                     }
                 }
+                if (comptime @hasField(ProviderEntry, "max_streaming_prompt_bytes")) {
+                    if (entry.max_streaming_prompt_bytes) |mb| {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"max_streaming_prompt_bytes\": {d}", .{mb});
+                        has_field = true;
+                    }
+                }
                 try w.print("}}", .{});
                 if (i + 1 < self.providers.len) try w.print(",", .{});
                 try w.print("\n", .{});
@@ -3828,6 +3835,161 @@ test "save escapes provider string fields" {
     try std.testing.expectEqualStrings("sk-\"quoted\"", openai.get("api_key").?.string);
     try std.testing.expectEqualStrings("https://api.example.com/v1/\"quoted\"", openai.get("base_url").?.string);
     try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
+}
+
+test "parseJson reads max_streaming_prompt_bytes from provider config" {
+    // GAP-1/2: Regression — field was missing from config_parse.zig so setting
+    // max_streaming_prompt_bytes in config.json had no effect.
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"models":{"providers":{"groq":{"api_key":"gsk_test","max_streaming_prompt_bytes":524288},"infini-ai":{"api_key":"key"}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    // Manually free provider allocations made by parseJson (same pattern as
+    // existing "json parse providers section" test — Config.deinit() only
+    // tears down the arena, which is not used here).
+    defer {
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.base_url) |b| allocator.free(b);
+            if (e.user_agent) |ua| allocator.free(ua);
+        }
+        allocator.free(cfg.providers);
+    }
+
+    // Provider with field set → value returned.
+    try std.testing.expectEqual(@as(?usize, 524288), cfg.getProviderMaxStreamingPromptBytes("groq"));
+    // Provider without field → null (no limit, always stream).
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("infini-ai"));
+    // Unrecognised provider → null.
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("unknown"));
+}
+
+test "parseJson ignores negative max_streaming_prompt_bytes" {
+    // A negative integer in the JSON should not crash and should leave the
+    // field at its default (null).
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"models":{"providers":{"bad":{"api_key":"x","max_streaming_prompt_bytes":-1}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    // Manually free provider allocations (same pattern as existing passing
+    // "json parse providers section" test — no arena in use here).
+    defer {
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.base_url) |b| allocator.free(b);
+            if (e.user_agent) |ua| allocator.free(ua);
+        }
+        allocator.free(cfg.providers);
+    }
+
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("bad"));
+}
+
+test "save writes max_streaming_prompt_bytes when set" {
+    // GAP-3/4: save() must emit the field so it survives a config write.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "groq", .api_key = "gsk_test", .max_streaming_prompt_bytes = 524288 },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    // The raw JSON must contain the field.
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"max_streaming_prompt_bytes\": 524288") != null);
+}
+
+test "save omits max_streaming_prompt_bytes when null" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "groq", .api_key = "gsk_test" },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    // When null the field should be absent from the JSON (no "max_streaming").
+    try std.testing.expect(std.mem.indexOf(u8, content, "max_streaming_prompt_bytes") == null);
+}
+
+test "save and parseJson round-trip max_streaming_prompt_bytes" {
+    // Full round-trip: write config with field, reload, assert value preserved.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "infini-ai", .api_key = "key", .max_streaming_prompt_bytes = 131072 },
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    // Provider with field set → value survives round-trip.
+    try std.testing.expectEqual(@as(?usize, 131072), loaded.getProviderMaxStreamingPromptBytes("infini-ai"));
+    // Provider without field → null survives round-trip.
+    try std.testing.expectEqual(@as(?usize, null), loaded.getProviderMaxStreamingPromptBytes("openai"));
 }
 
 test "json parse tools.media.audio section" {
