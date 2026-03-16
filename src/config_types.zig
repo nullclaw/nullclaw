@@ -1735,3 +1735,9 @@ test "HttpRequestConfig fallback provider validation disallows auto" {
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("AUTO"));
 }
+
+test "ProviderEntry.max_streaming_prompt_bytes defaults to null" {
+    // GAP-5: Documents that zero-init ProviderEntry has no streaming limit.
+    const pe = ProviderEntry{ .name = "test" };
+    try std.testing.expectEqual(@as(?usize, null), pe.max_streaming_prompt_bytes);
+}

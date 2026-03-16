@@ -2025,6 +2025,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("user_agent")) |ua| {
                             if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
                         }
+                        if (val.object.get("max_streaming_prompt_bytes")) |mb| {
+                            if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
+                        }
                         try prov_list.append(self.allocator, pe);
                     }
                     self.providers = try prov_list.toOwnedSlice(self.allocator);

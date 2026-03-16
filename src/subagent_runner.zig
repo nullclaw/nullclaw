@@ -166,3 +166,33 @@ test "findProviderEntry matches provider aliases" {
     const found = findProviderEntry("AZURE-OPENAI", &entries) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", found.base_url.?);
 }
+
+test "findProviderEntry threads max_streaming_prompt_bytes from entry" {
+    // GAP-20a: findProviderEntry must return the full ProviderEntry including
+    // max_streaming_prompt_bytes so runTaskWithTools can thread it to the holder.
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "groq", .api_key = "gsk_test", .max_streaming_prompt_bytes = 65536 },
+    };
+    const found = findProviderEntry("groq", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?usize, 65536), found.max_streaming_prompt_bytes);
+}
+
+test "findProviderEntry returns null max_streaming_prompt_bytes when not configured" {
+    // GAP-20b: When the provider entry does not set max_streaming_prompt_bytes
+    // the field must default to null (no limit, always stream).
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    const found = findProviderEntry("openai", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?usize, null), found.max_streaming_prompt_bytes);
+}
+
+test "findProviderEntry returns null when provider not in list" {
+    // GAP-20c: When no entry matches, findProviderEntry returns null and
+    // runTaskWithTools falls back to null for max_streaming_prompt_bytes,
+    // meaning no streaming limit is applied.
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    try std.testing.expect(findProviderEntry("anthropic", &entries) == null);
+}
