@@ -3890,6 +3890,33 @@ test "providers defaults to empty" {
     try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
 }
 
+test "getProviderMaxStreamingPromptBytes: null when not set and when provider missing" {
+    const entries = [_]ProviderEntry{
+        .{
+            .name = "infini-ai",
+            .api_key = "key",
+            // max_streaming_prompt_bytes not set — should default to null
+        },
+        .{
+            .name = "groq",
+            .api_key = "key",
+            .max_streaming_prompt_bytes = 524288,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .providers = &entries,
+        .allocator = std.testing.allocator,
+    };
+    // Provider with no field set returns null.
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("infini-ai"));
+    // Provider with field set returns the configured value.
+    try std.testing.expectEqual(@as(?usize, 524288), cfg.getProviderMaxStreamingPromptBytes("groq"));
+    // Unknown provider returns null.
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("unknown"));
+}
+
 test "audio_media defaults" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",
