@@ -228,6 +228,17 @@
     "version": "1.0.0"
   },
 
+  "http_request": {
+    "enabled": false,
+    "max_response_size": 1000000,
+    "timeout_secs": 30,
+    "allowed_domains": [],
+    "search_base_url": null,
+    "search_provider": "auto",
+    "search_fallback_providers": ["jina", "duckduckgo"]
+  },
+
+
   "security": {
     "sandbox": {
       "backend": "auto"

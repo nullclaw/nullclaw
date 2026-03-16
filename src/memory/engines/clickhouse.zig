@@ -1128,10 +1128,10 @@ const ClickHouseMemoryImpl = struct {
             \\SELECT toString(count()) FROM (
             \\    SELECT session_id
             \\    FROM {s}.{s}
-            \\    WHERE instance_id = {{iid:String}}
+            \\    WHERE instance_id = {{iid:String}} AND role != '{s}'
             \\    GROUP BY session_id
             \\)
-        , .{ self_.db_q, self_.messages_table_q });
+        , .{ self_.db_q, self_.messages_table_q, root.RUNTIME_COMMAND_ROLE });
         defer self_.allocator.free(query);
 
         const body = try self_.executeQuery(self_.allocator, query, &.{
@@ -1155,11 +1155,11 @@ const ClickHouseMemoryImpl = struct {
         const query = try std.fmt.allocPrint(allocator,
             \\SELECT session_id, toString(count()), toString(min(created_at)), toString(max(created_at))
             \\FROM {s}.{s}
-            \\WHERE instance_id = {{iid:String}}
+            \\WHERE instance_id = {{iid:String}} AND role != '{s}'
             \\GROUP BY session_id
             \\ORDER BY max(created_at) DESC
             \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
-        , .{ self_.db_q, self_.messages_table_q });
+        , .{ self_.db_q, self_.messages_table_q, root.RUNTIME_COMMAND_ROLE });
         defer allocator.free(query);
 
         const body = try self_.executeQuery(allocator, query, &.{
@@ -1201,8 +1201,8 @@ const ClickHouseMemoryImpl = struct {
 
         const query = try std.fmt.allocPrint(self_.allocator,
             \\SELECT toString(count()) FROM {s}.{s}
-            \\WHERE session_id = {{sid:String}} AND instance_id = {{iid:String}}
-        , .{ self_.db_q, self_.messages_table_q });
+            \\WHERE session_id = {{sid:String}} AND instance_id = {{iid:String}} AND role != '{s}'
+        , .{ self_.db_q, self_.messages_table_q, root.RUNTIME_COMMAND_ROLE });
         defer self_.allocator.free(query);
 
         const body = try self_.executeQuery(self_.allocator, query, &.{
@@ -1226,10 +1226,10 @@ const ClickHouseMemoryImpl = struct {
 
         const query = try std.fmt.allocPrint(allocator,
             \\SELECT role, content, toString(created_at) FROM {s}.{s}
-            \\WHERE session_id = {{sid:String}} AND instance_id = {{iid:String}}
+            \\WHERE session_id = {{sid:String}} AND instance_id = {{iid:String}} AND role != '{s}'
             \\ORDER BY message_order ASC, message_id ASC
             \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
-        , .{ self_.db_q, self_.messages_table_q });
+        , .{ self_.db_q, self_.messages_table_q, root.RUNTIME_COMMAND_ROLE });
         defer allocator.free(query);
 
         const body = try self_.executeQuery(allocator, query, &.{

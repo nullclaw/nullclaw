@@ -2823,5 +2823,3 @@ test "tick reschedules anchored recurring job using cron expression" {
     _ = scheduler.tick(3480, null);
     try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
 }
-
-test "cron module compiles" {}

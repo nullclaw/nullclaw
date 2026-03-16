@@ -49,8 +49,8 @@ nullclaw gateway
 | `nullclaw channel start telegram` | 启动指定渠道 |
 | `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw 数据 |
 | `nullclaw migrate openclaw` | 执行迁移 |
-| `nullclaw history list [--json]` | 列出会话记录 |
-| `nullclaw history show <session_id> [--json]` | 查看指定会话的消息详情 |
+| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出会话记录 |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定会话的消息详情 |
 
 ## 服务化运行建议
 

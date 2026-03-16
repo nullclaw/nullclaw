@@ -212,16 +212,36 @@ const PostgresMemoryImpl = struct {
         self_.q_clear_usage = try buildQuery(allocator, "DELETE FROM {schema}.session_usage WHERE session_id = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_usage);
 
-        self_.q_count_sessions = try buildQuery(allocator, "SELECT COUNT(*) FROM (SELECT 1 FROM {schema}.messages WHERE instance_id = $1 GROUP BY session_id) AS sessions", schema_q, table_q);
+        self_.q_count_sessions = try buildQuery(
+            allocator,
+            "SELECT COUNT(*) FROM (SELECT 1 FROM {schema}.messages WHERE instance_id = $1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' GROUP BY session_id) AS sessions",
+            schema_q,
+            table_q,
+        );
         errdefer allocator.free(self_.q_count_sessions);
 
-        self_.q_list_sessions = try buildQuery(allocator, "SELECT session_id, COUNT(*), MIN(created_at)::text, MAX(created_at)::text FROM {schema}.messages WHERE instance_id = $1 GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT $2 OFFSET $3", schema_q, table_q);
+        self_.q_list_sessions = try buildQuery(
+            allocator,
+            "SELECT session_id, COUNT(*), MIN(created_at)::text, MAX(created_at)::text FROM {schema}.messages WHERE instance_id = $1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT $2 OFFSET $3",
+            schema_q,
+            table_q,
+        );
         errdefer allocator.free(self_.q_list_sessions);
 
-        self_.q_count_detailed_msgs = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2", schema_q, table_q);
+        self_.q_count_detailed_msgs = try buildQuery(
+            allocator,
+            "SELECT COUNT(*) FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "'",
+            schema_q,
+            table_q,
+        );
         errdefer allocator.free(self_.q_count_detailed_msgs);
 
-        self_.q_load_msgs_detailed = try buildQuery(allocator, "SELECT role, content, created_at::text FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2 ORDER BY id ASC LIMIT $3 OFFSET $4", schema_q, table_q);
+        self_.q_load_msgs_detailed = try buildQuery(
+            allocator,
+            "SELECT role, content, created_at::text FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' ORDER BY id ASC LIMIT $3 OFFSET $4",
+            schema_q,
+            table_q,
+        );
         errdefer allocator.free(self_.q_load_msgs_detailed);
 
         self_.q_clear_auto = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND instance_id = $1", schema_q, table_q);

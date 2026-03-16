@@ -739,7 +739,8 @@ pub const SqliteMemory = struct {
     // ── History queries ──────────────────────────────────────────────
 
     pub fn countSessions(self: *Self) !u64 {
-        const sql = "SELECT COUNT(*) FROM (SELECT 1 FROM messages GROUP BY session_id)";
+        const sql =
+            "SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' GROUP BY session_id)";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -755,7 +756,8 @@ pub const SqliteMemory = struct {
     pub fn listSessions(self: *Self, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]root.SessionInfo {
         const sql =
             "SELECT session_id, COUNT(*) as msg_count, MIN(created_at) as first_at, MAX(created_at) as last_at " ++
-            "FROM messages GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT ?1 OFFSET ?2";
+            "FROM messages WHERE role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' " ++
+            "GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT ?1 OFFSET ?2";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -793,7 +795,7 @@ pub const SqliteMemory = struct {
     }
 
     pub fn countDetailedMessages(self: *Self, session_id: []const u8) !u64 {
-        const sql = "SELECT COUNT(*) FROM messages WHERE session_id = ?1";
+        const sql = "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "'";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -808,7 +810,10 @@ pub const SqliteMemory = struct {
 
     /// Load messages with timestamps for a session.
     pub fn loadMessagesDetailed(self: *Self, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) ![]root.DetailedMessageEntry {
-        const sql = "SELECT role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC LIMIT ?2 OFFSET ?3";
+        const sql =
+            "SELECT role, content, created_at FROM messages " ++
+            "WHERE session_id = ?1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' " ++
+            "ORDER BY id ASC LIMIT ?2 OFFSET ?3";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -2119,6 +2124,40 @@ test "sqlite sessionStore saveMessage + loadMessages roundtrip" {
     try std.testing.expectEqualStrings("hello", msgs[0].content);
     try std.testing.expectEqualStrings("assistant", msgs[1].role);
     try std.testing.expectEqualStrings("hi there", msgs[1].content);
+}
+
+test "sqlite sessionStore history views hide runtime command rows" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("s1", root.RUNTIME_COMMAND_ROLE, "/usage full");
+    try store.saveMessage("s1", "user", "hello");
+    try store.saveMessage("s1", "assistant", "hi there");
+    try store.saveMessage("s2", root.RUNTIME_COMMAND_ROLE, "/think high");
+
+    const raw = try store.loadMessages(allocator, "s1");
+    defer root.freeMessages(allocator, raw);
+    try std.testing.expectEqual(@as(usize, 3), raw.len);
+    try std.testing.expectEqualStrings(root.RUNTIME_COMMAND_ROLE, raw[0].role);
+
+    try std.testing.expectEqual(@as(u64, 1), try store.countSessions());
+
+    const sessions = try store.listSessions(allocator, 10, 0);
+    defer root.freeSessionInfos(allocator, sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("s1", sessions[0].session_id);
+    try std.testing.expectEqual(@as(u64, 2), sessions[0].message_count);
+
+    try std.testing.expectEqual(@as(u64, 2), try store.countDetailedMessages("s1"));
+    try std.testing.expectEqual(@as(u64, 0), try store.countDetailedMessages("s2"));
+
+    const detailed = try store.loadMessagesDetailed(allocator, "s1", 10, 0);
+    defer root.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expectEqualStrings("user", detailed[0].role);
+    try std.testing.expectEqualStrings("assistant", detailed[1].role);
 }
 
 test "sqlite sessionStore clearMessages" {

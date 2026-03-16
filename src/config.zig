@@ -906,6 +906,7 @@ pub const Config = struct {
         InvalidWebRelayPairingCodeTtl,
         InvalidWebRelayUiTokenTtl,
         InvalidWebRelayTokenTtl,
+        InsecurePlaintextSecrets,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -926,6 +927,9 @@ pub const Config = struct {
         }
         if (self.gateway.port == 0) {
             return ValidationError.InvalidPort;
+        }
+        if (!self.secrets.encrypt) {
+            return ValidationError.InsecurePlaintextSecrets;
         }
         if (self.reliability.provider_retries > 100) {
             return ValidationError.InvalidRetryCount;
@@ -1028,6 +1032,7 @@ pub const Config = struct {
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
+            ValidationError.InsecurePlaintextSecrets => std.debug.print("Config error: secrets.encrypt=false is not allowed because it stores secrets in plaintext.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
@@ -1213,6 +1218,17 @@ test "validation passes for defaults" {
         .allocator = std.testing.allocator,
     };
     try cfg.validate();
+}
+
+test "validation rejects plaintext secrets" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/model",
+        .allocator = std.testing.allocator,
+    };
+    cfg.secrets.encrypt = false;
+    try std.testing.expectError(Config.ValidationError.InsecurePlaintextSecrets, cfg.validate());
 }
 
 test "validation rejects null default_model" {

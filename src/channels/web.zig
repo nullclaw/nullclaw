@@ -64,6 +64,7 @@ pub const WebChannel = struct {
     listen_address: []const u8,
     ws_path: []const u8,
     max_connections: u16,
+    max_handshake_size: u16,
     account_id: []const u8,
     configured_auth_token: ?[]const u8,
     allowed_origins: []const []const u8,
@@ -127,6 +128,10 @@ pub const WebChannel = struct {
         else
             cfg.max_connections;
         const normalized_path = config_types.WebConfig.normalizePath(cfg.path);
+        const normalized_max_handshake_size: u16 = if (cfg.max_handshake_size == 0)
+            config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE
+        else
+            cfg.max_handshake_size;
         return .{
             .allocator = allocator,
             .transport = parseTransport(cfg.transport),
@@ -134,6 +139,7 @@ pub const WebChannel = struct {
             .listen_address = cfg.listen,
             .ws_path = normalized_path,
             .max_connections = clamped_max_connections,
+            .max_handshake_size = normalized_max_handshake_size,
             .account_id = cfg.account_id,
             .configured_auth_token = cfg.auth_token,
             .allowed_origins = cfg.allowed_origins,
@@ -1027,6 +1033,9 @@ pub const WebChannel = struct {
             .port = self.port,
             .address = self.listen_address,
             .max_conn = @intCast(self.max_connections),
+            .handshake = .{
+                .max_size = self.max_handshake_size,
+            },
         }) catch |err| {
             log.err("Failed to init WebSocket server: {}", .{err});
             return err;
@@ -1807,6 +1816,7 @@ test "WebChannel initFromConfig uses defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", ch.listen_address);
     try std.testing.expectEqualStrings(config_types.WebConfig.DEFAULT_PATH, ch.ws_path);
     try std.testing.expectEqual(@as(u16, 10), ch.max_connections);
+    try std.testing.expectEqual(config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, ch.max_handshake_size);
     try std.testing.expectEqualStrings("default", ch.account_id);
     try std.testing.expect(ch.configured_auth_token == null);
     try std.testing.expectEqual(@as(usize, 0), ch.allowed_origins.len);
@@ -1828,6 +1838,7 @@ test "WebChannel initFromConfig uses custom values" {
         .listen = "0.0.0.0",
         .path = "/relay/",
         .max_connections = 5,
+        .max_handshake_size = 12_288,
         .account_id = "web-main",
         .auth_token = "test-token-123456",
         .message_auth_mode = "token",
@@ -1837,6 +1848,7 @@ test "WebChannel initFromConfig uses custom values" {
     try std.testing.expectEqualStrings("0.0.0.0", ch.listen_address);
     try std.testing.expectEqualStrings("/relay", ch.ws_path);
     try std.testing.expectEqual(@as(u16, 5), ch.max_connections);
+    try std.testing.expectEqual(@as(u16, 12_288), ch.max_handshake_size);
     try std.testing.expectEqualStrings("web-main", ch.account_id);
     try std.testing.expectEqualStrings("test-token-123456", ch.configured_auth_token.?);
     try std.testing.expectEqual(WebChannel.MessageAuthMode.token, ch.message_auth_mode);
@@ -1891,6 +1903,13 @@ test "WebChannel initFromConfig clamps max_connections to tracked limit" {
         .max_connections = 500,
     });
     try std.testing.expectEqual(@as(u16, 64), ch.max_connections);
+}
+
+test "WebChannel initFromConfig normalizes zero handshake size to default" {
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .max_handshake_size = 0,
+    });
+    try std.testing.expectEqual(config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, ch.max_handshake_size);
 }
 
 test "WebChannel vtable name returns web" {

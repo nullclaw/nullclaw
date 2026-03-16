@@ -23,6 +23,22 @@ pub const ChatContext = struct {
 pub const DocumentInfo = struct {
     file_id: []const u8,
     file_name: ?[]const u8,
+    mime_type: ?[]const u8,
+    file_size: ?i64,
+};
+
+pub const VoiceOrAudioKind = enum {
+    voice,
+    audio,
+};
+
+pub const VoiceOrAudioInfo = struct {
+    kind: VoiceOrAudioKind,
+    file_id: []const u8,
+    file_name: ?[]const u8,
+    mime_type: ?[]const u8,
+    file_size: ?i64,
+    duration_secs: ?i64,
 };
 
 pub fn updateId(update: std.json.Value) ?i64 {
@@ -80,7 +96,34 @@ pub fn callbackMessageContext(callback_query: std.json.Value, scratch: *Identity
 }
 
 pub fn voiceOrAudioFileId(message: std.json.Value) ?[]const u8 {
-    return mediaFileId(message, "voice") orelse mediaFileId(message, "audio");
+    const info = voiceOrAudioInfo(message) orelse return null;
+    return info.file_id;
+}
+
+pub fn voiceOrAudioInfo(message: std.json.Value) ?VoiceOrAudioInfo {
+    if (mediaInfo(message, "voice")) |media| {
+        return .{
+            .kind = .voice,
+            .file_id = media.file_id,
+            .file_name = null,
+            .mime_type = media.mime_type,
+            .file_size = media.file_size,
+            .duration_secs = media.duration_secs,
+        };
+    }
+
+    if (mediaInfo(message, "audio")) |media| {
+        return .{
+            .kind = .audio,
+            .file_id = media.file_id,
+            .file_name = media.file_name,
+            .mime_type = media.mime_type,
+            .file_size = media.file_size,
+            .duration_secs = media.duration_secs,
+        };
+    }
+
+    return null;
 }
 
 pub fn photoFileId(message: std.json.Value) ?[]const u8 {
@@ -97,6 +140,8 @@ pub fn documentInfo(message: std.json.Value) ?DocumentInfo {
     return .{
         .file_id = stringField(doc_val, "file_id") orelse return null,
         .file_name = stringField(doc_val, "file_name"),
+        .mime_type = stringField(doc_val, "mime_type"),
+        .file_size = integerField(doc_val, "file_size"),
     };
 }
 
@@ -121,6 +166,25 @@ pub fn textOrCaption(allocator: std.mem.Allocator, message: std.json.Value) ?[]u
 fn mediaFileId(message: std.json.Value, key: []const u8) ?[]const u8 {
     const media = objectField(message, key) orelse return null;
     return stringField(media, "file_id");
+}
+
+const MediaInfo = struct {
+    file_id: []const u8,
+    file_name: ?[]const u8,
+    mime_type: ?[]const u8,
+    file_size: ?i64,
+    duration_secs: ?i64,
+};
+
+fn mediaInfo(message: std.json.Value, key: []const u8) ?MediaInfo {
+    const media = objectField(message, key) orelse return null;
+    return .{
+        .file_id = stringField(media, "file_id") orelse return null,
+        .file_name = stringField(media, "file_name"),
+        .mime_type = stringField(media, "mime_type"),
+        .file_size = integerField(media, "file_size"),
+        .duration_secs = integerField(media, "duration"),
+    };
 }
 
 fn userIdentity(from_obj: std.json.Value, scratch: *IdentityScratch) ?UserIdentity {
@@ -245,4 +309,56 @@ test "telegram update ingress falls back from text to caption" {
     const content = textOrCaption(allocator, parsed.value) orelse return error.TestExpectedEqual;
     defer allocator.free(content);
     try std.testing.expectEqualStrings("caption-only fallback", content);
+}
+
+test "telegram update ingress parses document metadata" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"document":{"file_id":"doc-1","file_name":"invoice.pdf","mime_type":"application/pdf","file_size":12345}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const doc = documentInfo(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("doc-1", doc.file_id);
+    try std.testing.expectEqualStrings("invoice.pdf", doc.file_name.?);
+    try std.testing.expectEqualStrings("application/pdf", doc.mime_type.?);
+    try std.testing.expectEqual(@as(?i64, 12345), doc.file_size);
+}
+
+test "telegram update ingress parses voice and audio metadata" {
+    const voice_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"voice":{"file_id":"voice-1","mime_type":"audio/ogg","file_size":321,"duration":7}}
+    ,
+        .{},
+    );
+    defer voice_parsed.deinit();
+
+    const voice_info = voiceOrAudioInfo(voice_parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(VoiceOrAudioKind.voice, voice_info.kind);
+    try std.testing.expectEqualStrings("voice-1", voice_info.file_id);
+    try std.testing.expectEqualStrings("audio/ogg", voice_info.mime_type.?);
+    try std.testing.expectEqual(@as(?i64, 321), voice_info.file_size);
+    try std.testing.expectEqual(@as(?i64, 7), voice_info.duration_secs);
+
+    const audio_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"audio":{"file_id":"audio-1","file_name":"note.ogg","mime_type":"audio/ogg","file_size":654,"duration":12}}
+    ,
+        .{},
+    );
+    defer audio_parsed.deinit();
+
+    const audio_info = voiceOrAudioInfo(audio_parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(VoiceOrAudioKind.audio, audio_info.kind);
+    try std.testing.expectEqualStrings("audio-1", audio_info.file_id);
+    try std.testing.expectEqualStrings("note.ogg", audio_info.file_name.?);
+    try std.testing.expectEqualStrings("audio/ogg", audio_info.mime_type.?);
+    try std.testing.expectEqual(@as(?i64, 654), audio_info.file_size);
+    try std.testing.expectEqual(@as(?i64, 12), audio_info.duration_secs);
 }

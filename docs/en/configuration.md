@@ -142,7 +142,7 @@ Notes:
 
 ### `agents.list`
 
-- Defines named agent profiles used by tools such as `/delegate`.
+- Defines named agent profiles used by the `delegate` tool, `/subagents spawn --agent`, and `bindings`.
 - Each entry may set `provider` + `model`, or a full `provider/model` ref in `model.primary`.
 - Example:
 
@@ -159,6 +159,101 @@ Notes:
   }
 }
 ```
+
+### Subagent Profiles + Routing (Practical Pattern)
+
+Use this pattern when you want one "orchestrator" agent to delegate specialized tasks:
+
+1. Define reusable specialists under `agents.list`.
+2. Keep a general default under `agents.defaults`.
+3. Use `bindings` to route specific chats/topics to a specialist.
+4. Use `/subagents spawn --agent <agent-id> <task>` when you want explicit one-off delegation from the operator side.
+
+Example:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "openrouter/anthropic/claude-sonnet-4" }
+    },
+    "list": [
+      {
+        "id": "orchestrator",
+        "model": { "primary": "openrouter/anthropic/claude-sonnet-4" },
+        "system_prompt": "Coordinate tasks and delegate to specialists."
+      },
+      {
+        "id": "coder",
+        "model": { "primary": "openrouter/qwen/qwen3-coder" },
+        "system_prompt": "You are focused on implementation and tests."
+      },
+      {
+        "id": "researcher",
+        "model": { "primary": "openrouter/openai/gpt-4.1" },
+        "system_prompt": "You are focused on investigation and synthesis."
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- `agents.list[].id` is the value used by `/subagents spawn --agent <name>`, the `delegate` tool's `agent` argument, and `bindings[].agent_id`.
+- Prefer short stable ids (`coder`, `researcher`) so chat commands stay simple.
+- Keep specialist prompts narrow; broad prompts overlap and reduce routing clarity.
+
+### `identity` (AIEOS v1.1)
+
+Use this section when you want the runtime identity to come from an AIEOS document:
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_path": "./identity/aieos.identity.json"
+  }
+}
+```
+
+You can also inline the same document directly in config:
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_inline": "{\"identity\":{\"names\":{\"first\":\"nullclaw-assistant\"},\"bio\":\"General-purpose autonomous assistant\"},\"linguistics\":{\"style\":\"concise\"},\"motivations\":{\"core_drive\":\"Help the operator finish tasks safely\"}}"
+  }
+}
+```
+
+Minimal AIEOS v1.1 example file (`identity/aieos.identity.json`):
+
+```json
+{
+  "identity": {
+    "names": {
+      "first": "nullclaw-assistant"
+    },
+    "bio": "General-purpose autonomous assistant"
+  },
+  "linguistics": {
+    "style": "concise"
+  },
+  "motivations": {
+    "core_drive": "Help the operator finish tasks safely"
+  }
+}
+```
+
+Notes:
+
+- AIEOS payloads use top-level sections such as `identity`, `psychology`, `linguistics`, `motivations`, and `capabilities`.
+- Prefer `aieos_path` for maintainability and version control readability.
+- Use `aieos_inline` only when you need a fully self-contained single config file.
+- Keep `identity.format` aligned with the payload source (`aieos`).
+
 ### `channels`
 
 - Channel config lives under `channels.<name>`.
@@ -223,6 +318,8 @@ Example:
 ```
 
 In that setup, topic `42` routes to `coder`, while the rest of the forum falls back to `orchestrator`.
+
+> **Peer ID format note**: Topic peer IDs in `bindings` must use the canonical `:thread:N` format (e.g. `"-1001234567890:thread:42"`). The legacy `#topic:N` format (e.g. `"-1001234567890#topic:42"`) is auto-converted at load time but is **deprecated** — a warning will appear in the logs. If you see `#topic:` in nullclaw's log output, convert it to `:thread:` when copying into your config. The `/bind` command always saves in the correct format automatically.
 
 Named agent profiles and bindings are separate concerns: `agents.list` defines reusable profiles, while `bindings` decides which profile is used for a given chat/topic.
 
@@ -337,6 +434,123 @@ Max notes:
 - `require_mention = true` only affects group chats. Direct messages and `bot_started` deep links still work normally.
 - Max inline buttons are one-shot in nullclaw: after a valid click, the original keyboard is cleared to avoid stale buttons.
 
+### Discord
+
+Discord example:
+
+```json
+{
+  "channels": {
+    "discord": {
+      "accounts": {
+        "default": {
+          "token": "YOUR_DISCORD_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["YOUR_DISCORD_USER_ID"]
+        }
+      }
+    }
+  }
+}
+```
+
+Set `allow_from` explicitly unless you intentionally want an open bot. In the current Discord runtime, an omitted or empty `allow_from` list disables filtering instead of denying all inbound messages.
+
+Enable MESSAGE CONTENT INTENT in the Discord Developer Portal if you want the bot to process ordinary guild messages. Without it, Discord omits message content for most guild traffic; direct messages and messages that mention the bot still include content.
+
+Gateway intents (`intents`) is a bitmask. Default 37377 = GUILDS (1) + GUILD_MESSAGES (512) + MESSAGE_CONTENT (32768) + DIRECT_MESSAGES (4096). Calculate custom intents from https://discord.com/developers/docs/topics/gateway#gateway-intents.
+
+Discord setup flow:
+1. Create application at https://discord.com/developers/applications
+2. Bot section → Add Bot → Reset Token (copy immediately)
+3. Privileged Gateway Intents → Enable MESSAGE CONTENT INTENT → Save
+4. OAuth2 → URL Generator → Scopes: `bot`
+5. Bot Permissions: Send Messages, Read Message History, Read Messages/View Channels
+6. Copy URL, open in browser, select server, authorize
+
+The current Discord integration does not require extra OAuth scopes or elevated permissions such as `Administrator`.
+
+Multi-bot setup uses `accounts` wrapper. Each `account_id` creates an independent Discord bot connection with separate session state and routing:
+
+```json
+{
+  "channels": {
+    "discord": {
+      "accounts": {
+        "production": {
+          "token": "PRODUCTION_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["ADMIN_USER_ID"]
+        },
+        "testing": {
+          "token": "TESTING_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["DEV_USER_ID"]
+        }
+      }
+    }
+  }
+}
+```
+
+Channel-specific bindings use `peer.kind = "channel"` with Discord channel IDs (enable Developer Mode → right-click channel → Copy ID):
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "coder",
+      "match": {
+        "channel": "discord",
+        "account_id": "default",
+        "peer": {"kind": "channel", "id": "CHANNEL_ID_HERE"}
+      }
+    }
+  ]
+}
+```
+
+Direct message bindings use `peer.kind = "direct"` with user IDs:
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "personal",
+      "match": {
+        "channel": "discord",
+        "account_id": "default",
+        "peer": {"kind": "direct", "id": "USER_ID_HERE"}
+      }
+    }
+  ]
+}
+```
+
+Parameters:
+- `token` (required) - Bot token from Discord Developer Portal
+- `intents` (default: 37377) - Gateway intents bitmask
+- `allow_bots` (default: false) - Allow messages from other bots
+- `allow_from` (default: []) - Optional allowlist of user IDs; for Discord, an omitted or empty list disables filtering, so set explicit IDs for a private bot. `["*"]` also matches all users
+- `require_mention` (default: false) - Require bot mention in guilds to respond
+- `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
+
+NullClaw splits messages >2000 characters (Discord API limit).
+
+Verification:
+```bash
+nullclaw channel start discord
+nullclaw channel status
+```
+
+`nullclaw channel start discord` starts only the first configured Discord account. For multi-account validation, run `nullclaw gateway` and send a test message to each configured bot.
+
+Common issues:
+- Bot only responds in DMs or explicit mentions: enable MESSAGE CONTENT INTENT, then re-invite the bot if needed
+- "Privileged Intents" error: enable MESSAGE CONTENT INTENT in Discord Developer Portal; verified apps may also need Discord approval
+- Bot offline: Check `nullclaw service status`, verify token hasn't been reset
+- No response in guilds: Check `require_mention` setting, verify Read Messages permission
+
 ### `memory`
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
@@ -401,6 +615,7 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 ### `autonomy`
 
 - `level`: start with `supervised`.
+- `level = "yolo"`: bypasses command policy checks; use only for trusted local debugging.
 - `workspace_only`: keep `true` to limit file access scope.
 - `max_actions_per_hour`: keep conservative limits first.
 
@@ -417,6 +632,7 @@ Use only in controlled environments:
 {
   "http_request": {
     "enabled": true,
+    "allowed_domains": ["192.168.1.10", "*.internal.example.com"],
     "search_base_url": "https://searx.example.com",
     "search_provider": "auto",
     "search_fallback_providers": ["jina", "duckduckgo"]
@@ -433,8 +649,18 @@ Use only in controlled environments:
 
 Notes:
 
-- `search_base_url` must be `https://host[/search]` or a local/private `http://host[:port][/search]` URL, otherwise startup validation fails.
+- `search_base_url` (for web_search tool): Must be `https://host[/search]` or a local/private `http://host[:port][/search]` URL. HTTP is allowed only for localhost/private hosts (e.g., `http://localhost:8888`, `http://192.168.1.10:8888`). This URL is used by the `web_search` tool to query SearXNG instances.
 - `allowed_commands: ["*"]` and `allowed_paths: ["*"]` significantly widen execution scope.
+- `http_request.allowed_domains`: Domains that bypass SSRF protection for the `http_request` and `web_fetch` tools.
+  - `[]` (empty): All domains go through SSRF check (default, safest).
+  - `["example.com"]`: Only specified domains skip SSRF protection.
+  - `["*.example.com"]`: Matches all subdomains (e.g., `api.example.com`, `www.example.com`).
+  - `["192.168.1.10"]`: IP addresses can also be allowlisted (exact match only, CIDR ranges not supported).
+  - `["*"]`: **DANGEROUS** - All domains skip SSRF protection and DNS pinning. Use only in trusted network environments where you control DNS and need to allow access to any IP address. This effectively disables SSRF protection.
+  - **Example**: If your SearXNG runs on `192.168.1.10`, add `"192.168.1.10"` to access it via `http_request` tool.
+  - **Security trade-off**: Allowlisted domains skip DNS pinning, allowing access to private IPs. This trades DNS rebinding protection for operational flexibility.
+  - **HTTPS-only policy**: The `http_request` and `web_fetch` tools require `https://` URLs. Plain HTTP is rejected for security. Note: This does not affect `web_search` tool's `search_base_url` which allows HTTP for local hosts.
+  - **Check order**: Allowlist is checked BEFORE DNS resolution to prevent DNS exfiltration attacks.
 
 ## Validate After Config Changes
 

@@ -183,7 +183,7 @@ Official releases also attach matching Android / Termux binaries built for Andro
 
 ## Add binary to PATH
 
-### Complied binary file
+### Compiled binary file
 
 #### macOS/Linux（zsh/bash）
 
@@ -191,10 +191,6 @@ Official releases also attach matching Android / Termux binaries built for Andro
 zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 # bash users: use ~/.bashrc
-source ~/.zshrc
-```
-```bash
-zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
 source ~/.zshrc
 ```
 

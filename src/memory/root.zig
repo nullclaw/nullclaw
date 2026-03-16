@@ -141,6 +141,12 @@ pub const SemanticCache = semantic_cache.SemanticCache;
 
 // ── Session message types ─────────────────────────────────────────
 
+pub const RUNTIME_COMMAND_ROLE = "__runtime_command__";
+
+pub fn isRuntimeCommandRole(role: []const u8) bool {
+    return std.mem.eql(u8, role, RUNTIME_COMMAND_ROLE);
+}
+
 pub const MessageEntry = struct {
     role: []const u8,
     content: []const u8,

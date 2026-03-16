@@ -15,7 +15,6 @@ const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
-const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
@@ -768,7 +767,7 @@ fn processTelegramMessage(
         log.err("Agent error: {}", .{err});
         tg_ptr.setTaskReaction(sender, message_id, .failed);
         const err_msg: []const u8 = switch (err) {
-            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
             error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
             error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
             error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -1041,16 +1040,6 @@ pub const ChannelRuntime = struct {
         const provider_i = runtime_provider.provider();
         const resolved_key = runtime_provider.primaryApiKey();
 
-        // MCP tools
-        const mcp_tools: ?[]const tools_mod.Tool = if (config.mcp_servers.len > 0)
-            mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-                log.warn("MCP init failed: {}", .{err});
-                break :blk null;
-            }
-        else
-            null;
-        defer if (mcp_tools) |mt| allocator.free(mt);
-
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
         if (subagent_manager) |mgr| {
@@ -1105,7 +1094,7 @@ pub const ChannelRuntime = struct {
             .web_search_fallback_providers = config.http_request.search_fallback_providers,
             .browser_enabled = config.browser.enabled,
             .screenshot_enabled = true,
-            .mcp_tools = mcp_tools,
+            .mcp_server_configs = config.mcp_servers,
             .agents = config.agents,
             .configured_providers = config.providers,
             .fallback_api_key = resolved_key,
@@ -1589,7 +1578,7 @@ pub fn runSignalLoop(
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -1815,7 +1804,7 @@ pub fn runMatrixLoop(
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -1960,7 +1949,7 @@ pub fn runMaxLoop(
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
                 log.err("Max agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",

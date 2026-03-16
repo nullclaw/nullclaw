@@ -545,6 +545,7 @@ pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
     pub const DEFAULT_TRANSPORT: []const u8 = "local";
     pub const DEFAULT_MESSAGE_AUTH_MODE: []const u8 = "pairing";
+    pub const DEFAULT_MAX_HANDSHAKE_SIZE: u16 = 8_192;
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
@@ -563,6 +564,9 @@ pub const WebConfig = struct {
     listen: []const u8 = "127.0.0.1",
     path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
+    /// Max bytes allowed for the HTTP upgrade request headers during WS handshake.
+    /// Increase this when running behind reverse proxies that append many headers.
+    max_handshake_size: u16 = DEFAULT_MAX_HANDSHAKE_SIZE,
     /// Optional WebSocket-upgrade auth token for browser/extension clients.
     /// Used for WebSocket-upgrade hardening and for `message_auth_mode="token"`.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
@@ -1464,6 +1468,7 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
+    try std.testing.expectEqual(WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, cfg.max_handshake_size);
     try std.testing.expect(cfg.auth_token == null);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_MESSAGE_AUTH_MODE, cfg.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);

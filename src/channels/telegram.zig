@@ -1908,6 +1908,58 @@ pub const TelegramChannel = struct {
         result.appendSlice(allocator, caption) catch return;
     }
 
+    fn buildAttachmentMetadataFallbackContent(
+        allocator: std.mem.Allocator,
+        kind: []const u8,
+        file_name: ?[]const u8,
+        mime_type: ?[]const u8,
+        file_size: ?i64,
+        duration_secs: ?i64,
+        message: std.json.Value,
+    ) ?[]u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        const writer = result.writer(allocator);
+
+        writer.print("[ATTACHMENT:{s}", .{kind}) catch {
+            result.deinit(allocator);
+            return null;
+        };
+        if (file_name) |name| {
+            writer.print(" file_name={s}", .{name}) catch {
+                result.deinit(allocator);
+                return null;
+            };
+        }
+        if (mime_type) |mime| {
+            writer.print(" mime_type={s}", .{mime}) catch {
+                result.deinit(allocator);
+                return null;
+            };
+        }
+        if (file_size) |size| {
+            writer.print(" file_size={d}", .{size}) catch {
+                result.deinit(allocator);
+                return null;
+            };
+        }
+        if (duration_secs) |duration| {
+            writer.print(" duration={d}", .{duration}) catch {
+                result.deinit(allocator);
+                return null;
+            };
+        }
+        result.appendSlice(allocator, "]") catch {
+            result.deinit(allocator);
+            return null;
+        };
+
+        appendOptionalCaption(&result, allocator, message);
+        return result.toOwnedSlice(allocator) catch {
+            result.deinit(allocator);
+            return null;
+        };
+    }
+
     fn buildTaggedAttachmentContent(
         allocator: std.mem.Allocator,
         prefix: []const u8,
@@ -1932,8 +1984,23 @@ pub const TelegramChannel = struct {
     }
 
     fn resolveVoiceOrAudioContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
-        const file_id = telegram_update_ingress.voiceOrAudioFileId(message) orelse return null;
-        return self.buildVoiceContent(allocator, file_id);
+        const info = telegram_update_ingress.voiceOrAudioInfo(message) orelse return null;
+        if (self.buildVoiceContent(allocator, info.file_id)) |transcribed| {
+            return transcribed;
+        }
+
+        return buildAttachmentMetadataFallbackContent(
+            allocator,
+            switch (info.kind) {
+                .voice => "voice",
+                .audio => "audio",
+            },
+            info.file_name,
+            info.mime_type,
+            info.file_size,
+            info.duration_secs,
+            message,
+        );
     }
 
     fn resolvePhotoContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
@@ -1945,9 +2012,20 @@ pub const TelegramChannel = struct {
 
     fn resolveDocumentContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
         const doc = telegram_update_ingress.documentInfo(message) orelse return null;
-        const local_path = downloadTelegramFile(allocator, self.bot_token, doc.file_id, doc.file_name, self.proxy) orelse return null;
-        defer allocator.free(local_path);
-        return buildTaggedAttachmentContent(allocator, "[FILE:", local_path, message);
+        if (downloadTelegramFile(allocator, self.bot_token, doc.file_id, doc.file_name, self.proxy)) |local_path| {
+            defer allocator.free(local_path);
+            return buildTaggedAttachmentContent(allocator, "[FILE:", local_path, message);
+        }
+
+        return buildAttachmentMetadataFallbackContent(
+            allocator,
+            "document",
+            doc.file_name,
+            doc.mime_type,
+            doc.file_size,
+            null,
+            message,
+        );
     }
 
     fn resolveMessageContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
@@ -4118,6 +4196,94 @@ test "telegram parseAttachmentMarkers FILE with cyrillic filename" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
     try std.testing.expectEqualStrings("/tmp/nullclaw_doc_Справка_в_школы.docx", parsed.attachments[0].target);
+}
+
+test "telegram buildAttachmentMetadataFallbackContent includes available metadata" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"caption":"please summarize"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const content = TelegramChannel.buildAttachmentMetadataFallbackContent(
+        alloc,
+        "document",
+        "report.pdf",
+        "application/pdf",
+        2048,
+        null,
+        parsed.value,
+    ) orelse return error.TestExpectedEqual;
+    defer alloc.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "[ATTACHMENT:document") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "file_name=report.pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "mime_type=application/pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "file_size=2048") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "please summarize") != null);
+}
+
+test "telegram buildAttachmentMetadataFallbackContent omits optional fields" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const content = TelegramChannel.buildAttachmentMetadataFallbackContent(
+        alloc,
+        "voice",
+        null,
+        null,
+        null,
+        6,
+        parsed.value,
+    ) orelse return error.TestExpectedEqual;
+    defer alloc.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "[ATTACHMENT:voice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "duration=6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "file_name=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "mime_type=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "file_size=") == null);
+}
+
+fn buildAttachmentMetadataFallbackContentAllocationTest(allocator: std.mem.Allocator) !void {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"caption":"please summarize"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const content = TelegramChannel.buildAttachmentMetadataFallbackContent(
+        allocator,
+        "document",
+        "report.pdf",
+        "application/pdf",
+        2048,
+        null,
+        parsed.value,
+    ) orelse return error.OutOfMemory;
+    defer allocator.free(content);
+}
+
+test "telegram buildAttachmentMetadataFallbackContent frees partial allocations on out-of-memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        buildAttachmentMetadataFallbackContentAllocationTest,
+        .{},
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════

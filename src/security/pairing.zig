@@ -178,7 +178,13 @@ pub const PairingGuard = struct {
 
         var hash_buf: [64]u8 = undefined;
         const hashed = hashToken(token, &hash_buf);
-        return self.paired_tokens.contains(hashed);
+        // Scan every stored hash so authentication does not leak match position.
+        var found: u8 = 0;
+        var it = self.paired_tokens.keyIterator();
+        while (it.next()) |stored_hash| {
+            found |= @as(u8, @intFromBool(constantTimeEq(hashed, stored_hash.*)));
+        }
+        return found != 0;
     }
 
     /// Returns true if the gateway is already paired (has at least one token).

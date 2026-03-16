@@ -28,6 +28,7 @@ const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
+const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
@@ -525,7 +526,7 @@ pub fn parseQueryParam(target: []const u8, name: []const u8) ?[]const u8 {
 pub fn validateBearerToken(token: []const u8, paired_tokens: []const []const u8) bool {
     if (paired_tokens.len == 0) return true;
     for (paired_tokens) |pt| {
-        if (std.mem.eql(u8, token, pt)) return true;
+        if (constantTimeEq(token, pt)) return true;
     }
     return false;
 }
@@ -1909,7 +1910,7 @@ pub fn sendTelegramReply(
 
 fn userFacingAgentError(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
         error.NoResponseContent => "Model returned an empty response. Please try again.",
@@ -1920,7 +1921,7 @@ fn userFacingAgentError(err: anyerror) []const u8 {
 
 fn userFacingAgentErrorJson(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "{\"error\":\"network error\"}",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "{\"error\":\"network error contacting provider\"}",
         error.ProviderDoesNotSupportVision => "{\"error\":\"provider does not support image input\"}",
         error.AllProvidersFailed => "{\"error\":\"all providers failed for this request\"}",
         error.NoResponseContent => "{\"error\":\"model returned empty response\"}",
@@ -3518,6 +3519,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
+                    .mcp_server_configs = cfg.mcp_servers,
                     .agents = cfg.agents,
                     .configured_providers = cfg.providers,
                     .fallback_api_key = resolved_api_key,
@@ -3561,6 +3563,16 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);
     const daemon_mode = event_bus != null;
+
+    // Best-effort probe to detect if the port is already in use.
+    // A TOCTOU gap exists between probe and listen(), but listen() will still
+    // fail with AddressInUse if another process binds the port in that window.
+    const probe_conn = std.net.tcpConnectToAddress(addr) catch null;
+    if (probe_conn) |conn| {
+        conn.close();
+        return error.AddressInUse;
+    }
+
     var server = try addr.listen(.{
         .reuse_address = true,
         // Daemon/service shutdown needs the accept loop to observe the shared
@@ -3926,10 +3938,6 @@ test "idempotency store allows different keys" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "b"));
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "c"));
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "a"));
-}
-
-test "gateway module compiles" {
-    // Compile-time check only
 }
 
 test "findWebhookRouteDescriptor resolves known webhook paths" {
@@ -5421,6 +5429,13 @@ test "userFacingAgentError maps NoResponseContent" {
     );
 }
 
+test "userFacingAgentError maps CurlFailed with actionable hint" {
+    try std.testing.expectEqualStrings(
+        "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        userFacingAgentError(error.CurlFailed),
+    );
+}
+
 test "userFacingAgentError maps AllProvidersFailed" {
     try std.testing.expectEqualStrings(
         "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -5439,6 +5454,13 @@ test "userFacingAgentErrorJson maps NoResponseContent" {
     try std.testing.expectEqualStrings(
         "{\"error\":\"model returned empty response\"}",
         userFacingAgentErrorJson(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentErrorJson maps CurlFailed" {
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"network error contacting provider\"}",
+        userFacingAgentErrorJson(error.CurlFailed),
     );
 }
 
@@ -6139,4 +6161,20 @@ test "jsonWrapChallenge escapes malicious challenge value" {
     try std.testing.expectEqualStrings("abc\",\"evil\":\"true", challenge.string);
     // Must NOT have an "evil" key (injection prevented)
     try std.testing.expect(parsed.value.object.get("evil") == null);
+}
+
+// ── Port conflict detection tests ─────────────────────────────────────
+
+test "run returns AddressInUse when port is already bound" {
+    // Find an available port by binding to port 0
+    const test_addr = try std.net.Address.resolveIp("127.0.0.1", 0);
+    var listener = try test_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    // Get the actual port that was assigned
+    const bound_port = listener.listen_address.in.getPort();
+
+    // Try to start gateway on the same port - should fail with AddressInUse
+    const result = run(std.testing.allocator, "127.0.0.1", bound_port, null, null);
+    try std.testing.expectError(error.AddressInUse, result);
 }

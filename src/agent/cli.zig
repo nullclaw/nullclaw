@@ -235,17 +235,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } };
     obs.recordEvent(&start_event);
 
-    // Initialize MCP tools from config
-    const mcp_mod = @import("../mcp.zig");
-    const mcp_tools: ?[]const tools_mod.Tool = if (cfg.mcp_servers.len > 0)
-        mcp_mod.initMcpTools(allocator, cfg.mcp_servers) catch |err| blk: {
-            log.warn("MCP: init failed: {}", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
-
     // Build security policy from config
     var tracker = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
     defer tracker.deinit();
@@ -304,7 +293,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
         .browser_enabled = cfg.browser.enabled,
         .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
+        .mcp_server_configs = cfg.mcp_servers,
         .agents = cfg.agents,
         .configured_providers = cfg.providers,
         .fallback_api_key = resolved_api_key,

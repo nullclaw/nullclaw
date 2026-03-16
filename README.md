@@ -692,16 +692,21 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `agent -m "..."` | Single message mode |
 | `agent` | Interactive chat mode |
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
-| `service install\|start\|stop\|status\|uninstall` | Manage background service |
+| `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
 | `doctor` | Diagnose system health |
 | `status` | Show full system status |
-| `channel status` | Show channel health/status |
+| `channel list\|start\|status\|add\|remove` | Manage channels |
 | `cron list\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs |
 | `history list\|show` | View session conversation history |
+| `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
-| `models list\|info\|benchmark` | Model catalog |
+| `models list\|info\|benchmark\|refresh` | Model catalog |
+| `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |
+| `capabilities [--json]` | Show runtime capabilities manifest |
+| `auth login\|status\|logout` | Manage OAuth authentication |
 | `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
+| `update [--check] [--yes]` | Check for and install updates |
 
 ## Development
 

@@ -8,6 +8,7 @@ const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
+const mcp_mod = @import("../mcp.zig");
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -288,7 +289,7 @@ pub fn allTools(
         composio_api_key: ?[]const u8 = null,
         browser_open_domains: ?[]const []const u8 = null,
         hardware_boards: ?[]const []const u8 = null,
-        mcp_tools: ?[]const Tool = null,
+        mcp_server_configs: []const @import("../config_types.zig").McpServerConfig = &.{},
         agents: ?[]const @import("../config.zig").NamedAgentConfig = null,
         configured_providers: []const @import("../config_types.zig").ProviderEntry = &.{},
         fallback_api_key: ?[]const u8 = null,
@@ -490,9 +491,15 @@ pub fn allTools(
         try list.append(allocator, i2ct.tool());
     }
 
-    // MCP tools (pre-initialized externally)
-    if (opts.mcp_tools) |mt| {
-        for (mt) |t| {
+    // MCP tools — connect to configured servers and register their tools.
+    if (opts.mcp_server_configs.len > 0) {
+        const mcp_tools = mcp_mod.initMcpTools(allocator, opts.mcp_server_configs) catch |err| blk: {
+            std.log.warn("allTools: MCP init failed: {}", .{err});
+            break :blk &[_]Tool{};
+        };
+        // mcp_tools backing slice is a temporary; append each Tool then free it.
+        defer allocator.free(mcp_tools);
+        for (mcp_tools) |t| {
             try list.append(allocator, t);
         }
     }

@@ -6,6 +6,8 @@ const interaction_choices = @import("../interactions/choices.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 
+const Atomic = @import("../portable_atomic.zig").Atomic;
+
 const log = std.log.scoped(.slack);
 
 const SocketFd = std.net.Stream.Handle;
@@ -60,7 +62,7 @@ pub const CallbackSelection = union(enum) {
 
 var shared_interactions_mu: std.Thread.Mutex = .{};
 var shared_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty;
-var shared_interaction_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+var shared_interaction_seq: Atomic(u64) = Atomic(u64).init(1);
 
 fn sharedInteractionsAllocator() std.mem.Allocator {
     return if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;

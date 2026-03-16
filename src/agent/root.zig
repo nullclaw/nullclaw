@@ -1692,6 +1692,8 @@ pub const Agent = struct {
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
+        var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
+        defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
@@ -2218,15 +2220,27 @@ pub const Agent = struct {
                 self.observer.recordEvent(&tool_start_event);
 
                 const tool_timer = std.time.milliTimestamp();
-                const result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
-                    ToolExecutionResult{
-                        .name = call.name,
-                        .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
-                        .success = true,
-                        .tool_call_id = call.tool_call_id,
+                const result = blk: {
+                    if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
+                        break :blk ToolExecutionResult{
+                            .name = call.name,
+                            .output = cached_result.output,
+                            .success = cached_result.success,
+                            .tool_call_id = call.tool_call_id,
+                        };
                     }
-                else
-                    self.executeTool(arena, call);
+                    const executed_result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                        ToolExecutionResult{
+                            .name = call.name,
+                            .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
+                            .success = true,
+                            .tool_call_id = call.tool_call_id,
+                        }
+                    else
+                        self.executeTool(arena, call);
+                    rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
+                    break :blk executed_result;
+                };
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
@@ -2394,6 +2408,68 @@ pub const Agent = struct {
         return false;
     }
 
+    fn toolCallDedupFingerprint(call: ParsedToolCall) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        if (call.tool_call_id) |tool_call_id| {
+            if (tool_call_id.len > 0) {
+                hasher.update("id:");
+                hasher.update(tool_call_id);
+                return hasher.final();
+            }
+        }
+
+        hasher.update("sig:");
+        hasher.update(call.name);
+        hasher.update("\n");
+        hasher.update(call.arguments_json);
+        return hasher.final();
+    }
+
+    const CachedToolCallResult = struct {
+        success: bool,
+        output: []const u8,
+    };
+
+    fn deinitSeenToolCallResults(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+    ) void {
+        var it = seen_tool_call_results.valueIterator();
+        while (it.next()) |cached_result| {
+            if (cached_result.output.len > 0) allocator.free(cached_result.output);
+        }
+        seen_tool_call_results.deinit(allocator);
+    }
+
+    fn cachedToolCallResultInTurn(
+        seen_tool_call_results: *const std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        call: ParsedToolCall,
+    ) ?CachedToolCallResult {
+        return seen_tool_call_results.get(toolCallDedupFingerprint(call));
+    }
+
+    fn rememberToolCallResultInTurn(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        call: ParsedToolCall,
+        result: ToolExecutionResult,
+    ) void {
+        const fingerprint = toolCallDedupFingerprint(call);
+        if (seen_tool_call_results.contains(fingerprint)) return;
+
+        const output_copy = if (result.output.len == 0)
+            ""
+        else
+            allocator.dupe(u8, result.output) catch return;
+
+        seen_tool_call_results.put(allocator, fingerprint, .{
+            .success = result.success,
+            .output = output_copy,
+        }) catch {
+            if (output_copy.len > 0) allocator.free(output_copy);
+        };
+    }
+
     fn is_tools_markdown_path(path: []const u8) bool {
         const basename = path_basename_any_separator(path);
         if (basename.len == 0) return false;
@@ -2520,8 +2596,15 @@ pub const Agent = struct {
                     self.noteInterruptedTool(trimmed_call_name) catch {};
                 }
                 if (verbose_mod.isVerbose()) {
-                    const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
-                    log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
+                    if (result.success) {
+                        const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
+                        log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
+                    } else {
+                        const error_msg = result.error_msg orelse result.output;
+                        const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
+                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview});
+                    }
+                    
                 }
                 return .{
                     .name = call.name,
@@ -6062,7 +6145,9 @@ test "slash additional commands are handled" {
         "/approve",
         "/poll",
         "/subagents",
+        "/config reload",
         "/config get model",
+        "/skill reload",
         "/skill list",
     };
 
@@ -6342,6 +6427,48 @@ test "direct slash skill command reports ambiguity between exact and composite m
     try std.testing.expect(std.mem.indexOf(u8, response, "Ambiguous skill name") != null);
 }
 
+test "slash /skill reload invalidates prompt caches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("skills/broken");
+    {
+        const f = try tmp.dir.createFile("skills/broken/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{ invalid json");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    agent.has_system_prompt = true;
+    agent.system_prompt_has_conversation_context = true;
+    agent.workspace_prompt_fingerprint = 1234;
+    agent.system_prompt_model_name = try allocator.dupe(u8, "openrouter/gpt-4o");
+
+    const response = (try agent.handleSlashCommand("/skill reload")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Skills reloaded") != null);
+    try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(!agent.system_prompt_has_conversation_context);
+    try std.testing.expect(agent.workspace_prompt_fingerprint == null);
+    try std.testing.expect(agent.system_prompt_model_name == null);
+}
+
+test "slash /config reload returns summary" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/config reload")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Config hot reload complete") != null);
+}
+
 test "Agent streaming fields default to null" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
@@ -6498,6 +6625,207 @@ test "should_skip_tools_memory_store_duplicate skips only tools-related memory_s
     try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[2]));
     try std.testing.expect(Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[3]));
     try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, false, calls[1]));
+}
+
+test "toolCallDedupFingerprint prefers tool_call_id over arguments" {
+    const call_a = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"pwd\"}",
+        .tool_call_id = "call_abc",
+    };
+    const call_b = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"ls\"}",
+        .tool_call_id = "call_abc",
+    };
+    try std.testing.expectEqual(Agent.toolCallDedupFingerprint(call_a), Agent.toolCallDedupFingerprint(call_b));
+}
+
+test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const call_a = ParsedToolCall{
+        .name = "memory_search",
+        .arguments_json = "{\"query\":\"hello\"}",
+        .tool_call_id = null,
+    };
+    const call_b = ParsedToolCall{
+        .name = "memory_search",
+        .arguments_json = "{\"query\":\"hello\"}",
+        .tool_call_id = null,
+    };
+    const call_c = ParsedToolCall{
+        .name = "memory_search",
+        .arguments_json = "{\"query\":\"world\"}",
+        .tool_call_id = null,
+    };
+
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_a) == null);
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, call_a, .{
+        .name = call_a.name,
+        .output = "first result",
+        .success = true,
+        .tool_call_id = null,
+    });
+
+    const cached_b = Agent.cachedToolCallResultInTurn(&seen, call_b).?;
+    try std.testing.expect(cached_b.success);
+    try std.testing.expectEqualStrings("first result", cached_b.output);
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_c) == null);
+}
+
+test "rememberToolCallResultInTurn preserves failed result for replayed tool_call_id" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const original_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"curl https://example.com\"}",
+        .tool_call_id = "call_retry_me",
+    };
+    const replayed_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"curl https://example.com --retry 2\"}",
+        .tool_call_id = "call_retry_me",
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, original_call, .{
+        .name = original_call.name,
+        .output = "Rate limit exceeded",
+        .success = false,
+        .tool_call_id = original_call.tool_call_id,
+    });
+
+    const cached_replay = Agent.cachedToolCallResultInTurn(&seen, replayed_call).?;
+    try std.testing.expect(!cached_replay.success);
+    try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
+}
+
+test "Agent turn skips replayed tool_call_id across iterations" {
+    const ProbeTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "probe";
+        pub const tool_description = "probe";
+        pub const tool_params =
+            \\{"type":"object","properties":{"value":{"type":"number"}},"required":["value"]}
+        ;
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "probe ok" };
+        }
+    };
+
+    const ReplayProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count <= 2) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-replay-1"),
+                    .name = try allocator.dupe(u8, "probe"),
+                    .arguments = try allocator.dupe(u8, "{\"value\":1}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "replaying"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "replay-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = ReplayProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReplayProvider.chatWithSystem,
+        .chat = ReplayProvider.chat,
+        .supportsNativeTools = ReplayProvider.supportsNativeTools,
+        .getName = ReplayProvider.getName,
+        .deinit = ReplayProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var probe_count: usize = 0;
+    var probe_tool_impl = ProbeTool{ .count = &probe_count };
+    const tool_list = [_]Tool{probe_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 5,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run probe");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 1), probe_count);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
 }
 
 test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same batch" {
@@ -7384,6 +7712,17 @@ test "Agent selectDisplayText hides malformed tool markup payload" {
     const raw = "<tool_call>web_search<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>";
     const selected = Agent.selectDisplayText(raw, "", 0);
     try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent selectDisplayText hides orphan closing tool_call tag" {
+    // Model emits </tool_call> without an opener — must not leak to user.
+    const raw = "Here are the results:\n</tool_call>\nSome reply";
+    const selected = Agent.selectDisplayText(raw, "", 0);
+    try std.testing.expectEqualStrings("", selected);
+
+    const bracket_raw = "Here are the results:\n[/tool_call]\nSome reply";
+    const bracket_selected = Agent.selectDisplayText(bracket_raw, "", 0);
+    try std.testing.expectEqualStrings("", bracket_selected);
 }
 
 test "Agent selectDisplayText keeps plain text when no markup exists" {

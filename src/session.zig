@@ -32,6 +32,7 @@ const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
+const RUNTIME_COMMAND_ROLE = memory_mod.RUNTIME_COMMAND_ROLE;
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
@@ -54,6 +55,32 @@ fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8
     const last = agent.history.items[agent.history.items.len - 1];
     if (last.role != .assistant) return response;
     return last.content;
+}
+
+fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
+    for (entries) |entry| {
+        if (memory_mod.isRuntimeCommandRole(entry.role)) {
+            const maybe_response = session.agent.handleSlashCommand(entry.content) catch null;
+            if (maybe_response) |response| session.agent.allocator.free(response);
+            continue;
+        }
+
+        const role: providers.Role = if (std.mem.eql(u8, entry.role, "assistant"))
+            .assistant
+        else if (std.mem.eql(u8, entry.role, "system"))
+            .system
+        else
+            .user;
+
+        const content = session.agent.allocator.dupe(u8, entry.content) catch continue;
+        session.agent.history.append(session.agent.allocator, .{
+            .role = role,
+            .content = content,
+        }) catch {
+            session.agent.allocator.free(content);
+            continue;
+        };
+    }
 }
 
 fn sessionAgentId(session_key: []const u8) ?[]const u8 {
@@ -264,7 +291,7 @@ pub const SessionManager = struct {
             if (maybe_entries) |entries| {
                 defer memory_mod.freeMessages(self.allocator, entries);
                 if (entries.len > 0) {
-                    session.agent.loadHistory(entries) catch {};
+                    restorePersistedSessionState(session, entries);
                 }
                 if (try store.loadUsage(session_key)) |total_tokens| {
                     session.agent.total_tokens = total_tokens;
@@ -541,6 +568,10 @@ pub const SessionManager = struct {
                 store.clearMessages(session_key) catch {};
                 // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
+            }
+
+            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
+                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
             }
 
             if (turn_input.llm_user_message) |persisted_user| {
@@ -2053,6 +2084,123 @@ test "processMessage slash-prefixed prompt that is not a local command persists 
     try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
     try testing.expectEqualStrings(slash_prompt, restored.agent.history.items[0].content);
     try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
+}
+
+test "processMessage runtime slash commands persist across reload" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:runtime-state";
+    const commands = [_][]const u8{
+        "/think high",
+        "/verbose full",
+        "/reasoning stream",
+        "/usage full",
+        "/exec host=node security=full ask=always node=worker-a",
+        "/queue debounce debounce:2s cap:3 drop:oldest",
+        "/tts always provider test-provider limit 120 summary on audio on",
+        "/session ttl 5m",
+        "/focus incident-123",
+        "/dock-telegram",
+        "/activation always",
+        "/send on",
+        "/debug reset",
+        "/usage cost",
+        "/exec host=sandbox security=allowlist ask=on-miss",
+        "/queue serial cap:4 drop:newest",
+        "/tts tagged provider replay-provider limit 77 summary off audio off",
+        "/session ttl 30s",
+        "/unfocus",
+        "/dock-slack",
+        "/activation mention",
+        "/send inherit",
+        "/elevated full",
+    };
+
+    for (commands) |command| {
+        const reply = try sm.processMessage(session_key, command, .{
+            .channel = "telegram",
+            .is_group = false,
+            .group_id = null,
+        });
+        defer testing.allocator.free(reply);
+    }
+
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expect(live_session.agent.reasoning_effort == null);
+    try testing.expect(live_session.agent.verbose_level == .off);
+    try testing.expect(live_session.agent.reasoning_mode == .off);
+    try testing.expect(live_session.agent.usage_mode == .cost);
+    try testing.expect(live_session.agent.exec_host == .sandbox);
+    try testing.expect(live_session.agent.exec_security == .full);
+    try testing.expect(live_session.agent.exec_ask == .off);
+    try testing.expect(live_session.agent.exec_node_id == null);
+    try testing.expect(live_session.agent.queue_mode == .serial);
+    try testing.expectEqual(@as(u32, 4), live_session.agent.queue_cap);
+    try testing.expect(live_session.agent.queue_drop == .newest);
+    try testing.expect(live_session.agent.tts_mode == .tagged);
+    try testing.expectEqualStrings("replay-provider", live_session.agent.tts_provider.?);
+    try testing.expectEqual(@as(u32, 77), live_session.agent.tts_limit_chars);
+    try testing.expect(!live_session.agent.tts_summary);
+    try testing.expect(!live_session.agent.tts_audio);
+    try testing.expectEqual(@as(?u64, 30), live_session.agent.session_ttl_secs);
+    try testing.expect(live_session.agent.focus_target == null);
+    try testing.expectEqualStrings("slack", live_session.agent.dock_target.?);
+    try testing.expect(live_session.agent.activation_mode == .mention);
+    try testing.expect(live_session.agent.send_mode == .inherit);
+    try testing.expectEqual(@as(usize, 0), live_session.agent.historyLen());
+
+    const store = sqlite_mem.sessionStore();
+    const entries = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, commands.len), entries.len);
+    for (entries, commands) |entry, command| {
+        try testing.expectEqualStrings(RUNTIME_COMMAND_ROLE, entry.role);
+        try testing.expectEqualStrings(command, entry.content);
+    }
+
+    live_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expect(restored.agent.reasoning_effort == null);
+    try testing.expect(restored.agent.verbose_level == .off);
+    try testing.expect(restored.agent.reasoning_mode == .off);
+    try testing.expect(restored.agent.usage_mode == .cost);
+    try testing.expect(restored.agent.exec_host == .sandbox);
+    try testing.expect(restored.agent.exec_security == .full);
+    try testing.expect(restored.agent.exec_ask == .off);
+    try testing.expect(restored.agent.exec_node_id == null);
+    try testing.expect(restored.agent.queue_mode == .serial);
+    try testing.expectEqual(@as(u32, 4), restored.agent.queue_cap);
+    try testing.expect(restored.agent.queue_drop == .newest);
+    try testing.expect(restored.agent.tts_mode == .tagged);
+    try testing.expectEqualStrings("replay-provider", restored.agent.tts_provider.?);
+    try testing.expectEqual(@as(u32, 77), restored.agent.tts_limit_chars);
+    try testing.expect(!restored.agent.tts_summary);
+    try testing.expect(!restored.agent.tts_audio);
+    try testing.expectEqual(@as(?u64, 30), restored.agent.session_ttl_secs);
+    try testing.expect(restored.agent.focus_target == null);
+    try testing.expectEqualStrings("slack", restored.agent.dock_target.?);
+    try testing.expect(restored.agent.activation_mode == .mention);
+    try testing.expect(restored.agent.send_mode == .inherit);
+    try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
 }
 
 test "processMessage different keys — independent sessions" {

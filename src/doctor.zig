@@ -945,8 +945,6 @@ test "DiagResult defaults" {
     try std.testing.expect(result.ok);
 }
 
-test "doctor module compiles" {}
-
 // ── Test helper ─────────────────────────────────────────────────
 
 fn testConfig() Config {
