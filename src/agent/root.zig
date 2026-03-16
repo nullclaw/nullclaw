@@ -7762,6 +7762,10 @@ test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I will fetch the file now"));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me search for that"));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll run the tool now"));
+    // Regression: "let me get/fetch/find" must be caught (was the exact failure mode with vikunja-mcp)
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Found the Workstream Board (project ID 4). Let me get the Kanban columns (buckets) for it."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me fetch the list of projects."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me look up the tasks now."));
 }
 
 test "Agent shouldForceActionFollowThrough ignores conclusory english statements" {
