@@ -780,18 +780,80 @@ pub const Agent = struct {
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
+        // Specific "let me <action-verb>" and "i'll/i will <action-verb>" phrases.
+        // Kept as explicit verb+phrase pairs to avoid false-positives on conclusory
+        // statements like "I'll note that…", "Let me know if…", or "I will summarize…".
         const ascii_patterns = [_][]const u8{
+            // try / retry / attempt
             "i'll try",
             "i will try",
             "let me try",
-            "i'll check",
-            "i will check",
-            "let me check",
             "i'll retry",
             "i will retry",
             "let me retry",
             "i'll attempt",
             "i will attempt",
+            "let me attempt",
+            // check / look / see / verify
+            "i'll check",
+            "i will check",
+            "let me check",
+            "i'll look",
+            "i will look",
+            "let me look",
+            "i'll see",
+            "i will see",
+            "let me see",
+            "i'll verify",
+            "i will verify",
+            "let me verify",
+            // fetch / get / retrieve
+            "i'll fetch",
+            "i will fetch",
+            "let me fetch",
+            "i'll get",
+            "i will get",
+            "let me get",
+            "i'll retrieve",
+            "i will retrieve",
+            "let me retrieve",
+            // list / show / find / search
+            "i'll list",
+            "i will list",
+            "let me list",
+            "i'll show",
+            "i will show",
+            "let me show",
+            "i'll find",
+            "i will find",
+            "let me find",
+            "i'll search",
+            "i will search",
+            "let me search",
+            // read / open / load
+            "i'll read",
+            "i will read",
+            "let me read",
+            "i'll open",
+            "i will open",
+            "let me open",
+            "i'll load",
+            "i will load",
+            "let me load",
+            // run / execute / call / use
+            "i'll run",
+            "i will run",
+            "let me run",
+            "i'll execute",
+            "i will execute",
+            "let me execute",
+            "i'll call",
+            "i will call",
+            "let me call",
+            "i'll use",
+            "i will use",
+            "let me use",
+            // do / do that
             "i'll do that now",
             "i will do that now",
             "doing that now",
@@ -2068,8 +2130,7 @@ pub const Agent = struct {
 
                 if (trimmed_display_text.len == 0) {
                     self.freeResponseFields(&response);
-                    if (!is_streaming and
-                        empty_response_retry_count < 1 and
+                    if (empty_response_retry_count < 1 and
                         iteration + 1 < self.max_tool_iterations)
                     {
                         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") });
@@ -2083,8 +2144,9 @@ pub const Agent = struct {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
-                if (!is_streaming and
-                    forced_follow_through_count < 2 and
+                // This applies in both streaming and non-streaming paths: the follow-up
+                // iteration will stream its own chunks independently.
+                if (forced_follow_through_count < 2 and
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
@@ -2602,9 +2664,8 @@ pub const Agent = struct {
                     } else {
                         const error_msg = result.error_msg orelse result.output;
                         const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
-                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview});
+                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
                     }
-                    
                 }
                 return .{
                     .name = call.name,
@@ -7696,6 +7757,18 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me list the contents of that directory"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll look into that for you"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I will fetch the file now"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me search for that"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll run the tool now"));
+}
+
+test "Agent shouldForceActionFollowThrough ignores conclusory english statements" {
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me know if you need anything else."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I'll note that this is a known limitation."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I will summarize what I found: the directory contains 3 files."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
 }
 
 test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
