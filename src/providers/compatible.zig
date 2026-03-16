@@ -308,6 +308,14 @@ pub const OpenAiCompatibleProvider = struct {
         return total;
     }
 
+    /// Returns true when the streaming path should be skipped in favour of the
+    /// non-streaming fallback.  When `limit` is null (the default) this always
+    /// returns false — i.e. always attempt streaming regardless of payload size.
+    pub fn shouldSkipStreaming(limit: ?usize, request: ChatRequest) bool {
+        const l = limit orelse return false;
+        return estimateRequestTextBytes(request) >= l;
+    }
+
     /// Build a Responses API request JSON body.
     pub fn buildResponsesRequestBody(
         allocator: std.mem.Allocator,
@@ -752,25 +760,23 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!root.StreamChatResult {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
-        const request_text_bytes = estimateRequestTextBytes(request);
 
-        if (self.max_streaming_prompt_bytes) |limit| {
-            if (request_text_bytes >= limit) {
-                log.warn(
-                    "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
-                    .{ self.name, request_text_bytes, limit },
-                );
-                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-                if (fallback.content) |text| {
-                    callback(callback_ctx, root.StreamChunk.textDelta(text));
-                }
-                callback(callback_ctx, root.StreamChunk.finalChunk());
-                return .{
-                    .content = fallback.content,
-                    .usage = fallback.usage,
-                    .model = fallback.model,
-                };
+        if (shouldSkipStreaming(self.max_streaming_prompt_bytes, request)) {
+            const request_text_bytes = estimateRequestTextBytes(request);
+            log.warn(
+                "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
+                .{ self.name, request_text_bytes, self.max_streaming_prompt_bytes.? },
+            );
+            const fallback = try chatImpl(ptr, allocator, request, model, temperature);
+            if (fallback.content) |text| {
+                callback(callback_ctx, root.StreamChunk.textDelta(text));
             }
+            callback(callback_ctx, root.StreamChunk.finalChunk());
+            return .{
+                .content = fallback.content,
+                .usage = fallback.usage,
+                .model = fallback.model,
+            };
         }
 
         const url = try self.chatCompletionsUrl(allocator);
@@ -2193,4 +2199,53 @@ test "max_streaming_prompt_bytes set applies threshold" {
 
 test "DEFAULT_MAX_STREAMING_PROMPT_BYTES legacy value is 32 KiB" {
     try std.testing.expectEqual(@as(usize, 32 * 1024), DEFAULT_MAX_STREAMING_PROMPT_BYTES);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// shouldSkipStreaming — behavioural branch tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "shouldSkipStreaming: null limit never skips streaming" {
+    // Even a payload larger than the old 32 KiB hardcoded limit must NOT skip
+    // when max_streaming_prompt_bytes is null (the new default).
+    const big_content = "x" ** 70000; // 70 KiB > old 32 KiB limit
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(big_content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+test "shouldSkipStreaming: below limit does not skip" {
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    // limit = 1 MiB, 5 bytes << 1 MiB
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(1024 * 1024, req));
+}
+
+test "shouldSkipStreaming: at limit skips" {
+    // Content of exactly `limit` bytes should trigger the fallback.
+    const content = "a" ** 100;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(100, req));
+}
+
+test "shouldSkipStreaming: above limit skips" {
+    const content = "a" ** 101;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(100, req));
+}
+
+test "shouldSkipStreaming: old 32KiB limit would have skipped typical session with 50 MCP tools" {
+    // Regression: with the old hardcoded 32 KiB threshold a session loaded with
+    // 50 Vikunja tools (~46-48 KiB of text) always fell back to non-streaming.
+    // The new default (null) must never skip it.
+    const content = "x" ** 48000; // representative of typical session text estimate
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+
+    // Old hardcoded limit would have skipped.
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(DEFAULT_MAX_STREAMING_PROMPT_BYTES, req));
+    // New default (null) must not skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
 }
