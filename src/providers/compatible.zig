@@ -12,7 +12,9 @@ const ToolCall = root.ToolCall;
 const TokenUsage = root.TokenUsage;
 
 const log = std.log.scoped(.compatible);
-const MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
+/// Legacy default kept as a named constant for tests only.
+/// Runtime code uses OpenAiCompatibleProvider.max_streaming_prompt_bytes (null = no limit).
+const DEFAULT_MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
 
 fn logCompatibleApiError(
     allocator: std.mem.Allocator,
@@ -182,6 +184,10 @@ pub const OpenAiCompatibleProvider = struct {
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Maximum estimated request text bytes before streaming is skipped.
+    /// null means no limit — streaming is always attempted.
+    /// Set via per-provider config field `max_streaming_prompt_bytes`.
+    max_streaming_prompt_bytes: ?usize = null,
     allocator: std.mem.Allocator,
 
     const think_open_tag = "<think>";
@@ -748,21 +754,23 @@ pub const OpenAiCompatibleProvider = struct {
         const effective_model = self.normalizeProviderModel(model);
         const request_text_bytes = estimateRequestTextBytes(request);
 
-        if (request_text_bytes >= MAX_STREAMING_PROMPT_BYTES) {
-            log.warn(
-                "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
-                .{ self.name, request_text_bytes, MAX_STREAMING_PROMPT_BYTES },
-            );
-            const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-            if (fallback.content) |text| {
-                callback(callback_ctx, root.StreamChunk.textDelta(text));
+        if (self.max_streaming_prompt_bytes) |limit| {
+            if (request_text_bytes >= limit) {
+                log.warn(
+                    "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
+                    .{ self.name, request_text_bytes, limit },
+                );
+                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                if (fallback.content) |text| {
+                    callback(callback_ctx, root.StreamChunk.textDelta(text));
+                }
+                callback(callback_ctx, root.StreamChunk.finalChunk());
+                return .{
+                    .content = fallback.content,
+                    .usage = fallback.usage,
+                    .model = fallback.model,
+                };
             }
-            callback(callback_ctx, root.StreamChunk.finalChunk());
-            return .{
-                .content = fallback.content,
-                .usage = fallback.usage,
-                .model = fallback.model,
-            };
         }
 
         const url = try self.chatCompletionsUrl(allocator);
@@ -2143,4 +2151,46 @@ test "merge_system_into_user streaming body also merges" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     const content = messages.items[0].object.get("content").?.string;
     try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be concise]") != null);
+}
+
+test "max_streaming_prompt_bytes null means no limit" {
+    // A provider with no limit set should never skip to non-streaming regardless of payload size.
+    const prov = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "test",
+        "https://api.example.com/v1",
+        "key",
+        .bearer,
+        null,
+    );
+    // null = no limit
+    try std.testing.expectEqual(@as(?usize, null), prov.max_streaming_prompt_bytes);
+}
+
+test "max_streaming_prompt_bytes set applies threshold" {
+    // A provider with a limit set should reflect it.
+    var prov = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "test",
+        "https://api.example.com/v1",
+        "key",
+        .bearer,
+        null,
+    );
+    prov.max_streaming_prompt_bytes = 65536;
+    try std.testing.expectEqual(@as(?usize, 65536), prov.max_streaming_prompt_bytes);
+
+    // A small message should be under the limit; a large one should exceed it.
+    const small_msgs = [_]root.ChatMessage{root.ChatMessage.user("hi")};
+    const small_req = root.ChatRequest{ .messages = &small_msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.estimateRequestTextBytes(small_req) < 65536);
+
+    const big_content = "x" ** 70000;
+    const big_msgs = [_]root.ChatMessage{root.ChatMessage.user(big_content)};
+    const big_req = root.ChatRequest{ .messages = &big_msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.estimateRequestTextBytes(big_req) >= 65536);
+}
+
+test "DEFAULT_MAX_STREAMING_PROMPT_BYTES legacy value is 32 KiB" {
+    try std.testing.expectEqual(@as(usize, 32 * 1024), DEFAULT_MAX_STREAMING_PROMPT_BYTES);
 }

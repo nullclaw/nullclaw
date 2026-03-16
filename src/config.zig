@@ -229,6 +229,15 @@ pub const Config = struct {
         return null;
     }
 
+    /// Look up the optional streaming prompt byte limit for a provider.
+    /// Returns null if provider is not in the list or has no limit set (no limit = always stream).
+    pub fn getProviderMaxStreamingPromptBytes(self: *const Config, name: []const u8) ?usize {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.max_streaming_prompt_bytes;
+        }
+        return null;
+    }
+
     /// Sync flat convenience fields from the nested sub-configs.
     pub fn syncFlatFields(self: *Config) void {
         self.temperature = self.default_temperature;

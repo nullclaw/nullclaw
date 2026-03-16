@@ -359,6 +359,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         provider_base_url,
         cfg.getProviderNativeTools(provider),
         cfg.getProviderUserAgent(provider),
+        cfg.getProviderMaxStreamingPromptBytes(provider),
     );
     defer holder.deinit();
 
