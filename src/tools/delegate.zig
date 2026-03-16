@@ -197,6 +197,7 @@ pub const DelegateTool = struct {
             base_url,
             native_tools,
             user_agent,
+            null, // max_streaming_prompt_bytes: no limit for delegate calls
         );
         defer provider_holder.deinit();
         return provider_holder.provider().chatWithSystem(

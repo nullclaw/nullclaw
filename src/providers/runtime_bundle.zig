@@ -13,6 +13,7 @@ const HolderPlan = struct {
     base_url: ?[]const u8,
     native_tools: bool,
     user_agent: ?[]const u8,
+    max_streaming_prompt_bytes: ?usize,
 };
 
 fn trimOptionalKey(raw_key: ?[]const u8) ?[]const u8 {
@@ -62,6 +63,7 @@ fn appendHolderPlan(
         .base_url = cfg.getProviderBaseUrl(provider_name),
         .native_tools = cfg.getProviderNativeTools(provider_name),
         .user_agent = cfg.getProviderUserAgent(provider_name),
+        .max_streaming_prompt_bytes = cfg.getProviderMaxStreamingPromptBytes(provider_name),
     });
     return plans.items.len;
 }
@@ -114,6 +116,7 @@ pub const RuntimeProviderBundle = struct {
             cfg.getProviderBaseUrl(cfg.default_provider),
             cfg.getProviderNativeTools(cfg.default_provider),
             cfg.getProviderUserAgent(cfg.default_provider),
+            cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
         );
 
         if (cfg.model_routes.len > 0) {
@@ -214,6 +217,7 @@ pub const RuntimeProviderBundle = struct {
                         plan.base_url,
                         plan.native_tools,
                         plan.user_agent,
+                        plan.max_streaming_prompt_bytes,
                     );
                     bundle.router_holders_initialized = i + 1;
                 }
@@ -284,6 +288,7 @@ pub const RuntimeProviderBundle = struct {
                     cfg.getProviderBaseUrl(provider_name),
                     cfg.getProviderNativeTools(provider_name),
                     cfg.getProviderUserAgent(provider_name),
+                    cfg.getProviderMaxStreamingPromptBytes(provider_name),
                 );
                 bundle.extra_holders_initialized = extra_i + 1;
                 bundle.reliable_entries.?[extra_i] = .{
@@ -310,6 +315,7 @@ pub const RuntimeProviderBundle = struct {
                         cfg.getProviderBaseUrl(cfg.default_provider),
                         cfg.getProviderNativeTools(cfg.default_provider),
                         cfg.getProviderUserAgent(cfg.default_provider),
+                        cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
                     );
                     bundle.extra_holders_initialized = extra_i + 1;
                     bundle.reliable_entries.?[extra_i] = .{

@@ -50,6 +50,12 @@ pub const ProviderEntry = struct {
     /// Optional User-Agent header for HTTP requests to this provider.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Maximum estimated request text bytes before the streaming path is
+    /// skipped and a non-streaming POST is used instead.
+    /// null means no limit — streaming is always attempted (recommended for
+    /// modern LLMs with large context windows).
+    /// When set, must be > 0. Example: 524288 for 512 KiB.
+    max_streaming_prompt_bytes: ?usize = null,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────

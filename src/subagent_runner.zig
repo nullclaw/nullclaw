@@ -31,6 +31,7 @@ pub fn runTaskWithTools(
     const provider_base_url = if (provider_entry) |entry| entry.base_url else null;
     const provider_native_tools = if (provider_entry) |entry| entry.native_tools else true;
     const provider_user_agent = if (provider_entry) |entry| entry.user_agent else null;
+    const provider_max_streaming_prompt_bytes = if (provider_entry) |entry| entry.max_streaming_prompt_bytes else null;
 
     var provider_holder = providers.ProviderHolder.fromConfig(
         allocator,
@@ -39,6 +40,7 @@ pub fn runTaskWithTools(
         provider_base_url,
         provider_native_tools,
         provider_user_agent,
+        provider_max_streaming_prompt_bytes,
     );
     defer provider_holder.deinit();
 
