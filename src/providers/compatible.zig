@@ -716,9 +716,34 @@ pub const OpenAiCompatibleProvider = struct {
 
                 const model_str = if (root_obj.get("model")) |m| (if (m == .string) try allocator.dupe(u8, m.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
 
+                const owned_tool_calls = try tool_calls_list.toOwnedSlice(allocator);
+
+                // Treat a response with no content, no tool calls, and no reasoning as empty.
+                // This happens when the model hits its context limit and returns finish_reason=length
+                // with a null or empty content field. Returning NoResponseContent here lets the
+                // agent's empty-response retry and model-fallback logic engage rather than
+                // silently succeeding with nothing to show.
+                const has_content = content != null and content.?.len > 0;
+                const has_tools = owned_tool_calls.len > 0;
+                const has_reasoning = reasoning_content != null and reasoning_content.?.len > 0;
+                if (!has_content and !has_tools and !has_reasoning) {
+                    log.warn("parseNativeResponse: response has no content, tool calls, or reasoning — treating as NoResponseContent", .{});
+                    // Free allocations made before this guard fires to avoid a leak.
+                    if (content) |c| if (c.len > 0) allocator.free(c);
+                    if (reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+                    for (owned_tool_calls) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    if (owned_tool_calls.len > 0) allocator.free(owned_tool_calls);
+                    allocator.free(model_str);
+                    return error.NoResponseContent;
+                }
+
                 return .{
                     .content = content,
-                    .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
+                    .tool_calls = owned_tool_calls,
                     .usage = usage,
                     .model = model_str,
                     .reasoning_content = reasoning_content,
@@ -1329,6 +1354,65 @@ test "parseNativeResponse reads native reasoning field (Groq/Cerebras parsed for
     try std.testing.expectEqualStrings("Final answer", result.content.?);
     try std.testing.expect(result.reasoning_content != null);
     try std.testing.expectEqualStrings("parsed reasoning trace", result.reasoning_content.?);
+}
+
+test "parseNativeResponse null content with no tools or reasoning returns NoResponseContent" {
+    // Simulates GLM-5 hitting its context limit: finish_reason=length, content=null.
+    // All three payloads (content, tool_calls, reasoning_content) are absent/empty.
+    // parseNativeResponse must return NoResponseContent so the agent's retry/fallback chain engages.
+    const body =
+        \\{"choices":[{"message":{"content":null},"finish_reason":"length"}],"model":"glm-5"}
+    ;
+    try std.testing.expectError(
+        error.NoResponseContent,
+        OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body),
+    );
+}
+
+test "parseNativeResponse null content with reasoning_content succeeds" {
+    // Reasoning-only response (thinking model that produced a CoT but no final text) is valid.
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"step-by-step reasoning here"}}],"model":"glm-z1"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("step-by-step reasoning here", result.reasoning_content.?);
+}
+
+test "parseNativeResponse null content with native tool calls succeeds" {
+    // Models that emit tool_calls with no text content are valid — the agent should
+    // execute the tool, not treat the response as empty.
+    const body =
+        \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"list_dir","arguments":"{\"path\":\"/tmp\"}"}}]}}],"model":"glm-5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.tool_calls.len == 1);
+    try std.testing.expectEqualStrings("list_dir", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
 }
 
 test "buildChatRequestBody emits thinking param for GLM when reasoning_effort set" {
