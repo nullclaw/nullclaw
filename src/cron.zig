@@ -1374,7 +1374,11 @@ const JsonCronJob = struct {
 };
 
 /// Get the default cron.json path: ~/.nullclaw/cron.json
+/// In test builds, uses a temp path to avoid clobbering production data.
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
+    if (comptime builtin.is_test) {
+        return try allocator.dupe(u8, "/tmp/.nullclaw-test/cron.json");
+    }
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.json" });
@@ -1382,10 +1386,15 @@ fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
 
 /// Ensure the ~/.nullclaw directory exists.
 fn ensureCronDir(allocator: std.mem.Allocator) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
-    defer allocator.free(dir);
+    const dir = if (comptime builtin.is_test)
+        "/tmp/.nullclaw-test"
+    else blk: {
+        const home = try platform.getHomeDir(allocator);
+        defer allocator.free(home);
+        const d = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+        break :blk d;
+    };
+    defer if (!builtin.is_test) allocator.free(dir);
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -1515,6 +1524,10 @@ pub fn reloadJobs(scheduler: *CronScheduler) !void {
         }
         return err;
     };
+    // Guard: never replace populated in-memory jobs with an empty disk state.
+    // This prevents wiping the scheduler when cron.json is temporarily missing
+    // (e.g. during atomic write) or empty due to a truncated write.
+    if (loaded.jobs.items.len == 0 and scheduler.jobs.items.len > 0) return;
     std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
 }
 
