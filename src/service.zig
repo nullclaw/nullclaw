@@ -1,7 +1,13 @@
-//! Service management — launchd (macOS), systemd (Linux), and SCM (Windows).
+//! Service management — launchd (macOS), systemd/OpenRC (Linux), and SCM (Windows).
 //!
 //! Mirrors ZeroClaw's service module: install, start, stop, restart, status, uninstall.
-//! Uses child process execution to interact with launchctl / systemctl / sc.exe.
+//! Uses child process execution to interact with launchctl / systemctl / rc-service / sc.exe.
+//!
+//! Linux init system selection:
+//!   - systemd  — preferred; detected via `systemctl --user status`
+//!   - OpenRC   — fallback; detected via `rc-service --list`
+//!   OpenRC writes the init script to /etc/init.d/nullclaw and symlinks it into
+//!   /etc/runlevels/default/, both of which require root (sudo / doas).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,6 +21,13 @@ const SERVICE_LABEL = "com.nullclaw.daemon";
 const WINDOWS_SERVICE_NAME = "nullclaw";
 const WINDOWS_SERVICE_DISPLAY_NAME = "nullclaw gateway runtime";
 pub const WINDOWS_SERVICE_GATEWAY_ARG = "__windows-service-gateway";
+
+/// Name used for the OpenRC init script and rc-service identifier.
+const OPENRC_SERVICE_NAME = "nullclaw";
+/// Absolute path of the installed OpenRC init script.
+const OPENRC_INIT_SCRIPT = "/etc/init.d/" ++ OPENRC_SERVICE_NAME;
+/// Runlevel directory where the service symlink is created.
+const OPENRC_RUNLEVEL_DIR = "/etc/runlevels/default";
 
 const windows = std.os.windows;
 const WINDOWS_SERVICE_NAME_W = std.unicode.utf8ToUtf16LeStringLiteral(WINDOWS_SERVICE_NAME);
@@ -81,7 +94,42 @@ pub const ServiceError = error{
     FileCreateFailed,
     SystemctlUnavailable,
     SystemdUserUnavailable,
+    OpenrcUnavailable,
+    NoInitSystemDetected,
 };
+
+// ── Linux init system detection ──────────────────────────────────
+
+/// Which init system is active on the current Linux host.
+const LinuxInit = enum { systemd, openrc, unknown };
+
+/// Probe the running init system.
+///
+/// Priority: systemd > OpenRC > unknown.
+/// Detection is best-effort and cheap (single child-process each).
+fn detectLinuxInit(allocator: std.mem.Allocator) LinuxInit {
+    // systemd: attempt `systemctl --user status`.  A non-zero exit that is
+    // *not* a "systemd unavailable" message still implies systemd is present
+    // (e.g. degraded state, no units loaded).
+    const sd = runCaptureStatus(allocator, &.{ "systemctl", "--user", "status" }) catch null;
+    if (sd) |s| {
+        defer allocator.free(s.stdout);
+        defer allocator.free(s.stderr);
+        const detail = captureStatusDetail(&s);
+        if (!isSystemdUnavailableDetail(detail)) return .systemd;
+    }
+
+    // OpenRC: `rc-service --list` exits 0 on any OpenRC system.
+    const rc = runCaptureStatus(allocator, &.{ "rc-service", "--list" }) catch null;
+    if (rc) |r| {
+        defer allocator.free(r.stdout);
+        defer allocator.free(r.stderr);
+        // rc-service found — OpenRC is present regardless of exit code.
+        return .openrc;
+    }
+
+    return .unknown;
+}
 
 pub fn isWindowsServiceGatewayArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, WINDOWS_SERVICE_GATEWAY_ARG);
@@ -144,9 +192,17 @@ fn startService(allocator: std.mem.Allocator) !void {
         try runChecked(allocator, &.{ "launchctl", "load", "-w", plist });
         try runChecked(allocator, &.{ "launchctl", "start", SERVICE_LABEL });
     } else if (comptime builtin.os.tag == .linux) {
-        try assertLinuxSystemdUserAvailable(allocator);
-        try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
-        try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullclaw.service" });
+        switch (detectLinuxInit(allocator)) {
+            .systemd => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+                try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullclaw.service" });
+            },
+            .openrc => {
+                try runChecked(allocator, &.{ "rc-service", OPENRC_SERVICE_NAME, "start" });
+            },
+            .unknown => return error.NoInitSystemDetected,
+        }
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "start", WINDOWS_SERVICE_NAME });
     } else {
@@ -161,8 +217,16 @@ fn stopService(allocator: std.mem.Allocator) !void {
         runChecked(allocator, &.{ "launchctl", "stop", SERVICE_LABEL }) catch {};
         runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
     } else if (comptime builtin.os.tag == .linux) {
-        try assertLinuxSystemdUserAvailable(allocator);
-        try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+        switch (detectLinuxInit(allocator)) {
+            .systemd => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+            },
+            .openrc => {
+                try runChecked(allocator, &.{ "rc-service", OPENRC_SERVICE_NAME, "stop" });
+            },
+            .unknown => return error.NoInitSystemDetected,
+        }
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
     } else {
@@ -186,14 +250,29 @@ fn stopServiceForRestart(allocator: std.mem.Allocator) !void {
         runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
         return;
     } else if (comptime builtin.os.tag == .linux) {
-        try assertLinuxSystemdUserAvailable(allocator);
-        const status = try runCaptureStatus(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
-        defer allocator.free(status.stdout);
-        defer allocator.free(status.stderr);
-        if (status.success) return;
-        const detail = captureStatusDetail(&status);
-        if (isSystemdUnitNotLoadedDetail(detail)) return;
-        return error.CommandFailed;
+        switch (detectLinuxInit(allocator)) {
+            .systemd => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                const status = try runCaptureStatus(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+                defer allocator.free(status.stdout);
+                defer allocator.free(status.stderr);
+                if (status.success) return;
+                const detail = captureStatusDetail(&status);
+                if (isSystemdUnitNotLoadedDetail(detail)) return;
+                return error.CommandFailed;
+            },
+            .openrc => {
+                // rc-service stop exits non-zero when already stopped; treat as best-effort.
+                const status = try runCaptureStatus(allocator, &.{ "rc-service", OPENRC_SERVICE_NAME, "stop" });
+                defer allocator.free(status.stdout);
+                defer allocator.free(status.stderr);
+                if (status.success) return;
+                const detail = captureStatusDetail(&status);
+                if (isOpenrcServiceNotRunningDetail(detail)) return;
+                return error.CommandFailed;
+            },
+            .unknown => return error.NoInitSystemDetected,
+        }
     } else if (comptime builtin.os.tag == .windows) {
         const status = try runCaptureStatus(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
         defer allocator.free(status.stdout);
@@ -222,14 +301,32 @@ fn serviceStatus(allocator: std.mem.Allocator) !void {
         try w.print("Unit: {s}\n", .{plist});
         try w.flush();
     } else if (comptime builtin.os.tag == .linux) {
-        try assertLinuxSystemdUserAvailable(allocator);
-        const output = runCapture(allocator, &.{ "systemctl", "--user", "is-active", "nullclaw.service" }) catch try allocator.dupe(u8, "unknown");
-        defer allocator.free(output);
-        try w.print("Service state: {s}\n", .{std.mem.trim(u8, output, " \t\n\r")});
-        const unit = try linuxServiceFile(allocator);
-        defer allocator.free(unit);
-        try w.print("Unit: {s}\n", .{unit});
-        try w.flush();
+        switch (detectLinuxInit(allocator)) {
+            .systemd => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                const output = runCapture(allocator, &.{ "systemctl", "--user", "is-active", "nullclaw.service" }) catch try allocator.dupe(u8, "unknown");
+                defer allocator.free(output);
+                try w.print("Service state: {s}\n", .{std.mem.trim(u8, output, " \t\n\r")});
+                const unit = try linuxServiceFile(allocator);
+                defer allocator.free(unit);
+                try w.print("Unit: {s}\n", .{unit});
+                try w.print("Init: systemd\n", .{});
+                try w.flush();
+            },
+            .openrc => {
+                // `rc-service nullclaw status` prints human-readable state to stdout.
+                const output = runCapture(allocator, &.{ "rc-service", OPENRC_SERVICE_NAME, "status" }) catch try allocator.dupe(u8, "unknown");
+                defer allocator.free(output);
+                try w.print("Service state: {s}\n", .{std.mem.trim(u8, output, " \t\n\r")});
+                try w.print("Unit: {s}\n", .{OPENRC_INIT_SCRIPT});
+                try w.print("Init: openrc\n", .{});
+                try w.flush();
+            },
+            .unknown => {
+                try w.print("Service state: unknown (no supported init system detected)\n", .{});
+                try w.flush();
+            },
+        }
     } else if (comptime builtin.os.tag == .windows) {
         const status = try runCaptureStatus(allocator, &.{ "sc.exe", "query", WINDOWS_SERVICE_NAME });
         defer allocator.free(status.stdout);
@@ -259,15 +356,23 @@ fn uninstall(allocator: std.mem.Allocator) !void {
         defer allocator.free(plist);
         std.fs.deleteFileAbsolute(plist) catch {};
     } else if (comptime builtin.os.tag == .linux) {
-        try stopService(allocator);
-        const unit = try linuxServiceFile(allocator);
-        defer allocator.free(unit);
-        std.fs.deleteFileAbsolute(unit) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        try assertLinuxSystemdUserAvailable(allocator);
-        try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+        switch (detectLinuxInit(allocator)) {
+            .systemd => {
+                try stopService(allocator);
+                const unit = try linuxServiceFile(allocator);
+                defer allocator.free(unit);
+                std.fs.deleteFileAbsolute(unit) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+                try assertLinuxSystemdUserAvailable(allocator);
+                try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+            },
+            .openrc => {
+                try uninstallOpenrc(allocator);
+            },
+            .unknown => return error.NoInitSystemDetected,
+        }
     } else if (comptime builtin.os.tag == .windows) {
         try uninstallWindows(allocator);
     } else {
@@ -371,6 +476,14 @@ fn preferredHomebrewShimPath(allocator: std.mem.Allocator, exe_path: []const u8)
 }
 
 fn installLinux(allocator: std.mem.Allocator) !void {
+    switch (detectLinuxInit(allocator)) {
+        .systemd => try installLinuxSystemd(allocator),
+        .openrc => try installOpenrc(allocator),
+        .unknown => return error.NoInitSystemDetected,
+    }
+}
+
+fn installLinuxSystemd(allocator: std.mem.Allocator) !void {
     const unit = try linuxServiceFile(allocator);
     defer allocator.free(unit);
 
@@ -413,6 +526,78 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
     try runChecked(allocator, &.{ "systemctl", "--user", "enable", "nullclaw.service" });
+}
+
+/// Write an OpenRC init script to /etc/init.d/nullclaw and add it to the
+/// default runlevel.  Requires root privileges.
+fn installOpenrc(allocator: std.mem.Allocator) !void {
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
+
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+    const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    defer allocator.free(config_dir);
+
+    // OpenRC SysV-compatible init script.
+    const content = try std.fmt.allocPrint(allocator,
+        \\#!/sbin/openrc-run
+        \\
+        \\name="{s}"
+        \\description="nullclaw gateway runtime"
+        \\
+        \\command="{s}"
+        \\command_args="gateway"
+        \\command_background=true
+        \\pidfile="/run/{s}.pid"
+        \\
+        \\# Load optional environment overrides (e.g. API keys).
+        \\# The leading '-' suppresses errors when the file is absent.
+        \\dotenv="{s}/.env"
+        \\
+        \\depend() {{
+        \\    need net
+        \\    use logger
+        \\}}
+    , .{ OPENRC_SERVICE_NAME, service_exe_path, OPENRC_SERVICE_NAME, config_dir });
+    defer allocator.free(content);
+
+    // Write init script.
+    const file = std.fs.createFileAbsolute(OPENRC_INIT_SCRIPT, .{ .mode = 0o755 }) catch |err| {
+        if (err == error.AccessDenied) {
+            std.debug.print("error: writing {s} requires root privileges\n", .{OPENRC_INIT_SCRIPT});
+        }
+        return err;
+    };
+    defer file.close();
+    try file.writeAll(content);
+
+    // Ensure the script is executable (createFileAbsolute mode may be masked by umask).
+    try std.fs.chdirAbsolute("/");
+    const cwd = std.fs.cwd();
+    // Strip leading '/' for a relative path from cwd '/'.
+    cwd.chmod(OPENRC_INIT_SCRIPT[1..], 0o755) catch {};
+
+    // Add to default runlevel: `rc-update add nullclaw default`.
+    try runChecked(allocator, &.{ "rc-update", "add", OPENRC_SERVICE_NAME, "default" });
+}
+
+/// Remove the OpenRC service: stop it, delete the runlevel symlink and the
+/// init script.  Non-fatal if the script or symlink is already absent.
+fn uninstallOpenrc(allocator: std.mem.Allocator) !void {
+    // Best-effort stop.
+    runChecked(allocator, &.{ "rc-service", OPENRC_SERVICE_NAME, "stop" }) catch {};
+
+    // Remove from runlevel.
+    runChecked(allocator, &.{ "rc-update", "del", OPENRC_SERVICE_NAME, "default" }) catch {};
+
+    // Delete the init script.
+    std.fs.deleteFileAbsolute(OPENRC_INIT_SCRIPT) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn installWindows(allocator: std.mem.Allocator) !void {
@@ -519,6 +704,13 @@ fn isSystemdUnitNotLoadedDetail(detail: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(detail, "unit nullclaw.service not loaded") != null or
         std.ascii.indexOfIgnoreCase(detail, "could not be found") != null or
         std.ascii.indexOfIgnoreCase(detail, "not loaded") != null;
+}
+
+/// True when rc-service reports the daemon is already stopped / not running.
+fn isOpenrcServiceNotRunningDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "is not running") != null or
+        std.ascii.indexOfIgnoreCase(detail, "has not been started") != null or
+        std.ascii.indexOfIgnoreCase(detail, "stopped") != null;
 }
 
 fn isWindowsServiceMissingDetail(detail: []const u8) bool {
@@ -818,6 +1010,14 @@ test "isSystemdUnitNotLoadedDetail detects stop-not-loaded patterns" {
     try std.testing.expect(isSystemdUnitNotLoadedDetail("Unit nullclaw.service could not be found."));
     try std.testing.expect(isSystemdUnitNotLoadedDetail("not loaded"));
     try std.testing.expect(!isSystemdUnitNotLoadedDetail("permission denied"));
+}
+
+test "isOpenrcServiceNotRunningDetail detects already-stopped patterns" {
+    try std.testing.expect(isOpenrcServiceNotRunningDetail("nullclaw is not running"));
+    try std.testing.expect(isOpenrcServiceNotRunningDetail("service has not been started"));
+    try std.testing.expect(isOpenrcServiceNotRunningDetail("* stopped nullclaw"));
+    try std.testing.expect(!isOpenrcServiceNotRunningDetail("failed to start nullclaw"));
+    try std.testing.expect(!isOpenrcServiceNotRunningDetail("permission denied"));
 }
 
 test "isWindowsServiceMissingDetail detects missing-service patterns" {
