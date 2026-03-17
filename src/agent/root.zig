@@ -312,6 +312,10 @@ pub const Agent = struct {
     status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
+    /// When true, suppresses intermediate text output to stdout during the tool
+    /// loop.  Used in single-message (``-m``) mode so that cron / subprocess
+    /// callers only see the final response on stdout.
+    suppress_intermediate_output: bool = false,
     log_llm_io: bool = false,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
@@ -375,6 +379,13 @@ pub const Agent = struct {
     /// Skill evolution performance tracker (detects improvement opportunities).
     /// Heap-allocated because the tracker is ~11 KB (32 skill slots × ring buffers).
     evolution_tracker: ?*skillforge_evolution.SkillPerformanceTracker = null,
+
+    /// Plan gate: tool-free planning turn before execution.
+    plan_gate_enabled: bool = false,
+    /// Channels where plan gate is active. Empty = all channels.
+    plan_gate_channels: []const []const u8 = &.{},
+    pending_plan: ?[]const u8 = null,
+    pending_plan_owned: bool = false,
 
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
@@ -501,6 +512,8 @@ pub const Agent = struct {
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .skill_routing_enabled = cfg.agent.skill_routing_enabled,
             .skill_routing_max_active = cfg.agent.skill_routing_max_active,
+            .plan_gate_enabled = cfg.agent.plan_gate_enabled,
+            .plan_gate_channels = cfg.agent.plan_gate_channels,
             .evolution_tracker = if (cfg.agent.skill_evolution_enabled) blk: {
                 const tracker = try allocator.create(skillforge_evolution.SkillPerformanceTracker);
                 tracker.* = skillforge_evolution.SkillPerformanceTracker.init(.{
@@ -530,6 +543,7 @@ pub const Agent = struct {
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
+        if (self.pending_plan_owned and self.pending_plan != null) self.allocator.free(self.pending_plan.?);
         if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
         if (self.dock_target_owned and self.dock_target != null) self.allocator.free(self.dock_target.?);
         self.tool_state_mu.lock();
@@ -863,6 +877,95 @@ pub const Agent = struct {
                 }
             }
             if (matched) return true;
+        }
+        return false;
+    }
+
+    /// Check if the plan gate should be active for the current session's channel.
+    /// Returns true if plan_gate_channels is empty (all channels) or the channel
+    /// extracted from memory_session_id matches one of the configured channels.
+    fn isPlanGateActiveForChannel(self: *const Agent) bool {
+        if (self.plan_gate_channels.len == 0) return true;
+        const session_id = self.memory_session_id orelse return false;
+        const channel = if (std.mem.indexOfScalar(u8, session_id, ':')) |sep|
+            session_id[0..sep]
+        else
+            session_id;
+        for (self.plan_gate_channels) |allowed| {
+            if (std.mem.eql(u8, channel, allowed)) return true;
+        }
+        return false;
+    }
+
+    fn clearPendingPlan(self: *Agent) void {
+        if (self.pending_plan_owned) if (self.pending_plan) |p| self.allocator.free(p);
+        self.pending_plan = null;
+        self.pending_plan_owned = false;
+    }
+
+    fn isPlanConfirmation(text: []const u8) bool {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return false;
+
+        const keywords = [_][]const u8{
+            "ja",      "go",      "ok",    "yes",        "doen",      "doe maar",
+            "akkoord", "prima",   "klopt", "top",        "goed",      "sure",
+            "yep",     "proceed", "do it", "ga je gang", "confirmed", "yes go",
+        };
+
+        // Short messages: any keyword match
+        if (trimmed.len <= 40) {
+            inline for (keywords) |kw| {
+                if (containsWordIgnoreCase(trimmed, kw)) return true;
+            }
+            return false;
+        }
+
+        // Longer messages: only match if the message STARTS with a confirmation keyword
+        // (e.g. "Goed plan, het document heet..." or "Ok maar gebruik...")
+        inline for (keywords) |kw| {
+            if (trimmed.len >= kw.len) {
+                var match = true;
+                for (kw, 0..) |c, idx| {
+                    if (std.ascii.toLower(trimmed[idx]) != std.ascii.toLower(c)) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    // Check word boundary after keyword
+                    if (trimmed.len == kw.len) return true;
+                    if (!std.ascii.isAlphabetic(trimmed[kw.len])) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Check if haystack contains needle as a whole word (case-insensitive).
+    /// Word boundaries are: start/end of string, space, comma, period, exclamation, question mark.
+    fn containsWordIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or haystack.len < needle.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) : (i += 1) {
+            // Check if substring matches (case-insensitive)
+            var matched = true;
+            var j: usize = 0;
+            while (j < needle.len) : (j += 1) {
+                if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (!matched) continue;
+
+            // Check word boundary before
+            if (i > 0 and std.ascii.isAlphabetic(haystack[i - 1])) continue;
+            // Check word boundary after
+            const end = i + needle.len;
+            if (end < haystack.len and std.ascii.isAlphabetic(haystack[end])) continue;
+
+            return true;
         }
         return false;
     }
@@ -1552,6 +1655,7 @@ pub const Agent = struct {
                 .tool_failures = score.tool_failures,
                 .signals = @bitCast(score.signals),
                 .model = prev_ctx.model,
+                .session_id = self.memory_session_id orelse "",
             } };
             self.observer.recordEvent(&scored_event);
 
@@ -1570,6 +1674,9 @@ pub const Agent = struct {
                         .skill = trigger.skill_name,
                         .trigger_type = trigger.trigger_type.toSlice(),
                         .score = trigger.score,
+                        .model = prev_ctx.model,
+                        .tool_failures = trigger.tool_failures,
+                        .context = "Auto-detected by evolution tracker",
                     } };
                     self.observer.recordEvent(&evo_event);
 
@@ -1727,6 +1834,287 @@ pub const Agent = struct {
 
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+
+        // ── Plan gate ──
+        if (self.plan_gate_enabled and self.isPlanGateActiveForChannel()) {
+            var plan_confirmed = false;
+
+            // Skip plan gate if the last assistant message was a question (user is answering, not requesting)
+            const last_was_question = blk: {
+                var i = self.history.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.history.items[i].role == .assistant) {
+                        const content = std.mem.trimRight(u8, self.history.items[i].content, " \t\r\n");
+                        break :blk content.len > 0 and content[content.len - 1] == '?';
+                    }
+                    if (self.history.items[i].role == .user) break :blk false;
+                }
+                break :blk false;
+            };
+
+            // Blok A: pending plan exists — check for confirmation or correction
+            if (self.pending_plan != null) {
+                if (isPlanConfirmation(effective_user_message)) {
+                    // User confirms — inject plan context + instruction so model knows what to execute.
+                    // Include the pending plan text for context (the model may have forgotten).
+                    const plan_context = self.pending_plan orelse "the task above";
+                    const confirm_msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "SYSTEM: User approved your plan:\n{s}\n\nExecute it now using the available tools. Do not ask for confirmation again.",
+                        .{plan_context},
+                    );
+                    try self.appendOwnedHistoryMessage(.{
+                        .role = .user,
+                        .content = confirm_msg,
+                    });
+                    self.clearPendingPlan();
+                    plan_confirmed = true;
+                } else {
+                    // User corrects — clear plan and re-plan (fall through to Blok B)
+                    self.clearPendingPlan();
+                }
+            }
+
+            // Blok B: no pending plan, not just confirmed, and not answering a question — do a tool-free planning call
+            if (!plan_confirmed and !last_was_question and self.pending_plan == null) plan_gate_blk: {
+                // Save original system prompt and swap in plan-gate version
+                if (self.history.items.len == 0 or self.history.items[0].role != .system) break :plan_gate_blk;
+
+                const original_system = self.history.items[0].content;
+                const plan_gate_instruction =
+                    "\n\n## Planning Mode (ACTIVE)\n\n" ++
+                    "CRITICAL: You are in planning mode. All tool capabilities are DISABLED for this response.\n\n" ++
+                    "FORBIDDEN in this response:\n" ++
+                    "- <tool_call> or [TOOL_CALL] tags\n" ++
+                    "- <invoke> or <function_calls> tags\n" ++
+                    "- JSON objects with \"tool\" or \"name\" and \"arguments\" keys\n" ++
+                    "- Shell commands or code blocks meant for execution\n" ++
+                    "- Any attempt to call, invoke, or execute tools\n\n" ++
+                    "INSTEAD, respond with ONLY plain text:\n" ++
+                    "- If you can answer the user's question directly from your knowledge, just answer.\n" ++
+                    "- If you need tools to complete the task, present a brief numbered plan:\n" ++
+                    "  1. What you will do\n" ++
+                    "  2. Which approach you'll use\n" ++
+                    "  3. Expected result\n\n" ++
+                    "Then wait for the user to confirm before you get tool access.\n";
+
+                // Strip only the Tool Use Protocol section (tool-call syntax/format).
+                // Keep Skills visible so the model knows WHAT it can do for planning,
+                // but not HOW to invoke tools. The safety net catches any tool-call attempts.
+                const prefix_len = if (std.mem.indexOf(u8, original_system, "## Tool Use Protocol")) |pos|
+                    pos
+                else
+                    original_system.len;
+
+                const modified_system = try self.allocator.alloc(u8, prefix_len + plan_gate_instruction.len);
+                defer self.allocator.free(modified_system);
+                @memcpy(modified_system[0..prefix_len], original_system[0..prefix_len]);
+                @memcpy(modified_system[prefix_len..], plan_gate_instruction);
+
+                // Temporarily swap system prompt
+                self.history.items[0].content = modified_system;
+                defer self.history.items[0].content = original_system;
+
+                // Build messages and call LLM without tools
+                var gate_arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer gate_arena.deinit();
+                const messages = try self.buildProviderMessages(gate_arena.allocator(), turn_model_name);
+
+                const gate_token_limit = context_tokens.resolveContextTokens(self.token_limit_override, turn_model_name);
+                const gate_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(self.max_tokens_override, turn_model_name);
+                const gate_token_limit_cap: u32 = @intCast(@min(gate_token_limit, @as(u64, std.math.maxInt(u32))));
+                const gate_max_tokens = @min(gate_max_tokens_raw, gate_token_limit_cap);
+                const gate_request_max_tokens = self.effectiveMaxTokensForTurn(messages, null, gate_token_limit, gate_max_tokens);
+
+                const timer_start = std.time.milliTimestamp();
+                const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+
+                var gate_response: ChatResponse = undefined;
+                if (is_streaming) {
+                    const stream_result = self.provider.streamChat(
+                        self.allocator,
+                        .{
+                            .messages = messages,
+                            .session_id = self.memory_session_id,
+                            .model = turn_model_name,
+                            .temperature = self.temperature,
+                            .max_tokens = gate_request_max_tokens,
+                            .tools = null,
+                            .timeout_secs = self.message_timeout_secs,
+                            .reasoning_effort = self.reasoning_effort,
+                        },
+                        turn_model_name,
+                        self.temperature,
+                        self.stream_callback.?,
+                        self.stream_ctx.?,
+                    ) catch |err| {
+                        self.emitUsageFailure(turn_model_name);
+                        return err;
+                    };
+                    gate_response = ChatResponse{
+                        .content = stream_result.content,
+                        .tool_calls = &.{},
+                        .usage = stream_result.usage,
+                        .model = stream_result.model,
+                    };
+                } else {
+                    self.logLlmRequest(1, 1, turn_model_name, messages, false, false);
+                    gate_response = self.provider.chat(
+                        self.allocator,
+                        .{
+                            .messages = messages,
+                            .session_id = self.memory_session_id,
+                            .model = turn_model_name,
+                            .temperature = self.temperature,
+                            .max_tokens = gate_request_max_tokens,
+                            .tools = null,
+                            .timeout_secs = self.message_timeout_secs,
+                            .reasoning_effort = self.reasoning_effort,
+                        },
+                        turn_model_name,
+                        self.temperature,
+                    ) catch |err| {
+                        self.emitUsageFailure(turn_model_name);
+                        return err;
+                    };
+                    self.logLlmResponse(1, 1, &gate_response);
+                }
+
+                const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                const resp_event = ObserverEvent{ .llm_response = .{
+                    .provider = self.provider.getName(),
+                    .model = turn_model_name,
+                    .duration_ms = duration_ms,
+                    .success = true,
+                    .error_message = null,
+                } };
+                self.observer.recordEvent(&resp_event);
+
+                // Track usage
+                var normalized_usage = gate_response.usage;
+                if (normalized_usage.total_tokens == 0 and
+                    (normalized_usage.prompt_tokens > 0 or normalized_usage.completion_tokens > 0))
+                {
+                    normalized_usage.total_tokens = normalized_usage.prompt_tokens +| normalized_usage.completion_tokens;
+                }
+                const gate_text = gate_response.contentOrEmpty();
+                if (normalized_usage.total_tokens == 0 and normalized_usage.prompt_tokens == 0 and
+                    normalized_usage.completion_tokens == 0 and gate_text.len > 0)
+                {
+                    normalized_usage.completion_tokens = estimate_text_tokens(gate_text);
+                    normalized_usage.total_tokens = normalized_usage.completion_tokens;
+                }
+                gate_response.usage = normalized_usage;
+                self.total_tokens += normalized_usage.total_tokens;
+                self.last_turn_usage = normalized_usage;
+                self.emitUsageRecord(&gate_response, true);
+
+                // Safety net: if model emitted tool calls despite planning mode,
+                // strip them and force a plan message so raw markup/JSON never leaks to the user.
+                const has_tool_calls = std.mem.indexOf(u8, gate_text, "<tool_call") != null or
+                    std.mem.indexOf(u8, gate_text, "[TOOL_CALL]") != null or
+                    std.mem.indexOf(u8, gate_text, "<invoke") != null or
+                    std.mem.indexOf(u8, gate_text, "<function_call") != null or
+                    (std.mem.indexOf(u8, gate_text, "\"tool\"") != null and
+                        std.mem.indexOf(u8, gate_text, "\"arguments\"") != null) or
+                    (std.mem.indexOf(u8, gate_text, "\"name\"") != null and
+                        std.mem.indexOf(u8, gate_text, "\"arguments\"") != null);
+
+                if (has_tool_calls) {
+                    // Model tried to use tools — extract tool names to build a meaningful plan.
+                    var plan_buf: [512]u8 = undefined;
+                    var plan_stream = std.io.fixedBufferStream(&plan_buf);
+                    const pw = plan_stream.writer();
+                    pw.writeAll("Ik ga het volgende doen:\n") catch {};
+
+                    // Extract unique tool names from the response.
+                    // Markers include the opening quote of the value, so the value starts right after.
+                    const tool_markers = [_][]const u8{ "\"tool\": \"", "\"tool\":\"", "\"name\": \"", "\"name\":\"" };
+                    var step: u32 = 0;
+                    var search_pos: usize = 0;
+                    var seen_tools: [8][]const u8 = undefined;
+                    var seen_count: usize = 0;
+                    outer: while (search_pos < gate_text.len and step < 5) {
+                        // Find the earliest marker
+                        var best_end: ?usize = null;
+                        for (tool_markers) |marker| {
+                            if (std.mem.indexOfPos(u8, gate_text, search_pos, marker)) |pos| {
+                                const end = pos + marker.len;
+                                if (best_end == null or end < best_end.?) {
+                                    best_end = end;
+                                }
+                            }
+                        }
+                        const val_start = best_end orelse break;
+                        // Value runs from val_start until the next closing quote
+                        const remaining = gate_text[val_start..];
+                        const val_end = std.mem.indexOf(u8, remaining, "\"") orelse break;
+                        const tool_name = remaining[0..val_end];
+                        search_pos = val_start + val_end + 1;
+
+                        if (tool_name.len == 0) continue;
+
+                        // Deduplicate
+                        var is_dup = false;
+                        for (seen_tools[0..seen_count]) |seen| {
+                            if (std.mem.eql(u8, seen, tool_name)) {
+                                is_dup = true;
+                                break;
+                            }
+                        }
+                        if (is_dup) continue :outer;
+                        if (seen_count < seen_tools.len) {
+                            seen_tools[seen_count] = tool_name;
+                            seen_count += 1;
+                        }
+
+                        step += 1;
+                        std.fmt.format(pw, "{d}. {s} gebruiken\n", .{ step, tool_name }) catch {};
+                    }
+                    if (step == 0) {
+                        pw.writeAll("1. Tools gebruiken om je verzoek uit te voeren\n") catch {};
+                    }
+                    pw.writeAll("\nZal ik doorgaan?") catch {};
+
+                    const plan_len = plan_stream.pos;
+                    const fallback_plan = try self.allocator.dupe(u8, plan_buf[0..plan_len]);
+                    self.pending_plan = fallback_plan;
+                    self.pending_plan_owned = true;
+
+                    // Return the fallback plan (not the raw tool calls)
+                    const result_text = try self.allocator.dupe(u8, fallback_plan);
+                    errdefer self.allocator.free(result_text);
+                    try self.history.append(self.allocator, .{
+                        .role = .assistant,
+                        .content = try self.allocator.dupe(u8, fallback_plan),
+                    });
+                    self.trimHistory();
+                    self.freeResponseFields(&gate_response);
+                    return result_text;
+                }
+
+                // Classify: plan (has numbered steps) or direct answer
+                const has_plan = std.mem.indexOf(u8, gate_text, "1.") != null and
+                    std.mem.indexOf(u8, gate_text, "2.") != null;
+
+                if (has_plan) {
+                    self.pending_plan = try self.allocator.dupe(u8, gate_text);
+                    self.pending_plan_owned = true;
+                }
+
+                // Append assistant response to history and return
+                const result_text = try self.allocator.dupe(u8, gate_text);
+                errdefer self.allocator.free(result_text);
+                try self.history.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = try self.allocator.dupe(u8, gate_text),
+                });
+                self.trimHistory();
+                self.freeResponseFields(&gate_response);
+                return result_text;
+            }
+        }
 
         // ── Response cache check ──
         if (self.response_cache) |rc| {
@@ -2251,7 +2639,10 @@ pub const Agent = struct {
             // There are tool calls — print intermediary text.
             // In tests, stdout is used by Zig's test runner protocol (`--listen`),
             // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
+            // In subprocess/single-message mode, intermediate output is suppressed
+            // so that only the final response appears on stdout (prevents cron jobs
+            // from delivering reasoning/tool-call text in emails).
+            if (!builtin.is_test and !self.suppress_intermediate_output and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
@@ -8052,6 +8443,137 @@ test "filterToolSpecsForTurn dynamic group keyword match is case-insensitive" {
     const result = try agent.filterToolSpecsForTurn(arena, "Create a TASK for me");
     try std.testing.expectEqual(@as(usize, 1), result.len);
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "isPlanConfirmation recognizes NL confirmations" {
+    try std.testing.expect(Agent.isPlanConfirmation("ja"));
+    try std.testing.expect(Agent.isPlanConfirmation("Ja"));
+    try std.testing.expect(Agent.isPlanConfirmation("doe maar"));
+    try std.testing.expect(Agent.isPlanConfirmation("akkoord"));
+    try std.testing.expect(Agent.isPlanConfirmation("prima"));
+    try std.testing.expect(Agent.isPlanConfirmation("ga je gang"));
+    try std.testing.expect(Agent.isPlanConfirmation("  ok  "));
+    try std.testing.expect(Agent.isPlanConfirmation("goed"));
+    try std.testing.expect(Agent.isPlanConfirmation("top"));
+    try std.testing.expect(Agent.isPlanConfirmation("klopt"));
+    try std.testing.expect(Agent.isPlanConfirmation("doen"));
+}
+
+test "isPlanConfirmation recognizes EN confirmations" {
+    try std.testing.expect(Agent.isPlanConfirmation("yes"));
+    try std.testing.expect(Agent.isPlanConfirmation("Yes"));
+    try std.testing.expect(Agent.isPlanConfirmation("sure"));
+    try std.testing.expect(Agent.isPlanConfirmation("yep"));
+    try std.testing.expect(Agent.isPlanConfirmation("proceed"));
+    try std.testing.expect(Agent.isPlanConfirmation("do it"));
+    try std.testing.expect(Agent.isPlanConfirmation("go"));
+    try std.testing.expect(Agent.isPlanConfirmation("confirmed"));
+    try std.testing.expect(Agent.isPlanConfirmation("Yes go"));
+    try std.testing.expect(Agent.isPlanConfirmation("yes, go"));
+    try std.testing.expect(Agent.isPlanConfirmation("ok do it"));
+}
+
+test "isPlanConfirmation accepts long messages starting with confirmation" {
+    try std.testing.expect(Agent.isPlanConfirmation("Goed plan Donna, het document heet andys-brain-marketing-plan.md"));
+    try std.testing.expect(Agent.isPlanConfirmation("ja dat klopt, ga maar aan de slag met het bestand"));
+    try std.testing.expect(Agent.isPlanConfirmation("Ok maar gebruik wel de docx skill hiervoor"));
+}
+
+test "isPlanConfirmation rejects long messages not starting with confirmation" {
+    try std.testing.expect(!Agent.isPlanConfirmation("I want you to change the approach and use a different tool instead"));
+}
+
+test "isPlanConfirmation rejects non-confirmations" {
+    try std.testing.expect(!Agent.isPlanConfirmation("nee"));
+    try std.testing.expect(!Agent.isPlanConfirmation("no"));
+    try std.testing.expect(!Agent.isPlanConfirmation("stop"));
+    try std.testing.expect(!Agent.isPlanConfirmation("wait"));
+    try std.testing.expect(!Agent.isPlanConfirmation(""));
+}
+
+test "plan_gate_enabled defaults to false" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.5,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer allocator.free(agent.tool_specs);
+    try std.testing.expect(!agent.plan_gate_enabled);
+    try std.testing.expect(agent.pending_plan == null);
+    try std.testing.expect(!agent.pending_plan_owned);
+}
+
+test "clearPendingPlan frees owned plan" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.5,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer allocator.free(agent.tool_specs);
+
+    // Set a pending plan
+    agent.pending_plan = try allocator.dupe(u8, "1. Do thing\n2. Do other thing");
+    agent.pending_plan_owned = true;
+
+    // Clear it
+    agent.clearPendingPlan();
+    try std.testing.expect(agent.pending_plan == null);
+    try std.testing.expect(!agent.pending_plan_owned);
+}
+
+test "clearPendingPlan is safe when no plan" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.5,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer allocator.free(agent.tool_specs);
+
+    // Should not crash
+    agent.clearPendingPlan();
+    try std.testing.expect(agent.pending_plan == null);
 }
 
 test "globMatch handles prefix wildcard" {

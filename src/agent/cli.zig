@@ -356,20 +356,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         defer agent.deinit();
 
-        // Enable streaming if provider supports it
-        var stream_sink_ctx: u8 = 0;
-        var stream_ctx = CliStreamCtx{
-            .sink = .{
-                .callback = cliStreamSinkCallback,
-                .ctx = @ptrCast(&stream_sink_ctx),
-            },
-        };
-        if (supports_streaming) {
-            agent.stream_callback = cliStreamCallback;
-            agent.stream_ctx = @ptrCast(&stream_ctx);
-        }
+        // Single-message mode: suppress intermediate output so that subprocess
+        // callers (cron jobs, heartbeat) only receive the final response on
+        // stdout.  Streaming is intentionally disabled here — streamed chunks
+        // would include reasoning and tool-call markup from every tool-loop
+        // iteration, which corrupts email delivery and other delivery channels.
+        agent.suppress_intermediate_output = true;
 
-        stream_ctx.emitted_text = false;
         const response = agent.turn(message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -392,11 +385,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
-            try w.print("{s}\n", .{response});
-        } else {
-            try w.print("\n", .{});
-        }
+        // Streaming is disabled in single-message mode, so always print the
+        // final (clean) response returned by turn().
+        try w.print("{s}\n", .{response});
         try w.flush();
         return;
     }
