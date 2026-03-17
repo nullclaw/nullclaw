@@ -144,7 +144,7 @@ pub const BrowserTool = struct {
         const body_len = if (truncated) MAX_READ_BYTES else result.stdout.len;
         const suffix: []const u8 = if (truncated) "\n\n[Content truncated to 8 KB]" else "";
 
-        const output = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.stdout[0..body_len], suffix });
+        const output = try std.fmt.allocPrint(allocator, "[UNTRUSTED_WEB_CONTENT_START]\n{s}{s}\n[UNTRUSTED_WEB_CONTENT_END]", .{ result.stdout[0..body_len], suffix });
         return ToolResult{ .success = true, .output = output };
     }
 };

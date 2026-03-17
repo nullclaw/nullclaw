@@ -68,6 +68,10 @@ pub const DiagnosticsConfig = struct {
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    /// RAG API base URL for turn score benchmarking (e.g. "http://127.0.0.1:8080/api/v1").
+    rag_url: ?[]const u8 = null,
+    /// Bearer token for the RAG API.
+    rag_token: ?[]const u8 = null,
     /// Optional max length for user-visible provider/API errors after scrubbing.
     /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
     api_error_max_chars: ?u32 = null,
@@ -226,6 +230,10 @@ pub const AgentConfig = struct {
     skill_evolution_max_per_day: u32 = 3,
     /// Cooldown between evolution triggers for the same skill (minutes).
     skill_evolution_cooldown_minutes: u32 = 30,
+    /// Enable plan gate: first turn is tool-free planning, user confirms before tool execution.
+    plan_gate_enabled: bool = false,
+    /// Channels where plan gate is active. Empty = all channels (when plan_gate_enabled is true).
+    plan_gate_channels: []const []const u8 = &.{},
 };
 
 pub const ToolsConfig = struct {

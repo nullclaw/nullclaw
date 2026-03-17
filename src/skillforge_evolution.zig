@@ -4,8 +4,9 @@
 //! needs improvement. When a trigger fires, an evolution event is recorded
 //! in the memory system for later processing (LLM analysis via nullclaw-rag).
 //!
-//! Current implementation: detection + tracking only (no LLM calls).
-//! LLM-based analysis and SKILL.md patching deferred to Fase 7 / nullclaw-rag.
+//! Current implementation: detection + tracking + RAG API forwarding.
+//! LLM-based analysis is delegated to nullclaw-rag via POST /skills/{skill}/analyze.
+//! SKILL.md patching from analysis proposals is not yet implemented.
 
 const std = @import("std");
 const builtin = @import("builtin");

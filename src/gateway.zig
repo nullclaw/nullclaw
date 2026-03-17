@@ -3685,7 +3685,26 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .backend_name = cfg.memory.backend,
                 }) catch &.{};
 
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_thread_observer.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                // Build observer — combine gateway thread observer with optional RAG observer.
+                const final_observer = blk: {
+                    if (cfg.diagnostics.rag_url) |rag_url| {
+                        if (cfg.diagnostics.rag_token) |rag_token| {
+                            const rag_obs_ptr = allocator.create(observability.RagObserver) catch break :blk gateway_thread_observer.observer();
+                            rag_obs_ptr.* = .{ .base_url = rag_url, .bearer_token = rag_token };
+
+                            const observers = allocator.alloc(observability.Observer, 2) catch break :blk gateway_thread_observer.observer();
+                            observers[0] = gateway_thread_observer.observer();
+                            observers[1] = rag_obs_ptr.observer();
+
+                            const multi_ptr = allocator.create(observability.MultiObserver) catch break :blk gateway_thread_observer.observer();
+                            multi_ptr.* = .{ .observers = observers };
+                            break :blk multi_ptr.observer();
+                        }
+                    }
+                    break :blk gateway_thread_observer.observer();
+                };
+
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, final_observer, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }

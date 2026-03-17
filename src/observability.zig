@@ -16,9 +16,21 @@ pub const ObserverEvent = union(enum) {
         tool_failures: u16,
         signals: u8, // packed SignalSet as byte
         model: []const u8 = "",
+        session_id: []const u8 = "",
     },
     tool_retry: struct { tool: []const u8, attempt: u8, backoff_ms: u64, error_class: []const u8 },
-    evolution_trigger: struct { skill: []const u8, trigger_type: []const u8, score: f32 },
+    evolution_trigger: struct { skill: []const u8, trigger_type: []const u8, score: f32, model: []const u8 = "", tool_failures: u16 = 0, context: []const u8 = "" },
+    digest_ready: struct {
+        session_id: []const u8,
+        summary: []const u8,
+        user_preferences: []const []const u8,
+        tool_insights: []const []const u8,
+        task_patterns: []const []const u8,
+        user_turns: u32 = 0,
+        assistant_turns: u32 = 0,
+        tool_calls: u32 = 0,
+        tool_failures: u32 = 0,
+    },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
@@ -130,9 +142,10 @@ pub const LogObserver = struct {
                 }
             },
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
-            .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2} model={s}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model }),
+            .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2} model={s} session={s}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model, e.session_id }),
             .tool_retry => |e| std.log.info("tool.retry tool={s} attempt={d} backoff_ms={d} class={s}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }),
-            .evolution_trigger => |e| std.log.info("evolution.trigger skill={s} type={s} score={d:.2}", .{ e.skill, e.trigger_type, e.score }),
+            .evolution_trigger => |e| std.log.info("evolution.trigger skill={s} type={s} score={d:.2} model={s}", .{ e.skill, e.trigger_type, e.score, e.model }),
+            .digest_ready => |e| std.log.info("digest.ready session={s} prefs={d} insights={d} patterns={d}", .{ e.session_id, e.user_preferences.len, e.tool_insights.len, e.task_patterns.len }),
             .turn_complete => std.log.info("turn.complete", .{}),
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
@@ -316,9 +329,10 @@ pub const FileObserver = struct {
                 break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":\"{s}\",\"duration_ms\":{d},\"success\":{}}}", .{ e.tool, e.duration_ms, e.success }) catch return;
             },
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
-            .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d},\"model\":\"{s}\"}}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model }) catch return,
+            .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d},\"model\":\"{s}\",\"session_id\":\"{s}\"}}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model, e.session_id }) catch return,
             .tool_retry => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_retry\",\"tool\":\"{s}\",\"attempt\":{d},\"backoff_ms\":{d},\"class\":\"{s}\"}}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }) catch return,
-            .evolution_trigger => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"evolution_trigger\",\"skill\":\"{s}\",\"type\":\"{s}\",\"score\":{d:.2}}}", .{ e.skill, e.trigger_type, e.score }) catch return,
+            .evolution_trigger => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"evolution_trigger\",\"skill\":\"{s}\",\"type\":\"{s}\",\"score\":{d:.2},\"model\":\"{s}\"}}", .{ e.skill, e.trigger_type, e.score, e.model }) catch return,
+            .digest_ready => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"digest_ready\",\"session_id\":\"{s}\",\"prefs\":{d},\"insights\":{d}}}", .{ e.session_id, e.user_preferences.len, e.tool_insights.len }) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":\"{s}\",\"direction\":\"{s}\"}}", .{ e.channel, e.direction }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
@@ -605,6 +619,13 @@ pub const OtelObserver = struct {
                     .{ .key = "skill", .value = e.skill },
                     .{ .key = "trigger_type", .value = e.trigger_type },
                     .{ .key = "score", .value = score_str },
+                    .{ .key = "model", .value = e.model },
+                });
+            },
+            .digest_ready => |e| {
+                self.addSpan("digest.ready", now, now, &.{
+                    .{ .key = "session_id", .value = e.session_id },
+                    .{ .key = "summary", .value = e.summary },
                 });
             },
             .turn_complete => {
@@ -741,6 +762,162 @@ pub const OtelObserver = struct {
         return "otel";
     }
 };
+
+// ── RagObserver ──────────────────────────────────────────────────────
+
+/// Observer that forwards turn_scored and evolution_trigger events to the
+/// RAG API for persistent per-model benchmarking. Uses fire-and-forget
+/// curl subprocesses so agent turns are never blocked by HTTP latency.
+pub const RagObserver = struct {
+    base_url: []const u8,
+    bearer_token: []const u8,
+
+    const vtable_impl = Observer.VTable{
+        .record_event = ragRecordEvent,
+        .record_metric = ragRecordMetric,
+        .flush = ragFlush,
+        .name = ragName,
+    };
+
+    pub fn observer(self: *RagObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_impl,
+        };
+    }
+
+    fn resolve(ptr: *anyopaque) *RagObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    /// Spawn a fire-and-forget curl POST. Non-blocking: the child process
+    /// runs independently and the result is discarded.
+    fn postAsync(self: *RagObserver, endpoint: []const u8, body: []const u8) void {
+        var url_buf: [512]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/{s}", .{ self.base_url, endpoint }) catch return;
+
+        var auth_buf: [128]u8 = undefined;
+        const auth = std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{self.bearer_token}) catch return;
+
+        const argv = [_][]const u8{
+            "curl",       "-s",                       "-o",                "/dev/null",
+            "-X",         "POST",                     "-H",                "Content-Type: application/json",
+            "-H",         "Accept: application/json", "-H",                auth,
+            "-d",         body,                       "--connect-timeout", "5",
+            "--max-time", "10",                       url,
+        };
+        var child = std.process.Child.init(&argv, std.heap.page_allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        _ = child.spawn() catch return;
+        // Detach — we don't wait for the result.
+    }
+
+    fn ragRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+
+        switch (event.*) {
+            .turn_scored => |e| {
+                var buf: [512]u8 = undefined;
+                const body = std.fmt.bufPrint(&buf,
+                    \\{{"score":{d:.4},"model":"{s}","tool_count":{d},"tool_failures":{d},"signals":{d},"session_id":"{s}"}}
+                , .{
+                    e.score,
+                    e.model,
+                    e.tool_count,
+                    e.tool_failures,
+                    e.signals,
+                    e.session_id,
+                }) catch return;
+                self.postAsync("skills/general/score", body);
+            },
+            .evolution_trigger => |e| {
+                // 1. Post the evolution trigger entry
+                var buf: [512]u8 = undefined;
+                const body = std.fmt.bufPrint(&buf,
+                    \\{{"trigger_type":"{s}","score":{d:.4},"tool_failures":{d},"model":"{s}","context":"{s}"}}
+                , .{ e.trigger_type, e.score, e.tool_failures, e.model, e.context }) catch return;
+                var endpoint_buf: [256]u8 = undefined;
+                const endpoint = std.fmt.bufPrint(&endpoint_buf, "skills/{s}/evolution", .{e.skill}) catch return;
+                self.postAsync(endpoint, body);
+
+                // 2. Request LLM analysis of pending entries (Fase 7).
+                //    The RAG API returns 422 if no pending entries exist — harmless.
+                var analyze_buf: [512]u8 = undefined;
+                const analyze_body = std.fmt.bufPrint(&analyze_buf,
+                    \\{{"skill_description":"Skill '{s}' — auto-analysis triggered by {s} (score={d:.2}, model={s})"}}
+                , .{ e.skill, e.trigger_type, e.score, e.model }) catch return;
+                var analyze_endpoint_buf: [256]u8 = undefined;
+                const analyze_endpoint = std.fmt.bufPrint(&analyze_endpoint_buf, "skills/{s}/analyze", .{e.skill}) catch return;
+                self.postAsync(analyze_endpoint, analyze_body);
+            },
+            .digest_ready => |e| {
+                self.postDigest(e);
+            },
+            else => {},
+        }
+    }
+
+    /// Build and post the digest JSON payload. Uses a heap allocation because
+    /// the array fields can exceed a stack buffer.
+    fn postDigest(self: *RagObserver, e: anytype) void {
+        var buf: [4096]u8 = undefined;
+        var pos: usize = 0;
+
+        // Opening + scalar fields
+        const head = std.fmt.bufPrint(buf[pos..], "{{\"session_id\":\"{s}\",\"summary\":\"{s}\",\"user_turns\":{d},\"assistant_turns\":{d},\"tool_calls\":{d},\"tool_failures\":{d}", .{
+            e.session_id,
+            e.summary,
+            e.user_turns,
+            e.assistant_turns,
+            e.tool_calls,
+            e.tool_failures,
+        }) catch return;
+        pos += head.len;
+
+        // user_preferences array
+        pos += (std.fmt.bufPrint(buf[pos..], ",\"user_preferences\":[", .{}) catch return).len;
+        for (e.user_preferences, 0..) |p, i| {
+            if (i > 0) {
+                pos += (std.fmt.bufPrint(buf[pos..], ",", .{}) catch return).len;
+            }
+            pos += (std.fmt.bufPrint(buf[pos..], "\"{s}\"", .{p}) catch return).len;
+        }
+        pos += (std.fmt.bufPrint(buf[pos..], "]", .{}) catch return).len;
+
+        // tool_insights array
+        pos += (std.fmt.bufPrint(buf[pos..], ",\"tool_insights\":[", .{}) catch return).len;
+        for (e.tool_insights, 0..) |t, i| {
+            if (i > 0) {
+                pos += (std.fmt.bufPrint(buf[pos..], ",", .{}) catch return).len;
+            }
+            pos += (std.fmt.bufPrint(buf[pos..], "\"{s}\"", .{t}) catch return).len;
+        }
+        pos += (std.fmt.bufPrint(buf[pos..], "]", .{}) catch return).len;
+
+        // task_patterns array
+        pos += (std.fmt.bufPrint(buf[pos..], ",\"task_patterns\":[", .{}) catch return).len;
+        for (e.task_patterns, 0..) |p, i| {
+            if (i > 0) {
+                pos += (std.fmt.bufPrint(buf[pos..], ",", .{}) catch return).len;
+            }
+            pos += (std.fmt.bufPrint(buf[pos..], "\"{s}\"", .{p}) catch return).len;
+        }
+        pos += (std.fmt.bufPrint(buf[pos..], "]}}", .{}) catch return).len;
+
+        self.postAsync("digests", buf[0..pos]);
+    }
+
+    fn ragRecordMetric(_: *anyopaque, _: *const ObserverMetric) void {}
+    fn ragFlush(_: *anyopaque) void {}
+    fn ragName(_: *anyopaque) []const u8 {
+        return "rag";
+    }
+};
+
+// ── SignalSet re-export for RagObserver ──
+const SignalSet = @import("agent/turn_scorer.zig").SignalSet;
 
 // ── Tests ────────────────────────────────────────────────────────────
 

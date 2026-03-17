@@ -601,6 +601,14 @@ fn clearPendingExecCommand(self: anytype) void {
     self.pending_exec_command_owned = false;
 }
 
+fn clearPendingPlan(self: anytype) void {
+    if (self.pending_plan_owned and self.pending_plan != null) {
+        self.allocator.free(self.pending_plan.?);
+    }
+    self.pending_plan = null;
+    self.pending_plan_owned = false;
+}
+
 fn setPendingExecCommand(self: anytype, command: []const u8) !void {
     clearPendingExecCommand(self);
     self.pending_exec_command = try self.allocator.dupe(u8, command);
@@ -1014,6 +1022,7 @@ fn findShellTool(self: anytype) ?Tool {
 fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
+    clearPendingPlan(self);
     if (@hasField(@TypeOf(self.*), "total_tokens")) {
         self.total_tokens = 0;
     }
@@ -1181,6 +1190,7 @@ fn resetRuntimeCommandState(self: anytype) void {
     self.tts_summary = false;
     self.tts_audio = false;
     clearPendingExecCommand(self);
+    clearPendingPlan(self);
     self.session_ttl_secs = null;
     if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
     self.focus_target = null;
@@ -2313,6 +2323,10 @@ fn handleStopCommand(self: anytype) ![]const u8 {
     var cleared_pending = false;
     if (self.pending_exec_command != null) {
         clearPendingExecCommand(self);
+        cleared_pending = true;
+    }
+    if (self.pending_plan != null) {
+        clearPendingPlan(self);
         cleared_pending = true;
     }
 

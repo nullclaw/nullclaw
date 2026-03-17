@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const outbound = @import("../outbound.zig");
 const config_types = @import("../config_types.zig");
 
 /// WhatsApp Web channel — uses Baileys sidecar for WhatsApp Web protocol.
@@ -188,6 +189,57 @@ pub const WhatsAppWebChannel = struct {
         }
     }
 
+    /// Send a message with media attachments via the sidecar's /send endpoint.
+    /// The sidecar accepts {to, text, media: ["/abs/path", ...]}.
+    pub fn sendMessageWithMedia(self: *WhatsAppWebChannel, recipient: []const u8, text: []const u8, media_paths: []const []const u8) !void {
+        if (builtin.is_test) return;
+
+        // Build URL
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/send", .{self.sidecar_url});
+        const url = url_fbs.getWritten();
+
+        // Build JSON body
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const w = body_list.writer(self.allocator);
+        try w.writeAll("{\"to\":");
+        try root.appendJsonStringW(w, recipient);
+        try w.writeAll(",\"text\":");
+        try root.appendJsonStringW(w, text);
+        try w.writeAll(",\"media\":[");
+        for (media_paths, 0..) |mp, idx| {
+            if (idx > 0) try w.writeAll(",");
+            try root.appendJsonStringW(w, mp);
+        }
+        try w.writeAll("]}");
+        const body = body_list.items;
+
+        // Build auth header
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Bearer {s}", .{self.auth_token});
+        const auth_value = auth_fbs.getWritten();
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Authorization", .value = auth_value },
+            },
+        }) catch return error.WhatsAppWebSidecarError;
+
+        if (result.status != .ok) {
+            return error.WhatsAppWebSidecarError;
+        }
+    }
+
     pub fn healthCheck(self: *WhatsAppWebChannel) bool {
         if (builtin.is_test) return true;
 
@@ -222,6 +274,30 @@ pub const WhatsAppWebChannel = struct {
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *WhatsAppWebChannel = @ptrCast(@alignCast(ptr));
+
+        // Parse attachment markers ([IMAGE:], [FILE:], [DOCUMENT:])
+        if (outbound.has_legacy_attachment_markers(message)) {
+            var parsed = parseAttachmentMarkers(self.allocator, message) catch {
+                // Fallback: send as plain text
+                return self.sendPlainChunked(target, message);
+            };
+            defer parsed.deinit(self.allocator);
+
+            const clean_text = std.mem.trim(u8, parsed.text, " \t\n");
+            if (parsed.media.len > 0) {
+                const formatted = markdownToWhatsApp(self.allocator, clean_text) catch clean_text;
+                defer if (formatted.ptr != clean_text.ptr) self.allocator.free(formatted);
+                try self.sendMessageWithMedia(target, formatted, parsed.media);
+            } else {
+                return self.sendPlainChunked(target, message);
+            }
+            return;
+        }
+
+        return self.sendPlainChunked(target, message);
+    }
+
+    fn sendPlainChunked(self: *WhatsAppWebChannel, target: []const u8, message: []const u8) !void {
         var it = root.splitMessage(message, MAX_MESSAGE_LEN);
         while (it.next()) |chunk| {
             const formatted = markdownToWhatsApp(self.allocator, chunk) catch chunk;
@@ -268,6 +344,97 @@ pub const ParsedMessage = struct {
         if (self.group_id) |gid| allocator.free(gid);
     }
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// Attachment marker parsing
+// ════════════════════════════════════════════════════════════════════════════
+
+const marker_prefixes = [_][]const u8{
+    "[IMAGE:",
+    "[image:",
+    "[PHOTO:",
+    "[photo:",
+    "[FILE:",
+    "[file:",
+    "[DOCUMENT:",
+    "[document:",
+    "[VIDEO:",
+    "[video:",
+    "[AUDIO:",
+    "[audio:",
+    "[VOICE:",
+    "[voice:",
+};
+
+const ParsedAttachments = struct {
+    text: []const u8,
+    media: []const []const u8,
+
+    fn deinit(self: *ParsedAttachments, allocator: std.mem.Allocator) void {
+        if (self.media.len > 0) {
+            for (self.media) |p| allocator.free(p);
+            allocator.free(self.media);
+        }
+        if (self.text.len > 0) allocator.free(self.text);
+    }
+};
+
+/// Parse [IMAGE:/path], [FILE:/path], etc. markers from message text.
+/// Returns clean text (markers removed) and extracted file paths.
+fn parseAttachmentMarkers(allocator: std.mem.Allocator, text: []const u8) !ParsedAttachments {
+    var media_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (media_paths.items) |p| allocator.free(p);
+        media_paths.deinit(allocator);
+    }
+    var clean: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer clean.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < text.len) {
+        if (std.mem.indexOfScalar(u8, text[pos..], '[')) |bracket_offset| {
+            const bracket_pos = pos + bracket_offset;
+            var matched = false;
+            for (marker_prefixes) |prefix| {
+                if (bracket_pos + prefix.len <= text.len and
+                    std.mem.eql(u8, text[bracket_pos .. bracket_pos + prefix.len], prefix))
+                {
+                    if (bracket_pos > pos) {
+                        try clean.appendSlice(allocator, text[pos..bracket_pos]);
+                    }
+                    const path_start = bracket_pos + prefix.len;
+                    if (std.mem.indexOfScalar(u8, text[path_start..], ']')) |close_offset| {
+                        const path = std.mem.trim(u8, text[path_start .. path_start + close_offset], " \t");
+                        if (path.len > 0) {
+                            try media_paths.append(allocator, try allocator.dupe(u8, path));
+                        }
+                        pos = path_start + close_offset + 1;
+                    } else {
+                        try clean.appendSlice(allocator, text[bracket_pos .. bracket_pos + prefix.len]);
+                        pos = bracket_pos + prefix.len;
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                if (bracket_pos > pos) {
+                    try clean.appendSlice(allocator, text[pos..bracket_pos]);
+                }
+                try clean.append(allocator, '[');
+                pos = bracket_pos + 1;
+            }
+        } else {
+            try clean.appendSlice(allocator, text[pos..]);
+            break;
+        }
+    }
+
+    return .{
+        .text = try clean.toOwnedSlice(allocator),
+        .media = try media_paths.toOwnedSlice(allocator),
+    };
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Markdown → WhatsApp formatting
@@ -821,4 +988,55 @@ test "markdownToWhatsApp combined formatting" {
     const result = try markdownToWhatsApp(allocator, "# Hoi\n\n**Donna** hier. Bekijk [dit](https://x.com):\n- Punt 1\n- Punt 2");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("*Hoi*\n\n*Donna* hier. Bekijk dit (https://x.com):\n\xe2\x80\xa2 Punt 1\n\xe2\x80\xa2 Punt 2", result);
+}
+
+// ── parseAttachmentMarkers tests ────────────────────────────────────────
+
+test "whatsapp_web parseAttachmentMarkers extracts IMAGE marker" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseAttachmentMarkers(allocator, "Check [IMAGE:/tmp/photo.png] this");
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("Check  this", parsed.text);
+    try std.testing.expectEqual(@as(usize, 1), parsed.media.len);
+    try std.testing.expectEqualStrings("/tmp/photo.png", parsed.media[0]);
+}
+
+test "whatsapp_web parseAttachmentMarkers handles multiple markers" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseAttachmentMarkers(allocator, "[IMAGE:a.png] text [DOCUMENT:b.pdf]");
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings(" text ", parsed.text);
+    try std.testing.expectEqual(@as(usize, 2), parsed.media.len);
+    try std.testing.expectEqualStrings("a.png", parsed.media[0]);
+    try std.testing.expectEqualStrings("b.pdf", parsed.media[1]);
+}
+
+test "whatsapp_web parseAttachmentMarkers no markers returns full text" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseAttachmentMarkers(allocator, "Just plain text");
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("Just plain text", parsed.text);
+    try std.testing.expectEqual(@as(usize, 0), parsed.media.len);
+}
+
+test "whatsapp_web parseAttachmentMarkers case insensitive" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseAttachmentMarkers(allocator, "See [image:/tmp/x.png]");
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), parsed.media.len);
+    try std.testing.expectEqualStrings("/tmp/x.png", parsed.media[0]);
+}
+
+test "whatsapp_web parseAttachmentMarkers preserves non-marker brackets" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseAttachmentMarkers(allocator, "hello [world] there");
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("hello [world] there", parsed.text);
+    try std.testing.expectEqual(@as(usize, 0), parsed.media.len);
+}
+
+test "whatsapp_web vtableSend with attachment marker uses test path" {
+    var ch = WhatsAppWebChannel.init(std.testing.allocator, "http://127.0.0.1:7100", "tok", &.{}, &.{}, "allowlist");
+    // In test mode sendMessage/sendMessageWithMedia return immediately
+    try ch.sendPlainChunked("123", "Hello [IMAGE:/tmp/test.png] world");
 }

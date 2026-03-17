@@ -872,6 +872,17 @@ pub const SessionManager = struct {
 
         digest_mod.storeDigest(mem, session.session_key, &digest, self.allocator);
         session.digest_generated = true;
+
+        // Forward digest to observer pipeline (→ RAG API)
+        const digest_event = observability.ObserverEvent{ .digest_ready = .{
+            .session_id = session.session_key,
+            .summary = digest.summary,
+            .user_preferences = digest.user_preferences,
+            .tool_insights = digest.tool_insights,
+            .task_patterns = digest.task_patterns,
+        } };
+        self.observer.recordEvent(&digest_event);
+
         log.info("session digest generated for {s}: {d} prefs, {d} insights", .{
             session.session_key,
             digest.user_preferences.len,
