@@ -287,8 +287,18 @@ pub const MatrixChannel = struct {
         }
     }
 
-    fn eventArrayLooksDirect(events_val: std.json.Value) bool {
+    fn countJoinedMembers(summary_val: std.json.Value) ?usize {
+        if (summary_val != .object) return null;
+
+        const joined_val = summary_val.object.get("m.joined_member_count") orelse return null;
+        if (joined_val != .integer or joined_val.integer < 0) return null;
+
+        return @as(usize, @intCast(joined_val.integer));
+    }
+
+    fn eventArrayLooksDirect(events_val: std.json.Value, joined_member_count: ?usize) bool {
         if (eventArrayHasDirectMemberFlag(events_val)) return true;
+        if (joined_member_count) |count| return count > 0 and count <= 2;
 
         var members: std.StringHashMapUnmanaged(void) = .empty;
         defer members.deinit(std.heap.page_allocator);
@@ -370,7 +380,12 @@ pub const MatrixChannel = struct {
             const events_val = invite_state_val.object.get("events") orelse continue;
             const inviter = inviteSenderForUser(events_val, self.user_id) orelse continue;
 
-            if (eventArrayLooksDirect(events_val)) {
+            const joined_member_count = if (room.object.get("summary")) |summary_val|
+                countJoinedMembers(summary_val)
+            else
+                null;
+
+            if (eventArrayLooksDirect(events_val, joined_member_count)) {
                 if (!self.dmSenderAllowed(inviter)) continue;
             } else {
                 if (!self.groupInviteSenderAllowed(inviter)) continue;
@@ -508,6 +523,11 @@ pub const MatrixChannel = struct {
         if (direct_rooms.contains(room_id)) return true;
         if (room != .object) return false;
 
+        const joined_member_count = if (room.object.get("summary")) |summary_val|
+            countJoinedMembers(summary_val)
+        else
+            null;
+
         if (room.object.get("summary")) |summary_val| {
             if (summary_val == .object) {
                 var total_members: usize = 0;
@@ -535,7 +555,7 @@ pub const MatrixChannel = struct {
         if (room.object.get("state")) |state_val| {
             if (state_val == .object) {
                 if (state_val.object.get("events")) |state_events| {
-                    if (eventArrayLooksDirect(state_events)) return true;
+                    if (eventArrayLooksDirect(state_events, joined_member_count)) return true;
                 }
             }
         }
@@ -543,7 +563,7 @@ pub const MatrixChannel = struct {
         if (room.object.get("timeline")) |timeline_val| {
             if (timeline_val == .object) {
                 if (timeline_val.object.get("events")) |timeline_events| {
-                    if (eventArrayLooksDirect(timeline_events)) return true;
+                    if (eventArrayLooksDirect(timeline_events, joined_member_count)) return true;
                 }
             }
         }
@@ -947,6 +967,51 @@ test "MatrixChannel parseSyncResponse marks m.direct rooms as direct chats" {
     try std.testing.expectEqual(@as(usize, 1), msgs.len);
     try std.testing.expect(!msgs[0].is_group);
     try std.testing.expectEqualStrings("!dm:example", msgs[0].reply_target.?);
+}
+
+test "MatrixChannel parseSyncResponse keeps quiet two-member room as direct chat" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!dm:example",
+        &.{"@alice:example"},
+    );
+
+    const payload =
+        \\{
+        \\  "rooms": {
+        \\    "join": {
+        \\      "!dm:example": {
+        \\        "summary": {
+        \\          "m.joined_member_count": 2
+        \\        },
+        \\        "timeline": {
+        \\          "events": [
+        \\            {
+        \\              "type": "m.room.message",
+        \\              "sender": "@alice:example",
+        \\              "event_id": "$evt-dm",
+        \\              "content": { "msgtype": "m.text", "body": "hello dm" }
+        \\            }
+        \\          ]
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(!msgs[0].is_group);
 }
 
 test "MatrixChannel parseSyncResponse allowlist and policy semantics" {

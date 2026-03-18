@@ -1594,6 +1594,7 @@ pub const Agent = struct {
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
+                .identity_config = if (cfg_for_caps_ptr) |cfg| cfg.identity else null,
             });
             const final_system = if (self.profile_system_prompt) |profile_prompt|
                 if (profile_prompt.len > 0) blk: {

@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
+const identity_mod = @import("../identity.zig");
 const platform = @import("../platform.zig");
 const memory_root = @import("../memory/root.zig");
 const tools_mod = @import("../tools/root.zig");
@@ -201,6 +203,7 @@ pub const PromptContext = struct {
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
     bootstrap_provider: ?BootstrapProvider = null,
+    identity_config: ?config_types.IdentityConfig = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -273,7 +276,7 @@ pub fn buildSystemPrompt(
     const w = buf.writer(allocator);
 
     // Identity section — inject workspace MD files
-    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider);
+    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider, ctx.identity_config);
 
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
@@ -412,6 +415,7 @@ fn buildIdentitySection(
     w: anytype,
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
+    identity_config: ?config_types.IdentityConfig,
 ) !void {
     var remaining_bootstrap_chars: usize = BOOTSTRAP_TOTAL_MAX_CHARS;
     var hit_total_bootstrap_limit = false;
@@ -421,6 +425,7 @@ fn buildIdentitySection(
     try w.writeAll("If AGENTS.md is present, follow its operational guidance (including startup routines and red-line constraints) unless higher-priority instructions override it.\n\n");
     try w.writeAll("If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.\n\n");
     try w.writeAll("TOOLS.md does not control tool availability; it is user guidance for how to use external tools.\n\n");
+    try injectAieosIdentitySection(allocator, w, workspace_dir, identity_config);
 
     const identity_files = [_][]const u8{
         "AGENTS.md",
@@ -461,6 +466,54 @@ fn buildIdentitySection(
             .{BOOTSTRAP_TOTAL_MAX_CHARS},
         );
     }
+}
+
+fn injectAieosIdentitySection(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    workspace_dir: []const u8,
+    identity_config: ?config_types.IdentityConfig,
+) !void {
+    const cfg = identity_config orelse return;
+    if (!identity_mod.isAieosConfigured(cfg.format, cfg.aieos_path, cfg.aieos_inline)) return;
+
+    const json_content = if (cfg.aieos_inline) |inline_json|
+        inline_json
+    else if (cfg.aieos_path) |path|
+        try loadAieosJsonFromPath(allocator, workspace_dir, path)
+    else
+        return;
+    defer if (cfg.aieos_inline == null) allocator.free(json_content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const parsed_identity = try identity_mod.parseAieosJson(arena_allocator, json_content);
+    const prompt_text = try identity_mod.aieosToSystemPrompt(allocator, &parsed_identity);
+    defer allocator.free(prompt_text);
+
+    try w.writeAll("### AIEOS Identity\n\n");
+    try w.writeAll(prompt_text);
+    try w.writeAll("\n\n");
+}
+
+fn loadAieosJsonFromPath(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    identity_path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(identity_path)) {
+        return std.fs.cwd().readFileAlloc(allocator, identity_path, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES);
+    }
+
+    const workspace_relative = try std.fs.path.join(allocator, &.{ workspace_dir, identity_path });
+    defer allocator.free(workspace_relative);
+
+    return std.fs.cwd().readFileAlloc(allocator, workspace_relative, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES) catch |workspace_err| switch (workspace_err) {
+        error.FileNotFound => std.fs.cwd().readFileAlloc(allocator, identity_path, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES),
+        else => workspace_err,
+    };
 }
 
 test "buildSystemPrompt includes SOUL persona guidance" {
@@ -521,6 +574,53 @@ test "buildSystemPrompt includes TOOLS availability guidance" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "TOOLS.md does not control tool availability; it is user guidance for how to use external tools.") != null);
+}
+
+test "buildSystemPrompt injects AIEOS identity from inline config" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_inline = "{\"identity\":{\"names\":{\"first\":\"Nova\"},\"bio\":\"Helpful.\"},\"linguistics\":{\"style\":\"concise\"}}",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AIEOS Identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Name:** Nova") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Bio:** Helpful.") != null);
+}
+
+test "buildSystemPrompt injects AIEOS identity from workspace-relative path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("identity");
+    try tmp.dir.writeFile(.{
+        .sub_path = "identity/aieos.identity.json",
+        .data = "{\"identity\":{\"names\":{\"first\":\"Path Nova\"}},\"motivations\":{\"core_drive\":\"Help\"}}",
+    });
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_path = "identity/aieos.identity.json",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Name:** Path Nova") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Core Drive:** Help") != null);
 }
 
 test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {

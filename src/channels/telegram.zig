@@ -2946,6 +2946,11 @@ pub const TelegramChannel = struct {
                 self.suppressDraftSends(chat_id, 15);
                 return;
             }
+            if (telegram_api.responseIsDraftPeerInvalid(resp)) {
+                log.warn("sendMessageDraft unsupported for peer; suppressing drafts for this target", .{});
+                self.suppressDraftSends(chat_id, 24 * 60 * 60);
+                return;
+            }
             log.warn("sendMessageDraft API error: {s}", .{resp[0..@min(resp.len, 256)]});
         }
     }
