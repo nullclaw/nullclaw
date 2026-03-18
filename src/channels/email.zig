@@ -1190,29 +1190,48 @@ pub const ImapClient = struct {
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    /// Read raw bytes from subprocess stdout with poll-based timeout (30s).
+    /// Read raw bytes from subprocess stdout with platform-appropriate timeout.
     fn readRaw(self: *ImapClient, out: []u8) !usize {
+        const builtin = @import("builtin");
         const child = self.child orelse return error.ImapReadError;
         const stdout = child.stdout orelse return error.ImapReadError;
-        const fd = stdout.handle;
 
-        // Poll with 30s timeout for data availability
-        var pollfds = [1]std.posix.pollfd{.{
-            .fd = fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const poll_result = std.posix.poll(&pollfds, 30_000) catch return error.ImapReadError;
-        if (poll_result == 0) return error.ImapTimeout; // 30s timeout
-        if (pollfds[0].revents & std.posix.POLL.IN != 0) {
-            // Data available — read below
-        } else if (pollfds[0].revents & std.posix.POLL.HUP != 0) {
-            return @as(usize, 0); // EOF
+        if (comptime builtin.os.tag == .windows) {
+            // Windows: use WaitForSingleObject for timeout on pipe handles.
+            const windows = std.os.windows;
+            const handle = stdout.handle;
+            const result = windows.kernel32.WaitForSingleObject(handle, 30_000);
+            if (result == windows.WAIT_OBJECT_0) {
+                // Data available
+            } else if (result == windows.WAIT_TIMEOUT) {
+                return error.ImapTimeout;
+            } else {
+                return error.ImapReadError;
+            }
+            var bytes_read: u32 = 0;
+            if (windows.kernel32.ReadFile(handle, out.ptr, @intCast(out.len), &bytes_read, null) == 0) {
+                return error.ImapReadError;
+            }
+            return @intCast(bytes_read);
         } else {
-            return error.ImapReadError;
+            // POSIX: poll with 30s timeout for data availability.
+            const fd = stdout.handle;
+            var pollfds = [1]std.posix.pollfd{.{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const poll_result = std.posix.poll(&pollfds, 30_000) catch return error.ImapReadError;
+            if (poll_result == 0) return error.ImapTimeout;
+            if (pollfds[0].revents & std.posix.POLL.IN != 0) {
+                // Data available — read below
+            } else if (pollfds[0].revents & std.posix.POLL.HUP != 0) {
+                return @as(usize, 0); // EOF
+            } else {
+                return error.ImapReadError;
+            }
+            return std.posix.read(fd, out) catch return error.ImapReadError;
         }
-
-        return std.posix.read(fd, out) catch return error.ImapReadError;
     }
 
     /// Write all bytes to subprocess stdin.
