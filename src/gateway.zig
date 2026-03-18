@@ -676,6 +676,15 @@ pub fn extractBearerToken(auth_header: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Validate a single configured bearer token. Empty config keeps backwards
+/// compatibility by allowing unauthenticated requests.
+pub fn validateConfiguredBearerToken(auth_header: ?[]const u8, expected_token: []const u8) bool {
+    if (expected_token.len == 0) return true;
+    const header = auth_header orelse return false;
+    const bearer = extractBearerToken(header) orelse return false;
+    return std.mem.eql(u8, bearer, expected_token);
+}
+
 /// Returns true when a webhook request should be accepted for the current
 /// pairing state and bearer token. Missing pairing state fails closed.
 pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[]const u8) bool {
@@ -2562,6 +2571,13 @@ fn handleWhatsAppWebWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (!std.mem.eql(u8, ctx.method, "POST")) {
         ctx.response_status = "405 Method Not Allowed";
         ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    const auth_header = extractHeader(ctx.raw_request, "Authorization");
+    if (!validateConfiguredBearerToken(auth_header, ctx.state.whatsapp_web_auth_token)) {
+        ctx.response_status = "401 Unauthorized";
+        ctx.response_body = "{\"error\":\"unauthorized\"}";
         return;
     }
 
@@ -4744,6 +4760,20 @@ test "extractBearerToken returns null for empty string" {
 test "extractBearerToken returns null for just Bearer" {
     // "Bearer " is 7 chars, "Bearer" is 6 — no space
     try std.testing.expect(extractBearerToken("Bearer") == null);
+}
+
+test "validateConfiguredBearerToken allows empty config" {
+    try std.testing.expect(validateConfiguredBearerToken(null, ""));
+}
+
+test "validateConfiguredBearerToken accepts matching bearer" {
+    try std.testing.expect(validateConfiguredBearerToken("Bearer secret123", "secret123"));
+}
+
+test "validateConfiguredBearerToken rejects missing or wrong bearer" {
+    try std.testing.expect(!validateConfiguredBearerToken(null, "secret123"));
+    try std.testing.expect(!validateConfiguredBearerToken("Basic secret123", "secret123"));
+    try std.testing.expect(!validateConfiguredBearerToken("Bearer wrong", "secret123"));
 }
 
 // ── JSON helper tests ────────────────────────────────────────────
