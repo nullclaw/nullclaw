@@ -70,11 +70,20 @@ pub const MaixCamChannel = struct {
     /// If the allowlist is empty, all devices are allowed.
     pub fn isDeviceAllowed(self: *const MaixCamChannel, device_id: []const u8) bool {
         if (self.config.allow_from.len == 0) return true;
+        var matched = false;
+        var wildcard_seen = false;
         for (self.config.allow_from) |allowed| {
-            if (std.mem.eql(u8, allowed, "*")) return true;
-            if (std.mem.eql(u8, allowed, device_id)) return true;
+            if (std.mem.eql(u8, allowed, "*")) {
+                wildcard_seen = true;
+                continue;
+            }
+            if (std.mem.eql(u8, allowed, device_id)) matched = true;
         }
-        return false;
+        if (wildcard_seen) {
+            root.warnWildcardAllowAll("maixcam channel");
+            return true;
+        }
+        return matched;
     }
 
     // ── JSON Message Parsing ──────────────────────────────────────
@@ -510,6 +519,16 @@ test "maixcam allowlist wildcard allows all" {
     const ch = MaixCamChannel.init(std.testing.allocator, .{ .allow_from = &allowlist });
     try std.testing.expect(ch.isDeviceAllowed("anything"));
     try std.testing.expect(ch.isDeviceAllowed("cam-99"));
+}
+
+test "maixcam exact match still triggers wildcard warning" {
+    root.resetWildcardWarningForTest("maixcam channel");
+    defer root.resetWildcardWarningForTest("maixcam channel");
+
+    const allowlist = [_][]const u8{ "cam-01", "*" };
+    const ch = MaixCamChannel.init(std.testing.allocator, .{ .allow_from = &allowlist });
+    try std.testing.expect(ch.isDeviceAllowed("cam-01"));
+    try std.testing.expect(root.wildcardWarningTriggeredForTest("maixcam channel"));
 }
 
 test "maixcam allowlist exact match only" {

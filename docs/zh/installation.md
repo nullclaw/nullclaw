@@ -206,7 +206,7 @@ $env:Path = "$env:Path;$bin"
 
 ```Powershell 
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
-$new = "$old;x:\nullclaww二进制文件所在目录"
+$new = "$old;x:\nullclaw二进制文件所在目录"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")
 ```
 

@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const gateway = @import("gateway.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const streaming = @import("streaming.zig");
 
 /// Maximum number of tasks kept in the registry before eviction.
@@ -563,7 +564,7 @@ pub fn handleStreamingRpc(
     };
     const sink = sse_ctx.makeSink();
 
-    const context: ConversationContext = .{ .channel = "a2a" };
+    const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
     const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink) catch {
         var failed_task = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
@@ -634,7 +635,7 @@ fn handleSendMessage(
     // Update state to working.
     _ = registry.setTaskState(task.id, .working);
 
-    const context: ConversationContext = .{ .channel = "a2a" };
+    const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
     const response = session_mgr.processMessage(task.session_key, text, context) catch {
         _ = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Agent processing failed") catch

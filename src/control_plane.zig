@@ -1,4 +1,5 @@
 const std = @import("std");
+const interaction_commands = @import("interactions/commands.zig");
 
 pub const SlashCommand = struct {
     name: []const u8,
@@ -54,62 +55,6 @@ pub const HELP_TEXT =
     \\  exit, quit
 ;
 
-const TelegramBotCommand = struct {
-    command: []const u8,
-    description: []const u8,
-};
-
-const PRIMARY_TELEGRAM_BOT_COMMANDS = [_]TelegramBotCommand{
-    .{ .command = "start", .description = "Start a conversation" },
-    .{ .command = "menu", .description = "Show grouped command menu" },
-    .{ .command = "new", .description = "Clear history, start fresh" },
-    .{ .command = "status", .description = "Show model and stats" },
-    .{ .command = "whoami", .description = "Show current session id" },
-    .{ .command = "model", .description = "Switch model" },
-    .{ .command = "think", .description = "Set thinking level" },
-    .{ .command = "verbose", .description = "Set verbose level" },
-    .{ .command = "reasoning", .description = "Set reasoning output" },
-    .{ .command = "exec", .description = "Set exec policy" },
-    .{ .command = "allowlist", .description = "Show allowlist" },
-    .{ .command = "queue", .description = "Set queue policy" },
-    .{ .command = "usage", .description = "Set usage footer mode" },
-    .{ .command = "tts", .description = "Set TTS mode" },
-    .{ .command = "memory", .description = "Memory tools and diagnostics" },
-    .{ .command = "skill", .description = "List skills" },
-    .{ .command = "doctor", .description = "Memory diagnostics quick check" },
-    .{ .command = "tasks", .description = "List background tasks" },
-    .{ .command = "agents", .description = "Show active agents" },
-    .{ .command = "bind", .description = "Bind current chat to an agent" },
-    .{ .command = "poll", .description = "Show pending tasks and approvals" },
-    .{ .command = "stop", .description = "Stop active background task" },
-    .{ .command = "restart", .description = "Restart current session" },
-    .{ .command = "compact", .description = "Compact context now" },
-};
-
-const TOPIC_TELEGRAM_BOT_COMMAND = TelegramBotCommand{
-    .command = "topic",
-    .description = "Create forum topic",
-};
-
-const TOPICS_TELEGRAM_BOT_COMMAND = TelegramBotCommand{
-    .command = "topics",
-    .description = "Show topic session map",
-};
-
-fn appendTelegramBotCommand(
-    out: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-    cmd: TelegramBotCommand,
-    first: bool,
-) !void {
-    if (!first) try out.appendSlice(allocator, ",");
-    try out.appendSlice(allocator, "{\"command\":\"");
-    try out.appendSlice(allocator, cmd.command);
-    try out.appendSlice(allocator, "\",\"description\":\"");
-    try out.appendSlice(allocator, cmd.description);
-    try out.appendSlice(allocator, "\"}");
-}
-
 fn appendTelegramBotCommandScope(
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -130,21 +75,11 @@ pub fn buildTelegramBotCommandsJson(
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, "{\"commands\":[");
-    var first = true;
-    for (PRIMARY_TELEGRAM_BOT_COMMANDS) |cmd| {
-        if (!opts.include_bind_command and std.mem.eql(u8, cmd.command, "bind")) continue;
-        try appendTelegramBotCommand(&out, allocator, cmd, first);
-        first = false;
-    }
-    const include_topic_command = opts.scope != .all_private_chats and opts.include_topic_command;
-    const include_topics_command = opts.scope != .all_private_chats and opts.include_topics_command;
-    if (include_topic_command) {
-        try appendTelegramBotCommand(&out, allocator, TOPIC_TELEGRAM_BOT_COMMAND, first);
-        first = false;
-    }
-    if (include_topics_command) {
-        try appendTelegramBotCommand(&out, allocator, TOPICS_TELEGRAM_BOT_COMMAND, first);
-    }
+    try interaction_commands.appendTelegramCommandCatalogJson(&out, allocator, .{
+        .include_bind_command = opts.include_bind_command,
+        .include_topic_command = opts.scope != .all_private_chats and opts.include_topic_command,
+        .include_topics_command = opts.scope != .all_private_chats and opts.include_topics_command,
+    });
     try out.appendSlice(allocator, "],\"scope\":");
     try appendTelegramBotCommandScope(&out, allocator, opts.scope);
     try out.appendSlice(allocator, "}");

@@ -825,10 +825,22 @@ fn allowEntryMatches(entry: []const u8, sender_id: []const u8, sender_name: ?[]c
 
 fn senderMatchesAllowlist(allow_from: []const []const u8, sender_id: []const u8, sender_name: ?[]const u8) bool {
     if (allow_from.len == 0) return false;
+    var matched = false;
+    var wildcard_seen = false;
     for (allow_from) |entry| {
-        if (allowEntryMatches(entry, sender_id, sender_name)) return true;
+        const normalized = normalizeAllowEntry(entry);
+        if (normalized.len == 0) continue;
+        if (std.mem.eql(u8, normalized, "*")) {
+            wildcard_seen = true;
+            continue;
+        }
+        if (allowEntryMatches(entry, sender_id, sender_name)) matched = true;
     }
-    return false;
+    if (wildcard_seen) {
+        root.warnWildcardAllowAll("mattermost channel");
+        return true;
+    }
+    return matched;
 }
 
 fn channelKindFromType(raw_type: ?[]const u8) ChannelKind {
@@ -959,6 +971,15 @@ test "mattermost allow entry matching supports user id username and prefixes" {
     try std.testing.expect(allowEntryMatches("@Alice", "u123", "alice"));
     try std.testing.expect(!allowEntryMatches("@Bob", "u123", "alice"));
     try std.testing.expect(allowEntryMatches("*", "u123", null));
+}
+
+test "mattermost exact match still triggers wildcard warning" {
+    root.resetWildcardWarningForTest("mattermost channel");
+    defer root.resetWildcardWarningForTest("mattermost channel");
+
+    const allow_from = [_][]const u8{ "user-a", "*" };
+    try std.testing.expect(senderMatchesAllowlist(&allow_from, "user-a", null));
+    try std.testing.expect(root.wildcardWarningTriggeredForTest("mattermost channel"));
 }
 
 test "mattermost handleGatewayMessage publishes allowed direct message" {

@@ -1,0 +1,39 @@
+{
+  "channels": {
+    "external": {
+      "accounts": {
+        "mailbox": {
+          "runtime_name": "imap_connector",
+          "transport": {
+            "command": "/absolute/path/to/nullclaw-channel-imap-connector/nullclaw-plugin-imap-connector",
+            "timeout_ms": 10000
+          },
+          "config": {
+            "imap": {
+              "host": "imap.example.com",
+              "port": 993,
+              "username": "agent@example.com",
+              "password": "YOUR_APP_PASSWORD",
+              "tls": true,
+              "folder": "INBOX"
+            },
+            "smtp": {
+              "host": "smtp.example.com",
+              "port": 587,
+              "username": "agent@example.com",
+              "password": "YOUR_APP_PASSWORD",
+              "tls": true
+            },
+            "from_address": "agent@example.com",
+            "allow_from": ["*@your-company.com"],
+            "poll_interval_secs": 60,
+            "max_body_length": 50000,
+            "attachment_save_dir": "/absolute/path/inside/runtime-state-dir/attachments",
+            "attachment_extensions": [".pdf", ".docx"],
+            "state_file": "imap-connector-state.json"
+          }
+        }
+      }
+    }
+  }
+}

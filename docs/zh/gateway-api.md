@@ -17,6 +17,7 @@
 | `/webhook` | POST | `Authorization: Bearer <token>` | 发送消息：`{"message":"..."}` |
 | `/whatsapp` | GET | Query 参数 | Meta Webhook 验证 |
 | `/whatsapp` | POST | Meta 签名 | WhatsApp 入站消息 |
+| `/max` | POST | `X-Max-Bot-Api-Secret`（配置后必填） | Max 入站 webhook |
 
 ## 快速示例
 
@@ -46,11 +47,40 @@ curl -X POST \
   http://127.0.0.1:3000/webhook
 ```
 
+### 4) Max webhook 投递
+
+单账号示例：
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Max-Bot-Api-Secret: YOUR_MAX_SECRET" \
+  -d '{"update_type":"bot_started","chat_id":100,"timestamp":1710000000000,"user":{"user_id":42,"first_name":"Igor"}}' \
+  http://127.0.0.1:3000/max
+```
+
+多账号示例：
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Max-Bot-Api-Secret: YOUR_MAX_SECRET" \
+  -d '{"update_type":"message_created","timestamp":1710000000000,"message":{"sender":{"user_id":42,"first_name":"Igor"},"recipient":{"chat_id":100,"chat_type":"dialog"},"body":{"mid":"m1","text":"ping"}}}' \
+  "http://127.0.0.1:3000/max?account_id=main"
+```
+
+Max webhook 说明：
+
+- `nullclaw` 对 `/max` 路由优先按 `account_id` query 参数匹配，其次按 `X-Max-Bot-Api-Secret` 匹配。
+- 如果 `channels.max[].webhook_secret` 已配置，header 必须存在且完全匹配。
+- Max 侧配置的 webhook URL 必须使用 HTTPS。
+
 ## 鉴权与安全建议
 
 1. 保持 `gateway.require_pairing = true`。
 2. 网关优先绑定 `127.0.0.1`，外网访问通过 tunnel/反向代理。
 3. token 视为密钥，不写入公开仓库或日志。
+4. Max webhook secret 同理：每个账号使用独立随机值，不跨 bot 复用。
 
 ## 下一步
 

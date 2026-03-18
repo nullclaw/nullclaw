@@ -1,5 +1,7 @@
 const std = @import("std");
 const crypto = @import("../security/secrets.zig");
+const platform = @import("../platform.zig");
+const policy = @import("policy.zig");
 
 /// Maximum failed pairing attempts before lockout.
 const MAX_PAIR_ATTEMPTS: u32 = 5;
@@ -178,7 +180,13 @@ pub const PairingGuard = struct {
 
         var hash_buf: [64]u8 = undefined;
         const hashed = hashToken(token, &hash_buf);
-        return self.paired_tokens.contains(hashed);
+        // Scan every stored hash so authentication does not leak match position.
+        var found: u8 = 0;
+        var it = self.paired_tokens.keyIterator();
+        while (it.next()) |stored_hash| {
+            found |= @as(u8, @intFromBool(constantTimeEq(hashed, stored_hash.*)));
+        }
+        return found != 0;
     }
 
     /// Returns true if the gateway is already paired (has at least one token).
@@ -265,12 +273,53 @@ pub fn constantTimeEq(a: []const u8, b: []const u8) bool {
 
 /// Check if a host string represents a non-localhost bind address.
 pub fn isPublicBind(host: []const u8) bool {
-    if (std.mem.eql(u8, host, "127.0.0.1")) return false;
-    if (std.mem.eql(u8, host, "localhost")) return false;
-    if (std.mem.eql(u8, host, "::1")) return false;
-    if (std.mem.eql(u8, host, "[::1]")) return false;
-    if (std.mem.eql(u8, host, "0:0:0:0:0:0:0:1")) return false;
-    return true;
+    return !isLoopbackBindHost(host);
+}
+
+fn isLoopbackBindHost(host: []const u8) bool {
+    const normalized = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+        host[1 .. host.len - 1]
+    else
+        host;
+
+    if (std.ascii.eqlIgnoreCase(normalized, "localhost")) return true;
+
+    if (std.net.Address.parseIp4(normalized, 0)) |ip4| {
+        const octets: *const [4]u8 = @ptrCast(&ip4.in.sa.addr);
+        return octets[0] == 127;
+    } else |_| {}
+
+    if (std.net.Address.parseIp6(normalized, 0)) |ip6| {
+        const bytes = ip6.in6.sa.addr;
+        return std.mem.eql(u8, bytes[0..15], &[_]u8{0} ** 15) and bytes[15] == 1;
+    } else |_| {}
+
+    return false;
+}
+
+fn isTruthyFlag(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
+pub fn isYoloForceEnabled(allocator: std.mem.Allocator) bool {
+    if (platform.getEnvOrNull(allocator, "NULLCLAW_ALLOW_YOLO")) |v| {
+        defer allocator.free(v);
+        if (isTruthyFlag(v)) return true;
+    }
+    if (platform.getEnvOrNull(allocator, "OPENCLAW_ALLOW_YOLO")) |v| {
+        defer allocator.free(v);
+        if (isTruthyFlag(v)) return true;
+    }
+    return false;
+}
+
+pub fn isYoloGatewayAllowed(level: policy.AutonomyLevel, host: []const u8, forced: bool) bool {
+    if (level != .yolo) return true;
+    if (forced) return true;
+    return !isPublicBind(host);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -412,9 +461,14 @@ test "is token hash detects hash vs plaintext" {
 
 test "localhost variants not public" {
     try std.testing.expect(!isPublicBind("127.0.0.1"));
+    try std.testing.expect(!isPublicBind("127.0.0.2"));
+    try std.testing.expect(!isPublicBind("127.255.255.255"));
     try std.testing.expect(!isPublicBind("localhost"));
+    try std.testing.expect(!isPublicBind("LOCALHOST"));
     try std.testing.expect(!isPublicBind("::1"));
     try std.testing.expect(!isPublicBind("[::1]"));
+    try std.testing.expect(!isPublicBind("0:0:0:0:0:0:0:1"));
+    try std.testing.expect(!isPublicBind("[0:0:0:0:0:0:0:1]"));
 }
 
 test "zero zero is public" {
@@ -539,8 +593,24 @@ test "is public bind empty string" {
     try std.testing.expect(isPublicBind(""));
 }
 
-test "is public bind ipv6 full form not public" {
-    try std.testing.expect(!isPublicBind("0:0:0:0:0:0:0:1"));
+test "isYoloGatewayAllowed rejects remote host without force" {
+    try std.testing.expect(!isYoloGatewayAllowed(.yolo, "0.0.0.0", false));
+}
+
+test "isYoloGatewayAllowed allows loopback variants without force" {
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "127.0.0.1", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "127.0.0.2", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "LOCALHOST", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "0:0:0:0:0:0:0:1", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "[0:0:0:0:0:0:0:1]", false));
+}
+
+test "isYoloGatewayAllowed allows force override" {
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "0.0.0.0", true));
+}
+
+test "isYoloGatewayAllowed allows non-yolo levels" {
+    try std.testing.expect(isYoloGatewayAllowed(.supervised, "0.0.0.0", false));
 }
 
 test "constant time eq handles unicode bytes" {

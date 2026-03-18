@@ -517,8 +517,8 @@ pub fn curlStream(
     }
     const term = child.wait() catch |err| {
         log.err("curlStream child.wait failed: {}", .{err});
-        if (saw_done) {
-            log.warn("curlStream proceeding despite wait failure after receiving stream data", .{});
+        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+            log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeStreamResult(allocator, accumulated.items, stream_usage);
         }
@@ -529,16 +529,16 @@ pub fn curlStream(
     }
     switch (term) {
         .Exited => |code| if (code != 0) {
-            if (saw_done) {
-                log.warn("curlStream exit code {d} after stream data; returning accumulated output", .{code});
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, stream_usage);
             }
             return error.CurlFailed;
         },
         else => {
-            if (saw_done) {
-                log.warn("curlStream abnormal termination after stream data; returning accumulated output", .{});
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, stream_usage);
             }
@@ -786,8 +786,8 @@ pub fn curlStreamAnthropic(
 
     const term = child.wait() catch |err| {
         log.err("curlStreamAnthropic child.wait failed: {}", .{err});
-        if (saw_done) {
-            log.warn("curlStreamAnthropic proceeding despite wait failure after receiving stream data", .{});
+        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+            log.warn("curlStreamAnthropic proceeding despite wait failure after partial stream output", .{});
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
         }
@@ -795,16 +795,16 @@ pub fn curlStreamAnthropic(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
-            if (saw_done) {
-                log.warn("curlStreamAnthropic exit code {d} after stream data; returning accumulated output", .{code});
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
             }
             return error.CurlFailed;
         },
         else => {
-            if (saw_done) {
-                log.warn("curlStreamAnthropic abnormal termination after stream data; returning accumulated output", .{});
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                log.warn("curlStreamAnthropic abnormal termination after partial stream output; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
             }

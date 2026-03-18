@@ -235,6 +235,19 @@ pub const ApiMemory = struct {
         return std.fmt.allocPrint(alloc, "{s}/memories", .{self.base_url});
     }
 
+    fn buildMemoryKeyUrlWithQuery(self: *const Self, alloc: Allocator, key: []const u8, session_id: ?[]const u8) ![]u8 {
+        const base = try self.buildMemoryUrl(alloc, key);
+        defer alloc.free(base);
+        if (session_id == null) return try alloc.dupe(u8, base);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        try buf.appendSlice(alloc, base);
+        try buf.appendSlice(alloc, "?session_id=");
+        try appendUrlEncoded(&buf, alloc, session_id.?);
+        return buf.toOwnedSlice(alloc);
+    }
+
     fn buildMemoryUrlWithQuery(self: *const Self, alloc: Allocator, category: ?[]const u8, session_id: ?[]const u8) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(alloc);
@@ -832,6 +845,21 @@ pub const ApiMemory = struct {
         return error.ApiRequestFailed;
     }
 
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildMemoryKeyUrlWithQuery(alloc, key, session_id);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .DELETE, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .ok) return true;
+        if (resp.status == .not_found) return false;
+        return error.ApiRequestFailed;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
@@ -872,6 +900,7 @@ pub const ApiMemory = struct {
         .get = &implGet,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -1249,6 +1278,21 @@ test "api url building list with query params" {
     const url4 = try mem.buildMemoryUrlWithQuery(std.testing.allocator, null, null);
     defer std.testing.allocator.free(url4);
     try std.testing.expectEqualStrings("http://localhost:8080/memories", url4);
+}
+
+test "api url building key with session query param" {
+    var mem = try ApiMemory.init(std.testing.allocator, .{
+        .url = "http://localhost:8080",
+    });
+    defer mem.deinit();
+
+    const scoped = try mem.buildMemoryKeyUrlWithQuery(std.testing.allocator, "key1", "sess-9");
+    defer std.testing.allocator.free(scoped);
+    try std.testing.expectEqualStrings("http://localhost:8080/memories/key1?session_id=sess-9", scoped);
+
+    const unscoped = try mem.buildMemoryKeyUrlWithQuery(std.testing.allocator, "key1", null);
+    defer std.testing.allocator.free(unscoped);
+    try std.testing.expectEqualStrings("http://localhost:8080/memories/key1", unscoped);
 }
 
 test "api json escaping" {

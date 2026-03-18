@@ -22,6 +22,7 @@ pub const ChannelId = enum {
     qq,
     onebot,
     maixcam,
+    external,
     nostr,
     web,
     whatsapp_web,
@@ -64,6 +65,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .qq, .key = "qq", .label = "QQ", .configured_message = "QQ configured", .listener_mode = .gateway_loop },
     .{ .id = .onebot, .key = "onebot", .label = "OneBot", .configured_message = "OneBot configured", .listener_mode = .gateway_loop },
     .{ .id = .maixcam, .key = "maixcam", .label = "MaixCam", .configured_message = "MaixCam configured", .listener_mode = .send_only },
+    .{ .id = .external, .key = "external", .label = "External", .configured_message = "External channel configured", .listener_mode = .gateway_loop },
     .{ .id = .nostr, .key = "nostr", .label = "Nostr", .configured_message = "Nostr configured", .listener_mode = .gateway_loop },
     .{ .id = .web, .key = "web", .label = "Web", .configured_message = "Web configured", .listener_mode = .gateway_loop },
     .{ .id = .whatsapp_web, .key = "whatsapp_web", .label = "WhatsApp Web", .configured_message = "WhatsApp Web configured", .listener_mode = .webhook_only },
@@ -91,6 +93,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .qq => build_options.enable_channel_qq,
         .onebot => build_options.enable_channel_onebot,
         .maixcam => build_options.enable_channel_maixcam,
+        .external => true,
         .nostr => build_options.enable_channel_nostr,
         .web => build_options.enable_channel_web,
         .whatsapp_web => build_options.enable_channel_whatsapp_web,
@@ -118,6 +121,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "qq")) return build_options.enable_channel_qq;
     if (comptime std.mem.eql(u8, key, "onebot")) return build_options.enable_channel_onebot;
     if (comptime std.mem.eql(u8, key, "maixcam")) return build_options.enable_channel_maixcam;
+    if (comptime std.mem.eql(u8, key, "external")) return true;
     if (comptime std.mem.eql(u8, key, "nostr")) return build_options.enable_channel_nostr;
     if (comptime std.mem.eql(u8, key, "web")) return build_options.enable_channel_web;
     if (comptime std.mem.eql(u8, key, "whatsapp_web")) return build_options.enable_channel_whatsapp_web;
@@ -146,6 +150,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .qq => cfg.channels.qq.len,
         .onebot => cfg.channels.onebot.len,
         .maixcam => cfg.channels.maixcam.len,
+        .external => cfg.channels.external.len,
         .nostr => if (cfg.channels.nostr != null) 1 else 0,
         .web => cfg.channels.web.len,
         .whatsapp_web => cfg.channels.whatsapp_web.len,

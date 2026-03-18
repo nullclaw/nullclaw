@@ -44,6 +44,7 @@ pub const OutboundMessage = struct {
     media: []const []const u8 = &.{}, // file paths/URLs to send
     choices: []const outbound.Choice = &.{}, // structured action choices for rich-capable channels
     stage: streaming.OutboundStage = .final,
+    draft_id: u64 = 0, // host-managed tracked draft turn id; 0 means no tracked draft
 
     pub fn deinit(self: *const OutboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);
@@ -409,6 +410,30 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
             self.not_empty.signal();
         }
 
+        pub fn publishTimeout(self: *Self, item: T, timeout_ms: u32) error{ Closed, Timeout }!void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const deadline_ns: i128 = std.time.nanoTimestamp() +
+                (@as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms);
+            while (self.len == capacity and !self.closed) {
+                const remaining_ns = remainingTimeoutNs(deadline_ns);
+                if (remaining_ns == 0) return error.Timeout;
+                self.not_full.timedWait(&self.mutex, remaining_ns) catch |err| switch (err) {
+                    error.Timeout => {
+                        if (self.len == capacity and !self.closed) return error.Timeout;
+                    },
+                };
+            }
+            if (self.closed) return error.Closed;
+
+            self.buf[self.tail] = item;
+            self.tail = (self.tail + 1) % capacity;
+            self.len += 1;
+
+            self.not_empty.signal();
+        }
+
         /// Blocks if the queue is empty. Returns null if closed and the queue is empty.
         pub fn consume(self: *Self) ?T {
             self.mutex.lock();
@@ -445,6 +470,12 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
     };
 }
 
+fn remainingTimeoutNs(deadline_ns: i128) u64 {
+    const remaining_ns = deadline_ns - std.time.nanoTimestamp();
+    if (remaining_ns <= 0) return 0;
+    return @intCast(remaining_ns);
+}
+
 // ---------------------------------------------------------------------------
 // Bus — top-level structure
 // ---------------------------------------------------------------------------
@@ -463,6 +494,10 @@ pub const Bus = struct {
 
     pub fn publishInbound(self: *Bus, msg: InboundMessage) error{Closed}!void {
         return self.inbound.publish(msg);
+    }
+
+    pub fn publishInboundTimeout(self: *Bus, msg: InboundMessage, timeout_ms: u32) error{ Closed, Timeout }!void {
+        return self.inbound.publishTimeout(msg, timeout_ms);
     }
 
     pub fn consumeInbound(self: *Bus) ?InboundMessage {
@@ -542,6 +577,7 @@ test "makeOutbound produces owned copies" {
     src_content[0] = 'Z';
     try testing.expectEqualStrings("reply", msg.content);
     try testing.expect(msg.stage == .final);
+    try testing.expectEqual(@as(u64, 0), msg.draft_id);
 }
 
 test "makeOutboundWithAccount stores account_id" {
@@ -551,6 +587,7 @@ test "makeOutboundWithAccount stores account_id" {
     try testing.expect(msg.account_id != null);
     try testing.expectEqualStrings("backup", msg.account_id.?);
     try testing.expect(msg.stage == .final);
+    try testing.expectEqual(@as(u64, 0), msg.draft_id);
 }
 
 test "makeOutboundChunk marks chunk stage" {
@@ -558,6 +595,7 @@ test "makeOutboundChunk marks chunk stage" {
     const msg = try makeOutboundChunk(alloc, "web", "c1", "delta");
     defer msg.deinit(alloc);
     try testing.expect(msg.stage == .chunk);
+    try testing.expectEqual(@as(u64, 0), msg.draft_id);
 }
 
 test "makeOutboundChunkWithAccount marks chunk stage" {
@@ -566,6 +604,7 @@ test "makeOutboundChunkWithAccount marks chunk stage" {
     defer msg.deinit(alloc);
     try testing.expect(msg.stage == .chunk);
     try testing.expectEqualStrings("main", msg.account_id.?);
+    try testing.expectEqual(@as(u64, 0), msg.draft_id);
 }
 
 test "makeOutboundWithChoices stores structured choices" {

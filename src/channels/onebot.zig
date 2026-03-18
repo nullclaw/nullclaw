@@ -266,7 +266,7 @@ pub const OneBotChannel = struct {
         const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{user_id}) catch return;
 
         // Allowlist check
-        if (self.config.allow_from.len > 0 and !root.isAllowed(self.config.allow_from, user_str)) return;
+        if (self.config.allow_from.len > 0 and !root.isAllowedScoped("onebot channel", self.config.allow_from, user_str)) return;
 
         // Extract chat_id (group_id for group messages, user_id for private)
         const chat_id_int = if (is_group) getJsonInt(val, "group_id") orelse return else user_id;

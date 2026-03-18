@@ -264,7 +264,7 @@ test "export_manifest produces valid structure" {
     try std.testing.expect(onboard.known_providers.len >= 29);
     try std.testing.expect(onboard.wizard_memory_backend_order.len == 10);
     try std.testing.expect(onboard.tunnel_options.len == 4);
-    try std.testing.expect(onboard.autonomy_options.len == 3);
+    try std.testing.expect(onboard.autonomy_options.len == 4);
     try std.testing.expect(channel_catalog.known_channels.len >= 20);
 
     // Verify first provider
@@ -272,4 +272,5 @@ test "export_manifest produces valid structure" {
 
     // Verify memory backends start with hybrid
     try std.testing.expectEqualStrings("hybrid", onboard.wizard_memory_backend_order[0]);
+    try std.testing.expectEqualStrings("yolo", onboard.autonomy_options[3]);
 }

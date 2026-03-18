@@ -111,6 +111,7 @@ fn openWorkspaceFileWithGuards(
 /// Carries per-message sender metadata so the LLM always knows who is talking.
 pub const ConversationContext = struct {
     channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
     // Signal
     sender_number: ?[]const u8 = null,
     sender_uuid: ?[]const u8 = null,
@@ -120,6 +121,7 @@ pub const ConversationContext = struct {
     sender_username: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
     // Shared
+    peer_id: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
 
@@ -129,7 +131,7 @@ pub const ConversationContext = struct {
     pub fn senderFingerprint(self: ConversationContext) u64 {
         var h = std.hash.Wyhash.init(0x1234_5678);
         // Hash each sender-identifying field (or a sentinel null byte).
-        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name }) |field| {
+        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.peer_id }) |field| {
             if (field) |v| {
                 h.update(v);
             } else {
@@ -140,6 +142,56 @@ pub const ConversationContext = struct {
         return h.final();
     }
 };
+
+/// Normalize partially-filled inbound metadata into a stable conversation context.
+pub fn buildConversationContext(args: ConversationContext) ?ConversationContext {
+    const channel = normalizeOptionalString(args.channel);
+    const account_id = normalizeOptionalString(args.account_id);
+    const sender_number = normalizeOptionalString(args.sender_number);
+    const sender_uuid = normalizeOptionalString(args.sender_uuid);
+    const sender_name = normalizeOptionalString(args.sender_name);
+    const sender_id = normalizeOptionalString(args.sender_id);
+    const sender_username = normalizeOptionalString(args.sender_username);
+    const sender_display_name = normalizeOptionalString(args.sender_display_name);
+    const peer_id = normalizeOptionalString(args.peer_id);
+    const is_group = args.is_group;
+    const group_id = if (normalizeOptionalString(args.group_id)) |value|
+        value
+    else if (is_group != null and is_group.? and peer_id != null)
+        peer_id
+    else
+        null;
+
+    const has_sender_identity = sender_id != null or
+        sender_uuid != null or
+        sender_number != null or
+        sender_name != null or
+        sender_username != null or
+        sender_display_name != null;
+    const has_scope = account_id != null or peer_id != null or group_id != null or is_group != null;
+    if (channel == null and !has_sender_identity and !has_scope) return null;
+
+    return .{
+        .channel = channel,
+        .account_id = account_id,
+        .sender_number = sender_number,
+        .sender_uuid = sender_uuid,
+        .sender_name = sender_name,
+        .sender_id = sender_id,
+        .sender_username = sender_username,
+        .sender_display_name = sender_display_name,
+        .peer_id = peer_id,
+        .group_id = group_id,
+        .is_group = is_group,
+    };
+}
+
+fn normalizeOptionalString(value: ?[]const u8) ?[]const u8 {
+    return if (value) |slice|
+        if (slice.len > 0) slice else null
+    else
+        null;
+}
 
 /// Context passed to prompt sections during construction.
 pub const PromptContext = struct {
@@ -264,9 +316,14 @@ pub fn buildSystemPrompt(
         } else if (cc.sender_uuid) |uuid| {
             try std.fmt.format(w, "- Sender: ({s})\n", .{uuid});
         }
-        // Discord sender fields
+        // Sender identity fields
         if (cc.sender_id) |sid| {
-            try std.fmt.format(w, "- Sender Discord ID: {s}\n", .{sid});
+            const is_discord = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "discord") else false;
+            if (is_discord) {
+                try std.fmt.format(w, "- Sender Discord ID: {s}\n", .{sid});
+            } else {
+                try std.fmt.format(w, "- Sender ID: {s}\n", .{sid});
+            }
         }
         if (cc.sender_username) |uname| {
             try std.fmt.format(w, "- Sender username: {s}\n", .{uname});
@@ -1149,6 +1206,23 @@ test "buildSystemPrompt includes discord sender identity fields" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: u-42") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender display name: Discord User") != null);
+}
+
+test "buildSystemPrompt uses generic sender id label outside discord" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "nostr",
+            .sender_id = "npub-42",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender ID: npub-42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: npub-42") == null);
 }
 
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {

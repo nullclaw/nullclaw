@@ -63,10 +63,31 @@ pub fn freeMutationResult(allocator: std.mem.Allocator, result: *MutationResult)
     if (result.backup_path) |p| allocator.free(p);
 }
 
-pub fn defaultConfigPath(allocator: std.mem.Allocator) ![]u8 {
+fn defaultConfigDir(allocator: std.mem.Allocator, nullclaw_home_override: ?[]const u8) ![]u8 {
+    if (nullclaw_home_override) |config_dir| {
+        return allocator.dupe(u8, config_dir);
+    }
+
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".nullclaw", "config.json" });
+    return try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+}
+
+fn defaultConfigPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]u8 {
+    return try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
+}
+
+pub fn defaultConfigPath(allocator: std.mem.Allocator) ![]u8 {
+    const nullclaw_home = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (nullclaw_home) |config_dir| allocator.free(config_dir);
+
+    const config_dir = try defaultConfigDir(allocator, nullclaw_home);
+    defer allocator.free(config_dir);
+
+    return try defaultConfigPathFromDir(allocator, config_dir);
 }
 
 fn splitPathTokens(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {
@@ -206,6 +227,25 @@ fn readConfigOrDefault(allocator: std.mem.Allocator, config_path: []const u8) !s
 
     const content = try file.readToEndAlloc(allocator, 1024 * 1024);
     return .{ .content = content, .existed = true };
+}
+
+test "defaultConfigDir uses NULLCLAW_HOME override" {
+    const allocator = std.testing.allocator;
+    const config_dir = try defaultConfigDir(allocator, "/tmp/nullclaw-home");
+    defer allocator.free(config_dir);
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-home", config_dir);
+}
+
+test "defaultConfigPath appends config filename to NULLCLAW_HOME override" {
+    const allocator = std.testing.allocator;
+    const config_path = try defaultConfigPathFromDir(allocator, "/tmp/nullclaw-home");
+    defer allocator.free(config_path);
+
+    const expected = try std.fmt.allocPrint(allocator, "/tmp/nullclaw-home{s}config.json", .{std.fs.path.sep_str});
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, config_path);
 }
 
 fn writeAtomic(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !void {

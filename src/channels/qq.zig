@@ -622,7 +622,7 @@ fn qqWebhookValidationSignature(
 pub fn isGroupAllowed(config: config_types.QQConfig, group_id: []const u8) bool {
     return switch (config.group_policy) {
         .allow => true,
-        .allowlist => root.isAllowedExact(config.allowed_groups, group_id),
+        .allowlist => root.isAllowedExactScoped("qq channel", config.allowed_groups, group_id),
     };
 }
 
@@ -1127,7 +1127,7 @@ pub const QQChannel = struct {
         }
 
         // Allowlist check
-        if (!root.isAllowedExact(self.config.allow_from, sender_id)) {
+        if (!root.isAllowedExactScoped("qq channel", self.config.allow_from, sender_id)) {
             log.info("handleMessageCreate: DROPPED — sender '{s}' not in allow_from", .{sender_id});
             return;
         }

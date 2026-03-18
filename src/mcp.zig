@@ -1,9 +1,7 @@
-//! MCP (Model Context Protocol) — stdio transport client.
+//! MCP (Model Context Protocol) client.
 //!
-//! Spawns external tool servers as child processes, communicates via
-//! JSON-RPC 2.0 over newline-delimited stdio. Wraps discovered tools
-//! into the standard Tool vtable so the agent can call them like any
-//! built-in tool.
+//! Supports stdio and HTTP JSON-RPC transports. Wraps discovered tools into
+//! the standard Tool vtable so the agent can call them like any built-in tool.
 
 const std = @import("std");
 const tools_mod = @import("tools/root.zig");
@@ -11,6 +9,8 @@ const config_mod = @import("config.zig");
 const json_util = @import("json_util.zig");
 const version = @import("version.zig");
 const platform = @import("platform.zig");
+const http_util = @import("http_util.zig");
+const verbose = @import("verbose.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.mcp);
@@ -32,7 +32,9 @@ pub const McpServer = struct {
     name: []const u8,
     config: McpServerConfig,
     child: ?std.process.Child,
+    http_client: ?std.http.Client,
     next_id: u32,
+    mcp_session_id: ?[]u8,
 
     pub fn init(allocator: Allocator, config: McpServerConfig) McpServer {
         return .{
@@ -40,12 +42,45 @@ pub const McpServer = struct {
             .name = config.name,
             .config = config,
             .child = null,
+            .http_client = null,
             .next_id = 1,
+            .mcp_session_id = null,
         };
     }
 
-    /// Spawn child process and perform the MCP initialize handshake.
+    /// Connect transport and perform the MCP initialize handshake.
     pub fn connect(self: *McpServer) !void {
+        if (McpServerConfig.isHttpTransport(self.config.transport)) {
+            try self.connectHttp();
+        } else {
+            try self.connectStdio();
+        }
+
+        // Send initialize request
+        const init_params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"nullclaw\",\"version\":\"{s}\"}}}}",
+            .{version.string},
+        );
+        defer self.allocator.free(init_params);
+
+        const init_resp = try self.sendRequest(self.allocator, "initialize", init_params);
+        defer self.allocator.free(init_resp);
+
+        // Verify we got a valid response (has protocolVersion in result)
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, init_resp, .{}) catch
+            return error.InvalidHandshake;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidHandshake;
+        const result = parsed.value.object.get("result") orelse return error.InvalidHandshake;
+        if (result != .object) return error.InvalidHandshake;
+        _ = result.object.get("protocolVersion") orelse return error.InvalidHandshake;
+
+        // Send initialized notification (no id, no response expected)
+        try self.sendNotification("notifications/initialized", null);
+    }
+
+    fn connectStdio(self: *McpServer) !void {
         // Build argv: command + args
         var argv_list: std.ArrayList([]const u8) = .{};
         defer argv_list.deinit(self.allocator);
@@ -84,29 +119,14 @@ pub const McpServer = struct {
 
         try child.spawn();
         self.child = child;
+    }
 
-        // Send initialize request
-        const init_params = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"nullclaw\",\"version\":\"{s}\"}}}}",
-            .{version.string},
-        );
-        defer self.allocator.free(init_params);
+    fn connectHttp(self: *McpServer) !void {
+        const url = self.config.url orelse return error.MissingHttpUrl;
+        _ = std.Uri.parse(url) catch return error.InvalidHttpUrl;
+        if (!McpServerConfig.isValidHttpUrl(url)) return error.InvalidHttpUrl;
 
-        const init_resp = try self.sendRequest(self.allocator, "initialize", init_params);
-        defer self.allocator.free(init_resp);
-
-        // Verify we got a valid response (has protocolVersion in result)
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, init_resp, .{}) catch
-            return error.InvalidHandshake;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidHandshake;
-        const result = parsed.value.object.get("result") orelse return error.InvalidHandshake;
-        if (result != .object) return error.InvalidHandshake;
-        _ = result.object.get("protocolVersion") orelse return error.InvalidHandshake;
-
-        // Send initialized notification (no id, no response expected)
-        try self.sendNotification("notifications/initialized", null);
+        self.http_client = std.http.Client{ .allocator = self.allocator };
     }
 
     /// Request the list of tools from the MCP server.
@@ -134,6 +154,14 @@ pub const McpServer = struct {
     }
 
     pub fn deinit(self: *McpServer) void {
+        if (self.http_client) |*client| {
+            client.deinit();
+            self.http_client = null;
+        }
+        if (self.mcp_session_id) |sid| {
+            self.allocator.free(sid);
+            self.mcp_session_id = null;
+        }
         if (self.child) |*child| {
             // Close stdin to signal the server to exit
             if (child.stdin) |stdin| {
@@ -161,6 +189,22 @@ pub const McpServer = struct {
                 \\{{"jsonrpc":"2.0","id":{d},"method":"{s}"}}
             ++ "\n", .{ id, method });
         defer allocator.free(msg);
+        if (McpServerConfig.isHttpTransport(self.config.transport)) {
+            const resp = try self.sendHttpRequest(allocator, msg);
+            defer allocator.free(resp.headers);
+            if (resp.status_code < 200 or resp.status_code >= 300) {
+                const max_body: usize = 4096;
+                const body_truncated = if (resp.body.len > max_body) resp.body[0..max_body] else resp.body;
+                if (verbose.isVerbose()) {
+                    log.err("MCP server '{s}': HTTP {d}: {s}", .{ self.name, resp.status_code, body_truncated });
+                } else {
+                    log.err("MCP server '{s}': HTTP {d}", .{ self.name, resp.status_code });
+                }
+                allocator.free(resp.body);
+                return error.HttpBadStatus;
+            }
+            return resp.body;
+        }
 
         const stdin = self.child.?.stdin orelse return error.NoStdin;
         try stdin.writeAll(msg);
@@ -178,9 +222,97 @@ pub const McpServer = struct {
                 \\{{"jsonrpc":"2.0","method":"{s}"}}
             ++ "\n", .{method});
         defer self.allocator.free(msg);
+        if (McpServerConfig.isHttpTransport(self.config.transport)) {
+            const resp = try self.sendHttpRequest(self.allocator, msg);
+            defer {
+                self.allocator.free(resp.headers);
+                self.allocator.free(resp.body);
+            }
+            if (resp.status_code < 200 or resp.status_code >= 300) {
+                return error.HttpBadStatus;
+            }
+            return;
+        }
 
         const stdin = self.child.?.stdin orelse return error.NoStdin;
         try stdin.writeAll(msg);
+    }
+
+    fn extractMcpSessionIdFromHeaders(headers: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, headers, '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r\n");
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            if (!std.ascii.eqlIgnoreCase(name, "mcp-session-id")) continue;
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (value.len == 0) return null;
+            return value;
+        }
+        return null;
+    }
+
+    fn sendHttpRequest(self: *McpServer, allocator: Allocator, msg: []const u8) !http_util.HttpResponseWithHeaders {
+        if (self.http_client == null) return error.NoHttpClient;
+        const url = self.config.url orelse return error.MissingHttpUrl;
+
+        var headers_buf: [24]std.http.Header = undefined;
+        var header_count: usize = 0;
+
+        headers_buf[header_count] = .{ .name = "Content-Type", .value = "application/json" };
+        header_count += 1;
+
+        if (self.mcp_session_id) |sid| {
+            if (header_count >= headers_buf.len) return error.TooManyHeaders;
+            headers_buf[header_count] = .{ .name = "mcp-session-id", .value = sid };
+            header_count += 1;
+        }
+
+        for (self.config.headers) |entry| {
+            if (header_count >= headers_buf.len) return error.TooManyHeaders;
+            headers_buf[header_count] = .{ .name = entry.key, .value = entry.value };
+            header_count += 1;
+        }
+
+        const timeout_ms = self.config.timeout_ms;
+        const timeout_secs: u32 = @max(@as(u32, 1), (timeout_ms + 999) / 1000);
+        var timeout_buf: [16]u8 = undefined;
+        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
+
+        // std.http.Client.fetch has no request timeout control in Zig 0.15.
+        // Use curl so timeouts are enforced.
+        var header_lines: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (header_lines.items) |line| allocator.free(line);
+            header_lines.deinit(allocator);
+        }
+
+        for (headers_buf[0..header_count]) |h| {
+            try header_lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value }));
+        }
+        const resp = http_util.curlPostWithStatusHeadersAndTimeout(
+            allocator,
+            url,
+            msg,
+            header_lines.items,
+            timeout_str,
+        ) catch |err| switch (err) {
+            error.CurlInterrupted => return error.HttpRequestInterrupted,
+            error.CurlFailed, error.CurlReadError, error.CurlWriteError, error.CurlWaitError, error.CurlParseError => return error.HttpRequestFailed,
+            else => return err,
+        };
+        errdefer {
+            allocator.free(resp.headers);
+            allocator.free(resp.body);
+        }
+        if (extractMcpSessionIdFromHeaders(resp.headers)) |sid| {
+            const owned = try self.allocator.dupe(u8, sid);
+            if (self.mcp_session_id) |old| self.allocator.free(old);
+            self.mcp_session_id = owned;
+        }
+
+        return resp;
     }
 
     fn readLine(self: *McpServer, allocator: Allocator) ![]const u8 {
@@ -319,9 +451,9 @@ pub const McpToolWrapper = struct {
         const output = self.server.callTool(self.original_name, args_json) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "MCP tool '{s}' failed: {}", .{ self.original_name, err }) catch
                 return tools_mod.ToolResult.fail("MCP tool call failed");
-            return tools_mod.ToolResult.fail(msg);
+            return tools_mod.ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
-        return tools_mod.ToolResult.ok(output);
+        return tools_mod.ToolResult{ .success = true, .output = output };
     }
 
     fn nameImpl(ptr: *anyopaque) []const u8 {
@@ -435,6 +567,7 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
 test "McpServer init fields" {
     const cfg = McpServerConfig{
         .name = "test-server",
+        .transport = "stdio",
         .command = "/usr/bin/echo",
         .args = &.{"hello"},
         .env = &.{.{ .key = "FOO", .value = "bar" }},
@@ -444,6 +577,37 @@ test "McpServer init fields" {
     try std.testing.expectEqual(@as(u32, 1), server.next_id);
     try std.testing.expect(server.child == null);
     try std.testing.expectEqualStrings("/usr/bin/echo", server.config.command);
+}
+
+test "McpServer sendRequest requires http client for http transport" {
+    var server = McpServer.init(std.testing.allocator, .{
+        .name = "remote",
+        .transport = "http",
+        .url = "https://mcp.example.com/rpc",
+    });
+    try std.testing.expectError(error.NoHttpClient, server.sendRequest(std.testing.allocator, "tools/list", "{}"));
+}
+
+test "McpServer sendNotification propagates http transport setup errors" {
+    var server = McpServer.init(std.testing.allocator, .{
+        .name = "remote",
+        .transport = "http",
+        .url = "https://mcp.example.com/rpc",
+    });
+    try std.testing.expectError(error.NoHttpClient, server.sendNotification("notifications/initialized", null));
+}
+
+test "McpServer init http fields" {
+    const cfg = McpServerConfig{
+        .name = "remote",
+        .transport = "http",
+        .url = "https://mcp.example.com/rpc",
+    };
+    const server = McpServer.init(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("remote", server.name);
+    try std.testing.expectEqualStrings("http", server.config.transport);
+    try std.testing.expectEqualStrings("", server.config.command);
+    try std.testing.expectEqualStrings("https://mcp.example.com/rpc", server.config.url.?);
 }
 
 test "parseToolsListResponse valid" {
@@ -591,4 +755,16 @@ test "buildJsonRpcRequest format" {
     try std.testing.expectEqualStrings("2.0", jsonrpc.string);
     const id_val = parsed.value.object.get("id").?;
     try std.testing.expectEqual(@as(i64, 42), id_val.integer);
+}
+
+test "extractMcpSessionIdFromHeaders parses CRLF headers" {
+    const hdr = "HTTP/2 200\r\ncontent-type: application/json\r\nmcp-session-id: abc123\r\ncache-control: no-cache\r\n";
+    const got = McpServer.extractMcpSessionIdFromHeaders(hdr) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("abc123", got);
+}
+
+test "extractMcpSessionIdFromHeaders parses LF headers" {
+    const hdr = "HTTP/1.1 200 OK\nMCP-Session-Id: zzz\nX: y\n";
+    const got = McpServer.extractMcpSessionIdFromHeaders(hdr) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("zzz", got);
 }

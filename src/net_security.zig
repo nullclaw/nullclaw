@@ -39,6 +39,8 @@ pub fn extractHost(url: []const u8) ?[]const u8 {
 pub fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool {
     if (allowed.len == 0) return true; // empty allowlist = allow all
     for (allowed) |pattern| {
+        // Global wildcard: "*" matches any host
+        if (std.mem.eql(u8, pattern, "*")) return true;
         // Exact match
         if (std.mem.eql(u8, host, pattern)) return true;
         // Wildcard subdomain: "*.example.com" matches "api.example.com"

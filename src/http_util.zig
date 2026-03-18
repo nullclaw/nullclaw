@@ -10,6 +10,31 @@ const AtomicBool = std.atomic.Value(bool);
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn classifyCurlExitCode(code: u8) []const u8 {
+    return switch (code) {
+        6 => "dns",
+        7 => "connect",
+        28 => "timeout",
+        35, 51, 58, 60 => "tls",
+        else => "other",
+    };
+}
+
+fn mapCurlExitCodeToError(code: u8) anyerror {
+    return switch (code) {
+        6 => error.CurlDnsError,
+        7 => error.CurlConnectError,
+        28 => error.CurlTimeout,
+        35, 51, 58, 60 => error.CurlTlsError,
+        else => error.CurlFailed,
+    };
+}
+
+fn logCurlExitFailure(op: []const u8, code: u8) void {
+    log.warn("curl {s} failed: exit_code={d} class={s}", .{ op, code, classifyCurlExitCode(code) });
+}
 
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
     thread_interrupt_flag = flag;
@@ -41,6 +66,12 @@ fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
 
 pub const HttpResponse = struct {
     status_code: u16,
+    body: []u8,
+};
+
+pub const HttpResponseWithHeaders = struct {
+    status_code: u16,
+    headers: []u8,
     body: []u8,
 };
 
@@ -183,7 +214,7 @@ fn curlRequestWithProxy(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
@@ -196,9 +227,9 @@ fn curlRequestWithProxy(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
-            log.debug("curl {s} exited with code {d}", .{ method, code });
+            logCurlExitFailure(method, code);
             allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
         else => {
             allocator.free(stdout);
@@ -230,6 +261,19 @@ pub fn curlPostWithStatus(
     body: []const u8,
     headers: []const []const u8,
 ) !HttpResponse {
+    return curlPostWithStatusAndTimeout(allocator, url, body, headers, null);
+}
+
+/// HTTP POST via curl subprocess and include HTTP status code in response,
+/// with optional --max-time timeout.
+/// Caller owns `response.body`.
+pub fn curlPostWithStatusAndTimeout(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+) !HttpResponse {
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -237,6 +281,14 @@ pub fn curlPostWithStatus(
     argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
+
+    if (max_time) |mt| {
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = mt;
+        argc += 1;
+    }
+
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";
@@ -253,6 +305,133 @@ pub fn curlPostWithStatus(
         argv_buf[argc] = hdr;
         argc += 1;
     }
+
+    argv_buf[argc] = "--data-binary";
+    argc += 1;
+    argv_buf[argc] = "@-";
+    argc += 1;
+    argv_buf[argc] = "-w";
+    argc += 1;
+    argv_buf[argc] = "\n%{http_code}";
+    argc += 1;
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+    const cancel_flag = thread_interrupt_flag;
+    var cancel_done = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
+    };
+    errdefer allocator.free(stdout);
+
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            logCurlExitFailure("POST", code);
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
+        },
+        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+    }
+
+    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
+    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
+    if (status_raw.len != 3) return error.CurlParseError;
+    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
+    const body_slice = stdout[0..status_sep];
+    const response_body = try allocator.dupe(u8, body_slice);
+    allocator.free(stdout);
+
+    return .{
+        .status_code = status_code,
+        .body = response_body,
+    };
+}
+
+/// HTTP POST via curl subprocess and include HTTP status code and response headers,
+/// with optional --max-time timeout.
+/// Caller owns `response.headers` and `response.body`.
+pub fn curlPostWithStatusHeadersAndTimeout(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+) !HttpResponseWithHeaders {
+    var argv_buf: [56][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+
+    if (max_time) |mt| {
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = mt;
+        argc += 1;
+    }
+
+    argv_buf[argc] = "-X";
+    argc += 1;
+    argv_buf[argc] = "POST";
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = "Content-Type: application/json";
+    argc += 1;
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    // Dump response headers to stdout so we can capture session IDs.
+    argv_buf[argc] = "-D";
+    argc += 1;
+    argv_buf[argc] = "-";
+    argc += 1;
 
     argv_buf[argc] = "--data-binary";
     argc += 1;
@@ -320,13 +499,32 @@ pub fn curlPostWithStatus(
     const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
     if (status_raw.len != 3) return error.CurlParseError;
     const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
-    const body_slice = stdout[0..status_sep];
-    const response_body = try allocator.dupe(u8, body_slice);
+
+    const payload = stdout[0..status_sep];
+    const header_end_crlf = std.mem.indexOf(u8, payload, "\r\n\r\n");
+    const header_end_lf = std.mem.indexOf(u8, payload, "\n\n");
+
+    var headers_slice: []const u8 = "";
+    var body_slice: []const u8 = payload;
+
+    if (header_end_crlf) |pos| {
+        headers_slice = payload[0..pos];
+        body_slice = payload[pos + 4 ..];
+    } else if (header_end_lf) |pos| {
+        headers_slice = payload[0..pos];
+        body_slice = payload[pos + 2 ..];
+    }
+
+    const headers_out = try allocator.dupe(u8, headers_slice);
+    errdefer allocator.free(headers_out);
+    const body_out = try allocator.dupe(u8, body_slice);
+
     allocator.free(stdout);
 
     return .{
         .status_code = status_code,
-        .body = response_body,
+        .headers = headers_out,
+        .body = body_out,
     };
 }
 
@@ -424,9 +622,9 @@ fn curlGetWithProxyAndResolve(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
-            log.debug("curl GET exited with code {d} (timeout={s}s)", .{ code, timeout_secs });
+            logCurlExitFailure("GET", code);
             allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
         else => {
             allocator.free(stdout);
@@ -603,9 +801,9 @@ pub fn curlGetSSE(
                 // but curl may have received some data before timing out - return it.
                 // For other exit codes, treat as error.
                 if (code != 28) {
-                    std.debug.print("[curlGetSSE] curl error: code={}\n", .{code});
+                    logCurlExitFailure("GET-SSE", code);
                     allocator.free(stdout);
-                    return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
+                    return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
                 }
                 // Timeout (code 28) - return any data we received
             }
@@ -660,6 +858,26 @@ test "curlGetWithResolve compiles and is callable" {
 
 test "curlGetMaxBytes compiles and is callable" {
     _ = curlGetMaxBytes;
+}
+
+test "curl post max bytes is increased for large provider responses" {
+    try std.testing.expect(DEFAULT_CURL_POST_MAX_BYTES >= 8 * 1024 * 1024);
+}
+
+test "curl exit code classification maps key network classes" {
+    try std.testing.expectEqualStrings("dns", classifyCurlExitCode(6));
+    try std.testing.expectEqualStrings("connect", classifyCurlExitCode(7));
+    try std.testing.expectEqualStrings("timeout", classifyCurlExitCode(28));
+    try std.testing.expectEqualStrings("tls", classifyCurlExitCode(60));
+    try std.testing.expectEqualStrings("other", classifyCurlExitCode(22));
+}
+
+test "curl exit code mapping returns specific errors" {
+    try std.testing.expect(mapCurlExitCodeToError(6) == error.CurlDnsError);
+    try std.testing.expect(mapCurlExitCodeToError(7) == error.CurlConnectError);
+    try std.testing.expect(mapCurlExitCodeToError(28) == error.CurlTimeout);
+    try std.testing.expect(mapCurlExitCodeToError(60) == error.CurlTlsError);
+    try std.testing.expect(mapCurlExitCodeToError(22) == error.CurlFailed);
 }
 
 test "normalizeProxyEnvValue trims surrounding whitespace" {

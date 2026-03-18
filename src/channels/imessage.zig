@@ -73,7 +73,7 @@ pub const IMessageChannel = struct {
     }
 
     pub fn isContactAllowed(self: *const IMessageChannel, sender: []const u8) bool {
-        return root.isAllowed(self.allow_from, sender);
+        return root.isAllowedScoped("imessage channel", self.allow_from, sender);
     }
 
     fn senderAllowedForContext(self: *const IMessageChannel, sender: []const u8, is_group: bool) bool {
@@ -83,7 +83,7 @@ pub const IMessageChannel = struct {
         if (std.mem.eql(u8, self.group_policy, "open")) return true;
 
         const effective = if (self.group_allow_from.len > 0) self.group_allow_from else self.allow_from;
-        return root.isAllowed(effective, sender);
+        return root.isAllowedScoped("imessage channel", effective, sender);
     }
 
     fn currentChatDbPath(self: *const IMessageChannel, allocator: std.mem.Allocator) ![]u8 {

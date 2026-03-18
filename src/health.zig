@@ -308,8 +308,6 @@ test "snapshot returns valid state" {
     try std.testing.expect(snap.components.count() >= 1);
 }
 
-test "health module compiles" {}
-
 // ── Readiness Check tests ────────────────────────────────────────────
 
 test "checkReadiness all healthy returns ready" {

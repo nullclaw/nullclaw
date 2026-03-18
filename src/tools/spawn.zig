@@ -65,7 +65,7 @@ pub const SpawnTool = struct {
             .{ label, task_id },
         ) catch return ToolResult.ok("Subagent spawned");
 
-        return ToolResult.ok(msg);
+        return ToolResult{ .success = true, .output = msg };
     }
 };
 

@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+const net_security = @import("../root.zig").net_security;
 
 /// Maximum response body size for the "read" action (8 KB).
 const MAX_READ_BYTES: usize = 8192;
@@ -112,14 +113,73 @@ pub const BrowserTool = struct {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter for read action");
 
+        if (url.len > 0 and url[0] == '-') {
+            return ToolResult.fail("Invalid URL for read action");
+        }
+        const uri = std.Uri.parse(url) catch
+            return ToolResult.fail("Invalid URL format");
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+            return ToolResult.fail("Only https:// URLs are supported for security");
+        }
+
+        const host = net_security.extractHost(url) orelse
+            return ToolResult.fail("Invalid URL: cannot extract host");
+        const resolved_port: u16 = uri.port orelse 443;
+        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
+            else => return ToolResult.fail("Unable to verify host safety"),
+        };
+        defer allocator.free(connect_host);
+
         // Use curl to fetch the page. Flags:
         //   -sS  silent but show errors
         //   -L   follow redirects
         //   -m 10  timeout 10 seconds
         //   --max-filesize 65536  abort if body exceeds 64 KB
         const max_size_str = std.fmt.comptimePrint("{d}", .{MAX_FETCH_BYTES});
+        var resolve_entry: ?[]u8 = null;
+        defer if (resolve_entry) |entry| allocator.free(entry);
+
+        var argv_buf: [16][]const u8 = undefined;
+        var argc: usize = 0;
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-sS";
+        argc += 1;
+        argv_buf[argc] = "-L";
+        argc += 1;
+        argv_buf[argc] = "-m";
+        argc += 1;
+        argv_buf[argc] = "10";
+        argc += 1;
+        argv_buf[argc] = "--max-filesize";
+        argc += 1;
+        argv_buf[argc] = max_size_str;
+        argc += 1;
+        argv_buf[argc] = "--proto";
+        argc += 1;
+        argv_buf[argc] = "=https";
+        argc += 1;
+        argv_buf[argc] = "--proto-redir";
+        argc += 1;
+        argv_buf[argc] = "=https";
+        argc += 1;
+
+        if (shouldUseCurlResolve(host)) {
+            resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
+            argv_buf[argc] = "--resolve";
+            argc += 1;
+            argv_buf[argc] = resolve_entry.?;
+            argc += 1;
+        }
+
+        argv_buf[argc] = "--";
+        argc += 1;
+        argv_buf[argc] = url;
+        argc += 1;
+
         const proc = @import("process_util.zig");
-        const result = proc.run(allocator, &.{ "curl", "-sS", "-L", "-m", "10", "--max-filesize", max_size_str, url }, .{ .max_output_bytes = MAX_FETCH_BYTES }) catch {
+        const result = proc.run(allocator, argv_buf[0..argc], .{ .max_output_bytes = MAX_FETCH_BYTES }) catch {
             return ToolResult.fail("Failed to spawn curl — is curl installed?");
         };
         defer allocator.free(result.stderr);
@@ -148,6 +208,26 @@ pub const BrowserTool = struct {
         return ToolResult{ .success = true, .output = output };
     }
 };
+
+fn shouldUseCurlResolve(host: []const u8) bool {
+    return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
+}
+
+fn buildCurlResolveEntry(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    connect_host: []const u8,
+) ![]u8 {
+    const host_for_resolve = net_security.stripHostBrackets(host);
+    const connect_target = if (std.mem.indexOfScalar(u8, connect_host, ':') != null)
+        try std.fmt.allocPrint(allocator, "[{s}]", .{connect_host})
+    else
+        try allocator.dupe(u8, connect_host);
+    defer allocator.free(connect_target);
+
+    return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -232,6 +312,46 @@ test "browser read missing url" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "url") != null);
+}
+
+test "browser read rejects http" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"url\": \"http://example.com\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "https") != null);
+}
+
+test "browser read rejects option-like url" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"url\": \"--help\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid") != null);
+}
+
+test "browser read blocks localhost SSRF" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"url\": \"https://127.0.0.1/\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
+}
+
+test "browser read blocks loopback decimal alias SSRF" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"url\": \"https://2130706433/\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
 test "browser open returns output with URL" {

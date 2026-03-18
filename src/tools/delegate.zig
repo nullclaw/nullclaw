@@ -83,7 +83,7 @@ pub const DelegateTool = struct {
                     "Delegation depth limit reached ({d}/{d}) for agent '{s}'",
                     .{ self.depth, ac.max_depth, trimmed_agent },
                 ) catch return ToolResult.fail("Delegation depth limit reached");
-                return ToolResult.fail(msg);
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
             }
         } else {
             // No agent config — use default max_depth of 3

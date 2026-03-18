@@ -403,14 +403,14 @@ pub const MaxChannel = struct {
     // ── Authorization ────────────────────────────────────────────────
 
     pub fn isUserAllowed(self: *const MaxChannel, sender_id: []const u8) bool {
-        return root.isAllowed(self.allow_from, sender_id);
+        return root.isAllowedScoped("max channel", self.allow_from, sender_id);
     }
 
     pub fn isGroupUserAllowed(self: *const MaxChannel, sender_id: []const u8) bool {
         if (self.group_allow_from.len == 0) {
             return self.isUserAllowed(sender_id);
         }
-        return root.isAllowed(self.group_allow_from, sender_id);
+        return root.isAllowedScoped("max channel", self.group_allow_from, sender_id);
     }
 
     fn isAuthorized(self: *const MaxChannel, sender_id: []const u8, is_group: bool) bool {
@@ -430,15 +430,15 @@ pub const MaxChannel = struct {
             if (std.mem.eql(u8, self.group_policy, "open")) return true;
             if (std.mem.eql(u8, self.group_policy, "disabled")) return false;
             if (self.group_allow_from.len == 0) {
-                return root.isAllowed(self.allow_from, identity) or
-                    root.isAllowed(self.allow_from, user_id);
+                return root.isAllowedScoped("max channel", self.allow_from, identity) or
+                    root.isAllowedScoped("max channel", self.allow_from, user_id);
             }
-            return root.isAllowed(self.group_allow_from, identity) or
-                root.isAllowed(self.group_allow_from, user_id);
+            return root.isAllowedScoped("max channel", self.group_allow_from, identity) or
+                root.isAllowedScoped("max channel", self.group_allow_from, user_id);
         }
 
-        return root.isAllowed(self.allow_from, identity) or
-            root.isAllowed(self.allow_from, user_id);
+        return root.isAllowedScoped("max channel", self.allow_from, identity) or
+            root.isAllowedScoped("max channel", self.allow_from, user_id);
     }
 
     // ── Fetch bot identity ───────────────────────────────────────────
@@ -1400,6 +1400,11 @@ pub const MaxChannel = struct {
         try self.stopTyping(recipient);
     }
 
+    fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
+        const self: *MaxChannel = @ptrCast(@alignCast(ptr));
+        return self.streaming_enabled;
+    }
+
     // ── Streaming sink (for processMessageStreaming) ──────────────
 
     pub const StreamCtx = struct {
@@ -1437,6 +1442,7 @@ pub const MaxChannel = struct {
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
     };
 
     pub fn channel(self: *MaxChannel) root.Channel {

@@ -119,6 +119,24 @@ pub fn resolveLinkedPeerId(
     return peer_id;
 }
 
+/// Build a deterministic synthetic agent id for direct-peer auto-provision.
+/// Format: `peer-{16 hex chars}`.
+fn buildAutoProvisionedAgentId(
+    allocator: std.mem.Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    peer_id: []const u8,
+) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(channel);
+    hasher.update("\x1f");
+    hasher.update(account_id);
+    hasher.update("\x1f");
+    hasher.update(peer_id);
+    const digest = hasher.final();
+    return std.fmt.allocPrint(allocator, "peer-{x:0>16}", .{digest});
+}
+
 /// Build a DM-scope-aware session key.
 /// Returns owned slice; caller must free with the same allocator.
 pub fn buildSessionKey(
@@ -404,16 +422,41 @@ pub fn resolveRouteWithSession(
     var route = try resolveRoute(allocator, input, bindings, agents);
     errdefer allocator.free(route.main_session_key);
 
+    const auto_provision_candidate = blk: {
+        if (!session.auto_provision_direct_agents) break :blk null;
+        if (route.matched_by != .default) break :blk null;
+        const peer = input.peer orelse break :blk null;
+        if (peer.kind != .direct or peer.id.len == 0) break :blk null;
+        break :blk peer.id;
+    };
+
+    const session_agent_id = if (auto_provision_candidate) |peer_id| blk: {
+        const synthetic = try buildAutoProvisionedAgentId(
+            allocator,
+            input.channel,
+            input.account_id,
+            peer_id,
+        );
+        defer allocator.free(synthetic);
+        break :blk try allocator.dupe(u8, synthetic);
+    } else try allocator.dupe(u8, route.agent_id);
+    defer allocator.free(session_agent_id);
+
+    allocator.free(route.main_session_key);
+    route.main_session_key = try buildMainSessionKey(allocator, session_agent_id);
     allocator.free(route.session_key);
     route.session_key = try buildSessionKeyWithScope(
         allocator,
-        route.agent_id,
+        session_agent_id,
         input.channel,
         input.peer,
         session.dm_scope,
         input.account_id,
         session.identity_links,
     );
+    if (auto_provision_candidate != null) {
+        route.agent_id = route.main_session_key["agent:".len .. route.main_session_key.len - ":main".len];
+    }
     return route;
 }
 
@@ -1499,4 +1542,55 @@ test "resolveLinkedPeerId — multiple links, first match wins" {
 
 test "resolveLinkedPeerId — empty links returns original" {
     try std.testing.expectEqualStrings("user42", resolveLinkedPeerId("user42", &.{}));
+}
+
+test "resolveRouteWithSession auto-provisions direct peer into synthetic agent session key" {
+    const allocator = std.testing.allocator;
+    const input = RouteInput{
+        .channel = "whatsapp_web",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "5511987654321" },
+    };
+    const session_cfg = config_types.SessionConfig{
+        .auto_provision_direct_agents = true,
+    };
+
+    const route = try resolveRouteWithSession(allocator, input, &.{}, &.{}, session_cfg);
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    try std.testing.expect(std.mem.startsWith(u8, route.agent_id, "peer-"));
+    try std.testing.expect(std.mem.startsWith(u8, route.main_session_key, "agent:peer-"));
+    try std.testing.expect(std.mem.endsWith(u8, route.main_session_key, ":main"));
+    try std.testing.expect(std.mem.startsWith(u8, route.session_key, "agent:peer-"));
+    try std.testing.expect(std.mem.indexOf(u8, route.session_key, ":whatsapp_web:direct:5511987654321") != null);
+}
+
+test "resolveRouteWithSession does not auto-provision when binding matched" {
+    const allocator = std.testing.allocator;
+    const input = RouteInput{
+        .channel = "telegram",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "4242" },
+    };
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "tg-dm-agent",
+            .match = .{
+                .channel = "telegram",
+                .peer = .{ .kind = .direct, .id = "4242" },
+            },
+        },
+    };
+    const session_cfg = config_types.SessionConfig{
+        .auto_provision_direct_agents = true,
+    };
+
+    const route = try resolveRouteWithSession(allocator, input, &bindings, &.{}, session_cfg);
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    try std.testing.expectEqualStrings("tg-dm-agent", route.agent_id);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:main", route.main_session_key);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", route.session_key);
 }

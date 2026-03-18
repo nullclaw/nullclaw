@@ -176,7 +176,16 @@ fn timeoutString(buf: []u8, timeout_secs: u64) []const u8 {
 
 fn classifyProbeError(err: anyerror) []const u8 {
     if (err == error.CurlFailed) return "auth_check_failed";
-    if (err == error.CurlReadError or err == error.CurlWriteError or err == error.CurlWaitError) return "network_error";
+    if (err == error.CurlReadError or
+        err == error.CurlWriteError or
+        err == error.CurlWaitError or
+        err == error.CurlDnsError or
+        err == error.CurlConnectError or
+        err == error.CurlTimeout or
+        err == error.CurlTlsError)
+    {
+        return "network_error";
+    }
 
     const name = @errorName(err);
     if (std.mem.indexOf(u8, name, "Timeout") != null or
@@ -1103,6 +1112,13 @@ test "channelSupportsAccounts differentiates account models" {
     try std.testing.expect(channelSupportsAccounts("web"));
     try std.testing.expect(!channelSupportsAccounts("webhook"));
     try std.testing.expect(!channelSupportsAccounts("cli"));
+}
+
+test "classifyProbeError maps specific curl network errors" {
+    try std.testing.expectEqualStrings("network_error", classifyProbeError(error.CurlDnsError));
+    try std.testing.expectEqualStrings("network_error", classifyProbeError(error.CurlConnectError));
+    try std.testing.expectEqualStrings("network_error", classifyProbeError(error.CurlTimeout));
+    try std.testing.expectEqualStrings("network_error", classifyProbeError(error.CurlTlsError));
 }
 
 test "resolveChannelAccountObject handles canonical accounts wrapper" {

@@ -442,6 +442,11 @@ pub const LucidMemory = struct {
         return self.localMemory().get(allocator, key);
     }
 
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self = castSelf(ptr);
+        return self.localMemory().getScoped(allocator, key, session_id);
+    }
+
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self = castSelf(ptr);
         return self.localMemory().list(allocator, category, session_id);
@@ -450,6 +455,11 @@ pub const LucidMemory = struct {
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self = castSelf(ptr);
         return self.localMemory().forget(key);
+    }
+
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self = castSelf(ptr);
+        return self.localMemory().forgetScoped(self.allocator, key, session_id);
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -479,8 +489,10 @@ pub const LucidMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,

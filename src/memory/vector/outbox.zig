@@ -14,6 +14,7 @@ const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.z
 const c = sqlite_mod.c;
 const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 const embeddings = @import("embeddings.zig");
+const key_codec = @import("key_codec.zig");
 const vector_store_mod = @import("store.zig");
 const circuit_breaker_mod = @import("circuit_breaker.zig");
 const log = std.log.scoped(.outbox);
@@ -83,6 +84,11 @@ pub const VectorOutbox = struct {
         op: []u8, // owned (duped)
     };
 
+    const ResolvedMemoryContent = struct {
+        content: []u8,
+        vector_key: []u8,
+    };
+
     /// Drain: process pending items. For each: embed -> upsert to vector store -> delete from outbox.
     /// Returns count of successfully processed items.
     pub fn drain(
@@ -144,6 +150,7 @@ pub const VectorOutbox = struct {
         var success_count: u32 = 0;
 
         for (items.items) |item| {
+            const decoded_item_key = key_codec.decode(item.key);
             if (std.mem.eql(u8, item.op, "delete")) {
                 // Delete from vector store
                 vs.delete(item.key) catch |err| {
@@ -151,23 +158,27 @@ pub const VectorOutbox = struct {
                     if (breaker) |b| b.recordFailure();
                     continue;
                 };
+                if (!decoded_item_key.is_legacy) {
+                    vs.delete(decoded_item_key.logical_key) catch {};
+                }
                 self.deleteItem(item.id) catch {};
                 if (breaker) |b| b.recordSuccess();
                 success_count += 1;
             } else if (std.mem.eql(u8, item.op, "upsert")) {
                 // Fetch content from the memories table
-                const content = self.fetchMemoryContent(allocator, item.key) catch {
+                const resolved = self.fetchMemoryContent(allocator, item.key) catch {
                     // Could not look up content — record failure
                     self.recordItemFailure(item.id, "content_lookup_failed") catch {};
                     if (breaker) |b| b.recordFailure();
                     continue;
                 };
 
-                if (content) |c_slice| {
-                    defer allocator.free(c_slice);
+                if (resolved) |value| {
+                    defer allocator.free(value.content);
+                    defer allocator.free(value.vector_key);
 
                     // Embed the content
-                    const embedding = embed_provider.embed(allocator, c_slice) catch |err| {
+                    const embedding = embed_provider.embed(allocator, value.content) catch |err| {
                         self.recordItemFailure(item.id, @errorName(err)) catch {};
                         if (breaker) |b| b.recordFailure();
                         continue;
@@ -175,11 +186,15 @@ pub const VectorOutbox = struct {
                     defer allocator.free(embedding);
 
                     // Upsert to vector store
-                    vs.upsert(item.key, embedding) catch |err| {
+                    vs.upsert(value.vector_key, embedding) catch |err| {
                         self.recordItemFailure(item.id, @errorName(err)) catch {};
                         if (breaker) |b| b.recordFailure();
                         continue;
                     };
+                    const decoded_vector_key = key_codec.decode(value.vector_key);
+                    if (!decoded_vector_key.is_legacy) {
+                        vs.delete(decoded_vector_key.logical_key) catch {};
+                    }
 
                     self.deleteItem(item.id) catch {};
                     if (breaker) |b| b.recordSuccess();
@@ -265,15 +280,24 @@ pub const VectorOutbox = struct {
     }
 
     /// Fetch content from the memories table by key. Returns null if not found.
-    /// Caller owns the returned slice.
-    fn fetchMemoryContent(self: *VectorOutbox, allocator: Allocator, key: []const u8) !?[]u8 {
-        const sql = "SELECT content FROM memories WHERE key = ?1";
+    /// Caller owns the returned slices.
+    fn fetchMemoryContent(self: *VectorOutbox, allocator: Allocator, key: []const u8) !?ResolvedMemoryContent {
+        const decoded = key_codec.decode(key);
+        const sql = if (decoded.is_legacy)
+            "SELECT content, session_id FROM memories WHERE key = ?1 ORDER BY updated_at DESC LIMIT 1"
+        else if (decoded.session_id != null)
+            "SELECT content, session_id FROM memories WHERE key = ?1 AND session_id = ?2 LIMIT 1"
+        else
+            "SELECT content, session_id FROM memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, decoded.logical_key.ptr, @intCast(decoded.logical_key.len), SQLITE_STATIC);
+        if (decoded.session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
 
         rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_ROW) {
@@ -282,7 +306,25 @@ pub const VectorOutbox = struct {
             if (content_ptr == null or content_len == 0) return null;
 
             const slice: []const u8 = @as([*]const u8, @ptrCast(content_ptr))[0..content_len];
-            return try allocator.dupe(u8, slice);
+            const content = try allocator.dupe(u8, slice);
+            errdefer allocator.free(content);
+
+            const session_ptr = c.sqlite3_column_text(stmt, 1);
+            const session_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const session_id = if (session_ptr != null and session_len > 0)
+                @as([*]const u8, @ptrCast(@constCast(session_ptr)))[0..session_len]
+            else
+                null;
+            const vector_key = if (decoded.is_legacy)
+                try key_codec.encode(allocator, decoded.logical_key, session_id)
+            else
+                try allocator.dupe(u8, key);
+            errdefer allocator.free(vector_key);
+
+            return .{
+                .content = content,
+                .vector_key = vector_key,
+            };
         }
         return null;
     }
@@ -324,6 +366,24 @@ fn insertMemory(db: ?*c.sqlite3, key: []const u8, content: []const u8) !void {
 
     _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
     _ = c.sqlite3_bind_text(stmt, 2, content.ptr, @intCast(content.len), SQLITE_STATIC);
+
+    rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_DONE) return error.StepFailed;
+}
+
+fn insertScopedMemory(db: ?*c.sqlite3, key: []const u8, content: []const u8, session_id: []const u8) !void {
+    const sql =
+        "INSERT OR REPLACE INTO memories (id, key, content, category, session_id, created_at, updated_at) " ++
+        "VALUES (?1, ?2, ?3, 'core', ?4, datetime('now'), datetime('now'))";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 4, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -470,6 +530,47 @@ test "drain deletes item from outbox on success" {
 
     _ = try setup.ob.drain(allocator, ep, vs, null);
     try testing.expectEqual(@as(usize, 0), try totalOutboxCount(setup.mem.db));
+}
+
+test "drain resolves scoped content from encoded vector key" {
+    const allocator = testing.allocator;
+    var setup = try testSetup(allocator);
+    defer setup.deinit();
+
+    const encoded_key = try key_codec.encode(allocator, "scoped", "sess-a");
+    defer allocator.free(encoded_key);
+
+    try insertScopedMemory(setup.mem.db, "scoped", "scoped content", "sess-a");
+    try setup.ob.enqueue(encoded_key, "upsert");
+
+    var noop = embeddings.NoopEmbedding{};
+    const ep = noop.provider();
+    const vs = setup.vs_impl.store();
+
+    _ = try setup.ob.drain(allocator, ep, vs, null);
+    try testing.expectEqual(@as(usize, 0), try totalOutboxCount(setup.mem.db));
+    try testing.expectEqual(@as(usize, 1), try vs.count());
+}
+
+test "drain migrates legacy outbox key to encoded vector key" {
+    const allocator = testing.allocator;
+    var setup = try testSetup(allocator);
+    defer setup.deinit();
+
+    const encoded_key = try key_codec.encode(allocator, "legacy", "sess-a");
+    defer allocator.free(encoded_key);
+
+    try insertScopedMemory(setup.mem.db, "legacy", "legacy content", "sess-a");
+    try setup.ob.enqueue("legacy", "upsert");
+
+    var noop = embeddings.NoopEmbedding{};
+    const ep = noop.provider();
+    const vs = setup.vs_impl.store();
+
+    _ = try setup.ob.drain(allocator, ep, vs, null);
+    try testing.expectEqual(@as(usize, 0), try totalOutboxCount(setup.mem.db));
+    try testing.expect(try hasEmbeddingKey(setup.mem.db, encoded_key));
+    try testing.expect(!(try hasEmbeddingKey(setup.mem.db, "legacy")));
 }
 
 // 8. purgeDeadLetters removes over-limit items
@@ -670,6 +771,21 @@ fn getAttempts(db: ?*c.sqlite3, memory_key: []const u8) !?i32 {
         return c.sqlite3_column_int(stmt, 0);
     }
     return null;
+}
+
+fn hasEmbeddingKey(db: ?*c.sqlite3, memory_key: []const u8) !bool {
+    const sql = "SELECT COUNT(*) FROM memory_embeddings WHERE memory_key = ?1";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, memory_key.ptr, @intCast(memory_key.len), SQLITE_STATIC);
+    rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) {
+        return c.sqlite3_column_int64(stmt, 0) > 0;
+    }
+    return false;
 }
 
 /// Failing embedding provider for testing drain failure paths.

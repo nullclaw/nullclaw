@@ -41,9 +41,9 @@ pub const MemoryListTool = struct {
             null;
 
         const session_id_opt: ?[]const u8 = if (root.getString(args, "session_id")) |sid_raw|
-            if (sid_raw.len > 0) sid_raw else null
+            if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
         else
-            null;
+            root.threadMemorySessionId();
 
         const include_content = root.getBool(args, "include_content") orelse true;
         const include_internal = root.getBool(args, "include_internal") orelse false;

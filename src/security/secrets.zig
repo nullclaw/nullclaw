@@ -11,6 +11,8 @@ pub const NONCE_LEN: usize = 12;
 
 /// Tag length
 pub const TAG_LEN: usize = ChaCha20Poly1305.tag_length;
+const KEY_ROTATION_MAX_AGE_DAYS: i64 = 90;
+const NS_PER_DAY: i128 = std.time.ns_per_day;
 
 /// Encrypt data using ChaCha20-Poly1305 (Zig stdlib).
 pub fn encrypt(key: [32]u8, nonce: [12]u8, plaintext: []const u8, buf: []u8) ![]const u8 {
@@ -117,6 +119,57 @@ pub const SecretStore = struct {
         return self.key_path_buf[0..self.key_path_len];
     }
 
+    fn prevKeyPath(self: *const SecretStore, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}.prev", .{self.keyPath()});
+    }
+
+    fn archivedPrevKeyPath(
+        self: *const SecretStore,
+        buf: *[std.fs.max_path_bytes]u8,
+        stamp_ns: i128,
+        suffix: usize,
+    ) ![]const u8 {
+        if (suffix == 0) {
+            return std.fmt.bufPrint(buf, "{s}.prev.{d}", .{ self.keyPath(), stamp_ns });
+        }
+        return std.fmt.bufPrint(buf, "{s}.prev.{d}.{d}", .{ self.keyPath(), stamp_ns, suffix });
+    }
+
+    fn archivePreviousKey(self: *const SecretStore) !void {
+        const stamp_ns: i128 = @as(i128, std.time.nanoTimestamp());
+        var prev_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const prev_path = self.prevKeyPath(&prev_buf) catch return error.KeyRotateFailed;
+
+        var archived_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var suffix: usize = 0;
+        while (true) : (suffix += 1) {
+            const archived_path = self.archivedPrevKeyPath(&archived_buf, stamp_ns, suffix) catch {
+                return error.KeyRotateFailed;
+            };
+            std.fs.cwd().rename(prev_path, archived_path) catch |err| switch (err) {
+                error.FileNotFound => return,
+                error.PathAlreadyExists => continue,
+                else => return error.KeyRotateFailed,
+            };
+            return;
+        }
+    }
+
+    pub fn rotateKey(self: *const SecretStore, allocator: std.mem.Allocator) !void {
+        _ = allocator;
+        const path = self.keyPath();
+        _ = self.loadKeyFromPath(path) catch return error.KeyRotateFailed;
+
+        try self.archivePreviousKey();
+        var prev_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const prev_path = self.prevKeyPath(&prev_buf) catch return error.KeyRotateFailed;
+        std.fs.cwd().rename(path, prev_path) catch return error.KeyRotateFailed;
+
+        var new_key: [KEY_LEN]u8 = undefined;
+        std.crypto.random.bytes(&new_key);
+        try self.writeKeyToPath(path, new_key);
+    }
+
     /// Encrypt a plaintext secret. Returns hex-encoded ciphertext prefixed with "enc2:".
     /// Format: enc2:<hex(nonce || ciphertext || tag)> (12 + N + 16 bytes).
     /// If encryption is disabled, returns the plaintext as-is.
@@ -188,9 +241,62 @@ pub const SecretStore = struct {
         // in ChaCha20Poly1305.decrypt when tag verification fails with
         // heap-allocated output on Zig 0.15/macOS).
         var plain_buf: [8192]u8 = undefined;
-        const decrypted = decrypt(key, nonce, ciphertext, &plain_buf) catch return error.DecryptionFailed;
+        const decrypted = decrypt(key, nonce, ciphertext, &plain_buf) catch blk: {
+            const prev = self.loadPreviousKey() catch null;
+            if (prev) |prev_key| {
+                const old_decrypted = decrypt(prev_key, nonce, ciphertext, &plain_buf) catch null;
+                if (old_decrypted) |plaintext| break :blk plaintext;
+            }
+
+            const archived = self.decryptWithArchivedKeys(nonce, ciphertext, &plain_buf) catch null;
+            if (archived) |plaintext| {
+                break :blk plaintext;
+            }
+            return error.DecryptionFailed;
+        };
 
         return try allocator.dupe(u8, decrypted);
+    }
+
+    fn decryptWithArchivedKeys(
+        self: *const SecretStore,
+        nonce: [NONCE_LEN]u8,
+        ciphertext: []const u8,
+        plain_buf: []u8,
+    ) !?[]const u8 {
+        const key_path = self.keyPath();
+        const key_dir = std.fs.path.dirname(key_path) orelse ".";
+        const key_name = std.fs.path.basename(key_path);
+
+        var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "{s}.prev.", .{key_name}) catch return error.KeyReadFailed;
+
+        var dir = std.fs.cwd().openDir(key_dir, .{ .iterate = true }) catch return error.KeyReadFailed;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+
+            const file = dir.openFile(entry.name, .{}) catch continue;
+            defer file.close();
+
+            const archived_key = self.readKeyFromFile(file) catch continue;
+            const decrypted = decrypt(archived_key, nonce, ciphertext, plain_buf) catch continue;
+            return decrypted;
+        }
+        return null;
+    }
+
+    fn loadPreviousKey(self: *const SecretStore) !?[KEY_LEN]u8 {
+        var prev_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const prev_path = self.prevKeyPath(&prev_buf) catch return error.KeyReadFailed;
+        const key = self.loadKeyFromPath(prev_path) catch |err| switch (err) {
+            error.KeyReadFailed => return null,
+            else => return err,
+        };
+        return key;
     }
 
     /// Check if a value is encrypted
@@ -205,40 +311,75 @@ pub const SecretStore = struct {
         // Try to read existing key
         if (std.fs.cwd().openFile(path, .{})) |file| {
             defer file.close();
-            var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined; // some slack for whitespace
-            const bytes_read = file.readAll(&hex_buf) catch return error.KeyReadFailed;
-            const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
-            var key: [KEY_LEN]u8 = undefined;
-            _ = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+            var key = try self.readKeyFromFile(file);
+
+            const stat = file.stat() catch return key;
+            if (shouldRotateByMtime(stat.mtime)) {
+                self.rotateKey(std.heap.page_allocator) catch |err| {
+                    log.warn("secret key rotation failed, continuing with existing key: {}", .{err});
+                    return key;
+                };
+                key = self.loadKeyFromPath(path) catch return error.KeyReadFailed;
+            }
             return key;
         } else |_| {
             // Generate new key
             var key: [KEY_LEN]u8 = undefined;
             std.crypto.random.bytes(&key);
-
-            // Write hex-encoded key
-            var hex_buf: [KEY_LEN * 2]u8 = undefined;
-            _ = hexEncode(&key, &hex_buf);
-
-            // Ensure parent dir exists
-            if (std.fs.path.dirname(path)) |parent| {
-                std.fs.cwd().makePath(parent) catch |err| {
-                    log.err("failed to create parent dir {s}: {}", .{ parent, err });
-                };
-            }
-
-            const file = std.fs.cwd().createFile(path, .{}) catch return error.KeyWriteFailed;
-            defer file.close();
-            file.writeAll(&hex_buf) catch return error.KeyWriteFailed;
-
-            // Set restrictive permissions (Unix: 0600, owner-only)
-            if (@import("builtin").os.tag != .windows) {
-                file.chmod(0o600) catch |err| {
-                    log.err("failed to set 0600 permissions on {s}: {}", .{ path, err });
-                };
-            }
+            try self.writeKeyToPath(path, key);
 
             return key;
+        }
+    }
+
+    fn shouldRotateByMtime(mtime_ns: i128) bool {
+        if (mtime_ns <= 0) return false;
+        const now_ns: i128 = @as(i128, std.time.nanoTimestamp());
+        const age_ns = now_ns - mtime_ns;
+        return age_ns > (KEY_ROTATION_MAX_AGE_DAYS * NS_PER_DAY);
+    }
+
+    fn readKeyFromFile(self: *const SecretStore, file: std.fs.File) ![KEY_LEN]u8 {
+        _ = self;
+        var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined; // some slack for whitespace
+        const bytes_read = file.readAll(&hex_buf) catch return error.KeyReadFailed;
+        const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
+        var key: [KEY_LEN]u8 = undefined;
+        _ = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        return key;
+    }
+
+    fn loadKeyFromPath(self: *const SecretStore, path: []const u8) ![KEY_LEN]u8 {
+        _ = self;
+        const file = std.fs.cwd().openFile(path, .{}) catch return error.KeyReadFailed;
+        defer file.close();
+        var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined;
+        const bytes_read = file.readAll(&hex_buf) catch return error.KeyReadFailed;
+        const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
+        var key: [KEY_LEN]u8 = undefined;
+        _ = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        return key;
+    }
+
+    fn writeKeyToPath(self: *const SecretStore, path: []const u8, key: [KEY_LEN]u8) !void {
+        _ = self;
+        var hex_buf: [KEY_LEN * 2]u8 = undefined;
+        _ = hexEncode(&key, &hex_buf);
+
+        if (std.fs.path.dirname(path)) |parent| {
+            std.fs.cwd().makePath(parent) catch |err| {
+                log.err("failed to create parent dir {s}: {}", .{ parent, err });
+            };
+        }
+
+        const file = std.fs.cwd().createFile(path, .{}) catch return error.KeyWriteFailed;
+        defer file.close();
+        file.writeAll(&hex_buf) catch return error.KeyWriteFailed;
+
+        if (@import("builtin").os.tag != .windows) {
+            file.chmod(0o600) catch |err| {
+                log.err("failed to set 0600 permissions on {s}: {}", .{ path, err });
+            };
         }
     }
 };
@@ -407,6 +548,65 @@ test "secret store same dir interop" {
     const decrypted = try store2.decryptSecret(std.testing.allocator, encrypted);
     defer std.testing.allocator.free(decrypted);
     try std.testing.expectEqualStrings("cross-store-secret", decrypted);
+}
+
+test "secret store decrypts data encrypted before key rotation" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+
+    const old_encrypted = try store.encryptSecret(std.testing.allocator, "old-secret");
+    defer std.testing.allocator.free(old_encrypted);
+
+    try store.rotateKey(std.testing.allocator);
+
+    const new_encrypted = try store.encryptSecret(std.testing.allocator, "new-secret");
+    defer std.testing.allocator.free(new_encrypted);
+
+    const old_decrypted = try store.decryptSecret(std.testing.allocator, old_encrypted);
+    defer std.testing.allocator.free(old_decrypted);
+    try std.testing.expectEqualStrings("old-secret", old_decrypted);
+
+    const new_decrypted = try store.decryptSecret(std.testing.allocator, new_encrypted);
+    defer std.testing.allocator.free(new_decrypted);
+    try std.testing.expectEqualStrings("new-secret", new_decrypted);
+}
+
+test "secret store preserves decryptability across multiple key rotations" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+
+    const oldest_encrypted = try store.encryptSecret(std.testing.allocator, "oldest-secret");
+    defer std.testing.allocator.free(oldest_encrypted);
+
+    try store.rotateKey(std.testing.allocator);
+
+    const middle_encrypted = try store.encryptSecret(std.testing.allocator, "middle-secret");
+    defer std.testing.allocator.free(middle_encrypted);
+
+    try store.rotateKey(std.testing.allocator);
+
+    const newest_encrypted = try store.encryptSecret(std.testing.allocator, "newest-secret");
+    defer std.testing.allocator.free(newest_encrypted);
+
+    const oldest_decrypted = try store.decryptSecret(std.testing.allocator, oldest_encrypted);
+    defer std.testing.allocator.free(oldest_decrypted);
+    try std.testing.expectEqualStrings("oldest-secret", oldest_decrypted);
+
+    const middle_decrypted = try store.decryptSecret(std.testing.allocator, middle_encrypted);
+    defer std.testing.allocator.free(middle_decrypted);
+    try std.testing.expectEqualStrings("middle-secret", middle_decrypted);
+
+    const newest_decrypted = try store.decryptSecret(std.testing.allocator, newest_encrypted);
+    defer std.testing.allocator.free(newest_decrypted);
+    try std.testing.expectEqualStrings("newest-secret", newest_decrypted);
 }
 
 // ── Additional encryption tests ──────────────────────────────────

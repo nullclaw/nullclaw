@@ -225,7 +225,7 @@ pub const LineChannel = struct {
         var kept: usize = 0;
         for (events) |*ev| {
             if (ev.user_id) |uid| {
-                if (!root.isAllowed(self.config.allow_from, uid)) {
+                if (!root.isAllowedScoped("line channel", self.config.allow_from, uid)) {
                     ev.deinit(self.allocator);
                     continue;
                 }
