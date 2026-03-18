@@ -536,8 +536,9 @@ pub const SessionManager = struct {
             session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
         }
 
-        // Pre-reset digest: generate before clearing session history
+        // Pre-reset: flush final turn score and generate digest before clearing session
         if (turn_input.clear_session) {
+            self.flushFinalTurnScore(session);
             self.maybeGenerateDigest(session, .reset);
         }
 
@@ -803,6 +804,8 @@ pub const SessionManager = struct {
         for (to_remove.items) |key| {
             if (self.sessions.fetchRemove(key)) |kv| {
                 const session = kv.value;
+                // Pre-eviction: flush any unscored final turn
+                self.flushFinalTurnScore(session);
                 // Pre-eviction: generate session digest (best-effort)
                 self.maybeGenerateDigest(session, .eviction);
                 session.deinit(self.allocator);
@@ -812,6 +815,28 @@ pub const SessionManager = struct {
         }
 
         return evicted;
+    }
+
+    /// Emit a turn_scored event for the last (unscored) turn of a session.
+    /// Normally, scoring is deferred to the next user message — but at session
+    /// end there is no next message, so we flush with neutral feedback.
+    fn flushFinalTurnScore(self: *SessionManager, session: *Session) void {
+        const prev_ctx = session.agent.prev_turn_context orelse return;
+        const turn_scorer = @import("agent/turn_scorer.zig");
+        const score = turn_scorer.scoreTurn(prev_ctx, .{});
+        const scored_event = observability.ObserverEvent{ .turn_scored = .{
+            .score = score.score,
+            .tool_count = score.tool_count,
+            .tool_failures = score.tool_failures,
+            .signals = @bitCast(score.signals),
+            .model = prev_ctx.model,
+            .session_id = session.session_key,
+            .skill = prev_ctx.skill,
+        } };
+        self.observer.recordEvent(&scored_event);
+        if (session.agent.prev_turn_skill_owned) |s| self.allocator.free(s);
+        session.agent.prev_turn_skill_owned = null;
+        session.agent.prev_turn_context = null;
     }
 
     const DigestTrigger = enum { eviction, reset };

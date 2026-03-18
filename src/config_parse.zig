@@ -750,6 +750,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.diagnostics.token_usage_ledger_max_lines = @intCast(v.integer);
                 }
             }
+            if (diag.object.get("rag_url")) |v| {
+                if (v == .string) self.diagnostics.rag_url = try self.allocator.dupe(u8, v.string);
+            }
+            if (diag.object.get("rag_token")) |v| {
+                if (v == .string) self.diagnostics.rag_token = try self.allocator.dupe(u8, v.string);
+            }
             if (diag.object.get("otel")) |otel| {
                 if (otel == .object) {
                     if (otel.object.get("endpoint")) |v| {

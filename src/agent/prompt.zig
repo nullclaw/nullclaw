@@ -153,6 +153,9 @@ pub const PromptContext = struct {
     skill_routing_message: ?[]const u8 = null,
     /// Max skills to load as Active (full text). 0 = disabled.
     skill_routing_max_active: u32 = 3,
+    /// Output: when skill routing matches, the top skill name is written here
+    /// (heap-duped, caller owns). Used for per-skill performance attribution.
+    matched_skill_out: ?*?[]const u8 = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -335,7 +338,7 @@ pub fn buildSystemPrompt(
     try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
 
     // Skills section
-    try appendSkillsSection(allocator, w, ctx.workspace_dir, ctx.skill_routing_message, ctx.skill_routing_max_active);
+    try appendSkillsSection(allocator, w, ctx.workspace_dir, ctx.skill_routing_message, ctx.skill_routing_max_active, ctx.matched_skill_out);
 
     // Workspace section
     try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
@@ -595,6 +598,7 @@ fn appendSkillsSection(
     workspace_dir: []const u8,
     routing_message: ?[]const u8,
     max_active: u32,
+    matched_skill_out: ?*?[]const u8,
 ) !void {
     // Two-source loading: workspace skills + ~/.nullclaw/skills/
     const home_dir = platform.getHomeDir(allocator) catch null;
@@ -651,9 +655,15 @@ fn appendSkillsSection(
         const scored = router.route(allocator, routing_message.?, max_active);
         defer skill_router.freeScored(allocator, scored);
 
-        for (scored) |s| {
+        for (scored, 0..) |s, si| {
             if (s.index < skill_list.len and skill_list[s.index].available) {
                 active_mask[s.index] = true;
+                // Export the top-matched skill name for turn-level attribution.
+                if (si == 0) {
+                    if (matched_skill_out) |out| {
+                        out.* = allocator.dupe(u8, skill_list[s.index].name) catch null;
+                    }
+                }
             }
         }
 
@@ -1798,7 +1808,7 @@ test "appendSkillsSection with no skills produces nothing" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills", null, 0);
+    try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills", null, 0, null);
 
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
@@ -1824,7 +1834,7 @@ test "appendSkillsSection renders summary XML for always=false skill" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base, null, 0);
+    try appendSkillsSection(allocator, w, base, null, 0, null);
 
     const output = buf.items;
     // Summary skills should appear as child-element XML
@@ -1858,7 +1868,7 @@ test "appendSkillsSection escapes XML attributes in summary output" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base, null, 0);
+    try appendSkillsSection(allocator, w, base, null, 0, null);
 
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "&quot;") != null);
@@ -1886,7 +1896,7 @@ test "appendSkillsSection supports markdown-only installed skill" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base, null, 0);
+    try appendSkillsSection(allocator, w, base, null, 0, null);
 
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "<name>md-only</name>") != null);
@@ -1920,7 +1930,7 @@ test "appendSkillsSection renders full instructions for always=true skill" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base, null, 0);
+    try appendSkillsSection(allocator, w, base, null, 0, null);
 
     const output = buf.items;
     // Full instructions should be in the output
@@ -1966,7 +1976,7 @@ test "appendSkillsSection renders mixed always=true and always=false" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base, null, 0);
+    try appendSkillsSection(allocator, w, base, null, 0, null);
 
     const output = buf.items;
     // Full skill should be in ## Skills section with active header
@@ -2001,7 +2011,7 @@ test "appendSkillsSection renders unavailable skill with missing deps" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base, null, 0);
+    try appendSkillsSection(allocator, w, base, null, 0, null);
 
     const output = buf.items;
     // Should render as unavailable in XML
@@ -2040,7 +2050,7 @@ test "appendSkillsSection unavailable always=true skill renders in XML not full"
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base, null, 0);
+    try appendSkillsSection(allocator, w, base, null, 0, null);
 
     const output = buf.items;
     // Even though always=true, since unavailable it should render as XML summary

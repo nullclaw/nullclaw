@@ -17,6 +17,7 @@ pub const ObserverEvent = union(enum) {
         signals: u8, // packed SignalSet as byte
         model: []const u8 = "",
         session_id: []const u8 = "",
+        skill: []const u8 = "general",
     },
     tool_retry: struct { tool: []const u8, attempt: u8, backoff_ms: u64, error_class: []const u8 },
     evolution_trigger: struct { skill: []const u8, trigger_type: []const u8, score: f32, model: []const u8 = "", tool_failures: u16 = 0, context: []const u8 = "" },
@@ -792,26 +793,32 @@ pub const RagObserver = struct {
 
     /// Spawn a fire-and-forget curl POST. Non-blocking: the child process
     /// runs independently and the result is discarded.
+    /// All string arguments are heap-duped because the child process outlives
+    /// the caller's stack frame (use-after-free otherwise).
     fn postAsync(self: *RagObserver, endpoint: []const u8, body: []const u8) void {
-        var url_buf: [512]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "{s}/{s}", .{ self.base_url, endpoint }) catch return;
+        const alloc = std.heap.page_allocator;
 
-        var auth_buf: [128]u8 = undefined;
-        const auth = std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{self.bearer_token}) catch return;
+        // Heap-dupe all dynamic strings so they outlive this function.
+        // These intentionally leak — the child process reads them after we return.
+        const url = std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.base_url, endpoint }) catch return;
+        const auth = std.fmt.allocPrint(alloc, "Authorization: Bearer {s}", .{self.bearer_token}) catch return;
+        const body_owned = alloc.dupe(u8, body) catch return;
 
         const argv = [_][]const u8{
             "curl",       "-s",                       "-o",                "/dev/null",
             "-X",         "POST",                     "-H",                "Content-Type: application/json",
             "-H",         "Accept: application/json", "-H",                auth,
-            "-d",         body,                       "--connect-timeout", "5",
+            "-d",         body_owned,                 "--connect-timeout", "5",
             "--max-time", "10",                       url,
         };
-        var child = std.process.Child.init(&argv, std.heap.page_allocator);
+        var child = std.process.Child.init(&argv, alloc);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
         _ = child.spawn() catch return;
         // Detach — we don't wait for the result.
+        // The heap-duped strings are intentionally leaked; curl exits in <10s
+        // and the OS reclaims the pages.
     }
 
     fn ragRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
@@ -830,7 +837,9 @@ pub const RagObserver = struct {
                     e.signals,
                     e.session_id,
                 }) catch return;
-                self.postAsync("skills/general/score", body);
+                var endpoint_buf: [256]u8 = undefined;
+                const endpoint = std.fmt.bufPrint(&endpoint_buf, "skills/{s}/score", .{e.skill}) catch return;
+                self.postAsync(endpoint, body);
             },
             .evolution_trigger => |e| {
                 // 1. Post the evolution trigger entry

@@ -370,9 +370,13 @@ pub const Agent = struct {
 
     /// Tool execution context from the previous turn (for deferred feedback scoring).
     prev_turn_context: ?turn_scorer.TurnContext = null,
+    /// Owned copy of the previous turn's skill name (heap-allocated, freed on replacement).
+    prev_turn_skill_owned: ?[]const u8 = null,
 
     /// Enable keyword-based skill routing (select top-N skills per turn).
     skill_routing_enabled: bool = false,
+    /// Top-matched skill from the router for current turn (not owned; points to prev_turn_skill_owned).
+    routed_skill: ?[]const u8 = null,
     /// Max skills loaded as Active when routing is enabled.
     skill_routing_max_active: u32 = 3,
 
@@ -534,6 +538,25 @@ pub const Agent = struct {
         };
     }
 
+    /// Save turn context for deferred scoring, managing the owned skill string.
+    fn savePrevTurnContext(self: *Agent, ctx: turn_scorer.TurnContext) void {
+        // If ctx.skill already points to our owned copy (set during tool tracking),
+        // just save the context — no need to dupe or free.
+        if (self.prev_turn_skill_owned) |s| {
+            if (ctx.skill.ptr == s.ptr) {
+                self.prev_turn_context = ctx;
+                return;
+            }
+        }
+        // ctx.skill is a string literal (e.g. "general") — dupe it.
+        const owned = self.allocator.dupe(u8, ctx.skill) catch null;
+        if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
+        self.prev_turn_skill_owned = owned;
+        var saved = ctx;
+        saved.skill = owned orelse "general";
+        self.prev_turn_context = saved;
+    }
+
     pub fn deinit(self: *Agent) void {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
@@ -552,6 +575,7 @@ pub const Agent = struct {
         for (self.interrupted_tools.items) |name| self.allocator.free(name);
         self.interrupted_tools.deinit(self.allocator);
         self.tool_state_mu.unlock();
+        if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
         if (self.evolution_tracker) |tracker| self.allocator.destroy(tracker);
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
@@ -1656,6 +1680,7 @@ pub const Agent = struct {
                 .signals = @bitCast(score.signals),
                 .model = prev_ctx.model,
                 .session_id = self.memory_session_id orelse "",
+                .skill = prev_ctx.skill,
             } };
             self.observer.recordEvent(&scored_event);
 
@@ -1687,6 +1712,8 @@ pub const Agent = struct {
                 }
             }
 
+            if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
+            self.prev_turn_skill_owned = null;
             self.prev_turn_context = null;
         }
 
@@ -1755,6 +1782,7 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
+            var routed_skill: ?[]const u8 = null;
             const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
@@ -1764,7 +1792,17 @@ pub const Agent = struct {
                 .bootstrap_provider = self.bootstrap,
                 .skill_routing_message = if (self.skill_routing_enabled) effective_user_message else null,
                 .skill_routing_max_active = self.skill_routing_max_active,
+                .matched_skill_out = if (self.skill_routing_enabled) &routed_skill else null,
             });
+            // Store routed skill for turn-level attribution. Ownership transfers
+            // to prev_turn_skill_owned; freed on next turn or agent deinit.
+            if (routed_skill) |rs| {
+                if (self.prev_turn_skill_owned) |prev| self.allocator.free(prev);
+                self.prev_turn_skill_owned = rs;
+                self.routed_skill = rs;
+            } else {
+                self.routed_skill = null;
+            }
             const final_system = if (self.profile_system_prompt) |profile_prompt|
                 if (profile_prompt.len > 0) blk: {
                     defer self.allocator.free(full_system);
@@ -2156,7 +2194,11 @@ pub const Agent = struct {
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
-        var turn_ctx = turn_scorer.TurnContext{ .model = self.model_name };
+        var turn_ctx = turn_scorer.TurnContext{
+            .model = self.model_name,
+            // Use routed skill as initial attribution; tool-name fallback only if unrouted.
+            .skill = self.routed_skill orelse "general",
+        };
         var empty_response_retry_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             if (self.isInterruptRequested()) {
@@ -2611,7 +2653,7 @@ pub const Agent = struct {
                 }
 
                 // ── Turn scorer: save context for deferred feedback scoring ──
-                self.prev_turn_context = turn_ctx;
+                self.savePrevTurnContext(turn_ctx);
 
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
@@ -2720,6 +2762,16 @@ pub const Agent = struct {
                 turn_ctx.tools_called += 1;
                 turn_ctx.has_tool_calls = true;
                 if (!result.success) turn_ctx.tools_failed += 1;
+                // Skill attribution: prefer routed skill name (from skill router).
+                // Fall back to first tool name only when no skill was routed.
+                if (turn_ctx.tools_called == 1 and self.routed_skill == null) {
+                    const skill_owned = self.allocator.dupe(u8, call.name) catch null;
+                    if (skill_owned) |s| {
+                        if (self.prev_turn_skill_owned) |prev| self.allocator.free(prev);
+                        self.prev_turn_skill_owned = s;
+                        turn_ctx.skill = s;
+                    }
+                }
 
                 try results_buf.append(self.allocator, result);
             }
@@ -2764,7 +2816,7 @@ pub const Agent = struct {
         // Build messages for the summary call
         const summary_messages = self.buildMessageSlice() catch {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
-            self.prev_turn_context = turn_ctx;
+            self.savePrevTurnContext(turn_ctx);
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -2789,7 +2841,7 @@ pub const Agent = struct {
             self.temperature,
         ) catch {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
-            self.prev_turn_context = turn_ctx;
+            self.savePrevTurnContext(turn_ctx);
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;

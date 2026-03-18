@@ -55,6 +55,8 @@ pub const TurnContext = struct {
     max_iterations_hit: bool = false,
     /// Model used for this turn (for per-model attribution in deferred scoring).
     model: []const u8 = "",
+    /// Primary skill (first tool called) for per-skill attribution.
+    skill: []const u8 = "general",
 };
 
 /// User feedback signals detected from the next user message.

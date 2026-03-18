@@ -1119,11 +1119,25 @@ pub const ChannelRuntime = struct {
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
-        // Noop observer (heap for vtable stability)
+        // Observer — RagObserver if configured, otherwise Noop (heap for vtable stability)
         const noop_obs = try allocator.create(observability.NoopObserver);
         errdefer allocator.destroy(noop_obs);
         noop_obs.* = .{};
-        const obs = noop_obs.observer();
+        const obs = blk: {
+            if (config.diagnostics.rag_url) |rag_url| {
+                if (config.diagnostics.rag_token) |rag_token| {
+                    const rag_obs_ptr = allocator.create(observability.RagObserver) catch break :blk noop_obs.observer();
+                    rag_obs_ptr.* = .{ .base_url = rag_url, .bearer_token = rag_token };
+                    const observers = allocator.alloc(observability.Observer, 2) catch break :blk noop_obs.observer();
+                    observers[0] = noop_obs.observer();
+                    observers[1] = rag_obs_ptr.observer();
+                    const multi_ptr = allocator.create(observability.MultiObserver) catch break :blk noop_obs.observer();
+                    multi_ptr.* = .{ .observers = observers };
+                    break :blk multi_ptr.observer();
+                }
+            }
+            break :blk noop_obs.observer();
+        };
 
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
