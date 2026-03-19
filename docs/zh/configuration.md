@@ -192,6 +192,57 @@ nullclaw onboard --interactive
 - 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
 - `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
 
+### `identity`（AIEOS v1.1）
+
+如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_path": "./identity/aieos.identity.json"
+  }
+}
+```
+
+也可以直接把同样的文档内联到配置里：
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_inline": "{\"identity\":{\"names\":{\"first\":\"nullclaw-assistant\"},\"bio\":\"通用自主助手\"},\"linguistics\":{\"style\":\"concise\"},\"motivations\":{\"core_drive\":\"安全地帮助操作者完成任务\"}}"
+  }
+}
+```
+
+最小 AIEOS v1.1 示例文件（`identity/aieos.identity.json`）：
+
+```json
+{
+  "identity": {
+    "names": {
+      "first": "nullclaw-assistant"
+    },
+    "bio": "通用自主助手"
+  },
+  "linguistics": {
+    "style": "concise"
+  },
+  "motivations": {
+    "core_drive": "安全地帮助操作者完成任务"
+  }
+}
+```
+
+说明：
+
+- AIEOS payload 采用 `identity`、`psychology`、`linguistics`、`motivations`、`capabilities` 等顶层 section。
+- 为了可维护性和版本控制可读性，优先使用 `aieos_path`。
+- 只有在你确实需要单文件自包含配置时，再使用 `aieos_inline`。
+- `identity.format` 应与 payload 来源保持一致，也就是 `aieos`。
+- 相对路径的 `aieos_path` 会优先按当前 workspace 解析，找不到时再按当前工作目录解析。
+
 ### `channels`
 
 - 渠道配置统一在 `channels.<name>` 下。

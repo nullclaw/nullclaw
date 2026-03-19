@@ -49,6 +49,8 @@ NullClaw 当前提供官方 OCI 镜像：`ghcr.io/nullclaw/nullclaw`。
 - 配置文件：`/nullclaw-data/config.json`
 - 工作区：`/nullclaw-data/workspace`
 
+镜像内自带的初始配置已经使用当前配置结构（`agents.defaults.model.primary` 和 `models.providers`），因此在你填入 provider 凭证之前，`latest` 也应能正常启动。
+
 ### 单次命令
 
 ```bash

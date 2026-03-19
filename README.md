@@ -710,10 +710,31 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
-| `/.well-known/agent.json` | GET | None | A2A Agent Card discovery (public) |
-| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`) |
+| `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
+| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (canonical methods plus legacy slash aliases) |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
+
+### A2A
+
+Enable the gateway binding with:
+
+```json
+{
+  "a2a": {
+    "enabled": true,
+    "name": "nullclaw",
+    "description": "General-purpose AI assistant",
+    "url": "https://example.com",
+    "version": "1.0.0"
+  }
+}
+```
+
+- Discover the agent card at `/.well-known/agent-card.json`.
+- Send JSON-RPC requests to `/a2a` using a bearer token obtained from `/pair`.
+- Canonical JSON-RPC methods: `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `ListTasks`, `SubscribeToTask`.
+- Legacy slash aliases remain accepted for compatibility: `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`, `tasks/resubscribe`.
 
 ## Commands
 

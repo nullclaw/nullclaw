@@ -4685,6 +4685,18 @@ test "defaultProviderKey returns key for default provider" {
     allocator.free(cfg.providers);
 }
 
+test "defaultProviderKey stays null when provider entry omits api key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"model":{"primary":"openrouter/anthropic/claude-sonnet-4"}}},"models":{"providers":{"openrouter":{}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.defaultProviderKey() == null);
+}
+
 test "tools.media.audio with language only parses correctly" {
     const allocator = std.testing.allocator;
     const json =

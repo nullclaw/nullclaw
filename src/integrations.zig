@@ -116,6 +116,7 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "Together AI", .description = "Open-source model hosting", .category = .ai_model, .status = .available },
     .{ .name = "Fireworks AI", .description = "Fast open-source inference", .category = .ai_model, .status = .available },
     .{ .name = "Cohere", .description = "Command R+ & embeddings", .category = .ai_model, .status = .available },
+    .{ .name = "Novita AI", .description = "Multi-model inference platform", .category = .ai_model, .status = .available },
     // Productivity
     .{ .name = "GitHub", .description = "Code, issues, PRs", .category = .productivity, .status = .coming_soon },
     .{ .name = "Notion", .description = "Workspace & databases", .category = .productivity, .status = .coming_soon },

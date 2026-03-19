@@ -661,6 +661,7 @@ pub const TelegramChannel = struct {
     draft_mu: std.Thread.Mutex = .{},
     draft_send_mu: std.Thread.Mutex = .{},
     draft_buffers: std.StringHashMapUnmanaged(DraftState) = .empty,
+    draft_target_suppress_until_ms: std.StringHashMapUnmanaged(i64) = .empty,
     draft_id_counter: Atomic(u64) = Atomic(u64).init(1),
     draft_global_suppress_until_ms: i64 = 0,
     streaming_enabled: bool = true,
@@ -2749,6 +2750,23 @@ pub const TelegramChannel = struct {
 
     fn deinitDraftBuffers(self: *TelegramChannel) void {
         telegram_draft_presenter.deinitDraftBuffers(self.allocator, &self.draft_buffers);
+        var it = self.draft_target_suppress_until_ms.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.draft_target_suppress_until_ms.deinit(self.allocator);
+        self.draft_target_suppress_until_ms = .empty;
+    }
+
+    fn targetDraftSuppressUntilLocked(self: *TelegramChannel, chat_id: []const u8, now_ms: i64) i64 {
+        const suppress_until_ms = self.draft_target_suppress_until_ms.get(chat_id) orelse return 0;
+        if (suppress_until_ms <= now_ms) {
+            if (self.draft_target_suppress_until_ms.fetchRemove(chat_id)) |entry| {
+                self.allocator.free(entry.key);
+            }
+            return 0;
+        }
+        return suppress_until_ms;
     }
 
     fn beginDraftStateLocked(self: *TelegramChannel, target: []const u8, now_ms: i64) !*DraftState {
@@ -2770,10 +2788,15 @@ pub const TelegramChannel = struct {
         if (self.draft_global_suppress_until_ms > gop.value_ptr.suppress_until_ms) {
             gop.value_ptr.suppress_until_ms = self.draft_global_suppress_until_ms;
         }
+        const target_suppress_until_ms = self.targetDraftSuppressUntilLocked(target, now_ms);
+        if (target_suppress_until_ms > gop.value_ptr.suppress_until_ms) {
+            gop.value_ptr.suppress_until_ms = target_suppress_until_ms;
+        }
         return gop.value_ptr;
     }
 
     fn ensureDraftStateLocked(self: *TelegramChannel, target: []const u8, now_ms: i64) !*DraftState {
+        const target_suppress_until_ms = self.targetDraftSuppressUntilLocked(target, now_ms);
         const gop = try self.draft_buffers.getOrPut(self.allocator, target);
         if (!gop.found_existing) {
             const key_copy = try self.allocator.dupe(u8, target);
@@ -2782,7 +2805,7 @@ pub const TelegramChannel = struct {
                 .draft_id = self.draft_id_counter.fetchAdd(1, .monotonic),
                 .last_flush_time = now_ms,
                 .started_at_ms = now_ms,
-                .suppress_until_ms = self.draft_global_suppress_until_ms,
+                .suppress_until_ms = @max(self.draft_global_suppress_until_ms, target_suppress_until_ms),
             };
         } else {
             if (gop.value_ptr.started_at_ms == 0) gop.value_ptr.started_at_ms = now_ms;
@@ -2790,6 +2813,12 @@ pub const TelegramChannel = struct {
                 telegram_draft_presenter.suppressDraftUntilMs(
                     gop.value_ptr,
                     self.draft_global_suppress_until_ms,
+                );
+            }
+            if (target_suppress_until_ms > now_ms) {
+                telegram_draft_presenter.suppressDraftUntilMs(
+                    gop.value_ptr,
+                    target_suppress_until_ms,
                 );
             }
         }
@@ -2859,6 +2888,36 @@ pub const TelegramChannel = struct {
         }
     }
 
+    fn suppressDraftSendsForTarget(self: *TelegramChannel, chat_id: []const u8, retry_after_secs: u32) void {
+        const now_ms = std.time.milliTimestamp();
+        const retry_after_ms = @as(i64, @intCast(retry_after_secs)) * std.time.ms_per_s;
+        const suppress_until_ms = now_ms + retry_after_ms;
+
+        self.draft_mu.lock();
+        defer self.draft_mu.unlock();
+
+        if (self.draft_target_suppress_until_ms.getPtr(chat_id)) |existing| {
+            if (suppress_until_ms > existing.*) existing.* = suppress_until_ms;
+        } else {
+            const key_copy = self.allocator.dupe(u8, chat_id) catch return;
+            errdefer self.allocator.free(key_copy);
+
+            const gop = self.draft_target_suppress_until_ms.getOrPut(self.allocator, chat_id) catch return;
+            if (gop.found_existing) {
+                self.allocator.free(key_copy);
+                if (suppress_until_ms > gop.value_ptr.*) gop.value_ptr.* = suppress_until_ms;
+            } else {
+                gop.key_ptr.* = key_copy;
+                gop.value_ptr.* = suppress_until_ms;
+            }
+        }
+
+        if (self.draft_buffers.getPtr(chat_id)) |state| {
+            const target_suppress_until_ms = self.draft_target_suppress_until_ms.get(chat_id) orelse suppress_until_ms;
+            telegram_draft_presenter.suppressDraftUntilMs(state, target_suppress_until_ms);
+        }
+    }
+
     fn shouldSkipDraftSend(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, now_ms: i64) bool {
         self.draft_mu.lock();
         defer self.draft_mu.unlock();
@@ -2866,6 +2925,10 @@ pub const TelegramChannel = struct {
         const state = self.draft_buffers.getPtr(chat_id) orelse return true;
         if (self.draft_global_suppress_until_ms > now_ms) {
             telegram_draft_presenter.suppressDraftUntilMs(state, self.draft_global_suppress_until_ms);
+        }
+        const target_suppress_until_ms = self.targetDraftSuppressUntilLocked(chat_id, now_ms);
+        if (target_suppress_until_ms > now_ms) {
+            telegram_draft_presenter.suppressDraftUntilMs(state, target_suppress_until_ms);
         }
         if (state.suppress_until_ms > now_ms) return true;
         return state.draft_id != draft_id;
@@ -2944,6 +3007,11 @@ pub const TelegramChannel = struct {
             if (telegram_api.responseIsMessageTooLong(resp)) {
                 log.warn("sendMessageDraft exceeded Telegram message limit; suppressing drafts briefly", .{});
                 self.suppressDraftSends(chat_id, 15);
+                return;
+            }
+            if (telegram_api.responseIsDraftPeerInvalid(resp)) {
+                log.warn("sendMessageDraft unsupported for peer; suppressing drafts for this target", .{});
+                self.suppressDraftSendsForTarget(chat_id, 24 * 60 * 60);
                 return;
             }
             log.warn("sendMessageDraft API error: {s}", .{resp[0..@min(resp.len, 256)]});
@@ -5054,6 +5122,24 @@ test "shouldSkipDraftSend skips while global cooldown is active" {
     try std.testing.expect(ch.shouldSkipDraftSend("12345", draft_id, std.time.milliTimestamp()));
 }
 
+test "shouldSkipDraftSend skips while target cooldown is active" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("12345", "Hello", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    const draft = ch.draft_buffers.get("12345") orelse return error.TestUnexpectedResult;
+    const draft_id = draft.draft_id;
+    ch.draft_mu.unlock();
+
+    ch.suppressDraftSendsForTarget("12345", 5);
+
+    try std.testing.expect(ch.shouldSkipDraftSend("12345", draft_id, std.time.milliTimestamp()));
+    try std.testing.expectEqual(@as(i64, 0), ch.draft_global_suppress_until_ms);
+}
+
 test "vtableSendEvent final cleans up draft state" {
     const allocator = std.testing.allocator;
     var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
@@ -5128,6 +5214,49 @@ test "vtableSendEvent new chat inherits global draft cooldown" {
     try std.testing.expectEqual(ch.draft_global_suppress_until_ms, draft.suppress_until_ms);
     try std.testing.expect(draft.suppress_until_ms >= before + (4 * std.time.ms_per_s));
     try std.testing.expectEqual(@as(usize, 0), draft.last_flush_len);
+}
+
+test "vtableSendEvent same chat inherits target draft cooldown across turns" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("111", "hello", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    const draft_id = ch.draft_buffers.get("111").?.draft_id;
+    ch.draft_mu.unlock();
+
+    const before = std.time.milliTimestamp();
+    ch.suppressDraftSendsForTarget("111", 5);
+    try ch.finishDraftTurn("111", draft_id);
+    try ch.channel().sendEvent("111", "again", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    defer ch.draft_mu.unlock();
+    const draft = ch.draft_buffers.get("111") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 0), ch.draft_global_suppress_until_ms);
+    try std.testing.expect(draft.suppress_until_ms >= before + (4 * std.time.ms_per_s));
+}
+
+test "vtableSendEvent target draft cooldown does not affect other chats" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    try ch.channel().sendEvent("111", "hello", &.{}, .chunk);
+    try ch.channel().sendEvent("222", "world", &.{}, .chunk);
+
+    ch.draft_mu.lock();
+    const target_draft_id = ch.draft_buffers.get("111").?.draft_id;
+    const other_draft_id = ch.draft_buffers.get("222").?.draft_id;
+    ch.draft_mu.unlock();
+
+    ch.suppressDraftSendsForTarget("111", 5);
+
+    try std.testing.expect(ch.shouldSkipDraftSend("111", target_draft_id, std.time.milliTimestamp()));
+    try std.testing.expect(!ch.shouldSkipDraftSend("222", other_draft_id, std.time.milliTimestamp()));
+    try std.testing.expectEqual(@as(i64, 0), ch.draft_global_suppress_until_ms);
 }
 
 test "vtableSendEvent disabled streaming is noop" {

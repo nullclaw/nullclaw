@@ -1756,8 +1756,17 @@ pub const Agent = struct {
         const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
         defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
 
+        var cfg_for_prompt_opt: ?Config = Config.load(self.allocator) catch null;
+        defer if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded.deinit();
+        const cfg_for_prompt_ptr: ?*const Config = if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded else null;
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(
+            self.allocator,
+            self.workspace_dir,
+            self.bootstrap,
+            if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+        ) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
         }
@@ -1785,13 +1794,9 @@ pub const Agent = struct {
                 self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
 
         if (!self.has_system_prompt or conversation_context_changed) {
-            var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
-            defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
-            const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
-
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
-                cfg_for_caps_ptr,
+                cfg_for_prompt_ptr,
                 self.tools,
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
@@ -1807,6 +1812,7 @@ pub const Agent = struct {
                 .skill_routing_message = if (self.skill_routing_enabled) effective_user_message else null,
                 .skill_routing_max_active = self.skill_routing_max_active,
                 .matched_skill_out = if (self.skill_routing_enabled) &routed_skill else null,
+                .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
             });
             // Store routed skill for turn-level attribution. Ownership transfers
             // to prev_turn_skill_owned; freed on next turn or agent deinit.

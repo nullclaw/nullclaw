@@ -253,7 +253,8 @@ Practical effect:
 
 ### `identity` (AIEOS v1.1)
 
-Use this section when you want the runtime identity to come from an AIEOS document:
+Use this section when you want the runtime identity to come from an AIEOS document.
+When configured, nullclaw injects the parsed AIEOS content into the system prompt alongside workspace identity files such as `AGENTS.md` and `IDENTITY.md`:
 
 ```json
 {
@@ -300,6 +301,7 @@ Notes:
 - Prefer `aieos_path` for maintainability and version control readability.
 - Use `aieos_inline` only when you need a fully self-contained single config file.
 - Keep `identity.format` aligned with the payload source (`aieos`).
+- Relative `aieos_path` values are resolved against the active workspace first, then against the current working directory.
 
 ### `channels`
 

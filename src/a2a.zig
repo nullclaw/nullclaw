@@ -1,10 +1,11 @@
 //! A2A (Agent-to-Agent) protocol support for nullclaw.
 //!
-//! Implements Google's Agent-to-Agent protocol over JSON-RPC 2.0:
+//! Implements Google's Agent-to-Agent protocol v0.3.0 over JSON-RPC 2.0:
 //!   - GET /.well-known/agent-card.json -> Agent Card discovery
-//!   - POST /a2a -> JSON-RPC dispatch (message/send, message/stream, tasks/get, tasks/cancel, tasks/list)
+//!   - POST /a2a -> JSON-RPC dispatch (message/send, message/stream, tasks/get, tasks/cancel,
+//!     tasks/list, tasks/resubscribe)
 //!
-//! Task state machine: submitted -> working -> completed | failed | canceled | input-required
+//! Task state machine: submitted -> working -> completed | failed | canceled | rejected | input-required | auth-required
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -16,7 +17,7 @@ const streaming = @import("streaming.zig");
 
 /// Maximum number of tasks kept in the registry before eviction.
 const MAX_TASKS: usize = 1000;
-const A2A_PROTOCOL_VERSION = "0.2.5";
+const A2A_PROTOCOL_VERSION = "0.3.0";
 
 // ── Task State ──────────────────────────────────────────────────
 
@@ -27,6 +28,9 @@ pub const TaskState = enum {
     failed,
     canceled,
     input_required,
+    rejected,
+    auth_required,
+    unknown,
 
     pub fn jsonName(self: TaskState) []const u8 {
         return switch (self) {
@@ -36,6 +40,9 @@ pub const TaskState = enum {
             .failed => "failed",
             .canceled => "canceled",
             .input_required => "input-required",
+            .rejected => "rejected",
+            .auth_required => "auth-required",
+            .unknown => "unknown",
         };
     }
 };
@@ -79,7 +86,7 @@ fn deinitTaskSnapshots(allocator: std.mem.Allocator, tasks: []TaskSnapshot) void
 
 fn isTerminalState(state: TaskState) bool {
     return switch (state) {
-        .completed, .failed, .canceled => true,
+        .completed, .failed, .canceled, .rejected => true,
         else => false,
     };
 }
@@ -434,16 +441,31 @@ pub fn handleJsonRpc(
     // Extract JSON-RPC id — may be a string or number.
     const request_id = extractJsonRpcId(body) orelse "null";
 
-    if (std.mem.eql(u8, method, "message/send") or std.mem.eql(u8, method, "tasks/send") or
-        std.mem.eql(u8, method, "message/stream") or std.mem.eql(u8, method, "tasks/sendSubscribe"))
+    if (std.mem.eql(u8, method, "message/send") or
+        std.mem.eql(u8, method, "message/stream") or
+        std.mem.eql(u8, method, "SendMessage") or
+        std.mem.eql(u8, method, "SendStreamingMessage"))
     {
         return handleSendMessage(allocator, body, request_id, registry, session_mgr);
-    } else if (std.mem.eql(u8, method, "tasks/get")) {
+    } else if (std.mem.eql(u8, method, "tasks/get") or std.mem.eql(u8, method, "GetTask")) {
         return handleGetTask(allocator, body, request_id, registry);
-    } else if (std.mem.eql(u8, method, "tasks/cancel")) {
+    } else if (std.mem.eql(u8, method, "tasks/cancel") or std.mem.eql(u8, method, "CancelTask")) {
         return handleCancelTask(allocator, body, request_id, registry, session_mgr);
-    } else if (std.mem.eql(u8, method, "tasks/list")) {
+    } else if (std.mem.eql(u8, method, "tasks/list") or std.mem.eql(u8, method, "ListTasks")) {
         return handleListTasks(allocator, body, request_id, registry);
+    } else if (std.mem.startsWith(u8, method, "tasks/pushNotificationConfig/") or
+        std.mem.eql(u8, method, "CreateTaskPushNotificationConfig") or
+        std.mem.eql(u8, method, "GetTaskPushNotificationConfig") or
+        std.mem.eql(u8, method, "ListTaskPushNotificationConfigs") or
+        std.mem.eql(u8, method, "DeleteTaskPushNotificationConfig"))
+    {
+        const err_body = buildJsonRpcError(allocator, request_id, -32003, "Push notifications not supported") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    } else if (std.mem.eql(u8, method, "agent/getAuthenticatedExtendedCard") or std.mem.eql(u8, method, "GetExtendedAgentCard")) {
+        const err_body = buildJsonRpcError(allocator, request_id, -32004, "Extended agent card not supported") catch
+            return errorResponse();
+        return .{ .body = err_body };
     } else {
         const err_body = buildJsonRpcError(allocator, request_id, -32601, "Method not found") catch
             return errorResponse();
@@ -458,7 +480,9 @@ pub fn handleJsonRpc(
 pub fn isStreamingMethod(body: []const u8) bool {
     const method = extractJsonRpcMethod(body) orelse return false;
     return std.mem.eql(u8, method, "message/stream") or
-        std.mem.eql(u8, method, "tasks/sendSubscribe");
+        std.mem.eql(u8, method, "tasks/resubscribe") or
+        std.mem.eql(u8, method, "SendStreamingMessage") or
+        std.mem.eql(u8, method, "SubscribeToTask");
 }
 
 /// SSE Sink context — writes JSON-RPC SSE events to a raw TCP stream.
@@ -516,10 +540,24 @@ pub fn handleStreamingRpc(
 ) void {
     const request_id = extractJsonRpcId(body) orelse "null";
 
+    // Handle tasks/resubscribe: resume SSE for an existing task.
+    const method = extractJsonRpcMethod(body) orelse "message/stream";
+    if (std.mem.eql(u8, method, "tasks/resubscribe") or std.mem.eql(u8, method, "SubscribeToTask")) {
+        handleResubscribeStreaming(allocator, body, stream, request_id, registry);
+        return;
+    }
+
     const text = extractMessageText(body) orelse {
         writeSseError(allocator, stream, request_id, -32602, "Missing message text");
         return;
     };
+
+    // v0.3.0: messageId is required on Message.
+    if (extractMessageMessageId(body) == null) {
+        writeSseError(allocator, stream, request_id, -32602, "Missing messageId");
+        return;
+    }
+
     const context_id = extractMessageContextId(body);
 
     var task = registry.createTask(allocator, text, context_id) catch {
@@ -531,7 +569,7 @@ pub fn handleStreamingRpc(
     // Write SSE headers.
     stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
 
-    const initial_task_json = buildTaskJson(allocator, &task) catch return;
+    const initial_task_json = buildTaskJson(allocator, &task, null) catch return;
     defer allocator.free(initial_task_json);
     const initial_event = buildJsonRpcResult(allocator, request_id, initial_task_json) catch return;
     defer allocator.free(initial_event);
@@ -592,6 +630,40 @@ pub fn handleStreamingRpc(
     sse_ctx.writeSseEvent(final_event);
 }
 
+/// Handle tasks/resubscribe: emit the current task state as SSE, then close.
+fn handleResubscribeStreaming(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    stream: *std.net.Stream,
+    request_id: []const u8,
+    registry: *TaskRegistry,
+) void {
+    const task_id = extractParamsId(body) orelse {
+        writeSseError(allocator, stream, request_id, -32602, "Missing task id");
+        return;
+    };
+
+    var task = registry.getTaskSnapshot(allocator, task_id) catch {
+        writeSseError(allocator, stream, request_id, -32603, "Internal error");
+        return;
+    };
+    defer if (task) |*snapshot| snapshot.deinit(allocator);
+    const snapshot = task orelse {
+        writeSseError(allocator, stream, request_id, -32001, "Task not found");
+        return;
+    };
+
+    // Write SSE headers.
+    stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
+
+    // buildResubscribeStatusEvent already returns a JSON-RPC envelope; write it directly.
+    const status_event = buildResubscribeStatusEvent(allocator, request_id, snapshot.id, snapshot.context_id, snapshot.state, snapshot.updated_at) catch return;
+    defer allocator.free(status_event);
+    stream.writeAll("data: ") catch return;
+    stream.writeAll(status_event) catch return;
+    stream.writeAll("\n\n") catch return;
+}
+
 /// Write an SSE error event to the stream context.
 fn writeSseErrorEvent(allocator: std.mem.Allocator, sse_ctx: *SseStreamCtx, code: i32, message: []const u8) void {
     const err_json = buildJsonRpcError(allocator, sse_ctx.request_id, code, message) catch return;
@@ -623,7 +695,33 @@ fn handleSendMessage(
             return errorResponse();
         return .{ .body = err_body };
     };
+
+    // v0.3.0: messageId is required on Message.
+    if (extractMessageMessageId(body) == null) {
+        const err_body = buildJsonRpcError(allocator, request_id, -32602, "Missing messageId") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    }
+
     const context_id = extractMessageContextId(body);
+
+    // Parse optional configuration.
+    const config = parseSendMessageConfiguration(body);
+
+    if (config.history_length) |history_length| {
+        if (history_length < 0) {
+            const err_body = buildJsonRpcError(allocator, request_id, -32602, "historyLength must be non-negative") catch
+                return errorResponse();
+            return .{ .body = err_body };
+        }
+    }
+
+    // Check acceptedOutputModes: if specified, must include text/plain.
+    if (config.has_accepted_output_modes and !config.accepts_text_plain) {
+        const err_body = buildJsonRpcError(allocator, request_id, -32005, "Incompatible content types") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    }
 
     var task = registry.createTask(allocator, text, context_id) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to create task") catch
@@ -656,7 +754,7 @@ fn handleSendMessage(
         return .{ .body = err_body };
     };
 
-    const task_json = buildTaskJson(allocator, &task_snapshot) catch {
+    const task_json = buildTaskJson(allocator, &task_snapshot, config.history_length) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -682,6 +780,17 @@ fn handleGetTask(
         return .{ .body = err_body };
     };
 
+    // Parse optional historyLength from params.
+    const params_section = extractParamsObject(body) orelse "{}";
+    const history_length = extractObjectIntField(params_section, "historyLength");
+    if (history_length) |value| {
+        if (value < 0) {
+            const err_body = buildJsonRpcError(allocator, request_id, -32602, "historyLength must be non-negative") catch
+                return errorResponse();
+            return .{ .body = err_body };
+        }
+    }
+
     var task = registry.getTaskSnapshot(allocator, task_id) catch return errorResponse();
     defer if (task) |*snapshot| snapshot.deinit(allocator);
     const task_snapshot = task orelse {
@@ -690,7 +799,7 @@ fn handleGetTask(
         return .{ .body = err_body };
     };
 
-    const task_json = buildTaskJson(allocator, &task_snapshot) catch {
+    const task_json = buildTaskJson(allocator, &task_snapshot, history_length) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -725,11 +834,7 @@ fn handleCancelTask(
         return .{ .body = err_body };
     };
 
-    // Check if task is in a terminal state.
-    const is_terminal = task.state == .completed or
-        task.state == .failed or
-        task.state == .canceled;
-    if (is_terminal) {
+    if (isTerminalState(task.state)) {
         const err_body = buildJsonRpcError(allocator, request_id, -32002, "Task already in terminal state") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -754,7 +859,7 @@ fn handleCancelTask(
         return .{ .body = err_body };
     }
 
-    const task_json = buildTaskJson(allocator, &task_snapshot) catch {
+    const task_json = buildTaskJson(allocator, &task_snapshot, null) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -777,21 +882,37 @@ fn handleListTasks(
     // Parse optional filters from params.
     const params_section = extractParamsObject(body) orelse "{}";
 
-    // Optional state filter.
     const filter_state: ?TaskState = blk: {
-        const state_str = extractObjectStringField(params_section, "state") orelse break :blk null;
-        if (std.mem.eql(u8, state_str, "submitted")) break :blk .submitted;
-        if (std.mem.eql(u8, state_str, "working")) break :blk .working;
-        if (std.mem.eql(u8, state_str, "completed")) break :blk .completed;
-        if (std.mem.eql(u8, state_str, "failed")) break :blk .failed;
-        if (std.mem.eql(u8, state_str, "canceled")) break :blk .canceled;
-        if (std.mem.eql(u8, state_str, "input-required")) break :blk .input_required;
-        if (std.mem.eql(u8, state_str, "input_required")) break :blk .input_required;
-        break :blk null;
+        const has_status_filter = extractObjectFieldRaw(params_section, "status") != null or
+            extractObjectFieldRaw(params_section, "state") != null;
+        if (!has_status_filter) break :blk null;
+
+        const state_str = extractObjectStringField(params_section, "status") orelse
+            extractObjectStringField(params_section, "state") orelse {
+            const err_body = buildJsonRpcError(allocator, request_id, -32602, "Invalid task status") catch
+                return errorResponse();
+            return .{ .body = err_body };
+        };
+
+        const parsed_state = parseTaskState(state_str) orelse {
+            const err_body = buildJsonRpcError(allocator, request_id, -32602, "Invalid task status") catch
+                return errorResponse();
+            return .{ .body = err_body };
+        };
+        break :blk parsed_state;
     };
 
     // Optional context_id filter.
     const filter_context_id = extractObjectStringField(params_section, "contextId");
+
+    const history_length = extractObjectIntField(params_section, "historyLength");
+    if (history_length) |value| {
+        if (value < 0) {
+            const err_body = buildJsonRpcError(allocator, request_id, -32602, "historyLength must be non-negative") catch
+                return errorResponse();
+            return .{ .body = err_body };
+        }
+    }
 
     // Page size (default 50, max 100).
     const page_size: usize = blk: {
@@ -816,7 +937,7 @@ fn handleListTasks(
     w.writeAll("{\"tasks\":[") catch return errorResponse();
     for (tasks, 0..) |*task, i| {
         if (i > 0) w.writeByte(',') catch return errorResponse();
-        const task_json = buildTaskJson(allocator, task) catch return errorResponse();
+        const task_json = buildTaskJson(allocator, task, history_length) catch return errorResponse();
         defer allocator.free(task_json);
         w.writeAll(task_json) catch return errorResponse();
     }
@@ -868,7 +989,7 @@ fn buildJsonRpcError(allocator: std.mem.Allocator, request_id: []const u8, code:
     return buf.toOwnedSlice(allocator);
 }
 
-fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot) ![]u8 {
+fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot, max_history: ?i64) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -895,23 +1016,40 @@ fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot) ![]u8 
         try gateway.jsonEscapeInto(w, task.agent_text);
         try w.writeAll("\"}]}]");
 
-        try w.writeAll(",\"history\":[{\"role\":\"user\",\"messageId\":\"msg-user-");
-        try gateway.jsonEscapeInto(w, task.id);
-        try w.writeAll("\",\"taskId\":\"");
-        try gateway.jsonEscapeInto(w, task.id);
-        try w.writeAll("\",\"contextId\":\"");
-        try gateway.jsonEscapeInto(w, task.context_id);
-        try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
-        try gateway.jsonEscapeInto(w, task.user_text);
-        try w.writeAll("\"}]},{\"role\":\"agent\",\"messageId\":\"msg-agent-");
-        try gateway.jsonEscapeInto(w, task.id);
-        try w.writeAll("\",\"taskId\":\"");
-        try gateway.jsonEscapeInto(w, task.id);
-        try w.writeAll("\",\"contextId\":\"");
-        try gateway.jsonEscapeInto(w, task.context_id);
-        try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
-        try gateway.jsonEscapeInto(w, task.agent_text);
-        try w.writeAll("\"}]}]");
+        // Respect historyLength: null = all, 0 = omit, 1 = latest only, 2+ = all (we have 2 max).
+        const history_limit: i64 = max_history orelse 2;
+        if (history_limit >= 2) {
+            // Both user and agent messages.
+            try w.writeAll(",\"history\":[{\"kind\":\"message\",\"role\":\"user\",\"messageId\":\"msg-user-");
+            try gateway.jsonEscapeInto(w, task.id);
+            try w.writeAll("\",\"taskId\":\"");
+            try gateway.jsonEscapeInto(w, task.id);
+            try w.writeAll("\",\"contextId\":\"");
+            try gateway.jsonEscapeInto(w, task.context_id);
+            try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
+            try gateway.jsonEscapeInto(w, task.user_text);
+            try w.writeAll("\"}]},{\"kind\":\"message\",\"role\":\"agent\",\"messageId\":\"msg-agent-");
+            try gateway.jsonEscapeInto(w, task.id);
+            try w.writeAll("\",\"taskId\":\"");
+            try gateway.jsonEscapeInto(w, task.id);
+            try w.writeAll("\",\"contextId\":\"");
+            try gateway.jsonEscapeInto(w, task.context_id);
+            try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
+            try gateway.jsonEscapeInto(w, task.agent_text);
+            try w.writeAll("\"}]}]");
+        } else if (history_limit == 1) {
+            // Only the most recent message (agent response).
+            try w.writeAll(",\"history\":[{\"kind\":\"message\",\"role\":\"agent\",\"messageId\":\"msg-agent-");
+            try gateway.jsonEscapeInto(w, task.id);
+            try w.writeAll("\",\"taskId\":\"");
+            try gateway.jsonEscapeInto(w, task.id);
+            try w.writeAll("\",\"contextId\":\"");
+            try gateway.jsonEscapeInto(w, task.context_id);
+            try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
+            try gateway.jsonEscapeInto(w, task.agent_text);
+            try w.writeAll("\"}]}]");
+        }
+        // history_limit <= 0: omit history entirely.
     }
 
     try w.writeByte('}');
@@ -1196,6 +1334,74 @@ fn extractParamsId(body: []const u8) ?[]const u8 {
     return extractObjectStringField(params, "id");
 }
 
+/// Extract messageId from params.message.messageId.
+fn extractMessageMessageId(body: []const u8) ?[]const u8 {
+    const params = extractParamsObject(body) orelse return null;
+    const message = extractObjectObjectField(params, "message") orelse return null;
+    return extractObjectStringField(message, "messageId");
+}
+
+fn parseTaskState(state_str: []const u8) ?TaskState {
+    if (std.mem.eql(u8, state_str, "submitted")) return .submitted;
+    if (std.mem.eql(u8, state_str, "working")) return .working;
+    if (std.mem.eql(u8, state_str, "completed")) return .completed;
+    if (std.mem.eql(u8, state_str, "failed")) return .failed;
+    if (std.mem.eql(u8, state_str, "canceled")) return .canceled;
+    if (std.mem.eql(u8, state_str, "input-required") or std.mem.eql(u8, state_str, "input_required")) return .input_required;
+    if (std.mem.eql(u8, state_str, "rejected")) return .rejected;
+    if (std.mem.eql(u8, state_str, "auth-required") or std.mem.eql(u8, state_str, "auth_required")) return .auth_required;
+    if (std.mem.eql(u8, state_str, "unknown")) return .unknown;
+    return null;
+}
+
+/// Parsed SendMessageConfiguration fields.
+const SendMessageConfiguration = struct {
+    history_length: ?i64 = null,
+    has_accepted_output_modes: bool = false,
+    accepts_text_plain: bool = false,
+};
+
+/// Parse configuration from params.configuration in a SendMessageRequest.
+fn parseSendMessageConfiguration(body: []const u8) SendMessageConfiguration {
+    var result = SendMessageConfiguration{};
+    const params = extractParamsObject(body) orelse return result;
+    const config = extractObjectObjectField(params, "configuration") orelse return result;
+
+    result.history_length = extractObjectIntField(config, "historyLength");
+
+    // Check acceptedOutputModes array for text/plain compatibility.
+    const modes = extractObjectArrayField(config, "acceptedOutputModes") orelse return result;
+    result.has_accepted_output_modes = true;
+    // Scan the array for "text/plain" or "text/*" or "*/*".
+    if (std.mem.indexOf(u8, modes, "\"text/plain\"") != null or
+        std.mem.indexOf(u8, modes, "\"text/*\"") != null or
+        std.mem.indexOf(u8, modes, "\"*/*\"") != null)
+    {
+        result.accepts_text_plain = true;
+    }
+
+    return result;
+}
+
+fn buildResubscribeStatusEvent(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    task_id: []const u8,
+    context_id: []const u8,
+    state: TaskState,
+    updated_at: i64,
+) ![]u8 {
+    return buildStatusUpdateEvent(
+        allocator,
+        request_id,
+        task_id,
+        context_id,
+        state,
+        updated_at,
+        isTerminalState(state),
+    );
+}
+
 fn buildArtifactUpdateEvent(
     allocator: std.mem.Allocator,
     request_id: []const u8,
@@ -1372,6 +1578,9 @@ test "TaskState jsonName returns correct strings" {
     try testing.expectEqualStrings("failed", TaskState.failed.jsonName());
     try testing.expectEqualStrings("canceled", TaskState.canceled.jsonName());
     try testing.expectEqualStrings("input-required", TaskState.input_required.jsonName());
+    try testing.expectEqualStrings("rejected", TaskState.rejected.jsonName());
+    try testing.expectEqualStrings("auth-required", TaskState.auth_required.jsonName());
+    try testing.expectEqualStrings("unknown", TaskState.unknown.jsonName());
 }
 
 test "TaskRegistry createTask and getTaskSnapshot" {
@@ -1447,7 +1656,7 @@ test "handleAgentCard returns valid JSON" {
     try testing.expectEqualStrings("application/json", resp.content_type);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"TestAgent\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"description\":\"A test agent\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"protocolVersion\":\"0.2.5\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"protocolVersion\":\"0.3.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"version\":\"1.0.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"url\":\"http://localhost:3000/a2a\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"supportedInterfaces\":[") != null);
@@ -1459,13 +1668,13 @@ test "handleAgentCard returns valid JSON" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"skills\":[") != null);
 }
 
-test "handleJsonRpc dispatches tasks/send" {
+test "handleJsonRpc dispatches message/send with string id" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
     var mock = MockSessionManager{};
     const body =
-        \\{"jsonrpc":"2.0","id":"req-1","method":"tasks/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"Hello agent"}]}}}
+        \\{"jsonrpc":"2.0","id":"req-1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"Hello agent"}]}}}
     ;
     const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
     defer if (resp.allocated) testing.allocator.free(resp.body);
@@ -1484,7 +1693,7 @@ test "handleJsonRpc dispatches message/send" {
 
     var mock = MockSessionManager{};
     const body =
-        \\{"jsonrpc":"2.0","id":42,"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"Hello via message/send"}]}}}
+        \\{"jsonrpc":"2.0","id":42,"method":"message/send","params":{"message":{"messageId":"msg-2","role":"user","parts":[{"type":"text","text":"Hello via message/send"}]}}}
     ;
     const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
     defer if (resp.allocated) testing.allocator.free(resp.body);
@@ -1559,7 +1768,7 @@ test "buildTaskJson escapes special characters" {
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "line1\nline2\ttab")).?;
     defer completed.deinit(testing.allocator);
 
-    const json = try buildTaskJson(testing.allocator, &completed);
+    const json = try buildTaskJson(testing.allocator, &completed, null);
     defer testing.allocator.free(json);
 
     try testing.expect(std.mem.indexOf(u8, json, "hello \\\"world\\\"") != null);
@@ -1568,7 +1777,7 @@ test "buildTaskJson escapes special characters" {
 
 test "extractMessageText finds text in parts" {
     const body =
-        \\{"jsonrpc":"2.0","id":"1","method":"tasks/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"Hello there"}]}}}
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"Hello there"}]}}}
     ;
     const text = extractMessageText(body);
     try testing.expect(text != null);
@@ -1577,7 +1786,7 @@ test "extractMessageText finds text in parts" {
 
 test "extractMessageText returns null for missing parts" {
     const body =
-        \\{"jsonrpc":"2.0","id":"1","method":"tasks/send","params":{"message":{"role":"user"}}}
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user"}}}
     ;
     try testing.expect(extractMessageText(body) == null);
 }
@@ -1642,21 +1851,52 @@ test "handleJsonRpc tasks/get returns error for nonexistent task" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "Task not found") != null);
 }
 
-test "handleJsonRpc dispatches tasks/sendSubscribe same as tasks/send" {
+test "handleJsonRpc returns error for removed tasks/send method" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
     var mock = MockSessionManager{};
     const body =
-        \\{"jsonrpc":"2.0","id":"req-8","method":"tasks/sendSubscribe","params":{"message":{"role":"user","parts":[{"type":"text","text":"Subscribe test"}]}}}
+        \\{"jsonrpc":"2.0","id":"req-8","method":"tasks/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"Legacy test"}]}}}
     ;
     const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
-    try testing.expectEqualStrings("200 OK", resp.status);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"result\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "mock response") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32601") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Method not found") != null);
+}
+
+test "handleJsonRpc returns error for push notification config methods" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-pn","method":"tasks/pushNotificationConfig/set","params":{"taskId":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32003") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Push notification") != null);
+}
+
+test "handleJsonRpc returns error for GetExtendedAgentCard" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-ec","method":"GetExtendedAgentCard","params":{}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32004") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "not supported") != null);
 }
 
 test "buildTaskJson omits artifacts and history when agent_text is empty" {
@@ -1666,7 +1906,7 @@ test "buildTaskJson omits artifacts and history when agent_text is empty" {
     var task = try registry.createTask(testing.allocator, "test input", null);
     defer task.deinit(testing.allocator);
 
-    const json = try buildTaskJson(testing.allocator, &task);
+    const json = try buildTaskJson(testing.allocator, &task, null);
     defer testing.allocator.free(json);
 
     try testing.expect(std.mem.indexOf(u8, json, "\"artifacts\"") == null);
@@ -1677,7 +1917,7 @@ test "buildTaskJson omits artifacts and history when agent_text is empty" {
     try testing.expect(std.mem.indexOf(u8, json, "\"metadata\":{}") != null);
 }
 
-test "buildTaskJson includes contextId artifactId and messageId" {
+test "buildTaskJson includes contextId artifactId messageId and message kind" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
@@ -1686,7 +1926,7 @@ test "buildTaskJson includes contextId artifactId and messageId" {
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "reply")).?;
     defer completed.deinit(testing.allocator);
 
-    const json = try buildTaskJson(testing.allocator, &completed);
+    const json = try buildTaskJson(testing.allocator, &completed, null);
     defer testing.allocator.free(json);
 
     try testing.expect(std.mem.indexOf(u8, json, "\"contextId\":\"conversation-1\"") != null);
@@ -1694,6 +1934,9 @@ test "buildTaskJson includes contextId artifactId and messageId" {
     try testing.expect(std.mem.indexOf(u8, json, "\"messageId\":\"msg-user-task-1\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"messageId\":\"msg-agent-task-1\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"taskId\":\"task-1\"") != null);
+    // v0.3.0: history messages must include kind:"message" discriminator.
+    try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"message\",\"role\":\"user\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"message\",\"role\":\"agent\"") != null);
 }
 
 test "extractJsonRpcId handles string numeric and reordered ids" {
@@ -1727,7 +1970,7 @@ test "extractParamsId finds id in params only" {
 
 test "extractMessageContextId finds context id in message" {
     const body =
-        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"contextId":"chat-42","role":"user","parts":[{"type":"text","text":"hello"}]}}}
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","contextId":"chat-42","role":"user","parts":[{"type":"text","text":"hello"}]}}}
     ;
     try testing.expectEqualStrings("chat-42", extractMessageContextId(body).?);
 }
@@ -1835,10 +2078,16 @@ test "isStreamingMethod detects streaming methods only" {
         \\{"jsonrpc":"2.0","id":1,"method":"message/stream","params":{"message":{"role":"user","parts":[{"type":"text","text":"hi"}]}}}
     ));
     try testing.expect(isStreamingMethod(
-        \\{"jsonrpc":"2.0","id":"1","method":"tasks/sendSubscribe","params":{}}
+        \\{"jsonrpc":"2.0","id":"1","method":"tasks/resubscribe","params":{"id":"task-1"}}
+    ));
+    try testing.expect(isStreamingMethod(
+        \\{"jsonrpc":"2.0","id":"1","method":"SendStreamingMessage","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hi"}]}}}
+    ));
+    try testing.expect(isStreamingMethod(
+        \\{"jsonrpc":"2.0","id":"1","method":"SubscribeToTask","params":{"id":"task-1"}}
     ));
     try testing.expect(!isStreamingMethod(
-        \\{"jsonrpc":"2.0","id":"1","method":"tasks/send","params":{}}
+        \\{"jsonrpc":"2.0","id":"1","method":"tasks/get","params":{}}
     ));
     try testing.expect(!isStreamingMethod(
         \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{}}
@@ -1874,7 +2123,7 @@ test "handleJsonRpc reuses provided contextId for follow-up turns" {
 
     var mock = MockSessionManager{};
     const body =
-        \\{"jsonrpc":"2.0","id":"req-ctx","method":"message/send","params":{"message":{"contextId":"conversation-9","role":"user","parts":[{"type":"text","text":"Hello via context"}]}}}
+        \\{"jsonrpc":"2.0","id":"req-ctx","method":"message/send","params":{"message":{"messageId":"msg-1","contextId":"conversation-9","role":"user","parts":[{"type":"text","text":"Hello via context"}]}}}
     ;
     const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
     defer if (resp.allocated) testing.allocator.free(resp.body);
@@ -1918,4 +2167,321 @@ test "finalizeTask preserves canceled state and setTaskState does not revive it"
     defer finalized.deinit(testing.allocator);
     try testing.expect(finalized.state == .canceled);
     try testing.expectEqual(@as(usize, 0), finalized.agent_text.len);
+}
+
+test "rejected state is terminal" {
+    try testing.expect(isTerminalState(.rejected));
+    try testing.expect(!isTerminalState(.auth_required));
+    try testing.expect(!isTerminalState(.unknown));
+}
+
+test "handleListTasks filters by rejected state" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "bad request", null);
+    defer task.deinit(testing.allocator);
+    try mutateStoredTask(&registry, task.id, .rejected, null, 50);
+
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-rej","method":"tasks/list","params":{"state":"rejected"}}
+    ;
+    var mock = MockSessionManager{};
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"rejected\"") != null);
+}
+
+test "handleListTasks filters by auth-required state" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "needs auth", null);
+    defer task.deinit(testing.allocator);
+    try mutateStoredTask(&registry, task.id, .auth_required, null, 50);
+
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-ar","method":"tasks/list","params":{"state":"auth-required"}}
+    ;
+    var mock = MockSessionManager{};
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"auth-required\"") != null);
+}
+
+test "handleListTasks accepts status filter alias" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "done", null);
+    defer task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "ok")).?;
+    defer completed.deinit(testing.allocator);
+
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-status","method":"ListTasks","params":{"status":"completed"}}
+    ;
+    var mock = MockSessionManager{};
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expectEqualStrings("200 OK", resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+}
+
+test "handleListTasks rejects invalid status filter" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bad-status","method":"ListTasks","params":{"status":"not-a-state"}}
+    ;
+    var mock = MockSessionManager{};
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Invalid task status") != null);
+}
+
+test "handleSendMessage rejects missing messageId" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-no-mid","method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"No messageId"}]}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "messageId") != null);
+}
+
+test "handleSendMessage rejects incompatible acceptedOutputModes" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-modes","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]},"configuration":{"acceptedOutputModes":["image/png"]}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32005") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "content types") != null);
+}
+
+test "handleSendMessage accepts text/plain in acceptedOutputModes" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-ok","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]},"configuration":{"acceptedOutputModes":["text/plain","image/png"]}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expectEqualStrings("200 OK", resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"result\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+}
+
+test "handleSendMessage rejects negative historyLength" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bad-history","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]},"configuration":{"historyLength":-1}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "historyLength") != null);
+}
+
+test "handleGetTask respects historyLength parameter" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "input", null);
+    defer task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "output")).?;
+    defer completed.deinit(testing.allocator);
+
+    var mock = MockSessionManager{};
+
+    // historyLength=0: no history in response.
+    const body_0 =
+        \\{"jsonrpc":"2.0","id":"req-h0","method":"tasks/get","params":{"id":"task-1","historyLength":0}}
+    ;
+    const resp_0 = handleJsonRpc(testing.allocator, body_0, &registry, &mock);
+    defer if (resp_0.allocated) testing.allocator.free(resp_0.body);
+    try testing.expect(std.mem.indexOf(u8, resp_0.body, "\"history\"") == null);
+    try testing.expect(std.mem.indexOf(u8, resp_0.body, "\"artifacts\"") != null);
+
+    // historyLength=1: only agent message.
+    const body_1 =
+        \\{"jsonrpc":"2.0","id":"req-h1","method":"tasks/get","params":{"id":"task-1","historyLength":1}}
+    ;
+    const resp_1 = handleJsonRpc(testing.allocator, body_1, &registry, &mock);
+    defer if (resp_1.allocated) testing.allocator.free(resp_1.body);
+    try testing.expect(std.mem.indexOf(u8, resp_1.body, "\"history\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp_1.body, "\"role\":\"agent\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp_1.body, "\"role\":\"user\"") == null);
+
+    // No historyLength: full history.
+    const body_full =
+        \\{"jsonrpc":"2.0","id":"req-hf","method":"tasks/get","params":{"id":"task-1"}}
+    ;
+    const resp_full = handleJsonRpc(testing.allocator, body_full, &registry, &mock);
+    defer if (resp_full.allocated) testing.allocator.free(resp_full.body);
+    try testing.expect(std.mem.indexOf(u8, resp_full.body, "\"role\":\"user\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp_full.body, "\"role\":\"agent\"") != null);
+}
+
+test "handleGetTask rejects negative historyLength" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "input", null);
+    defer task.deinit(testing.allocator);
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-neg","method":"tasks/get","params":{"id":"task-1","historyLength":-1}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "historyLength") != null);
+}
+
+test "handleListTasks rejects negative historyLength" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-list-neg","method":"ListTasks","params":{"historyLength":-1}}
+    ;
+    var mock = MockSessionManager{};
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "historyLength") != null);
+}
+
+test "buildTaskJson historyLength limits history output" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "test", null);
+    defer task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "reply")).?;
+    defer completed.deinit(testing.allocator);
+
+    // max_history=0: no history.
+    const json_0 = try buildTaskJson(testing.allocator, &completed, 0);
+    defer testing.allocator.free(json_0);
+    try testing.expect(std.mem.indexOf(u8, json_0, "\"history\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json_0, "\"artifacts\"") != null);
+
+    // max_history=1: only agent message.
+    const json_1 = try buildTaskJson(testing.allocator, &completed, 1);
+    defer testing.allocator.free(json_1);
+    try testing.expect(std.mem.indexOf(u8, json_1, "\"history\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_1, "\"role\":\"agent\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_1, "\"role\":\"user\"") == null);
+
+    // max_history=null: full history.
+    const json_full = try buildTaskJson(testing.allocator, &completed, null);
+    defer testing.allocator.free(json_full);
+    try testing.expect(std.mem.indexOf(u8, json_full, "\"role\":\"user\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_full, "\"role\":\"agent\"") != null);
+}
+
+test "handleCancelTask rejects rejected task" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task = try registry.createTask(testing.allocator, "already rejected", null);
+    defer task.deinit(testing.allocator);
+    try mutateStoredTask(&registry, task.id, .rejected, null, 50);
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-cancel-rejected","method":"tasks/cancel","params":{"id":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32002") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "terminal") != null);
+}
+
+test "buildResubscribeStatusEvent emits direct status update envelope" {
+    const event = try buildResubscribeStatusEvent(
+        testing.allocator,
+        "\"req-sub\"",
+        "task-1",
+        "ctx-1",
+        .working,
+        123,
+    );
+    defer testing.allocator.free(event);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, event, .{});
+    defer parsed.deinit();
+
+    const result = parsed.value.object.get("result") orelse return error.TestUnexpectedResult;
+    try testing.expect(result == .object);
+    try testing.expectEqualStrings("status-update", result.object.get("kind").?.string);
+    try testing.expectEqualStrings("working", result.object.get("status").?.object.get("state").?.string);
+    try testing.expectEqual(false, result.object.get("final").?.bool);
+}
+
+test "handleJsonRpc dispatches SendMessage alias" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-alias","method":"SendMessage","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"Hello alias"}]}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expectEqualStrings("200 OK", resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"result\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+}
+
+test "handleJsonRpc returns error for CreateTaskPushNotificationConfig alias" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-pn-alias","method":"CreateTaskPushNotificationConfig","params":{"taskId":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32003") != null);
 }

@@ -7,6 +7,7 @@ pub fn canonicalProviderName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "vertex-ai") or std.mem.eql(u8, name, "google-vertex")) return "vertex";
     if (std.mem.eql(u8, name, "claude-code")) return "claude-cli";
     if (std.mem.eql(u8, name, "azure-openai") or std.mem.eql(u8, name, "azure_openai")) return "azure";
+    if (std.mem.eql(u8, name, "novita-ai")) return "novita";
     return name;
 }
 
@@ -17,6 +18,7 @@ pub fn canonicalProviderNameIgnoreCase(name: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(name, "vertex-ai") or std.ascii.eqlIgnoreCase(name, "google-vertex")) return "vertex";
     if (std.ascii.eqlIgnoreCase(name, "claude-code")) return "claude-cli";
     if (std.ascii.eqlIgnoreCase(name, "azure-openai") or std.ascii.eqlIgnoreCase(name, "azure_openai")) return "azure";
+    if (std.ascii.eqlIgnoreCase(name, "novita-ai")) return "novita";
     return name;
 }
 
@@ -38,6 +40,7 @@ test "canonicalProviderName handles supported aliases" {
     try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
     try std.testing.expectEqualStrings("azure", canonicalProviderName("azure-openai"));
     try std.testing.expectEqualStrings("azure", canonicalProviderName("azure_openai"));
+    try std.testing.expectEqualStrings("novita", canonicalProviderName("novita-ai"));
 }
 
 test "providerNamesMatch handles aliases without broadening custom providers" {

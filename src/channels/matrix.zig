@@ -949,6 +949,97 @@ test "MatrixChannel parseSyncResponse marks m.direct rooms as direct chats" {
     try std.testing.expectEqualStrings("!dm:example", msgs[0].reply_target.?);
 }
 
+test "MatrixChannel parseSyncResponse keeps quiet two-member room as direct chat" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!dm:example",
+        &.{"@alice:example"},
+    );
+
+    const payload =
+        \\{
+        \\  "rooms": {
+        \\    "join": {
+        \\      "!dm:example": {
+        \\        "summary": {
+        \\          "m.joined_member_count": 2
+        \\        },
+        \\        "timeline": {
+        \\          "events": [
+        \\            {
+        \\              "type": "m.room.message",
+        \\              "sender": "@alice:example",
+        \\              "event_id": "$evt-dm",
+        \\              "content": { "msgtype": "m.text", "body": "hello dm" }
+        \\            }
+        \\          ]
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(!msgs[0].is_group);
+}
+
+test "MatrixChannel parseSyncResponse keeps invited three-member room as group chat" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!group:example",
+        &.{"@alice:example"},
+    );
+
+    const payload =
+        \\{
+        \\  "rooms": {
+        \\    "join": {
+        \\      "!group:example": {
+        \\        "summary": {
+        \\          "m.joined_member_count": 2,
+        \\          "m.invited_member_count": 1
+        \\        },
+        \\        "timeline": {
+        \\          "events": [
+        \\            {
+        \\              "type": "m.room.message",
+        \\              "sender": "@alice:example",
+        \\              "event_id": "$evt-group",
+        \\              "content": { "msgtype": "m.text", "body": "hello group" }
+        \\            }
+        \\          ]
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(msgs[0].is_group);
+}
+
 test "MatrixChannel parseSyncResponse allowlist and policy semantics" {
     const allocator = std.testing.allocator;
 

@@ -114,6 +114,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "perplexity", .label = "Perplexity", .default_model = "llama-4-sonar-small-128k-online", .env_var = "PERPLEXITY_API_KEY" },
 
     // --- Tier 6: Infrastructure providers ---
+    .{ .key = "novita", .label = "Novita AI (inference)", .default_model = "moonshotai/kimi-k2.5", .env_var = "NOVITA_API_KEY" },
     .{ .key = "nvidia", .label = "NVIDIA NIM (enterprise)", .default_model = "meta/llama-4-70b-instruct", .env_var = "NVIDIA_API_KEY" },
     .{ .key = "cloudflare", .label = "Cloudflare AI Gateway", .default_model = "meta/llama-4-70b-instruct", .env_var = "CLOUDFLARE_API_TOKEN" },
     .{ .key = "vercel-ai", .label = "Vercel AI Gateway", .default_model = "gpt-5.2", .env_var = "VERCEL_API_KEY" },
@@ -327,6 +328,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
     if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
+    if (std.mem.eql(u8, canonical, "novita")) return &novita_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
@@ -403,6 +405,11 @@ const deepseek_fallback = [_][]const u8{
     "deepseek-chat",
     "deepseek-reasoner",
 };
+const novita_fallback = [_][]const u8{
+    "moonshotai/kimi-k2.5",
+    "zai-org/glm-5",
+    "minimax/minimax-m2.5",
+};
 const ollama_fallback = [_][]const u8{
     "llama4",
     "llama3.2",
@@ -443,6 +450,7 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "minimax", .key = "minimax" },
     .{ .canonical = "cohere", .key = "cohere" },
     .{ .canonical = "perplexity", .key = "perplexity" },
+    .{ .canonical = "novita", .key = "novita-ai" },
     .{ .canonical = "nvidia", .key = "nvidia" },
     .{ .canonical = "bedrock", .key = "amazon-bedrock" },
     .{ .canonical = "copilot", .key = "github-copilot" },
@@ -3945,7 +3953,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 35);
+    try std.testing.expect(known_providers.len == 36);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -4445,6 +4453,7 @@ test "modelsDevProviderKey maps known providers" {
     try std.testing.expectEqualStrings("google", modelsDevProviderKey("gemini").?);
     try std.testing.expectEqualStrings("google-vertex", modelsDevProviderKey("vertex").?);
     try std.testing.expectEqualStrings("zai", modelsDevProviderKey("z.ai").?);
+    try std.testing.expectEqualStrings("novita-ai", modelsDevProviderKey("novita").?);
     try std.testing.expect(modelsDevProviderKey("ollama") == null);
 }
 

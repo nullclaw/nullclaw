@@ -53,6 +53,8 @@ The container stores its persistent state under `/nullclaw-data`:
 - config: `/nullclaw-data/config.json`
 - workspace: `/nullclaw-data/workspace`
 
+The bundled starter config already uses the current schema (`agents.defaults.model.primary` plus `models.providers`), so `latest` should boot cleanly before you customize provider credentials.
+
 ### Quick one-off commands
 
 ```bash

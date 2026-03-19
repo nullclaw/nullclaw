@@ -56,6 +56,7 @@ const PROVIDER_WINDOWS = [_]ContextWindowEntry{
     .{ .key = "vllm", .tokens = 128_000 },
     .{ .key = "github-copilot", .tokens = 128_000 },
     .{ .key = "qianfan", .tokens = 98_304 },
+    .{ .key = "novita", .tokens = 128_000 },
     .{ .key = "nvidia", .tokens = 131_072 },
 };
 

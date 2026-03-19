@@ -358,6 +358,10 @@ pub fn responseIsMessageTooLong(resp: []const u8) bool {
         std.mem.indexOf(u8, resp, "message is too long") != null;
 }
 
+pub fn responseIsDraftPeerInvalid(resp: []const u8) bool {
+    return std.mem.indexOf(u8, resp, "TEXTDRAFT_PEER_INVALID") != null;
+}
+
 pub fn parseRetryAfterSecs(allocator: std.mem.Allocator, resp: []const u8) ?u32 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
     defer parsed.deinit();
@@ -448,6 +452,15 @@ test "telegram api responseIsMessageTooLong matches telegram payloads" {
     ));
     try std.testing.expect(!responseIsMessageTooLong(
         "{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests\"}",
+    ));
+}
+
+test "telegram api responseIsDraftPeerInvalid matches telegram payloads" {
+    try std.testing.expect(responseIsDraftPeerInvalid(
+        "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: TEXTDRAFT_PEER_INVALID\"}",
+    ));
+    try std.testing.expect(!responseIsDraftPeerInvalid(
+        "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: MESSAGE_TOO_LONG\"}",
     ));
 }
 
