@@ -1011,18 +1011,10 @@ pub const WebChannel = struct {
             log.warn("Web channel start failed: message_auth_mode=token is supported only for local transport", .{});
             return error.InvalidConfiguration;
         }
-        if (self.transport == .local and !supportsLocalWebsocketServer()) {
-            log.warn("Web channel local transport is unsupported on Windows in this build; use transport=relay", .{});
-            return error.UnsupportedOperation;
-        }
         switch (self.transport) {
             .local => try self.startLocalTransport(),
             .relay => try self.startRelayTransport(),
         }
-    }
-
-    fn supportsLocalWebsocketServer() bool {
-        return builtin.os.tag != .windows;
     }
 
     fn ensureLocalTokenSourceCompatible(self: *const WebChannel, token_source: LocalTokenSource) !void {
@@ -1902,16 +1894,6 @@ test "WebChannel wsStart rejects token mode for relay transport" {
         .relay_url = "wss://relay.nullclaw.io/ws/agent",
     });
     try std.testing.expectError(error.InvalidConfiguration, ch.channel().vtable.start(ch.channel().ptr));
-}
-
-test "WebChannel wsStart rejects local transport on windows" {
-    if (builtin.os.tag != .windows) return;
-
-    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
-        .transport = "local",
-        .message_auth_mode = "pairing",
-    });
-    try std.testing.expectError(error.UnsupportedOperation, ch.channel().vtable.start(ch.channel().ptr));
 }
 
 test "WebChannel initFromConfig maps relay transport settings" {
