@@ -72,6 +72,7 @@ pub fn runTaskWithTools(
         .http_enabled = request.http_enabled,
         .http_allowed_domains = request.http_allowed_domains,
         .http_max_response_size = request.http_max_response_size,
+        .http_timeout_secs = request.http_timeout_secs,
         .allowed_paths = request.allowed_paths,
         .policy = &policy,
         .tools_config = request.tools_config,
@@ -108,18 +109,20 @@ pub fn runTaskWithTools(
             .enabled = request.http_enabled,
             .allowed_domains = request.http_allowed_domains,
             .max_response_size = request.http_max_response_size,
+            .timeout_secs = request.http_timeout_secs,
         },
         .tools = request.tools_config,
     };
 
     var noop_obs = observability.NoopObserver{};
+    const obs = request.observer orelse noop_obs.observer();
     var agent = try agent_mod.Agent.fromConfig(
         allocator,
         &cfg,
         provider_holder.provider(),
         tools,
         mem_opt,
-        noop_obs.observer(),
+        obs,
     );
     defer agent.deinit();
     agent.policy = &policy;
@@ -144,7 +147,7 @@ pub fn runTaskWithTools(
     agent.has_system_prompt = true;
     agent.system_prompt_has_conversation_context = false;
     agent.system_prompt_conversation_context_fingerprint = null;
-    agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap) catch null;
+    agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap, null) catch null;
 
     return agent.turn(request.task);
 }

@@ -60,6 +60,7 @@ const PROVIDER_MAX_TOKENS = [_]MaxTokensEntry{
     .{ .key = "vllm", .tokens = 8192 },
     .{ .key = "github-copilot", .tokens = 8192 },
     .{ .key = "qianfan", .tokens = 32_768 },
+    .{ .key = "novita", .tokens = 8192 },
     .{ .key = "nvidia", .tokens = 4096 },
     .{ .key = "byteplus", .tokens = 4096 },
     .{ .key = "doubao", .tokens = 4096 },

@@ -8,6 +8,7 @@ const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
+const mcp_mod = @import("../mcp.zig");
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -56,6 +57,18 @@ pub fn getStringArray(args: JsonObjectMap, key: []const u8) ?[]const JsonValue {
 /// The caller must `defer parsed.deinit()` and extract `.value.object` for the ObjectMap.
 pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
     return std.json.parseFromSlice(JsonValue, std.testing.allocator, json_str, .{});
+}
+
+threadlocal var tls_memory_session_id: ?[]const u8 = null;
+
+pub fn setThreadMemorySessionId(session_id: ?[]const u8) ?[]const u8 {
+    const previous = tls_memory_session_id;
+    tls_memory_session_id = session_id;
+    return previous;
+}
+
+pub fn threadMemorySessionId() ?[]const u8 {
+    return tls_memory_session_id;
 }
 
 // Sub-modules
@@ -288,7 +301,7 @@ pub fn allTools(
         composio_api_key: ?[]const u8 = null,
         browser_open_domains: ?[]const []const u8 = null,
         hardware_boards: ?[]const []const u8 = null,
-        mcp_tools: ?[]const Tool = null,
+        mcp_server_configs: []const @import("../config_types.zig").McpServerConfig = &.{},
         agents: ?[]const @import("../config.zig").NamedAgentConfig = null,
         configured_providers: []const @import("../config_types.zig").ProviderEntry = &.{},
         fallback_api_key: ?[]const u8 = null,
@@ -432,6 +445,7 @@ pub fn allTools(
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
             .max_response_size = opts.http_max_response_size,
+            .timeout_secs = opts.http_timeout_secs,
         };
         try list.append(allocator, ht.tool());
 
@@ -490,9 +504,15 @@ pub fn allTools(
         try list.append(allocator, i2ct.tool());
     }
 
-    // MCP tools (pre-initialized externally)
-    if (opts.mcp_tools) |mt| {
-        for (mt) |t| {
+    // MCP tools — connect to configured servers and register their tools.
+    if (opts.mcp_server_configs.len > 0) {
+        const mcp_tools = mcp_mod.initMcpTools(allocator, opts.mcp_server_configs) catch |err| blk: {
+            std.log.warn("allTools: MCP init failed: {}", .{err});
+            break :blk &[_]Tool{};
+        };
+        // mcp_tools backing slice is a temporary; append each Tool then free it.
+        defer allocator.free(mcp_tools);
+        for (mcp_tools) |t| {
             try list.append(allocator, t);
         }
     }
@@ -557,6 +577,7 @@ pub fn subagentTools(
         http_enabled: bool = false,
         http_allowed_domains: []const []const u8 = &.{},
         http_max_response_size: u32 = 1_000_000,
+        http_timeout_secs: u64 = 30,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         tools_config: @import("../config.zig").ToolsConfig = .{},
@@ -648,6 +669,7 @@ pub fn subagentTools(
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
             .max_response_size = opts.http_max_response_size,
+            .timeout_secs = opts.http_timeout_secs,
         };
         try list.append(allocator, ht.tool());
     }
@@ -844,6 +866,7 @@ test "all tools wires http and web_search config into tool instances" {
             try std.testing.expectEqual(@as(usize, 2), ht.allowed_domains.len);
             try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
             try std.testing.expectEqual(@as(u32, 321_000), ht.max_response_size);
+            try std.testing.expectEqual(@as(u64, 12), ht.timeout_secs);
             saw_http = true;
             continue;
         }
@@ -1028,12 +1051,13 @@ test "subagent tools wire bootstrap provider into file_read for sqlite backends"
     try std.testing.expect(checked);
 }
 
-test "subagent tools wire http allowlist and response limit" {
+test "subagent tools wire http allowlist, response limit, and timeout" {
     const domains = [_][]const u8{"example.com"};
     const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
         .http_enabled = true,
         .http_allowed_domains = &domains,
         .http_max_response_size = 2222,
+        .http_timeout_secs = 17,
     });
     defer deinitTools(std.testing.allocator, tools);
 
@@ -1044,6 +1068,7 @@ test "subagent tools wire http allowlist and response limit" {
         try std.testing.expectEqual(@as(usize, 1), ht.allowed_domains.len);
         try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
         try std.testing.expectEqual(@as(u32, 2222), ht.max_response_size);
+        try std.testing.expectEqual(@as(u64, 17), ht.timeout_secs);
         saw_http = true;
         break;
     }

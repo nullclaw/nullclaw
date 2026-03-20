@@ -47,15 +47,20 @@ pub const EmailChannel = struct {
     pub fn isSenderAllowed(self: *const EmailChannel, email_addr: []const u8) bool {
         if (self.config.allow_from.len == 0) return false;
 
+        var matched = false;
+        var wildcard_seen = false;
         for (self.config.allow_from) |allowed| {
-            if (std.mem.eql(u8, allowed, "*")) return true;
+            if (std.mem.eql(u8, allowed, "*")) {
+                wildcard_seen = true;
+                continue;
+            }
 
             if (allowed.len > 0 and allowed[0] == '@') {
                 // Domain match with @ prefix: "@example.com"
-                if (std.ascii.endsWithIgnoreCase(email_addr, allowed)) return true;
+                if (std.ascii.endsWithIgnoreCase(email_addr, allowed)) matched = true;
             } else if (std.mem.indexOf(u8, allowed, "@") != null) {
                 // Full email address match
-                if (std.ascii.eqlIgnoreCase(allowed, email_addr)) return true;
+                if (std.ascii.eqlIgnoreCase(allowed, email_addr)) matched = true;
             } else {
                 // Domain match without @: "example.com" -> match @example.com
                 if (email_addr.len > allowed.len + 1) {
@@ -63,12 +68,16 @@ pub const EmailChannel = struct {
                     if (email_addr[suffix_start] == '@' and
                         std.ascii.eqlIgnoreCase(email_addr[suffix_start + 1 ..], allowed))
                     {
-                        return true;
+                        matched = true;
                     }
                 }
             }
         }
-        return false;
+        if (wildcard_seen) {
+            root.warnWildcardAllowAll("email channel");
+            return true;
+        }
+        return matched;
     }
 
     pub fn healthCheck(_: *EmailChannel) bool {
@@ -580,6 +589,16 @@ test "email sender wildcard with specific" {
     const senders = [_][]const u8{ "alice@example.com", "*" };
     const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
     try std.testing.expect(ch.isSenderAllowed("anyone@anything.com"));
+}
+
+test "email sender exact match still triggers wildcard warning" {
+    root.resetWildcardWarningForTest("email channel");
+    defer root.resetWildcardWarningForTest("email channel");
+
+    const senders = [_][]const u8{ "alice@example.com", "*" };
+    const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
+    try std.testing.expect(ch.isSenderAllowed("alice@example.com"));
+    try std.testing.expect(root.wildcardWarningTriggeredForTest("email channel"));
 }
 
 test "email sender short address not domain match" {

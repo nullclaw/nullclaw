@@ -1547,11 +1547,68 @@ fn isRecoverableCronStoreError(err: anyerror) bool {
 
 // ── CLI entry points (called from main.zig) ──────────────────────
 
+const SchedulerStatus = struct {
+    config_exists: bool,
+    scheduler_enabled: bool,
+    daemon_state_present: bool,
+    config_probe_error: ?[]const u8 = null,
+};
+
+fn absolutePathExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn probeSchedulerStatus(config_path: []const u8, daemon_state_path: []const u8, scheduler_enabled: bool) SchedulerStatus {
+    return .{
+        .config_exists = absolutePathExists(config_path),
+        .scheduler_enabled = scheduler_enabled,
+        .daemon_state_present = absolutePathExists(daemon_state_path),
+    };
+}
+
 /// CLI: list all cron jobs.
+fn checkSchedulerStatus(allocator: std.mem.Allocator) SchedulerStatus {
+    var config_opt = @import("config.zig").Config.load(allocator) catch |err| {
+        return .{
+            .config_exists = false,
+            .scheduler_enabled = false,
+            .daemon_state_present = false,
+            .config_probe_error = @errorName(err),
+        };
+    };
+    defer config_opt.deinit();
+
+    const daemon_state_path = @import("daemon.zig").stateFilePath(allocator, &config_opt) catch {
+        return .{
+            .config_exists = absolutePathExists(config_opt.config_path),
+            .scheduler_enabled = config_opt.scheduler.enabled,
+            .daemon_state_present = false,
+        };
+    };
+    defer allocator.free(daemon_state_path);
+
+    return probeSchedulerStatus(config_opt.config_path, daemon_state_path, config_opt.scheduler.enabled);
+}
+
 pub fn cliListJobs(allocator: std.mem.Allocator) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
+
+    // Check scheduler status and warn user if needed.
+    const sched_status = checkSchedulerStatus(allocator);
+    if (sched_status.config_probe_error) |err_name| {
+        log.warn("Cannot inspect scheduler config: {s}", .{err_name});
+    } else if (!sched_status.config_exists) {
+        log.warn("Config file not found. Run `nullclaw onboard` first.", .{});
+    } else if (!sched_status.scheduler_enabled) {
+        log.warn("Cron scheduler is DISABLED in config. Jobs will not run automatically.", .{});
+        log.warn("Enable with: scheduler.enabled = true in config, then restart daemon.", .{});
+    } else if (!sched_status.daemon_state_present) {
+        log.warn("Daemon state file not found. Cron jobs will not run until the daemon starts.", .{});
+        log.warn("Start with: nullclaw gateway or nullclaw service start", .{});
+    }
 
     const jobs = scheduler.listJobs();
     if (jobs.len == 0) {
@@ -1559,6 +1616,10 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
         log.info("Usage:", .{});
         log.info("  nullclaw cron add '*/10 * * * *' 'echo hello'", .{});
         log.info("  nullclaw cron once 30m 'echo reminder'", .{});
+        if (sched_status.config_exists and sched_status.scheduler_enabled and sched_status.daemon_state_present) {
+            log.info("Scheduler is configured and has written a state file.", .{});
+            log.info("Run `nullclaw doctor` to verify live daemon health.", .{});
+        }
         return;
     }
 
@@ -1580,6 +1641,54 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
             flags,
             job.command,
         });
+    }
+}
+
+/// CLI: show scheduler daemon status and diagnostics.
+pub fn cliStatus(allocator: std.mem.Allocator) !void {
+    const sched_status = checkSchedulerStatus(allocator);
+
+    log.info("Cron Scheduler Status:", .{});
+
+    if (sched_status.config_probe_error) |err_name| {
+        log.info("  Config probe:      error ({s})", .{err_name});
+        return;
+    }
+
+    log.info("  Config file:       {s}", .{if (sched_status.config_exists) "present" else "missing"});
+    log.info("  Scheduler enabled: {s}", .{if (sched_status.scheduler_enabled) "yes" else "no"});
+    log.info("  Daemon state file: {s}", .{if (sched_status.daemon_state_present) "present" else "missing"});
+
+    if (!sched_status.config_exists) {
+        log.info("  Status: missing configuration; run `nullclaw onboard` first", .{});
+    } else if (!sched_status.scheduler_enabled) {
+        log.info("  Status: scheduler disabled in config", .{});
+        log.info("  Fix: Set scheduler.enabled = true in config, then restart", .{});
+    } else if (!sched_status.daemon_state_present) {
+        log.info("  Status: no daemon state file found yet", .{});
+        log.info("  Fix: Start daemon with `nullclaw gateway` or `nullclaw service start`", .{});
+    } else {
+        log.info("  Status: configured; run `nullclaw doctor` for live daemon health", .{});
+    }
+
+    // Show job count
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+    const jobs = scheduler.listJobs();
+    log.info("  Jobs loaded: {d} total", .{jobs.len});
+
+    if (jobs.len > 0) {
+        var enabled_count: usize = 0;
+        var paused_count: usize = 0;
+        for (jobs) |job| {
+            if (job.paused) {
+                paused_count += 1;
+            } else {
+                enabled_count += 1;
+            }
+        }
+        log.info("    - {d} active, {d} paused", .{ enabled_count, paused_count });
     }
 }
 
@@ -2777,6 +2886,60 @@ test "DeliveryMode parse and asStr" {
     try std.testing.expectEqualStrings("on_success", DeliveryMode.on_success.asStr());
 }
 
+test "probeSchedulerStatus reports missing config file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+    const daemon_state_path = try std.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    defer allocator.free(daemon_state_path);
+
+    const status = probeSchedulerStatus(config_path, daemon_state_path, true);
+    try std.testing.expect(!status.config_exists);
+    try std.testing.expect(status.scheduler_enabled);
+    try std.testing.expect(!status.daemon_state_present);
+    try std.testing.expect(status.config_probe_error == null);
+}
+
+test "probeSchedulerStatus reports config and daemon state files independently" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+    const daemon_state_path = try std.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    defer allocator.free(daemon_state_path);
+
+    {
+        const file = try std.fs.createFileAbsolute(config_path, .{});
+        defer file.close();
+        try file.writeAll("{}\n");
+    }
+
+    var status = probeSchedulerStatus(config_path, daemon_state_path, false);
+    try std.testing.expect(status.config_exists);
+    try std.testing.expect(!status.scheduler_enabled);
+    try std.testing.expect(!status.daemon_state_present);
+
+    {
+        const file = try std.fs.createFileAbsolute(daemon_state_path, .{});
+        defer file.close();
+        try file.writeAll("{\"status\":\"running\"}\n");
+    }
+
+    status = probeSchedulerStatus(config_path, daemon_state_path, false);
+    try std.testing.expect(status.config_exists);
+    try std.testing.expect(!status.scheduler_enabled);
+    try std.testing.expect(status.daemon_state_present);
+}
+
 test "tick without bus still executes jobs" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
@@ -2823,5 +2986,3 @@ test "tick reschedules anchored recurring job using cron expression" {
     _ = scheduler.tick(3480, null);
     try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
 }
-
-test "cron module compiles" {}

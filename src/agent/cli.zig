@@ -6,6 +6,8 @@
 const std = @import("std");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
+const config_types = @import("../config_types.zig");
+const agent_routing = @import("../agent_routing.zig");
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
 const http_util = @import("../http_util.zig");
@@ -31,6 +33,23 @@ const Agent = @import("root.zig").Agent;
 const CliStreamCtx = struct {
     sink: streaming.Sink,
     emitted_text: bool = false,
+};
+
+const CliProviderContext = struct {
+    provider: Provider,
+    holder: ?providers.ProviderHolder = null,
+    owned_api_key: ?[]u8 = null,
+
+    fn deinit(self: *CliProviderContext, allocator: std.mem.Allocator) void {
+        if (self.holder) |*holder| {
+            holder.deinit();
+            self.holder = null;
+        }
+        if (self.owned_api_key) |api_key| {
+            allocator.free(api_key);
+            self.owned_api_key = null;
+        }
+    }
 };
 
 fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
@@ -126,6 +145,7 @@ const ParsedAgentArgs = struct {
     provider_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
     temperature_override: ?f64 = null,
+    agent_name: ?[]const u8 = null,
     verbose: bool = false,
 };
 
@@ -161,11 +181,66 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             i += 1;
             const temp = std.fmt.parseFloat(f64, args[i]) catch return .{ .invalid_temperature = args[i] };
             parsed.temperature_override = temp;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.agent_name = args[i];
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
         }
     }
     return .{ .ok = parsed };
+}
+
+fn findNamedAgentProfile(agents: []const config_types.NamedAgentConfig, requested_name: []const u8) ?config_types.NamedAgentConfig {
+    for (agents) |agent_cfg| {
+        if (std.mem.eql(u8, agent_cfg.name, requested_name)) return agent_cfg;
+
+        var requested_buf: [64]u8 = undefined;
+        var agent_buf: [64]u8 = undefined;
+        const normalized_requested = agent_routing.normalizeId(&requested_buf, requested_name);
+        const normalized_agent = agent_routing.normalizeId(&agent_buf, agent_cfg.name);
+        if (std.mem.eql(u8, normalized_requested, normalized_agent)) return agent_cfg;
+    }
+    return null;
+}
+
+fn profileMemoryNamespace(allocator: std.mem.Allocator, profile_name: []const u8) ![]u8 {
+    var normalized_buf: [64]u8 = undefined;
+    const normalized_name = agent_routing.normalizeId(&normalized_buf, profile_name);
+    return std.fmt.allocPrint(allocator, "agent:{s}", .{normalized_name});
+}
+
+fn resolveProfileProvider(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    profile: config_types.NamedAgentConfig,
+) !CliProviderContext {
+    var owned_api_key: ?[]u8 = null;
+    errdefer if (owned_api_key) |api_key| allocator.free(api_key);
+
+    const provider_api_key = profile.api_key orelse blk: {
+        owned_api_key = providers.resolveApiKeyFromConfig(
+            allocator,
+            profile.provider,
+            cfg.providers,
+        ) catch null;
+        break :blk owned_api_key;
+    };
+
+    var holder = providers.ProviderHolder.fromConfig(
+        allocator,
+        profile.provider,
+        provider_api_key,
+        cfg.getProviderBaseUrl(profile.provider),
+        cfg.getProviderNativeTools(profile.provider),
+        cfg.getProviderUserAgent(profile.provider),
+    );
+    return .{
+        .provider = holder.provider(),
+        .holder = holder,
+        .owned_api_key = owned_api_key,
+    };
 }
 
 /// Run the agent in single-message or interactive REPL mode.
@@ -189,18 +264,54 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         },
     };
     if (parsed_args.provider_override) |provider| {
-        cfg.default_provider = provider;
+        if (parsed_args.agent_name == null) {
+            cfg.default_provider = provider;
+        }
     }
     if (parsed_args.model_override) |model| {
-        cfg.default_model = model;
+        if (parsed_args.agent_name == null) {
+            cfg.default_model = model;
+        }
     }
     if (parsed_args.temperature_override) |temp| {
-        cfg.default_temperature = temp;
-        cfg.temperature = temp;
+        if (parsed_args.agent_name == null) {
+            cfg.default_temperature = temp;
+            cfg.temperature = temp;
+        }
     }
     if (parsed_args.verbose) {
         log.warn("Verbose flag detected, enabling verbose logging", .{});
         verbose.setVerbose(true);
+    }
+
+    var selected_profile_storage: ?config_types.NamedAgentConfig = null;
+    if (parsed_args.agent_name) |agent_name| {
+        const found_profile = findNamedAgentProfile(cfg.agents, agent_name) orelse {
+            log.err("Unknown named agent profile: {s}", .{agent_name});
+            return;
+        };
+        var adjusted_profile = found_profile;
+        if (parsed_args.provider_override) |provider| adjusted_profile.provider = provider;
+        if (parsed_args.model_override) |model| adjusted_profile.model = model;
+        if (parsed_args.temperature_override) |temp| adjusted_profile.temperature = temp;
+        selected_profile_storage = adjusted_profile;
+    }
+
+    var selected_workspace_dir: ?[]const u8 = null;
+    defer if (selected_workspace_dir) |workspace_dir| allocator.free(workspace_dir);
+    if (selected_profile_storage) |profile| {
+        if (profile.workspace_path) |workspace_path| {
+            selected_workspace_dir = try cfg.resolveAgentWorkspacePath(allocator, workspace_path);
+            cfg.workspace_dir = selected_workspace_dir.?;
+        }
+    }
+
+    var agent_memory_session_id: ?[]u8 = null;
+    defer if (agent_memory_session_id) |memory_session_id| allocator.free(memory_session_id);
+    if (selected_profile_storage) |profile| {
+        if (profile.workspace_path != null) {
+            agent_memory_session_id = try profileMemoryNamespace(allocator, profile.name);
+        }
     }
 
     cfg.validate() catch |err| {
@@ -224,27 +335,26 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const message_arg = parsed_args.message_arg;
     const session_id = parsed_args.session_id;
 
-    // Create a noop observer
-    var noop = observability.NoopObserver{};
-    const obs = noop.observer();
+    const runtime_observer = try observability.RuntimeObserver.create(
+        allocator,
+        .{
+            .workspace_dir = cfg.workspace_dir,
+            .backend = cfg.diagnostics.backend,
+            .otel_endpoint = cfg.diagnostics.otel_endpoint,
+            .otel_service_name = cfg.diagnostics.otel_service_name,
+        },
+        cfg.diagnostics.otel_headers,
+        &.{},
+    );
+    defer runtime_observer.destroy();
+    const obs = runtime_observer.observer();
 
     // Record agent start
     const start_event = ObserverEvent{ .agent_start = .{
-        .provider = cfg.default_provider,
-        .model = cfg.default_model orelse "(default)",
+        .provider = if (selected_profile_storage) |profile| profile.provider else cfg.default_provider,
+        .model = if (selected_profile_storage) |profile| profile.model else (cfg.default_model orelse "(default)"),
     } };
     obs.recordEvent(&start_event);
-
-    // Initialize MCP tools from config
-    const mcp_mod = @import("../mcp.zig");
-    const mcp_tools: ?[]const tools_mod.Tool = if (cfg.mcp_servers.len > 0)
-        mcp_mod.initMcpTools(allocator, cfg.mcp_servers) catch |err| blk: {
-            log.warn("MCP: init failed: {}", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
 
     // Build security policy from config
     var tracker = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
@@ -262,12 +372,24 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tracker = &tracker,
     };
 
-    // Provider runtime bundle (primary provider + reliability wrapper).
-    var runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
-    defer runtime_provider.deinit();
-    const resolved_api_key = runtime_provider.primaryApiKey();
+    var runtime_provider: ?providers.runtime_bundle.RuntimeProviderBundle = null;
+    defer if (runtime_provider) |*bundle| bundle.deinit();
+    var provider_ctx: ?CliProviderContext = null;
+    defer if (provider_ctx) |*ctx| ctx.deinit(allocator);
+
+    if (selected_profile_storage) |profile| {
+        provider_ctx = try resolveProfileProvider(allocator, &cfg, profile);
+    } else {
+        runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
+    }
+
+    const resolved_api_key = if (provider_ctx) |ctx|
+        (ctx.owned_api_key orelse selected_profile_storage.?.api_key)
+    else
+        runtime_provider.?.primaryApiKey();
 
     var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+    subagent_manager.observer = runtime_observer.backendObserver();
     subagent_manager.task_runner = subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
@@ -304,7 +426,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
         .browser_enabled = cfg.browser.enabled,
         .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
+        .mcp_server_configs = cfg.mcp_servers,
         .agents = cfg.agents,
         .configured_providers = cfg.providers,
         .fallback_api_key = resolved_api_key,
@@ -325,8 +447,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         tools_mod.bindMemoryRuntime(tools, rt);
     }
 
-    // Provider interface from runtime bundle (includes retries/fallbacks).
-    const provider_i: Provider = runtime_provider.provider();
+    const provider_i: Provider = if (provider_ctx) |ctx| ctx.provider else runtime_provider.?.provider();
 
     const supports_streaming = provider_i.supportsStreaming();
 
@@ -335,13 +456,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Keep subprocess runs quiet by default; cron and other callers
         // consume this mode programmatically and should only see the response.
         if (verbose.isVerbose()) {
-            log.info("Sending to {s}...", .{cfg.default_provider});
+            log.info("Sending to {s}...", .{if (selected_profile_storage) |profile| profile.provider else cfg.default_provider});
             if (session_id) |sid| {
                 log.info("Session: {s}", .{sid});
             }
         }
 
-        var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
+        var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
         agent.policy = &policy;
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
@@ -351,6 +472,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         if (session_id) |sid| {
             agent.memory_session_id = sid;
+        } else if (agent_memory_session_id) |memory_session_id| {
+            agent.memory_session_id = memory_session_id;
         }
         defer agent.deinit();
 
@@ -403,8 +526,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     cfg.printModelConfig();
     try w.print("nullclaw Agent -- Interactive Mode\n", .{});
     try w.print("Provider: {s} | Model: {s}\n", .{
-        cfg.default_provider,
-        cfg.default_model orelse "(default)",
+        if (selected_profile_storage) |profile| profile.provider else cfg.default_provider,
+        if (selected_profile_storage) |profile| profile.model else (cfg.default_model orelse "(default)"),
     });
     if (session_id) |sid| {
         try w.print("Session: {s}\n", .{sid});
@@ -447,7 +570,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         try w.flush();
     }
 
-    var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
     agent.policy = &policy;
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
@@ -457,6 +580,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     if (session_id) |sid| {
         agent.memory_session_id = sid;
+    } else if (agent_memory_session_id) |memory_session_id| {
+        agent.memory_session_id = memory_session_id;
     }
     defer agent.deinit();
 
@@ -630,6 +755,24 @@ test "parseAgentArgs returns error for invalid temperature value" {
     };
     switch (parseAgentArgs(&args)) {
         .invalid_temperature => |value| try std.testing.expectEqualStrings("hot", value),
+        else => unreachable,
+    }
+}
+
+test "parseAgentArgs parses --agent" {
+    const args = [_][]const u8{ "--agent", "researcher", "-m", "hello" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings("researcher", parsed.agent_name.?);
+    try std.testing.expectEqualStrings("hello", parsed.message_arg.?);
+}
+
+test "parseAgentArgs returns missing value for --agent" {
+    const args = [_][]const u8{"--agent"};
+    switch (parseAgentArgs(&args)) {
+        .missing_value => |value| try std.testing.expectEqualStrings("--agent", value),
         else => unreachable,
     }
 }

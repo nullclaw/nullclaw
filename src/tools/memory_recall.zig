@@ -37,6 +37,10 @@ pub const MemoryRecallTool = struct {
 
         const limit_raw = root.getInt(args, "limit") orelse 5;
         const limit: usize = if (limit_raw > 0 and limit_raw <= 100) @intCast(limit_raw) else 5;
+        const session_id = if (root.getString(args, "session_id")) |sid_raw|
+            if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
+        else
+            root.threadMemorySessionId();
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot search for: {s}", .{query});
@@ -46,7 +50,7 @@ pub const MemoryRecallTool = struct {
         // Use retrieval engine (hybrid pipeline) when MemoryRuntime is available,
         // fall back to raw mem.recall() otherwise.
         if (self.mem_rt) |rt| {
-            const candidates = rt.search(allocator, query, limit, null) catch |err| {
+            const candidates = rt.search(allocator, query, limit, session_id) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to search memories for '{s}': {s}", .{ query, @errorName(err) });
                 return ToolResult{ .success = false, .output = msg };
             };
@@ -61,7 +65,7 @@ pub const MemoryRecallTool = struct {
             return formatCandidates(allocator, candidates, visible_candidates);
         }
 
-        const entries = m.recall(allocator, query, limit, null) catch |err| {
+        const entries = m.recall(allocator, query, limit, session_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };

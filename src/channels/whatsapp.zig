@@ -57,7 +57,7 @@ pub const WhatsAppChannel = struct {
 
     /// Check if a phone number is allowed (E.164 format: +1234567890).
     pub fn isNumberAllowed(self: *const WhatsAppChannel, phone: []const u8) bool {
-        return root.isAllowed(self.allow_from, phone);
+        return root.isAllowedScoped("whatsapp channel", self.allow_from, phone);
     }
 
     /// Normalize a phone number to E.164 (prepend + if missing).
@@ -133,7 +133,7 @@ pub const WhatsAppChannel = struct {
                             else
                                 self.allow_from;
                             if (effective_allow_from.len == 0) continue;
-                            if (!root.isAllowed(effective_allow_from, normalized)) continue;
+                            if (!root.isAllowedScoped("whatsapp channel", effective_allow_from, normalized)) continue;
                         }
                     }
 

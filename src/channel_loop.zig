@@ -10,12 +10,12 @@ const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
 const session_mod = @import("session.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const providers = @import("providers/root.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
-const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
@@ -144,7 +144,7 @@ pub fn buildTelegramBindingStatusReply(
     const exact_binding = agent_bindings_config.findExactPeerBinding(config.agent_bindings, current_target);
     const inherited_binding = agent_bindings_config.findInheritedPeerBinding(config.agent_bindings, current_target);
 
-    const route = try agent_routing.resolveRoute(allocator, .{
+    const route = try agent_routing.resolveRouteWithSession(allocator, .{
         .channel = "telegram",
         .account_id = account_id,
         .peer = .{
@@ -158,7 +158,7 @@ pub fn buildTelegramBindingStatusReply(
             }
         else
             null,
-    }, config.agent_bindings, config.agents);
+    }, config.agent_bindings, config.agents, config.session);
     defer allocator.free(route.session_key);
     defer allocator.free(route.main_session_key);
 
@@ -384,7 +384,7 @@ fn resolveTelegramBaseRouteKey(
     var topic_peer_id: ?[]u8 = null;
     defer if (topic_peer_id) |owned| allocator.free(owned);
 
-    const route = try agent_routing.resolveRoute(allocator, .{
+    const route = try agent_routing.resolveRouteWithSession(allocator, .{
         .channel = "telegram",
         .account_id = account_id,
         .peer = .{
@@ -401,9 +401,9 @@ fn resolveTelegramBaseRouteKey(
             }
         else
             null,
-    }, config.agent_bindings, config.agents);
+    }, config.agent_bindings, config.agents, config.session);
     defer allocator.free(route.session_key);
-    allocator.free(route.main_session_key);
+    defer allocator.free(route.main_session_key);
 
     return agent_routing.buildSessionKeyWithScope(
         allocator,
@@ -750,11 +750,13 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context: ?ConversationContext = .{
+    const conversation_context = buildConversationContext(.{
         .channel = "telegram",
+        .account_id = tg_ptr.account_id,
+        .peer_id = sender,
         .is_group = is_group,
         .group_id = if (is_group) sender else null,
-    };
+    });
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -768,7 +770,7 @@ fn processTelegramMessage(
         log.err("Agent error: {}", .{err});
         tg_ptr.setTaskReaction(sender, message_id, .failed);
         const err_msg: []const u8 = switch (err) {
-            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
             error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
             error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
             error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -1028,7 +1030,7 @@ pub const ChannelRuntime = struct {
     tools: []const tools_mod.Tool,
     mem_rt: ?memory_mod.MemoryRuntime,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
-    noop_obs: *observability.NoopObserver,
+    runtime_observer: *observability.RuntimeObserver,
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
@@ -1040,16 +1042,6 @@ pub const ChannelRuntime = struct {
 
         const provider_i = runtime_provider.provider();
         const resolved_key = runtime_provider.primaryApiKey();
-
-        // MCP tools
-        const mcp_tools: ?[]const tools_mod.Tool = if (config.mcp_servers.len > 0)
-            mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-                log.warn("MCP init failed: {}", .{err});
-                break :blk null;
-            }
-        else
-            null;
-        defer if (mcp_tools) |mt| allocator.free(mt);
 
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
@@ -1105,7 +1097,7 @@ pub const ChannelRuntime = struct {
             .web_search_fallback_providers = config.http_request.search_fallback_providers,
             .browser_enabled = config.browser.enabled,
             .screenshot_enabled = true,
-            .mcp_tools = mcp_tools,
+            .mcp_server_configs = config.mcp_servers,
             .agents = config.agents,
             .configured_providers = config.providers,
             .fallback_api_key = resolved_key,
@@ -1118,11 +1110,22 @@ pub const ChannelRuntime = struct {
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
-        // Noop observer (heap for vtable stability)
-        const noop_obs = try allocator.create(observability.NoopObserver);
-        errdefer allocator.destroy(noop_obs);
-        noop_obs.* = .{};
-        const obs = noop_obs.observer();
+        const runtime_observer = try observability.RuntimeObserver.create(
+            allocator,
+            .{
+                .workspace_dir = config.workspace_dir,
+                .backend = config.diagnostics.backend,
+                .otel_endpoint = config.diagnostics.otel_endpoint,
+                .otel_service_name = config.diagnostics.otel_service_name,
+            },
+            config.diagnostics.otel_headers,
+            &.{},
+        );
+        errdefer runtime_observer.destroy();
+        const obs = runtime_observer.observer();
+        if (subagent_manager) |mgr| {
+            mgr.observer = runtime_observer.backendObserver();
+        }
 
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -1138,7 +1141,7 @@ pub const ChannelRuntime = struct {
             .tools = tools,
             .mem_rt = mem_rt,
             .bootstrap_provider = bootstrap_provider,
-            .noop_obs = noop_obs,
+            .runtime_observer = runtime_observer,
             .subagent_manager = subagent_manager,
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
@@ -1167,7 +1170,7 @@ pub const ChannelRuntime = struct {
         self.policy_tracker.deinit();
         alloc.destroy(self.security_policy);
         alloc.destroy(self.policy_tracker);
-        alloc.destroy(self.noop_obs);
+        self.runtime_observer.destroy();
         alloc.destroy(self);
     }
 };
@@ -1578,18 +1581,20 @@ pub fn runSignalLoop(
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
 
             // Build conversation context for Signal
-            const conversation_context: ?ConversationContext = .{
+            const conversation_context = buildConversationContext(.{
                 .channel = "signal",
+                .account_id = sg_ptr.account_id,
                 .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
                 .sender_uuid = msg.sender_uuid,
+                .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                 .group_id = msg.group_id,
                 .is_group = msg.is_group,
-            };
+            });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Signal agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -1812,10 +1817,18 @@ pub fn runMatrixLoop(
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const conversation_context = buildConversationContext(.{
+                .channel = "matrix",
+                .account_id = mx_ptr.account_id,
+                .peer_id = if (msg.is_group) room_peer_id else msg.sender,
+                .is_group = msg.is_group,
+                .group_id = if (msg.is_group) room_peer_id else null,
+            });
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -1945,11 +1958,13 @@ pub fn runMaxLoop(
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};
 
-            const conversation_context: ?ConversationContext = .{
+            const conversation_context = buildConversationContext(.{
                 .channel = "max",
+                .account_id = mx_ptr.account_id,
+                .peer_id = if (msg.is_group) reply_target else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) reply_target else null,
-            };
+            });
 
             var stream_ctx = max_mod.MaxChannel.StreamCtx{
                 .max_ptr = mx_ptr,
@@ -1960,7 +1975,7 @@ pub fn runMaxLoop(
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
                 log.err("Max agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -2279,6 +2294,24 @@ test "resolveTelegramBaseRouteKey falls back to base telegram group binding for 
     try std.testing.expectEqualStrings("agent:group-agent:telegram:group:-100123", key);
 }
 
+test "resolveTelegramBaseRouteKey auto-provisions direct telegram peers" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .session = .{
+            .auto_provision_direct_agents = true,
+        },
+    };
+
+    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "123456", null, false);
+    defer allocator.free(key);
+
+    try std.testing.expect(std.mem.startsWith(u8, key, "agent:peer-"));
+    try std.testing.expect(std.mem.endsWith(u8, key, ":telegram:direct:123456"));
+}
+
 test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bindings" {
     const allocator = std.testing.allocator;
     const agents = [_]config_types.NamedAgentConfig{
@@ -2318,6 +2351,24 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
     try std.testing.expect(std.mem.indexOf(u8, reply, "Exact binding: coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Inherited peer binding: reviewer") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: peer") != null);
+}
+
+test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provisioned dm" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .session = .{
+            .auto_provision_direct_agents = true,
+        },
+    };
+
+    const reply = try buildTelegramBindingStatusReply(allocator, &cfg, "main", "123456", false);
+    defer allocator.free(reply);
+
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Effective agent: peer-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: default") != null);
 }
 
 test "telegram update offset store roundtrip" {

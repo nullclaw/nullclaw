@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const root = @import("../root.zig");
+const key_codec = @import("../vector/key_codec.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
@@ -95,6 +96,59 @@ pub const InMemoryLruMemory = struct {
         };
     }
 
+    fn cloneEntry(allocator: std.mem.Allocator, e: StoredEntry) !MemoryEntry {
+        const id = try allocator.dupe(u8, e.key);
+        errdefer allocator.free(id);
+        const dup_key = try allocator.dupe(u8, e.key);
+        errdefer allocator.free(dup_key);
+        const dup_content = try allocator.dupe(u8, e.content);
+        errdefer allocator.free(dup_content);
+        const dup_cat: MemoryCategory = switch (e.category) {
+            .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+            else => e.category,
+        };
+        errdefer switch (dup_cat) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+        const dup_ts = try allocator.dupe(u8, e.updated_at);
+        errdefer allocator.free(dup_ts);
+        const dup_sid = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null;
+        errdefer if (dup_sid) |sid| allocator.free(sid);
+
+        return .{
+            .id = id,
+            .key = dup_key,
+            .content = dup_content,
+            .category = dup_cat,
+            .timestamp = dup_ts,
+            .session_id = dup_sid,
+            .score = null,
+        };
+    }
+
+    fn findDefaultEntryPtr(self: *Self, key: []const u8) ?*StoredEntry {
+        var best: ?*StoredEntry = null;
+        var best_is_global = false;
+        var best_access: u64 = 0;
+
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (!std.mem.eql(u8, kv.value_ptr.key, key)) continue;
+            const is_global = kv.value_ptr.session_id == null;
+            if (best == null or
+                (is_global and !best_is_global) or
+                (is_global == best_is_global and kv.value_ptr.last_access > best_access))
+            {
+                best = kv.value_ptr;
+                best_is_global = is_global;
+                best_access = kv.value_ptr.last_access;
+            }
+        }
+
+        return best;
+    }
+
     // ── vtable impl fns ────────────────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -103,8 +157,11 @@ pub const InMemoryLruMemory = struct {
 
     fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const storage_key = try key_codec.encode(self_.allocator, key, session_id);
+        errdefer self_.allocator.free(storage_key);
 
-        if (self_.entries.getPtr(key)) |existing| {
+        if (self_.entries.getPtr(storage_key)) |existing| {
+            defer self_.allocator.free(storage_key);
             // Upsert: update existing entry in-place.
             self_.allocator.free(existing.content);
             existing.content = try self_.allocator.dupe(u8, content);
@@ -132,9 +189,6 @@ pub const InMemoryLruMemory = struct {
         if (self_.entries.count() >= self_.max_entries) {
             self_.evictLru();
         }
-
-        const owned_key = try self_.allocator.dupe(u8, key);
-        errdefer self_.allocator.free(owned_key);
 
         const ts = try self_.nowTimestamp();
         errdefer self_.allocator.free(ts);
@@ -167,7 +221,7 @@ pub const InMemoryLruMemory = struct {
             .last_access = self_.nextAccess(),
         };
 
-        try self_.entries.put(self_.allocator, owned_key, stored);
+        try self_.entries.put(self_.allocator, storage_key, stored);
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -212,33 +266,7 @@ pub const InMemoryLruMemory = struct {
 
         for (results, 0..) |*slot, i| {
             const src = matches.items[i].entry;
-            const id = try allocator.dupe(u8, src.key);
-            errdefer allocator.free(id);
-            const dup_key = try allocator.dupe(u8, src.key);
-            errdefer allocator.free(dup_key);
-            const dup_content = try allocator.dupe(u8, src.content);
-            errdefer allocator.free(dup_content);
-            const dup_cat: MemoryCategory = switch (src.category) {
-                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
-                else => src.category,
-            };
-            errdefer switch (dup_cat) {
-                .custom => |name| allocator.free(name),
-                else => {},
-            };
-            const dup_ts = try allocator.dupe(u8, src.updated_at);
-            errdefer allocator.free(dup_ts);
-            const dup_sid = if (src.session_id) |sid| try allocator.dupe(u8, sid) else null;
-
-            slot.* = .{
-                .id = id,
-                .key = dup_key,
-                .content = dup_content,
-                .category = dup_cat,
-                .timestamp = dup_ts,
-                .session_id = dup_sid,
-                .score = null,
-            };
+            slot.* = try cloneEntry(allocator, src);
             filled += 1;
         }
 
@@ -248,40 +276,22 @@ pub const InMemoryLruMemory = struct {
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        const entry_ptr = self_.entries.getPtr(key) orelse return null;
+        const entry_ptr = self_.findDefaultEntryPtr(key) orelse return null;
 
         // Update access timestamp.
         entry_ptr.last_access = self_.nextAccess();
 
-        const e = entry_ptr.*;
+        return try cloneEntry(allocator, entry_ptr.*);
+    }
 
-        const id = try allocator.dupe(u8, e.key);
-        errdefer allocator.free(id);
-        const dup_key = try allocator.dupe(u8, e.key);
-        errdefer allocator.free(dup_key);
-        const dup_content = try allocator.dupe(u8, e.content);
-        errdefer allocator.free(dup_content);
-        const dup_cat: MemoryCategory = switch (e.category) {
-            .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
-            else => e.category,
-        };
-        errdefer switch (dup_cat) {
-            .custom => |name| allocator.free(name),
-            else => {},
-        };
-        const dup_ts = try allocator.dupe(u8, e.updated_at);
-        errdefer allocator.free(dup_ts);
-        const dup_sid = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null;
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const storage_key = try key_codec.encode(allocator, key, session_id);
+        defer allocator.free(storage_key);
 
-        return MemoryEntry{
-            .id = id,
-            .key = dup_key,
-            .content = dup_content,
-            .category = dup_cat,
-            .timestamp = dup_ts,
-            .session_id = dup_sid,
-            .score = null,
-        };
+        const entry_ptr = self_.entries.getPtr(storage_key) orelse return null;
+        entry_ptr.last_access = self_.nextAccess();
+        return try cloneEntry(allocator, entry_ptr.*);
     }
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -309,34 +319,7 @@ pub const InMemoryLruMemory = struct {
                 } else continue;
             }
 
-            const l_id = try allocator.dupe(u8, e.key);
-            errdefer allocator.free(l_id);
-            const l_key = try allocator.dupe(u8, e.key);
-            errdefer allocator.free(l_key);
-            const l_content = try allocator.dupe(u8, e.content);
-            errdefer allocator.free(l_content);
-            const l_cat: MemoryCategory = switch (e.category) {
-                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
-                else => e.category,
-            };
-            errdefer switch (l_cat) {
-                .custom => |name| allocator.free(name),
-                else => {},
-            };
-            const l_ts = try allocator.dupe(u8, e.updated_at);
-            errdefer allocator.free(l_ts);
-            const l_sid = if (e.session_id) |sid| try allocator.dupe(u8, sid) else null;
-            errdefer if (l_sid) |s| allocator.free(s);
-
-            try results.append(allocator, .{
-                .id = l_id,
-                .key = l_key,
-                .content = l_content,
-                .category = l_cat,
-                .timestamp = l_ts,
-                .session_id = l_sid,
-                .score = null,
-            });
+            try results.append(allocator, try cloneEntry(allocator, e));
         }
 
         return results.toOwnedSlice(allocator);
@@ -344,8 +327,36 @@ pub const InMemoryLruMemory = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        var keys_to_remove: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (keys_to_remove.items) |storage_key| self_.allocator.free(storage_key);
+            keys_to_remove.deinit(self_.allocator);
+        }
 
-        const removed = self_.entries.fetchRemove(key) orelse return false;
+        var it = self_.entries.iterator();
+        while (it.next()) |kv| {
+            if (!std.mem.eql(u8, kv.value_ptr.key, key)) continue;
+            try keys_to_remove.append(self_.allocator, try self_.allocator.dupe(u8, kv.key_ptr.*));
+        }
+
+        var removed_any = false;
+        for (keys_to_remove.items) |storage_key| {
+            if (self_.entries.fetchRemove(storage_key)) |removed| {
+                self_.freeStoredEntry(removed.value);
+                self_.allocator.free(removed.key);
+                removed_any = true;
+            }
+        }
+
+        return removed_any;
+    }
+
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const storage_key = try key_codec.encode(self_.allocator, key, session_id);
+        defer self_.allocator.free(storage_key);
+
+        const removed = self_.entries.fetchRemove(storage_key) orelse return false;
         self_.freeStoredEntry(removed.value);
         self_.allocator.free(removed.key);
         return true;
@@ -370,8 +381,10 @@ pub const InMemoryLruMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -444,16 +457,16 @@ test "basic store/get/recall/forget cycle" {
     try std.testing.expect(!forgotten2);
 }
 
-test "update existing key (upsert semantics)" {
+test "update existing key within same namespace" {
     var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("key1", "original", .core, null);
+    try m.store("key1", "original", .core, "sess-1");
     try m.store("key1", "updated", .daily, "sess-1");
     try std.testing.expectEqual(@as(usize, 1), try m.count());
 
-    const entry = (try m.get(std.testing.allocator, "key1")).?;
+    const entry = (try m.getScoped(std.testing.allocator, "key1", "sess-1")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("updated", entry.content);
     try std.testing.expect(entry.category.eql(.daily));
@@ -632,6 +645,42 @@ test "session_id accepted on store" {
     try std.testing.expectEqual(@as(usize, 1), listed.len);
 }
 
+test "same logical key can exist in global and scoped namespaces" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("shared", "global", .core, null);
+    try m.store("shared", "scoped", .core, "sess-a");
+
+    const global_entry = (try m.getScoped(std.testing.allocator, "shared", null)).?;
+    defer global_entry.deinit(std.testing.allocator);
+    try std.testing.expect(global_entry.session_id == null);
+    try std.testing.expectEqualStrings("global", global_entry.content);
+
+    const scoped_entry = (try m.getScoped(std.testing.allocator, "shared", "sess-a")).?;
+    defer scoped_entry.deinit(std.testing.allocator);
+    try std.testing.expect(scoped_entry.session_id != null);
+    try std.testing.expectEqualStrings("sess-a", scoped_entry.session_id.?);
+    try std.testing.expectEqualStrings("scoped", scoped_entry.content);
+}
+
+test "forgetScoped removes only matching namespace in LRU" {
+    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("shared", "global", .core, null);
+    try m.store("shared", "scoped", .core, "sess-a");
+
+    try std.testing.expect(try m.forgetScoped(std.testing.allocator, "shared", "sess-a"));
+    try std.testing.expect(try m.getScoped(std.testing.allocator, "shared", "sess-a") == null);
+
+    const global_entry = (try m.getScoped(std.testing.allocator, "shared", null)).?;
+    defer global_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("global", global_entry.content);
+}
+
 test "recall respects limit" {
     var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
     defer mem.deinit();
@@ -713,7 +762,7 @@ test "LRU recall with empty query matches everything" {
     try std.testing.expectEqual(@as(usize, 2), results.len);
 }
 
-test "LRU upsert session_id from null to value" {
+test "LRU same key supports null and value session_id" {
     var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
     defer mem.deinit();
     const m = mem.memory();
@@ -727,14 +776,20 @@ test "LRU upsert session_id from null to value" {
 
     try m.store("k", "v2", .core, "sess-new");
     {
-        const entry = (try m.get(std.testing.allocator, "k")).?;
-        defer entry.deinit(std.testing.allocator);
-        try std.testing.expect(entry.session_id != null);
-        try std.testing.expectEqualStrings("sess-new", entry.session_id.?);
+        try std.testing.expectEqual(@as(usize, 2), try m.count());
+
+        const global_entry = (try m.getScoped(std.testing.allocator, "k", null)).?;
+        defer global_entry.deinit(std.testing.allocator);
+        try std.testing.expect(global_entry.session_id == null);
+
+        const scoped_entry = (try m.getScoped(std.testing.allocator, "k", "sess-new")).?;
+        defer scoped_entry.deinit(std.testing.allocator);
+        try std.testing.expect(scoped_entry.session_id != null);
+        try std.testing.expectEqualStrings("sess-new", scoped_entry.session_id.?);
     }
 }
 
-test "LRU upsert session_id from value to null" {
+test "LRU same key supports value and null session_id" {
     var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
     defer mem.deinit();
     const m = mem.memory();
@@ -742,9 +797,15 @@ test "LRU upsert session_id from value to null" {
     try m.store("k", "v", .core, "sess-old");
     try m.store("k", "v2", .core, null);
 
-    const entry = (try m.get(std.testing.allocator, "k")).?;
-    defer entry.deinit(std.testing.allocator);
-    try std.testing.expect(entry.session_id == null);
+    try std.testing.expectEqual(@as(usize, 2), try m.count());
+
+    const scoped_entry = (try m.getScoped(std.testing.allocator, "k", "sess-old")).?;
+    defer scoped_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("sess-old", scoped_entry.session_id.?);
+
+    const global_entry = (try m.getScoped(std.testing.allocator, "k", null)).?;
+    defer global_entry.deinit(std.testing.allocator);
+    try std.testing.expect(global_entry.session_id == null);
 }
 
 test "LRU list with session_id filter" {

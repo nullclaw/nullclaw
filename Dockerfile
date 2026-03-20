@@ -39,10 +39,18 @@ RUN mkdir -p /nullclaw-data/workspace
 
 RUN cat > /nullclaw-data/config.json << 'EOF'
 {
-  "api_key": "",
-  "default_provider": "openrouter",
-  "default_model": "anthropic/claude-sonnet-4",
-  "default_temperature": 0.7,
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/anthropic/claude-sonnet-4"
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "openrouter": {}
+    }
+  },
   "gateway": {
     "port": 3000,
     "host": "::",

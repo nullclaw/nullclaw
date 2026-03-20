@@ -37,9 +37,10 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 
 ## Channel Allowlists
 
-- `allow_from: []`: deny all inbound messages.
+- Most channels: `allow_from: []`: deny all inbound messages.
 - `allow_from: ["*"]`: allow all sources (high-risk).
 - Otherwise: exact-match allowlist.
+- Discord currently differs: an omitted or empty `allow_from` disables filtering, so set explicit user IDs in `channels.discord.accounts.*.allow_from` when you want a private bot.
 
 ## Nostr-specific Rules
 
@@ -103,6 +104,7 @@ With the config above and `LD_LIBRARY_PATH=/opt/tools/usr/lib:/opt/tools/lib` se
 These settings significantly widen trust boundaries and should be used only in controlled environments:
 
 - `autonomy.level = "full"`
+- `autonomy.level = "yolo"`
 - `allowed_commands = ["*"]`
 - `allowed_paths = ["*"]`
 - `gateway.allow_public_bind = true`

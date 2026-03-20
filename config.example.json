@@ -40,6 +40,25 @@
         }
       }
     },
+    "external": {
+      "accounts": {
+        "wa-web": {
+          "runtime_name": "whatsapp_web",
+          "transport": {
+            "command": "nullclaw-plugin-whatsapp-web",
+            "args": ["--stdio"],
+            "timeout_ms": 10000,
+            "env": {
+              "PLUGIN_TOKEN": "YOUR_PLUGIN_TOKEN"
+            }
+          },
+          "config": {
+            "bridge_url": "http://127.0.0.1:3301",
+            "allow_from": ["*"]
+          }
+        }
+      }
+    },
     "irc": {
       "accounts": {
         "meshrelay": {
@@ -227,6 +246,17 @@
     "url": "https://agent.example.com",
     "version": "1.0.0"
   },
+
+  "http_request": {
+    "enabled": false,
+    "max_response_size": 1000000,
+    "timeout_secs": 30,
+    "allowed_domains": [],
+    "search_base_url": null,
+    "search_provider": "auto",
+    "search_fallback_providers": ["jina", "duckduckgo"]
+  },
+
 
   "security": {
     "sandbox": {

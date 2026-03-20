@@ -15,12 +15,15 @@ const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
 const Agent = agent_mod.Agent;
+const NamedAgentConfig = @import("config_types.zig").NamedAgentConfig;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const config_types = @import("config_types.zig");
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
+const onboard = @import("onboard.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
@@ -32,6 +35,37 @@ const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
+const RUNTIME_COMMAND_ROLE = memory_mod.RUNTIME_COMMAND_ROLE;
+const CLAIM_STATE_FILENAME = "identity_claims.json";
+const CLAIM_STATE_VERSION: u32 = 1;
+
+const ClaimDirectContext = struct {
+    channel: []const u8,
+    account_id: []const u8,
+    peer_id: []const u8,
+};
+
+const VerifiedBinding = struct {
+    canonical_user_id: []u8,
+    verified_at: i64,
+};
+
+const ClaimAttempt = struct {
+    failures: u32 = 0,
+    locked_until: i64 = 0,
+};
+
+const ClaimToken = struct {
+    expires_at: i64,
+    canonical_user_id: []const u8,
+    nonce: []const u8,
+    signature_hex: []const u8,
+};
+
+const ClaimStateSnapshot = struct {
+    generation: u64,
+    content: []u8,
+};
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
@@ -54,6 +88,32 @@ fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8
     const last = agent.history.items[agent.history.items.len - 1];
     if (last.role != .assistant) return response;
     return last.content;
+}
+
+fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
+    for (entries) |entry| {
+        if (memory_mod.isRuntimeCommandRole(entry.role)) {
+            const maybe_response = session.agent.handleSlashCommand(entry.content) catch null;
+            if (maybe_response) |response| session.agent.allocator.free(response);
+            continue;
+        }
+
+        const role: providers.Role = if (std.mem.eql(u8, entry.role, "assistant"))
+            .assistant
+        else if (std.mem.eql(u8, entry.role, "system"))
+            .system
+        else
+            .user;
+
+        const content = session.agent.allocator.dupe(u8, entry.content) catch continue;
+        session.agent.history.append(session.agent.allocator, .{
+            .role = role,
+            .content = content,
+        }) catch {
+            session.agent.allocator.free(content);
+            continue;
+        };
+    }
 }
 
 fn sessionAgentId(session_key: []const u8) ?[]const u8 {
@@ -101,6 +161,7 @@ pub const Session = struct {
     agent: Agent,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
+    owned_memory_session_id: ?[]u8 = null,
     created_at: i64,
     last_active: i64,
     last_consolidated: u64 = 0,
@@ -113,7 +174,29 @@ pub const Session = struct {
         self.agent.deinit();
         if (self.provider_holder) |*holder| holder.deinit();
         if (self.owned_provider_api_key) |key| allocator.free(key);
+        if (self.owned_memory_session_id) |sid| allocator.free(sid);
         allocator.free(self.session_key);
+    }
+};
+
+const AgentRuntime = struct {
+    agent_id: []const u8,
+    workspace_dir: []const u8,
+    config: Config,
+    provider: Provider,
+    tools: []const Tool,
+    mem: ?Memory,
+    mem_rt: ?memory_mod.MemoryRuntime,
+    session_store: ?memory_mod.SessionStore,
+    response_cache: ?*memory_mod.cache.ResponseCache,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
+
+    fn deinit(self: *AgentRuntime, allocator: Allocator) void {
+        if (self.tools.len > 0) tools_mod.deinitTools(allocator, self.tools);
+        if (self.bootstrap_provider) |bp| bp.deinit();
+        if (self.mem_rt) |*rt| rt.deinit();
+        allocator.free(self.workspace_dir);
+        allocator.free(self.agent_id);
     }
 };
 
@@ -132,13 +215,23 @@ pub const SessionManager = struct {
     mem_rt: ?*memory_mod.MemoryRuntime = null,
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
+    subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
 
     mutex: std.Thread.Mutex,
     usage_log_mutex: std.Thread.Mutex,
+    claim_state_io_mutex: std.Thread.Mutex,
     usage_ledger_state_initialized: bool,
     usage_ledger_window_started_at: i64,
     usage_ledger_line_count: u64,
     sessions: std.StringHashMapUnmanaged(*Session),
+    agent_runtimes: std.StringHashMapUnmanaged(*AgentRuntime),
+    claim_state_path: ?[]u8 = null,
+    claim_state_loaded: bool = false,
+    claim_state_generation: u64 = 0,
+    claim_state_persisted_generation: u64 = 0,
+    verified_bindings: std.StringHashMapUnmanaged(VerifiedBinding),
+    used_claim_nonces: std.StringHashMapUnmanaged(i64),
+    claim_attempts: std.StringHashMapUnmanaged(ClaimAttempt),
 
     pub fn init(
         allocator: Allocator,
@@ -152,7 +245,14 @@ pub const SessionManager = struct {
     ) SessionManager {
         tools_mod.bindMemoryTools(tools, mem);
 
-        return .{
+        const claim_state_path = blk: {
+            const secret = config.session.claim_secret orelse break :blk null;
+            if (std.mem.trim(u8, secret, " \t\r\n").len == 0) break :blk null;
+            const config_dir = std.fs.path.dirname(config.config_path) orelse ".";
+            break :blk std.fs.path.join(allocator, &.{ config_dir, "state", CLAIM_STATE_FILENAME }) catch null;
+        };
+
+        var manager: SessionManager = .{
             .allocator = allocator,
             .config = config,
             .provider = provider,
@@ -161,13 +261,25 @@ pub const SessionManager = struct {
             .session_store = session_store,
             .response_cache = response_cache,
             .observer = observer_i,
+            .subagent_manager = detectSubagentManager(tools),
             .mutex = .{},
             .usage_log_mutex = .{},
+            .claim_state_io_mutex = .{},
             .usage_ledger_state_initialized = false,
             .usage_ledger_window_started_at = 0,
             .usage_ledger_line_count = 0,
             .sessions = .{},
+            .agent_runtimes = .{},
+            .claim_state_path = claim_state_path,
+            .claim_state_loaded = false,
+            .claim_state_generation = 0,
+            .claim_state_persisted_generation = 0,
+            .verified_bindings = .{},
+            .used_claim_nonces = .{},
+            .claim_attempts = .{},
         };
+        manager.loadClaimState();
+        return manager;
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -177,6 +289,891 @@ pub const SessionManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit(self.allocator);
+
+        var rt_it = self.agent_runtimes.iterator();
+        while (rt_it.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.agent_runtimes.deinit(self.allocator);
+
+        var bindings_it = self.verified_bindings.iterator();
+        while (bindings_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.canonical_user_id);
+        }
+        self.verified_bindings.deinit(self.allocator);
+
+        var nonces_it = self.used_claim_nonces.iterator();
+        while (nonces_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.used_claim_nonces.deinit(self.allocator);
+
+        var attempts_it = self.claim_attempts.iterator();
+        while (attempts_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.claim_attempts.deinit(self.allocator);
+
+        if (self.claim_state_path) |path| self.allocator.free(path);
+    }
+
+    fn detectSubagentManager(tools: []const Tool) ?*@import("subagent.zig").SubagentManager {
+        for (tools) |tool| {
+            if (!std.mem.eql(u8, tool.name(), "spawn")) continue;
+            const spawn_tool: *tools_mod.spawn.SpawnTool = @ptrCast(@alignCast(tool.ptr));
+            return spawn_tool.manager;
+        }
+        return null;
+    }
+
+    fn secureEql(a: []const u8, b: []const u8) bool {
+        const max_len = @max(a.len, b.len);
+        var diff: u8 = @intFromBool(a.len != b.len);
+        var i: usize = 0;
+        while (i < max_len) : (i += 1) {
+            const av: u8 = if (i < a.len) a[i] else 0;
+            const bv: u8 = if (i < b.len) b[i] else 0;
+            diff |= av ^ bv;
+        }
+        return diff == 0;
+    }
+
+    fn parseClaimToken(token: []const u8) ?ClaimToken {
+        var parts = std.mem.splitScalar(u8, token, ':');
+        const version = parts.next() orelse return null;
+        const expires_raw = parts.next() orelse return null;
+        const canonical = parts.next() orelse return null;
+        const nonce = parts.next() orelse return null;
+        const sig_hex = parts.next() orelse return null;
+        if (parts.next() != null) return null;
+
+        if (!std.mem.eql(u8, version, "v1")) return null;
+        if (canonical.len == 0 or nonce.len == 0 or sig_hex.len != 64) return null;
+
+        for (canonical) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.')) return null;
+        }
+        for (nonce) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.')) return null;
+        }
+        for (sig_hex) |ch| {
+            if (!std.ascii.isHex(ch)) return null;
+        }
+
+        const expires_at = std.fmt.parseInt(i64, expires_raw, 10) catch return null;
+        return .{
+            .expires_at = expires_at,
+            .canonical_user_id = canonical,
+            .nonce = nonce,
+            .signature_hex = sig_hex,
+        };
+    }
+
+    fn decodeHex32(hex: []const u8) ?[32]u8 {
+        if (hex.len != 64) return null;
+        var out: [32]u8 = undefined;
+        var i: usize = 0;
+        while (i < 32) : (i += 1) {
+            const off = i * 2;
+            out[i] = std.fmt.parseInt(u8, hex[off .. off + 2], 16) catch return null;
+        }
+        return out;
+    }
+
+    fn claimSecret(self: *const SessionManager) ?[]const u8 {
+        const secret = self.config.session.claim_secret orelse return null;
+        const trimmed = std.mem.trim(u8, secret, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return trimmed;
+    }
+
+    fn claimAdminSecret(self: *const SessionManager) ?[]const u8 {
+        const secret = self.config.session.claim_admin_secret orelse return null;
+        const trimmed = std.mem.trim(u8, secret, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return trimmed;
+    }
+
+    fn claimGateEnabled(self: *const SessionManager) bool {
+        return self.config.session.auto_provision_direct_agents and self.claimSecret() != null;
+    }
+
+    fn claimBindingKeyOwned(self: *SessionManager, channel: []const u8, account_id: []const u8, peer_id: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}\x1f{s}\x1f{s}", .{ channel, account_id, peer_id });
+    }
+
+    fn splitClaimBindingKey(key: []const u8) ?struct { channel: []const u8, account_id: []const u8, peer_id: []const u8 } {
+        const first_sep = std.mem.indexOfScalar(u8, key, 0x1f) orelse return null;
+        if (first_sep == 0 or first_sep + 1 >= key.len) return null;
+        const rest = key[first_sep + 1 ..];
+        const second_rel = std.mem.indexOfScalar(u8, rest, 0x1f) orelse {
+            return .{
+                .channel = key[0..first_sep],
+                .account_id = "default",
+                .peer_id = rest,
+            };
+        };
+        if (second_rel == 0 or second_rel + 1 >= rest.len) return null;
+        return .{
+            .channel = key[0..first_sep],
+            .account_id = rest[0..second_rel],
+            .peer_id = rest[second_rel + 1 ..],
+        };
+    }
+
+    fn parseAgentIdFromSessionKey(session_key: []const u8) []const u8 {
+        return sessionAgentId(session_key) orelse "main";
+    }
+
+    fn parseChannelFromSessionKey(session_key: []const u8) ?[]const u8 {
+        if (std.mem.startsWith(u8, session_key, "agent:")) {
+            var rest = session_key["agent:".len..];
+            const agent_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+            rest = rest[agent_sep + 1 ..];
+            const seg_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+            const candidate = rest[0..seg_sep];
+            if (std.mem.eql(u8, candidate, "main") or
+                std.mem.eql(u8, candidate, "direct") or
+                std.mem.eql(u8, candidate, "group") or
+                std.mem.eql(u8, candidate, "channel") or
+                std.mem.eql(u8, candidate, "room"))
+            {
+                return null;
+            }
+            return candidate;
+        }
+        const sep = std.mem.indexOfScalar(u8, session_key, ':') orelse return null;
+        if (sep == 0) return null;
+        return session_key[0..sep];
+    }
+
+    fn parseAccountIdFromSessionKey(session_key: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, session_key, "agent:")) return null;
+        var rest = session_key["agent:".len..];
+        const agent_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+        rest = rest[agent_sep + 1 ..];
+
+        const first_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+        const first = rest[0..first_sep];
+        if (std.mem.eql(u8, first, "main") or
+            std.mem.eql(u8, first, "direct") or
+            std.mem.eql(u8, first, "group") or
+            std.mem.eql(u8, first, "channel") or
+            std.mem.eql(u8, first, "room"))
+        {
+            return null;
+        }
+
+        rest = rest[first_sep + 1 ..];
+        const second_sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+        const second = rest[0..second_sep];
+        if (std.mem.eql(u8, second, "direct") or
+            std.mem.eql(u8, second, "group") or
+            std.mem.eql(u8, second, "channel") or
+            std.mem.eql(u8, second, "room"))
+        {
+            return null;
+        }
+        return second;
+    }
+
+    fn parsePeerIdFromSessionKey(session_key: []const u8) ?[]const u8 {
+        const markers = [_][]const u8{
+            ":direct:",
+            ":group:",
+            ":channel:",
+            ":room:",
+        };
+        for (markers) |marker| {
+            const marker_idx = std.mem.indexOf(u8, session_key, marker) orelse continue;
+            const start = marker_idx + marker.len;
+            if (start >= session_key.len) continue;
+            var end = session_key.len;
+            if (std.mem.indexOfPos(u8, session_key, start, ":thread:")) |thread_idx| {
+                end = thread_idx;
+            }
+            if (end > start) return session_key[start..end];
+        }
+        return null;
+    }
+
+    fn directContextForClaims(session_key: []const u8, conversation_context: ?ConversationContext) ?ClaimDirectContext {
+        const is_direct = if (conversation_context) |ctx|
+            if (ctx.is_group) |is_group| !is_group else std.mem.indexOf(u8, session_key, ":direct:") != null
+        else
+            std.mem.indexOf(u8, session_key, ":direct:") != null;
+        if (!is_direct) return null;
+
+        const peer_id = (if (conversation_context) |ctx|
+            (ctx.peer_id orelse parsePeerIdFromSessionKey(session_key))
+        else
+            parsePeerIdFromSessionKey(session_key)) orelse return null;
+        const channel = if (conversation_context) |ctx|
+            (ctx.channel orelse parseChannelFromSessionKey(session_key) orelse "unknown")
+        else
+            parseChannelFromSessionKey(session_key) orelse "unknown";
+        const account_id = if (conversation_context) |ctx|
+            (ctx.account_id orelse parseAccountIdFromSessionKey(session_key) orelse "default")
+        else
+            parseAccountIdFromSessionKey(session_key) orelse "default";
+        return .{ .channel = channel, .account_id = account_id, .peer_id = peer_id };
+    }
+
+    fn clearExpiredClaimNoncesLocked(self: *SessionManager, now_ts: i64) void {
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.used_claim_nonces.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* <= now_ts) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.used_claim_nonces.fetchRemove(key)) |entry| {
+                self.allocator.free(entry.key);
+            }
+        }
+    }
+
+    fn evictClaimAttemptLocked(self: *SessionManager, binding_key: []const u8) bool {
+        if (self.claim_attempts.fetchRemove(binding_key)) |entry| {
+            self.allocator.free(entry.key);
+            return true;
+        }
+        return false;
+    }
+
+    fn claimAttemptStatusLocked(self: *SessionManager, binding_key: []const u8, now_ts: i64) ?ClaimAttempt {
+        const attempt = self.claim_attempts.getPtr(binding_key) orelse return null;
+        if (attempt.locked_until > now_ts) return attempt.*;
+        if (attempt.failures == 0) {
+            _ = self.evictClaimAttemptLocked(binding_key);
+            return null;
+        }
+        return attempt.*;
+    }
+
+    fn registerClaimFailureLocked(self: *SessionManager, binding_key: []const u8, now_ts: i64) void {
+        const max_attempts: u32 = @max(1, self.config.session.claim_max_attempts);
+        const lockout_secs: i64 = @intCast(@max(1, self.config.session.claim_lockout_secs));
+
+        if (self.claim_attempts.getPtr(binding_key)) |attempt| {
+            if (attempt.locked_until > now_ts) return;
+            attempt.failures += 1;
+            if (attempt.failures >= max_attempts) {
+                attempt.failures = 0;
+                attempt.locked_until = now_ts + lockout_secs;
+            }
+            return;
+        }
+
+        const owned_key = self.allocator.dupe(u8, binding_key) catch return;
+        var attempt = ClaimAttempt{ .failures = 1, .locked_until = 0 };
+        if (attempt.failures >= max_attempts) {
+            attempt.failures = 0;
+            attempt.locked_until = now_ts + lockout_secs;
+        }
+        self.claim_attempts.put(self.allocator, owned_key, attempt) catch {
+            self.allocator.free(owned_key);
+        };
+    }
+
+    fn putClaimNonceLocked(self: *SessionManager, nonce: []const u8, expires_at: i64) void {
+        if (self.used_claim_nonces.getPtr(nonce)) |existing| {
+            existing.* = expires_at;
+            return;
+        }
+        const owned_nonce = self.allocator.dupe(u8, nonce) catch return;
+        self.used_claim_nonces.put(self.allocator, owned_nonce, expires_at) catch {
+            self.allocator.free(owned_nonce);
+        };
+    }
+
+    fn setVerifiedBindingLocked(self: *SessionManager, channel: []const u8, account_id: []const u8, peer_id: []const u8, canonical_user_id: []const u8, verified_at: i64) void {
+        const key = self.claimBindingKeyOwned(channel, account_id, peer_id) catch return;
+        if (self.verified_bindings.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.value.canonical_user_id);
+        }
+
+        const canonical_owned = self.allocator.dupe(u8, canonical_user_id) catch {
+            self.allocator.free(key);
+            return;
+        };
+        self.verified_bindings.put(self.allocator, key, .{
+            .canonical_user_id = canonical_owned,
+            .verified_at = verified_at,
+        }) catch {
+            self.allocator.free(canonical_owned);
+            self.allocator.free(key);
+        };
+    }
+
+    fn removeVerifiedBindingLocked(self: *SessionManager, channel: []const u8, account_id: []const u8, peer_id: []const u8) bool {
+        const key = self.claimBindingKeyOwned(channel, account_id, peer_id) catch return false;
+        defer self.allocator.free(key);
+        if (self.verified_bindings.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.value.canonical_user_id);
+            return true;
+        }
+        return false;
+    }
+
+    fn hmacClaimPayload(self: *SessionManager, expires_at: i64, canonical_user_id: []const u8, nonce: []const u8) ?[32]u8 {
+        const secret = self.claimSecret() orelse return null;
+        const payload = std.fmt.allocPrint(self.allocator, "v1:{d}:{s}:{s}", .{ expires_at, canonical_user_id, nonce }) catch return null;
+        defer self.allocator.free(payload);
+
+        var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(mac[0..], payload, secret);
+        return mac;
+    }
+
+    fn verifyClaimTokenLocked(self: *SessionManager, token_raw: []const u8, now_ts: i64) ?ClaimToken {
+        const token = parseClaimToken(token_raw) orelse return null;
+        if (token.expires_at <= now_ts) return null;
+
+        self.clearExpiredClaimNoncesLocked(now_ts);
+        if (self.used_claim_nonces.get(token.nonce)) |_| {
+            return null;
+        }
+
+        const provided_sig = decodeHex32(token.signature_hex) orelse return null;
+        const expected_sig = self.hmacClaimPayload(token.expires_at, token.canonical_user_id, token.nonce) orelse return null;
+        if (!std.crypto.timing_safe.eql([32]u8, expected_sig, provided_sig)) return null;
+        return token;
+    }
+
+    fn loadClaimState(self: *SessionManager) void {
+        if (self.claim_state_loaded) return;
+        self.claim_state_loaded = true;
+        const path = self.claim_state_path orelse return;
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch return;
+        defer file.close();
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return;
+        defer self.allocator.free(content);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, content, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const root = parsed.value.object;
+
+        const now_ts = std.time.timestamp();
+
+        if (root.get("bindings")) |bindings_val| {
+            if (bindings_val == .array) {
+                for (bindings_val.array.items) |item| {
+                    if (item != .object) continue;
+                    const channel_v = item.object.get("channel") orelse continue;
+                    const peer_v = item.object.get("peer_id") orelse continue;
+                    const canonical_v = item.object.get("canonical_user_id") orelse continue;
+                    if (channel_v != .string or peer_v != .string or canonical_v != .string) continue;
+                    const verified_at: i64 = blk: {
+                        const ts_v = item.object.get("verified_at") orelse break :blk now_ts;
+                        if (ts_v == .integer) break :blk ts_v.integer;
+                        break :blk now_ts;
+                    };
+                    const account_id = if (item.object.get("account_id")) |account_v|
+                        if (account_v == .string and account_v.string.len > 0) account_v.string else "default"
+                    else
+                        "default";
+                    self.setVerifiedBindingLocked(channel_v.string, account_id, peer_v.string, canonical_v.string, verified_at);
+                }
+            }
+        }
+
+        if (root.get("used_nonces")) |nonces_val| {
+            if (nonces_val == .array) {
+                for (nonces_val.array.items) |item| {
+                    if (item != .object) continue;
+                    const nonce_v = item.object.get("nonce") orelse continue;
+                    const expires_v = item.object.get("expires_at") orelse continue;
+                    if (nonce_v != .string or expires_v != .integer) continue;
+                    if (expires_v.integer <= now_ts) continue;
+                    self.putClaimNonceLocked(nonce_v.string, expires_v.integer);
+                }
+            }
+        }
+
+        if (root.get("attempts")) |attempts_val| {
+            if (attempts_val == .array) {
+                for (attempts_val.array.items) |item| {
+                    if (item != .object) continue;
+                    const channel_v = item.object.get("channel") orelse continue;
+                    const peer_v = item.object.get("peer_id") orelse continue;
+                    if (channel_v != .string or peer_v != .string) continue;
+                    const account_id = if (item.object.get("account_id")) |account_v|
+                        if (account_v == .string and account_v.string.len > 0) account_v.string else "default"
+                    else
+                        "default";
+                    const key = self.claimBindingKeyOwned(channel_v.string, account_id, peer_v.string) catch continue;
+                    const failures: u32 = blk: {
+                        const fv = item.object.get("failures") orelse break :blk 0;
+                        if (fv == .integer and fv.integer > 0) break :blk @intCast(fv.integer);
+                        break :blk 0;
+                    };
+                    const locked_until: i64 = blk: {
+                        const lv = item.object.get("locked_until") orelse break :blk 0;
+                        if (lv == .integer and lv.integer > now_ts) break :blk lv.integer;
+                        break :blk 0;
+                    };
+                    if (failures == 0 and locked_until == 0) {
+                        self.allocator.free(key);
+                        continue;
+                    }
+                    self.claim_attempts.put(self.allocator, key, .{
+                        .failures = failures,
+                        .locked_until = locked_until,
+                    }) catch self.allocator.free(key);
+                }
+            }
+        }
+    }
+
+    fn markClaimStateDirtyLocked(self: *SessionManager) void {
+        self.claim_state_generation += 1;
+    }
+
+    fn captureClaimStateSnapshotLocked(self: *SessionManager) ?ClaimStateSnapshot {
+        if (self.claim_state_path == null) return null;
+        if (self.claim_state_generation <= self.claim_state_persisted_generation) return null;
+
+        const now_ts = std.time.timestamp();
+        self.clearExpiredClaimNoncesLocked(now_ts);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+
+        w.print("{{\"version\":{d},\"bindings\":[", .{CLAIM_STATE_VERSION}) catch return null;
+
+        var wrote_binding = false;
+        var binding_it = self.verified_bindings.iterator();
+        while (binding_it.next()) |entry| {
+            const split = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
+            if (wrote_binding) w.writeAll(",") catch return null;
+            w.print(
+                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"canonical_user_id\":{f},\"verified_at\":{d}}}",
+                .{
+                    std.json.fmt(split.channel, .{}),
+                    std.json.fmt(split.account_id, .{}),
+                    std.json.fmt(split.peer_id, .{}),
+                    std.json.fmt(entry.value_ptr.canonical_user_id, .{}),
+                    entry.value_ptr.verified_at,
+                },
+            ) catch return null;
+            wrote_binding = true;
+        }
+
+        w.writeAll("],\"used_nonces\":[") catch return null;
+        var wrote_nonce = false;
+        var nonce_it = self.used_claim_nonces.iterator();
+        while (nonce_it.next()) |entry| {
+            if (entry.value_ptr.* <= now_ts) continue;
+            if (wrote_nonce) w.writeAll(",") catch return null;
+            w.print(
+                "{{\"nonce\":{f},\"expires_at\":{d}}}",
+                .{
+                    std.json.fmt(entry.key_ptr.*, .{}),
+                    entry.value_ptr.*,
+                },
+            ) catch return null;
+            wrote_nonce = true;
+        }
+
+        w.writeAll("],\"attempts\":[") catch return null;
+        var wrote_attempt = false;
+        var attempt_it = self.claim_attempts.iterator();
+        while (attempt_it.next()) |entry| {
+            const attempt = entry.value_ptr.*;
+            if (attempt.failures == 0 and attempt.locked_until <= now_ts) continue;
+            const split = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
+            if (wrote_attempt) w.writeAll(",") catch return null;
+            w.print(
+                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"failures\":{d},\"locked_until\":{d}}}",
+                .{
+                    std.json.fmt(split.channel, .{}),
+                    std.json.fmt(split.account_id, .{}),
+                    std.json.fmt(split.peer_id, .{}),
+                    attempt.failures,
+                    attempt.locked_until,
+                },
+            ) catch return null;
+            wrote_attempt = true;
+        }
+
+        w.writeAll("]}") catch return null;
+        const content = buf.toOwnedSlice(self.allocator) catch return null;
+        return .{
+            .generation = self.claim_state_generation,
+            .content = content,
+        };
+    }
+
+    fn persistClaimStateSnapshot(self: *SessionManager, snapshot: ?ClaimStateSnapshot) void {
+        const claim_snapshot = snapshot orelse return;
+        defer self.allocator.free(claim_snapshot.content);
+
+        const path = self.claim_state_path orelse return;
+
+        self.claim_state_io_mutex.lock();
+        defer self.claim_state_io_mutex.unlock();
+
+        self.mutex.lock();
+        const is_stale = claim_snapshot.generation <= self.claim_state_persisted_generation;
+        self.mutex.unlock();
+        if (is_stale) return;
+
+        if (std.fs.path.dirname(path)) |parent| {
+            std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => {
+                    std.fs.cwd().makePath(parent) catch return;
+                },
+            };
+        }
+
+        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path}) catch return;
+        defer self.allocator.free(tmp_path);
+
+        var tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
+        tmp_file.writeAll(claim_snapshot.content) catch {
+            tmp_file.close();
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            return;
+        };
+        tmp_file.close();
+
+        std.fs.renameAbsolute(tmp_path, path) catch {
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+            defer file.close();
+            file.writeAll(claim_snapshot.content) catch return;
+        };
+
+        self.mutex.lock();
+        if (claim_snapshot.generation > self.claim_state_persisted_generation) {
+            self.claim_state_persisted_generation = claim_snapshot.generation;
+        }
+        self.mutex.unlock();
+    }
+
+    fn claimTokenArg(message: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, message, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "/claim")) return null;
+        if (trimmed.len == "/claim".len) return null;
+        if (trimmed["/claim".len] != ' ' and trimmed["/claim".len] != '\t') return null;
+        const arg = std.mem.trim(u8, trimmed["/claim".len + 1 ..], " \t\r\n");
+        if (arg.len == 0) return null;
+        return arg;
+    }
+
+    fn revokeSecretArg(message: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, message, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "/revoke")) return null;
+        if (trimmed.len == "/revoke".len) return null;
+        if (trimmed["/revoke".len] != ' ' and trimmed["/revoke".len] != '\t') return null;
+        const arg = std.mem.trim(u8, trimmed["/revoke".len + 1 ..], " \t\r\n");
+        if (arg.len == 0) return null;
+        return arg;
+    }
+
+    fn maybeHandleClaimGate(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+    ) ?[]const u8 {
+        if (!self.claimGateEnabled()) return null;
+        if (!std.mem.startsWith(u8, parseAgentIdFromSessionKey(session_key), "peer-")) return null;
+
+        const direct_ctx = directContextForClaims(session_key, conversation_context) orelse return null;
+        const now_ts = std.time.timestamp();
+
+        if (revokeSecretArg(content)) |provided_revoke_secret| {
+            const admin_secret = self.claimAdminSecret() orelse {
+                return self.allocator.dupe(
+                    u8,
+                    "Revocation is disabled. Configure session.claim_admin_secret to enable /revoke.",
+                ) catch null;
+            };
+            if (!secureEql(provided_revoke_secret, admin_secret)) {
+                return self.allocator.dupe(u8, "Invalid revoke secret.") catch null;
+            }
+
+            var removed = false;
+            var snapshot: ?ClaimStateSnapshot = null;
+            self.mutex.lock();
+            removed = self.removeVerifiedBindingLocked(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id);
+            const attempt_key = self.claimBindingKeyOwned(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id) catch null;
+            var cleared_attempts = false;
+            if (attempt_key) |k| {
+                cleared_attempts = self.evictClaimAttemptLocked(k);
+                self.allocator.free(k);
+            }
+            if (removed or cleared_attempts) {
+                self.markClaimStateDirtyLocked();
+                snapshot = self.captureClaimStateSnapshotLocked();
+            }
+            self.mutex.unlock();
+            self.persistClaimStateSnapshot(snapshot);
+
+            if (removed) {
+                return self.allocator.dupe(u8, "Identity link revoked. This peer is back in gatekeeper mode.") catch null;
+            }
+            return self.allocator.dupe(u8, "No active identity link was found for this peer.") catch null;
+        }
+
+        const claim_token = claimTokenArg(content);
+        const binding_key = self.claimBindingKeyOwned(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id) catch return null;
+        defer self.allocator.free(binding_key);
+
+        self.mutex.lock();
+        if (self.verified_bindings.get(binding_key)) |_| {
+            self.mutex.unlock();
+            if (claim_token != null) {
+                return self.allocator.dupe(u8, "This peer is already verified.") catch null;
+            }
+            return null;
+        }
+
+        if (self.claimAttemptStatusLocked(binding_key, now_ts)) |attempt| {
+            if (attempt.locked_until > now_ts) {
+                self.mutex.unlock();
+                const remaining = @as(u64, @intCast(attempt.locked_until - now_ts));
+                return std.fmt.allocPrint(
+                    self.allocator,
+                    "Too many failed claim attempts. Try again in {d} seconds.",
+                    .{remaining},
+                ) catch null;
+            }
+        }
+
+        if (claim_token) |raw_token| {
+            const verified = self.verifyClaimTokenLocked(raw_token, now_ts);
+            if (verified) |token| {
+                self.setVerifiedBindingLocked(
+                    direct_ctx.channel,
+                    direct_ctx.account_id,
+                    direct_ctx.peer_id,
+                    token.canonical_user_id,
+                    now_ts,
+                );
+                self.putClaimNonceLocked(token.nonce, token.expires_at);
+                _ = self.evictClaimAttemptLocked(binding_key);
+                self.markClaimStateDirtyLocked();
+                const snapshot = self.captureClaimStateSnapshotLocked();
+                self.mutex.unlock();
+                self.persistClaimStateSnapshot(snapshot);
+                return std.fmt.allocPrint(
+                    self.allocator,
+                    "Identity verified as '{s}'. Dedicated agent runtime unlocked.",
+                    .{token.canonical_user_id},
+                ) catch null;
+            }
+
+            self.registerClaimFailureLocked(binding_key, now_ts);
+            self.markClaimStateDirtyLocked();
+            const snapshot = self.captureClaimStateSnapshotLocked();
+            self.mutex.unlock();
+            self.persistClaimStateSnapshot(snapshot);
+            return self.allocator.dupe(
+                u8,
+                "Invalid or expired claim token. Use `/claim v1:<exp>:<canonical>:<nonce>:<hmac_sha256_hex>`.",
+            ) catch null;
+        }
+
+        self.mutex.unlock();
+        return self.allocator.dupe(
+            u8,
+            "Identity verification required before agent provisioning. Send `/claim <token>` to continue.",
+        ) catch null;
+    }
+
+    fn setTurnToolContext(
+        tools: []const Tool,
+        session_key: []const u8,
+        conversation_context: ?ConversationContext,
+    ) void {
+        const channel = if (conversation_context) |ctx| (ctx.channel orelse parseChannelFromSessionKey(session_key)) else parseChannelFromSessionKey(session_key);
+        const chat_id = parsePeerIdFromSessionKey(session_key);
+        const account_id = if (conversation_context) |ctx| ctx.account_id else null;
+
+        for (tools) |tool| {
+            if (std.mem.eql(u8, tool.name(), "schedule")) {
+                const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
+                schedule_tool.setContext(channel, account_id, chat_id);
+            }
+        }
+    }
+
+    fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
+        if (named_agent) |cfg| {
+            if (cfg.workspace_path != null) return true;
+        }
+        return self.config.session.auto_provision_direct_agents and std.mem.startsWith(u8, agent_id, "peer-");
+    }
+
+    fn sanitizePathComponent(allocator: Allocator, value: []const u8) ![]u8 {
+        var trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) trimmed = "default";
+        var out = try allocator.alloc(u8, trimmed.len);
+        for (trimmed, 0..) |ch, idx| {
+            out[idx] = if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.') ch else '_';
+        }
+        return out;
+    }
+
+    fn resolveAgentWorkspaceDir(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) ![]const u8 {
+        if (named_agent) |cfg| {
+            if (cfg.workspace_path) |workspace_path| {
+                return self.config.resolveAgentWorkspacePath(self.allocator, workspace_path);
+            }
+        }
+
+        const config_dir = std.fs.path.dirname(self.config.config_path) orelse ".";
+        const normalized = try sanitizePathComponent(self.allocator, agent_id);
+        defer self.allocator.free(normalized);
+        return std.fs.path.join(self.allocator, &.{ config_dir, "agents", normalized, "workspace" });
+    }
+
+    fn makeAgentConfig(base: *const Config, workspace_dir: []const u8, named_agent: ?NamedAgentConfig) Config {
+        var cfg = base.*;
+        cfg.workspace_dir = workspace_dir;
+        if (named_agent) |agent_cfg| {
+            cfg.default_provider = agent_cfg.provider;
+            cfg.default_model = agent_cfg.model;
+            if (agent_cfg.temperature) |t| cfg.default_temperature = t;
+        }
+        cfg.syncFlatFields();
+        return cfg;
+    }
+
+    fn createAgentRuntime(
+        self: *SessionManager,
+        agent_id: []const u8,
+        named_agent: ?NamedAgentConfig,
+    ) !*AgentRuntime {
+        const runtime = try self.allocator.create(AgentRuntime);
+        errdefer self.allocator.destroy(runtime);
+
+        const owned_agent_id = try self.allocator.dupe(u8, agent_id);
+        errdefer self.allocator.free(owned_agent_id);
+
+        const workspace_dir = try self.resolveAgentWorkspaceDir(agent_id, named_agent);
+        errdefer self.allocator.free(workspace_dir);
+
+        var mem_rt = memory_mod.initRuntime(self.allocator, &self.config.memory, workspace_dir);
+        errdefer if (mem_rt) |*rt| rt.deinit();
+
+        const mem_opt: ?Memory = if (mem_rt) |rt| rt.memory else null;
+        const session_store: ?memory_mod.SessionStore = if (mem_rt) |rt| rt.session_store else null;
+        const response_cache: ?*memory_mod.cache.ResponseCache = if (mem_rt) |*rt| rt.response_cache else null;
+
+        const bootstrap_provider = bootstrap_mod.createProvider(
+            self.allocator,
+            self.config.memory.backend,
+            mem_opt,
+            workspace_dir,
+        ) catch null;
+        errdefer if (bootstrap_provider) |bp| bp.deinit();
+
+        var project_ctx = onboard.ProjectContext{};
+        onboard.scaffoldWorkspace(self.allocator, workspace_dir, &project_ctx, bootstrap_provider) catch {};
+
+        const runtime_tools = tools_mod.allTools(self.allocator, workspace_dir, .{
+            .http_enabled = self.config.http_request.enabled,
+            .http_allowed_domains = self.config.http_request.allowed_domains,
+            .http_max_response_size = self.config.http_request.max_response_size,
+            .http_timeout_secs = self.config.http_request.timeout_secs,
+            .web_search_base_url = self.config.http_request.search_base_url,
+            .web_search_provider = self.config.http_request.search_provider,
+            .web_search_fallback_providers = self.config.http_request.search_fallback_providers,
+            .browser_enabled = self.config.browser.enabled,
+            .screenshot_enabled = true,
+            .mcp_server_configs = self.config.mcp_servers,
+            .agents = self.config.agents,
+            .configured_providers = self.config.providers,
+            .fallback_api_key = self.config.defaultProviderKey(),
+            .tools_config = self.config.tools,
+            .allowed_paths = self.config.autonomy.allowed_paths,
+            .policy = self.policy,
+            .subagent_manager = self.subagent_manager,
+            .bootstrap_provider = bootstrap_provider,
+            .backend_name = self.config.memory.backend,
+        }) catch &.{};
+        errdefer if (runtime_tools.len > 0) tools_mod.deinitTools(self.allocator, runtime_tools);
+
+        runtime.* = .{
+            .agent_id = owned_agent_id,
+            .workspace_dir = workspace_dir,
+            .config = makeAgentConfig(self.config, workspace_dir, named_agent),
+            .provider = self.provider,
+            .tools = runtime_tools,
+            .mem = mem_opt,
+            .mem_rt = mem_rt,
+            .session_store = session_store,
+            .response_cache = response_cache,
+            .bootstrap_provider = bootstrap_provider,
+        };
+
+        tools_mod.bindMemoryTools(runtime.tools, runtime.mem);
+        if (runtime.mem_rt) |*rt| {
+            tools_mod.bindMemoryRuntime(runtime.tools, rt);
+        }
+
+        return runtime;
+    }
+
+    fn getOrCreateAgentRuntimeLocked(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) !*AgentRuntime {
+        if (self.agent_runtimes.get(agent_id)) |runtime| return runtime;
+
+        const runtime = try self.createAgentRuntime(agent_id, named_agent);
+        errdefer {
+            runtime.deinit(self.allocator);
+            self.allocator.destroy(runtime);
+        }
+        try self.agent_runtimes.put(self.allocator, runtime.agent_id, runtime);
+        return runtime;
+    }
+
+    fn pruneUnusedAgentRuntimesLocked(self: *SessionManager) void {
+        if (self.agent_runtimes.count() == 0) return;
+
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var runtime_it = self.agent_runtimes.iterator();
+        while (runtime_it.next()) |entry| {
+            const runtime_agent_id = entry.key_ptr.*;
+            var in_use = false;
+
+            var session_it = self.sessions.iterator();
+            while (session_it.next()) |session_entry| {
+                const session_agent_id = parseAgentIdFromSessionKey(session_entry.key_ptr.*);
+                if (std.mem.eql(u8, session_agent_id, runtime_agent_id)) {
+                    in_use = true;
+                    break;
+                }
+            }
+
+            if (!in_use) {
+                to_remove.append(self.allocator, runtime_agent_id) catch continue;
+            }
+        }
+
+        for (to_remove.items) |agent_id| {
+            if (self.agent_runtimes.fetchRemove(agent_id)) |entry| {
+                entry.value.deinit(self.allocator);
+                self.allocator.destroy(entry.value);
+            }
+        }
     }
 
     /// Find or create a session for the given key. Thread-safe.
@@ -208,6 +1205,22 @@ pub const SessionManager = struct {
         };
 
         const agent_profile = findProfileForSessionKey(self.config, session_key);
+        const parsed_agent_id = parseAgentIdFromSessionKey(session_key);
+        const dedicated_runtime = if (self.shouldUseDedicatedRuntime(parsed_agent_id, agent_profile))
+            try self.getOrCreateAgentRuntimeLocked(parsed_agent_id, agent_profile)
+        else
+            null;
+
+        const selected_config: *const Config = if (dedicated_runtime) |rt| &rt.config else self.config;
+        const selected_tools: []const Tool = if (dedicated_runtime) |rt| rt.tools else self.tools;
+        const selected_mem: ?Memory = if (dedicated_runtime) |rt| rt.mem else self.mem;
+        const selected_session_store: ?memory_mod.SessionStore = if (dedicated_runtime) |rt| rt.session_store else self.session_store;
+        const selected_response_cache: ?*memory_mod.cache.ResponseCache = if (dedicated_runtime) |rt| rt.response_cache else self.response_cache;
+        const selected_mem_rt: ?*memory_mod.MemoryRuntime = if (dedicated_runtime) |rt|
+            (if (rt.mem_rt) |*v| v else null)
+        else
+            self.mem_rt;
+
         var provider_ctx = try self.resolveProviderForSession(agent_profile);
         errdefer provider_ctx.deinit(self.allocator);
 
@@ -224,18 +1237,28 @@ pub const SessionManager = struct {
 
         var agent = try Agent.fromConfigWithProfile(
             self.allocator,
-            self.config,
+            selected_config,
             session_provider,
-            self.tools,
-            self.mem,
+            selected_tools,
+            selected_mem,
             self.observer,
             agent_profile,
         );
         agent.policy = self.policy;
-        agent.session_store = self.session_store;
-        agent.response_cache = self.response_cache;
-        agent.mem_rt = self.mem_rt;
+        agent.session_store = selected_session_store;
+        agent.response_cache = selected_response_cache;
+        agent.mem_rt = selected_mem_rt;
         agent.memory_session_id = owned_key;
+        var owned_memory_session_id: ?[]u8 = null;
+        errdefer if (owned_memory_session_id) |sid| self.allocator.free(sid);
+        if (agent_profile) |profile| {
+            if (profile.workspace_path != null) {
+                if (sessionAgentId(session_key)) |agent_id| {
+                    owned_memory_session_id = try std.fmt.allocPrint(self.allocator, "agent:{s}", .{agent_id});
+                    agent.memory_session_id = owned_memory_session_id.?;
+                }
+            }
+        }
         if (self.config.diagnostics.token_usage_ledger_enabled) {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
@@ -247,6 +1270,7 @@ pub const SessionManager = struct {
             .agent = agent,
             .provider_holder = session_provider_holder,
             .owned_provider_api_key = session_owned_provider_api_key,
+            .owned_memory_session_id = owned_memory_session_id,
             .created_at = std.time.timestamp(),
             .last_active = std.time.timestamp(),
             .last_consolidated = 0,
@@ -259,12 +1283,12 @@ pub const SessionManager = struct {
         session_initialized = true;
 
         // Restore persisted conversation history from session store
-        if (self.session_store) |store| {
+        if (selected_session_store) |store| {
             const maybe_entries = store.loadMessages(self.allocator, session_key) catch null;
             if (maybe_entries) |entries| {
                 defer memory_mod.freeMessages(self.allocator, entries);
                 if (entries.len > 0) {
-                    session.agent.loadHistory(entries) catch {};
+                    restorePersistedSessionState(session, entries);
                 }
                 if (try store.loadUsage(session_key)) |total_tokens| {
                     session.agent.total_tokens = total_tokens;
@@ -493,6 +1517,23 @@ pub const SessionManager = struct {
             );
         }
 
+        if (self.maybeHandleClaimGate(session_key, content, conversation_context)) |gate_reply| {
+            if (self.config.diagnostics.log_message_payloads) {
+                const preview = messageLogPreview(gate_reply);
+                log.info(
+                    "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
+                    .{
+                        channel,
+                        session_hash,
+                        gate_reply.len,
+                        std.json.fmt(preview.slice, .{}),
+                        if (preview.truncated) " [truncated]" else "",
+                    },
+                );
+            }
+            return gate_reply;
+        }
+
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
@@ -506,6 +1547,7 @@ pub const SessionManager = struct {
         // Set conversation context for this turn.
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
+        setTurnToolContext(session.agent.tools, session_key, conversation_context);
 
         const prev_stream_callback = session.agent.stream_callback;
         const prev_stream_ctx = session.agent.stream_ctx;
@@ -535,12 +1577,16 @@ pub const SessionManager = struct {
         }
 
         // Persist messages via session store
-        if (self.session_store) |store| {
+        if (session.agent.session_store) |store| {
             if (turn_input.clear_session) {
                 // Clear persisted messages on session reset
                 store.clearMessages(session_key) catch {};
                 // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
+            }
+
+            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
+                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
             }
 
             if (turn_input.llm_user_message) |persisted_user| {
@@ -682,11 +1728,15 @@ pub const SessionManager = struct {
             const old_key = session.session_key;
 
             session.session_key = new_key;
-            session.agent.memory_session_id = session.session_key;
+            if (session.owned_memory_session_id == null) {
+                session.agent.memory_session_id = session.session_key;
+            }
 
             self.sessions.put(self.allocator, session.session_key, session) catch {
                 session.session_key = old_key;
-                session.agent.memory_session_id = session.session_key;
+                if (session.owned_memory_session_id == null) {
+                    session.agent.memory_session_id = session.session_key;
+                }
                 self.sessions.put(self.allocator, old_key, session) catch {
                     log.err("failed to restore live session after canonical key migration rollback", .{});
                 };
@@ -726,6 +1776,7 @@ pub const SessionManager = struct {
 
     fn migrateScopedMemoryEntries(self: *SessionManager, canonical_session_key: []const u8, legacy_session_key: []const u8) void {
         const mem = self.mem orelse return;
+        if (std.mem.eql(u8, mem.name(), "markdown")) return;
 
         const legacy_entries = mem.list(self.allocator, null, legacy_session_key) catch return;
         defer memory_mod.freeEntries(self.allocator, legacy_entries);
@@ -733,6 +1784,7 @@ pub const SessionManager = struct {
 
         for (legacy_entries) |entry| {
             mem.store(entry.key, entry.content, entry.category, canonical_session_key) catch return;
+            _ = mem.forgetScoped(self.allocator, entry.key, legacy_session_key) catch return;
         }
     }
 
@@ -800,6 +1852,10 @@ pub const SessionManager = struct {
                 self.allocator.destroy(session);
                 evicted += 1;
             }
+        }
+
+        if (evicted > 0) {
+            self.pruneUnusedAgentRuntimesLocked();
         }
 
         return evicted;
@@ -1061,6 +2117,63 @@ fn testConfig() Config {
         .default_model = "test/mock-model",
         .allocator = testing.allocator,
     };
+}
+
+fn testBuildClaimToken(
+    allocator: Allocator,
+    secret: []const u8,
+    expires_at: i64,
+    canonical_user_id: []const u8,
+    nonce: []const u8,
+) ![]u8 {
+    const payload = try std.fmt.allocPrint(allocator, "v1:{d}:{s}:{s}", .{ expires_at, canonical_user_id, nonce });
+    defer allocator.free(payload);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, payload, secret);
+
+    var sig_hex: [64]u8 = undefined;
+    for (mac, 0..) |byte, i| {
+        sig_hex[i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_hex[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "v1:{d}:{s}:{s}:{s}",
+        .{ expires_at, canonical_user_id, nonce, sig_hex[0..] },
+    );
+}
+
+fn testClaimCommand(allocator: Allocator, token: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/claim {s}", .{token});
+}
+
+fn toNativePathFragment(allocator: Allocator, unix_path_fragment: []const u8) ![]u8 {
+    const native = try allocator.dupe(u8, unix_path_fragment);
+    if (std.fs.path.sep == '\\') {
+        for (native) |*ch| {
+            if (ch.* == '/') ch.* = '\\';
+        }
+    }
+    return native;
+}
+
+fn expectPathContains(path: []const u8, unix_path_fragment: []const u8) !void {
+    const native_fragment = try toNativePathFragment(testing.allocator, unix_path_fragment);
+    defer testing.allocator.free(native_fragment);
+    const has_unix = std.mem.indexOf(u8, path, unix_path_fragment) != null;
+    const has_native = std.mem.indexOf(u8, path, native_fragment) != null;
+    try testing.expect(has_unix or has_native);
+}
+
+fn expectPathEndsWith(path: []const u8, unix_path_suffix: []const u8) !void {
+    const native_suffix = try toNativePathFragment(testing.allocator, unix_path_suffix);
+    defer testing.allocator.free(native_suffix);
+    const ends_unix = std.mem.endsWith(u8, path, unix_path_suffix);
+    const ends_native = std.mem.endsWith(u8, path, native_suffix);
+    try testing.expect(ends_unix or ends_native);
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,6 +2514,434 @@ test "getOrCreate stores named agent provider interface from session-owned holde
     const holder_provider = holder.provider();
     try testing.expect(session.agent.provider.ptr == holder_provider.ptr);
     try testing.expect(session.agent.provider.vtable == holder_provider.vtable);
+}
+
+test "getOrCreate uses named agent workspace namespace when workspace_path is set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    defer testing.allocator.free(config_path);
+    const expected_workspace = try std.fs.path.join(testing.allocator, &.{ base, "agents", "coder-agent" });
+    defer testing.allocator.free(expected_workspace);
+
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agents = &.{
+        .{
+            .name = "Coder Agent",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+            .workspace_path = "agents/coder-agent",
+        },
+    };
+
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:coder-agent:telegram:group:-100123");
+    try testing.expect(session.owned_memory_session_id != null);
+    try testing.expectEqualStrings("agent:coder-agent", session.agent.memory_session_id.?);
+    try testing.expectEqualStrings(expected_workspace, session.agent.workspace_dir);
+}
+
+test "getOrCreate auto-provisioned peer uses dedicated runtime workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const auto_session = try sm.getOrCreate("agent:peer-deadbeefcafebabe:whatsapp_web:direct:5511987654321");
+    try expectPathContains(auto_session.agent.workspace_dir, "/agents/peer-deadbeefcafebabe/workspace");
+    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+
+    const default_session = try sm.getOrCreate("agent:main:whatsapp_web:direct:5511987654321");
+    try testing.expectEqualStrings(base, default_session.agent.workspace_dir);
+    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "getOrCreate named agent workspace override creates dedicated runtime" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    const agents = [_]NamedAgentConfig{
+        .{
+            .name = "Helper Bot",
+            .provider = "openrouter",
+            .model = "test/mock-model",
+            .workspace_path = "agents/helper-workspace",
+        },
+    };
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agents = &agents;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:helper-bot:telegram:direct:42");
+    try expectPathEndsWith(session.agent.workspace_dir, "agents/helper-workspace");
+    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "claim gate blocks unverified peer when dm_scope is main" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.dm_scope = .main;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const resp = try sm.processMessage("agent:peer-0011223344556677:main", "hello", .{
+        .channel = "whatsapp_web",
+        .account_id = "default",
+        .peer_id = "5511",
+        .is_group = false,
+    });
+    defer testing.allocator.free(resp);
+
+    try testing.expect(std.mem.indexOf(u8, resp, "Identity verification required") != null);
+    try testing.expectEqual(@as(usize, 0), sm.sessionCount());
+}
+
+test "claim gate attempts are scoped by account_id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.dm_scope = .per_account_channel_peer;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+    cfg.session.claim_max_attempts = 1;
+    cfg.session.claim_lockout_secs = 120;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const bad_claim = "/claim v1:9999999999:void:nonce-bad:0000000000000000000000000000000000000000000000000000000000000000";
+    const account_a = try sm.processMessage("agent:peer-aaaaaaaaaaaaaaaa:whatsapp_web:acct-a:direct:55118888", bad_claim, .{
+        .channel = "whatsapp_web",
+        .account_id = "acct-a",
+        .peer_id = "55118888",
+        .is_group = false,
+    });
+    defer testing.allocator.free(account_a);
+    try testing.expect(std.mem.indexOf(u8, account_a, "Invalid or expired claim token") != null);
+
+    const locked_a = try sm.processMessage("agent:peer-aaaaaaaaaaaaaaaa:whatsapp_web:acct-a:direct:55118888", "hello", .{
+        .channel = "whatsapp_web",
+        .account_id = "acct-a",
+        .peer_id = "55118888",
+        .is_group = false,
+    });
+    defer testing.allocator.free(locked_a);
+    try testing.expect(std.mem.indexOf(u8, locked_a, "Too many failed claim attempts") != null);
+
+    const account_b = try sm.processMessage("agent:peer-bbbbbbbbbbbbbbbb:whatsapp_web:acct-b:direct:55118888", "hello", .{
+        .channel = "whatsapp_web",
+        .account_id = "acct-b",
+        .peer_id = "55118888",
+        .is_group = false,
+    });
+    defer testing.allocator.free(account_b);
+    try testing.expect(std.mem.indexOf(u8, account_b, "Identity verification required") != null);
+}
+
+test "claim gate blocks unverified peer before session provisioning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:peer-0011223344556677:whatsapp_web:direct:5511";
+    const resp = try sm.processMessage(session_key, "hello", null);
+    defer testing.allocator.free(resp);
+
+    try testing.expect(std.mem.indexOf(u8, resp, "Identity verification required") != null);
+    try testing.expectEqual(@as(usize, 0), sm.sessionCount());
+    try testing.expectEqual(@as(usize, 0), sm.agent_runtimes.count());
+}
+
+test "claim gate unlocks peer runtime after valid signed token" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:peer-deadbeefcafebabe:whatsapp_web:direct:5511987654321";
+    const token = try testBuildClaimToken(
+        testing.allocator,
+        cfg.session.claim_secret.?,
+        std.time.timestamp() + 600,
+        "void",
+        "nonce-001",
+    );
+    defer testing.allocator.free(token);
+    const claim_cmd = try testClaimCommand(testing.allocator, token);
+    defer testing.allocator.free(claim_cmd);
+
+    const claim_resp = try sm.processMessage(session_key, claim_cmd, null);
+    defer testing.allocator.free(claim_resp);
+    try testing.expect(std.mem.indexOf(u8, claim_resp, "Identity verified as 'void'") != null);
+
+    const resp = try sm.processMessage(session_key, "hello after claim", null);
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings("ok", resp);
+    try testing.expectEqual(@as(usize, 1), sm.sessionCount());
+    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "claim gate persists verified identity across manager restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+
+    var mock = MockProvider{ .response = "ok" };
+    const session_key = "agent:peer-a1b2c3d4e5f60718:whatsapp_web:direct:55115555";
+
+    {
+        var sm = testSessionManager(testing.allocator, &mock, &cfg);
+        defer sm.deinit();
+
+        const token = try testBuildClaimToken(
+            testing.allocator,
+            cfg.session.claim_secret.?,
+            std.time.timestamp() + 600,
+            "void",
+            "nonce-persist",
+        );
+        defer testing.allocator.free(token);
+        const claim_cmd = try testClaimCommand(testing.allocator, token);
+        defer testing.allocator.free(claim_cmd);
+
+        const claim_resp = try sm.processMessage(session_key, claim_cmd, null);
+        defer testing.allocator.free(claim_resp);
+        try testing.expect(std.mem.indexOf(u8, claim_resp, "Identity verified as 'void'") != null);
+    }
+
+    {
+        var sm = testSessionManager(testing.allocator, &mock, &cfg);
+        defer sm.deinit();
+
+        const resp = try sm.processMessage(session_key, "hello after restart", null);
+        defer testing.allocator.free(resp);
+        try testing.expectEqualStrings("ok", resp);
+    }
+}
+
+test "claim gate rejects replayed nonce across peers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const token = try testBuildClaimToken(
+        testing.allocator,
+        cfg.session.claim_secret.?,
+        std.time.timestamp() + 600,
+        "void",
+        "nonce-replay",
+    );
+    defer testing.allocator.free(token);
+    const claim_cmd = try testClaimCommand(testing.allocator, token);
+    defer testing.allocator.free(claim_cmd);
+
+    const first_key = "agent:peer-aaaaaaaaaaaaaaaa:whatsapp_web:direct:551100000001";
+    const second_key = "agent:peer-bbbbbbbbbbbbbbbb:whatsapp_web:direct:551100000002";
+
+    const first_resp = try sm.processMessage(first_key, claim_cmd, null);
+    defer testing.allocator.free(first_resp);
+    try testing.expect(std.mem.indexOf(u8, first_resp, "Identity verified as 'void'") != null);
+
+    const replay_resp = try sm.processMessage(second_key, claim_cmd, null);
+    defer testing.allocator.free(replay_resp);
+    try testing.expect(std.mem.indexOf(u8, replay_resp, "Invalid or expired claim token") != null);
+    try testing.expectEqual(@as(usize, 0), sm.sessionCount());
+}
+
+test "claim gate locks out after max failed attempts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+    cfg.session.claim_max_attempts = 2;
+    cfg.session.claim_lockout_secs = 120;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:peer-feedfacefeedface:whatsapp_web:direct:55118888";
+    const bad_claim = "/claim v1:9999999999:void:nonce-bad:0000000000000000000000000000000000000000000000000000000000000000";
+
+    const first = try sm.processMessage(session_key, bad_claim, null);
+    defer testing.allocator.free(first);
+    try testing.expect(std.mem.indexOf(u8, first, "Invalid or expired claim token") != null);
+
+    const second = try sm.processMessage(session_key, bad_claim, null);
+    defer testing.allocator.free(second);
+    try testing.expect(std.mem.indexOf(u8, second, "Invalid or expired claim token") != null);
+
+    const third = try sm.processMessage(session_key, "hello", null);
+    defer testing.allocator.free(third);
+    try testing.expect(std.mem.indexOf(u8, third, "Too many failed claim attempts") != null);
+    try testing.expectEqual(@as(usize, 0), sm.sessionCount());
+}
+
+test "claim gate supports revoke and returns peer to quarantine mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+    cfg.session.claim_secret = "claim-secret";
+    cfg.session.claim_admin_secret = "admin-secret";
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:peer-1234567890abcdef:whatsapp_web:direct:55119999";
+    const token = try testBuildClaimToken(
+        testing.allocator,
+        cfg.session.claim_secret.?,
+        std.time.timestamp() + 600,
+        "void",
+        "nonce-revoke",
+    );
+    defer testing.allocator.free(token);
+    const claim_cmd = try testClaimCommand(testing.allocator, token);
+    defer testing.allocator.free(claim_cmd);
+
+    const claim_resp = try sm.processMessage(session_key, claim_cmd, null);
+    defer testing.allocator.free(claim_resp);
+    try testing.expect(std.mem.indexOf(u8, claim_resp, "Identity verified as 'void'") != null);
+
+    const unlocked = try sm.processMessage(session_key, "hello", null);
+    defer testing.allocator.free(unlocked);
+    try testing.expectEqualStrings("ok", unlocked);
+    try testing.expectEqual(@as(usize, 1), sm.sessionCount());
+
+    const bad_revoke = try sm.processMessage(session_key, "/revoke nope", null);
+    defer testing.allocator.free(bad_revoke);
+    try testing.expectEqualStrings("Invalid revoke secret.", bad_revoke);
+
+    const revoked = try sm.processMessage(session_key, "/revoke admin-secret", null);
+    defer testing.allocator.free(revoked);
+    try testing.expect(std.mem.indexOf(u8, revoked, "Identity link revoked") != null);
+
+    const gated_again = try sm.processMessage(session_key, "hello again", null);
+    defer testing.allocator.free(gated_again);
+    try testing.expect(std.mem.indexOf(u8, gated_again, "Identity verification required") != null);
 }
 
 test "getOrCreate falls back to default config for unknown routed agent id" {
@@ -2055,6 +3596,123 @@ test "processMessage slash-prefixed prompt that is not a local command persists 
     try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
 }
 
+test "processMessage runtime slash commands persist across reload" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:runtime-state";
+    const commands = [_][]const u8{
+        "/think high",
+        "/verbose full",
+        "/reasoning stream",
+        "/usage full",
+        "/exec host=node security=full ask=always node=worker-a",
+        "/queue debounce debounce:2s cap:3 drop:oldest",
+        "/tts always provider test-provider limit 120 summary on audio on",
+        "/session ttl 5m",
+        "/focus incident-123",
+        "/dock-telegram",
+        "/activation always",
+        "/send on",
+        "/debug reset",
+        "/usage cost",
+        "/exec host=sandbox security=allowlist ask=on-miss",
+        "/queue serial cap:4 drop:newest",
+        "/tts tagged provider replay-provider limit 77 summary off audio off",
+        "/session ttl 30s",
+        "/unfocus",
+        "/dock-slack",
+        "/activation mention",
+        "/send inherit",
+        "/elevated full",
+    };
+
+    for (commands) |command| {
+        const reply = try sm.processMessage(session_key, command, .{
+            .channel = "telegram",
+            .is_group = false,
+            .group_id = null,
+        });
+        defer testing.allocator.free(reply);
+    }
+
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expect(live_session.agent.reasoning_effort == null);
+    try testing.expect(live_session.agent.verbose_level == .off);
+    try testing.expect(live_session.agent.reasoning_mode == .off);
+    try testing.expect(live_session.agent.usage_mode == .cost);
+    try testing.expect(live_session.agent.exec_host == .sandbox);
+    try testing.expect(live_session.agent.exec_security == .full);
+    try testing.expect(live_session.agent.exec_ask == .off);
+    try testing.expect(live_session.agent.exec_node_id == null);
+    try testing.expect(live_session.agent.queue_mode == .serial);
+    try testing.expectEqual(@as(u32, 4), live_session.agent.queue_cap);
+    try testing.expect(live_session.agent.queue_drop == .newest);
+    try testing.expect(live_session.agent.tts_mode == .tagged);
+    try testing.expectEqualStrings("replay-provider", live_session.agent.tts_provider.?);
+    try testing.expectEqual(@as(u32, 77), live_session.agent.tts_limit_chars);
+    try testing.expect(!live_session.agent.tts_summary);
+    try testing.expect(!live_session.agent.tts_audio);
+    try testing.expectEqual(@as(?u64, 30), live_session.agent.session_ttl_secs);
+    try testing.expect(live_session.agent.focus_target == null);
+    try testing.expectEqualStrings("slack", live_session.agent.dock_target.?);
+    try testing.expect(live_session.agent.activation_mode == .mention);
+    try testing.expect(live_session.agent.send_mode == .inherit);
+    try testing.expectEqual(@as(usize, 0), live_session.agent.historyLen());
+
+    const store = sqlite_mem.sessionStore();
+    const entries = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, commands.len), entries.len);
+    for (entries, commands) |entry, command| {
+        try testing.expectEqualStrings(RUNTIME_COMMAND_ROLE, entry.role);
+        try testing.expectEqualStrings(command, entry.content);
+    }
+
+    live_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expect(restored.agent.reasoning_effort == null);
+    try testing.expect(restored.agent.verbose_level == .off);
+    try testing.expect(restored.agent.reasoning_mode == .off);
+    try testing.expect(restored.agent.usage_mode == .cost);
+    try testing.expect(restored.agent.exec_host == .sandbox);
+    try testing.expect(restored.agent.exec_security == .full);
+    try testing.expect(restored.agent.exec_ask == .off);
+    try testing.expect(restored.agent.exec_node_id == null);
+    try testing.expect(restored.agent.queue_mode == .serial);
+    try testing.expectEqual(@as(u32, 4), restored.agent.queue_cap);
+    try testing.expect(restored.agent.queue_drop == .newest);
+    try testing.expect(restored.agent.tts_mode == .tagged);
+    try testing.expectEqualStrings("replay-provider", restored.agent.tts_provider.?);
+    try testing.expectEqual(@as(u32, 77), restored.agent.tts_limit_chars);
+    try testing.expect(!restored.agent.tts_summary);
+    try testing.expect(!restored.agent.tts_audio);
+    try testing.expectEqual(@as(?u64, 30), restored.agent.session_ttl_secs);
+    try testing.expect(restored.agent.focus_target == null);
+    try testing.expectEqualStrings("slack", restored.agent.dock_target.?);
+    try testing.expect(restored.agent.activation_mode == .mention);
+    try testing.expect(restored.agent.send_mode == .inherit);
+    try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
+}
+
 test "processMessage different keys — independent sessions" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
@@ -2273,6 +3931,34 @@ test "evictIdle removes old sessions" {
     const evicted = sm.evictIdle(500);
     try testing.expectEqual(@as(usize, 1), evicted);
     try testing.expectEqual(@as(usize, 0), sm.sessionCount());
+}
+
+test "evictIdle prunes unused dedicated agent runtimes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.session.auto_provision_direct_agents = true;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:peer-0011223344556677:whatsapp_web:direct:5511");
+    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+
+    session.last_active = std.time.timestamp() - 1000;
+    const evicted = sm.evictIdle(1);
+    try testing.expectEqual(@as(usize, 1), evicted);
+    try testing.expectEqual(@as(usize, 0), sm.sessionCount());
+    try testing.expectEqual(@as(usize, 0), sm.agent_runtimes.count());
 }
 
 test "evictIdle preserves recent sessions" {

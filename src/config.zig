@@ -1,6 +1,7 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const provider_names = @import("provider_names.zig");
+const secrets = @import("security/secrets.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
 /// Write a JSON-escaped string (with enclosing quotes) to any writer.
@@ -56,6 +57,7 @@ pub const MatrixConfig = config_types.MatrixConfig;
 pub const MaxConfig = config_types.MaxConfig;
 pub const MattermostConfig = config_types.MattermostConfig;
 pub const WhatsAppConfig = config_types.WhatsAppConfig;
+pub const ExternalChannelConfig = config_types.ExternalChannelConfig;
 pub const IrcConfig = config_types.IrcConfig;
 pub const LarkReceiveMode = config_types.LarkReceiveMode;
 pub const LarkConfig = config_types.LarkConfig;
@@ -105,9 +107,19 @@ const SerializedNamedAgentConfig = struct {
     provider: []const u8,
     model: []const u8,
     system_prompt: ?[]const u8 = null,
+    workspace_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+};
+
+const SerializedModelRouteConfig = struct {
+    hint: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    cost_class: config_types.ModelRouteCostClass = .standard,
+    quota_class: config_types.ModelRouteQuotaClass = .normal,
 };
 
 fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentConfig) void {
@@ -117,6 +129,7 @@ fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentC
         allocator.free(agent_cfg.model);
         if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
         if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+        if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
         if (agent_cfg.api_key) |api_key| allocator.free(api_key);
     }
     allocator.free(agents);
@@ -203,6 +216,59 @@ pub const Config = struct {
         return self.getProviderKey(self.default_provider);
     }
 
+    fn sanitizeStatePathSegment(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        for (trimmed) |ch| {
+            if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') {
+                try buf.append(allocator, ch);
+            } else {
+                try buf.append(allocator, '_');
+            }
+        }
+        if (buf.items.len == 0) {
+            try buf.appendSlice(allocator, "default");
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn backfillExternalChannelStateDirs(self: *Config) !void {
+        const config_dir = std.fs.path.dirname(self.config_path) orelse ".";
+        const external_mut = @constCast(self.channels.external);
+        for (external_mut) |*external_cfg| {
+            const runtime_segment = try sanitizeStatePathSegment(self.allocator, external_cfg.runtime_name);
+            defer self.allocator.free(runtime_segment);
+            const account_segment = try sanitizeStatePathSegment(self.allocator, external_cfg.account_id);
+            defer self.allocator.free(account_segment);
+
+            external_cfg.state_dir = try std.fs.path.join(self.allocator, &.{
+                config_dir,
+                "state",
+                "external",
+                runtime_segment,
+                account_segment,
+            });
+        }
+    }
+
+    pub fn backfillRuntimeDerivedFields(self: *Config) !void {
+        if (self.channels.nostr) |ns| {
+            ns.config_dir = std.fs.path.dirname(self.config_path) orelse ".";
+        }
+
+        {
+            const dir = std.fs.path.dirname(self.config_path) orelse ".";
+            const teams_mut = @constCast(self.channels.teams);
+            for (teams_mut) |*tc| {
+                tc.config_dir = dir;
+            }
+        }
+
+        try self.backfillExternalChannelStateDirs();
+    }
+
     /// Look up a provider's base_url from the providers list.
     pub fn getProviderBaseUrl(self: *const Config, name: []const u8) ?[]const u8 {
         for (self.providers) |e| {
@@ -218,6 +284,31 @@ pub const Config = struct {
             if (provider_names.providerNamesMatch(e.name, name)) return e.native_tools;
         }
         return true;
+    }
+
+    fn isReservedRuntimeChannelName(runtime_name: []const u8) bool {
+        inline for (std.meta.fields(config_types.ChannelsConfig)) |field| {
+            if (std.mem.eql(u8, field.name, runtime_name)) return true;
+        }
+        return false;
+    }
+
+    fn externalRuntimeNameConflicts(self: *const Config, runtime_name: []const u8, current_index: usize) bool {
+        if (isReservedRuntimeChannelName(runtime_name)) return true;
+        for (self.channels.maixcam) |maixcam_cfg| {
+            if (std.mem.eql(u8, maixcam_cfg.name, runtime_name)) return true;
+        }
+        for (self.channels.external, 0..) |external_cfg, index| {
+            if (index == current_index) continue;
+            if (std.mem.eql(u8, external_cfg.runtime_name, runtime_name)) return true;
+        }
+        return false;
+    }
+
+    fn isValidExternalPluginConfigJson(allocator: std.mem.Allocator, raw: []const u8) bool {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+        defer parsed.deinit();
+        return parsed.value == .object;
     }
 
     /// Look up the optional User-Agent for a provider.
@@ -294,17 +385,7 @@ pub const Config = struct {
         }
 
         // Backfill runtime-derived fields not present in JSON
-        if (cfg.channels.nostr) |ns| {
-            ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
-        }
-        // Backfill config_dir for Teams channels (used for conversation reference persistence)
-        {
-            const dir = std.fs.path.dirname(config_path) orelse ".";
-            const teams_mut = @constCast(cfg.channels.teams);
-            for (teams_mut) |*tc| {
-                tc.config_dir = dir;
-            }
-        }
+        try cfg.backfillRuntimeDerivedFields();
 
         // Environment variable overrides
         cfg.applyEnvOverrides();
@@ -339,6 +420,39 @@ pub const Config = struct {
         if (wrote_any) {
             try w.print(",\n", .{});
         }
+    }
+
+    fn secretStore(self: *const Config) secrets.SecretStore {
+        const config_dir = std.fs.path.dirname(self.config_path) orelse ".";
+        return secrets.SecretStore.init(config_dir, self.secrets.encrypt);
+    }
+
+    fn encryptConfigSecret(
+        self: *const Config,
+        store: *const secrets.SecretStore,
+        value: ?[]const u8,
+    ) !?[]u8 {
+        const secret = value orelse return null;
+        return try store.encryptSecret(self.allocator, secret);
+    }
+
+    fn encryptConfigSecretArray(
+        self: *const Config,
+        store: *const secrets.SecretStore,
+        values: []const []const u8,
+    ) ![][]const u8 {
+        var encrypted = try self.allocator.alloc([]const u8, values.len);
+        var count: usize = 0;
+        errdefer {
+            for (encrypted[0..count]) |value| self.allocator.free(value);
+            self.allocator.free(encrypted);
+        }
+
+        for (values, 0..) |value, i| {
+            encrypted[i] = try store.encryptSecret(self.allocator, value);
+            count += 1;
+        }
+        return encrypted;
     }
 
     fn writeIndentedMultilineJson(w: *std.Io.Writer, json: []const u8, continuation_indent: []const u8) !void {
@@ -385,6 +499,61 @@ pub const Config = struct {
         try w.print("\n      }}\n    }}", .{});
     }
 
+    fn writeExternalTransport(self: *const Config, w: *std.Io.Writer, transport: ExternalChannelConfig.TransportConfig) !void {
+        _ = self;
+        try w.print("{{\"command\": {f}", .{std.json.fmt(transport.command, .{})});
+
+        if (transport.args.len > 0) {
+            try w.print(", \"args\": {f}", .{std.json.fmt(transport.args, .{})});
+        }
+        if (transport.env.len > 0) {
+            try w.print(", \"env\": {{", .{});
+            for (transport.env, 0..) |entry, index| {
+                if (index > 0) try w.print(", ", .{});
+                try w.print("{f}: {f}", .{
+                    std.json.fmt(entry.key, .{}),
+                    std.json.fmt(entry.value, .{}),
+                });
+            }
+            try w.print("}}", .{});
+        }
+        if (transport.timeout_ms != 10_000) {
+            try w.print(", \"timeout_ms\": {d}", .{transport.timeout_ms});
+        }
+        try w.print("}}", .{});
+    }
+
+    fn writeExternalChannelAccount(self: *const Config, w: *std.Io.Writer, account: ExternalChannelConfig) !void {
+        try w.print("{{\"runtime_name\": {f}, \"transport\": ", .{
+            std.json.fmt(account.runtime_name, .{}),
+        });
+        try self.writeExternalTransport(w, account.transport);
+
+        try w.print(", \"config\": ", .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, account.plugin_config_json, .{}) catch {
+            try w.print("{f}", .{std.json.fmt(account.plugin_config_json, .{})});
+            try w.print("}}", .{});
+            return;
+        };
+        defer parsed.deinit();
+        try writePrettyJsonInline(self.allocator, w, parsed.value, "");
+        try w.print("}}", .{});
+    }
+
+    fn writeExternalChannelAccounts(self: *const Config, w: *std.Io.Writer, accounts: []const ExternalChannelConfig) !void {
+        try w.print("    \"external\": {{\n      \"accounts\": {{", .{});
+        for (accounts, 0..) |account, index| {
+            if (index == 0) {
+                try w.print("\n", .{});
+            } else {
+                try w.print(",\n", .{});
+            }
+            try w.print("        \"{s}\": ", .{account.account_id});
+            try self.writeExternalChannelAccount(w, account);
+        }
+        try w.print("\n      }}\n    }}", .{});
+    }
+
     fn writeChannelsSection(self: *const Config, w: *std.Io.Writer) !void {
         try w.print("  \"channels\": {{\n", .{});
 
@@ -400,6 +569,14 @@ pub const Config = struct {
             if (comptime std.mem.eql(u8, field.name, "nostr")) continue;
 
             const channel_value = @field(self.channels, field.name);
+            if (comptime std.mem.eql(u8, field.name, "external")) {
+                if (channel_value.len > 0) {
+                    try writeChannelFieldSeparator(w, wrote_any);
+                    try self.writeExternalChannelAccounts(w, channel_value);
+                    wrote_any = true;
+                }
+                continue;
+            }
             switch (@typeInfo(field.type)) {
                 .pointer => |ptr| {
                     if (ptr.size == .slice and channel_value.len > 0) {
@@ -482,7 +659,7 @@ pub const Config = struct {
         try w.print("]", .{});
     }
 
-    fn writeReliabilitySection(self: *const Config, w: *std.Io.Writer) !void {
+    fn writeReliabilitySection(self: *const Config, w: *std.Io.Writer, store: *const secrets.SecretStore) !void {
         try w.print("  \"reliability\": {{\n", .{});
         try w.print("    \"provider_retries\": {d},\n", .{self.reliability.provider_retries});
         try w.print("    \"provider_backoff_ms\": {d},\n", .{self.reliability.provider_backoff_ms});
@@ -496,7 +673,12 @@ pub const Config = struct {
         try w.print(",\n", .{});
 
         try w.print("    \"api_keys\": ", .{});
-        try writeStringArray(w, self.reliability.api_keys);
+        const encrypted_api_keys = try self.encryptConfigSecretArray(store, self.reliability.api_keys);
+        defer {
+            for (encrypted_api_keys) |value| self.allocator.free(value);
+            self.allocator.free(encrypted_api_keys);
+        }
+        try writeStringArray(w, encrypted_api_keys);
         try w.print(",\n", .{});
 
         try w.print("    \"model_fallbacks\": [", .{});
@@ -513,15 +695,36 @@ pub const Config = struct {
     fn writeMcpServersSection(self: *const Config, w: *std.Io.Writer) !void {
         try w.print("  \"mcp_servers\": {{\n", .{});
         for (self.mcp_servers, 0..) |server, i| {
-            try w.print("    {f}: {{\"command\": {f}", .{
-                std.json.fmt(server.name, .{}),
-                std.json.fmt(server.command, .{}),
-            });
+            try w.print("    {f}: {{", .{std.json.fmt(server.name, .{})});
+
+            var wrote_field = false;
+            if (!std.mem.eql(u8, server.transport, McpServerConfig.DEFAULT_TRANSPORT)) {
+                try w.print("\"transport\": {f}", .{std.json.fmt(server.transport, .{})});
+                wrote_field = true;
+            }
+            if (server.command.len > 0) {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"command\": {f}", .{std.json.fmt(server.command, .{})});
+                wrote_field = true;
+            }
+            if (server.url) |url| {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"url\": {f}", .{std.json.fmt(url, .{})});
+                wrote_field = true;
+            }
+            if (server.timeout_ms != 10_000) {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"timeout_ms\": {d}", .{server.timeout_ms});
+                wrote_field = true;
+            }
             if (server.args.len > 0) {
-                try w.print(", \"args\": {f}", .{std.json.fmt(server.args, .{})});
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"args\": {f}", .{std.json.fmt(server.args, .{})});
+                wrote_field = true;
             }
             if (server.env.len > 0) {
-                try w.print(", \"env\": {{", .{});
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"env\": {{", .{});
                 for (server.env, 0..) |entry, env_i| {
                     if (env_i > 0) try w.print(", ", .{});
                     try w.print("{f}: {f}", .{
@@ -530,6 +733,20 @@ pub const Config = struct {
                     });
                 }
                 try w.print("}}", .{});
+                wrote_field = true;
+            }
+            if (server.headers.len > 0) {
+                if (wrote_field) try w.print(", ", .{});
+                try w.print("\"headers\": {{", .{});
+                for (server.headers, 0..) |entry, hdr_i| {
+                    if (hdr_i > 0) try w.print(", ", .{});
+                    try w.print("{f}: {f}", .{
+                        std.json.fmt(entry.key, .{}),
+                        std.json.fmt(entry.value, .{}),
+                    });
+                }
+                try w.print("}}", .{});
+                wrote_field = true;
             }
             try w.print("}}", .{});
             if (i + 1 < self.mcp_servers.len) try w.print(",", .{});
@@ -588,6 +805,7 @@ pub const Config = struct {
     /// Save config as JSON to the config_path.
     pub fn save(self: *const Config) !void {
         const dir = std.fs.path.dirname(self.config_path) orelse return error.InvalidConfigPath;
+        const store = self.secretStore();
 
         // Ensure parent directory exists
         std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
@@ -627,8 +845,10 @@ pub const Config = struct {
                 try w.print("      \"{s}\": {{", .{entry.name});
                 var has_field = false;
                 if (entry.api_key) |key| {
+                    const encrypted_key = try self.encryptConfigSecret(&store, key);
+                    defer if (encrypted_key) |value| self.allocator.free(value);
                     try w.print("\"api_key\": ", .{});
-                    try writePrettyJsonInline(self.allocator, w, key, "");
+                    try writePrettyJsonInline(self.allocator, w, encrypted_key.?, "");
                     has_field = true;
                 }
                 if (entry.base_url) |base| {
@@ -660,7 +880,32 @@ pub const Config = struct {
         }
 
         if (self.model_routes.len > 0) {
-            try w.print("  \"model_routes\": {f},\n", .{std.json.fmt(self.model_routes, .{})});
+            const serialized_routes = try self.allocator.alloc(SerializedModelRouteConfig, self.model_routes.len);
+            defer self.allocator.free(serialized_routes);
+            var route_count: usize = 0;
+            errdefer {
+                for (serialized_routes[0..route_count]) |route| {
+                    if (route.api_key) |value| self.allocator.free(value);
+                }
+            }
+            for (self.model_routes, 0..) |route, i| {
+                const encrypted_key = try self.encryptConfigSecret(&store, route.api_key);
+                serialized_routes[i] = .{
+                    .hint = route.hint,
+                    .provider = route.provider,
+                    .model = route.model,
+                    .api_key = encrypted_key,
+                    .cost_class = route.cost_class,
+                    .quota_class = route.quota_class,
+                };
+                route_count += 1;
+            }
+            defer {
+                for (serialized_routes) |route| {
+                    if (route.api_key) |value| self.allocator.free(value);
+                }
+            }
+            try w.print("  \"model_routes\": {f},\n", .{std.json.fmt(serialized_routes, .{})});
         }
 
         // agents.defaults (model + heartbeat) + agents.list
@@ -700,16 +945,30 @@ pub const Config = struct {
                 if (has_agents) {
                     const serialized_agents = try self.allocator.alloc(SerializedNamedAgentConfig, self.agents.len);
                     defer self.allocator.free(serialized_agents);
+                    var agent_count: usize = 0;
+                    errdefer {
+                        for (serialized_agents[0..agent_count]) |agent_cfg| {
+                            if (agent_cfg.api_key) |value| self.allocator.free(value);
+                        }
+                    }
                     for (self.agents, 0..) |agent_cfg, i| {
+                        const encrypted_key = try self.encryptConfigSecret(&store, agent_cfg.api_key);
                         serialized_agents[i] = .{
                             .name = agent_cfg.name,
                             .provider = agent_cfg.provider,
                             .model = agent_cfg.model,
                             .system_prompt = agent_cfg.system_prompt_path orelse agent_cfg.system_prompt,
-                            .api_key = agent_cfg.api_key,
+                            .workspace_path = agent_cfg.workspace_path,
+                            .api_key = encrypted_key,
                             .temperature = agent_cfg.temperature,
                             .max_depth = agent_cfg.max_depth,
                         };
+                        agent_count += 1;
+                    }
+                    defer {
+                        for (serialized_agents) |agent_cfg| {
+                            if (agent_cfg.api_key) |value| self.allocator.free(value);
+                        }
                     }
                     if (wrote_agent_field) {
                         try w.print(",\n", .{});
@@ -743,7 +1002,7 @@ pub const Config = struct {
         try w.print(",\n    \"token_usage_ledger_window_hours\": {d}", .{self.diagnostics.token_usage_ledger_window_hours});
         try w.print(",\n    \"token_usage_ledger_max_bytes\": {d}", .{self.diagnostics.token_usage_ledger_max_bytes});
         try w.print(",\n    \"token_usage_ledger_max_lines\": {d}", .{self.diagnostics.token_usage_ledger_max_lines});
-        if (self.diagnostics.otel_endpoint != null or self.diagnostics.otel_service_name != null) {
+        if (self.diagnostics.otel_endpoint != null or self.diagnostics.otel_service_name != null or self.diagnostics.otel_headers.len > 0) {
             try w.print(",\n    \"otel\": {{", .{});
             var otel_first = true;
             if (self.diagnostics.otel_endpoint) |ep| {
@@ -753,6 +1012,18 @@ pub const Config = struct {
             if (self.diagnostics.otel_service_name) |sn| {
                 if (!otel_first) try w.print(", ", .{});
                 try w.print("\"service_name\": \"{s}\"", .{sn});
+                otel_first = false;
+            }
+            if (self.diagnostics.otel_headers.len > 0) {
+                if (!otel_first) try w.print(", ", .{});
+                try w.print("\"headers\": {{", .{});
+                for (self.diagnostics.otel_headers, 0..) |header, i| {
+                    if (i > 0) try w.print(", ", .{});
+                    try writeJsonStr(w, header.key);
+                    try w.print(": ", .{});
+                    try writeJsonStr(w, header.value);
+                }
+                try w.print("}}", .{});
             }
             try w.print("}}", .{});
         }
@@ -771,7 +1042,7 @@ pub const Config = struct {
         }, .{})});
 
         // Reliability
-        try self.writeReliabilitySection(w);
+        try self.writeReliabilitySection(w, &store);
         try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
         try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
             .compact_context = self.agent.compact_context,
@@ -792,11 +1063,33 @@ pub const Config = struct {
         // Channels
         try self.writeChannelsSection(w);
 
-        try w.print("  \"memory\": {f},\n", .{std.json.fmt(self.memory, .{})});
+        var serialized_memory = self.memory;
+        if (serialized_memory.search.store.qdrant_api_key.len > 0) {
+            serialized_memory.search.store.qdrant_api_key = try store.encryptSecret(self.allocator, serialized_memory.search.store.qdrant_api_key);
+        }
+        defer if (serialized_memory.search.store.qdrant_api_key.ptr != self.memory.search.store.qdrant_api_key.ptr) {
+            self.allocator.free(serialized_memory.search.store.qdrant_api_key);
+        };
+        if (serialized_memory.api.api_key.len > 0) {
+            serialized_memory.api.api_key = try store.encryptSecret(self.allocator, serialized_memory.api.api_key);
+        }
+        defer if (serialized_memory.api.api_key.ptr != self.memory.api.api_key.ptr) {
+            self.allocator.free(serialized_memory.api.api_key);
+        };
+        try w.print("  \"memory\": {f},\n", .{std.json.fmt(serialized_memory, .{})});
         try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
         try w.print("  \"a2a\": {f},\n", .{std.json.fmt(self.a2a, .{})});
         try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
-        try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
+        var serialized_composio = self.composio;
+        if (serialized_composio.api_key) |api_key| {
+            serialized_composio.api_key = try store.encryptSecret(self.allocator, api_key);
+        }
+        defer if (serialized_composio.api_key) |api_key| {
+            if (self.composio.api_key == null or api_key.ptr != self.composio.api_key.?.ptr) {
+                self.allocator.free(api_key);
+            }
+        };
+        try w.print("  \"composio\": {f},\n", .{std.json.fmt(serialized_composio, .{})});
         try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
         try w.print("  \"browser\": {f},\n", .{std.json.fmt(.{
             .enabled = self.browser.enabled,
@@ -894,6 +1187,17 @@ pub const Config = struct {
         InvalidHttpSearchBaseUrl,
         InvalidHttpSearchProvider,
         InvalidHttpSearchFallbackProvider,
+        InvalidMcpTransport,
+        MissingMcpCommand,
+        MissingMcpHttpUrl,
+        InvalidMcpHttpUrl,
+        InvalidMcpHeader,
+        InvalidMcpTimeoutMs,
+        InvalidExternalRuntimeName,
+        ConflictingExternalRuntimeName,
+        MissingExternalTransportCommand,
+        InvalidExternalTransportTimeoutMs,
+        InvalidExternalPluginConfig,
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
@@ -906,6 +1210,7 @@ pub const Config = struct {
         InvalidWebRelayPairingCodeTtl,
         InvalidWebRelayUiTokenTtl,
         InvalidWebRelayTokenTtl,
+        InsecurePlaintextSecrets,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -926,6 +1231,9 @@ pub const Config = struct {
         }
         if (self.gateway.port == 0) {
             return ValidationError.InvalidPort;
+        }
+        if (!self.secrets.encrypt) {
+            return ValidationError.InsecurePlaintextSecrets;
         }
         if (self.reliability.provider_retries > 100) {
             return ValidationError.InvalidRetryCount;
@@ -954,6 +1262,48 @@ pub const Config = struct {
         for (self.http_request.search_fallback_providers) |provider| {
             if (!config_types.HttpRequestConfig.isValidSearchFallbackProviderName(provider)) {
                 return ValidationError.InvalidHttpSearchFallbackProvider;
+            }
+        }
+        for (self.mcp_servers) |mcp_cfg| {
+            if (!config_types.McpServerConfig.isValidTransport(mcp_cfg.transport)) {
+                return ValidationError.InvalidMcpTransport;
+            }
+            if (config_types.McpServerConfig.isHttpTransport(mcp_cfg.transport)) {
+                const mcp_url = mcp_cfg.url orelse return ValidationError.MissingMcpHttpUrl;
+                if (!config_types.McpServerConfig.isValidHttpUrl(mcp_url)) {
+                    return ValidationError.InvalidMcpHttpUrl;
+                }
+                if (mcp_cfg.timeout_ms == 0 or mcp_cfg.timeout_ms > 600_000) {
+                    return ValidationError.InvalidMcpTimeoutMs;
+                }
+                for (mcp_cfg.headers) |entry| {
+                    if (!config_types.McpServerConfig.isValidHeaderName(entry.key) or
+                        !config_types.McpServerConfig.isValidHeaderValue(entry.value))
+                    {
+                        return ValidationError.InvalidMcpHeader;
+                    }
+                }
+            } else {
+                if (std.mem.trim(u8, mcp_cfg.command, " \t\r\n").len == 0) {
+                    return ValidationError.MissingMcpCommand;
+                }
+            }
+        }
+        for (self.channels.external, 0..) |external_cfg, index| {
+            if (!config_types.ExternalChannelConfig.isValidRuntimeName(external_cfg.runtime_name)) {
+                return ValidationError.InvalidExternalRuntimeName;
+            }
+            if (self.externalRuntimeNameConflicts(external_cfg.runtime_name, index)) {
+                return ValidationError.ConflictingExternalRuntimeName;
+            }
+            if (!config_types.ExternalChannelConfig.hasCommand(external_cfg.transport.command)) {
+                return ValidationError.MissingExternalTransportCommand;
+            }
+            if (!config_types.ExternalChannelConfig.isValidTimeoutMs(external_cfg.transport.timeout_ms)) {
+                return ValidationError.InvalidExternalTransportTimeoutMs;
+            }
+            if (!isValidExternalPluginConfigJson(self.allocator, external_cfg.plugin_config_json)) {
+                return ValidationError.InvalidExternalPluginConfig;
             }
         }
         for (self.channels.web) |web_cfg| {
@@ -1028,6 +1378,7 @@ pub const Config = struct {
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
+            ValidationError.InsecurePlaintextSecrets => std.debug.print("Config error: secrets.encrypt=false is not allowed because it stores secrets in plaintext.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
@@ -1035,6 +1386,17 @@ pub const Config = struct {
             ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host[/search] or local http://host[:port][/search] (no query/fragment).\n", .{}),
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
+            ValidationError.InvalidMcpTransport => std.debug.print("Config error: mcp_servers.<name>.transport must be 'stdio' or 'http'.\n", .{}),
+            ValidationError.MissingMcpCommand => std.debug.print("Config error: mcp_servers.<name>.command is required when transport='stdio'.\n", .{}),
+            ValidationError.MissingMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url is required when transport='http'.\n", .{}),
+            ValidationError.InvalidMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url must be an absolute https:// URL.\n", .{}),
+            ValidationError.InvalidMcpHeader => std.debug.print("Config error: mcp_servers.<name>.headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
+            ValidationError.InvalidMcpTimeoutMs => std.debug.print("Config error: mcp_servers.<name>.timeout_ms must be in [1, 600000].\n", .{}),
+            ValidationError.InvalidExternalRuntimeName => std.debug.print("Config error: channels.external.accounts.<id>.runtime_name must be non-empty and contain only letters, digits, '_', '-', or '.'.\n", .{}),
+            ValidationError.ConflictingExternalRuntimeName => std.debug.print("Config error: channels.external.accounts.<id>.runtime_name must not reuse a built-in or already-configured runtime channel name.\n", .{}),
+            ValidationError.MissingExternalTransportCommand => std.debug.print("Config error: channels.external.accounts.<id>.transport.command is required.\n", .{}),
+            ValidationError.InvalidExternalTransportTimeoutMs => std.debug.print("Config error: channels.external.accounts.<id>.transport.timeout_ms must be in [1, 600000].\n", .{}),
+            ValidationError.InvalidExternalPluginConfig => std.debug.print("Config error: channels.external.accounts.<id>.config must be a JSON object.\n", .{}),
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
@@ -1070,6 +1432,68 @@ pub const Config = struct {
             }
         }
     }
+
+    pub fn resolveAgentWorkspacePath(self: *const Config, allocator: std.mem.Allocator, workspace_path: []const u8) ![]const u8 {
+        if (std.fs.path.isAbsolute(workspace_path)) {
+            return try allocator.dupe(u8, workspace_path);
+        }
+        const normalized_workspace_path = try normalizeHostPathSeparators(allocator, workspace_path);
+        defer allocator.free(normalized_workspace_path);
+        const home_dir = std.fs.path.dirname(self.config_path) orelse self.workspace_dir;
+        return try std.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path });
+    }
+
+    pub fn resolveAgentWorkspace(self: *const Config, allocator: std.mem.Allocator, agent_name: []const u8) ![]const u8 {
+        for (self.agents) |agent_cfg| {
+            if (!std.mem.eql(u8, agent_cfg.name, agent_name)) continue;
+            if (agent_cfg.workspace_path) |workspace_path| {
+                return try self.resolveAgentWorkspacePath(allocator, workspace_path);
+            }
+            break;
+        }
+        return try allocator.dupe(u8, self.workspace_dir);
+    }
+
+    pub fn scaffoldAgentWorkspace(allocator: std.mem.Allocator, workspace_path: []const u8) !void {
+        std.fs.cwd().makePath(workspace_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const files = [_]struct {
+            name: []const u8,
+            content: []const u8,
+        }{
+            .{
+                .name = "AGENTS.md",
+                .content = "# Agent Instructions\n\nDefine this agent's operating rules, workflow, and guardrails here.\n",
+            },
+            .{
+                .name = "SOUL.md",
+                .content = "# Soul\n\nDefine this agent's persona, tone, and communication style here.\n",
+            },
+            .{
+                .name = "IDENTITY.md",
+                .content = "# Identity\n\nDefine this agent's name, role, and purpose here.\n",
+            },
+            .{
+                .name = "MEMORY.md",
+                .content = "# Memory\n",
+            },
+        };
+
+        for (files) |file_spec| {
+            const path = try std.fs.path.join(allocator, &.{ workspace_path, file_spec.name });
+            defer allocator.free(path);
+
+            const file = std.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            defer file.close();
+            try file.writeAll(file_spec.content);
+        }
+    }
 };
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -1080,6 +1504,14 @@ fn normalizePathSeparators(allocator: std.mem.Allocator, path: []const u8) ![]co
     const dup = try allocator.dupe(u8, path);
     for (dup) |*c| {
         if (c.* == '\\') c.* = '/';
+    }
+    return dup;
+}
+
+pub fn normalizeHostPathSeparators(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const dup = try allocator.dupe(u8, path);
+    for (dup) |*c| {
+        if (c.* == '/' or c.* == '\\') c.* = std.fs.path.sep;
     }
     return dup;
 }
@@ -1213,6 +1645,17 @@ test "validation passes for defaults" {
         .allocator = std.testing.allocator,
     };
     try cfg.validate();
+}
+
+test "validation rejects plaintext secrets" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/model",
+        .allocator = std.testing.allocator,
+    };
+    cfg.secrets.encrypt = false;
+    try std.testing.expectError(Config.ValidationError.InsecurePlaintextSecrets, cfg.validate());
 }
 
 test "validation rejects null default_model" {
@@ -1394,6 +1837,72 @@ test "save roundtrip preserves telegram interactive settings" {
     try std.testing.expect(!loaded.channels.telegram[0].interactive.remove_on_click);
 }
 
+test "save roundtrip preserves external channel config" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    const external_env = [_]ExternalChannelConfig.EnvEntry{
+        .{ .key = "TOKEN", .value = "secret" },
+    };
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .runtime_name = "whatsapp_web",
+            .transport = .{
+                .command = "nullclaw-plugin-whatsapp-web",
+                .args = &.{"--stdio"},
+                .env = &external_env,
+                .timeout_ms = 2500,
+            },
+            .plugin_config_json = "{\"bridge_url\":\"http://127.0.0.1:3301\",\"group_policy\":\"allowlist\"}",
+        },
+    };
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.channels.external = &external_accounts;
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"external\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"runtime_name\": \"whatsapp_web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"transport\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"command\": \"nullclaw-plugin-whatsapp-web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"config\": {") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.channels.external.len);
+    const external_cfg = loaded.channels.external[0];
+    try std.testing.expectEqualStrings("main", external_cfg.account_id);
+    try std.testing.expectEqualStrings("whatsapp_web", external_cfg.runtime_name);
+    try std.testing.expectEqualStrings("nullclaw-plugin-whatsapp-web", external_cfg.transport.command);
+    try std.testing.expectEqual(@as(u32, 2500), external_cfg.transport.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), external_cfg.transport.env.len);
+    try std.testing.expectEqualStrings("TOKEN", external_cfg.transport.env[0].key);
+    try std.testing.expect(std.mem.indexOf(u8, external_cfg.plugin_config_json, "\"group_policy\":\"allowlist\"") != null);
+}
+
 test "save roundtrip preserves diagnostics logging flags" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1441,6 +1950,55 @@ test "save roundtrip preserves diagnostics logging flags" {
     try std.testing.expectEqual(@as(u32, 6), loaded.diagnostics.token_usage_ledger_window_hours);
     try std.testing.expectEqual(@as(u64, 131072), loaded.diagnostics.token_usage_ledger_max_bytes);
     try std.testing.expectEqual(@as(u64, 2048), loaded.diagnostics.token_usage_ledger_max_lines);
+}
+
+test "save roundtrip preserves diagnostics otel headers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    const headers = [_]DiagnosticsConfig.OtelHeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer secret-token" },
+        .{ .key = "x-nullwatch-source", .value = "nullclaw" },
+    };
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.diagnostics.backend = "otel";
+    cfg.diagnostics.otel_endpoint = "http://127.0.0.1:7710";
+    cfg.diagnostics.otel_service_name = "nullclaw";
+    cfg.diagnostics.otel_headers = &headers;
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expectEqualStrings("otel", loaded.diagnostics.backend);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7710", loaded.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("nullclaw", loaded.diagnostics.otel_service_name.?);
+    try std.testing.expectEqual(@as(usize, 2), loaded.diagnostics.otel_headers.len);
+    try std.testing.expectEqualStrings("Authorization", loaded.diagnostics.otel_headers[0].key);
+    try std.testing.expectEqualStrings("Bearer secret-token", loaded.diagnostics.otel_headers[0].value);
+    try std.testing.expectEqualStrings("x-nullwatch-source", loaded.diagnostics.otel_headers[1].key);
+    try std.testing.expectEqualStrings("nullclaw", loaded.diagnostics.otel_headers[1].value);
 }
 
 test "save roundtrip preserves reliability settings" {
@@ -1763,6 +2321,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("main", loaded.agent_bindings[0].match.account_id.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
     try std.testing.expectEqualStrings("context7", loaded.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("stdio", loaded.mcp_servers[0].transport);
     try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].args.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", loaded.mcp_servers[0].env[0].key);
@@ -1852,6 +2411,7 @@ test "save escapes mcp_servers strings safely" {
 
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
     try std.testing.expectEqualStrings("ctx\"7", loaded.mcp_servers[0].name);
+    try std.testing.expectEqualStrings("stdio", loaded.mcp_servers[0].transport);
     try std.testing.expectEqualStrings("npx \"@scope/pkg\"\nrun", loaded.mcp_servers[0].command);
     try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].args.len);
     try std.testing.expectEqualStrings("--path=C:\\tmp\\file", loaded.mcp_servers[0].args[0]);
@@ -2191,6 +2751,223 @@ test "validation rejects unknown web transport mode" {
     try std.testing.expectError(Config.ValidationError.InvalidWebTransport, cfg.validate());
 }
 
+test "validation accepts mcp http transport config" {
+    const headers = [_]McpServerConfig.McpHeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer test-token" },
+    };
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+            .url = "https://mcp.example.com/rpc",
+            .timeout_ms = 5000,
+            .headers = &headers,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try cfg.validate();
+}
+
+test "validation rejects mcp http transport without url" {
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.MissingMcpHttpUrl, cfg.validate());
+}
+
+test "validation rejects mcp stdio transport without command" {
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "local",
+            .transport = "stdio",
+            .command = "",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.MissingMcpCommand, cfg.validate());
+}
+
+test "validation rejects mcp http transport with malformed header" {
+    const headers = [_]McpServerConfig.McpHeaderEntry{
+        .{ .key = "Authorization", .value = "line1\nline2" },
+    };
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+            .url = "https://mcp.example.com/rpc",
+            .headers = &headers,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidMcpHeader, cfg.validate());
+}
+
+test "validation rejects mcp http transport with invalid timeout_ms" {
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote",
+            .transport = "http",
+            .url = "https://mcp.example.com/rpc",
+            .timeout_ms = 0,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .mcp_servers = &mcp_servers,
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidMcpTimeoutMs, cfg.validate());
+}
+
+test "validation rejects external channel with invalid timeout_ms" {
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .runtime_name = "whatsapp_web",
+            .transport = .{
+                .command = "nullclaw-plugin-whatsapp-web",
+                .timeout_ms = 0,
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &external_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidExternalTransportTimeoutMs, cfg.validate());
+}
+
+test "validation rejects external runtime name that collides with built-in channel" {
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .runtime_name = "telegram",
+            .transport = .{ .command = "plugin" },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &external_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.ConflictingExternalRuntimeName, cfg.validate());
+}
+
+test "validation rejects external runtime name that collides with maixcam runtime" {
+    const maixcam_accounts = [_]MaixCamConfig{
+        .{
+            .account_id = "cam-main",
+            .name = "vision-lab",
+            .host = "127.0.0.1",
+            .port = 8080,
+        },
+    };
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .runtime_name = "vision-lab",
+            .transport = .{ .command = "plugin" },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .maixcam = &maixcam_accounts,
+            .external = &external_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.ConflictingExternalRuntimeName, cfg.validate());
+}
+
+test "validation rejects duplicate external runtime names across accounts" {
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .runtime_name = "whatsapp_web",
+            .transport = .{ .command = "plugin-a" },
+        },
+        .{
+            .account_id = "backup",
+            .runtime_name = "whatsapp_web",
+            .transport = .{ .command = "plugin-b" },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &external_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.ConflictingExternalRuntimeName, cfg.validate());
+}
+
+test "validation rejects external channel config that is not a JSON object" {
+    const external_accounts = [_]ExternalChannelConfig{
+        .{
+            .account_id = "main",
+            .runtime_name = "whatsapp_web",
+            .transport = .{ .command = "plugin" },
+            .plugin_config_json = "\"oops\"",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &external_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidExternalPluginConfig, cfg.validate());
+}
+
 test "validation rejects unsupported web message_auth_mode value" {
     const web_accounts = [_]WebConfig{
         .{
@@ -2388,7 +3165,7 @@ test "validation rejects relay ttl values outside supported ranges" {
 test "json parse diagnostics section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "token_usage_ledger_enabled": false, "token_usage_ledger_window_hours": 12, "token_usage_ledger_max_bytes": 262144, "token_usage_ledger_max_lines": 4096, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
+        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "token_usage_ledger_enabled": false, "token_usage_ledger_window_hours": 12, "token_usage_ledger_max_bytes": 262144, "token_usage_ledger_max_lines": 4096, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc", "headers": {"Authorization": "Bearer test", "x-nullwatch-source": "nullclaw"}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2403,9 +3180,19 @@ test "json parse diagnostics section" {
     try std.testing.expectEqual(@as(u64, 4096), cfg.diagnostics.token_usage_ledger_max_lines);
     try std.testing.expectEqualStrings("http://localhost:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("yc", cfg.diagnostics.otel_service_name.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.diagnostics.otel_headers.len);
+    try std.testing.expectEqualStrings("Authorization", cfg.diagnostics.otel_headers[0].key);
+    try std.testing.expectEqualStrings("Bearer test", cfg.diagnostics.otel_headers[0].value);
+    try std.testing.expectEqualStrings("x-nullwatch-source", cfg.diagnostics.otel_headers[1].key);
+    try std.testing.expectEqualStrings("nullclaw", cfg.diagnostics.otel_headers[1].value);
     allocator.free(cfg.diagnostics.backend);
     allocator.free(cfg.diagnostics.otel_endpoint.?);
     allocator.free(cfg.diagnostics.otel_service_name.?);
+    for (cfg.diagnostics.otel_headers) |header| {
+        allocator.free(header.key);
+        allocator.free(header.value);
+    }
+    allocator.free(cfg.diagnostics.otel_headers);
 }
 
 test "json parse scheduler section" {
@@ -3164,6 +3951,71 @@ test "parse agents.list primary model ref without provider field" {
     try std.testing.expectEqualStrings("qwen3.5:cloud", cfg.agents[0].model);
 }
 
+test "parse agents.list with workspace_path" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents": {"list": [{"name": "coder", "provider": "openai", "model": "gpt-5.2", "workspace_path": "agents/coder"}]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqualStrings("agents/coder", cfg.agents[0].workspace_path.?);
+}
+
+test "resolveAgentWorkspace resolves relative path against config directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+    const expected_workspace = try std.fs.path.join(allocator, &.{ base, "agents", "coder" });
+    defer allocator.free(expected_workspace);
+
+    const agents = [_]NamedAgentConfig{.{
+        .name = "coder",
+        .provider = "openai",
+        .model = "gpt-5.2",
+        .workspace_path = "agents/coder",
+    }};
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+        .agents = &agents,
+    };
+
+    const resolved = try cfg.resolveAgentWorkspace(allocator, "coder");
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(expected_workspace, resolved);
+}
+
+test "scaffoldAgentWorkspace leaves markdown memory empty" {
+    const allocator = std.testing.allocator;
+    const markdown = @import("memory/engines/markdown.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "agents", "writer" });
+    defer allocator.free(workspace);
+
+    try Config.scaffoldAgentWorkspace(allocator, workspace);
+
+    var mem = try markdown.MarkdownMemory.init(allocator, workspace);
+    defer mem.deinit();
+
+    const entries = try mem.memory().list(allocator, null, null);
+    defer @import("memory/root.zig").freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
 test "parse agents object-of-objects shape" {
     const allocator = std.testing.allocator;
     const json =
@@ -3331,12 +4183,14 @@ test "json parse mcp_servers" {
     for (cfg.mcp_servers) |s| {
         if (std.mem.eql(u8, s.name, "filesystem")) {
             found_fs = true;
+            try std.testing.expectEqualStrings("stdio", s.transport);
             try std.testing.expectEqualStrings("npx", s.command);
             try std.testing.expectEqual(@as(usize, 3), s.args.len);
             try std.testing.expectEqualStrings("-y", s.args[0]);
         }
         if (std.mem.eql(u8, s.name, "git")) {
             found_git = true;
+            try std.testing.expectEqualStrings("stdio", s.transport);
             try std.testing.expectEqualStrings("mcp-server-git", s.command);
             try std.testing.expectEqual(@as(usize, 0), s.args.len);
         }
@@ -3346,9 +4200,16 @@ test "json parse mcp_servers" {
     // Cleanup
     for (cfg.mcp_servers) |s| {
         allocator.free(s.name);
+        allocator.free(s.transport);
         allocator.free(s.command);
+        if (s.url) |u| allocator.free(u);
         for (s.args) |a| allocator.free(a);
         allocator.free(s.args);
+        for (s.headers) |h| {
+            allocator.free(h.key);
+            allocator.free(h.value);
+        }
+        allocator.free(s.headers);
     }
     allocator.free(cfg.mcp_servers);
 }
@@ -3389,7 +4250,9 @@ test "json parse mcp_servers with env" {
     try std.testing.expect(found_debug);
     // Cleanup
     allocator.free(s.name);
+    allocator.free(s.transport);
     allocator.free(s.command);
+    if (s.url) |u| allocator.free(u);
     for (s.args) |a| allocator.free(a);
     allocator.free(s.args);
     for (s.env) |e| {
@@ -3397,6 +4260,98 @@ test "json parse mcp_servers with env" {
         allocator.free(e.value);
     }
     allocator.free(s.env);
+    for (s.headers) |h| {
+        allocator.free(h.key);
+        allocator.free(h.value);
+    }
+    allocator.free(s.headers);
+    allocator.free(cfg.mcp_servers);
+}
+
+test "json parse mcp_servers http transport" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"mcp_servers": {
+        \\  "remote": {
+        \\    "transport": "http",
+        \\    "url": "https://mcp.example.com/rpc",
+        \\    "timeout_ms": 2500,
+        \\    "headers": {"Authorization": "Bearer test-token"}
+        \\  }
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    const s = cfg.mcp_servers[0];
+    try std.testing.expectEqualStrings("remote", s.name);
+    try std.testing.expectEqualStrings("http", s.transport);
+    try std.testing.expectEqualStrings("", s.command);
+    try std.testing.expectEqualStrings("https://mcp.example.com/rpc", s.url.?);
+    try std.testing.expectEqual(@as(u32, 2500), s.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), s.headers.len);
+    try std.testing.expectEqualStrings("Authorization", s.headers[0].key);
+    try std.testing.expectEqualStrings("Bearer test-token", s.headers[0].value);
+
+    allocator.free(s.name);
+    allocator.free(s.transport);
+    allocator.free(s.command);
+    if (s.url) |u| allocator.free(u);
+    for (s.args) |a| allocator.free(a);
+    allocator.free(s.args);
+    for (s.env) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
+    }
+    allocator.free(s.env);
+    for (s.headers) |h| {
+        allocator.free(h.key);
+        allocator.free(h.value);
+    }
+    allocator.free(s.headers);
+    allocator.free(cfg.mcp_servers);
+}
+
+test "json parse mcp_servers infers http transport from url" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"mcp_servers": {
+        \\  "remote": {
+        \\    "url": "https://mcp.example.com/rpc",
+        \\    "timeout_ms": 2500,
+        \\    "headers": {"Authorization": "Bearer test-token"}
+        \\  }
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    const s = cfg.mcp_servers[0];
+    try std.testing.expectEqualStrings("remote", s.name);
+    try std.testing.expectEqualStrings("http", s.transport);
+    try std.testing.expectEqualStrings("", s.command);
+    try std.testing.expectEqualStrings("https://mcp.example.com/rpc", s.url.?);
+    try std.testing.expectEqual(@as(u32, 2500), s.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), s.headers.len);
+    try std.testing.expectEqualStrings("Authorization", s.headers[0].key);
+    try std.testing.expectEqualStrings("Bearer test-token", s.headers[0].value);
+
+    allocator.free(s.name);
+    allocator.free(s.transport);
+    allocator.free(s.command);
+    if (s.url) |u| allocator.free(u);
+    for (s.args) |a| allocator.free(a);
+    allocator.free(s.args);
+    for (s.env) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
+    }
+    allocator.free(s.env);
+    for (s.headers) |h| {
+        allocator.free(h.key);
+        allocator.free(h.value);
+    }
+    allocator.free(s.headers);
     allocator.free(cfg.mcp_servers);
 }
 
@@ -3501,6 +4456,7 @@ test "save escapes provider string fields" {
         .config_path = config_path,
         .allocator = allocator,
     };
+    cfg.secrets.encrypt = false;
     cfg.providers = &.{
         .{
             .name = "openai",
@@ -3527,6 +4483,89 @@ test "save escapes provider string fields" {
     try std.testing.expectEqualStrings("sk-\"quoted\"", openai.get("api_key").?.string);
     try std.testing.expectEqualStrings("https://api.example.com/v1/\"quoted\"", openai.get("base_url").?.string);
     try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
+}
+
+test "save encrypts persisted api keys and parse decrypts them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "openrouter",
+            .api_key = "sk-or-secret",
+        },
+    };
+    cfg.reliability.api_keys = &.{ "rel-key-a", "rel-key-b" };
+    cfg.model_routes = &.{
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-70b",
+            .api_key = "gsk-secret",
+        },
+    };
+    cfg.agents = &.{
+        .{
+            .name = "helper",
+            .provider = "openrouter",
+            .model = "openai/gpt-4o-mini",
+            .api_key = "agent-secret",
+        },
+    };
+    cfg.memory.search.store.qdrant_api_key = "qdrant-secret";
+    cfg.memory.api.api_key = "memory-secret";
+    cfg.composio.api_key = "comp-secret";
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    const secret_values = [_][]const u8{
+        "sk-or-secret",
+        "rel-key-a",
+        "rel-key-b",
+        "gsk-secret",
+        "agent-secret",
+        "qdrant-secret",
+        "memory-secret",
+        "comp-secret",
+    };
+    for (secret_values) |secret| {
+        try std.testing.expect(std.mem.indexOf(u8, content, secret) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"api_key\": \"enc2:") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqualStrings("sk-or-secret", loaded.getProviderKey("openrouter").?);
+    try std.testing.expectEqualStrings("rel-key-a", loaded.reliability.api_keys[0]);
+    try std.testing.expectEqualStrings("rel-key-b", loaded.reliability.api_keys[1]);
+    try std.testing.expectEqualStrings("gsk-secret", loaded.model_routes[0].api_key.?);
+    try std.testing.expectEqualStrings("agent-secret", loaded.agents[0].api_key.?);
+    try std.testing.expectEqualStrings("qdrant-secret", loaded.memory.search.store.qdrant_api_key);
+    try std.testing.expectEqualStrings("memory-secret", loaded.memory.api.api_key);
+    try std.testing.expectEqualStrings("comp-secret", loaded.composio.api_key.?);
 }
 
 test "json parse tools.media.audio section" {
@@ -3620,6 +4659,18 @@ test "defaultProviderKey returns key for default provider" {
         if (e.user_agent) |ua| allocator.free(ua);
     }
     allocator.free(cfg.providers);
+}
+
+test "defaultProviderKey stays null when provider entry omits api key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"model":{"primary":"openrouter/anthropic/claude-sonnet-4"}}},"models":{"providers":{"openrouter":{}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.defaultProviderKey() == null);
 }
 
 test "tools.media.audio with language only parses correctly" {
@@ -3862,7 +4913,7 @@ test "parse irc accounts" {
 test "parse matrix accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "group_policy": "open"}}}}}
+        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3873,7 +4924,9 @@ test "parse matrix accounts" {
     try std.testing.expectEqualStrings("syt_abc", mc.access_token);
     try std.testing.expectEqualStrings("!room:matrix.org", mc.room_id);
     try std.testing.expectEqualStrings("@bot:matrix.org", mc.user_id.?);
+    try std.testing.expectEqualStrings("open", mc.dm_policy);
     try std.testing.expectEqualStrings("open", mc.group_policy);
+    try std.testing.expect(mc.require_mention);
     try std.testing.expectEqual(@as(usize, 1), mc.group_allow_from.len);
     try std.testing.expectEqualStrings("@alice:matrix.org", mc.group_allow_from[0]);
     allocator.free(mc.account_id);
@@ -3881,6 +4934,7 @@ test "parse matrix accounts" {
     allocator.free(mc.access_token);
     allocator.free(mc.room_id);
     allocator.free(mc.user_id.?);
+    allocator.free(mc.dm_policy);
     allocator.free(mc.group_policy);
     for (mc.group_allow_from) |entry| allocator.free(entry);
     allocator.free(mc.group_allow_from);
@@ -3913,6 +4967,83 @@ test "parse mattermost accounts" {
     try std.testing.expectEqual(@as(usize, 1), mm.onchar_prefixes.len);
     try std.testing.expectEqualStrings("!", mm.onchar_prefixes[0]);
     try std.testing.expect(!mm.require_mention);
+}
+
+test "parse external channel accounts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"whatsapp_web","transport":{"command":"nullclaw-plugin-whatsapp-web","args":["--stdio"],"env":{"TOKEN":"secret"},"timeout_ms":2500},"config":{"bridge_url":"http://127.0.0.1:3301","allow_from":["*"]}}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.external.len);
+    const external_cfg = cfg.channels.external[0];
+    try std.testing.expectEqualStrings("wa-web", external_cfg.account_id);
+    try std.testing.expectEqualStrings("whatsapp_web", external_cfg.runtime_name);
+    try std.testing.expectEqualStrings("nullclaw-plugin-whatsapp-web", external_cfg.transport.command);
+    try std.testing.expectEqual(@as(usize, 1), external_cfg.transport.args.len);
+    try std.testing.expectEqualStrings("--stdio", external_cfg.transport.args[0]);
+    try std.testing.expectEqual(@as(usize, 1), external_cfg.transport.env.len);
+    try std.testing.expectEqualStrings("TOKEN", external_cfg.transport.env[0].key);
+    try std.testing.expectEqualStrings("secret", external_cfg.transport.env[0].value);
+    try std.testing.expectEqual(@as(u32, 2500), external_cfg.transport.timeout_ms);
+    try std.testing.expect(std.mem.indexOf(u8, external_cfg.plugin_config_json, "\"bridge_url\":\"http://127.0.0.1:3301\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, external_cfg.plugin_config_json, "\"allow_from\":[\"*\"]") != null);
+}
+
+test "parse external channel preserves invalid timeout for validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"whatsapp_web","transport":{"command":"nullclaw-plugin-whatsapp-web","timeout_ms":0}}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    cfg.default_model = "test/model";
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.external.len);
+    try std.testing.expectEqual(@as(u32, 0), cfg.channels.external[0].transport.timeout_ms);
+    try std.testing.expectError(Config.ValidationError.InvalidExternalTransportTimeoutMs, cfg.validate());
+}
+
+test "parse external channel rejects timeout with wrong type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"whatsapp_web","transport":{"command":"nullclaw-plugin-whatsapp-web","timeout_ms":"slow"}}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    cfg.default_model = "test/model";
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.external.len);
+    try std.testing.expectEqual(@as(u32, 0), cfg.channels.external[0].transport.timeout_ms);
+    try std.testing.expectError(Config.ValidationError.InvalidExternalTransportTimeoutMs, cfg.validate());
+}
+
+test "parse external channel rejects scalar config at validation time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"whatsapp_web","transport":{"command":"nullclaw-plugin-whatsapp-web"},"config":"oops"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    cfg.default_model = "test/model";
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.external.len);
+    try std.testing.expectEqualStrings("\"oops\"", cfg.channels.external[0].plugin_config_json);
+    try std.testing.expectError(Config.ValidationError.InvalidExternalPluginConfig, cfg.validate());
 }
 
 test "parse lark accounts" {
@@ -4508,6 +5639,33 @@ test "session config: ignores idleMinutes camelCase alias" {
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
 }
 
+test "session config: parse auto_provision_direct_agents" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"auto_provision_direct_agents": true}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.session.auto_provision_direct_agents);
+}
+
+test "session config: parse claim gate settings" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"claim_secret": "hmac-secret", "claim_admin_secret": "admin-secret", "claim_max_attempts": 7, "claim_lockout_secs": 120}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.session.claim_secret != null);
+    try std.testing.expect(cfg.session.claim_admin_secret != null);
+    try std.testing.expectEqualStrings("hmac-secret", cfg.session.claim_secret.?);
+    try std.testing.expectEqualStrings("admin-secret", cfg.session.claim_admin_secret.?);
+    try std.testing.expectEqual(@as(u32, 7), cfg.session.claim_max_attempts);
+    try std.testing.expectEqual(@as(u32, 120), cfg.session.claim_lockout_secs);
+    allocator.free(cfg.session.claim_secret.?);
+    allocator.free(cfg.session.claim_admin_secret.?);
+}
+
 test "session config: parse identity_links map format" {
     const allocator = std.testing.allocator;
     const json =
@@ -4551,6 +5709,7 @@ test "session config: empty session block uses defaults" {
     try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
     try std.testing.expectEqual(@as(usize, 0), cfg.session.identity_links.len);
+    try std.testing.expect(!cfg.session.auto_provision_direct_agents);
 }
 
 test "session config: all dm_scope values accepted" {

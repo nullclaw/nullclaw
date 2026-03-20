@@ -19,6 +19,11 @@ These documents cover:
 - [`en/`](./en/) — English documentation
 - [`zh/`](./zh/) — Chinese documentation
 
+Highlighted extension docs:
+
+- [English external channel plugin guide](./en/external-channels.md)
+- [中文外部渠道插件指南](./zh/external-channels.md)
+
 ## Contributing
 
 When working on ecosystem integration:

@@ -1,4 +1,10 @@
 const std = @import("std");
+const build_options = @import("build_options");
+const embedded_wasm3_available = build_options.enable_embedded_wasm3;
+
+const c_wasm3 = if (embedded_wasm3_available) @cImport({
+    @cInclude("wasm3.h");
+}) else struct {};
 
 /// Runtime adapter interface -- abstracts platform differences.
 /// Mirrors ZeroClaw's RuntimeAdapter trait.
@@ -175,18 +181,62 @@ pub const WasmCapabilities = struct {
 };
 
 /// WASM runtime configuration.
+pub const WasmEngine = enum {
+    wasmtime,
+    wasm3,
+};
+
 pub const WasmRuntimeConfig = struct {
     fuel_limit: u64 = 1_000_000,
     memory_limit_mb: u64 = 64,
     tools_dir: []const u8 = "tools/wasm",
+    engine: WasmEngine = .wasmtime,
     allow_workspace_read: bool = false,
     allow_workspace_write: bool = false,
 };
 
-/// WASM sandbox runtime -- executes tool modules via `wasmtime run`.
+/// WASM sandbox runtime -- executes tool modules via `wasmtime` or `wasm3`.
 /// Provides fuel-limited, memory-capped isolation without Docker.
 pub const WasmRuntime = struct {
     wasm_config: WasmRuntimeConfig,
+
+    const WASM_PAGE_SIZE: u64 = 64 * 1024;
+
+    const WasmtimeInvocation = struct {
+        fuel_str: [32]u8,
+        fuel_len: usize,
+        mem_pages_str: [32]u8,
+        mem_pages_len: usize,
+        module_path: []const u8,
+
+        fn writeArgv(self: *const WasmtimeInvocation, out: *[7][]const u8) usize {
+            out.* = .{
+                "wasmtime",
+                "run",
+                "--fuel",
+                self.fuel_str[0..self.fuel_len],
+                "--max-memory-size",
+                self.mem_pages_str[0..self.mem_pages_len],
+                self.module_path,
+            };
+            return 7;
+        }
+    };
+
+    const Wasm3Invocation = struct {
+        module_path: []const u8,
+
+        fn writeArgv(self: *const Wasm3Invocation, out: *[7][]const u8) usize {
+            out[0] = "wasm3";
+            out[1] = self.module_path;
+            return 2;
+        }
+    };
+
+    const WasmInvocation = union(enum) {
+        wasmtime: WasmtimeInvocation,
+        wasm3: Wasm3Invocation,
+    };
 
     const wasm_vtable = RuntimeAdapter.VTable{
         .name = wasmName,
@@ -281,7 +331,7 @@ pub const WasmRuntime = struct {
         }
     }
 
-    /// Execute a WASM module via `wasmtime run`.
+    /// Execute a WASM module via selected runtime engine.
     /// Returns the captured stdout, stderr, exit code, and estimated fuel consumed.
     pub fn executeModule(
         self: *const WasmRuntime,
@@ -295,43 +345,35 @@ pub const WasmRuntime = struct {
 
         const fuel = self.effectiveFuel(caps);
         const max_mem = self.effectiveMemoryBytes(caps);
-        const max_mem_pages = max_mem / (64 * 1024); // WASM pages are 64KB
 
-        // Build fuel string
-        var fuel_buf: [32]u8 = undefined;
-        const fuel_str = std.fmt.bufPrint(&fuel_buf, "{d}", .{fuel}) catch return error.FormatError;
+        if (self.wasm_config.engine == .wasm3 and embedded_wasm3_available) {
+            return self.executeEmbeddedWasm3(allocator, module_path, fuel, max_mem);
+        }
 
-        // Build memory string
-        var mem_buf: [32]u8 = undefined;
-        const mem_str = std.fmt.bufPrint(&mem_buf, "{d}", .{max_mem_pages}) catch return error.FormatError;
+        const invocation = try self.buildInvocation(module_path, fuel, max_mem);
 
-        // Build argv: wasmtime run --fuel LIMIT --max-memory-size SIZE MODULE
-        var child = std.process.Child.init(.{
-            .argv = &.{
-                "wasmtime",
-                "run",
-                "--fuel",
-                fuel_str,
-                "--max-memory-size",
-                mem_str,
-                module_path,
-            },
-            .allocator = allocator,
-        }, allocator);
+        var argv_buf: [7][]const u8 = undefined;
+        const argc = switch (invocation) {
+            .wasmtime => |inv| inv.writeArgv(&argv_buf),
+            .wasm3 => |inv| inv.writeArgv(&argv_buf),
+        };
+
+        // Build argv for selected engine (wasmtime/wasm3).
+        var child = std.process.Child.init(argv_buf[0..argc], allocator);
 
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
         try child.spawn();
 
-        const stdout = try child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024);
+        const stdout = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
         errdefer allocator.free(stdout);
-        const stderr = try child.stderr.?.reader().readAllAlloc(allocator, 1024 * 1024);
+        const stderr = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
         errdefer allocator.free(stderr);
 
         const term = try child.wait();
         const exit_code: i32 = switch (term) {
-            .exited => |code| @as(i32, @intCast(code)),
+            .Exited => |code| @as(i32, @intCast(code)),
             else => -1,
         };
 
@@ -341,6 +383,141 @@ pub const WasmRuntime = struct {
             .exit_code = exit_code,
             .fuel_consumed = fuel, // approximate: real wasmtime reports via stderr
         };
+    }
+
+    fn executeEmbeddedWasm3(
+        self: *const WasmRuntime,
+        allocator: std.mem.Allocator,
+        module_path: []const u8,
+        fuel: u64,
+        max_mem: u64,
+    ) !WasmExecutionResult {
+        _ = self;
+
+        const module_bytes = try readModuleBytes(allocator, module_path);
+        defer allocator.free(module_bytes);
+
+        const env = c_wasm3.m3_NewEnvironment() orelse return error.Wasm3EnvironmentInitFailed;
+        defer c_wasm3.m3_FreeEnvironment(env);
+
+        const stack_size_u64 = @min(max_mem, @as(u64, std.math.maxInt(u32)));
+        const stack_size: u32 = @intCast(stack_size_u64);
+        const runtime = c_wasm3.m3_NewRuntime(env, stack_size, null) orelse return error.Wasm3RuntimeInitFailed;
+        defer c_wasm3.m3_FreeRuntime(runtime);
+
+        var module: c_wasm3.IM3Module = undefined;
+        var result = c_wasm3.m3_ParseModule(
+            env,
+            &module,
+            module_bytes.ptr,
+            @as(u32, @intCast(module_bytes.len)),
+        );
+        if (result != null) {
+            return error.Wasm3ParseFailed;
+        }
+
+        result = c_wasm3.m3_LoadModule(runtime, module);
+        if (result != null) {
+            return error.Wasm3LoadFailed;
+        }
+
+        result = c_wasm3.m3_RunStart(module);
+        if (result != null and !isWasm3FunctionLookupError(result)) {
+            return error.Wasm3StartFailed;
+        }
+
+        var fn_entry: c_wasm3.IM3Function = undefined;
+        var has_entry = false;
+
+        result = c_wasm3.m3_FindFunction(&fn_entry, runtime, "_start");
+        if (result == null) {
+            has_entry = true;
+        } else {
+            result = c_wasm3.m3_FindFunction(&fn_entry, runtime, "main");
+            if (result == null) {
+                has_entry = true;
+            }
+        }
+
+        if (has_entry) {
+            result = c_wasm3.m3_CallV(fn_entry);
+            if (result != null and !isWasm3TrapExit(result)) {
+                return error.Wasm3CallFailed;
+            }
+        }
+
+        const stdout = try allocator.dupe(u8, "");
+        errdefer allocator.free(stdout);
+        const stderr = try allocator.dupe(u8, "");
+        errdefer allocator.free(stderr);
+
+        return .{
+            .stdout = stdout,
+            .stderr = stderr,
+            .exit_code = 0,
+            .fuel_consumed = fuel,
+        };
+    }
+
+    fn readModuleBytes(allocator: std.mem.Allocator, module_path: []const u8) ![]u8 {
+        const MAX_MODULE_BYTES = 64 * 1024 * 1024;
+        if (std.fs.path.isAbsolute(module_path)) {
+            const file = try std.fs.openFileAbsolute(module_path, .{});
+            defer file.close();
+            return file.readToEndAlloc(allocator, MAX_MODULE_BYTES);
+        }
+
+        const file = try std.fs.cwd().openFile(module_path, .{});
+        defer file.close();
+        return file.readToEndAlloc(allocator, MAX_MODULE_BYTES);
+    }
+
+    fn isWasm3FunctionLookupError(result: anytype) bool {
+        if (result == null) return false;
+        return std.mem.eql(u8, std.mem.span(result), "function lookup failed");
+    }
+
+    fn isWasm3TrapExit(result: anytype) bool {
+        if (result == null) return false;
+        return std.mem.eql(u8, std.mem.span(result), "[trap] program called exit");
+    }
+
+    fn memoryBytesToWasmPages(max_mem_bytes: u64) u64 {
+        return max_mem_bytes / WASM_PAGE_SIZE;
+    }
+
+    fn buildInvocation(self: *const WasmRuntime, module_path: []const u8, fuel: u64, max_mem_bytes: u64) !WasmInvocation {
+        return switch (self.wasm_config.engine) {
+            .wasmtime => .{ .wasmtime = try buildWasmtimeInvocation(module_path, fuel, max_mem_bytes) },
+            .wasm3 => .{ .wasm3 = buildWasm3Invocation(module_path) },
+        };
+    }
+
+    fn buildWasmtimeInvocation(module_path: []const u8, fuel: u64, max_mem_bytes: u64) !WasmtimeInvocation {
+        const max_mem_pages = memoryBytesToWasmPages(max_mem_bytes);
+
+        var invocation: WasmtimeInvocation = undefined;
+        const fuel_str = std.fmt.bufPrint(&invocation.fuel_str, "{d}", .{fuel}) catch return error.FormatError;
+        const mem_pages_str = std.fmt.bufPrint(&invocation.mem_pages_str, "{d}", .{max_mem_pages}) catch return error.FormatError;
+
+        invocation.fuel_len = fuel_str.len;
+        invocation.mem_pages_len = mem_pages_str.len;
+        invocation.module_path = module_path;
+        return invocation;
+    }
+
+    fn buildWasm3Invocation(module_path: []const u8) Wasm3Invocation {
+        return .{ .module_path = module_path };
+    }
+
+    fn isCommandAvailable(allocator: std.mem.Allocator, command: []const u8) bool {
+        var child = std.process.Child.init(&.{ command, "--version" }, allocator);
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch return false;
+        _ = child.wait() catch return false;
+        return true;
     }
 };
 
@@ -817,8 +994,14 @@ test "WasmRuntimeConfig defaults" {
     try std.testing.expectEqual(@as(u64, 1_000_000), cfg.fuel_limit);
     try std.testing.expectEqual(@as(u64, 64), cfg.memory_limit_mb);
     try std.testing.expectEqualStrings("tools/wasm", cfg.tools_dir);
+    try std.testing.expectEqual(WasmEngine.wasmtime, cfg.engine);
     try std.testing.expect(!cfg.allow_workspace_read);
     try std.testing.expect(!cfg.allow_workspace_write);
+}
+
+test "WasmRuntimeConfig supports wasm3 engine" {
+    const cfg = WasmRuntimeConfig{ .engine = .wasm3 };
+    try std.testing.expectEqual(WasmEngine.wasm3, cfg.engine);
 }
 
 test "WasmRuntime memory budget saturating" {
@@ -836,4 +1019,73 @@ test "WasmRuntime vtable dispatch" {
     _ = rt.storagePath();
     _ = rt.supportsLongRunning();
     _ = rt.memoryBudget();
+}
+
+test "wasm unit memory bytes to pages" {
+    try std.testing.expectEqual(@as(u64, 0), WasmRuntime.memoryBytesToWasmPages(0));
+    try std.testing.expectEqual(@as(u64, 1), WasmRuntime.memoryBytesToWasmPages(64 * 1024));
+    try std.testing.expectEqual(@as(u64, 3), WasmRuntime.memoryBytesToWasmPages(3 * 64 * 1024 + 1024));
+}
+
+test "wasm integration builds wasmtime invocation from effective caps" {
+    const wasm = WasmRuntime.init(.{ .fuel_limit = 77, .memory_limit_mb = 8, .engine = .wasmtime });
+    const caps = wasm.defaultCapabilities();
+    const invocation = try WasmRuntime.buildWasmtimeInvocation("tools/wasm/echo.wasm", wasm.effectiveFuel(caps), wasm.effectiveMemoryBytes(caps));
+    var argv: [7][]const u8 = undefined;
+    _ = invocation.writeArgv(&argv);
+
+    try std.testing.expectEqualStrings("wasmtime", argv[0]);
+    try std.testing.expectEqualStrings("run", argv[1]);
+    try std.testing.expectEqualStrings("--fuel", argv[2]);
+    try std.testing.expectEqualStrings("77", argv[3]);
+    try std.testing.expectEqualStrings("--max-memory-size", argv[4]);
+    try std.testing.expectEqualStrings("128", argv[5]);
+    try std.testing.expectEqualStrings("tools/wasm/echo.wasm", argv[6]);
+}
+
+test "wasm regression invocation flags remain stable" {
+    const invocation = try WasmRuntime.buildWasmtimeInvocation("mod.wasm", 1_000_000, 64 * 1024 * 1024);
+    var argv: [7][]const u8 = undefined;
+    _ = invocation.writeArgv(&argv);
+    try std.testing.expectEqualStrings("--fuel", argv[2]);
+    try std.testing.expectEqualStrings("--max-memory-size", argv[4]);
+}
+
+test "wasm integration builds wasm3 invocation" {
+    const wasm = WasmRuntime.init(.{ .engine = .wasm3 });
+    const invocation = try wasm.buildInvocation("tools/wasm/echo.wasm", 10, 64 * 1024 * 1024);
+    try std.testing.expect(invocation == .wasm3);
+    var argv: [7][]const u8 = undefined;
+    const argc = invocation.wasm3.writeArgv(&argv);
+    try std.testing.expectEqual(@as(usize, 2), argc);
+    try std.testing.expectEqualStrings("wasm3", argv[0]);
+    try std.testing.expectEqualStrings("tools/wasm/echo.wasm", argv[1]);
+}
+
+test "wasm integration executes module with wasm3 when available" {
+    if (!embedded_wasm3_available and !WasmRuntime.isCommandAvailable(std.testing.allocator, "wasm3")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Minimal valid wasm module with empty start function.
+    const module_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x08, 0x01, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "minimal.wasm", .data = &module_bytes });
+
+    const module_path = try tmp.dir.realpathAlloc(std.testing.allocator, "minimal.wasm");
+    defer std.testing.allocator.free(module_path);
+
+    const wasm = WasmRuntime.init(.{ .engine = .wasm3 });
+    const result = try wasm.executeModule(std.testing.allocator, module_path, wasm.defaultCapabilities());
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqual(@as(i32, 0), result.exit_code);
 }

@@ -6,6 +6,8 @@ const interaction_choices = @import("../interactions/choices.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 
+const Atomic = @import("../portable_atomic.zig").Atomic;
+
 const log = std.log.scoped(.slack);
 
 const SocketFd = std.net.Stream.Handle;
@@ -60,7 +62,7 @@ pub const CallbackSelection = union(enum) {
 
 var shared_interactions_mu: std.Thread.Mutex = .{};
 var shared_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty;
-var shared_interaction_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
+var shared_interaction_seq: Atomic(u64) = Atomic(u64).init(1);
 
 fn sharedInteractionsAllocator() std.mem.Allocator {
     return if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
@@ -221,7 +223,7 @@ pub const SlackChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const SlackChannel, sender: []const u8) bool {
-        return root.isAllowed(self.allow_from, sender);
+        return root.isAllowedScoped("slack channel", self.allow_from, sender);
     }
 
     /// Check if an incoming message should be handled based on the channel policy.
@@ -231,7 +233,7 @@ pub const SlackChannel = struct {
     /// `bot_user_id`: the bot's own Slack user ID (for mention detection).
     pub fn shouldHandle(self: *const SlackChannel, sender_id: []const u8, is_dm: bool, message_text: []const u8, bot_user_id: ?[]const u8) bool {
         const is_mention = if (bot_user_id) |bid| containsMention(message_text, bid) else false;
-        return root.checkPolicy(self.policy, sender_id, is_dm, is_mention);
+        return root.checkPolicyScoped("slack channel", self.policy, sender_id, is_dm, is_mention);
     }
 
     pub fn healthCheck(self: *SlackChannel) bool {

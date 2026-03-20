@@ -50,6 +50,7 @@ pub const embeddings_ollama = @import("vector/embeddings_ollama.zig");
 pub const provider_router = @import("vector/provider_router.zig");
 pub const store_qdrant = @import("vector/store_qdrant.zig");
 pub const store_pgvector = @import("vector/store_pgvector.zig");
+pub const vector_key = @import("vector/key_codec.zig");
 pub const circuit_breaker = @import("vector/circuit_breaker.zig");
 pub const outbox = @import("vector/outbox.zig");
 pub const chunker = @import("vector/chunker.zig");
@@ -140,6 +141,12 @@ pub const parseSummaryResponse = summarizer.parseSummaryResponse;
 pub const SemanticCache = semantic_cache.SemanticCache;
 
 // ── Session message types ─────────────────────────────────────────
+
+pub const RUNTIME_COMMAND_ROLE = "__runtime_command__";
+
+pub fn isRuntimeCommandRole(role: []const u8) bool {
+    return std.mem.eql(u8, role, RUNTIME_COMMAND_ROLE);
+}
 
 pub const MessageEntry = struct {
     role: []const u8,
@@ -408,8 +415,10 @@ pub const Memory = struct {
         store: *const fn (ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void,
         recall: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry,
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry,
+        getScoped: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry = null,
         list: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry,
         forget: *const fn (ptr: *anyopaque, key: []const u8) anyerror!bool,
+        forgetScoped: ?*const fn (ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool = null,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
@@ -431,11 +440,50 @@ pub const Memory = struct {
         return self.vtable.get(self.ptr, allocator, key);
     }
 
+    pub fn getScoped(self: Memory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) !?MemoryEntry {
+        if (self.vtable.getScoped) |func| {
+            return func(self.ptr, allocator, key, session_id);
+        }
+
+        if (session_id == null) {
+            return self.vtable.get(self.ptr, allocator, key);
+        }
+
+        const entries = try self.vtable.list(self.ptr, allocator, null, session_id);
+        defer allocator.free(entries);
+
+        var found: ?MemoryEntry = null;
+        errdefer if (found) |value| value.deinit(allocator);
+
+        for (entries) |*entry_ptr| {
+            if (std.mem.eql(u8, entry_ptr.key, key)) {
+                if (found) |*prev| prev.deinit(allocator);
+                found = entry_ptr.*;
+            } else {
+                @constCast(entry_ptr).deinit(allocator);
+            }
+        }
+
+        return found;
+    }
+
     pub fn list(self: Memory, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) ![]MemoryEntry {
         return self.vtable.list(self.ptr, allocator, category, session_id);
     }
 
     pub fn forget(self: Memory, key: []const u8) !bool {
+        return self.vtable.forget(self.ptr, key);
+    }
+
+    pub fn forgetScoped(self: Memory, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) !bool {
+        if (self.vtable.forgetScoped) |func| {
+            return func(self.ptr, key, session_id);
+        }
+
+        _ = allocator;
+        if (session_id != null) {
+            return error.NotSupported;
+        }
         return self.vtable.forget(self.ptr, key);
     }
 
@@ -566,11 +614,18 @@ pub const MemoryRuntime = struct {
     /// Best-effort vector sync after a store() call.
     /// Embeds the content and upserts into the vector store.
     /// Errors are caught and logged, never propagated.
-    pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
+    pub fn syncVectorAfterStore(
+        self: *MemoryRuntime,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        content: []const u8,
+        session_id: ?[]const u8,
+    ) void {
         syncVectorUpsertWithComponents(
             allocator,
             key,
             content,
+            session_id,
             self._outbox,
             self._embedding_provider,
             self._vector_store,
@@ -590,18 +645,22 @@ pub const MemoryRuntime = struct {
 
     /// Best-effort delete from vector store after a forget() call.
     /// Errors are caught and logged, never propagated.
-    pub fn deleteFromVectorStore(self: *MemoryRuntime, key: []const u8) void {
+    pub fn deleteFromVectorStore(self: *MemoryRuntime, key: []const u8, session_id: ?[]const u8) void {
+        const encoded_key = vector_key.encode(self._allocator, key, session_id) catch return;
+        defer self._allocator.free(encoded_key);
+
         if (self._outbox) |ob| {
-            ob.enqueue(key, "delete") catch |err| {
-                log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
+            ob.enqueue(encoded_key, "delete") catch |err| {
+                log.warn("outbox enqueue failed for key '{s}': {}", .{ encoded_key, err });
             };
             return;
         }
 
         const vs = self._vector_store orelse return;
-        vs.delete(key) catch |err| {
-            log.warn("vector store delete failed for key '{s}': {}", .{ key, err });
+        vs.delete(encoded_key) catch |err| {
+            log.warn("vector store delete failed for key '{s}': {}", .{ encoded_key, err });
         };
+        deleteLegacyVectorKey(vs, encoded_key, "vector store delete") catch {};
     }
 
     /// Rebuild the entire vector store from primary memory entries.
@@ -628,10 +687,17 @@ pub const MemoryRuntime = struct {
             defer allocator.free(emb);
             if (emb.len == 0) continue;
 
-            vs.upsert(entry.key, emb) catch |err| {
-                log.warn("reindex: upsert failed for key '{s}': {}", .{ entry.key, err });
+            const encoded_key = vector_key.encode(allocator, entry.key, entry.session_id) catch |err| {
+                log.warn("reindex: failed to encode vector key '{s}': {}", .{ entry.key, err });
                 continue;
             };
+            defer allocator.free(encoded_key);
+
+            vs.upsert(encoded_key, emb) catch |err| {
+                log.warn("reindex: upsert failed for key '{s}': {}", .{ encoded_key, err });
+                continue;
+            };
+            deleteLegacyVectorKey(vs, encoded_key, "reindex cleanup") catch {};
             reindexed += 1;
         }
 
@@ -640,10 +706,12 @@ pub const MemoryRuntime = struct {
     }
 
     /// Enqueue a key for vector sync via the outbox (if configured).
-    pub fn enqueueVectorSync(self: *MemoryRuntime, key: []const u8, operation: []const u8) void {
+    pub fn enqueueVectorSync(self: *MemoryRuntime, key: []const u8, session_id: ?[]const u8, operation: []const u8) void {
         const ob = self._outbox orelse return;
-        ob.enqueue(key, operation) catch |err| {
-            log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
+        const encoded_key = vector_key.encode(self._allocator, key, session_id) catch return;
+        defer self._allocator.free(encoded_key);
+        ob.enqueue(encoded_key, operation) catch |err| {
+            log.warn("outbox enqueue failed for key '{s}': {}", .{ encoded_key, err });
         };
     }
 
@@ -715,16 +783,20 @@ fn syncVectorUpsertWithComponents(
     allocator: std.mem.Allocator,
     key: []const u8,
     content: []const u8,
+    session_id: ?[]const u8,
     outbox_inst: ?*outbox.VectorOutbox,
     embed_provider: ?embeddings.EmbeddingProvider,
     vector_store_inst: ?vector_store.VectorStore,
     circuit_breaker_inst: ?*circuit_breaker.CircuitBreaker,
     log_prefix: []const u8,
 ) void {
+    const encoded_key = vector_key.encode(allocator, key, session_id) catch return;
+    defer allocator.free(encoded_key);
+
     // Durable mode: enqueue and return.
     if (outbox_inst) |ob| {
-        ob.enqueue(key, "upsert") catch |err| {
-            log.warn("{s}outbox enqueue failed for key '{s}': {}", .{ log_prefix, key, err });
+        ob.enqueue(encoded_key, "upsert") catch |err| {
+            log.warn("{s}outbox enqueue failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
         };
         return;
     }
@@ -737,7 +809,7 @@ fn syncVectorUpsertWithComponents(
     }
 
     const emb = provider.embed(allocator, content) catch |err| {
-        log.warn("{s}vector sync embed failed for key '{s}': {}", .{ log_prefix, key, err });
+        log.warn("{s}vector sync embed failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
         if (circuit_breaker_inst) |cb| cb.recordFailure();
         return;
     };
@@ -746,8 +818,18 @@ fn syncVectorUpsertWithComponents(
     if (circuit_breaker_inst) |cb| cb.recordSuccess();
     if (emb.len == 0) return;
 
-    vs.upsert(key, emb) catch |err| {
-        log.warn("{s}vector sync upsert failed for key '{s}': {}", .{ log_prefix, key, err });
+    vs.upsert(encoded_key, emb) catch |err| {
+        log.warn("{s}vector sync upsert failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
+        return;
+    };
+    deleteLegacyVectorKey(vs, encoded_key, "vector legacy cleanup") catch {};
+}
+
+fn deleteLegacyVectorKey(vs: vector_store.VectorStore, encoded_key: []const u8, log_prefix: []const u8) !void {
+    const decoded = vector_key.decode(encoded_key);
+    if (decoded.is_legacy) return;
+    vs.delete(decoded.logical_key) catch |err| {
+        log.warn("{s} failed for legacy key '{s}': {}", .{ log_prefix, decoded.logical_key, err });
     };
 }
 
@@ -762,6 +844,7 @@ fn syncPreservedChunkToVector(
         allocator,
         key,
         content,
+        null,
         ctx.outbox,
         ctx.embed_provider,
         ctx.vector_store,
@@ -1393,6 +1476,131 @@ test "Memory convenience list accepts session_id" {
     try std.testing.expectEqual(@as(usize, 0), results2.len);
 }
 
+test "Memory getScoped fallback uses scoped list when backend lacks native getter" {
+    const TestMemory = struct {
+        fn makeEntry(allocator: std.mem.Allocator, key: []const u8, content: []const u8, session_id: ?[]const u8) !MemoryEntry {
+            return .{
+                .id = try allocator.dupe(u8, key),
+                .key = try allocator.dupe(u8, key),
+                .content = try allocator.dupe(u8, content),
+                .category = .core,
+                .timestamp = try allocator.dupe(u8, "now"),
+                .session_id = if (session_id) |sid| try allocator.dupe(u8, sid) else null,
+                .score = null,
+            };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "fallback";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror!?MemoryEntry {
+            return try makeEntry(allocator, "shared", "global", null);
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
+            if (session_id == null) return allocator.alloc(MemoryEntry, 0);
+            var entries = try allocator.alloc(MemoryEntry, 1);
+            entries[0] = try makeEntry(allocator, "shared", "scoped", session_id);
+            return entries;
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return true;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 0;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    const mem = Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    const entry = (try mem.getScoped(std.testing.allocator, "shared", "sess-a")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("scoped", entry.content);
+    try std.testing.expectEqualStrings("sess-a", entry.session_id.?);
+}
+
+test "Memory forgetScoped fallback fails closed without native support" {
+    const TestMemory = struct {
+        var forget_calls: usize = 0;
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "fallback";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            forget_calls += 1;
+            return true;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 0;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    const mem = Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    TestMemory.forget_calls = 0;
+    try std.testing.expectError(error.NotSupported, mem.forgetScoped(std.testing.allocator, "shared", "sess-a"));
+    try std.testing.expectEqual(@as(usize, 0), TestMemory.forget_calls);
+}
+
 test "SessionStore delegates through vtable" {
     const TestSessionStore = struct {
         call_count: usize = 0,
@@ -1921,7 +2129,7 @@ test "syncVectorAfterStore enqueues when durable outbox is active" {
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), try ob.pendingCount());
 
-    rt.syncVectorAfterStore(std.testing.allocator, "k1", "content");
+    rt.syncVectorAfterStore(std.testing.allocator, "k1", "content", null);
     try std.testing.expectEqual(@as(usize, 1), try ob.pendingCount());
 }
 
@@ -1945,7 +2153,7 @@ test "deleteFromVectorStore enqueues delete when durable outbox is active" {
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), try ob.pendingCount());
 
-    rt.deleteFromVectorStore("k1");
+    rt.deleteFromVectorStore("k1", null);
     try std.testing.expectEqual(@as(usize, 1), try ob.pendingCount());
 }
 
@@ -2015,7 +2223,7 @@ test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
         ._outbox = null,
     };
     // Should not crash — just a no-op
-    rt.syncVectorAfterStore(std.testing.allocator, "key", "content");
+    rt.syncVectorAfterStore(std.testing.allocator, "key", "content", null);
 }
 
 test "MemoryRuntime.drainOutbox with no outbox returns 0" {

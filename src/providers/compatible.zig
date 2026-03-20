@@ -820,16 +820,8 @@ pub const OpenAiCompatibleProvider = struct {
         ) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
-                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-                if (fallback.content) |text| {
-                    callback(callback_ctx, root.StreamChunk.textDelta(text));
-                }
-                callback(callback_ctx, root.StreamChunk.finalChunk());
-                return .{
-                    .content = fallback.content,
-                    .usage = fallback.usage,
-                    .model = fallback.model,
-                };
+                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;
         };

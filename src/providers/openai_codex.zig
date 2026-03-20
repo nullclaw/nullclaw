@@ -452,6 +452,7 @@ fn codexStreamRequest(
     var saw_text_delta = false;
     var emitted_text_fallback = false;
     var emitted_tool_payload = false;
+    var saw_terminal = false;
 
     outer: while (true) {
         const n = file.read(&read_buf) catch break;
@@ -511,8 +512,14 @@ fn codexStreamRequest(
                             },
                         }
                     },
-                    .done => break :outer,
-                    .error_msg => break :outer,
+                    .done => {
+                        saw_terminal = true;
+                        break :outer;
+                    },
+                    .error_msg => {
+                        saw_terminal = true;
+                        break :outer;
+                    },
                     .skip => {},
                 }
             } else {
@@ -521,29 +528,49 @@ fn codexStreamRequest(
         }
     }
 
-    // Send final chunk
-    callback(ctx, root.StreamChunk.finalChunk());
-
     // Drain remaining stdout
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch {
+        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeCodexStreamResult(allocator, accumulated.items);
+        }
+        return error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeCodexStreamResult(allocator, accumulated.items);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeCodexStreamResult(allocator, accumulated.items);
+            }
+            return error.CurlFailed;
+        },
     }
 
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeCodexStreamResult(allocator, accumulated.items);
+}
+
+fn finalizeCodexStreamResult(allocator: std.mem.Allocator, accumulated: []const u8) !StreamChatResult {
+    const content = if (accumulated.len > 0)
+        try allocator.dupe(u8, accumulated)
     else
         null;
 
     return .{
         .content = content,
-        .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
+        .usage = .{ .completion_tokens = @intCast((accumulated.len + 3) / 4) },
         .model = "",
     };
 }

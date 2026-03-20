@@ -556,7 +556,7 @@ pub const NostrChannel = struct {
     /// Owner is always allowed regardless of the allowlist.
     pub fn isDmAllowed(self: *const NostrChannel, sender_pubkey: []const u8) bool {
         if (std.mem.eql(u8, sender_pubkey, self.config.owner_pubkey)) return true;
-        return root.isAllowedExact(self.config.dm_allowed_pubkeys, sender_pubkey);
+        return root.isAllowedExactScoped("nostr channel", self.config.dm_allowed_pubkeys, sender_pubkey);
     }
 
     /// Record which DM protocol a sender used, for protocol mirroring.

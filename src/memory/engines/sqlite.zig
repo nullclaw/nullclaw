@@ -230,6 +230,7 @@ pub const SqliteMemory = struct {
         try self_.configurePragmas(use_wal);
         try self_.migrate();
         try self_.migrateSessionId();
+        try self_.migrateAgentNamespace();
         return self_;
     }
 
@@ -403,6 +404,105 @@ pub const SqliteMemory = struct {
         }
     }
 
+    pub fn migrateAgentNamespace(self: *Self) !void {
+        {
+            const check_sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_key_session'";
+            var stmt: ?*c.sqlite3_stmt = null;
+            var rc = c.sqlite3_prepare_v2(self.db, check_sql, -1, &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+
+            rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_ROW and c.sqlite3_column_int64(stmt.?, 0) > 0) return;
+        }
+
+        var needs_rebuild = false;
+        {
+            const check_sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'sqlite_autoindex_memories_%'";
+            var stmt: ?*c.sqlite3_stmt = null;
+            var rc = c.sqlite3_prepare_v2(self.db, check_sql, -1, &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+
+            rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_ROW) {
+                needs_rebuild = c.sqlite3_column_int64(stmt.?, 0) > 0;
+            }
+        }
+
+        if (needs_rebuild) {
+            const rebuild_sql =
+                \\BEGIN;
+                \\CREATE TABLE memories_new (
+                \\  id         TEXT PRIMARY KEY,
+                \\  key        TEXT NOT NULL,
+                \\  content    TEXT NOT NULL,
+                \\  category   TEXT NOT NULL DEFAULT 'core',
+                \\  session_id TEXT,
+                \\  created_at TEXT NOT NULL,
+                \\  updated_at TEXT NOT NULL
+                \\);
+                \\INSERT INTO memories_new SELECT id, key, content, category, session_id, created_at, updated_at FROM memories;
+                \\DROP TABLE memories;
+                \\ALTER TABLE memories_new RENAME TO memories;
+                \\CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+                \\CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
+                \\CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+                \\CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                \\  INSERT INTO memories_fts(rowid, key, content)
+                \\  VALUES (new.rowid, new.key, new.content);
+                \\END;
+                \\CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                \\  INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                \\  VALUES ('delete', old.rowid, old.key, old.content);
+                \\END;
+                \\CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                \\  INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                \\  VALUES ('delete', old.rowid, old.key, old.content);
+                \\  INSERT INTO memories_fts(rowid, key, content)
+                \\  VALUES (new.rowid, new.key, new.content);
+                \\END;
+                \\COMMIT;
+            ;
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, rebuild_sql, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                self.logExecFailure("agent namespace migration (rebuild)", "CREATE TABLE memories_new / rename", rc, err_msg);
+                if (err_msg) |msg| c.sqlite3_free(msg);
+                return error.MigrationFailed;
+            }
+
+            var fts_err_msg: [*c]u8 = null;
+            const fts_rc = c.sqlite3_exec(
+                self.db,
+                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild');",
+                null,
+                null,
+                &fts_err_msg,
+            );
+            if (fts_rc != c.SQLITE_OK) {
+                self.logExecFailure("agent namespace migration (fts rebuild)", "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", fts_rc, fts_err_msg);
+                if (fts_err_msg) |msg| c.sqlite3_free(msg);
+            }
+        }
+
+        {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(
+                self.db,
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_key_session ON memories(key, COALESCE(session_id, '__global__'));",
+                null,
+                null,
+                &err_msg,
+            );
+            if (rc != c.SQLITE_OK) {
+                self.logExecFailure("agent namespace migration (composite index)", "CREATE UNIQUE INDEX idx_memories_key_session", rc, err_msg);
+                if (err_msg) |msg| c.sqlite3_free(msg);
+                return error.MigrationFailed;
+            }
+        }
+    }
+
     // ── Memory trait implementation ────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -422,10 +522,9 @@ pub const SqliteMemory = struct {
 
         const sql = "INSERT INTO memories (id, key, content, category, session_id, created_at, updated_at) " ++
             "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) " ++
-            "ON CONFLICT(key) DO UPDATE SET " ++
+            "ON CONFLICT(key, COALESCE(session_id, '__global__')) DO UPDATE SET " ++
             "content = excluded.content, " ++
             "category = excluded.category, " ++
-            "session_id = excluded.session_id, " ++
             "updated_at = excluded.updated_at";
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -472,6 +571,30 @@ pub const SqliteMemory = struct {
         defer _ = c.sqlite3_finalize(stmt);
 
         _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            return try readEntryFromRow(stmt.?, allocator);
+        }
+        return null;
+    }
+
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sql = if (session_id != null)
+            "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1 AND session_id = ?2 LIMIT 1"
+        else
+            "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
 
         rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_ROW) {
@@ -555,6 +678,28 @@ pub const SqliteMemory = struct {
         return c.sqlite3_changes(self_.db) > 0;
     }
 
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sql = if (session_id != null)
+            "DELETE FROM memories WHERE key = ?1 AND session_id = ?2"
+        else
+            "DELETE FROM memories WHERE key = ?1 AND session_id IS NULL";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+        return c.sqlite3_changes(self_.db) > 0;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -593,8 +738,10 @@ pub const SqliteMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -739,7 +886,8 @@ pub const SqliteMemory = struct {
     // ── History queries ──────────────────────────────────────────────
 
     pub fn countSessions(self: *Self) !u64 {
-        const sql = "SELECT COUNT(*) FROM (SELECT 1 FROM messages GROUP BY session_id)";
+        const sql =
+            "SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' GROUP BY session_id)";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -755,7 +903,8 @@ pub const SqliteMemory = struct {
     pub fn listSessions(self: *Self, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]root.SessionInfo {
         const sql =
             "SELECT session_id, COUNT(*) as msg_count, MIN(created_at) as first_at, MAX(created_at) as last_at " ++
-            "FROM messages GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT ?1 OFFSET ?2";
+            "FROM messages WHERE role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' " ++
+            "GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT ?1 OFFSET ?2";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -793,7 +942,7 @@ pub const SqliteMemory = struct {
     }
 
     pub fn countDetailedMessages(self: *Self, session_id: []const u8) !u64 {
-        const sql = "SELECT COUNT(*) FROM messages WHERE session_id = ?1";
+        const sql = "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "'";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -808,7 +957,10 @@ pub const SqliteMemory = struct {
 
     /// Load messages with timestamps for a session.
     pub fn loadMessagesDetailed(self: *Self, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) ![]root.DetailedMessageEntry {
-        const sql = "SELECT role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC LIMIT ?2 OFFSET ?3";
+        const sql =
+            "SELECT role, content, created_at FROM messages " ++
+            "WHERE session_id = ?1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' " ++
+            "ORDER BY id ASC LIMIT ?2 OFFSET ?3";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -2121,6 +2273,40 @@ test "sqlite sessionStore saveMessage + loadMessages roundtrip" {
     try std.testing.expectEqualStrings("hi there", msgs[1].content);
 }
 
+test "sqlite sessionStore history views hide runtime command rows" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("s1", root.RUNTIME_COMMAND_ROLE, "/usage full");
+    try store.saveMessage("s1", "user", "hello");
+    try store.saveMessage("s1", "assistant", "hi there");
+    try store.saveMessage("s2", root.RUNTIME_COMMAND_ROLE, "/think high");
+
+    const raw = try store.loadMessages(allocator, "s1");
+    defer root.freeMessages(allocator, raw);
+    try std.testing.expectEqual(@as(usize, 3), raw.len);
+    try std.testing.expectEqualStrings(root.RUNTIME_COMMAND_ROLE, raw[0].role);
+
+    try std.testing.expectEqual(@as(u64, 1), try store.countSessions());
+
+    const sessions = try store.listSessions(allocator, 10, 0);
+    defer root.freeSessionInfos(allocator, sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("s1", sessions[0].session_id);
+    try std.testing.expectEqual(@as(u64, 2), sessions[0].message_count);
+
+    try std.testing.expectEqual(@as(u64, 2), try store.countDetailedMessages("s1"));
+    try std.testing.expectEqual(@as(u64, 0), try store.countDetailedMessages("s2"));
+
+    const detailed = try store.loadMessagesDetailed(allocator, "s1", 10, 0);
+    defer root.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expectEqualStrings("user", detailed[0].role);
+    try std.testing.expectEqualStrings("assistant", detailed[1].role);
+}
+
 test "sqlite sessionStore clearMessages" {
     const allocator = std.testing.allocator;
     var mem = try SqliteMemory.init(allocator, ":memory:");
@@ -2280,28 +2466,27 @@ test "sqlite store newlines in content roundtrip" {
     try std.testing.expectEqualStrings(content, entry.content);
 }
 
-test "sqlite upsert updates session_id from null to value" {
+test "sqlite same key can exist in global and scoped namespaces" {
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     const m = mem.memory();
 
     try m.store("k", "v", .core, null);
-    {
-        const entry = (try m.get(std.testing.allocator, "k")).?;
-        defer entry.deinit(std.testing.allocator);
-        try std.testing.expect(entry.session_id == null);
-    }
-
     try m.store("k", "v2", .core, "sess-new");
-    {
-        const entry = (try m.get(std.testing.allocator, "k")).?;
-        defer entry.deinit(std.testing.allocator);
-        try std.testing.expect(entry.session_id != null);
-        try std.testing.expectEqualStrings("sess-new", entry.session_id.?);
-    }
+
+    const global_entry = (try m.getScoped(std.testing.allocator, "k", null)).?;
+    defer global_entry.deinit(std.testing.allocator);
+    try std.testing.expect(global_entry.session_id == null);
+    try std.testing.expectEqualStrings("v", global_entry.content);
+
+    const scoped_entry = (try m.getScoped(std.testing.allocator, "k", "sess-new")).?;
+    defer scoped_entry.deinit(std.testing.allocator);
+    try std.testing.expect(scoped_entry.session_id != null);
+    try std.testing.expectEqualStrings("sess-new", scoped_entry.session_id.?);
+    try std.testing.expectEqualStrings("v2", scoped_entry.content);
 }
 
-test "sqlite upsert updates session_id from value to null" {
+test "sqlite scoped forget removes only matching namespace" {
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     const m = mem.memory();
@@ -2309,9 +2494,16 @@ test "sqlite upsert updates session_id from value to null" {
     try m.store("k", "v", .core, "sess-old");
     try m.store("k", "v2", .core, null);
 
-    const entry = (try m.get(std.testing.allocator, "k")).?;
-    defer entry.deinit(std.testing.allocator);
-    try std.testing.expect(entry.session_id == null);
+    try std.testing.expect(try m.forgetScoped(std.testing.allocator, "k", "sess-old"));
+
+    const scoped_entry = try m.getScoped(std.testing.allocator, "k", "sess-old");
+    defer if (scoped_entry) |entry| entry.deinit(std.testing.allocator);
+    try std.testing.expect(scoped_entry == null);
+
+    const global_entry = (try m.getScoped(std.testing.allocator, "k", null)).?;
+    defer global_entry.deinit(std.testing.allocator);
+    try std.testing.expect(global_entry.session_id == null);
+    try std.testing.expectEqualStrings("v2", global_entry.content);
 }
 
 test "sqlite loadMessages empty session" {

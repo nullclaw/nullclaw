@@ -65,9 +65,15 @@ pub const AudioMediaConfig = struct {
 // ── Sub-config structs ──────────────────────────────────────────
 
 pub const DiagnosticsConfig = struct {
+    pub const OtelHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    otel_headers: []const OtelHeaderEntry = &.{},
     /// Optional max length for user-visible provider/API errors after scrubbing.
     /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
     api_error_max_chars: ?u32 = null,
@@ -400,7 +406,9 @@ pub const MatrixConfig = struct {
     user_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
+    dm_policy: []const u8 = "allowlist",
     group_policy: []const u8 = "allowlist",
+    require_mention: bool = false,
 };
 
 pub const MattermostConfig = struct {
@@ -545,6 +553,7 @@ pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
     pub const DEFAULT_TRANSPORT: []const u8 = "local";
     pub const DEFAULT_MESSAGE_AUTH_MODE: []const u8 = "pairing";
+    pub const DEFAULT_MAX_HANDSHAKE_SIZE: u16 = 8_192;
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
@@ -563,6 +572,9 @@ pub const WebConfig = struct {
     listen: []const u8 = "127.0.0.1",
     path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
+    /// Max bytes allowed for the HTTP upgrade request headers during WS handshake.
+    /// Increase this when running behind reverse proxies that append many headers.
+    max_handshake_size: u16 = DEFAULT_MAX_HANDSHAKE_SIZE,
     /// Optional WebSocket-upgrade auth token for browser/extension clients.
     /// Used for WebSocket-upgrade hardening and for `message_auth_mode="token"`.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
@@ -743,6 +755,50 @@ pub const NostrConfig = struct {
     config_dir: []const u8 = ".",
 };
 
+pub const ExternalChannelConfig = struct {
+    pub const EnvEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub const TransportConfig = struct {
+        command: []const u8 = "",
+        args: []const []const u8 = &.{},
+        env: []const EnvEntry = &.{},
+        timeout_ms: u32 = 10_000,
+    };
+
+    account_id: []const u8 = "default",
+    /// Runtime channel identifier exposed inside nullclaw routing and bindings.
+    /// Example: "whatsapp_web"
+    runtime_name: []const u8 = "",
+    /// Plugin process transport configuration (JSON-RPC over stdio).
+    transport: TransportConfig = .{},
+    /// Raw JSON object forwarded as params.config during the start request.
+    plugin_config_json: []const u8 = "{}",
+    /// Runtime-only host-owned state directory for plugin persistence.
+    /// Backfilled by Config.load(); never serialized.
+    state_dir: []const u8 = ".",
+
+    pub fn isValidRuntimeName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 128) return false;
+        for (trimmed) |ch| {
+            if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') continue;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn hasCommand(raw: []const u8) bool {
+        return std.mem.trim(u8, raw, " \t\r\n").len > 0;
+    }
+
+    pub fn isValidTimeoutMs(timeout_ms: u32) bool {
+        return timeout_ms >= 1 and timeout_ms <= 600_000;
+    }
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
     telegram: []const TelegramConfig = &.{},
@@ -765,6 +821,7 @@ pub const ChannelsConfig = struct {
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
     max: []const MaxConfig = &.{},
+    external: []const ExternalChannelConfig = &.{},
     nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
@@ -838,6 +895,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn maxPrimary(self: *const ChannelsConfig) ?MaxConfig {
         return primaryAccount(MaxConfig, self.max);
+    }
+    pub fn externalPrimary(self: *const ChannelsConfig) ?ExternalChannelConfig {
+        return primaryAccount(ExternalChannelConfig, self.external);
     }
 };
 
@@ -1400,6 +1460,7 @@ pub const NamedAgentConfig = struct {
     system_prompt: ?[]const u8 = null,
     /// Runtime-only source path preserved so Config.save() can round-trip file-backed prompts.
     system_prompt_path: ?[]const u8 = null,
+    workspace_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
@@ -1408,15 +1469,84 @@ pub const NamedAgentConfig = struct {
 // ── MCP Server Config ──────────────────────────────────────────
 
 pub const McpServerConfig = struct {
+    pub const DEFAULT_TRANSPORT = "stdio";
+    pub const HTTP_TRANSPORT = "http";
+
     name: []const u8,
-    command: []const u8,
+    transport: []const u8 = DEFAULT_TRANSPORT,
+    command: []const u8 = "",
+    url: ?[]const u8 = null,
+    /// Per-request wall clock timeout for HTTP transport. 0 = default.
+    timeout_ms: u32 = 10_000,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
+    headers: []const McpHeaderEntry = &.{},
 
     pub const McpEnvEntry = struct {
         key: []const u8,
         value: []const u8,
     };
+
+    pub const McpHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn isValidTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, DEFAULT_TRANSPORT) or std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isHttpTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isValidHttpUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+        if (host[0] == ':') return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (std.mem.indexOfScalar(u8, trimmed, '#') != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
+        return true;
+    }
+
+    pub fn isValidHeaderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        for (trimmed) |ch| {
+            // RFC 7230 token subset; keep strict to prevent header injection.
+            if (ch <= 0x20 or ch >= 0x7f) return false;
+            if (ch == ':' or ch == '"' or ch == '\\') return false;
+        }
+        return true;
+    }
+
+    pub fn isValidHeaderValue(raw: []const u8) bool {
+        if (std.mem.indexOfAny(u8, raw, "\r\n") != null) return false;
+        return true;
+    }
 };
 
 // ── Model Pricing ──────────────────────────────────────────────
@@ -1449,6 +1579,18 @@ pub const SessionConfig = struct {
     dm_scope: DmScope = .per_channel_peer,
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
+    /// Automatically route direct messages from unknown peers into deterministic
+    /// per-peer agent IDs (agent runtime/workspace/memory isolation).
+    auto_provision_direct_agents: bool = false,
+    /// Optional HMAC secret used to verify `/claim <token>` identity assertions.
+    /// When unset, direct-peer auto-provisioning is not gated by identity claims.
+    claim_secret: ?[]const u8 = null,
+    /// Optional shared secret for manual `/revoke <admin-secret>` operations.
+    claim_admin_secret: ?[]const u8 = null,
+    /// Failed `/claim` attempts allowed before lockout kicks in.
+    claim_max_attempts: u32 = 5,
+    /// Lockout duration in seconds after too many failed claim attempts.
+    claim_lockout_secs: u32 = 300,
     typing_interval_secs: u32 = 5,
     /// Maximum concurrent message processing tasks per channel.
     /// When set to 0 or 1, messages are processed sequentially.
@@ -1464,6 +1606,7 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
+    try std.testing.expectEqual(WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, cfg.max_handshake_size);
     try std.testing.expect(cfg.auth_token == null);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_MESSAGE_AUTH_MODE, cfg.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
@@ -1493,6 +1636,31 @@ test "security defaults stay least-privilege" {
     try std.testing.expect(http_request.proxy == null);
     try std.testing.expect(http_request.search_base_url == null);
     try std.testing.expectEqualStrings("auto", http_request.search_provider);
+}
+
+test "McpServerConfig transport validation" {
+    try std.testing.expect(McpServerConfig.isValidTransport("stdio"));
+    try std.testing.expect(McpServerConfig.isValidTransport("http"));
+    try std.testing.expect(!McpServerConfig.isValidTransport("sse"));
+}
+
+test "McpServerConfig http url validation" {
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp#frag"));
+}
+
+test "McpServerConfig timeout defaults" {
+    const cfg = McpServerConfig{ .name = "x", .command = "echo" };
+    try std.testing.expectEqual(@as(u32, 10_000), cfg.timeout_ms);
+}
+
+test "McpServerConfig header validation" {
+    try std.testing.expect(McpServerConfig.isValidHeaderName("Authorization"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderName("Bad Header"));
+    try std.testing.expect(McpServerConfig.isValidHeaderValue("Bearer token"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderValue("line1\nline2"));
 }
 
 test "HttpRequestConfig proxy URL validation" {

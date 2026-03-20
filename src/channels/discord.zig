@@ -869,7 +869,7 @@ pub const DiscordChannel = struct {
 
         // Filter 3: allow_from allowlist
         if (self.allow_from.len > 0) {
-            if (!root.isAllowed(self.allow_from, author_id)) {
+            if (!root.isAllowedScoped("discord channel", self.allow_from, author_id)) {
                 return;
             }
         }

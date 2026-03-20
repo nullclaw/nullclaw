@@ -114,6 +114,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "perplexity", .label = "Perplexity", .default_model = "llama-4-sonar-small-128k-online", .env_var = "PERPLEXITY_API_KEY" },
 
     // --- Tier 6: Infrastructure providers ---
+    .{ .key = "novita", .label = "Novita AI (inference)", .default_model = "moonshotai/kimi-k2.5", .env_var = "NOVITA_API_KEY" },
     .{ .key = "nvidia", .label = "NVIDIA NIM (enterprise)", .default_model = "meta/llama-4-70b-instruct", .env_var = "NVIDIA_API_KEY" },
     .{ .key = "cloudflare", .label = "Cloudflare AI Gateway", .default_model = "meta/llama-4-70b-instruct", .env_var = "CLOUDFLARE_API_TOKEN" },
     .{ .key = "vercel-ai", .label = "Vercel AI Gateway", .default_model = "gpt-5.2", .env_var = "VERCEL_API_KEY" },
@@ -327,6 +328,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
     if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
+    if (std.mem.eql(u8, canonical, "novita")) return &novita_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
@@ -403,6 +405,11 @@ const deepseek_fallback = [_][]const u8{
     "deepseek-chat",
     "deepseek-reasoner",
 };
+const novita_fallback = [_][]const u8{
+    "moonshotai/kimi-k2.5",
+    "zai-org/glm-5",
+    "minimax/minimax-m2.5",
+};
 const ollama_fallback = [_][]const u8{
     "llama4",
     "llama3.2",
@@ -443,6 +450,7 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "minimax", .key = "minimax" },
     .{ .canonical = "cohere", .key = "cohere" },
     .{ .canonical = "perplexity", .key = "perplexity" },
+    .{ .canonical = "novita", .key = "novita-ai" },
     .{ .canonical = "nvidia", .key = "nvidia" },
     .{ .canonical = "bedrock", .key = "amazon-bedrock" },
     .{ .canonical = "copilot", .key = "github-copilot" },
@@ -889,6 +897,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     // Load or create config
     var cfg = Config.load(allocator) catch try initFreshConfig(allocator);
     defer cfg.deinit();
+    try ensureSecretsEncryptionEnabled(&cfg);
 
     // Apply overrides
     var provider_overridden = false;
@@ -970,6 +979,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
     return runWizard(allocator);
 }
 
+fn ensureSecretsEncryptionEnabled(cfg: *const Config) Config.ValidationError!void {
+    if (!cfg.secrets.encrypt) {
+        return Config.ValidationError.InsecurePlaintextSecrets;
+    }
+}
+
 /// Reconfigure channels and allowlists only (preserves existing config).
 pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -984,6 +999,7 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
         return error.ConfigNotFound;
     };
     defer cfg.deinit();
+    try ensureSecretsEncryptionEnabled(&cfg);
 
     try stdout.writeAll("Channel setup wizard:\n");
     const changed = try configureChannelsInteractive(allocator, &cfg, stdout, &input_buf, "");
@@ -1089,7 +1105,7 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
 }
 
 pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
-pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous", "yolo" };
 pub const wizard_memory_backend_order = [_][]const u8{
     "hybrid",
     "sqlite",
@@ -1128,7 +1144,7 @@ pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .max => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .external, .nostr, .max => true,
         else => false,
     };
 }
@@ -1242,6 +1258,7 @@ fn configureSingleChannel(
         .matrix => configureMatrixChannel(cfg, out, input_buf, prefix),
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
+        .external => configureExternalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
         .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
         .max => configureMaxChannel(cfg, out, input_buf, prefix),
@@ -1285,6 +1302,52 @@ fn parseTelegramAllowFrom(allocator: std.mem.Allocator, raw: []const u8) ![]cons
     }
 
     return allow.toOwnedSlice(allocator);
+}
+
+fn parseWizardTokenList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (items.items) |entry| allocator.free(entry);
+        items.deinit(allocator);
+    }
+
+    var tokens = std.mem.tokenizeAny(u8, raw, ", \t");
+    while (tokens.next()) |token| {
+        const trimmed = std.mem.trim(u8, token, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try items.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+
+    if (items.items.len == 0) return &.{};
+    return try items.toOwnedSlice(allocator);
+}
+
+fn parseWizardJsonConfig(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return try allocator.dupe(u8, "{}");
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.InvalidJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidJson;
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+fn sanitizeStatePathSegment(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    for (trimmed) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') {
+            try buf.append(allocator, ch);
+        } else {
+            try buf.append(allocator, '_');
+        }
+    }
+    if (buf.items.len == 0) {
+        try buf.appendSlice(allocator, "default");
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 fn configureTelegramChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
@@ -1475,6 +1538,88 @@ fn configureSignalChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pr
     return true;
 }
 
+fn configureExternalChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []const u8) !bool {
+    var account_id_buf: [128]u8 = undefined;
+    var runtime_name_buf: [128]u8 = undefined;
+    var command_buf: [512]u8 = undefined;
+    var args_buf: [512]u8 = undefined;
+    var timeout_buf: [64]u8 = undefined;
+    var config_buf: [1024]u8 = undefined;
+    var args: []const []const u8 = &.{};
+    var plugin_config_json: ?[]const u8 = null;
+    var committed = false;
+    defer {
+        if (!committed) {
+            for (args) |arg| cfg.allocator.free(arg);
+            if (args.len > 0) cfg.allocator.free(args);
+            if (plugin_config_json) |value| cfg.allocator.free(value);
+        }
+    }
+
+    try out.print("{s}  External account_id [default]: ", .{prefix});
+    const account_id = prompt(out, &account_id_buf, "", "default") orelse return false;
+
+    try out.print("{s}  External runtime_name (required, e.g. whatsapp_web): ", .{prefix});
+    const runtime_name = prompt(out, &runtime_name_buf, "", "") orelse return false;
+    if (!config_mod.ExternalChannelConfig.isValidRuntimeName(runtime_name)) {
+        try out.print("{s}  -> External skipped (invalid runtime_name)\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  External plugin command (required, Enter to skip): ", .{prefix});
+    const command = prompt(out, &command_buf, "", "") orelse return false;
+    if (command.len == 0) {
+        try out.print("{s}  -> External skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  External plugin args (optional, comma/space separated): ", .{prefix});
+    const raw_args = prompt(out, &args_buf, "", "") orelse return false;
+    args = try parseWizardTokenList(cfg.allocator, raw_args);
+
+    try out.print("{s}  External transport.timeout_ms [10000]: ", .{prefix});
+    const timeout_input = prompt(out, &timeout_buf, "", "10000") orelse return false;
+    const timeout_ms = std.fmt.parseInt(u32, timeout_input, 10) catch 10_000;
+    if (!config_mod.ExternalChannelConfig.isValidTimeoutMs(timeout_ms)) {
+        try out.print("{s}  -> External skipped (transport.timeout_ms must be in [1, 600000])\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  External config JSON (optional, object): ", .{prefix});
+    const raw_config = prompt(out, &config_buf, "", "") orelse return false;
+    plugin_config_json = parseWizardJsonConfig(cfg.allocator, raw_config) catch {
+        try out.print("{s}  -> External skipped (config JSON must be a valid object)\n", .{prefix});
+        return false;
+    };
+
+    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const account_segment = try sanitizeStatePathSegment(cfg.allocator, account_id);
+    defer cfg.allocator.free(account_segment);
+    const runtime_segment = try sanitizeStatePathSegment(cfg.allocator, runtime_name);
+    defer cfg.allocator.free(runtime_segment);
+
+    const accounts = try cfg.allocator.alloc(config_mod.ExternalChannelConfig, 1);
+    accounts[0] = .{
+        .account_id = try cfg.allocator.dupe(u8, account_id),
+        .runtime_name = try cfg.allocator.dupe(u8, runtime_name),
+        .transport = .{
+            .command = try cfg.allocator.dupe(u8, command),
+            .args = args,
+            .timeout_ms = timeout_ms,
+        },
+        .plugin_config_json = plugin_config_json.?,
+        .state_dir = try std.fs.path.join(cfg.allocator, &.{ config_dir, "state", "external", runtime_segment, account_segment }),
+    };
+    cfg.channels.external = accounts;
+    committed = true;
+    try out.print("{s}  -> External configured ({s}); add env vars manually in {s} if needed\n", .{
+        prefix,
+        runtime_name,
+        cfg.config_path,
+    });
+    return true;
+}
+
 fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
     try out.print("{s}  Webhook port [8080]: ", .{prefix});
     const port_input = prompt(out, input_buf, "", "8080") orelse return false;
@@ -1491,6 +1636,8 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
 }
 
 fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    try ensureSecretsEncryptionEnabled(cfg);
+
     const nak_path = "nak";
 
     // ── Bot keypair ──────────────────────────────────────────────
@@ -1760,6 +1907,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     // Load existing or create fresh config
     var cfg = Config.load(allocator) catch try initFreshConfig(allocator);
     defer cfg.deinit();
+    try ensureSecretsEncryptionEnabled(&cfg);
 
     // ── Step 1: Provider selection ──
     try out.writeAll("  Step 1/8: Select a provider\n");
@@ -2006,7 +2154,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
 
     // ── Step 6: Autonomy level ──
     try out.writeAll("  Step 6/8: Autonomy level\n");
-    try out.writeAll("    [1] supervised\n    [2] autonomous\n    [3] fully_autonomous\n");
+    try out.writeAll("    [1] supervised\n    [2] autonomous\n    [3] fully_autonomous\n    [4] yolo\n");
     try out.writeAll("  Choice [1]: ");
     const autonomy_idx = promptChoice(out, &input_buf, autonomy_options.len, 0) orelse {
         try out.writeAll("\n  Aborted.\n");
@@ -2028,6 +2176,12 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         2 => {
             // "fully_autonomous": fully acts and does not hard-block high-risk commands.
             cfg.autonomy.level = .full;
+            cfg.autonomy.require_approval_for_medium_risk = false;
+            cfg.autonomy.block_high_risk_commands = false;
+        },
+        3 => {
+            // "yolo": bypasses all command-level policy checks.
+            cfg.autonomy.level = .yolo;
             cfg.autonomy.require_approval_for_medium_risk = false;
             cfg.autonomy.block_high_risk_commands = false;
         },
@@ -2938,9 +3092,21 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.slack));
     try std.testing.expect(isWizardInteractiveChannel(.matrix));
     try std.testing.expect(isWizardInteractiveChannel(.signal));
+    try std.testing.expect(isWizardInteractiveChannel(.external));
     try std.testing.expect(isWizardInteractiveChannel(.nostr));
     try std.testing.expect(isWizardInteractiveChannel(.max));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
+}
+
+test "parseWizardJsonConfig normalizes valid object payload" {
+    const config_json = try parseWizardJsonConfig(std.testing.allocator, " { \"bridge_url\": \"http://127.0.0.1:3301\" } ");
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expectEqualStrings("{\"bridge_url\":\"http://127.0.0.1:3301\"}", config_json);
+}
+
+test "parseWizardJsonConfig rejects scalar payload" {
+    try std.testing.expectError(error.InvalidJson, parseWizardJsonConfig(std.testing.allocator, "\"nope\""));
 }
 
 test "parseTelegramAllowFrom defaults to wildcard" {
@@ -3573,6 +3739,17 @@ test "defaultModelForProvider openrouter" {
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", defaultModelForProvider("openrouter"));
 }
 
+test "ensureSecretsEncryptionEnabled rejects plaintext secrets config" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.secrets.encrypt = false;
+
+    try std.testing.expectError(Config.ValidationError.InsecurePlaintextSecrets, ensureSecretsEncryptionEnabled(&cfg));
+}
+
 test "printProviderNextSteps prefers interactive chat when api key is already set" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
@@ -3740,11 +3917,12 @@ test "tunnel_options has 4 entries" {
     try std.testing.expectEqualStrings("tailscale", tunnel_options[3]);
 }
 
-test "autonomy_options has 3 entries" {
-    try std.testing.expect(autonomy_options.len == 3);
+test "autonomy_options has 4 entries" {
+    try std.testing.expect(autonomy_options.len == 4);
     try std.testing.expectEqualStrings("supervised", autonomy_options[0]);
     try std.testing.expectEqualStrings("autonomous", autonomy_options[1]);
     try std.testing.expectEqualStrings("fully_autonomous", autonomy_options[2]);
+    try std.testing.expectEqualStrings("yolo", autonomy_options[3]);
 }
 
 test "catalog_providers has entries" {
@@ -3775,7 +3953,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 35);
+    try std.testing.expect(known_providers.len == 36);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -3795,10 +3973,11 @@ test "findChannelOptionIndex supports number and key" {
 test "wizard maps autonomy index to enum correctly" {
     // Verify the mapping used in runWizard
     const Config2 = @import("config.zig");
-    const mapping = [_]Config2.AutonomyLevel{ .supervised, .full, .full };
+    const mapping = [_]Config2.AutonomyLevel{ .supervised, .full, .full, .yolo };
     try std.testing.expect(mapping[0] == .supervised);
     try std.testing.expect(mapping[1] == .full);
     try std.testing.expect(mapping[2] == .full);
+    try std.testing.expect(mapping[3] == .yolo);
 }
 
 // ── New template tests ──────────────────────────────────────────
@@ -4274,6 +4453,7 @@ test "modelsDevProviderKey maps known providers" {
     try std.testing.expectEqualStrings("google", modelsDevProviderKey("gemini").?);
     try std.testing.expectEqualStrings("google-vertex", modelsDevProviderKey("vertex").?);
     try std.testing.expectEqualStrings("zai", modelsDevProviderKey("z.ai").?);
+    try std.testing.expectEqualStrings("novita-ai", modelsDevProviderKey("novita").?);
     try std.testing.expect(modelsDevProviderKey("ollama") == null);
 }
 

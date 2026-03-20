@@ -121,6 +121,7 @@ fn initConfigWithCustomHome(backing_allocator: std.mem.Allocator, home_dir: []co
     cfg.config_path = config_path;
     cfg.workspace_dir = workspace_dir;
     cfg.workspace_dir_override = workspace_dir;
+    try cfg.backfillRuntimeDerivedFields();
     cfg.syncFlatFields();
 
     return cfg;
@@ -561,6 +562,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (cfg.default_model == null) {
         cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
     }
+
+    try cfg.backfillRuntimeDerivedFields();
 
     // Sync flat convenience fields
     cfg.syncFlatFields();

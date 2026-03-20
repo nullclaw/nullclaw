@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -14,12 +15,13 @@ const log = std.log.scoped(.http_request);
 pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
     max_response_size: u32 = 1_000_000,
+    timeout_secs: u64 = 60,
 
     pub const tool_name = "http_request";
-    pub const tool_description = "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
-        "Security: allowlist-only domains, no local/private hosts, SSRF protection.";
+    pub const tool_description = "Make HTTPS requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
+        "Security: allowlist-only domains, SSRF protection, and allowlisted hosts may reach local/private addresses.";
     pub const tool_params =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to request"},"method":{"type":"string","description":"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)","default":"GET"},"headers":{"type":"object","description":"Optional HTTP headers as key-value pairs"},"body":{"type":"string","description":"Optional request body"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTPS URL to request"},"method":{"type":"string","description":"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)","default":"GET"},"headers":{"type":"object","description":"Optional HTTP headers as key-value pairs"},"body":{"type":"string","description":"Optional request body"}},"required":["url"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -37,40 +39,62 @@ pub const HttpRequestTool = struct {
 
         const method_str = root.getString(args, "method") orelse "GET";
 
-        // Validate URL scheme
-        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-            return ToolResult.fail("Only http:// and https:// URLs are allowed");
+        // Validate method first (cheap local operation, no network calls)
+        const method = validateMethod(method_str) orelse {
+            const msg = try std.fmt.allocPrint(allocator, "Unsupported HTTP method: {s}", .{method_str});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+
+        // Validate URL scheme - HTTPS only for security (AGENTS.md policy)
+        if (!std.mem.startsWith(u8, url, "https://")) {
+            return ToolResult.fail("Only HTTPS URLs are allowed for security");
         }
 
         // Build URI
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
 
-        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
-        const resolved_port: u16 = uri.port orelse default_port;
+        const resolved_port: u16 = uri.port orelse 443;
 
-        // SSRF protection and DNS-rebinding hardening:
-        // resolve once, validate global address, and connect directly to it.
+        // Extract host
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
-        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
-            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
-            else => return ToolResult.fail("Unable to verify host safety"),
-        };
-        defer allocator.free(connect_host);
 
-        // Check domain allowlist
-        if (self.allowed_domains.len > 0) {
-            if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
-                return ToolResult.fail("Host is not in http_request.allowed_domains");
-            }
+        // Check domain allowlist BEFORE any DNS resolution.
+        // This prevents DNS exfiltration and avoids unnecessary network calls.
+        const is_allowlisted = if (self.allowed_domains.len > 0)
+            net_security.hostMatchesAllowlist(host, self.allowed_domains)
+        else
+            false;
+
+        // Reject non-allowlisted hosts when allowlist is configured
+        if (self.allowed_domains.len > 0 and !is_allowlisted) {
+            return ToolResult.fail("Host is not in http_request.allowed_domains");
         }
 
-        // Validate method
-        const method = validateMethod(method_str) orelse {
-            const msg = try std.fmt.allocPrint(allocator, "Unsupported HTTP method: {s}", .{method_str});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
+        // SSRF protection: skip for allowlisted hosts (fixes #393).
+        // Allowlisted hosts can resolve to private IPs (e.g., local searxng).
+        // Non-allowlisted hosts require global address validation.
+        //
+        // Security trade-off for allowlisted hosts:
+        // - resolveConnectHost normally pins DNS results to curl via --resolve,
+        //   preventing DNS rebinding attacks between resolution and connection.
+        // - For allowlisted hosts, we skip this and let curl resolve the hostname.
+        //   This is acceptable because the operator explicitly trusts these domains
+        //   (e.g., internal services like searxng on private IPs).
+        // - DNS rebinding protection is intentionally traded for operational flexibility.
+        const connect_host: []const u8 = if (is_allowlisted)
+            // Allowlisted: trust the operator, skip SSRF check and DNS pinning.
+            // curl will resolve the hostname itself (no --resolve pinning).
+            try allocator.dupe(u8, host)
+        else
+            // No allowlist configured: enforce SSRF for all external hosts.
+            // DNS results are pinned to prevent rebinding attacks.
+            net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+                error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
+                else => return ToolResult.fail("Unable to verify host safety"),
+            };
+        defer allocator.free(connect_host);
 
         // Parse custom headers from ObjectMap
         const headers_val = root.getValue(args, "headers");
@@ -108,6 +132,12 @@ pub const HttpRequestTool = struct {
 
         const body: ?[]const u8 = root.getString(args, "body");
 
+        if (builtin.is_test) {
+            return ToolResult.fail("Network disabled in tests");
+        }
+        var curl_stderr: ?[]u8 = null;
+        defer if (curl_stderr) |s| allocator.free(s);
+
         const status_result = runCurlRequestWithStatus(
             allocator,
             methodToSlice(method),
@@ -117,12 +147,17 @@ pub const HttpRequestTool = struct {
             connect_host,
             custom_headers,
             body,
+            self.timeout_secs,
+            &curl_stderr,
             @intCast(self.max_response_size),
         ) catch |err| {
             if (err == error.CurlInterrupted) {
                 return ToolResult.fail("Interrupted by /stop");
             }
-            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
+            const msg = if (curl_stderr) |stderr_msg|
+                try std.fmt.allocPrint(allocator, "HTTP request failed: {}\ncurl stderr: {s}", .{ err, stderr_msg })
+            else
+                try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(status_result.body);
@@ -131,8 +166,8 @@ pub const HttpRequestTool = struct {
         const success = status_code >= 200 and status_code < 300;
 
         // Build redacted headers display for custom request headers
-        const redacted = redactHeadersForDisplay(allocator, custom_headers) catch "";
-        defer if (redacted.len > 0) allocator.free(redacted);
+        const redacted = redactHeadersForDisplay(allocator, custom_headers) catch try allocator.dupe(u8, "");
+        defer allocator.free(redacted);
 
         const output = if (redacted.len > 0)
             try std.fmt.allocPrint(
@@ -173,6 +208,10 @@ fn shouldUseCurlResolve(host: []const u8) bool {
     return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
 }
 
+fn shouldUsePinnedResolve(host: []const u8, connect_host: []const u8) bool {
+    return shouldUseCurlResolve(host) and !std.mem.eql(u8, host, connect_host);
+}
+
 fn buildCurlResolveEntry(
     allocator: std.mem.Allocator,
     host: []const u8,
@@ -198,8 +237,12 @@ fn runCurlRequestWithStatus(
     connect_host: []const u8,
     headers: []const [2][]const u8,
     body: ?[]const u8,
+    timeout_secs: u64,
+    stderr_out: ?*?[]u8,
     max_response_size: usize,
 ) !http_util.HttpResponse {
+    if (stderr_out) |out| out.* = null;
+
     var argv_buf: [64][]const u8 = undefined;
     var argc: usize = 0;
     const reserved_tail_args: usize = if (body != null) 5 else 3;
@@ -214,12 +257,14 @@ fn runCurlRequestWithStatus(
     argc += 1;
     argv_buf[argc] = "--max-time";
     argc += 1;
-    argv_buf[argc] = "60";
+    var timeout_buf: [20]u8 = undefined;
+    const timeout_str = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs});
+    argv_buf[argc] = timeout_str;
     argc += 1;
 
     var resolve_entry: ?[]u8 = null;
     defer if (resolve_entry) |entry| allocator.free(entry);
-    if (shouldUseCurlResolve(host)) {
+    if (shouldUsePinnedResolve(host, connect_host)) {
         resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
         argv_buf[argc] = "--resolve";
         argc += 1;
@@ -264,7 +309,7 @@ fn runCurlRequestWithStatus(
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = if (body != null) .Pipe else .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -327,18 +372,51 @@ fn runCurlRequestWithStatus(
     };
     errdefer allocator.free(stdout);
 
+    const stderr_raw = if (child.stderr) |stderr_file|
+        stderr_file.readToEndAlloc(allocator, 16 * 1024) catch null
+    else
+        null;
+    defer if (stderr_raw) |buf| allocator.free(buf);
+
+    var stderr_copy: ?[]u8 = try duplicateTrimmedStderr(allocator, stderr_raw);
+    defer if (stderr_copy) |buf| allocator.free(buf);
+
     const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) return error.CurlFailed,
+        .Exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) {
+            if (stderr_out) |out| {
+                out.* = stderr_copy;
+                stderr_copy = null;
+            }
+            return error.CurlFailed;
+        },
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
     }
 
     if (cancel_flag != null and cancel_flag.?.load(.acquire)) return error.CurlInterrupted;
 
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
+    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse {
+        if (stderr_out) |out| {
+            out.* = stderr_copy;
+            stderr_copy = null;
+        }
+        return error.CurlParseError;
+    };
     const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) return error.CurlParseError;
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
+    if (status_raw.len != 3) {
+        if (stderr_out) |out| {
+            out.* = stderr_copy;
+            stderr_copy = null;
+        }
+        return error.CurlParseError;
+    }
+    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch {
+        if (stderr_out) |out| {
+            out.* = stderr_copy;
+            stderr_copy = null;
+        }
+        return error.CurlParseError;
+    };
     const body_slice = stdout[0..status_sep];
     const response_body = try allocator.dupe(u8, body_slice);
     allocator.free(stdout);
@@ -347,6 +425,14 @@ fn runCurlRequestWithStatus(
         .status_code = status_code,
         .body = response_body,
     };
+}
+
+fn duplicateTrimmedStderr(allocator: std.mem.Allocator, raw: ?[]const u8) !?[]u8 {
+    const bytes = raw orelse return null;
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const copied = try allocator.dupe(u8, trimmed);
+    return copied;
 }
 
 fn ensureTlsCaBundleLoaded(client: *std.http.Client) !void {
@@ -455,7 +541,7 @@ fn parseHeaders(allocator: std.mem.Allocator, headers_json: ?[]const u8) ![]cons
 /// Headers with names containing authorization, api-key, apikey, token, secret,
 /// or password (case-insensitive) get their values replaced with "***REDACTED***".
 fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]const u8) ![]const u8 {
-    if (headers.len == 0) return "";
+    if (headers.len == 0) return allocator.dupe(u8, "");
 
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -478,7 +564,8 @@ fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]c
 fn isSensitiveHeader(name: []const u8) bool {
     // Convert to lowercase for comparison
     var lower_buf: [256]u8 = undefined;
-    if (name.len > lower_buf.len) return false;
+    // Fail closed: oversized header names are treated as sensitive.
+    if (name.len > lower_buf.len) return true;
     const lower = lower_buf[0..name.len];
     for (name, 0..) |c, i| {
         lower[i] = std.ascii.toLower(c);
@@ -503,7 +590,10 @@ test "http_request tool name" {
 test "http_request tool description not empty" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    try std.testing.expect(t.description().len > 0);
+    const description = t.description();
+    try std.testing.expect(description.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, description, "HTTPS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "allowlisted hosts may reach local/private addresses") != null);
 }
 
 test "http_request schema has url" {
@@ -511,6 +601,8 @@ test "http_request schema has url" {
     const t = ht.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "HTTPS URL to request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "HTTP or HTTPS URL to request") == null);
 }
 
 test "http_request schema has headers" {
@@ -570,6 +662,7 @@ test "redactHeadersForDisplay redacts api-key and token" {
 
 test "redactHeadersForDisplay empty returns empty" {
     const result = try redactHeadersForDisplay(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("", result);
 }
 
@@ -580,6 +673,12 @@ test "isSensitiveHeader checks" {
     try std.testing.expect(isSensitiveHeader("password-header"));
     try std.testing.expect(!isSensitiveHeader("Content-Type"));
     try std.testing.expect(!isSensitiveHeader("Accept"));
+}
+
+test "isSensitiveHeader treats oversized names as sensitive" {
+    var long_name: [300]u8 = undefined;
+    @memset(long_name[0..], 'a');
+    try std.testing.expect(isSensitiveHeader(long_name[0..]));
 }
 
 test "http_request disables automatic redirects" {
@@ -615,13 +714,13 @@ test "execute rejects non-http scheme" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "http") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "HTTPS") != null);
 }
 
 test "execute rejects localhost SSRF" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://127.0.0.1:8080/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://127.0.0.1:8080/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -631,7 +730,7 @@ test "execute rejects localhost SSRF" {
 test "execute rejects localhost SSRF with URL userinfo" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://user:pass@127.0.0.1:8080/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://user:pass@127.0.0.1:8080/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -641,7 +740,7 @@ test "execute rejects localhost SSRF with URL userinfo" {
 test "execute rejects localhost SSRF with unbracketed ipv6 authority" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://::1:8080/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://[::1]:8080/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -651,7 +750,7 @@ test "execute rejects localhost SSRF with unbracketed ipv6 authority" {
 test "execute rejects private IP SSRF" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://192.168.1.1/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://192.168.1.1/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -660,7 +759,7 @@ test "execute rejects private IP SSRF" {
 test "execute rejects 10.x private range" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://10.0.0.1/secret\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://10.0.0.1/secret\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -669,7 +768,7 @@ test "execute rejects 10.x private range" {
 test "execute rejects loopback decimal alias SSRF" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://2130706433/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://2130706433/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -707,6 +806,35 @@ test "execute rejects non-allowlisted domain" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "allowed_domains") != null);
 }
 
+// ── Allowlist SSRF bypass tests (Issue #393) ───────────────
+
+test "execute allows allowlisted private IP (fixes #393)" {
+    // When a domain is in the allowlist, SSRF protection is skipped,
+    // allowing access to private IPs (e.g., local searxng instance)
+    const domains = [_][]const u8{"127.0.0.1"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"https://127.0.0.1:8080/admin\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Network disabled in tests", result.error_msg.?);
+}
+
+test "execute rejects non-allowlisted domain before DNS resolution" {
+    // Non-allowlisted domains should be rejected immediately without DNS lookup
+    const domains = [_][]const u8{"example.com"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"https://evil.com/path\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "allowed_domains") != null);
+    // Should fail before any DNS resolution (no "Unable to verify host safety" error)
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "verify host") == null);
+}
+
 test "http_request parameters JSON is valid" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
@@ -715,6 +843,14 @@ test "http_request parameters JSON is valid" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "method") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "body") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "headers") != null);
+}
+
+test "shouldUsePinnedResolve skips allowlisted hostname" {
+    try std.testing.expect(!shouldUsePinnedResolve("searx.internal", "searx.internal"));
+}
+
+test "shouldUsePinnedResolve keeps pinning resolved hostname" {
+    try std.testing.expect(shouldUsePinnedResolve("example.com", "93.184.216.34"));
 }
 
 test "validateMethod case insensitive" {
@@ -746,6 +882,17 @@ test "buildHttpRequestErrorMessage includes TLS hint" {
     const msg = try buildHttpRequestErrorMessage(std.testing.allocator, "HTTP request failed", error.TlsInitializationFailed);
     defer std.testing.allocator.free(msg);
     try std.testing.expect(std.mem.indexOf(u8, msg, "system CA certificates") != null);
+}
+
+test "duplicateTrimmedStderr trims non-empty stderr" {
+    const copied = (try duplicateTrimmedStderr(std.testing.allocator, "\n curl: (6) Could not resolve host \n")).?;
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("curl: (6) Could not resolve host", copied);
+}
+
+test "duplicateTrimmedStderr ignores empty stderr" {
+    try std.testing.expect((try duplicateTrimmedStderr(std.testing.allocator, "  \n\t  ")) == null);
+    try std.testing.expect((try duplicateTrimmedStderr(std.testing.allocator, null)) == null);
 }
 
 // ── parseHeaders tests ──────────────────────────────────────

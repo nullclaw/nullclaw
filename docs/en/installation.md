@@ -53,6 +53,8 @@ The container stores its persistent state under `/nullclaw-data`:
 - config: `/nullclaw-data/config.json`
 - workspace: `/nullclaw-data/workspace`
 
+The bundled starter config already uses the current schema (`agents.defaults.model.primary` plus `models.providers`), so `latest` should boot cleanly before you customize provider credentials.
+
 ### Quick one-off commands
 
 ```bash
@@ -183,7 +185,7 @@ Official releases also attach matching Android / Termux binaries built for Andro
 
 ## Add binary to PATH
 
-### Complied binary file
+### Compiled binary file
 
 #### macOS/Linux（zsh/bash）
 
@@ -191,10 +193,6 @@ Official releases also attach matching Android / Termux binaries built for Andro
 zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 # bash users: use ~/.bashrc
-source ~/.zshrc
-```
-```bash
-zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
 source ~/.zshrc
 ```
 

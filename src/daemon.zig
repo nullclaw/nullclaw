@@ -26,6 +26,7 @@ const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 
@@ -40,6 +41,8 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
+var outbound_draft_id_counter: u64 = 1;
+var outbound_draft_id_mutex: std.Thread.Mutex = .{};
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -161,12 +164,30 @@ pub fn isShutdownRequested() bool {
     return shutdown_requested.load(.acquire);
 }
 
+fn recordGatewayFailure(err: anyerror, state: *DaemonState) void {
+    requestShutdown();
+    state.markError("gateway", @errorName(err));
+    health.markComponentError("gateway", @errorName(err));
+}
+
+fn logGatewayFailure(err: anyerror, port: u16) void {
+    switch (err) {
+        error.AddressInUse => {
+            log.err("Gateway failed to start: port {d} is already in use. Is another nullclaw instance running?", .{port});
+        },
+        else => {
+            log.err("Gateway failed to start: {}", .{err});
+        },
+    }
+    log.err("Shutting down daemon due to fatal gateway error.", .{});
+}
+
 /// Gateway thread entry point.
 fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
     gateway.run(allocator, host, port, config, event_bus) catch |err| {
-        state.markError("gateway", @errorName(err));
-        health.markComponentError("gateway", @errorName(err));
+        logGatewayFailure(err, port);
+        recordGatewayFailure(err, state);
         return;
     };
 }
@@ -446,6 +467,11 @@ fn channelSupervisorThread(
     channel_rt: ?*channel_loop.ChannelRuntime,
     event_bus: *bus_mod.Bus,
 ) void {
+    // Early exit if shutdown was requested before channel startup.
+    if (isShutdownRequested()) {
+        return;
+    }
+
     var mgr = channel_manager.ChannelManager.init(allocator, config, channel_registry) catch {
         state.markError("channels", "init_failed");
         health.markComponentError("channels", "init_failed");
@@ -520,6 +546,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("thread_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.thread_id = v.string;
         }
+        if (pm.value.object.get("typing_recipient")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.typing_recipient = v.string;
+        }
         if (pm.value.object.get("is_dm")) |v| {
             if (v == .bool) parsed.fields.is_dm = v.bool;
         }
@@ -534,6 +563,44 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         }
     }
     return parsed;
+}
+
+fn buildInboundConversationContext(
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?ConversationContext {
+    const inferred_is_group = if (meta.is_group) |value|
+        value
+    else if (meta.is_dm) |value|
+        !value
+    else if (meta.peer_kind) |kind|
+        kind != .direct
+    else if (meta.guild_id != null)
+        true
+    else
+        null;
+
+    const group_id = if (meta.guild_id) |guild_id|
+        guild_id
+    else if (meta.peer_kind != null and meta.peer_id != null and meta.peer_kind.? != .direct)
+        meta.peer_id.?
+    else if (inferred_is_group != null and inferred_is_group.? == true)
+        meta.channel_id orelse msg.chat_id
+    else
+        null;
+
+    const has_scope = inferred_is_group != null or group_id != null or meta.peer_id != null or meta.guild_id != null or meta.channel_id != null;
+
+    return buildConversationContext(.{
+        .channel = if (msg.channel.len > 0) msg.channel else null,
+        .account_id = meta.account_id,
+        .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
+        .sender_username = meta.sender_username,
+        .sender_display_name = meta.sender_display_name,
+        .peer_id = meta.peer_id orelse if (has_scope) msg.chat_id else null,
+        .group_id = group_id,
+        .is_group = inferred_is_group,
+    });
 }
 
 fn resolveInboundRouteSessionKeyWithMetadata(
@@ -633,16 +700,52 @@ fn resolveTypingRecipient(
     chat_id: []const u8,
     meta: channel_adapters.InboundMetadata,
 ) ?[]u8 {
+    if (meta.typing_recipient) |recipient| {
+        if (recipient.len == 0) return null;
+        return allocator.dupe(u8, recipient) catch null;
+    }
+
     if (std.mem.eql(u8, channel_name, "slack")) {
         const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return null;
         return std.fmt.allocPrint(allocator, "{s}:{s}", .{ slack_target.channel_id, slack_target.thread_ts }) catch null;
     }
 
-    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost") and !std.mem.eql(u8, channel_name, "teams")) {
-        return null;
-    }
     if (chat_id.len == 0) return null;
     return allocator.dupe(u8, chat_id) catch null;
+}
+
+fn resolveOutboundChannel(
+    registry: *const dispatch.ChannelRegistry,
+    channel_name: []const u8,
+    account_id: ?[]const u8,
+) ?channels_mod.Channel {
+    return if (account_id) |aid|
+        registry.findByNameAccount(channel_name, aid)
+    else
+        registry.findByName(channel_name);
+}
+
+fn buildInboundMessageRef(
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?channels_mod.Channel.MessageRef {
+    const message_id = meta.message_id orelse return null;
+    if (msg.chat_id.len == 0 or message_id.len == 0) return null;
+    return .{
+        .target = msg.chat_id,
+        .message_id = message_id,
+    };
+}
+
+fn markInboundMessageRead(
+    channel: channels_mod.Channel,
+    message_ref: ?channels_mod.Channel.MessageRef,
+) void {
+    const ref = message_ref orelse return;
+    channel.markRead(ref) catch |err| switch (err) {
+        error.NotSupported => {},
+        else => log.debug("inbound markRead failed: {}", .{err}),
+    };
 }
 
 fn sendInboundProcessingIndicator(
@@ -653,11 +756,7 @@ fn sendInboundProcessingIndicator(
     chat_id: []const u8,
     meta: channel_adapters.InboundMetadata,
 ) ?[]u8 {
-    const channel_opt = if (account_id) |aid|
-        registry.findByNameAccount(channel_name, aid)
-    else
-        registry.findByName(channel_name);
-    const ch = channel_opt orelse return null;
+    const ch = resolveOutboundChannel(registry, channel_name, account_id) orelse return null;
 
     const recipient = resolveTypingRecipient(allocator, channel_name, chat_id, meta) orelse return null;
     ch.startTyping(recipient) catch {
@@ -676,11 +775,7 @@ fn clearInboundProcessingIndicator(
 ) void {
     const target = recipient orelse return;
     defer allocator.free(target);
-    const channel_opt = if (account_id) |aid|
-        registry.findByNameAccount(channel_name, aid)
-    else
-        registry.findByName(channel_name);
-    const ch = channel_opt orelse return;
+    const ch = resolveOutboundChannel(registry, channel_name, account_id) orelse return;
     ch.stopTyping(target) catch {};
 }
 
@@ -690,7 +785,17 @@ const StreamingOutboundCtx = struct {
     channel: []const u8,
     account_id: ?[]const u8,
     chat_id: []const u8,
+    draft_id: u64 = 0,
+    emitted_chunk: bool = false,
 };
+
+fn nextOutboundDraftId() u64 {
+    outbound_draft_id_mutex.lock();
+    defer outbound_draft_id_mutex.unlock();
+    const id = outbound_draft_id_counter;
+    outbound_draft_id_counter += 1;
+    return id;
+}
 
 fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
@@ -705,18 +810,15 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
         log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
         return;
     };
+    message.draft_id = ctx.draft_id;
     ctx.event_bus.publishOutbound(message) catch |err| {
         message.deinit(ctx.allocator);
         if (err != error.Closed) {
             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
         }
+        return;
     };
-}
-
-fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or
-        std.mem.eql(u8, channel, "telegram") or
-        std.mem.eql(u8, channel, "dingtalk");
+    ctx.emitted_chunk = true;
 }
 
 fn makeAssistantReplyOutbound(
@@ -725,36 +827,43 @@ fn makeAssistantReplyOutbound(
     account_id: ?[]const u8,
     chat_id: []const u8,
     reply: []const u8,
+    draft_id: u64,
 ) !bus_mod.OutboundMessage {
     if (std.mem.indexOf(u8, reply, interaction_choices.START_TAG) == null) {
-        return if (account_id) |aid|
-            bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, reply)
+        var msg = if (account_id) |aid|
+            try bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, reply)
         else
-            bus_mod.makeOutbound(allocator, channel, chat_id, reply);
+            try bus_mod.makeOutbound(allocator, channel, chat_id, reply);
+        msg.draft_id = draft_id;
+        return msg;
     }
 
     var parsed = try interaction_choices.parseAssistantChoices(allocator, reply);
     defer parsed.deinit(allocator);
 
     if (parsed.choices) |choices| {
-        return if (account_id) |aid|
-            bus_mod.makeOutboundWithAccountChoices(allocator, channel, aid, chat_id, parsed.visible_text, choices.options)
+        var msg = if (account_id) |aid|
+            try bus_mod.makeOutboundWithAccountChoices(allocator, channel, aid, chat_id, parsed.visible_text, choices.options)
         else
-            bus_mod.makeOutboundWithChoices(allocator, channel, chat_id, parsed.visible_text, choices.options);
+            try bus_mod.makeOutboundWithChoices(allocator, channel, chat_id, parsed.visible_text, choices.options);
+        msg.draft_id = draft_id;
+        return msg;
     }
 
-    return if (account_id) |aid|
-        bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, parsed.visible_text)
+    var msg = if (account_id) |aid|
+        try bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, parsed.visible_text)
     else
-        bus_mod.makeOutbound(allocator, channel, chat_id, parsed.visible_text);
+        try bus_mod.makeOutbound(allocator, channel, chat_id, parsed.visible_text);
+    msg.draft_id = draft_id;
+    return msg;
 }
 
 fn makeStreamingSinkForChannel(
-    channel: []const u8,
+    streaming_supported: bool,
     raw_sink: streaming.Sink,
     filter: *streaming.TagFilter,
 ) ?streaming.Sink {
-    if (!supportsStreamingOutbound(channel)) return null;
+    if (!streaming_supported) return null;
     filter.* = streaming.TagFilter.init(raw_sink);
     return filter.sink();
 }
@@ -800,13 +909,26 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = supportsStreamingOutbound(msg.channel);
+        const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+        if (outbound_channel) |channel| {
+            markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
+        }
+        const use_tracked_draft_outbound = if (outbound_channel) |channel|
+            !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
+        else
+            false;
+        const use_streaming_outbound = if (outbound_channel) |channel|
+            channel.supportsStreamingOutbound() or dispatch.supportsDraftStreaming(channel)
+        else
+            false;
+        const outbound_draft_id: u64 = if (use_tracked_draft_outbound) nextOutboundDraftId() else 0;
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
             .channel = msg.channel,
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
+            .draft_id = outbound_draft_id,
         };
         var stream_sink: ?streaming.Sink = null;
         var outbound_tag_filter: streaming.TagFilter = undefined;
@@ -815,7 +937,7 @@ fn inboundDispatcherThread(
                 .callback = publishStreamingChunk,
                 .ctx = @ptrCast(&streaming_ctx),
             };
-            stream_sink = makeStreamingSinkForChannel(msg.channel, raw_sink, &outbound_tag_filter);
+            stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
         }
 
         if (std.mem.eql(u8, msg.channel, "max")) {
@@ -823,19 +945,7 @@ fn inboundDispatcherThread(
             defer channels_mod.max.setInteractiveOwnerContext(null);
         }
 
-        // Build conversation context for channels that provide sender metadata.
-        // Discord passes sender info via metadata JSON; Signal/Telegram do it in channel_loop.
-        const conversation_context: ?ConversationContext = if (std.mem.eql(u8, msg.channel, "discord"))
-            .{
-                .channel = "discord",
-                .sender_id = msg.sender_id,
-                .sender_username = parsed_meta.fields.sender_username,
-                .sender_display_name = parsed_meta.fields.sender_display_name,
-                .group_id = parsed_meta.fields.guild_id,
-                .is_group = if (parsed_meta.fields.is_dm) |dm| !dm else null,
-            }
-        else
-            null;
+        const conversation_context = buildInboundConversationContext(&msg, parsed_meta.fields);
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
@@ -847,16 +957,17 @@ fn inboundDispatcherThread(
 
             // Send user-visible error reply back to the originating channel
             const err_msg: []const u8 = switch (err) {
-                error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                 error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                 error.NoResponseContent => "Model returned an empty response. Please try again.",
                 error.OutOfMemory => "Out of memory.",
                 else => "An error occurred. Try again.",
             };
-            const err_out = if (outbound_account_id) |aid|
+            var err_out = if (outbound_account_id) |aid|
                 bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
             else
                 bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
+            err_out.draft_id = outbound_draft_id;
             event_bus.publishOutbound(err_out) catch {
                 err_out.deinit(allocator);
             };
@@ -870,6 +981,7 @@ fn inboundDispatcherThread(
             outbound_account_id,
             msg.chat_id,
             reply,
+            outbound_draft_id,
         ) catch |err| {
             log.err("inbound dispatch makeOutbound failed: {}", .{err});
             continue;
@@ -1153,7 +1265,7 @@ test "computeBackoff saturating" {
     try std.testing.expectEqual(std.math.maxInt(u64), computeBackoff(std.math.maxInt(u64), std.math.maxInt(u64)));
 }
 
-test "makeStreamingSinkForChannel filters web chunks" {
+test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
     const Collector = struct {
         buf: [128]u8 = undefined,
         len: usize = 0,
@@ -1181,7 +1293,7 @@ test "makeStreamingSinkForChannel filters web chunks" {
 
     var collector = Collector{};
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("web", collector.sink(), &filter).?;
+    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter).?;
     sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
     sink.emitFinal();
 
@@ -1189,26 +1301,26 @@ test "makeStreamingSinkForChannel filters web chunks" {
     try std.testing.expect(collector.got_final);
 }
 
-test "makeStreamingSinkForChannel supports dingtalk" {
+test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
     const Noop = struct {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("dingtalk", .{
+    const sink = makeStreamingSinkForChannel(true, .{
         .callback = Noop.callback,
         .ctx = undefined,
     }, &filter);
     try std.testing.expect(sink != null);
 }
 
-test "makeStreamingSinkForChannel returns null for unsupported channel" {
+test "makeStreamingSinkForChannel returns null when streaming is disabled" {
     const Noop = struct {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("discord", .{
+    const sink = makeStreamingSinkForChannel(false, .{
         .callback = Noop.callback,
         .ctx = undefined,
     }, &filter);
@@ -1419,6 +1531,38 @@ test "resolveInboundRouteSessionKey matches non-primary maixcam account by chann
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
     try std.testing.expectEqualStrings("agent:lab-camera-agent:vision-lab:direct:device-2", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes nostr direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "nostr-dm-agent",
+            .match = .{
+                .channel = "nostr",
+                .account_id = "default",
+                .peer = .{ .kind = .direct, .id = "pubkey-42" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "nostr",
+        .sender_id = "pubkey-42",
+        .chat_id = "pubkey-42",
+        .content = "ping",
+        .session_key = "nostr:pubkey-42",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:nostr-dm-agent:nostr:direct:pubkey-42", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
@@ -1985,14 +2129,78 @@ test "parseInboundMetadata extracts discord sender identity fields" {
     try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
 }
 
+test "buildInboundConversationContext preserves discord identity metadata" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-42",
+        .chat_id = "778899",
+        .content = "hello",
+        .session_key = "discord:778899",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .account_id = "discord-main",
+        .guild_id = "guild-1",
+        .is_dm = false,
+        .sender_username = "discord-user",
+        .sender_display_name = "Discord User",
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("discord", context.channel.?);
+    try std.testing.expectEqualStrings("discord-main", context.account_id.?);
+    try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("778899", context.peer_id.?);
+    try std.testing.expectEqualStrings("discord-user", context.sender_username.?);
+    try std.testing.expectEqualStrings("Discord User", context.sender_display_name.?);
+    try std.testing.expectEqualStrings("guild-1", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
+}
+
+test "buildInboundConversationContext keeps channel and sender when metadata is absent" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "external",
+        .sender_id = "user-1",
+        .chat_id = "chat-1",
+        .content = "hello",
+        .session_key = "external:chat-1",
+    };
+    const context = buildInboundConversationContext(&msg, .{}) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("external", context.channel.?);
+    try std.testing.expectEqualStrings("user-1", context.sender_id.?);
+    try std.testing.expect(context.group_id == null);
+    try std.testing.expect(context.is_group == null);
+}
+
+test "buildInboundConversationContext uses standardized peer metadata for external channels" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "external",
+        .sender_id = "user-42",
+        .chat_id = "120363-room",
+        .content = "hello",
+        .session_key = "external:room",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .peer_kind = .group,
+        .peer_id = "120363-room",
+        .is_group = true,
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("external", context.channel.?);
+    try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("120363-room", context.peer_id.?);
+    try std.testing.expectEqualStrings("120363-room", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
+}
+
 test "makeAssistantReplyOutbound preserves plain replies without choices" {
     const allocator = std.testing.allocator;
-    var msg = try makeAssistantReplyOutbound(allocator, "telegram", null, "chat1", "hello");
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", null, "chat1", "hello", 0);
     defer msg.deinit(allocator);
 
     try std.testing.expectEqualStrings("hello", msg.content);
     try std.testing.expectEqual(@as(usize, 0), msg.choices.len);
     try std.testing.expect(msg.account_id == null);
+    try std.testing.expectEqual(@as(u64, 0), msg.draft_id);
 }
 
 test "makeAssistantReplyOutbound extracts structured choices from assistant reply" {
@@ -2001,7 +2209,7 @@ test "makeAssistantReplyOutbound extracts structured choices from assistant repl
         \\Choose one:
         \\<nc_choices>{"v":1,"options":[{"id":"yes","label":"Yes","submit_text":"yes"},{"id":"no","label":"No"}]}</nc_choices>
     ;
-    var msg = try makeAssistantReplyOutbound(allocator, "telegram", "backup", "chat1", reply);
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", "backup", "chat1", reply, 17);
     defer msg.deinit(allocator);
 
     try std.testing.expectEqualStrings("backup", msg.account_id.?);
@@ -2009,6 +2217,7 @@ test "makeAssistantReplyOutbound extracts structured choices from assistant repl
     try std.testing.expectEqual(@as(usize, 2), msg.choices.len);
     try std.testing.expectEqualStrings("yes", msg.choices[0].id);
     try std.testing.expectEqualStrings("No", msg.choices[1].label);
+    try std.testing.expectEqual(@as(u64, 17), msg.draft_id);
 }
 
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
@@ -2027,6 +2236,60 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
     }, "C123");
     try std.testing.expect(with_message_only != null);
     try std.testing.expectEqualStrings("1700.1", with_message_only.?.thread_ts);
+}
+
+test "buildInboundMessageRef uses inbound chat target and metadata message id" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "external",
+        .sender_id = "user-1",
+        .chat_id = "room-9",
+        .content = "hello",
+        .session_key = "external:room-9",
+    };
+    const message_ref = buildInboundMessageRef(&msg, .{ .message_id = "msg-42" }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("room-9", message_ref.target);
+    try std.testing.expectEqualStrings("msg-42", message_ref.message_id);
+}
+
+test "markInboundMessageRead dispatches through channel vtable" {
+    const Mock = struct {
+        target: ?[]const u8 = null,
+        message_id: ?[]const u8 = null,
+
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "mock";
+        }
+        fn mockHealth(_: *anyopaque) bool {
+            return true;
+        }
+        fn markRead(ptr: *anyopaque, message_ref: channels_mod.Channel.MessageRef) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.target = message_ref.target;
+            self.message_id = message_ref.message_id;
+        }
+
+        const vtable = channels_mod.Channel.VTable{
+            .start = &start,
+            .stop = &stop,
+            .send = &send,
+            .name = &name,
+            .healthCheck = &mockHealth,
+            .markRead = &markRead,
+        };
+    };
+
+    var mock = Mock{};
+    const channel = channels_mod.Channel{ .ptr = @ptrCast(&mock), .vtable = &Mock.vtable };
+    markInboundMessageRead(channel, .{
+        .target = "room-9",
+        .message_id = "msg-42",
+    });
+
+    try std.testing.expectEqualStrings("room-9", mock.target.?);
+    try std.testing.expectEqualStrings("msg-42", mock.message_id.?);
 }
 
 test "hasSupervisedChannels true for nostr" {
@@ -2201,6 +2464,27 @@ test "channelSupervisorThread respects shutdown" {
     try std.testing.expect(state.components[0].?.running);
 }
 
+test "recordGatewayFailure requests shutdown for fatal gateway errors" {
+    shutdown_requested.store(false, .release);
+    defer shutdown_requested.store(false, .release);
+    health.reset();
+    defer health.reset();
+
+    var state = DaemonState{};
+    state.addComponent("gateway");
+
+    recordGatewayFailure(error.PermissionDenied, &state);
+
+    try std.testing.expect(isShutdownRequested());
+    try std.testing.expect(!state.components[0].?.running);
+    try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
+    try std.testing.expectEqualStrings("PermissionDenied", state.components[0].?.last_error.?);
+
+    const gateway_health = health.getComponentHealth("gateway") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("error", gateway_health.status);
+    try std.testing.expectEqualStrings("PermissionDenied", gateway_health.last_error.?);
+}
+
 test "DaemonState supports all supervised components" {
     var state = DaemonState{};
     state.addComponent("gateway");
@@ -2331,4 +2615,13 @@ test "startConfiguredTunnel records create failure" {
     try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
     try std.testing.expectEqualStrings("MissingNgrokConfig", state.components[0].?.last_error.?);
     try std.testing.expect(state.tunnel_url == null);
+}
+
+test "markError records AddressInUse for gateway component" {
+    var state = DaemonState{};
+    state.addComponent("gateway");
+    state.markError("gateway", "AddressInUse");
+    try std.testing.expect(!state.components[0].?.running);
+    try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
+    try std.testing.expectEqualStrings("AddressInUse", state.components[0].?.last_error.?);
 }

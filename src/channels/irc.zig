@@ -120,7 +120,7 @@ pub const IrcChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const IrcChannel, nick: []const u8) bool {
-        return root.isAllowed(self.allow_from, nick);
+        return root.isAllowedScoped("irc channel", self.allow_from, nick);
     }
 
     pub fn setBus(self: *IrcChannel, b: *bus_mod.Bus) void {

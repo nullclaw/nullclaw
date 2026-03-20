@@ -328,6 +328,10 @@ pub const MarkdownMemory = struct {
         return found;
     }
 
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, _: ?[]const u8) anyerror!?MemoryEntry {
+        return implGet(ptr, allocator, key);
+    }
+
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -362,6 +366,10 @@ pub const MarkdownMemory = struct {
         return false;
     }
 
+    fn implForgetScoped(_: *anyopaque, _: []const u8, _: ?[]const u8) anyerror!bool {
+        return false;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         const all = try self_.readAllEntries(self_.allocator);
@@ -391,8 +399,10 @@ pub const MarkdownMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -517,6 +527,23 @@ test "markdown accepts session_id param" {
         for (listed) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(listed);
     }
+}
+
+test "markdown getScoped returns entry inside isolated workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("scoped_key", "session data", .core, "session-123");
+
+    const entry = (try m.getScoped(std.testing.allocator, "scoped_key", "session-123")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "session data") != null);
 }
 
 test "markdown reads memory.md when MEMORY.md is absent" {

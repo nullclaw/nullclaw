@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.vertex);
 const root = @import("root.zig");
 const gemini = @import("gemini.zig");
 const config_types = @import("../config_types.zig");
@@ -370,7 +371,14 @@ pub const VertexProvider = struct {
             request.timeout_secs,
             callback,
             callback_ctx,
-        );
+        ) catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("Vertex streaming failed with {}; falling back to non-streaming response", .{err});
+                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+            }
+            return err;
+        };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {

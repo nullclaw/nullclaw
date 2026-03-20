@@ -22,6 +22,7 @@ const imessage = channels_mod.imessage;
 const qq = channels_mod.qq;
 const onebot = channels_mod.onebot;
 const maixcam = channels_mod.maixcam;
+const external = channels_mod.external;
 const slack = channels_mod.slack;
 const irc = channels_mod.irc;
 const web = channels_mod.web;
@@ -44,6 +45,7 @@ pub const ListenerType = enum {
 
 pub const Entry = struct {
     name: []const u8,
+    adapter_key: []const u8,
     account_id: []const u8 = "default",
     channel: Channel,
     listener_type: ListenerType,
@@ -116,7 +118,7 @@ pub const ChannelManager = struct {
     }
 
     fn spawnPollingThread(self: *ChannelManager, entry: *Entry, rt: *channel_loop.ChannelRuntime) !void {
-        const polling_desc = channel_adapters.findPollingDescriptor(entry.name) orelse
+        const polling_desc = channel_adapters.findPollingDescriptor(entry.adapter_key) orelse
             return error.UnsupportedChannel;
         const spawned = try polling_desc.spawn(self.allocator, self.config, rt, entry.channel);
         entry.polling_state = spawned.state;
@@ -131,7 +133,7 @@ pub const ChannelManager = struct {
     ) bool {
         const source_key_fn = polling_desc.source_key orelse return false;
         const current = entries[current_index];
-        if (!std.mem.eql(u8, current.name, polling_desc.channel_name)) return false;
+        if (!std.mem.eql(u8, current.adapter_key, polling_desc.channel_name)) return false;
         if (current.listener_type != .polling) return false;
 
         const current_source = source_key_fn(allocator, current.channel) orelse return false;
@@ -140,7 +142,7 @@ pub const ChannelManager = struct {
         var i: usize = 0;
         while (i < current_index) : (i += 1) {
             const prev = entries[i];
-            if (!std.mem.eql(u8, prev.name, polling_desc.channel_name)) continue;
+            if (!std.mem.eql(u8, prev.adapter_key, polling_desc.channel_name)) continue;
             if (prev.listener_type != .polling) continue;
             if (prev.supervised.state != .running) continue;
 
@@ -220,7 +222,8 @@ pub const ChannelManager = struct {
             listener_type = if (cfg.mode == .webhook) .webhook_only else .polling;
         }
         try self.entries.append(self.allocator, .{
-            .name = field_name,
+            .name = ch.name(),
+            .adapter_key = field_name,
             .account_id = account_id,
             .channel = ch,
             .listener_type = listener_type,
@@ -293,7 +296,7 @@ pub const ChannelManager = struct {
                         continue;
                     }
 
-                    if (channel_adapters.findPollingDescriptor(entry.name)) |polling_desc| {
+                    if (channel_adapters.findPollingDescriptor(entry.adapter_key)) |polling_desc| {
                         if (isPollingSourceDuplicate(self.allocator, self.entries.items, index, polling_desc)) {
                             log.warn("Skipping duplicate {s} polling source for account_id={s}", .{ entry.name, entry.account_id });
                             continue;
@@ -524,6 +527,7 @@ test "isPollingSourceDuplicate detects duplicate signal source" {
     var entries = [_]Entry{
         .{
             .name = "signal",
+            .adapter_key = "signal",
             .account_id = "main",
             .channel = sig_a.channel(),
             .listener_type = .polling,
@@ -532,6 +536,7 @@ test "isPollingSourceDuplicate detects duplicate signal source" {
         },
         .{
             .name = "signal",
+            .adapter_key = "signal",
             .account_id = "backup",
             .channel = sig_b.channel(),
             .listener_type = .polling,
@@ -573,6 +578,7 @@ test "isPollingSourceDuplicate ignores distinct signal source" {
     var entries = [_]Entry{
         .{
             .name = "signal",
+            .adapter_key = "signal",
             .account_id = "main",
             .channel = sig_a.channel(),
             .listener_type = .polling,
@@ -581,6 +587,7 @@ test "isPollingSourceDuplicate ignores distinct signal source" {
         },
         .{
             .name = "signal",
+            .adapter_key = "signal",
             .account_id = "backup",
             .channel = sig_b.channel(),
             .listener_type = .polling,
@@ -620,6 +627,7 @@ test "isPollingSourceDuplicate detects duplicate telegram source" {
     var entries = [_]Entry{
         .{
             .name = "telegram",
+            .adapter_key = "telegram",
             .account_id = "main",
             .channel = tg_a.channel(),
             .listener_type = .polling,
@@ -628,6 +636,7 @@ test "isPollingSourceDuplicate detects duplicate telegram source" {
         },
         .{
             .name = "telegram",
+            .adapter_key = "telegram",
             .account_id = "backup",
             .channel = tg_b.channel(),
             .listener_type = .polling,
@@ -665,6 +674,7 @@ test "isPollingSourceDuplicate ignores distinct telegram source" {
     var entries = [_]Entry{
         .{
             .name = "telegram",
+            .adapter_key = "telegram",
             .account_id = "main",
             .channel = tg_a.channel(),
             .listener_type = .polling,
@@ -673,6 +683,7 @@ test "isPollingSourceDuplicate ignores distinct telegram source" {
         },
         .{
             .name = "telegram",
+            .adapter_key = "telegram",
             .account_id = "backup",
             .channel = tg_b.channel(),
             .listener_type = .polling,
@@ -790,6 +801,16 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     const maixcam_accounts = [_]@import("config_types.zig").MaixCamConfig{
         .{ .account_id = "cam-main", .name = "maixcam-main" },
     };
+    const external_accounts = [_]@import("config_types.zig").ExternalChannelConfig{
+        .{
+            .account_id = "ext-main",
+            .runtime_name = "whatsapp_web",
+            .transport = .{
+                .command = "nullclaw-plugin-whatsapp-web",
+            },
+            .plugin_config_json = "{\"allow_from\":[\"*\"]}",
+        },
+    };
     const max_accounts = [_]@import("config_types.zig").MaxConfig{
         .{
             .account_id = "max-poll",
@@ -817,6 +838,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
             .mattermost = &mattermost_accounts,
             .slack = &slack_accounts,
             .maixcam = &maixcam_accounts,
+            .external = &external_accounts,
             .max = &max_accounts,
             .whatsapp = &[_]@import("config_types.zig").WhatsAppConfig{
                 .{
@@ -929,6 +951,10 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         expected_total += maixcam_accounts.len;
         expected_send_only += maixcam_accounts.len;
     }
+    if (channel_catalog.isBuildEnabled(.external)) {
+        expected_total += external_accounts.len;
+        expected_gateway_loop += external_accounts.len;
+    }
     if (channel_catalog.isBuildEnabled(.max)) {
         expected_total += max_accounts.len;
         for (max_accounts) |max_cfg| {
@@ -996,7 +1022,8 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     try expectEntryPresence(entries, "onebot", "ob-main", channel_catalog.isBuildEnabled(.onebot));
     try expectEntryPresence(entries, "mattermost", "mm-main", channel_catalog.isBuildEnabled(.mattermost));
     try expectEntryPresence(entries, "slack", "sl-main", channel_catalog.isBuildEnabled(.slack));
-    try expectEntryPresence(entries, "maixcam", "cam-main", channel_catalog.isBuildEnabled(.maixcam));
+    try expectEntryPresence(entries, "maixcam-main", "cam-main", channel_catalog.isBuildEnabled(.maixcam));
+    try expectEntryPresence(entries, "whatsapp_web", "ext-main", channel_catalog.isBuildEnabled(.external));
     try expectEntryPresence(entries, "max", "max-poll", channel_catalog.isBuildEnabled(.max));
     try expectEntryPresence(entries, "max", "max-webhook", channel_catalog.isBuildEnabled(.max));
     try expectEntryPresence(entries, "whatsapp", "wa-main", channel_catalog.isBuildEnabled(.whatsapp));
@@ -1051,10 +1078,19 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     }
 
     if (channel_catalog.isBuildEnabled(.maixcam)) {
-        const maixcam_entry = findEntryByNameAccount(entries, "maixcam", "cam-main") orelse
+        const maixcam_entry = findEntryByNameAccount(entries, "maixcam-main", "cam-main") orelse
             return error.TestUnexpectedResult;
         const maixcam_ptr: *maixcam.MaixCamChannel = @ptrCast(@alignCast(maixcam_entry.channel.ptr));
         try std.testing.expect(maixcam_ptr.event_bus == &event_bus);
+    }
+
+    if (channel_catalog.isBuildEnabled(.external)) {
+        const external_entry = findEntryByNameAccount(entries, "whatsapp_web", "ext-main") orelse
+            return error.TestUnexpectedResult;
+        const external_ptr: *external.ExternalChannel = @ptrCast(@alignCast(external_entry.channel.ptr));
+        try std.testing.expectEqualStrings("external", external_entry.adapter_key);
+        try std.testing.expectEqual(ListenerType.gateway_loop, external_entry.listener_type);
+        try std.testing.expect(external_ptr.event_bus == &event_bus);
     }
 
     if (channel_catalog.isBuildEnabled(.slack)) {

@@ -49,12 +49,14 @@ nullclaw gateway
 | `nullclaw channel start telegram` | 启动指定渠道 |
 | `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw 数据 |
 | `nullclaw migrate openclaw` | 执行迁移 |
-| `nullclaw history list [--json]` | 列出会话记录 |
-| `nullclaw history show <session_id> [--json]` | 查看指定会话的消息详情 |
+| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出会话记录 |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定会话的消息详情 |
 
 ## 服务化运行建议
 
 建议在长期运行场景使用 service 子命令：
+
+- Linux 环境会优先使用 `systemd --user`，在 Alpine / OpenRC 系统上会自动切换为 OpenRC。
 
 ```bash
 nullclaw service install

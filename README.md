@@ -14,12 +14,13 @@
 <p align="center">
   <a href="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
+  <a href="https://discord.gg/Bfmdua22Ud"><img src="https://img.shields.io/badge/discord-join%20community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
 </p>
 
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
-Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
+Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
 
 ```
 678 KB binary · <2 ms startup · 5,300+ tests · 50+ providers · 19 channels · Pluggable everything
@@ -49,7 +50,7 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **Language** | TypeScript | Python | Go | Rust | **Zig** |
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
-| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
+| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **678 KB** |
 | **Tests** | — | — | — | 1,017 | **5,300+** |
 | **Source Files** | ~400+ | — | — | ~120 | **~230** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
@@ -190,6 +191,7 @@ nullclaw channel start discord
 nullclaw channel start signal
 
 # Manage background service
+# Linux supports systemd user services and OpenRC
 nullclaw service install
 nullclaw service status
 
@@ -418,7 +420,19 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   },
 
   "mcp_servers": {
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"] }
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://mcp.example.com/rpc",
+      "timeout_ms": 10000,
+      "headers": {
+        "Authorization": "Bearer ${MCP_TOKEN}"
+      }
+    }
   },
 
   "memory": {
@@ -508,6 +522,10 @@ Example:
 In that setup, topic `42` routes to `coder`, while the rest of the forum falls back to `orchestrator`.
 
 Named agent profiles are configured separately from bindings. Bindings only choose which named agent handles a given chat/topic.
+
+If a named agent should run from its own workspace, set `agents.list[].workspace_path`.
+Relative paths are resolved from the directory that contains `config.json`, the workspace is scaffolded on first use, and the agent gets a durable memory namespace `agent:<agent-id>`.
+This applies to `nullclaw agent --agent <id>`, `/subagents spawn --agent <id>`, and routed sessions resolved through `bindings`.
 
 Minimal end-to-end example:
 
@@ -677,10 +695,31 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
-| `/.well-known/agent.json` | GET | None | A2A Agent Card discovery (public) |
-| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`) |
+| `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
+| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (canonical methods plus legacy slash aliases) |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
+
+### A2A
+
+Enable the gateway binding with:
+
+```json
+{
+  "a2a": {
+    "enabled": true,
+    "name": "nullclaw",
+    "description": "General-purpose AI assistant",
+    "url": "https://example.com",
+    "version": "1.0.0"
+  }
+}
+```
+
+- Discover the agent card at `/.well-known/agent-card.json`.
+- Send JSON-RPC requests to `/a2a` using a bearer token obtained from `/pair`.
+- Canonical JSON-RPC methods: `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `ListTasks`, `SubscribeToTask`.
+- Legacy slash aliases remain accepted for compatibility: `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`, `tasks/resubscribe`.
 
 ## Commands
 
@@ -692,16 +731,21 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `agent -m "..."` | Single message mode |
 | `agent` | Interactive chat mode |
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
-| `service install\|start\|stop\|status\|uninstall` | Manage background service |
+| `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
 | `doctor` | Diagnose system health |
 | `status` | Show full system status |
-| `channel status` | Show channel health/status |
+| `channel list\|start\|status\|add\|remove` | Manage channels |
 | `cron list\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs |
 | `history list\|show` | View session conversation history |
+| `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
-| `models list\|info\|benchmark` | Model catalog |
+| `models list\|info\|benchmark\|refresh` | Model catalog |
+| `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |
+| `capabilities [--json]` | Show runtime capabilities manifest |
+| `auth login\|status\|logout` | Manage OAuth authentication |
 | `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
+| `update [--check] [--yes]` | Check for and install updates |
 
 ## Development
 

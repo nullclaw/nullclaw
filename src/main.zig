@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
+const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -367,6 +367,14 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
+    if (!yc.security.isYoloGatewayAllowed(cfg.autonomy.level, cfg.gateway.host, yc.security.isYoloForceEnabled(allocator))) {
+        std.debug.print(
+            "Refusing to start gateway with autonomy.level=yolo on non-local host '{s}'. Use localhost or set NULLCLAW_ALLOW_YOLO=1 to force this insecure mode.\n",
+            .{cfg.gateway.host},
+        );
+        std.process.exit(1);
+    }
+
     // Check both sub_args and global args for --verbose flag
     var verbose = hasVerboseFlag(sub_args);
     if (!verbose) {
@@ -419,13 +427,7 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    var cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
-    defer cfg.deinit();
-
-    yc.service.handleCommand(allocator, service_cmd, cfg.config_path) catch |err| {
+    yc.service.handleCommand(allocator, service_cmd) catch |err| {
         const any_err: anyerror = err;
         switch (any_err) {
             error.UnsupportedPlatform => {
@@ -433,6 +435,10 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             },
             error.NoHomeDir => {
                 std.debug.print("Could not resolve home directory for service files.\n", .{});
+            },
+            error.OpenRcUnavailable => {
+                std.debug.print("OpenRC was detected, but the required OpenRC commands are unavailable.\n", .{});
+                std.debug.print("Verify `rc-service`, `rc-update`, and `openrc-run` are installed.\n", .{});
             },
             error.SystemctlUnavailable => {
                 std.debug.print("`systemctl` is not available; Linux service commands require systemd user services.\n", .{});
@@ -460,6 +466,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\
             \\Commands:
             \\  list                          List all scheduled tasks
+            \\  status                        Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
             \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]
             \\                                Add a recurring agent cron job
@@ -481,6 +488,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, subcmd, "list")) {
         try yc.cron.cliListJobs(allocator);
+    } else if (std.mem.eql(u8, subcmd, "status")) {
+        try yc.cron.cliStatus(allocator);
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add <expression> <command>\n", .{});
@@ -1297,12 +1306,51 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         const key = sub_args[1];
+
+        var vector_delete_scopes: std.ArrayListUnmanaged(?[]u8) = .empty;
+        defer {
+            for (vector_delete_scopes.items) |sid_opt| {
+                if (sid_opt) |sid| allocator.free(sid);
+            }
+            vector_delete_scopes.deinit(allocator);
+        }
+
+        const existing_entries = mem_rt.memory.list(allocator, null, null) catch |err| {
+            std.debug.print("memory list failed before delete: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.freeEntries(allocator, existing_entries);
+
+        var saw_global = false;
+        for (existing_entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) continue;
+            if (entry.session_id) |sid| {
+                var seen = false;
+                for (vector_delete_scopes.items) |existing_sid| {
+                    if (existing_sid) |existing| {
+                        if (std.mem.eql(u8, existing, sid)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                }
+                if (!seen) {
+                    try vector_delete_scopes.append(allocator, try allocator.dupe(u8, sid));
+                }
+            } else if (!saw_global) {
+                saw_global = true;
+                try vector_delete_scopes.append(allocator, null);
+            }
+        }
+
         const deleted = mem_rt.memory.forget(key) catch |err| {
             std.debug.print("memory forget failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         if (deleted) {
-            mem_rt.deleteFromVectorStore(key);
+            for (vector_delete_scopes.items) |sid_opt| {
+                mem_rt.deleteFromVectorStore(key, sid_opt);
+            }
             std.debug.print("Deleted memory entry: {s}\n", .{key});
         } else {
             std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
@@ -2190,9 +2238,25 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
 
     switch (parsed.mode) {
-        .channels_only => try yc.onboard.runChannelsOnly(allocator),
-        .interactive => try yc.onboard.runWizard(allocator),
+        .channels_only => yc.onboard.runChannelsOnly(allocator) catch |err| switch (err) {
+            error.InsecurePlaintextSecrets => {
+                yc.config.Config.printValidationError(error.InsecurePlaintextSecrets);
+                std.process.exit(1);
+            },
+            else => return err,
+        },
+        .interactive => yc.onboard.runWizard(allocator) catch |err| switch (err) {
+            error.InsecurePlaintextSecrets => {
+                yc.config.Config.printValidationError(error.InsecurePlaintextSecrets);
+                std.process.exit(1);
+            },
+            else => return err,
+        },
         .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.model, parsed.memory_backend) catch |err| switch (err) {
+            error.InsecurePlaintextSecrets => {
+                yc.config.Config.printValidationError(error.InsecurePlaintextSecrets);
+                std.process.exit(1);
+            },
             error.UnknownProvider => {
                 const requested = parsed.provider orelse "(missing)";
                 std.debug.print("Unknown provider '{s}' for quick setup.\n", .{requested});
@@ -2231,6 +2295,61 @@ fn canStartFromChannelCommand(channel_id: yc.channel_catalog.ChannelId) bool {
         .cli, .webhook => false,
         else => true,
     };
+}
+
+const ResolvedRuntimeChannel = struct {
+    adapter_key: []const u8,
+    start_name: []const u8,
+};
+
+fn resolveConfiguredRuntimeChannel(config: *const yc.config.Config, requested: []const u8) ?ResolvedRuntimeChannel {
+    for (config.channels.external) |external_cfg| {
+        if (std.mem.eql(u8, external_cfg.runtime_name, requested)) {
+            return .{
+                .adapter_key = "external",
+                .start_name = external_cfg.runtime_name,
+            };
+        }
+    }
+
+    for (config.channels.maixcam) |maixcam_cfg| {
+        if (std.mem.eql(u8, maixcam_cfg.name, requested)) {
+            return .{
+                .adapter_key = "maixcam",
+                .start_name = maixcam_cfg.name,
+            };
+        }
+    }
+
+    return null;
+}
+
+fn printConfiguredRuntimeChannelNames(config: *const yc.config.Config) void {
+    var first = true;
+
+    for (config.channels.external) |external_cfg| {
+        if (external_cfg.runtime_name.len == 0) continue;
+        if (first) {
+            std.debug.print("Configured runtime channel names: {s}", .{external_cfg.runtime_name});
+        } else {
+            std.debug.print(", {s}", .{external_cfg.runtime_name});
+        }
+        first = false;
+    }
+
+    for (config.channels.maixcam) |maixcam_cfg| {
+        if (maixcam_cfg.name.len == 0 or std.mem.eql(u8, maixcam_cfg.name, "maixcam")) continue;
+        if (first) {
+            std.debug.print("Configured runtime channel names: {s}", .{maixcam_cfg.name});
+        } else {
+            std.debug.print(", {s}", .{maixcam_cfg.name});
+        }
+        first = false;
+    }
+
+    if (!first) {
+        std.debug.print("\n", .{});
+    }
 }
 
 fn printChannelStartSupported() void {
@@ -2373,34 +2492,53 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const requested: ?[]const u8 = if (args.len > 0) args[0] else null;
 
     if (requested) |ch_name| {
-        const meta = yc.channel_catalog.findByKey(ch_name) orelse {
-            std.debug.print("Unknown channel: {s}\n", .{ch_name});
-            printChannelStartSupported();
-            std.process.exit(1);
-        };
-        if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
-            const configured = yc.channel_catalog.configuredCount(&config, meta.id);
-            if (configured > 0) {
-                std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
-            } else {
-                std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+        if (yc.channel_catalog.findByKey(ch_name)) |meta| {
+            if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+                const configured = yc.channel_catalog.configuredCount(&config, meta.id);
+                if (configured > 0) {
+                    std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
+                } else {
+                    std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+                }
+                std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+                printChannelStartSupported();
+                std.process.exit(1);
             }
-            std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
-            printChannelStartSupported();
-            std.process.exit(1);
-        }
-        if (!canStartFromChannelCommand(meta.id)) {
-            std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
-            printChannelStartSupported();
-            std.process.exit(1);
-        }
-        if (!yc.channel_catalog.isConfigured(&config, meta.id)) {
-            std.debug.print("{s} channel is not configured.\n", .{meta.label});
-            std.process.exit(1);
+            if (!canStartFromChannelCommand(meta.id)) {
+                std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
+                printChannelStartSupported();
+                std.process.exit(1);
+            }
+            if (!yc.channel_catalog.isConfigured(&config, meta.id)) {
+                std.debug.print("{s} channel is not configured.\n", .{meta.label});
+                std.process.exit(1);
+            }
+
+            const child_args: []const []const u8 = if (args.len > 1) args[1..] else &.{};
+            return dispatchChannelStart(allocator, child_args, &config, meta);
         }
 
-        const child_args: []const []const u8 = if (args.len > 1) args[1..] else &.{};
-        return dispatchChannelStart(allocator, child_args, &config, meta);
+        if (resolveConfiguredRuntimeChannel(&config, ch_name)) |resolved| {
+            const meta = yc.channel_catalog.findByKey(resolved.adapter_key) orelse unreachable;
+            if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+                std.debug.print("Channel {s} is configured via {s} but disabled in this build.\n", .{ ch_name, meta.key });
+                std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+                printChannelStartSupported();
+                std.process.exit(1);
+            }
+            if (!canStartFromChannelCommand(meta.id)) {
+                std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
+                printChannelStartSupported();
+                std.process.exit(1);
+            }
+
+            return runGatewayChannel(allocator, &config, resolved.start_name);
+        }
+
+        std.debug.print("Unknown channel: {s}\n", .{ch_name});
+        printChannelStartSupported();
+        printConfiguredRuntimeChannelNames(&config);
+        std.process.exit(1);
     }
 
     // No channel specified -- keep historical preference:
@@ -2436,13 +2574,15 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
 
     // Find and start only the requested channel
     var found = false;
+    var started_name = ch_name;
     for (mgr.channelEntries()) |entry| {
-        if (std.mem.eql(u8, entry.name, ch_name)) {
+        if (std.mem.eql(u8, entry.name, ch_name) or std.mem.eql(u8, entry.adapter_key, ch_name)) {
             entry.channel.start() catch |err| {
-                std.debug.print("{s} channel failed to start: {}\n", .{ ch_name, err });
+                std.debug.print("{s} channel failed to start: {}\n", .{ entry.name, err });
                 std.process.exit(1);
             };
             found = true;
+            started_name = entry.name;
             break;
         }
     }
@@ -2452,7 +2592,7 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
         std.process.exit(1);
     }
 
-    std.debug.print("{s} channel started. Press Ctrl+C to stop.\n", .{ch_name});
+    std.debug.print("{s} channel started. Press Ctrl+C to stop.\n", .{started_name});
 
     // Block until Ctrl+C
     while (!yc.daemon.isShutdownRequested()) {
@@ -2569,16 +2709,6 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
-    // Initialize MCP tools from config
-    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
-        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-            std.debug.print("  MCP: init failed: {}\n", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
-
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
     var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
@@ -2598,7 +2728,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    defer subagent_manager.deinit();
+    var subagent_manager_needs_err_cleanup = true;
+    errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
 
     // Create optional memory backend (don't fail if unavailable).
     var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
@@ -2624,7 +2755,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .web_search_fallback_providers = config.http_request.search_fallback_providers,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
+        .mcp_server_configs = config.mcp_servers,
         .agents = config.agents,
         .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
@@ -2637,10 +2768,6 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
-
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {
         yc.tools.bindMemoryRuntime(tools, rt);
@@ -2651,9 +2778,22 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     defer runtime_provider.deinit();
     const provider_i = runtime_provider.provider();
 
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
+    const runtime_observer = try yc.observability.RuntimeObserver.create(
+        allocator,
+        .{
+            .workspace_dir = config.workspace_dir,
+            .backend = config.diagnostics.backend,
+            .otel_endpoint = config.diagnostics.otel_endpoint,
+            .otel_service_name = config.diagnostics.otel_service_name,
+        },
+        config.diagnostics.otel_headers,
+        &.{},
+    );
+    defer runtime_observer.destroy();
+    subagent_manager_needs_err_cleanup = false;
+    defer subagent_manager.deinit();
+    const obs = runtime_observer.observer();
+    subagent_manager.observer = runtime_observer.backendObserver();
 
     // Initialize session manager
     var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -2712,8 +2852,10 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             const conversation_context: ?yc.agent.ConversationContext = if (std.mem.eql(u8, msg.channel, "signal")) blk: {
                 break :blk .{
                     .channel = "signal",
+                    .account_id = sg.account_id,
                     .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
                     .sender_uuid = msg.sender_uuid,
+                    .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                     .group_id = msg.group_id,
                     .is_group = msg.is_group,
                 };
@@ -2722,7 +2864,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
                     error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -3106,16 +3248,6 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     defer if (whisper_ptr) |wt| allocator.destroy(wt);
     if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
 
-    // Initialize MCP tools from config
-    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
-        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-            std.debug.print("  MCP: init failed: {}\n", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
-
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
     var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
@@ -3135,7 +3267,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    defer subagent_manager.deinit();
+    var subagent_manager_needs_err_cleanup = true;
+    errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
 
     // Create optional memory backend (don't fail if unavailable).
     var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
@@ -3161,7 +3294,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .web_search_fallback_providers = config.http_request.search_fallback_providers,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
+        .mcp_server_configs = config.mcp_servers,
         .agents = config.agents,
         .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
@@ -3174,18 +3307,27 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
-
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {
         yc.tools.bindMemoryRuntime(tools, rt);
     }
 
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
+    const runtime_observer = try yc.observability.RuntimeObserver.create(
+        allocator,
+        .{
+            .workspace_dir = config.workspace_dir,
+            .backend = config.diagnostics.backend,
+            .otel_endpoint = config.diagnostics.otel_endpoint,
+            .otel_service_name = config.diagnostics.otel_service_name,
+        },
+        config.diagnostics.otel_headers,
+        &.{},
+    );
+    defer runtime_observer.destroy();
+    subagent_manager_needs_err_cleanup = false;
+    defer subagent_manager.deinit();
+    const obs = runtime_observer.observer();
+    subagent_manager.observer = runtime_observer.backendObserver();
 
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &config);
@@ -3273,11 +3415,18 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             defer tg.stopTyping(typing_target) catch {};
 
             tg.setTaskReaction(msg.sender, msg.message_id, .running);
-            const reply = session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const conversation_context = yc.agent.buildConversationContext(.{
+                .channel = "telegram",
+                .account_id = tg.account_id,
+                .peer_id = msg.sender,
+                .is_group = msg.is_group,
+                .group_id = if (msg.is_group) msg.sender else null,
+            });
+            const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 tg.setTaskReaction(msg.sender, msg.message_id, .failed);
                 const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
                     error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
                     error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -3935,6 +4084,53 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
 
     if (!yc.channel_catalog.isBuildEnabled(.telegram)) return error.SkipZigTest;
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
+}
+
+test "resolveConfiguredRuntimeChannel matches external plugin name" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &[_]yc.config.ExternalChannelConfig{
+                .{
+                    .account_id = "main",
+                    .runtime_name = "whatsapp_web",
+                    .transport = .{
+                        .command = "nullclaw-plugin-whatsapp-web",
+                    },
+                },
+            },
+        },
+    };
+
+    const resolved = resolveConfiguredRuntimeChannel(&cfg, "whatsapp_web") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("external", resolved.adapter_key);
+    try std.testing.expectEqualStrings("whatsapp_web", resolved.start_name);
+}
+
+test "resolveConfiguredRuntimeChannel matches custom maixcam name" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .maixcam = &[_]yc.config.MaixCamConfig{
+                .{
+                    .account_id = "cam-main",
+                    .name = "vision-lab",
+                },
+            },
+        },
+    };
+
+    const resolved = resolveConfiguredRuntimeChannel(&cfg, "vision-lab") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("maixcam", resolved.adapter_key);
+    try std.testing.expectEqualStrings("vision-lab", resolved.start_name);
 }
 
 test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled channel" {

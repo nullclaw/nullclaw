@@ -13,6 +13,7 @@ const MemoryEntry = root.MemoryEntry;
 const MemoryCategory = root.MemoryCategory;
 const config_types = @import("../../config_types.zig");
 const rrf = @import("rrf.zig");
+const key_codec = @import("../vector/key_codec.zig");
 const vector_store_mod = @import("../vector/store.zig");
 const circuit_breaker_mod = @import("../vector/circuit_breaker.zig");
 const embeddings_mod = @import("../vector/embeddings.zig");
@@ -455,7 +456,7 @@ pub const RetrievalEngine = struct {
             if (vec_results.len == 0) break :hybrid_blk;
 
             // Convert VectorResults to RetrievalCandidates
-            vector_candidates = vectorResultsToCandidates(allocator, vec_results) catch |err| {
+            vector_candidates = vectorResultsToCandidates(allocator, vec_results, session_id) catch |err| {
                 log.warn("vector result conversion failed: {}", .{err});
                 break :hybrid_blk;
             };
@@ -688,29 +689,39 @@ fn shrinkAlloc(allocator: Allocator, slice: []RetrievalCandidate, new_len: usize
 
 /// Convert VectorResult slice to RetrievalCandidate slice.
 /// Each result gets source="vector", vector_score set, content=key (minimal).
-fn vectorResultsToCandidates(allocator: Allocator, vec_results: []const vector_store_mod.VectorResult) ![]RetrievalCandidate {
-    var result = try allocator.alloc(RetrievalCandidate, vec_results.len);
-    var i: usize = 0;
+fn vectorResultsToCandidates(
+    allocator: Allocator,
+    vec_results: []const vector_store_mod.VectorResult,
+    session_id: ?[]const u8,
+) ![]RetrievalCandidate {
+    var result: std.ArrayListUnmanaged(RetrievalCandidate) = .empty;
     errdefer {
-        for (result[0..i]) |*ca| ca.deinit(allocator);
-        allocator.free(result);
+        for (result.items) |*ca| ca.deinit(allocator);
+        result.deinit(allocator);
     }
 
     for (vec_results) |vr| {
-        const id = try allocator.dupe(u8, vr.key);
+        const decoded = key_codec.decode(vr.key);
+        if (decoded.is_legacy) continue;
+        if (session_id) |sid| {
+            if (decoded.session_id == null) continue;
+            if (!std.mem.eql(u8, decoded.session_id.?, sid)) continue;
+        }
+
+        const id = try allocator.dupe(u8, decoded.logical_key);
         errdefer allocator.free(id);
-        const key = try allocator.dupe(u8, vr.key);
+        const key = try allocator.dupe(u8, decoded.logical_key);
         errdefer allocator.free(key);
-        const content = try allocator.dupe(u8, vr.key); // minimal: key as content
+        const content = try allocator.dupe(u8, decoded.logical_key); // minimal: key as content
         errdefer allocator.free(content);
-        const snippet = try allocator.dupe(u8, vr.key);
+        const snippet = try allocator.dupe(u8, decoded.logical_key);
         errdefer allocator.free(snippet);
         const source = try allocator.dupe(u8, "vector");
         errdefer allocator.free(source);
         const source_path = try allocator.dupe(u8, "");
         errdefer allocator.free(source_path);
 
-        result[i] = .{
+        try result.append(allocator, .{
             .id = id,
             .key = key,
             .content = content,
@@ -723,10 +734,9 @@ fn vectorResultsToCandidates(allocator: Allocator, vec_results: []const vector_s
             .source_path = source_path,
             .start_line = 0,
             .end_line = 0,
-        };
-        i += 1;
+        });
     }
-    return result;
+    return result.toOwnedSlice(allocator);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1088,9 +1098,9 @@ test "Engine.setVectorSearch stores fields" {
 
 test "vectorResultsToCandidates converts correctly" {
     const allocator = std.testing.allocator;
-    const key1 = try allocator.dupe(u8, "key_a");
+    const key1 = try key_codec.encode(allocator, "key_a", null);
     defer allocator.free(key1);
-    const key2 = try allocator.dupe(u8, "key_b");
+    const key2 = try key_codec.encode(allocator, "key_b", null);
     defer allocator.free(key2);
 
     const vec_results = [_]vector_store_mod.VectorResult{
@@ -1098,7 +1108,7 @@ test "vectorResultsToCandidates converts correctly" {
         .{ .key = key2, .score = 0.5 },
     };
 
-    const candidates = try vectorResultsToCandidates(allocator, &vec_results);
+    const candidates = try vectorResultsToCandidates(allocator, &vec_results, null);
     defer freeCandidates(allocator, candidates);
 
     try std.testing.expectEqual(@as(usize, 2), candidates.len);
@@ -1107,6 +1117,50 @@ test "vectorResultsToCandidates converts correctly" {
     try std.testing.expect(candidates[0].vector_score != null);
     try std.testing.expect(@abs(candidates[0].vector_score.? - 0.9) < 0.001);
     try std.testing.expect(candidates[0].keyword_rank == null);
+}
+
+test "vectorResultsToCandidates filters scoped session" {
+    const allocator = std.testing.allocator;
+    const key_a = try key_codec.encode(allocator, "shared", "sess-a");
+    defer allocator.free(key_a);
+    const key_b = try key_codec.encode(allocator, "shared", "sess-b");
+    defer allocator.free(key_b);
+    const legacy = try allocator.dupe(u8, "shared");
+    defer allocator.free(legacy);
+
+    const vec_results = [_]vector_store_mod.VectorResult{
+        .{ .key = legacy, .score = 0.95 },
+        .{ .key = key_b, .score = 0.90 },
+        .{ .key = key_a, .score = 0.85 },
+    };
+
+    const candidates = try vectorResultsToCandidates(allocator, &vec_results, "sess-a");
+    defer freeCandidates(allocator, candidates);
+
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    try std.testing.expectEqualStrings("shared", candidates[0].key);
+    try std.testing.expect(candidates[0].vector_score != null);
+    try std.testing.expect(@abs(candidates[0].vector_score.? - 0.85) < 0.001);
+}
+
+test "vectorResultsToCandidates drops legacy results for unscoped search" {
+    const allocator = std.testing.allocator;
+    const encoded = try key_codec.encode(allocator, "shared", null);
+    defer allocator.free(encoded);
+    const legacy = try allocator.dupe(u8, "shared");
+    defer allocator.free(legacy);
+
+    const vec_results = [_]vector_store_mod.VectorResult{
+        .{ .key = legacy, .score = 0.95 },
+        .{ .key = encoded, .score = 0.85 },
+    };
+
+    const candidates = try vectorResultsToCandidates(allocator, &vec_results, null);
+    defer freeCandidates(allocator, candidates);
+
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    try std.testing.expectEqualStrings("shared", candidates[0].key);
+    try std.testing.expect(@abs(candidates[0].vector_score.? - 0.85) < 0.001);
 }
 
 test "Engine with circuit breaker open skips vector search" {

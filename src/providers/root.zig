@@ -254,6 +254,46 @@ pub const StreamChatResult = struct {
     model: []const u8 = "",
 };
 
+pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
+    return saw_done or accumulated_len > 0;
+}
+
+pub fn freeStreamUnusedChatResponseFields(allocator: std.mem.Allocator, response: *ChatResponse) void {
+    for (response.tool_calls) |tc| {
+        if (tc.id.len > 0) allocator.free(tc.id);
+        if (tc.name.len > 0) allocator.free(tc.name);
+        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+    }
+    if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
+    if (response.provider.len > 0) allocator.free(response.provider);
+    if (response.reasoning_content) |rc| {
+        if (rc.len > 0) allocator.free(rc);
+    }
+    response.tool_calls = &.{};
+    response.provider = "";
+    response.reasoning_content = null;
+}
+
+pub fn emitChatResponseAsStream(
+    allocator: std.mem.Allocator,
+    response: *ChatResponse,
+    callback: StreamCallback,
+    callback_ctx: *anyopaque,
+) StreamChatResult {
+    if (response.content) |content| {
+        if (content.len > 0) {
+            callback(callback_ctx, StreamChunk.textDelta(content));
+        }
+    }
+    callback(callback_ctx, StreamChunk.finalChunk());
+    freeStreamUnusedChatResponseFields(allocator, response);
+    return .{
+        .content = response.content,
+        .usage = response.usage,
+        .model = response.model,
+    };
+}
+
 /// Tool specification for function-calling APIs.
 pub const ToolSpec = struct {
     name: []const u8,
@@ -436,46 +476,7 @@ pub const Provider = struct {
         }
         // Fallback: blocking chat() → single chunk + final
         var response = try self.chat(allocator, request, model, temperature);
-        errdefer {
-            if (response.content) |content| {
-                if (content.len > 0) allocator.free(content);
-            }
-            for (response.tool_calls) |tc| {
-                if (tc.id.len > 0) allocator.free(tc.id);
-                if (tc.name.len > 0) allocator.free(tc.name);
-                if (tc.arguments.len > 0) allocator.free(tc.arguments);
-            }
-            if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
-            if (response.provider.len > 0) allocator.free(response.provider);
-            if (response.model.len > 0) allocator.free(response.model);
-            if (response.reasoning_content) |rc| {
-                if (rc.len > 0) allocator.free(rc);
-            }
-        }
-        if (response.content) |content| {
-            if (content.len > 0) {
-                callback(callback_ctx, StreamChunk.textDelta(content));
-            }
-        }
-        callback(callback_ctx, StreamChunk.finalChunk());
-        for (response.tool_calls) |tc| {
-            if (tc.id.len > 0) allocator.free(tc.id);
-            if (tc.name.len > 0) allocator.free(tc.name);
-            if (tc.arguments.len > 0) allocator.free(tc.arguments);
-        }
-        if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
-        if (response.provider.len > 0) allocator.free(response.provider);
-        if (response.reasoning_content) |rc| {
-            if (rc.len > 0) allocator.free(rc);
-        }
-        response.tool_calls = &.{};
-        response.provider = "";
-        response.reasoning_content = null;
-        return .{
-            .content = response.content,
-            .usage = response.usage,
-            .model = response.model,
-        };
+        return emitChatResponseAsStream(allocator, &response, callback, callback_ctx);
     }
 };
 
@@ -795,6 +796,65 @@ test "StreamChatResult defaults" {
     try std.testing.expect(result.usage.prompt_tokens == 0);
     try std.testing.expect(result.usage.completion_tokens == 0);
     try std.testing.expectEqualStrings("", result.model);
+}
+
+test "shouldRecoverPartialStream returns true after terminal event" {
+    try std.testing.expect(shouldRecoverPartialStream(0, true));
+}
+
+test "shouldRecoverPartialStream returns true after partial output" {
+    try std.testing.expect(shouldRecoverPartialStream(1, false));
+}
+
+test "shouldRecoverPartialStream returns false without output" {
+    try std.testing.expect(!shouldRecoverPartialStream(0, false));
+}
+
+test "emitChatResponseAsStream frees unused chat response fields" {
+    const allocator = std.testing.allocator;
+
+    var tool_calls = try allocator.alloc(ToolCall, 1);
+    tool_calls[0] = .{
+        .id = try allocator.dupe(u8, "tool-1"),
+        .name = try allocator.dupe(u8, "read_file"),
+        .arguments = try allocator.dupe(u8, "{\"path\":\"README.md\"}"),
+    };
+
+    var response = ChatResponse{
+        .content = try allocator.dupe(u8, "hello"),
+        .tool_calls = tool_calls,
+        .usage = .{ .completion_tokens = 2, .total_tokens = 2 },
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .reasoning_content = try allocator.dupe(u8, "private reasoning"),
+    };
+
+    const CallbackCtx = struct {
+        text_count: usize = 0,
+        saw_final: bool = false,
+
+        fn onChunk(ctx: *anyopaque, chunk: StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+            } else if (chunk.delta.len > 0) {
+                self.text_count += 1;
+            }
+        }
+    };
+
+    var ctx = CallbackCtx{};
+    const result = emitChatResponseAsStream(allocator, &response, CallbackCtx.onChunk, @ptrCast(&ctx));
+    defer if (result.content) |content| allocator.free(content);
+    defer if (result.model.len > 0) allocator.free(result.model);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.text_count);
+    try std.testing.expect(ctx.saw_final);
+    try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
+    try std.testing.expectEqualStrings("", response.provider);
+    try std.testing.expect(response.reasoning_content == null);
+    try std.testing.expectEqualStrings("hello", result.content.?);
+    try std.testing.expectEqualStrings("test-model", result.model);
 }
 
 test "Provider.streamChat fallback emits single chunk and final" {

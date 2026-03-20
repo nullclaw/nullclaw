@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.anthropic);
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
@@ -389,7 +390,14 @@ pub const AnthropicProvider = struct {
             hdr_count += 1;
         }
 
-        return sse.curlStreamAnthropic(allocator, url, body, headers_buf[0..hdr_count], callback, callback_ctx);
+        return sse.curlStreamAnthropic(allocator, url, body, headers_buf[0..hdr_count], callback, callback_ctx) catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("Anthropic streaming failed with {}; falling back to non-streaming response", .{err});
+                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+            }
+            return err;
+        };
     }
 };
 
