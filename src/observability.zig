@@ -178,7 +178,7 @@ pub const LogObserver = struct {
                 }
             },
             .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
-            .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2} model={s} session={s}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model, e.session_id }),
+            .turn_scored => |e| std.log.info("turn.scored score={d:.2} tools={d} failures={d} signals=0x{x:0>2} model={s} skill={s} session={s}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model, e.skill, e.session_id }),
             .tool_retry => |e| std.log.info("tool.retry tool={s} attempt={d} backoff_ms={d} class={s}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }),
             .evolution_trigger => |e| std.log.info("evolution.trigger skill={s} type={s} score={d:.2} model={s}", .{ e.skill, e.trigger_type, e.score, e.model }),
             .digest_ready => |e| std.log.info("digest.ready session={s} prefs={d} insights={d} patterns={d}", .{ e.session_id, e.user_preferences.len, e.tool_insights.len, e.task_patterns.len }),
@@ -383,7 +383,7 @@ pub const FileObserver = struct {
                 break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":{f},\"duration_ms\":{d},\"success\":{}}}", .{ std.json.fmt(e.tool, .{}), e.duration_ms, e.success }) catch return;
             },
             .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
-            .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d},\"model\":\"{s}\",\"session_id\":\"{s}\"}}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model, e.session_id }) catch return,
+            .turn_scored => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"turn_scored\",\"score\":{d:.2},\"tool_count\":{d},\"tool_failures\":{d},\"signals\":{d},\"model\":\"{s}\",\"skill\":\"{s}\",\"session_id\":\"{s}\"}}", .{ e.score, e.tool_count, e.tool_failures, e.signals, e.model, e.skill, e.session_id }) catch return,
             .tool_retry => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_retry\",\"tool\":\"{s}\",\"attempt\":{d},\"backoff_ms\":{d},\"class\":\"{s}\"}}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }) catch return,
             .evolution_trigger => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"evolution_trigger\",\"skill\":\"{s}\",\"type\":\"{s}\",\"score\":{d:.2},\"model\":\"{s}\"}}", .{ e.skill, e.trigger_type, e.score, e.model }) catch return,
             .digest_ready => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"digest_ready\",\"session_id\":\"{s}\",\"prefs\":{d},\"insights\":{d}}}", .{ e.session_id, e.user_preferences.len, e.tool_insights.len }) catch return,

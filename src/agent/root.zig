@@ -2558,16 +2558,9 @@ pub const Agent = struct {
                 turn_ctx.tools_called += 1;
                 turn_ctx.has_tool_calls = true;
                 if (!result.success) turn_ctx.tools_failed += 1;
-                // Skill attribution: prefer routed skill name (from skill router).
-                // Fall back to first tool name only when no skill was routed.
-                if (turn_ctx.tools_called == 1 and self.routed_skill == null) {
-                    const skill_owned = self.allocator.dupe(u8, call.name) catch null;
-                    if (skill_owned) |s| {
-                        if (self.prev_turn_skill_owned) |prev| self.allocator.free(prev);
-                        self.prev_turn_skill_owned = s;
-                        turn_ctx.skill = s;
-                    }
-                }
+                // Skill attribution: use routed skill name from skill router.
+                // When no skill was routed, keep "general" — avoids polluting
+                // performance reports with raw tool names (shell, file_read, etc.).
 
                 try results_buf.append(self.allocator, result);
             }
