@@ -2260,8 +2260,7 @@ fn processIncomingEmail(
                 .kind = .direct,
                 .id = sender_addr,
             },
-        }, config.agent_bindings, config.agents, config.session) catch break :blk
-            std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ em_ptr.config.account_id, sender_addr }) catch sender_addr;
+        }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ em_ptr.config.account_id, sender_addr }) catch sender_addr;
 
         allocator.free(route.main_session_key);
         routed_session_key = route.session_key;
@@ -2337,8 +2336,27 @@ fn runEmailPollLoop(
     em_ptr: *email.EmailChannel,
 ) void {
     var evict_counter: u32 = 0;
+    var consecutive_net_failures: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        // Skip polling when the network is unreachable (e.g. wifi off at night).
+        // Uses exponential backoff: 30s, 60s, 120s, ... up to 5 minutes.
+        if (!em_ptr.isImapReachable(allocator)) {
+            consecutive_net_failures +|= 1;
+            if (consecutive_net_failures == 1) {
+                log.info("Email: IMAP server unreachable, pausing poll until network returns", .{});
+            }
+            const shift: u6 = @intCast(@min(consecutive_net_failures, 3));
+            const backoff: u64 = @min(@as(u64, 30) << shift, 300);
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            std.Thread.sleep(backoff * std.time.ns_per_s);
+            continue;
+        }
+        if (consecutive_net_failures > 0) {
+            log.info("Email: network restored after {d} failed probes, resuming poll", .{consecutive_net_failures});
+            consecutive_net_failures = 0;
+        }
+
         const messages = em_ptr.pollMessages(allocator) catch |err| {
             log.warn("Email poll error: {}", .{err});
             loop_state.last_activity.store(std.time.timestamp(), .release);
@@ -2361,8 +2379,7 @@ fn runEmailPollLoop(
                         .kind = .direct,
                         .id = msg.sender,
                     },
-                }, config.agent_bindings, config.agents, config.session) catch break :blk
-                    std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ em_ptr.config.account_id, msg.sender }) catch msg.sender;
+                }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ em_ptr.config.account_id, msg.sender }) catch msg.sender;
 
                 allocator.free(route.main_session_key);
                 routed_session_key = route.session_key;

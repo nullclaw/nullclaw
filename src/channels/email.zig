@@ -504,6 +504,18 @@ pub const EmailChannel = struct {
 
     // ── IMAP Polling via curl ──────────────────────────────────────
 
+    /// Quick TCP probe to check if the IMAP server is reachable.
+    /// Returns true if a connection can be established, false otherwise.
+    /// Used to skip polling when the network is down (e.g. wifi off at night).
+    pub fn isImapReachable(self: *EmailChannel, allocator: std.mem.Allocator) bool {
+        const addr_list = std.net.getAddressList(allocator, self.config.imap_host, self.config.imap_port) catch return false;
+        defer addr_list.deinit();
+        if (addr_list.addrs.len == 0) return false;
+        const stream = std.net.tcpConnectToAddress(addr_list.addrs[0]) catch return false;
+        stream.close();
+        return true;
+    }
+
     /// Run a curl IMAP command and return stdout. Caller owns returned memory.
     pub fn imapCurl(self: *EmailChannel, allocator: std.mem.Allocator, url: []const u8, custom_request: ?[]const u8) ![]u8 {
         var argv_buf: [16][]const u8 = undefined;
