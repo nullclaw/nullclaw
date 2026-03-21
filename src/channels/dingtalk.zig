@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const fs_compat = @import("../fs_compat.zig");
 const http_util = @import("../http_util.zig");
+const outbound = @import("../outbound.zig");
 const platform = @import("../platform.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
@@ -275,7 +277,7 @@ fn attachment_cache_dir_path(allocator: std.mem.Allocator) ![]u8 {
 fn ensure_attachment_cache_dir(cache_dir: []const u8) !void {
     std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => try std.fs.cwd().makePath(cache_dir),
+        else => try fs_compat.makePath(cache_dir),
     };
 }
 
@@ -714,6 +716,115 @@ pub const DingTalkChannel = struct {
             };
         }
         return null;
+    }
+
+    fn postJson(self: *DingTalkChannel, webhook_url: []const u8, body: []const u8) !void {
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+        const result = client.fetch(.{
+            .location = .{ .url = webhook_url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/json" },
+            },
+        }) catch return error.DingTalkApiError;
+        if (result.status != .ok) return error.DingTalkApiError;
+    }
+
+    fn buildRichWebhookBody(buf: []u8, payload: root.Channel.OutboundPayload) ![]const u8 {
+        const has_buttons = for (payload.action_groups) |group| {
+            if (group.actions.len > 0) break true;
+        } else false;
+
+        var text_buf: [8192]u8 = undefined;
+        var text_fbs = std.io.fixedBufferStream(&text_buf);
+        const text_writer = text_fbs.writer();
+        if (payload.text.len > 0) {
+            try text_writer.print("{s}\n\n", .{payload.text});
+        }
+        for (payload.card_sections) |section| {
+            if (section.title.len > 0) try text_writer.print("### {s}\n", .{section.title});
+            try text_writer.print("{s}\n\n", .{section.body});
+        }
+        const body_text = text_fbs.getWritten();
+        const title = if (payload.card_title.len > 0) payload.card_title else "NullClaw";
+
+        var json_fbs = std.io.fixedBufferStream(buf);
+        const writer = json_fbs.writer();
+        if (has_buttons) {
+            try writer.writeAll("{\"msgtype\":\"actionCard\",\"actionCard\":{\"title\":");
+            try root.appendJsonStringW(writer, title);
+            try writer.writeAll(",\"text\":");
+            try root.appendJsonStringW(writer, body_text);
+            try writer.writeAll(",\"btnOrientation\":\"0\",\"btns\":[");
+            var first = true;
+            for (payload.action_groups) |group| {
+                for (group.actions) |button| {
+                    if (!first) try writer.writeByte(',');
+                    first = false;
+                    try writer.writeAll("{\"title\":");
+                    try root.appendJsonStringW(writer, button.label);
+                    // DingTalk session webhooks do not deliver button callbacks.
+                    try writer.writeAll(",\"actionURL\":\"dingtalk://dingtalkclient/page/close\"}");
+                }
+            }
+            try writer.writeAll("]}}");
+        } else {
+            var markdown_buf: [8192]u8 = undefined;
+            var markdown_fbs = std.io.fixedBufferStream(&markdown_buf);
+            const markdown_writer = markdown_fbs.writer();
+            if (payload.card_title.len > 0) try markdown_writer.print("## {s}\n\n", .{payload.card_title});
+            try markdown_writer.writeAll(body_text);
+
+            try writer.writeAll("{\"msgtype\":\"markdown\",\"markdown\":{\"title\":");
+            try root.appendJsonStringW(writer, title);
+            try writer.writeAll(",\"text\":");
+            try root.appendJsonStringW(writer, markdown_fbs.getWritten());
+            try writer.writeAll("}}");
+        }
+
+        return json_fbs.getWritten();
+    }
+
+    pub fn sendRichMessage(self: *DingTalkChannel, target: []const u8, payload: root.Channel.OutboundPayload) !void {
+        if (payload.attachments.len > 0) return error.NotSupported;
+        if (payload.choices.len > 0 and payload.action_groups.len == 0) {
+            const fallback = try payload.toPlainText(self.allocator);
+            defer self.allocator.free(fallback);
+            return self.sendMessage(target, fallback, &.{});
+        }
+
+        const trimmed_target = std.mem.trim(u8, target, " \t\r\n");
+        if (trimmed_target.len == 0) return error.InvalidTarget;
+
+        const reply_target = (try self.reply_targets.getClone(self.allocator, trimmed_target)) orelse {
+            const fallback = try payload.toPlainText(self.allocator);
+            defer self.allocator.free(fallback);
+            return self.sendMessage(trimmed_target, fallback, &.{});
+        };
+        defer {
+            var owned_reply_target = reply_target;
+            owned_reply_target.deinit(self.allocator);
+        }
+
+        if (reply_target.expires_at_ms > 0 and std.time.timestamp() >= @divTrunc(reply_target.expires_at_ms, 1000)) {
+            const fallback = try payload.toPlainText(self.allocator);
+            defer self.allocator.free(fallback);
+            return self.sendMessage(trimmed_target, fallback, &.{});
+        }
+
+        const has_buttons = for (payload.action_groups) |grp| {
+            if (grp.actions.len > 0) break true;
+        } else false;
+        var json_buf: [16384]u8 = undefined;
+        const body = try buildRichWebhookBody(&json_buf, payload);
+        if (!has_buttons and payload.text.len == 0 and payload.card_sections.len == 0 and payload.card_title.len == 0) {
+            const fallback = try payload.toPlainText(self.allocator);
+            defer self.allocator.free(fallback);
+            return self.sendMessage(trimmed_target, fallback, &.{});
+        }
+        try self.postJson(reply_target.webhook_url, body);
     }
 
     fn isSenderAllowed(self: *const DingTalkChannel, sender_id: []const u8, sender_staff_id: []const u8) bool {
@@ -1344,7 +1455,9 @@ pub const DingTalkChannel = struct {
 
         if (self.event_bus) |eb| {
             try eb.publishInbound(inbound);
+            log.debug("dingtalk published inbound message from {s} ({d} bytes)", .{ owned.sender_id, owned.content.len });
         } else {
+            log.warn("dingtalk no event_bus, dropping message", .{});
             inbound.deinit(self.allocator);
         }
     }
@@ -1430,6 +1543,7 @@ pub const DingTalkChannel = struct {
         var ws = try websocket.WsClient.connect(self.allocator, endpoint.host, endpoint.port, endpoint.path, &.{});
         self.ws_fd.store(ws.stream.handle, .release);
         self.connected.store(true, .release);
+        log.info("dingtalk websocket connected to {s}", .{endpoint.host});
         defer {
             self.connected.store(false, .release);
             self.ws_fd.store(invalid_socket, .release);
@@ -1446,6 +1560,7 @@ pub const DingTalkChannel = struct {
             defer self.allocator.free(message.payload);
 
             if (message.opcode != .text) continue;
+            log.debug("dingtalk received message: {d} bytes", .{message.payload.len});
             const should_disconnect = self.handleEnvelope(&ws, message.payload) catch |err| blk: {
                 log.warn("dingtalk envelope handling failed: {}", .{err});
                 break :blk false;
@@ -1552,6 +1667,11 @@ pub const DingTalkChannel = struct {
         try self.sendEventMessage(target, message, media, stage);
     }
 
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+        const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichMessage(target, payload);
+    }
+
     fn vtableName(ptr: *anyopaque) []const u8 {
         const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
         return self.channelName();
@@ -1573,6 +1693,7 @@ pub const DingTalkChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendRich = &vtableSendRich,
         .sendEvent = &vtableSendEvent,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
@@ -1704,6 +1825,42 @@ test "parse_prepare_conversation_token extracts nested token" {
     defer std.testing.allocator.free(token);
 
     try std.testing.expectEqualStrings("ct_123", token);
+}
+
+test "buildRichWebhookBody uses action card for action groups" {
+    const buttons = [_]outbound.ActionButton{
+        .{ .id = "approve", .label = "Approve" },
+        .{ .id = "deny", .label = "Deny" },
+    };
+    const groups = [_]outbound.ActionGroup{.{ .actions = &buttons }};
+
+    var buf: [4096]u8 = undefined;
+    const body = try DingTalkChannel.buildRichWebhookBody(&buf, .{
+        .card_title = "Review",
+        .text = "Pick one option.",
+        .action_groups = &groups,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"msgtype\":\"actionCard\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"title\":\"Approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"title\":\"Deny\"") != null);
+}
+
+test "buildRichWebhookBody uses markdown without action groups" {
+    const sections = [_]outbound.CardSection{
+        .{ .title = "Details", .body = "Line one" },
+    };
+
+    var buf: [4096]u8 = undefined;
+    const body = try DingTalkChannel.buildRichWebhookBody(&buf, .{
+        .card_title = "Review",
+        .text = "Summary",
+        .card_sections = &sections,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"msgtype\":\"markdown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Details") != null);
 }
 
 test "parseProactiveTarget accepts account-qualified conversation and union targets" {

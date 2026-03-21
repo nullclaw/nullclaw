@@ -228,13 +228,15 @@ fn resolveProfileProvider(
         break :blk owned_api_key;
     };
 
-    var holder = providers.ProviderHolder.fromConfig(
+    var holder = providers.ProviderHolder.fromConfigWithApiMode(
         allocator,
         profile.provider,
         provider_api_key,
         cfg.getProviderBaseUrl(profile.provider),
         cfg.getProviderNativeTools(profile.provider),
         cfg.getProviderUserAgent(profile.provider),
+        cfg.getProviderApiMode(profile.provider),
+        cfg.getProviderMaxStreamingPromptBytes(profile.provider),
     );
     return .{
         .provider = holder.provider(),

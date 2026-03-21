@@ -324,6 +324,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
+        .{ "xiaomi", .{ "MIMO_API_KEY", "", "" } },
         .{ "bedrock", .{ "AWS_ACCESS_KEY_ID", "", "" } },
         .{ "aws-bedrock", .{ "AWS_ACCESS_KEY_ID", "", "" } },
         .{ "cloudflare", .{ "CLOUDFLARE_API_TOKEN", "", "" } },
@@ -343,6 +344,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "lm-studio", .{ "API_KEY", "", "" } },
         .{ "claude-cli", .{ "ANTHROPIC_API_KEY", "", "" } },
         .{ "codex-cli", .{ "OPENAI_API_KEY", "", "" } },
+        .{ "gemini-cli", .{ "GEMINI_API_KEY", "", "" } },
     });
     return map.get(canonical) orelse .{ "", "", "" };
 }
@@ -405,6 +407,12 @@ test "azure aliases share Azure env candidate" {
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure")[0]);
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure-openai")[0]);
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure_openai")[0]);
+}
+
+test "xiaomi aliases share MIMO env candidate" {
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvCandidates("xiaomi")[0]);
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvCandidates("xiaomi-mimo")[0]);
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvCandidates("mimo")[0]);
 }
 
 test "providerEnvCandidates includes onboarding env hints" {

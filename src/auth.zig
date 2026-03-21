@@ -6,6 +6,7 @@
 //! - Device Authorization Grant flow (RFC 8628)
 
 const std = @import("std");
+const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 
@@ -116,7 +117,7 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     defer allocator.free(dir_path);
 
     // Ensure directory exists
-    std.fs.cwd().makePath(dir_path) catch return error.CredentialWriteFailed;
+    fs_compat.makePath(dir_path) catch return error.CredentialWriteFailed;
 
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, CRED_FILE });
     defer allocator.free(file_path);

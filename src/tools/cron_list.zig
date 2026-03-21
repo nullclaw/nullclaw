@@ -25,6 +25,16 @@ pub const CronListTool = struct {
     }
 
     pub fn execute(_: *CronListTool, allocator: std.mem.Allocator, _: JsonObjectMap) !ToolResult {
+        switch (cron.requestGatewayGet(allocator, "/cron")) {
+            .unavailable => {},
+            .response => |resp| {
+                if (resp.status_code >= 200 and resp.status_code < 300) {
+                    return ToolResult{ .success = true, .output = resp.body };
+                }
+                return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+            },
+        }
+
         var scheduler = loadScheduler(allocator) catch {
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled cron jobs.") };
         };

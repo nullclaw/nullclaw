@@ -17,6 +17,7 @@ const primary_telegram_commands = [_]TelegramCommand{
     .{ .command = "new", .description = "Clear history, start fresh" },
     .{ .command = "status", .description = "Show model and stats" },
     .{ .command = "whoami", .description = "Show current session id" },
+    .{ .command = "config", .description = "Manage runtime configuration" },
     .{ .command = "model", .description = "Switch model" },
     .{ .command = "think", .description = "Set thinking level" },
     .{ .command = "verbose", .description = "Set verbose level" },
@@ -88,6 +89,7 @@ test "telegram command catalog appends grouped commands" {
     try appendTelegramCommandCatalogJson(&out, std.testing.allocator, .{});
 
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"menu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"config\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"bind\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"topic\"") != null);

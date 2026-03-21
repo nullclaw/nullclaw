@@ -5,6 +5,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const cron_gateway = @import("cron_gateway.zig");
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
@@ -15,9 +16,9 @@ threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Set type='agent' to run as autonomous agent task (default: shell). Always provide a descriptive 'name' — it is used as the email subject when delivering results.";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Set type='agent' to run as autonomous agent task (default: shell). Always provide a descriptive 'name' — it is used as the email subject when delivering results. Set session_target to 'main' to route results through the main agent for contextualised delivery.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent' (autonomous agent task)"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs (default: config primary model)"},"name":{"type":"string","description":"Descriptive job name, used as email subject for delivery notifications"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent' (autonomous agent task)"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs (default: config primary model)"},"name":{"type":"string","description":"Descriptive job name, used as email subject for delivery notifications"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode: 'isolated' (default) delivers raw output directly; 'main' routes through the main agent session for contextualised responses"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -45,6 +46,10 @@ pub const ScheduleTool = struct {
         const explicit_channel = root.getString(args, "channel");
         const explicit_account_id = root.getString(args, "account_id");
         const explicit_chat_id = root.getString(args, "chat_id");
+        const session_target = if (root.getString(args, "session_target")) |st|
+            cron.SessionTarget.parse(st)
+        else
+            cron.SessionTarget.isolated;
 
         // Prefer explicit args; otherwise use per-thread context injected by channel_loop.
         const chat_id = explicit_chat_id orelse tls_schedule_chat_id;
@@ -62,6 +67,16 @@ pub const ScheduleTool = struct {
         }
 
         if (std.mem.eql(u8, action, "list")) {
+            switch (cron.requestGatewayGet(allocator, "/cron")) {
+                .unavailable => {},
+                .response => |resp| {
+                    if (resp.status_code >= 200 and resp.status_code < 300) {
+                        return ToolResult{ .success = true, .output = resp.body };
+                    }
+                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                },
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.ok("No scheduled jobs.");
             };
@@ -100,6 +115,26 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for get action");
 
+            switch (cron.requestGatewayGet(allocator, "/cron")) {
+                .unavailable => {},
+                .response => |resp| {
+                    if (resp.status_code < 200 or resp.status_code >= 300) {
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    }
+                    defer allocator.free(resp.body);
+
+                    const job_json = cron_gateway.findJobByIdJson(allocator, resp.body, id) catch {
+                        return ToolResult.fail("Invalid gateway response");
+                    };
+                    if (job_json) |json| {
+                        return ToolResult{ .success = true, .output = json };
+                    }
+
+                    const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                },
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -134,6 +169,30 @@ pub const ScheduleTool = struct {
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
 
+            const gateway_delivery = if (chat_id) |cid|
+                cron.DeliveryConfig{
+                    .mode = .always,
+                    .channel = delivery_channel,
+                    .account_id = delivery_account_id,
+                    .to = cid,
+                    .best_effort = true,
+                }
+            else
+                null;
+            const gateway_body = cron_gateway.buildAddBody(allocator, expression, null, command, null, null, gateway_delivery) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
@@ -164,6 +223,7 @@ pub const ScheduleTool = struct {
             };
 
             if (job_name) |n| job.name = try scheduler.allocator.dupe(u8, n);
+            job.session_target = session_target;
 
             // Set delivery config if chat_id is provided (agent jobs get delivery via addAgentJob)
             if (!is_agent) {
@@ -198,6 +258,30 @@ pub const ScheduleTool = struct {
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
 
+            const gateway_delivery = if (chat_id) |cid|
+                cron.DeliveryConfig{
+                    .mode = .always,
+                    .channel = delivery_channel,
+                    .account_id = delivery_account_id,
+                    .to = cid,
+                    .best_effort = true,
+                }
+            else
+                null;
+            const gateway_body = cron_gateway.buildAddBody(allocator, null, delay, command, null, null, gateway_delivery) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
@@ -221,6 +305,7 @@ pub const ScheduleTool = struct {
             };
 
             if (job_name) |n| job.name = try scheduler.allocator.dupe(u8, n);
+            job.session_target = session_target;
 
             // Set delivery config if chat_id is provided
             if (chat_id) |cid| {
@@ -251,6 +336,20 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for cancel action");
 
+            const gateway_body = cron_gateway.buildIdBody(allocator, id) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                switch (cron.requestGatewayPost(allocator, "/cron/remove", json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
@@ -268,6 +367,21 @@ pub const ScheduleTool = struct {
         if (std.mem.eql(u8, action, "pause") or std.mem.eql(u8, action, "resume")) {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter");
+
+            const gateway_body = cron_gateway.buildIdBody(allocator, id) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                const path = if (std.mem.eql(u8, action, "pause")) "/cron/pause" else "/cron/resume";
+                switch (cron.requestGatewayPost(allocator, path, json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
 
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
@@ -523,4 +637,20 @@ test "schedule resume requires id" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
+}
+
+test "schedule gateway get extracts matching job json" {
+    const body =
+        \\[
+        \\  {"id":"job-a","command":"echo a"},
+        \\  {"id":"job-b","command":"echo b"}
+        \\]
+    ;
+    const job_json = (try cron_gateway.findJobByIdJson(std.testing.allocator, body, "job-b")).?;
+    defer std.testing.allocator.free(job_json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, job_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("job-b", parsed.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("echo b", parsed.value.object.get("command").?.string);
 }

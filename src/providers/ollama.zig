@@ -168,22 +168,25 @@ fn appendOllamaImageValue(
     try buf.append(allocator, '"');
 }
 
-/// Ollama local LLM provider.
+/// Ollama LLM provider.
 ///
 /// Endpoints:
 /// - POST {base_url}/api/chat
-/// - No authentication required (local service)
+/// - Local: no authentication required
+/// - Cloud: optional `Authorization: Bearer <key>` when api_key is set
 pub const OllamaProvider = struct {
     base_url: []const u8,
+    api_key: ?[]const u8,
     allocator: std.mem.Allocator,
     native_tools: bool,
 
     const DEFAULT_BASE_URL = "http://localhost:11434";
 
-    pub fn init(allocator: std.mem.Allocator, base_url: ?[]const u8) OllamaProvider {
+    pub fn init(allocator: std.mem.Allocator, base_url: ?[]const u8, api_key: ?[]const u8) OllamaProvider {
         const url = if (base_url) |u| trimTrailingSlash(u) else DEFAULT_BASE_URL;
         return .{
             .base_url = url,
+            .api_key = api_key,
             .allocator = allocator,
             .native_tools = true,
         };
@@ -199,6 +202,15 @@ pub const OllamaProvider = struct {
     /// Build the chat endpoint URL.
     pub fn chatUrl(self: OllamaProvider, allocator: std.mem.Allocator) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{s}/api/chat", .{self.base_url});
+    }
+
+    /// Build the Authorization header slice for HTTP requests.
+    /// Returns an empty slice when no api_key is configured (local Ollama).
+    fn buildAuthHeaders(self: OllamaProvider, headers_buf: *[1][]const u8, auth_hdr_buf: *[512]u8) ![]const []const u8 {
+        const key = self.api_key orelse return &.{};
+        const auth_hdr = try std.fmt.bufPrint(auth_hdr_buf, "Authorization: Bearer {s}", .{key});
+        headers_buf[0] = auth_hdr;
+        return headers_buf[0..1];
     }
 
     /// Build an Ollama chat request JSON body.
@@ -289,7 +301,11 @@ pub const OllamaProvider = struct {
         const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
         defer allocator.free(body);
 
-        const resp_body = root.curlPostTimed(allocator, url, body, &.{}, 0) catch return error.OllamaApiError;
+        var headers_buf: [1][]const u8 = undefined;
+        var auth_hdr_buf: [512]u8 = undefined;
+        const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers, 0) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
         return parseResponse(allocator, resp_body);
@@ -310,7 +326,11 @@ pub const OllamaProvider = struct {
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        const resp_body = root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.OllamaApiError;
+        var headers_buf: [1][]const u8 = undefined;
+        var auth_hdr_buf: [512]u8 = undefined;
+        const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers, request.timeout_secs) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
         const text = try parseResponse(allocator, resp_body);
@@ -403,17 +423,17 @@ fn buildChatRequestBody(
 // ════════════════════════════════════════════════════════════════════════════
 
 test "default url" {
-    const p = OllamaProvider.init(std.testing.allocator, null);
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
     try std.testing.expectEqualStrings("http://localhost:11434", p.base_url);
 }
 
 test "custom url trailing slash" {
-    const p = OllamaProvider.init(std.testing.allocator, "http://192.168.1.100:11434/");
+    const p = OllamaProvider.init(std.testing.allocator, "http://192.168.1.100:11434/", null);
     try std.testing.expectEqualStrings("http://192.168.1.100:11434", p.base_url);
 }
 
 test "chat url is correct" {
-    const p = OllamaProvider.init(std.testing.allocator, null);
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
     const url = try p.chatUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("http://localhost:11434/api/chat", url);
@@ -454,9 +474,45 @@ test "parseResponse empty content" {
 }
 
 test "supportsNativeTools returns true" {
-    var p = OllamaProvider.init(std.testing.allocator, null);
+    var p = OllamaProvider.init(std.testing.allocator, null, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "init stores api_key" {
+    const p = OllamaProvider.init(std.testing.allocator, null, "test-key");
+    try std.testing.expectEqualStrings("test-key", p.api_key.?);
+}
+
+test "init without api_key has null" {
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
+    try std.testing.expect(p.api_key == null);
+}
+
+test "buildAuthHeaders with api_key returns authorization header" {
+    const p = OllamaProvider.init(std.testing.allocator, null, "test-key");
+    var headers_buf: [1][]const u8 = undefined;
+    var auth_hdr_buf: [512]u8 = undefined;
+    const headers = try p.buildAuthHeaders(&headers_buf, &auth_hdr_buf);
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqualStrings("Authorization: Bearer test-key", headers[0]);
+}
+
+test "buildAuthHeaders without api_key returns empty" {
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
+    var headers_buf: [1][]const u8 = undefined;
+    var auth_hdr_buf: [512]u8 = undefined;
+    const headers = try p.buildAuthHeaders(&headers_buf, &auth_hdr_buf);
+    try std.testing.expectEqual(@as(usize, 0), headers.len);
+}
+
+test "buildAuthHeaders errors when api_key exceeds header buffer" {
+    // Regression: a too-long cloud key must fail closed instead of dropping auth.
+    const long_key = [_]u8{'a'} ** 600;
+    const p = OllamaProvider.init(std.testing.allocator, null, long_key[0..]);
+    var headers_buf: [1][]const u8 = undefined;
+    var auth_hdr_buf: [512]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, p.buildAuthHeaders(&headers_buf, &auth_hdr_buf));
 }
 
 // ─── Tool Call Tests ─────────────────────────────────────────────────────────

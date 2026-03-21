@@ -12,6 +12,7 @@ const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const OAUTH_REFRESH_TIMEOUT_SECS: u64 = 20;
+const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
 
 fn parseExpiresIn(v: std.json.Value) ?i64 {
     return switch (v) {
@@ -790,6 +791,10 @@ pub const GeminiProvider = struct {
             argc += 1;
         }
 
+        // Match the generic SSE helper: if the stream goes idle for 60 seconds,
+        // let curl fail fast instead of waiting for the full --max-time budget.
+        sse.appendCurlStallDetectionArgs(argv_buf[0..], &argc);
+
         argv_buf[argc] = "-X";
         argc += 1;
         argv_buf[argc] = "POST";
@@ -1086,11 +1091,20 @@ pub const GeminiProvider = struct {
         return stream_result catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("Gemini streaming failed with {}; falling back to non-streaming response", .{err});
-                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                var fallback_request = request;
+                fallback_request.timeout_secs = streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
                 return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;
         };
+    }
+
+    pub fn streamingFallbackTimeoutSecs(request_timeout_secs: u64) u64 {
+        if (request_timeout_secs > 0 and request_timeout_secs < STREAMING_FALLBACK_TIMEOUT_SECS) {
+            return request_timeout_secs;
+        }
+        return STREAMING_FALLBACK_TIMEOUT_SECS;
     }
 };
 
@@ -1486,6 +1500,14 @@ test "parseGeminiSseLine invalid json returns error" {
         error.InvalidSseJson,
         GeminiProvider.parseGeminiSseLine(std.testing.allocator, "data: not-json"),
     );
+}
+
+test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+    // Regression: Gemini/Vertex must not wait the full message_timeout_secs
+    // twice when both the streaming and fallback paths are slow.
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(0));
+    try std.testing.expectEqual(@as(u64, 45), GeminiProvider.streamingFallbackTimeoutSecs(45));
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(300));
 }
 
 test "streamChatImpl fails without credentials" {

@@ -719,7 +719,7 @@ pub fn freeSkills(allocator: std.mem.Allocator, skills_slice: []Skill) void {
 pub fn checkRequirements(allocator: std.mem.Allocator, skill: *Skill) void {
     var missing: std.ArrayListUnmanaged(u8) = .empty;
 
-    // Check required binaries via `which`
+    // Check required binaries via PATH lookup.
     for (skill.requires_bins) |bin| {
         const found = checkBinaryExists(allocator, bin);
         if (!found) {
@@ -751,9 +751,10 @@ pub fn checkRequirements(allocator: std.mem.Allocator, skill: *Skill) void {
     }
 }
 
-/// Check if a binary exists on PATH using `which`.
+/// Check if a binary exists on PATH using `which` (Unix) or `where` (Windows).
 fn checkBinaryExists(allocator: std.mem.Allocator, bin_name: []const u8) bool {
-    var child = std.process.Child.init(&.{ "which", bin_name }, allocator);
+    const cmd: []const u8 = if (zig_builtin.os.tag == .windows) "where" else "which";
+    var child = std.process.Child.init(&.{ cmd, bin_name }, allocator);
     child.stderr_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
 
@@ -4140,7 +4141,9 @@ test "checkRequirements detects missing env var" {
 
 test "checkBinaryExists finds common binary" {
     const allocator = std.testing.allocator;
-    try std.testing.expect(checkBinaryExists(allocator, "ls"));
+    // Use platform-appropriate binary: 'cmd' on Windows, 'ls' on Unix
+    const bin_name: []const u8 = if (zig_builtin.os.tag == .windows) "cmd" else "ls";
+    try std.testing.expect(checkBinaryExists(allocator, bin_name));
 }
 
 test "checkBinaryExists returns false for nonexistent binary" {

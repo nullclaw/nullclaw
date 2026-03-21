@@ -5,6 +5,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const cron_gateway = @import("cron_gateway.zig");
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 /// CronRemove tool — removes a scheduled cron job by its ID.
@@ -30,6 +31,20 @@ pub const CronRemoveTool = struct {
 
         if (job_id.len == 0)
             return ToolResult.fail("Missing required parameter: job_id");
+
+        const gateway_body = cron_gateway.buildIdBody(allocator, job_id) catch null;
+        if (gateway_body) |json_body| {
+            defer allocator.free(json_body);
+            switch (cron.requestGatewayPost(allocator, "/cron/remove", json_body)) {
+                .unavailable => {},
+                .response => |resp| {
+                    if (resp.status_code >= 200 and resp.status_code < 300) {
+                        return ToolResult{ .success = true, .output = resp.body };
+                    }
+                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                },
+            }
+        }
 
         var scheduler = loadScheduler(allocator) catch {
             return ToolResult.fail("Failed to load scheduler state");
@@ -113,4 +128,13 @@ test "cron_remove empty job_id" {
     const result = try tool_iface.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "job_id") != null);
+}
+
+test "cron_remove gateway request body includes id" {
+    const body = try cron_gateway.buildIdBody(std.testing.allocator, "job-123");
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("job-123", parsed.value.object.get("id").?.string);
 }

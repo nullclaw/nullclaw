@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
@@ -12,7 +13,10 @@ const ToolCall = root.ToolCall;
 const TokenUsage = root.TokenUsage;
 
 const log = std.log.scoped(.compatible);
-const MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
+/// Legacy default kept as a named constant for tests only.
+/// Runtime code uses OpenAiCompatibleProvider.max_streaming_prompt_bytes (null = no limit).
+const DEFAULT_MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
+const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
 
 fn logCompatibleApiError(
     allocator: std.mem.Allocator,
@@ -26,6 +30,22 @@ fn logCompatibleApiError(
 
     const preview = sanitized orelse "<api error body unavailable>";
     log.err("{s} {s}: {s} {s}", .{ provider_name, @errorName(err), url, preview });
+}
+
+fn returnLoggedCompatibleApiError(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    err: anyerror,
+    url: []const u8,
+    resp_body: []const u8,
+) anyerror!T {
+    // Tests assert error propagation on this path; skip log side effects there
+    // because Zig's test runner treats unexpected stderr logs as failures.
+    if (!builtin.is_test) {
+        logCompatibleApiError(allocator, provider_name, err, url, resp_body);
+    }
+    return err;
 }
 
 fn parseStatusCodeValue(value: std.json.Value) ?u16 {
@@ -143,6 +163,11 @@ pub const AuthStyle = enum {
     }
 };
 
+pub const CompatibleApiMode = enum {
+    chat_completions,
+    responses,
+};
+
 /// A provider that speaks the OpenAI-compatible chat completions API.
 ///
 /// Used by: Venice, Vercel, Cloudflare, Moonshot, Synthetic, OpenCode,
@@ -167,11 +192,14 @@ pub const OpenAiCompatibleProvider = struct {
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// When false, the agent uses XML tool format via system prompt.
     native_tools: bool = true,
+    /// When true, disable streaming (force non-streaming requests).
+    /// Required for providers where native tool_calls only work in non-streaming mode.
+    disable_streaming: bool = false,
     /// When set, cap max_tokens in non-streaming requests to this value.
     /// Some providers (e.g. Fireworks) reject large max_tokens without streaming.
     max_tokens_non_streaming: ?u32 = null,
-    /// When true, include `"thinking":{"type":"enabled"}` in request bodies
-    /// when reasoning_effort is set. Required by Z.AI/GLM thinking models.
+    /// When true, include `"thinking":{"type":"enabled|disabled"}` in request
+    /// bodies so Z.AI/GLM models do not fall back to server-side defaults.
     thinking_param: bool = false,
     /// When true, include `"enable_thinking":true` in request bodies
     /// when reasoning_effort is set. Required by Qwen (DashScope compatible mode).
@@ -182,6 +210,12 @@ pub const OpenAiCompatibleProvider = struct {
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Primary OpenAI-compatible protocol to use for this provider.
+    api_mode: CompatibleApiMode = .chat_completions,
+    /// Maximum estimated request text bytes before streaming is skipped.
+    /// null means no limit — streaming is always attempted.
+    /// Set via per-provider config field `max_streaming_prompt_bytes`.
+    max_streaming_prompt_bytes: ?usize = null,
     allocator: std.mem.Allocator,
 
     const think_open_tag = "<think>";
@@ -302,106 +336,472 @@ pub const OpenAiCompatibleProvider = struct {
         return total;
     }
 
-    /// Build a Responses API request JSON body.
+    /// Returns true when the streaming path should be skipped in favour of the
+    /// non-streaming fallback.  When `limit` is null (the default) this always
+    /// returns false — i.e. always attempt streaming regardless of payload size.
+    pub fn shouldSkipStreaming(limit: ?usize, request: ChatRequest) bool {
+        const l = limit orelse return false;
+        return estimateRequestTextBytes(request) >= l;
+    }
+
+    fn streamingFallbackTimeoutSecs(request_timeout_secs: u64) u64 {
+        if (request_timeout_secs > 0 and request_timeout_secs < STREAMING_FALLBACK_TIMEOUT_SECS) {
+            return request_timeout_secs;
+        }
+        return STREAMING_FALLBACK_TIMEOUT_SECS;
+    }
+
+    fn appendResponsesMessageText(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        msg: ChatMessage,
+    ) !bool {
+        if (msg.content_parts) |parts| {
+            var wrote = false;
+            for (parts) |part| {
+                switch (part) {
+                    .text => |text| {
+                        const trimmed = std.mem.trim(u8, text, " \t\n\r");
+                        if (trimmed.len == 0) continue;
+                        if (wrote) try buf.appendSlice(allocator, "\n");
+                        try buf.appendSlice(allocator, trimmed);
+                        wrote = true;
+                    },
+                    else => {},
+                }
+            }
+            return wrote;
+        }
+
+        const trimmed = std.mem.trim(u8, msg.content, " \t\n\r");
+        if (trimmed.len == 0) return false;
+        try buf.appendSlice(allocator, trimmed);
+        return true;
+    }
+
+    fn collectResponsesInstructions(allocator: std.mem.Allocator, messages: []const ChatMessage) !?[]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        for (messages) |msg| {
+            if (msg.role != .system) continue;
+            const before = buf.items.len;
+            if (before > 0) try buf.appendSlice(allocator, "\n\n");
+            const wrote = try appendResponsesMessageText(&buf, allocator, msg);
+            if (!wrote) buf.items.len = before;
+        }
+
+        if (buf.items.len == 0) {
+            buf.deinit(allocator);
+            return null;
+        }
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn appendResponsesContentPart(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        part: ContentPart,
+    ) !void {
+        switch (part) {
+            .text => |text| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":");
+                try root.appendJsonString(buf, allocator, text);
+                try buf.append(allocator, '}');
+            },
+            .image_url => |img| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":");
+                try root.appendJsonString(buf, allocator, img.url);
+                try buf.appendSlice(allocator, ",\"detail\":");
+                try root.appendJsonString(buf, allocator, img.detail.toSlice());
+                try buf.append(allocator, '}');
+            },
+            .image_base64 => |img| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":\"data:");
+                try buf.appendSlice(allocator, img.media_type);
+                try buf.appendSlice(allocator, ";base64,");
+                try buf.appendSlice(allocator, img.data);
+                try buf.appendSlice(allocator, "\"}");
+            },
+        }
+    }
+
+    fn appendResponsesMessageContent(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        msg: ChatMessage,
+    ) !void {
+        if (msg.content_parts) |parts| {
+            try buf.append(allocator, '[');
+            var first = true;
+            for (parts) |part| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                try appendResponsesContentPart(buf, allocator, part);
+            }
+            try buf.append(allocator, ']');
+            return;
+        }
+        try root.appendJsonString(buf, allocator, msg.content);
+    }
+
+    fn serializeResponsesInputInto(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        messages: []const ChatMessage,
+    ) !void {
+        var first = true;
+        for (messages) |msg| {
+            if (msg.role == .system) continue;
+            if (!first) try buf.append(allocator, ',');
+            first = false;
+
+            switch (msg.role) {
+                .user, .assistant => {
+                    try buf.appendSlice(allocator, "{\"type\":\"message\",\"role\":\"");
+                    try buf.appendSlice(allocator, msg.role.toSlice());
+                    try buf.appendSlice(allocator, "\",\"content\":");
+                    try appendResponsesMessageContent(buf, allocator, msg);
+                    try buf.append(allocator, '}');
+                },
+                .tool => {
+                    try buf.appendSlice(allocator, "{\"type\":\"function_call_output\",\"call_id\":");
+                    try root.appendJsonString(buf, allocator, msg.tool_call_id orelse "unknown");
+                    try buf.appendSlice(allocator, ",\"output\":");
+                    try root.appendJsonString(buf, allocator, msg.content);
+                    try buf.append(allocator, '}');
+                },
+                .system => unreachable,
+            }
+        }
+    }
+
+    fn appendResponsesGenerationFields(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        model: []const u8,
+        temperature: f64,
+        max_tokens: ?u32,
+        reasoning_effort: ?[]const u8,
+    ) !void {
+        const normalized_effort = root.normalizeOpenAiReasoningEffort(reasoning_effort);
+        const effort_is_none = if (normalized_effort) |re| std.mem.eql(u8, re, "none") else false;
+
+        if (!root.isReasoningModel(model) or effort_is_none) {
+            try buf.appendSlice(allocator, ",\"temperature\":");
+            var temp_buf: [16]u8 = undefined;
+            const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
+            try buf.appendSlice(allocator, temp_str);
+        }
+
+        if (max_tokens) |max_tok| {
+            try buf.appendSlice(allocator, ",\"max_output_tokens\":");
+            var max_buf: [16]u8 = undefined;
+            const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
+            try buf.appendSlice(allocator, max_str);
+        }
+
+        if (normalized_effort) |re| {
+            if (!std.mem.eql(u8, re, "none")) {
+                try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
+                try root.appendJsonString(buf, allocator, re);
+                try buf.append(allocator, '}');
+            }
+        }
+    }
+
+    /// Build a Responses API request JSON body from a full ChatRequest.
     pub fn buildResponsesRequestBody(
         allocator: std.mem.Allocator,
-        system_prompt: ?[]const u8,
-        message: []const u8,
+        request: ChatRequest,
         model: []const u8,
+        temperature: f64,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
-        try buf.appendSlice(allocator, "{\"model\":\"");
-        try buf.appendSlice(allocator, model);
-        try buf.appendSlice(allocator, "\",\"input\":[{\"role\":\"user\",\"content\":");
-        try root.appendJsonString(&buf, allocator, message);
-        try buf.appendSlice(allocator, "}]");
+        const instructions = try collectResponsesInstructions(allocator, request.messages);
+        defer if (instructions) |text| allocator.free(text);
 
-        if (system_prompt) |sys| {
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"input\":[");
+        try serializeResponsesInputInto(&buf, allocator, request.messages);
+        try buf.append(allocator, ']');
+
+        if (instructions) |text| {
             try buf.appendSlice(allocator, ",\"instructions\":");
-            try root.appendJsonString(&buf, allocator, sys);
+            try root.appendJsonString(&buf, allocator, text);
+        }
+
+        try appendResponsesGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+
+        if (request.tools) |tools| {
+            if (tools.len > 0) {
+                try buf.appendSlice(allocator, ",\"tools\":");
+                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+            }
         }
 
         try buf.appendSlice(allocator, ",\"stream\":false}");
         return try buf.toOwnedSlice(allocator);
     }
 
-    /// Extract text from a Responses API JSON response.
-    /// Checks output_text first, then output[*].content[*] with type "output_text",
-    /// then any text in output[*].content[*].
-    pub fn extractResponsesText(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-        defer parsed.deinit();
-        const root_obj = parsed.value.object;
+    fn extractResponsesOutputText(
+        allocator: std.mem.Allocator,
+        root_obj: std.json.ObjectMap,
+    ) !?[]const u8 {
+        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer text_buf.deinit(allocator);
 
-        // Check top-level output_text first
         if (root_obj.get("output_text")) |ot| {
             if (ot == .string) {
                 const trimmed = std.mem.trim(u8, ot.string, " \t\n\r");
-                if (trimmed.len > 0) {
-                    return stripThinkBlocks(allocator, trimmed);
-                }
+                if (trimmed.len > 0) try text_buf.appendSlice(allocator, trimmed);
             }
         }
 
-        // Walk output[*].content[*] looking for type "output_text"
         if (root_obj.get("output")) |output_arr| {
-            for (output_arr.array.items) |item| {
-                if (item.object.get("content")) |content_arr| {
-                    for (content_arr.array.items) |content| {
-                        const cobj = content.object;
-                        if (cobj.get("type")) |t| {
-                            if (t == .string and std.mem.eql(u8, t.string, "output_text")) {
-                                if (cobj.get("text")) |text| {
-                                    if (text == .string) {
-                                        const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
-                                        if (trimmed.len > 0) {
-                                            return stripThinkBlocks(allocator, trimmed);
-                                        }
-                                    }
-                                }
-                            }
+            if (output_arr == .array) {
+                for (output_arr.array.items) |item| {
+                    if (item != .object) continue;
+                    const item_obj = item.object;
+                    if (item_obj.get("role")) |role_val| {
+                        if (role_val != .string or !std.mem.eql(u8, role_val.string, "assistant")) continue;
+                    }
+                    if (item_obj.get("content")) |content_arr| {
+                        if (content_arr != .array) continue;
+                        for (content_arr.array.items) |content| {
+                            if (content != .object) continue;
+                            const text_val = content.object.get("text") orelse continue;
+                            if (text_val != .string) continue;
+                            const trimmed = std.mem.trim(u8, text_val.string, " \t\n\r");
+                            if (trimmed.len == 0) continue;
+                            if (text_buf.items.len > 0) try text_buf.appendSlice(allocator, "\n\n");
+                            try text_buf.appendSlice(allocator, trimmed);
                         }
                     }
                 }
             }
         }
 
-        // Fallback: any text in output[*].content[*]
-        if (root_obj.get("output")) |output_arr| {
-            for (output_arr.array.items) |item| {
-                if (item.object.get("content")) |content_arr| {
-                    for (content_arr.array.items) |content| {
-                        if (content.object.get("text")) |text| {
-                            if (text == .string) {
-                                const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
-                                if (trimmed.len > 0) {
-                                    return stripThinkBlocks(allocator, trimmed);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if (text_buf.items.len == 0) {
+            text_buf.deinit(allocator);
+            return null;
         }
 
+        const raw = try text_buf.toOwnedSlice(allocator);
+        errdefer allocator.free(raw);
+        const cleaned = try stripThinkBlocks(allocator, raw);
+        allocator.free(raw);
+        if (cleaned.len == 0) {
+            allocator.free(cleaned);
+            return null;
+        }
+        return cleaned;
+    }
+
+    fn extractResponsesToolCalls(
+        allocator: std.mem.Allocator,
+        root_obj: std.json.ObjectMap,
+    ) ![]const ToolCall {
+        const output_arr = root_obj.get("output") orelse return try allocator.alloc(ToolCall, 0);
+        if (output_arr != .array) return try allocator.alloc(ToolCall, 0);
+
+        var tool_calls: std.ArrayListUnmanaged(ToolCall) = .empty;
+        errdefer {
+            for (tool_calls.items) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            tool_calls.deinit(allocator);
+        }
+
+        for (output_arr.array.items) |item| {
+            if (item != .object) continue;
+            const item_obj = item.object;
+            const type_val = item_obj.get("type") orelse continue;
+            if (type_val != .string or !std.mem.eql(u8, type_val.string, "function_call")) continue;
+
+            const id = if (item_obj.get("call_id")) |call_id|
+                if (call_id == .string) try allocator.dupe(u8, call_id.string) else try allocator.dupe(u8, "unknown")
+            else
+                try allocator.dupe(u8, "unknown");
+            errdefer allocator.free(id);
+
+            const name = if (item_obj.get("name")) |name_val|
+                if (name_val == .string) try allocator.dupe(u8, name_val.string) else try allocator.dupe(u8, "")
+            else
+                try allocator.dupe(u8, "");
+            errdefer allocator.free(name);
+
+            const arguments = if (item_obj.get("arguments")) |args_val|
+                if (args_val == .string) try allocator.dupe(u8, args_val.string) else try allocator.dupe(u8, "{}")
+            else
+                try allocator.dupe(u8, "{}");
+            errdefer allocator.free(arguments);
+
+            try tool_calls.append(allocator, .{
+                .id = id,
+                .name = name,
+                .arguments = arguments,
+            });
+        }
+
+        return try tool_calls.toOwnedSlice(allocator);
+    }
+
+    fn extractResponsesReasoning(
+        allocator: std.mem.Allocator,
+        root_obj: std.json.ObjectMap,
+    ) !?[]u8 {
+        const output_arr = root_obj.get("output") orelse return null;
+        if (output_arr != .array) return null;
+
+        for (output_arr.array.items) |item| {
+            if (item != .object) continue;
+            const item_obj = item.object;
+            const type_val = item_obj.get("type") orelse continue;
+            if (type_val != .string or !std.mem.eql(u8, type_val.string, "reasoning")) continue;
+
+            if (item_obj.get("summary")) |summary_val| {
+                switch (summary_val) {
+                    .string => |summary| {
+                        if (summary.len > 0) return try allocator.dupe(u8, summary);
+                    },
+                    .array => |summary_arr| {
+                        for (summary_arr.items) |summary_item| {
+                            if (summary_item != .object) continue;
+                            const text_val = summary_item.object.get("text") orelse continue;
+                            if (text_val == .string and text_val.string.len > 0) {
+                                return try allocator.dupe(u8, text_val.string);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (item_obj.get("content")) |content| {
+                if (content == .string and content.string.len > 0) return try allocator.dupe(u8, content.string);
+            }
+        }
+        return null;
+    }
+
+    fn extractResponsesUsage(root_obj: std.json.ObjectMap) TokenUsage {
+        var usage = TokenUsage{};
+        const usage_obj = root_obj.get("usage") orelse return usage;
+        if (usage_obj != .object) return usage;
+
+        if (usage_obj.object.get("input_tokens")) |v| {
+            if (v == .integer) usage.prompt_tokens = @intCast(v.integer);
+        }
+        if (usage_obj.object.get("output_tokens")) |v| {
+            if (v == .integer) usage.completion_tokens = @intCast(v.integer);
+        }
+        if (usage_obj.object.get("total_tokens")) |v| {
+            if (v == .integer) usage.total_tokens = @intCast(v.integer);
+        }
+        return usage;
+    }
+
+    pub fn parseResponsesResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.NoResponseContent;
+
+        const root_obj = parsed.value.object;
+
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("compatible", sanitized orelse summary);
+            return mapped_err;
+        }
+
+        const content = try extractResponsesOutputText(allocator, root_obj);
+        errdefer if (content) |text| allocator.free(text);
+
+        const tool_calls = try extractResponsesToolCalls(allocator, root_obj);
+        errdefer {
+            for (tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(tool_calls);
+        }
+
+        const reasoning = try extractResponsesReasoning(allocator, root_obj);
+        errdefer if (reasoning) |text| allocator.free(text);
+
+        if (content == null and tool_calls.len == 0 and reasoning == null) {
+            return error.NoResponseContent;
+        }
+
+        const model_str = if (root_obj.get("model")) |m|
+            if (m == .string and m.string.len > 0) try allocator.dupe(u8, m.string) else ""
+        else
+            "";
+
+        return .{
+            .content = content,
+            .tool_calls = tool_calls,
+            .usage = extractResponsesUsage(root_obj),
+            .model = model_str,
+            .reasoning_content = reasoning,
+        };
+    }
+
+    /// Extract plain text from a Responses response.
+    pub fn extractResponsesText(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+        var response = try parseResponsesResponse(allocator, body);
+        errdefer {
+            if (response.content) |text| allocator.free(text);
+            for (response.tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(response.tool_calls);
+            if (response.model.len > 0) allocator.free(response.model);
+            if (response.reasoning_content) |text| allocator.free(text);
+        }
+        if (response.content) |text| {
+            const result = text;
+            response.content = null;
+            for (response.tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(response.tool_calls);
+            if (response.model.len > 0) allocator.free(response.model);
+            if (response.reasoning_content) |reasoning| allocator.free(reasoning);
+            return result;
+        }
         return error.NoResponseContent;
     }
 
-    /// Chat via the Responses API endpoint (fallback when chat completions returns 404).
+    /// Chat via the Responses API endpoint using a full ChatRequest.
     pub fn chatViaResponses(
         self: OpenAiCompatibleProvider,
         allocator: std.mem.Allocator,
-        system_prompt: ?[]const u8,
-        message: []const u8,
+        request: ChatRequest,
         model: []const u8,
+        temperature: f64,
         timeout_secs: u64,
-    ) ![]const u8 {
+    ) !ChatResponse {
         const url = try self.responsesUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildResponsesRequestBody(allocator, system_prompt, message, model);
+        const body = try buildResponsesRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -429,7 +829,10 @@ pub const OpenAiCompatibleProvider = struct {
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        return extractResponsesText(allocator, resp_body);
+        return parseResponsesResponse(allocator, resp_body) catch |err| {
+            logCompatibleApiError(allocator, self.name, err, url, resp_body);
+            return err;
+        };
     }
 
     /// Build a chat request JSON body.
@@ -594,6 +997,44 @@ pub const OpenAiCompatibleProvider = struct {
         ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
     }
 
+    fn extractMessageText(allocator: std.mem.Allocator, msg_obj: std.json.ObjectMap) !?[]const u8 {
+        const content = msg_obj.get("content") orelse return null;
+
+        switch (content) {
+            .string => {
+                const trimmed = std.mem.trim(u8, content.string, " \t\n\r");
+                if (trimmed.len == 0) return null;
+                return try allocator.dupe(u8, trimmed);
+            },
+            .array => {
+                var text_parts: std.ArrayListUnmanaged(u8) = .empty;
+                defer text_parts.deinit(allocator);
+
+                for (content.array.items) |part| {
+                    var candidate: ?[]const u8 = null;
+                    switch (part) {
+                        .string => candidate = part.string,
+                        .object => {
+                            if (part.object.get("text")) |text| {
+                                if (text == .string) candidate = text.string;
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (candidate) |text_value| {
+                        try text_parts.appendSlice(allocator, text_value);
+                    }
+                }
+
+                const trimmed = std.mem.trim(u8, text_parts.items, " \t\n\r");
+                if (trimmed.len == 0) return null;
+                return try allocator.dupe(u8, trimmed);
+            },
+            else => return null,
+        }
+    }
+
     /// Parse text content from an OpenAI-compatible response.
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -613,10 +1054,11 @@ pub const OpenAiCompatibleProvider = struct {
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
-                    if (msg.object.get("content")) |content| {
-                        if (content == .string) {
-                            return stripThinkBlocks(allocator, content.string);
-                        }
+                    const msg_obj = msg.object;
+
+                    if (try extractMessageText(allocator, msg_obj)) |text| {
+                        defer allocator.free(text);
+                        return stripThinkBlocks(allocator, text);
                     }
                 }
             }
@@ -647,13 +1089,14 @@ pub const OpenAiCompatibleProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                errdefer if (content) |c| if (c.len > 0) allocator.free(c);
                 var reasoning_content: ?[]const u8 = null;
-                if (msg_obj.get("content")) |c| {
-                    if (c == .string) {
-                        const split = try splitThinkContent(allocator, c.string);
-                        content = split.visible;
-                        reasoning_content = split.reasoning;
-                    }
+                errdefer if (reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+                if (try extractMessageText(allocator, msg_obj)) |message_text| {
+                    defer allocator.free(message_text);
+                    const split = try splitThinkContent(allocator, message_text);
+                    content = split.visible;
+                    reasoning_content = split.reasoning;
                 }
                 // Fallback: some providers return reasoning in native fields.
                 // - Z.AI/GLM: `reasoning_content`
@@ -672,6 +1115,14 @@ pub const OpenAiCompatibleProvider = struct {
                 }
 
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
+                errdefer {
+                    for (tool_calls_list.items) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    tool_calls_list.deinit(allocator);
+                }
 
                 if (msg_obj.get("tool_calls")) |tc_arr| {
                     for (tc_arr.array.items) |tc| {
@@ -692,6 +1143,19 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
 
+                // Treat a response with no content, no tool calls, and no reasoning as empty.
+                // This happens when the model hits its context limit and returns finish_reason=length
+                // with a null or empty content field. Returning NoResponseContent here lets the
+                // agent's empty-response retry and model-fallback logic engage rather than
+                // silently succeeding with nothing to show.
+                const has_content = content != null and content.?.len > 0;
+                const has_tools = tool_calls_list.items.len > 0;
+                const has_reasoning = reasoning_content != null and reasoning_content.?.len > 0;
+                if (!has_content and !has_tools and !has_reasoning) {
+                    log.warn("parseNativeResponse: response has no content, tool calls, or reasoning; treating as NoResponseContent", .{});
+                    return error.NoResponseContent;
+                }
+
                 var usage = TokenUsage{};
                 if (root_obj.get("usage")) |usage_obj| {
                     if (usage_obj == .object) {
@@ -707,11 +1171,22 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
 
+                const owned_tool_calls = try tool_calls_list.toOwnedSlice(allocator);
+                errdefer {
+                    for (owned_tool_calls) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    if (owned_tool_calls.len > 0) allocator.free(owned_tool_calls);
+                }
+
                 const model_str = if (root_obj.get("model")) |m| (if (m == .string) try allocator.dupe(u8, m.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
+                errdefer if (model_str.len > 0) allocator.free(model_str);
 
                 return .{
                     .content = content,
-                    .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
+                    .tool_calls = owned_tool_calls,
                     .usage = usage,
                     .model = model_str,
                     .reasoning_content = reasoning_content,
@@ -742,6 +1217,41 @@ pub const OpenAiCompatibleProvider = struct {
         .supports_streaming = supportsStreamingImpl,
     };
 
+    fn buildSingleTurnMessages(
+        allocator: std.mem.Allocator,
+        system_prompt: ?[]const u8,
+        message: []const u8,
+        merge_system_into_user: bool,
+    ) ![]ChatMessage {
+        if (merge_system_into_user) {
+            if (system_prompt) |sp| {
+                const merged = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sp, message });
+                errdefer allocator.free(merged);
+                const messages = try allocator.alloc(ChatMessage, 1);
+                messages[0] = .{ .role = .user, .content = merged, .name = "__merged_system__" };
+                return messages;
+            }
+        }
+
+        const messages = try allocator.alloc(ChatMessage, if (system_prompt != null) 2 else 1);
+        if (system_prompt) |sp| {
+            messages[0] = ChatMessage.system(sp);
+            messages[1] = ChatMessage.user(message);
+        } else {
+            messages[0] = ChatMessage.user(message);
+        }
+        return messages;
+    }
+
+    fn freeSingleTurnMessages(allocator: std.mem.Allocator, messages: []ChatMessage) void {
+        for (messages) |msg| {
+            if (msg.role == .user and msg.name != null and std.mem.eql(u8, msg.name.?, "__merged_system__")) {
+                allocator.free(msg.content);
+            }
+        }
+        allocator.free(messages);
+    }
+
     fn streamChatImpl(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -753,12 +1263,17 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!root.StreamChatResult {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
-        const request_text_bytes = estimateRequestTextBytes(request);
 
-        if (request_text_bytes >= MAX_STREAMING_PROMPT_BYTES) {
+        if (self.api_mode == .responses) {
+            var fallback = try chatImpl(ptr, allocator, request, effective_model, temperature);
+            return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+        }
+
+        if (shouldSkipStreaming(self.max_streaming_prompt_bytes, request)) {
+            const request_text_bytes = estimateRequestTextBytes(request);
             log.warn(
                 "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
-                .{ self.name, request_text_bytes, MAX_STREAMING_PROMPT_BYTES },
+                .{ self.name, request_text_bytes, self.max_streaming_prompt_bytes.? },
             );
             const fallback = try chatImpl(ptr, allocator, request, model, temperature);
             if (fallback.content) |text| {
@@ -827,7 +1342,12 @@ pub const OpenAiCompatibleProvider = struct {
         ) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
-                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                // Cap the fallback timeout to 90 s — if streaming stalled (e.g. speed-limit
+                // triggered after 60 s of zero throughput) the non-streaming endpoint is
+                // likely slow too; avoid blocking for the full message_timeout_secs.
+                var fallback_request = request;
+                fallback_request.timeout_secs = streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
                 return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;
@@ -848,8 +1368,9 @@ pub const OpenAiCompatibleProvider = struct {
         return result;
     }
 
-    fn supportsStreamingImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return !self.disable_streaming and self.api_mode != .responses;
     }
 
     fn chatWithSystemImpl(
@@ -862,6 +1383,35 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror![]const u8 {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+
+        if (self.api_mode == .responses) {
+            const messages = try buildSingleTurnMessages(allocator, system_prompt, message, self.merge_system_into_user);
+            defer freeSingleTurnMessages(allocator, messages);
+
+            const request = ChatRequest{
+                .messages = messages,
+                .model = effective_model,
+                .temperature = temperature,
+                .timeout_secs = 0,
+            };
+
+            const response = try self.chatViaResponses(allocator, request, effective_model, temperature, 0);
+            defer {
+                if (response.content) |text| allocator.free(text);
+                for (response.tool_calls) |tc| {
+                    allocator.free(tc.id);
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                }
+                allocator.free(response.tool_calls);
+                if (response.model.len > 0) allocator.free(response.model);
+                if (response.reasoning_content) |text| allocator.free(text);
+            }
+
+            if (response.content) |text| return try allocator.dupe(u8, text);
+            return error.NoResponseContent;
+        }
+
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
@@ -909,10 +1459,30 @@ pub const OpenAiCompatibleProvider = struct {
         return parseTextResponse(allocator, resp_body) catch |err| {
             // Only switch protocols when chat-completions explicitly reports endpoint absence.
             if (self.supports_responses_fallback and shouldFallbackToResponses(allocator, resp_body)) {
-                return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model, 0) catch {
-                    logCompatibleApiError(allocator, self.name, err, url, resp_body);
-                    return err;
+                const fallback_messages = try buildSingleTurnMessages(allocator, eff_system, merged_msg orelse message, false);
+                defer freeSingleTurnMessages(allocator, fallback_messages);
+                const fallback_request = ChatRequest{
+                    .messages = fallback_messages,
+                    .model = effective_model,
+                    .temperature = temperature,
+                    .timeout_secs = 0,
                 };
+                const fallback_resp = self.chatViaResponses(allocator, fallback_request, effective_model, temperature, 0) catch |fallback_err| {
+                    return returnLoggedCompatibleApiError([]const u8, allocator, self.name, fallback_err, url, resp_body);
+                };
+                defer {
+                    if (fallback_resp.content) |text| allocator.free(text);
+                    for (fallback_resp.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments);
+                    }
+                    allocator.free(fallback_resp.tool_calls);
+                    if (fallback_resp.model.len > 0) allocator.free(fallback_resp.model);
+                    if (fallback_resp.reasoning_content) |text| allocator.free(text);
+                }
+                if (fallback_resp.content) |text| return try allocator.dupe(u8, text);
+                return error.NoResponseContent;
             }
             logCompatibleApiError(allocator, self.name, err, url, resp_body);
             return err;
@@ -928,11 +1498,15 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!ChatResponse {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+        const capped_request = self.capNonStreamingMaxTokens(request);
+
+        if (self.api_mode == .responses) {
+            return self.chatViaResponses(allocator, capped_request, effective_model, temperature, capped_request.timeout_secs);
+        }
 
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const capped_request = self.capNonStreamingMaxTokens(request);
         const body = try buildChatRequestBody(
             allocator,
             capped_request,
@@ -971,13 +1545,10 @@ pub const OpenAiCompatibleProvider = struct {
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        const result = parseNativeResponse(allocator, resp_body) catch |err| {
+        return parseNativeResponse(allocator, resp_body) catch |err| {
             logCompatibleApiError(allocator, self.name, err, url, resp_body);
             return err;
         };
-
-
-        return result;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
@@ -1114,8 +1685,12 @@ fn buildChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
-    if (thinking_param and reasoning_enabled) {
-        try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+    if (thinking_param) {
+        if (reasoning_enabled) {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+        } else {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"disabled\"}");
+        }
     }
     if (enable_thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"enable_thinking\":true");
@@ -1159,8 +1734,12 @@ fn buildStreamingChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
-    if (thinking_param and reasoning_enabled) {
-        try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+    if (thinking_param) {
+        if (reasoning_enabled) {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
+        } else {
+            try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"disabled\"}");
+        }
     }
     if (enable_thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"enable_thinking\":true");
@@ -1318,6 +1897,96 @@ test "parseNativeResponse reads native reasoning field (Groq/Cerebras parsed for
     try std.testing.expectEqualStrings("parsed reasoning trace", result.reasoning_content.?);
 }
 
+test "parseNativeResponse supports content array text parts" {
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}],"model":"kimi-k2.5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Hello from kimi-k2.5", result.content.?);
+    try std.testing.expect(result.reasoning_content == null);
+}
+
+test "parseNativeResponse null content with no tools or reasoning returns NoResponseContent" {
+    // Simulates GLM-5 hitting its context limit: finish_reason=length, content=null.
+    // All three payloads (content, tool_calls, reasoning_content) are absent/empty.
+    // parseNativeResponse must return NoResponseContent so the agent's retry/fallback chain engages.
+    const body =
+        \\{"choices":[{"message":{"content":null},"finish_reason":"length"}],"model":"glm-5"}
+    ;
+    try std.testing.expectError(
+        error.NoResponseContent,
+        OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body),
+    );
+}
+
+test "parseNativeResponse empty string content with no tools or reasoning returns NoResponseContent" {
+    const body =
+        \\{"choices":[{"message":{"content":""},"finish_reason":"length"}],"model":"glm-5"}
+    ;
+    try std.testing.expectError(
+        error.NoResponseContent,
+        OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body),
+    );
+}
+
+test "parseNativeResponse null content with reasoning_content succeeds" {
+    // Reasoning-only response (thinking model that produced a CoT but no final text) is valid.
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"step-by-step reasoning here"}}],"model":"glm-z1"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("step-by-step reasoning here", result.reasoning_content.?);
+}
+
+test "parseNativeResponse null content with native tool calls succeeds" {
+    // Models that emit tool_calls with no text content are valid — the agent should
+    // execute the tool, not treat the response as empty.
+    const body =
+        \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"list_dir","arguments":"{\"path\":\"/tmp\"}"}}]}}],"model":"glm-5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.tool_calls.len == 1);
+    try std.testing.expectEqualStrings("list_dir", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
+}
+
 test "buildChatRequestBody emits thinking param for GLM when reasoning_effort set" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
@@ -1370,17 +2039,17 @@ test "buildChatRequestBody emits reasoning_split when configured" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") != null);
 }
 
-test "buildChatRequestBody omits provider thinking params when reasoning_effort none" {
+test "buildChatRequestBody sends thinking disabled when reasoning_effort unset" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
     const req = root.ChatRequest{
         .messages = &msgs,
         .model = "glm-4.7-thinking",
-        .reasoning_effort = "none",
     };
     const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, true, true);
     defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    // Regression: GLM defaults deep thinking to enabled unless we explicitly send disabled.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }
@@ -1545,6 +2214,22 @@ test "parseTextResponse with null content fails" {
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
 }
 
+test "parseTextResponse does not surface reasoning_content as visible content" {
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"private chain of thought"}}]}
+    ;
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse supports content array text parts" {
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from kimi-k2.5", result);
+}
+
 test "AuthStyle headerName" {
     try std.testing.expectEqualStrings("authorization", AuthStyle.bearer.headerName());
     try std.testing.expectEqualStrings("x-api-key", AuthStyle.x_api_key.headerName());
@@ -1604,6 +2289,14 @@ test "capNonStreamingMaxTokens leaves request unchanged when limit is unset" {
 
     const capped = p.capNonStreamingMaxTokens(req);
     try std.testing.expectEqual(@as(?u32, 8000), capped.max_tokens);
+}
+
+test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+    // Regression: a provider that stalls on both streaming and non-streaming
+    // paths must not consume the full message_timeout_secs twice.
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(0));
+    try std.testing.expectEqual(@as(u64, 45), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(45));
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(300));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1669,6 +2362,22 @@ test "shouldFallbackToResponses only for explicit 404 payloads" {
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "not json at all"));
 }
 
+test "returnLoggedCompatibleApiError preserves fallback error" {
+    // Regression: when chat-completions 404 falls back to Responses, a failure
+    // on the second request must surface the Responses error, not the original one.
+    try std.testing.expectError(
+        error.RateLimited,
+        returnLoggedCompatibleApiError(
+            void,
+            std.testing.allocator,
+            "test",
+            error.RateLimited,
+            "https://example.com/v1/chat/completions",
+            "{\"error\":{\"message\":\"Too many requests\",\"status\":429}}",
+        ),
+    );
+}
+
 test "responsesUrl requires exact suffix match" {
     const p = OpenAiCompatibleProvider.init(
         std.testing.allocator,
@@ -1727,11 +2436,20 @@ test "extractResponsesText empty returns error" {
 }
 
 test "buildResponsesRequestBody with system" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.system("You are helpful"),
+        root.ChatMessage.user("hello"),
+    };
     const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
         std.testing.allocator,
-        "You are helpful",
-        "hello",
+        .{
+            .messages = &messages,
+            .model = "gpt-4o",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
         "gpt-4o",
+        0.7,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
@@ -1740,17 +2458,146 @@ test "buildResponsesRequestBody with system" {
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
 }
 
-test "buildResponsesRequestBody without system" {
+test "buildResponsesRequestBody preserves short system prompt" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.system("hi"),
+        root.ChatMessage.user("hello"),
+    };
     const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
         std.testing.allocator,
-        null,
-        "hello",
+        .{
+            .messages = &messages,
+            .model = "gpt-4o",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
         "gpt-4o",
+        0.7,
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"hi\"") != null);
+}
+
+test "buildResponsesRequestBody without system" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.user("hello"),
+    };
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        .{
+            .messages = &messages,
+            .model = "gpt-4o",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
+        "gpt-4o",
+        0.7,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "instructions") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+}
+
+test "buildResponsesRequestBody includes tools and tool results" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.user("list files"),
+        root.ChatMessage.toolMsg("done", "call_123"),
+    };
+    const tools = [_]root.ToolSpec{.{
+        .name = "bash",
+        .description = "Run shell command",
+        .parameters_json = "{\"type\":\"object\"}",
+    }};
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        .{
+            .messages = &messages,
+            .model = "gpt-5.4",
+            .temperature = 0.2,
+            .max_tokens = 512,
+            .tools = &tools,
+            .timeout_secs = 30,
+            .reasoning_effort = "medium",
+        },
+        "gpt-5.4",
+        0.2,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"function_call_output\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "call_123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_output_tokens\":512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"medium\"}") != null);
+}
+
+test "buildResponsesRequestBody includes image parts with responses schema" {
+    const parts = [_]root.ContentPart{
+        root.makeTextPart("describe this"),
+        root.makeImageUrlPart("https://example.com/cat.png"),
+        root.makeBase64ImagePart("Zm9v", "image/png"),
+    };
+    const messages = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "describe this",
+        .content_parts = &parts,
+    }};
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        .{
+            .messages = &messages,
+            .model = "gpt-4.1",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
+        "gpt-4.1",
+        0.7,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image_url\":\"https://example.com/cat.png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"detail\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image_url\":\"data:image/png;base64,Zm9v\"") != null);
+}
+
+test "parseResponsesResponse extracts function call text and reasoning summary" {
+    const body =
+        \\{"model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Need tool"}]},{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking summary"}]},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |text| std.testing.allocator.free(text);
+        for (result.tool_calls) |tc| {
+            std.testing.allocator.free(tc.id);
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |text| std.testing.allocator.free(text);
+    }
+
+    try std.testing.expectEqualStrings("Need tool", result.content.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", result.tool_calls[0].arguments);
+    try std.testing.expectEqual(@as(u32, 10), result.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 5), result.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 15), result.usage.total_tokens);
+    try std.testing.expectEqualStrings("gpt-5.4", result.model);
+    try std.testing.expectEqualStrings("thinking summary", result.reasoning_content.?);
+}
+
+test "parseResponsesResponse maps generic error envelope" {
+    const body =
+        \\{"error":{"message":"An error occurred while processing your request."}}
+    ;
+    try std.testing.expectError(error.ApiError, OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body));
 }
 
 test "AuthStyle custom headerName fallback" {
@@ -1791,25 +2638,32 @@ test "buildStreamingChatRequestBody contains stream true" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
 }
 
-test "buildStreamingChatRequestBody omits provider thinking params when reasoning_effort none" {
+test "buildStreamingChatRequestBody sends thinking disabled when reasoning_effort unset" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{
         .messages = &msgs,
         .model = "test-model",
-        .reasoning_effort = "none",
     };
     const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, true, true, true);
     defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    // Regression: GLM defaults deep thinking to enabled unless we explicitly send disabled.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }
 
-test "supportsStreaming returns true for compatible" {
+test "supportsStreaming returns true for compatible by default" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsStreaming());
+}
+
+test "supportsStreaming returns false when disable_streaming enabled" {
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "glm", "https://api.z.ai/api/paas/v4", "key", .bearer, null);
+    p.disable_streaming = true;
+    const prov = p.provider();
+    try std.testing.expect(!prov.supportsStreaming());
 }
 
 test "validateUserAgent rejects CRLF injection" {
@@ -2144,4 +2998,165 @@ test "merge_system_into_user streaming body also merges" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     const content = messages.items[0].object.get("content").?.string;
     try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be concise]") != null);
+}
+
+test "max_streaming_prompt_bytes null means no limit" {
+    // A provider with no limit set should never skip to non-streaming regardless of payload size.
+    const prov = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "test",
+        "https://api.example.com/v1",
+        "key",
+        .bearer,
+        null,
+    );
+    // null = no limit
+    try std.testing.expectEqual(@as(?usize, null), prov.max_streaming_prompt_bytes);
+}
+
+test "max_streaming_prompt_bytes set applies threshold" {
+    // A provider with a limit set should reflect it.
+    var prov = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "test",
+        "https://api.example.com/v1",
+        "key",
+        .bearer,
+        null,
+    );
+    prov.max_streaming_prompt_bytes = 65536;
+    try std.testing.expectEqual(@as(?usize, 65536), prov.max_streaming_prompt_bytes);
+
+    // A small message should be under the limit; a large one should exceed it.
+    const small_msgs = [_]root.ChatMessage{root.ChatMessage.user("hi")};
+    const small_req = root.ChatRequest{ .messages = &small_msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.estimateRequestTextBytes(small_req) < 65536);
+
+    const big_content = "x" ** 70000;
+    const big_msgs = [_]root.ChatMessage{root.ChatMessage.user(big_content)};
+    const big_req = root.ChatRequest{ .messages = &big_msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.estimateRequestTextBytes(big_req) >= 65536);
+}
+
+test "DEFAULT_MAX_STREAMING_PROMPT_BYTES legacy value is 32 KiB" {
+    try std.testing.expectEqual(@as(usize, 32 * 1024), DEFAULT_MAX_STREAMING_PROMPT_BYTES);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// shouldSkipStreaming — behavioural branch tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "shouldSkipStreaming: null limit never skips streaming" {
+    // Even a payload larger than the old 32 KiB hardcoded limit must NOT skip
+    // when max_streaming_prompt_bytes is null (the new default).
+    const big_content = "x" ** 70000; // 70 KiB > old 32 KiB limit
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(big_content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+test "shouldSkipStreaming: below limit does not skip" {
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    // limit = 1 MiB, 5 bytes << 1 MiB
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(1024 * 1024, req));
+}
+
+test "shouldSkipStreaming: at limit skips" {
+    // Content of exactly `limit` bytes should trigger the fallback.
+    const content = "a" ** 100;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(100, req));
+}
+
+test "shouldSkipStreaming: above limit skips" {
+    const content = "a" ** 101;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(100, req));
+}
+
+test "shouldSkipStreaming: old 32KiB limit would have skipped typical session with 50 MCP tools" {
+    // Regression: with the old hardcoded 32 KiB threshold a session loaded with
+    // 50 Vikunja tools (~46-48 KiB of text) always fell back to non-streaming.
+    // The new default (null) must never skip it.
+    const content = "x" ** 48000; // representative of typical session text estimate
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+
+    // Old hardcoded limit would have skipped.
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(DEFAULT_MAX_STREAMING_PROMPT_BYTES, req));
+    // New default (null) must not skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// estimateRequestTextBytes — edge cases (GAP-6, GAP-7, GAP-8)
+// ════════════════════════════════════════════════════════════════════════════
+
+test "estimateRequestTextBytes: empty messages slice returns zero" {
+    // GAP-6: Must not crash on an empty slice and must return 0.
+    const req = root.ChatRequest{ .messages = &.{}, .model = "m" };
+    try std.testing.expectEqual(@as(usize, 0), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+test "estimateRequestTextBytes: counts content_parts text and ignores non-text" {
+    // GAP-7: Only text parts inside content_parts should be counted; image
+    // parts must not contribute to the byte total.
+    const text_part = root.ContentPart{ .text = "hello world" }; // 11 bytes
+    const image_part = root.ContentPart{ .image_url = .{ .url = "https://x.com/img.jpg", .detail = .auto } };
+    var parts = [_]root.ContentPart{ text_part, image_part };
+    const msg = root.ChatMessage{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    };
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{msg}, .model = "m" };
+    // Only "hello world" (11 bytes) — not the image URL — is counted.
+    try std.testing.expectEqual(@as(usize, 11), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+test "estimateRequestTextBytes: accumulates across multiple messages" {
+    // GAP-8: Total must be the sum across all messages, not just the last.
+    const m1 = root.ChatMessage.user("aaa"); // 3 bytes
+    const m2 = root.ChatMessage.user("bbbb"); // 4 bytes
+    const m3 = root.ChatMessage.user("ccccc"); // 5 bytes
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{ m1, m2, m3 }, .model = "m" };
+    try std.testing.expectEqual(@as(usize, 12), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// shouldSkipStreaming — additional edge cases (GAP-9, GAP-10, GAP-11)
+// ════════════════════════════════════════════════════════════════════════════
+
+test "shouldSkipStreaming: zero limit skips any non-empty request" {
+    // GAP-9: A limit of 0 means every message (≥1 byte) should fall back.
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("x")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(0, req));
+}
+
+test "shouldSkipStreaming: empty request never skips regardless of limit" {
+    // GAP-10: Zero-byte payload is always below any limit (including 0 is
+    // 0 >= 0 = true — but an empty messages slice returns 0 bytes, and 0 >= 0
+    // means a zero limit would still skip an empty request; document actual behaviour).
+    const req = root.ChatRequest{ .messages = &.{}, .model = "m" };
+    // With a non-zero limit: 0 bytes < limit → no skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(1, req));
+    // With null: always no skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds limit" {
+    // GAP-11: Threshold must apply to the accumulated total, not per-message.
+    // Three messages of 10 bytes each = 30 bytes total; limit = 25.
+    const m1 = root.ChatMessage.user("aaaaaaaaaa"); // 10
+    const m2 = root.ChatMessage.user("bbbbbbbbbb"); // 10
+    const m3 = root.ChatMessage.user("cccccccccc"); // 10 → total 30
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{ m1, m2, m3 }, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(25, req));
+    // Individual messages are each under the limit; verify the sum is what matters.
+    const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
 }

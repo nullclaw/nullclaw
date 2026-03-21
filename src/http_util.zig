@@ -264,6 +264,14 @@ pub fn curlPostWithStatus(
     return curlPostWithStatusAndTimeout(allocator, url, body, headers, null);
 }
 
+pub fn curlGetWithStatus(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+) !HttpResponse {
+    return curlGetWithStatusAndTimeout(allocator, url, headers, null);
+}
+
 /// HTTP POST via curl subprocess and include HTTP status code in response,
 /// with optional --max-time timeout.
 /// Caller owns `response.body`.
@@ -525,6 +533,93 @@ pub fn curlPostWithStatusHeadersAndTimeout(
         .status_code = status_code,
         .headers = headers_out,
         .body = body_out,
+    };
+}
+
+pub fn curlGetWithStatusAndTimeout(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+) !HttpResponse {
+    var argv_buf: [48][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+
+    if (max_time) |mt| {
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = mt;
+        argc += 1;
+    }
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    argv_buf[argc] = "-w";
+    argc += 1;
+    argv_buf[argc] = "\n%{http_code}";
+    argc += 1;
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+    const cancel_flag = thread_interrupt_flag;
+    var cancel_done = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_GET_MAX_BYTES) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
+    };
+    errdefer allocator.free(stdout);
+
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            logCurlExitFailure("GET", code);
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
+        },
+        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+    }
+
+    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
+    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
+    if (status_raw.len != 3) return error.CurlParseError;
+    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
+    const body_slice = stdout[0..status_sep];
+    const response_body = try allocator.dupe(u8, body_slice);
+    allocator.free(stdout);
+
+    return .{
+        .status_code = status_code,
+        .body = response_body,
     };
 }
 
@@ -831,6 +926,10 @@ test "curlPostWithProxy header guard allows at most (argv_buf_len - base_args) /
 }
 
 test "curlPostWithStatus compiles and is callable" {
+    try std.testing.expect(true);
+}
+
+test "curlGetWithStatus compiles and is callable" {
     try std.testing.expect(true);
 }
 

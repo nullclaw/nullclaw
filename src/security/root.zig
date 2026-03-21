@@ -12,6 +12,7 @@ pub const audit = @import("audit.zig");
 pub const policy = @import("policy.zig");
 pub const pairing = @import("pairing.zig");
 pub const secrets = @import("secrets.zig");
+pub const tencent_crypto = @import("tencent_crypto.zig");
 pub const sandbox = @import("sandbox.zig");
 pub const tracker = @import("tracker.zig");
 pub const landlock = @import("landlock.zig");

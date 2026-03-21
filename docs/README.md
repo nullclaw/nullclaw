@@ -23,6 +23,8 @@ Highlighted extension docs:
 
 - [English external channel plugin guide](./en/external-channels.md)
 - [中文外部渠道插件指南](./zh/external-channels.md)
+- [English DingTalk ops readiness guide](./en/ops/dingtalk-ops-readiness.md)
+- [中文 DingTalk 运维就绪指南](./zh/ops/dingtalk-ops-readiness.md)
 
 ## Contributing
 

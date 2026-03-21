@@ -71,6 +71,33 @@ nullclaw onboard --interactive
 
 ## 核心配置块说明
 
+### `diagnostics`
+
+- 用于控制运行时诊断与可观测性输出。
+- 配置 OpenTelemetry 时，请使用嵌套的 `diagnostics.otel` 对象。
+- OTEL spans 会在回合完成、agent 结束等自然运行边界触发 flush；更长运行流程仍保留批量 flush 作为兜底。
+
+示例：
+
+```json
+{
+  "diagnostics": {
+    "backend": "otel",
+    "log_tool_calls": true,
+    "log_message_receipts": true,
+    "log_message_payloads": true,
+    "log_llm_io": true,
+    "otel": {
+      "endpoint": "http://otel:4318",
+      "service_name": "nullclaw",
+      "headers": {
+        "Authorization": "Bearer example-token"
+      }
+    }
+  }
+}
+```
+
 ### `models.providers`
 
 - 定义各 LLM provider 的连接参数与 API Key。
@@ -172,6 +199,7 @@ nullclaw onboard --interactive
 - 相对路径会相对于 `config.json` 所在目录解析。
 - 绝对路径会原样使用。
 - 配置中可以写 `/` 或 `\`，运行时会按当前操作系统规范化路径分隔符。
+- `workspace_path` 不会禁用 `system_prompt`。如果两者同时设置，nullclaw 仍会应用命名 agent 的 profile prompt，并从该独立工作区加载 bootstrap 上下文。
 - 首次使用时，如果工作区不存在，nullclaw 会自动创建并初始化：
   - `AGENTS.md`
   - `SOUL.md`

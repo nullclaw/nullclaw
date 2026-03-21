@@ -19,6 +19,7 @@ If you are new here, use the guided paths below instead of guessing which page t
 - Start with [Installation](./installation.md) if NullClaw is not running yet
 - Go to [Configuration](./configuration.md) if you already installed it
 - Go to [External Channel Plugins](./external-channels.md) if you are adding a non-core channel
+- Go to [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md) if you operate the built-in DingTalk channel
 - Jump to [Commands](./commands.md) if you want a task-based CLI reference
 
 **If you came from ...**
@@ -43,8 +44,10 @@ Recommended order:
 Focus on:
 
 - [Usage and Operations](./usage.md)
+- [Lark Ops Readiness](./ops/lark-ops-readiness.md) for Lark/Feishu websocket and permission incidents
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
+- [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md) for DingTalk-specific inbound and reply-path checks
 - [Signal Deployment](../../SIGNAL.md)
 
 ### 3. I want to contribute code or docs
@@ -63,6 +66,8 @@ Focus on:
 - [Configuration](./configuration.md)
 - [External Channel Plugins](./external-channels.md)
 - [Usage and Operations](./usage.md)
+- [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md)
+- [Lark Ops Readiness](./ops/lark-ops-readiness.md)
 - [Architecture](./architecture.md)
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
@@ -88,6 +93,7 @@ If you are building from source instead of Homebrew, start with [Installation](.
 ## Specialized Guides
 
 - [Contributing](../../CONTRIBUTING.md)
+- [Lark Ops Readiness](./ops/lark-ops-readiness.md)
 - [Security Policy](../../SECURITY.md)
 - [Signal Deployment](../../SIGNAL.md)
 
@@ -96,6 +102,7 @@ If you are building from source instead of Homebrew, start with [Installation](.
 - Follow [Installation](./installation.md) for setup from Homebrew or source
 - Continue to [Configuration](./configuration.md) to wire providers, memory, and channels
 - Use [External Channel Plugins](./external-channels.md) when a channel should live out of tree
+- Use [Lark Ops Readiness](./ops/lark-ops-readiness.md) when you are debugging Lark/Feishu runtime health
 - Use [Usage and Operations](./usage.md) once you want to run NullClaw day to day
 
 ## Related Pages
@@ -103,6 +110,7 @@ If you are building from source instead of Homebrew, start with [Installation](.
 - [Termux Guide](./termux.md)
 - [Commands](./commands.md)
 - [External Channel Plugins](./external-channels.md)
+- [Lark Ops Readiness](./ops/lark-ops-readiness.md)
 - [Development](./development.md)
 - [Architecture](./architecture.md)
 - [Gateway API](./gateway-api.md)

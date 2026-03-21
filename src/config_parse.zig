@@ -111,6 +111,40 @@ fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     };
 }
 
+fn parseDiagnosticsOtelHeaders(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?[]const types.DiagnosticsConfig.OtelHeaderEntry {
+    if (value != .object) return null;
+
+    var header_list: std.ArrayListUnmanaged(types.DiagnosticsConfig.OtelHeaderEntry) = .empty;
+    errdefer {
+        for (header_list.items) |header| {
+            allocator.free(header.key);
+            allocator.free(header.value);
+        }
+        header_list.deinit(allocator);
+    }
+
+    var hit = value.object.iterator();
+    while (hit.next()) |he| {
+        if (he.value_ptr.* != .string) continue;
+
+        const header_key = try allocator.dupe(u8, he.key_ptr.*);
+        const header_value = try allocator.dupe(u8, he.value_ptr.string);
+        header_list.append(allocator, .{
+            .key = header_key,
+            .value = header_value,
+        }) catch |err| {
+            allocator.free(header_key);
+            allocator.free(header_value);
+            return err;
+        };
+    }
+
+    return try header_list.toOwnedSlice(allocator);
+}
+
 fn parseNamedAgentObject(
     allocator: std.mem.Allocator,
     config_path: []const u8,
@@ -983,28 +1017,46 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (diag.object.get("rag_token")) |v| {
                 if (v == .string) self.diagnostics.rag_token = try self.allocator.dupe(u8, v.string);
             }
+            var has_nested_otel_endpoint = false;
+            var has_nested_otel_service_name = false;
+            var has_nested_otel_headers = false;
             if (diag.object.get("otel")) |otel| {
                 if (otel == .object) {
                     if (otel.object.get("endpoint")) |v| {
-                        if (v == .string) self.diagnostics.otel_endpoint = try self.allocator.dupe(u8, v.string);
+                        if (v == .string) {
+                            self.diagnostics.otel_endpoint = try self.allocator.dupe(u8, v.string);
+                            has_nested_otel_endpoint = true;
+                        }
                     }
                     if (otel.object.get("service_name")) |v| {
-                        if (v == .string) self.diagnostics.otel_service_name = try self.allocator.dupe(u8, v.string);
+                        if (v == .string) {
+                            self.diagnostics.otel_service_name = try self.allocator.dupe(u8, v.string);
+                            has_nested_otel_service_name = true;
+                        }
                     }
                     if (otel.object.get("headers")) |h| {
-                        if (h == .object) {
-                            var header_list: std.ArrayListUnmanaged(types.DiagnosticsConfig.OtelHeaderEntry) = .empty;
-                            var hit = h.object.iterator();
-                            while (hit.next()) |he| {
-                                if (he.value_ptr.* == .string) {
-                                    try header_list.append(self.allocator, .{
-                                        .key = try self.allocator.dupe(u8, he.key_ptr.*),
-                                        .value = try self.allocator.dupe(u8, he.value_ptr.string),
-                                    });
-                                }
-                            }
-                            self.diagnostics.otel_headers = try header_list.toOwnedSlice(self.allocator);
+                        if (try parseDiagnosticsOtelHeaders(self.allocator, h)) |headers| {
+                            self.diagnostics.otel_headers = headers;
+                            has_nested_otel_headers = true;
                         }
+                    }
+                }
+            }
+            // Accept flat OTEL diagnostics aliases as a fallback for older configs.
+            if (!has_nested_otel_endpoint) {
+                if (diag.object.get("otel_endpoint")) |v| {
+                    if (v == .string) self.diagnostics.otel_endpoint = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (!has_nested_otel_service_name) {
+                if (diag.object.get("otel_service_name")) |v| {
+                    if (v == .string) self.diagnostics.otel_service_name = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (!has_nested_otel_headers) {
+                if (diag.object.get("otel_headers")) |h| {
+                    if (try parseDiagnosticsOtelHeaders(self.allocator, h)) |headers| {
+                        self.diagnostics.otel_headers = headers;
                     }
                 }
             }
@@ -1218,6 +1270,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
+            }
+            if (ag.object.get("timezone")) |v| {
+                if (v == .string) self.agent.timezone = try self.allocator.dupe(u8, v.string);
             }
             if (ag.object.get("vision_disabled_models")) |v| {
                 if (v == .array) self.agent.vision_disabled_models = try parseStringArray(self.allocator, v.array);
@@ -2225,6 +2280,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (val.object.get("user_agent")) |ua| {
                             if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
+                        }
+                        if (val.object.get("api_mode")) |am| {
+                            if (am == .string) pe.api_mode = types.ProviderEntry.ApiMode.parse(am.string);
+                        }
+                        if (val.object.get("max_streaming_prompt_bytes")) |mb| {
+                            if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
                         }
                         try prov_list.append(self.allocator, pe);
                     }

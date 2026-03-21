@@ -15,6 +15,8 @@ const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const streaming = @import("streaming.zig");
 
+const log = std.log.scoped(.a2a);
+
 /// Maximum number of tasks kept in the registry before eviction.
 const MAX_TASKS: usize = 1000;
 const A2A_PROTOCOL_VERSION = "0.3.0";
@@ -603,7 +605,8 @@ pub fn handleStreamingRpc(
     const sink = sse_ctx.makeSink();
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink) catch {
+    const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink) catch |err| {
+        log.err("streaming turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         var failed_task = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
         if (failed_task) |snapshot| {
@@ -734,7 +737,8 @@ fn handleSendMessage(
     _ = registry.setTaskState(task.id, .working);
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processMessage(task.session_key, text, context) catch {
+    const response = session_mgr.processMessage(task.session_key, text, context) catch |err| {
+        log.err("turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         _ = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Agent processing failed") catch
             return errorResponse();

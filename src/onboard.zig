@@ -15,6 +15,7 @@ const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const codex_support = @import("codex_support.zig");
 const config_mod = @import("config.zig");
+const net_security = @import("net_security.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
 const provider_names = @import("provider_names.zig");
@@ -23,6 +24,7 @@ const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
 const util = @import("util.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
+const gemini_cli_mod = @import("providers/gemini_cli.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -58,6 +60,7 @@ const WorkspaceOnboardingState = struct {
 const WORKSPACE_AGENTS_TEMPLATE = @embedFile("workspace_templates/AGENTS.md");
 const WORKSPACE_SOUL_TEMPLATE = @embedFile("workspace_templates/SOUL.md");
 const WORKSPACE_TOOLS_TEMPLATE = @embedFile("workspace_templates/TOOLS.md");
+const WORKSPACE_CONFIG_TEMPLATE = @embedFile("workspace_templates/CONFIG.md");
 const WORKSPACE_IDENTITY_TEMPLATE = @embedFile("workspace_templates/IDENTITY.md");
 const WORKSPACE_USER_TEMPLATE = @embedFile("workspace_templates/USER.md");
 const WORKSPACE_HEARTBEAT_TEMPLATE = @embedFile("workspace_templates/HEARTBEAT.md");
@@ -104,6 +107,7 @@ pub const known_providers = [_]ProviderInfo{
     // --- Tier 4: AI platform specialists ---
     .{ .key = "venice", .label = "Venice", .default_model = "llama-4-70b-instruct", .env_var = "VENICE_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
+    .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
     .{ .key = "opencode-zen", .label = "OpenCode Zen", .default_model = "opencode-model", .env_var = "OPENCODE_API_KEY" },
     .{ .key = "minimax", .label = "MiniMax", .default_model = "minimax-m2.1", .env_var = "MINIMAX_API_KEY" },
@@ -136,6 +140,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
+    .{ .key = "gemini-cli", .label = "Gemini CLI (Google Gemini, local)", .default_model = "gemini-2.0-flash", .env_var = "GEMINI_API_KEY" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -173,14 +178,8 @@ fn isValidCustomProviderUrl(url: []const u8) bool {
 }
 
 fn isLocalEndpoint(url: []const u8) bool {
-    return std.mem.startsWith(u8, url, "http://localhost") or
-        std.mem.startsWith(u8, url, "https://localhost") or
-        std.mem.startsWith(u8, url, "http://127.") or
-        std.mem.startsWith(u8, url, "https://127.") or
-        std.mem.startsWith(u8, url, "http://0.0.0.0") or
-        std.mem.startsWith(u8, url, "https://0.0.0.0") or
-        std.mem.startsWith(u8, url, "http://[::1]") or
-        std.mem.startsWith(u8, url, "https://[::1]");
+    const host = net_security.extractHost(url) orelse return false;
+    return net_security.isLocalHost(host);
 }
 
 fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) bool {
@@ -190,6 +189,7 @@ fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) b
         std.mem.eql(u8, canonical, "lmstudio") or
         std.mem.eql(u8, canonical, "claude-cli") or
         std.mem.eql(u8, canonical, "codex-cli") or
+        std.mem.eql(u8, canonical, "gemini-cli") or
         std.mem.eql(u8, canonical, "openai-codex"))
     {
         return false;
@@ -235,6 +235,15 @@ fn printProviderNextSteps(
 
     if (std.mem.eql(u8, canonical, "codex-cli")) {
         try out.writeAll("    1. Authenticate:  codex login\n");
+        try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
+        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, canonical, "gemini-cli")) {
+        try out.writeAll("    1. Authenticate:  gemini\n");
+        try out.writeAll("       Then choose:   Login with Google\n");
         try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
         try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:       nullclaw gateway\n");
@@ -318,6 +327,12 @@ pub const ModelsCacheEntry = struct {
     fetched_at: i64,
 };
 
+const gemini_cli_fallback = [_][]const u8{
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+};
+
 /// Hardcoded fallback models for each provider (used when API fetch fails).
 pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     const canonical = canonicalProviderName(provider);
@@ -333,6 +348,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
     if (std.mem.eql(u8, canonical, "openai-codex")) return &codex_support.codex_model_fallbacks;
+    if (std.mem.eql(u8, canonical, "gemini-cli")) return &gemini_cli_fallback;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -436,6 +452,7 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "groq", .key = "groq" },
     .{ .canonical = "deepseek", .key = "deepseek" },
     .{ .canonical = "gemini", .key = "google" },
+    .{ .canonical = "gemini-cli", .key = "google" },
     .{ .canonical = "vertex", .key = "google-vertex" },
     .{ .canonical = "z.ai", .key = "zai" },
     .{ .canonical = "glm", .key = "zhipuai" },
@@ -511,6 +528,13 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
         return codex_support.loadCodexModels(allocator);
     }
 
+    // For the gemini CLI, prefer local discovery when available, then fall back
+    // to the shared models.dev/static pipeline used by other providers.
+    if (std.mem.eql(u8, canonical, "gemini-cli")) {
+        const dynamic = gemini_cli_mod.GeminiCliProvider.fetchModels(allocator);
+        if (dynamic.len > 0) return dynamic;
+    }
+
     if (fetchModelsFromNativeApi(allocator, canonical, api_key) catch null) |models| {
         return models;
     }
@@ -527,6 +551,7 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     // static fallback path for offline/test use.
     if (std.mem.eql(u8, canonical, "anthropic") or
         std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "gemini-cli") or
         std.mem.eql(u8, canonical, "vertex") or
         std.mem.eql(u8, canonical, "deepseek") or
         std.mem.eql(u8, canonical, "ollama") or
@@ -2025,6 +2050,8 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
             try out.writeAll("  -> Uses local OAuth tokens from ~/.nullclaw/auth.json or ~/.codex/auth.json\n\n");
         } else if (std.mem.eql(u8, cfg.default_provider, "codex-cli")) {
             try out.writeAll("  -> Uses your local Codex CLI login (`codex login`)\n\n");
+        } else if (std.mem.eql(u8, cfg.default_provider, "gemini-cli")) {
+            try out.writeAll("  -> Uses your local Gemini CLI login (`gemini` -> Login with Google)\n\n");
         } else {
             try out.writeAll("  -> No API key required for this local provider\n\n");
         }
@@ -2465,6 +2492,9 @@ pub fn scaffoldWorkspace(
     // TOOLS.md (tool usage guide — loaded by prompt.zig)
     try storeOrWriteIfMissing(allocator, workspace_dir, "TOOLS.md", toolsTemplate(), bootstrap_provider);
 
+    // CONFIG.md (guide for the fields written by onboarding into config.json)
+    try storeOrWriteIfMissing(allocator, workspace_dir, "CONFIG.md", configTemplate(), bootstrap_provider);
+
     // IDENTITY.md (identity config — loaded by prompt.zig)
     const identity_tmpl = try identityTemplate(allocator, ctx);
     defer allocator.free(identity_tmpl);
@@ -2530,6 +2560,7 @@ pub fn resetWorkspacePromptFiles(
         .{ .filename = "SOUL.md", .content = soul_tmpl },
         .{ .filename = "AGENTS.md", .content = agentsTemplate() },
         .{ .filename = "TOOLS.md", .content = toolsTemplate() },
+        .{ .filename = "CONFIG.md", .content = configTemplate() },
         .{ .filename = "IDENTITY.md", .content = identity_tmpl },
         .{ .filename = "USER.md", .content = user_tmpl },
         .{ .filename = "HEARTBEAT.md", .content = heartbeatTemplate() },
@@ -2940,6 +2971,10 @@ fn toolsTemplate() []const u8 {
     return WORKSPACE_TOOLS_TEMPLATE;
 }
 
+fn configTemplate() []const u8 {
+    return WORKSPACE_CONFIG_TEMPLATE;
+}
+
 fn identityTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
     _ = ctx;
     return allocator.dupe(u8, WORKSPACE_IDENTITY_TEMPLATE);
@@ -2996,6 +3031,8 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
     try std.testing.expectEqualStrings("azure", canonicalProviderName("azure-openai"));
     try std.testing.expectEqualStrings("azure", canonicalProviderName("azure_openai"));
+    try std.testing.expectEqualStrings("xiaomi", canonicalProviderName("xiaomi-mimo"));
+    try std.testing.expectEqualStrings("xiaomi", canonicalProviderName("mimo"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
 
@@ -3004,6 +3041,8 @@ test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
     try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
+    try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("xiaomi"));
+    try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("mimo"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("codex-cli"));
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("openai-codex"));
@@ -3018,11 +3057,17 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
 
 test "providerEnvVar grok alias maps to xai" {
     try std.testing.expectEqualStrings("XAI_API_KEY", providerEnvVar("grok"));
+}
+
+test "providerEnvVar xiaomi aliases" {
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi-mimo"));
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("mimo"));
 }
 
 test "providerEnvVar unknown falls back" {
@@ -3033,9 +3078,14 @@ test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless"
     try std.testing.expect(!providerRequiresApiKeyForSetup("ollama", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("lm-studio", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("claude-cli", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("gemini-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("codex-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("openai-codex", null));
+    // Regression: local-network compatible endpoints should not require API keys.
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1"));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://100.64.0.1:8080/v1", "http://100.64.0.1:8080/v1"));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://model.local:8080/v1", "http://model.local:8080/v1"));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://[fd00::1]:8080/v1", "http://[fd00::1]:8080/v1"));
     try std.testing.expect(providerRequiresApiKeyForSetup("openai", null));
 }
 
@@ -3225,7 +3275,7 @@ test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
     defer std.testing.allocator.free(base);
 
     const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{}, null);
-    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), report.rewritten_files);
     try std.testing.expectEqual(@as(usize, 0), report.removed_files);
 
     const agents_content = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
@@ -3269,7 +3319,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
         .clear_memory_markdown = true,
         .dry_run = true,
     }, null);
-    try std.testing.expectEqual(@as(usize, 6), dry_report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), dry_report.rewritten_files);
     try std.testing.expect(dry_report.removed_files >= 1);
     const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
     memory_file.close();
@@ -3277,7 +3327,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
         .clear_memory_markdown = true,
     }, null);
-    try std.testing.expectEqual(@as(usize, 6), reset_report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), reset_report.rewritten_files);
     try std.testing.expect(reset_report.removed_files >= 1);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
     if (has_distinct_case_memory_file) {
@@ -3295,7 +3345,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
     defer std.testing.allocator.free(nested);
 
     const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{}, null);
-    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), report.rewritten_files);
 
     const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
     defer std.testing.allocator.free(agents_path);
@@ -3540,7 +3590,7 @@ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touch
         .{ .include_bootstrap = true },
         bootstrap_provider,
     );
-    try std.testing.expectEqual(@as(usize, 7), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 8), report.rewritten_files);
     try std.testing.expectEqual(@as(usize, 0), report.removed_files);
 
     const disk_agents = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
@@ -3801,6 +3851,19 @@ test "printProviderNextSteps keeps codex-cli auth flow and interactive chat" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
+test "printProviderNextSteps keeps gemini-cli auth flow and interactive chat" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "gemini-cli", "GEMINI_API_KEY", false, false);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Authenticate:  gemini") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Login with Google") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+}
+
 test "providerEnvVar gemini aliases" {
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
@@ -3950,11 +4013,11 @@ test "catalog_providers names are unique" {
     }
 }
 
-test "wizard promptChoice returns default for out-of-range" {
-    // This tests the logic without actual I/O by validating the
-    // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 36);
-    // The wizard would clamp to default (0) for out of range input
+test "known_providers includes gemini-cli" {
+    for (known_providers) |provider| {
+        if (std.mem.eql(u8, provider.key, "gemini-cli")) return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "findChannelOptionIndex supports number and key" {
@@ -4004,6 +4067,14 @@ test "toolsTemplate contains tool docs" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "Skills define _how_ tools work") != null);
 }
 
+test "configTemplate contains generated config guide" {
+    const tmpl = configTemplate();
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "CONFIG.md - Generated Config Guide") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "`agents.defaults.model.primary`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "`memory.backend`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "`enabled: false`") != null);
+}
+
 test "identityTemplate contains agent name" {
     const tmpl = try identityTemplate(std.testing.allocator, &ProjectContext{ .agent_name = "TestBot" });
     defer std.testing.allocator.free(tmpl);
@@ -4041,9 +4112,9 @@ test "scaffoldWorkspace creates core prompt.zig files" {
     // Verify core files that prompt.zig always loads exist.
     const files = [_][]const u8{
         "SOUL.md",      "AGENTS.md",
-        "TOOLS.md",     "IDENTITY.md",
-        "USER.md",      "HEARTBEAT.md",
-        "BOOTSTRAP.md",
+        "TOOLS.md",     "CONFIG.md",
+        "IDENTITY.md",  "USER.md",
+        "HEARTBEAT.md", "BOOTSTRAP.md",
     };
     for (files) |filename| {
         const file = tmp.dir.openFile(filename, .{}) catch |err| {
@@ -4451,6 +4522,7 @@ test "fetchModels handles google alias" {
 test "modelsDevProviderKey maps known providers" {
     try std.testing.expectEqualStrings("anthropic", modelsDevProviderKey("claude-cli").?);
     try std.testing.expectEqualStrings("google", modelsDevProviderKey("gemini").?);
+    try std.testing.expectEqualStrings("google", modelsDevProviderKey("gemini-cli").?);
     try std.testing.expectEqualStrings("google-vertex", modelsDevProviderKey("vertex").?);
     try std.testing.expectEqualStrings("zai", modelsDevProviderKey("z.ai").?);
     try std.testing.expectEqualStrings("novita-ai", modelsDevProviderKey("novita").?);

@@ -374,7 +374,9 @@ pub const VertexProvider = struct {
         ) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("Vertex streaming failed with {}; falling back to non-streaming response", .{err});
-                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                var fallback_request = request;
+                fallback_request.timeout_secs = gemini.GeminiProvider.streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
                 return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;

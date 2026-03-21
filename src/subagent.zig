@@ -484,6 +484,14 @@ fn testTaskRunnerWorkspace(allocator: Allocator, request: TaskRunRequest) ![]con
     return allocator.dupe(u8, request.workspace_dir);
 }
 
+fn testTaskRunnerWorkspaceAndPrompt(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "workspace={s}\nprompt={s}",
+        .{ request.workspace_dir, request.system_prompt },
+    );
+}
+
 fn testTaskRunnerHttpTimeout(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{request.http_timeout_secs});
 }
@@ -721,6 +729,44 @@ test "SubagentManager uses named agent workspace_path for task runner" {
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
     try std.testing.expectEqualStrings(expected_workspace, mgr.getTaskResult(task_id).?);
+}
+
+test "SubagentManager preserves named agent system_prompt when workspace_path is set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
+    defer std.testing.allocator.free(config_path);
+    const expected_workspace = try std.fs.path.join(std.testing.allocator, &.{ base, "agents", "researcher" });
+    defer std.testing.allocator.free(expected_workspace);
+    const expected_prompt = "Focus on implementation and tests.";
+
+    const agents = [_]config_mod.NamedAgentConfig{.{
+        .name = "researcher",
+        .provider = "openrouter",
+        .model = "anthropic/claude-sonnet-4",
+        .system_prompt = expected_prompt,
+        .workspace_path = "agents/researcher",
+    }};
+    const cfg = config_mod.Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = std.testing.allocator,
+        .agents = &agents,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.task_runner = testTaskRunnerWorkspaceAndPrompt;
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawnWithAgent("quick task", "workspace-prompt-check", "agent", "session:42", "researcher");
+    const status = try waitTaskTerminalStatus(&mgr, task_id);
+    try std.testing.expectEqual(TaskStatus.completed, status);
+
+    const result = mgr.getTaskResult(task_id).?;
+    try std.testing.expect(std.mem.indexOf(u8, result, expected_workspace) != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, expected_prompt) != null);
 }
 
 test "SubagentManager uses task runner callback result" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("fs_compat.zig");
 
 /// Token usage information from a single API call.
 pub const TokenUsage = struct {
@@ -171,7 +172,7 @@ pub const CostTracker = struct {
 
         // Ensure parent directory exists
         if (std.fs.path.dirnamePosix(self.storage_path) orelse std.fs.path.dirnameWindows(self.storage_path)) |dir| {
-            std.fs.cwd().makePath(dir) catch {};
+            fs_compat.makePath(dir) catch {};
         }
 
         const file = std.fs.cwd().createFile(self.storage_path, .{ .truncate = false }) catch return;

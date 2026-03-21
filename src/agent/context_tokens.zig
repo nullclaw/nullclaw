@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const config_types = @import("../config_types.zig");
+const provider_names = @import("../provider_names.zig");
 
 pub const DEFAULT_CONTEXT_TOKENS: u64 = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
 
@@ -107,6 +108,15 @@ fn lookupTable(table: []const ContextWindowEntry, key: []const u8) ?u64 {
     return null;
 }
 
+fn lookupProviderWindow(key: []const u8) ?u64 {
+    if (lookupTable(&PROVIDER_WINDOWS, key)) |n| return n;
+    const canonical = provider_names.canonicalProviderNameIgnoreCase(key);
+    if (!std.ascii.eqlIgnoreCase(canonical, key)) {
+        if (lookupTable(&PROVIDER_WINDOWS, canonical)) |n| return n;
+    }
+    return null;
+}
+
 fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, model: []const u8 } {
     const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse {
         return .{ .provider = null, .model = model_ref };
@@ -163,6 +173,7 @@ pub fn lookupContextTokens(model_ref_raw: []const u8) ?u64 {
     if (model_ref.len == 0) return null;
 
     if (lookupModelCandidates(model_ref)) |n| return n;
+    if (lookupProviderWindow(model_ref)) |n| return n;
 
     const split = splitProviderModel(model_ref);
     if (lookupModelCandidates(split.model)) |n| return n;
@@ -172,7 +183,7 @@ pub fn lookupContextTokens(model_ref_raw: []const u8) ?u64 {
         const nested_provider = split.model[0..nested_sep];
         const nested_model = split.model[nested_sep + 1 ..];
         if (lookupModelCandidates(nested_model)) |n| return n;
-        if (lookupTable(&PROVIDER_WINDOWS, nested_provider)) |n| return n;
+        if (lookupProviderWindow(nested_provider)) |n| return n;
     }
     if (std.mem.lastIndexOfScalar(u8, split.model, '/')) |last_sep| {
         const leaf_model = split.model[last_sep + 1 ..];
@@ -180,7 +191,7 @@ pub fn lookupContextTokens(model_ref_raw: []const u8) ?u64 {
     }
 
     if (split.provider) |provider| {
-        if (lookupTable(&PROVIDER_WINDOWS, provider)) |n| return n;
+        if (lookupProviderWindow(provider)) |n| return n;
     }
 
     return null;
@@ -226,6 +237,11 @@ test "lookupContextTokens strips date suffixes" {
 test "lookupContextTokens falls back to provider defaults" {
     try std.testing.expectEqual(@as(?u64, 98_304), lookupContextTokens("qianfan/custom-model"));
     try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("openrouter/inception/mercury"));
+}
+
+test "lookupContextTokens honors canonical provider aliases" {
+    try std.testing.expectEqual(@as(?u64, 262_144), lookupContextTokens("mimo/custom-model"));
+    try std.testing.expectEqual(@as(?u64, 262_144), lookupContextTokens("xiaomi-mimo"));
 }
 
 test "resolveContextTokens falls back to global default" {

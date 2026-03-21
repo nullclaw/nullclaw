@@ -985,6 +985,21 @@ fn parseToolCallJson(allocator: std.mem.Allocator, json_str: []const u8) !Parsed
         allocator.free(call.arguments_json);
     }
     try repairMalformedParsedToolName(allocator, json_str, &call);
+
+    // Fail closed on implausible names (e.g. ":") and make one last
+    // attempt to recover from malformed quoted-colon payloads.
+    if (!isPlausibleToolName(call.name)) {
+        if (try salvageMalformedToolCallJson(allocator, json_str)) |recovered| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            call = recovered;
+        }
+    }
+
+    if (!isPlausibleToolName(call.name)) {
+        return error.InvalidToolName;
+    }
+
     return call;
 }
 
@@ -1138,6 +1153,7 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
     const name_end = std.mem.indexOfScalar(u8, after_prefix[1..], name_quote) orelse return error.InvalidInvokeFormat;
     const tool_name = std.mem.trim(u8, after_prefix[1 .. name_end + 1], " \t\r\n");
     if (tool_name.len == 0) return error.EmptyToolName;
+    if (!isPlausibleToolName(tool_name)) return error.InvalidToolName;
 
     const invoke_close_tag = "</invoke>";
     // Look for the '>' that closes the <invoke ...> tag.
@@ -1266,6 +1282,7 @@ fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
     };
 
     if (tool_name.len == 0) return error.EmptyToolName;
+    if (!isPlausibleToolName(tool_name)) return error.InvalidToolName;
 
     // 2. Greedy Parameter Collection
     var args_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1758,6 +1775,50 @@ test "parseToolCalls malformed JSON inside tag" {
         allocator.free(result.calls);
     }
     // Malformed JSON is skipped
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
+test "parseToolCalls recovers malformed quoted-colon tool name" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>
+        \\{"name":": "memory_recall", "arguments": {"query": "Traumforschung"}}
+        \\</tool_call>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        if (result.text.len > 0) allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("memory_recall", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "Traumforschung") != null);
+}
+
+test "parseToolCalls rejects literal colon tool name" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>
+        \\{"name": ":", "arguments": {"query": "x"}}
+        \\</tool_call>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        if (result.text.len > 0) allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
     try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }
 
@@ -2633,14 +2694,9 @@ test "parseToolCallJson robustness" {
     }
     try std.testing.expectEqualStrings("shell", res2.name);
 
-    // Case 3: JSON-like name without nested "name" keeps the outer name text.
+    // Case 3: JSON-like name without nested "name" is rejected as invalid tool name.
     const json3 = "{\"name\": \"{\\\"tool\\\":\\\"shell\\\"}\", \"arguments\": {}}";
-    const res3 = try parseToolCallJson(allocator, json3);
-    defer {
-        allocator.free(res3.name);
-        allocator.free(res3.arguments_json);
-    }
-    try std.testing.expectEqualStrings("{\"tool\":\"shell\"}", res3.name);
+    try std.testing.expectError(error.InvalidToolName, parseToolCallJson(allocator, json3));
 }
 
 test "parseToolCallJson salvages malformed quoted colon tool name" {
@@ -2701,7 +2757,7 @@ test "parseToolCalls salvages malformed quoted colon tool name" {
     try std.testing.expectEqualStrings("memory_recall", result.calls[0].name);
 }
 
-test "parseToolCalls does not salvage unrelated invalid tool name" {
+test "parseToolCalls rejects unrelated invalid tool name" {
     const allocator = std.testing.allocator;
     const response =
         \\<tool_call>
@@ -2719,8 +2775,7 @@ test "parseToolCalls does not salvage unrelated invalid tool name" {
         allocator.free(result.calls);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
-    try std.testing.expectEqualStrings("shell tool", result.calls[0].name);
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }
 
 test "parseXmlToolCalls minimax format" {
@@ -2774,6 +2829,29 @@ test "parseXmlToolCalls minimax format robustness" {
     try std.testing.expectEqual(@as(usize, 1), result.calls.len);
     try std.testing.expectEqualStrings("shell", result.calls[0].name);
     try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "ls -la") != null);
+}
+
+test "parseXmlToolCalls rejects invalid minimax tool name" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>
+        \\<invoke name=":">
+        \\<parameter name="command">ls</parameter>
+        \\</invoke>
+        \\</tool_call>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }
 
 test "parseXmlToolCalls hybrid format" {

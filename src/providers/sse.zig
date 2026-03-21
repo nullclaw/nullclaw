@@ -10,6 +10,12 @@ const log = std.log.scoped(.provider_sse);
 
 var curl_fail_fast_arg_mutex: std.Thread.Mutex = .{};
 var curl_fail_with_body_supported_cache: ?bool = null;
+const stream_stall_detection_args = [_][]const u8{
+    "--speed-limit",
+    "1",
+    "--speed-time",
+    "60",
+};
 
 fn finalizeStreamResult(
     allocator: std.mem.Allocator,
@@ -92,6 +98,13 @@ pub fn curlFailFastArg(allocator: std.mem.Allocator) []const u8 {
     }
 
     return if (curl_fail_with_body_supported_cache.?) "--fail-with-body" else "-f";
+}
+
+pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
+    for (stream_stall_detection_args) |arg| {
+        argv_buf[argc.*] = arg;
+        argc.* += 1;
+    }
 }
 
 const CurlBodyArg = struct {
@@ -240,7 +253,10 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
     return usage;
 }
 
-/// Extract `choices[0].delta.content` from an SSE JSON payload.
+/// Extract visible streaming text from an SSE JSON payload.
+/// Falls back to `delta.reasoning_content` when providers stream their
+/// thinking trace separately and wraps it in think tags so higher layers can
+/// suppress it from user-visible output.
 /// Returns owned slice or null if no content found.
 pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
@@ -257,11 +273,20 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     const delta = first.object.get("delta") orelse return null;
     if (delta != .object) return null;
 
-    const content = delta.object.get("content") orelse return null;
-    if (content != .string) return null;
-    if (content.string.len == 0) return null;
+    if (delta.object.get("content")) |content| {
+        if (content == .string and content.string.len > 0) {
+            return try allocator.dupe(u8, content.string);
+        }
+    }
 
-    return try allocator.dupe(u8, content.string);
+    if (delta.object.get("reasoning_content")) |reasoning_content| {
+        if (reasoning_content == .string and reasoning_content.string.len > 0) {
+            const wrapped = try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning_content.string});
+            return wrapped;
+        }
+    }
+
+    return null;
 }
 
 /// Run curl in SSE streaming mode and parse output line by line.
@@ -305,6 +330,11 @@ pub fn curlStream(
         argv_buf[argc] = timeout_str;
         argc += 1;
     }
+
+    // Kill the curl process if transfer rate drops below 1 byte/second for 60 seconds.
+    // This catches providers that open the SSE connection but stall mid-stream without
+    // hitting the --max-time wall (e.g. glm-5 on infini-ai hanging on large contexts).
+    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
 
     argv_buf[argc] = "-X";
     argc += 1;
@@ -859,6 +889,20 @@ test "prepareCurlBodyArg uses temp file only on Windows" {
     }
 }
 
+test "appendCurlStallDetectionArgs appends curl speed flags in order" {
+    // Regression: stalled SSE streams must trip curl's speed-limit instead of
+    // hanging until --max-time expires with an idle-but-open connection.
+    var argv_buf: [8][]const u8 = undefined;
+    var argc: usize = 0;
+    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
+
+    try std.testing.expectEqual(@as(usize, 4), argc);
+    try std.testing.expectEqualStrings("--speed-limit", argv_buf[0]);
+    try std.testing.expectEqualStrings("1", argv_buf[1]);
+    try std.testing.expectEqualStrings("--speed-time", argv_buf[2]);
+    try std.testing.expectEqualStrings("60", argv_buf[3]);
+}
+
 test "parseSseLine DONE sentinel" {
     const result = try parseSseLine(std.testing.allocator, "data: [DONE]");
     try std.testing.expect(result == .done);
@@ -925,6 +969,32 @@ test "extractDeltaContent without content" {
 
 test "extractDeltaContent empty content" {
     const result = try extractDeltaContent(std.testing.allocator, "{\"choices\":[{\"delta\":{\"content\":\"\"}}]}");
+    try std.testing.expect(result == null);
+}
+
+test "extractDeltaContent falls back to reasoning_content when content empty" {
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"step by step\"}}]}")).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+}
+
+test "extractDeltaContent falls back to reasoning_content when content missing" {
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"step by step\"}}]}")).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+}
+
+test "extractDeltaContent prefers visible content over reasoning_content" {
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"final answer\",\"reasoning_content\":\"private\"}}]}")).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("final answer", result);
+}
+
+test "extractDeltaContent empty reasoning_content returns null" {
+    const result = try extractDeltaContent(std.testing.allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"\"}}]}");
     try std.testing.expect(result == null);
 }
 

@@ -9,6 +9,7 @@ const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
 const daemon = @import("daemon.zig");
 const http_util = @import("http_util.zig");
+const fs_compat = @import("fs_compat.zig");
 const providers = @import("providers/root.zig");
 const security = @import("security/root.zig");
 
@@ -439,7 +440,7 @@ fn installLinuxSystemd(allocator: std.mem.Allocator) !void {
     try assertLinuxSystemdUserAvailable(allocator);
 
     if (std.mem.lastIndexOfScalar(u8, unit, '/')) |idx| {
-        try std.fs.cwd().makePath(unit[0..idx]);
+        try fs_compat.makePath(unit[0..idx]);
     }
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;

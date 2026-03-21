@@ -886,6 +886,26 @@ pub const TelegramChannel = struct {
         };
     }
 
+    fn matchesTelegramUserIdentity(user_val: std.json.Value, bot_name: ?[]const u8, bot_user_id: ?i64) bool {
+        if (user_val != .object) return false;
+
+        if (bot_user_id) |bot_id| {
+            if (user_val.object.get("id")) |id_val| {
+                if (id_val == .integer and id_val.integer == bot_id) return true;
+            }
+        }
+
+        if (bot_name) |name| {
+            if (user_val.object.get("username")) |username_val| {
+                if (username_val == .string and std.ascii.eqlIgnoreCase(username_val.string, name)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     fn containsMentionInEntitySet(
         message: std.json.Value,
         entities_key: []const u8,
@@ -929,26 +949,14 @@ pub const TelegramChannel = struct {
 
             if (std.mem.eql(u8, entity_type, "text_mention")) {
                 const user_val = entity.object.get("user") orelse continue;
-                if (user_val != .object) continue;
-                if (user_val.object.get("username")) |username_val| {
-                    if (username_val == .string and std.ascii.eqlIgnoreCase(username_val.string, bot_name)) {
-                        return true;
-                    }
-                }
-                if (bot_user_id) |bot_id| {
-                    if (user_val.object.get("id")) |id_val| {
-                        if (id_val == .integer and id_val.integer == bot_id) {
-                            return true;
-                        }
-                    }
-                }
+                if (matchesTelegramUserIdentity(user_val, bot_name, bot_user_id)) return true;
             }
         }
 
         return false;
     }
 
-    /// Fetch and cache the bot's username from Telegram API.
+    /// Fetch and cache the bot's Telegram identity from the API.
     fn fetchBotUsername(self: *TelegramChannel) void {
         if (self.bot_username != null) return;
         if (builtin.is_test) return;
@@ -957,11 +965,22 @@ pub const TelegramChannel = struct {
         self.bot_username = identity.username;
     }
 
+    /// Check if a message is a reply to a message from the bot.
+    /// Returns true if reply_to_message.from matches the bot's cached identity.
+    fn isReplyToBotMessage(message: std.json.Value, bot_name: ?[]const u8, bot_user_id: ?i64) bool {
+        const reply_to_val = message.object.get("reply_to_message") orelse return false;
+        if (reply_to_val != .object) return false;
+        const reply_to = reply_to_val.object;
+        const from_val = reply_to.get("from") orelse return false;
+        return matchesTelegramUserIdentity(from_val, bot_name, bot_user_id);
+    }
+
     /// Check if the bot should process this message based on mention requirements.
     /// In private chats, always returns true.
     /// In groups, returns true only if:
     ///   - require_mention is false, OR
-    ///   - the bot is @mentioned in the message
+    ///   - the bot is @mentioned in the message, OR
+    ///   - the message is a reply to the bot's own message
     pub fn shouldProcessMessage(self: *TelegramChannel, message: std.json.Value) bool {
         const chat_val = message.object.get("chat") orelse return true;
         if (chat_val != .object) return true;
@@ -977,8 +996,11 @@ pub const TelegramChannel = struct {
         // If mention not required in groups, respond
         if (!self.require_mention) return true;
 
-        // Ensure we have bot username cached
+        // Ensure we have bot identity cached before reply/mention checks.
         self.fetchBotUsername();
+
+        // If replying to bot's own message, respond (bypasses mention requirement)
+        if (isReplyToBotMessage(message, self.bot_username, self.bot_user_id)) return true;
         // Fail closed: if username is unavailable, do not bypass require_mention.
         const bot_name = self.bot_username orelse return false;
 
@@ -4950,6 +4972,58 @@ test "telegram shouldProcessMessage accepts text_mention entity by bot user id" 
     defer parsed.deinit();
 
     try std.testing.expect(ch.shouldProcessMessage(parsed.value));
+}
+
+test "telegram shouldProcessMessage accepts reply to bot message by username" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "tok", &.{}, &.{}, "allowlist");
+    defer ch.deinitPendingInteractions();
+    ch.require_mention = true;
+    ch.bot_username = try allocator.dupe(u8, "MyBot");
+    defer if (ch.bot_username) |name| allocator.free(name);
+
+    // Regression: replies to the bot should bypass require_mention without a literal @mention.
+    const json =
+        \\{"chat":{"type":"group"},"text":"reply text","reply_to_message":{"from":{"id":123,"is_bot":true,"username":"MyBot"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(ch.shouldProcessMessage(parsed.value));
+}
+
+test "telegram shouldProcessMessage accepts reply to bot message by bot user id" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "tok", &.{}, &.{}, "allowlist");
+    defer ch.deinitPendingInteractions();
+    ch.require_mention = true;
+    ch.bot_user_id = 4242;
+
+    // Regression: replies should still work when only the cached bot user ID is available.
+    const json =
+        \\{"chat":{"type":"group"},"text":"reply text","reply_to_message":{"from":{"id":4242,"is_bot":true,"first_name":"Bot"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(ch.shouldProcessMessage(parsed.value));
+}
+
+test "telegram shouldProcessMessage blocks reply to non-bot message without mention" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "tok", &.{}, &.{}, "allowlist");
+    defer ch.deinitPendingInteractions();
+    ch.require_mention = true;
+    ch.bot_user_id = 4242;
+
+    // Regression: only replies to the bot should bypass require_mention.
+    const json =
+        \\{"chat":{"type":"group"},"text":"reply text","reply_to_message":{"from":{"id":777,"is_bot":false,"first_name":"User"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(!ch.shouldProcessMessage(parsed.value));
 }
 
 test "telegram buildInlineKeyboardJson builds callback_data" {

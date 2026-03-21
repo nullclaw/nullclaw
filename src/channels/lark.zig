@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
 const http_util = @import("../http_util.zig");
+const outbound = @import("../outbound.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 
@@ -306,6 +307,48 @@ pub const LarkChannel = struct {
         return code >= 200 and code < 300;
     }
 
+    fn messageSuggestsPermissionIssue(msg: []const u8) bool {
+        if (msg.len == 0) return false;
+        if (std.mem.indexOf(u8, msg, "权限") != null) return true;
+
+        var lower_buf: [512]u8 = undefined;
+        const n = @min(msg.len, lower_buf.len);
+        for (msg[0..n], 0..) |c, i| {
+            lower_buf[i] = std.ascii.toLower(c);
+        }
+        const lower = lower_buf[0..n];
+        return std.mem.indexOf(u8, lower, "permission") != null or
+            std.mem.indexOf(u8, lower, "scope") != null or
+            std.mem.indexOf(u8, lower, "forbidden") != null or
+            std.mem.indexOf(u8, lower, "unauthorized") != null;
+    }
+
+    fn validateBusinessResponse(allocator: std.mem.Allocator, op: []const u8, body: []const u8) !void {
+        if (body.len == 0) return;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const code_val = parsed.value.object.get("code") orelse return;
+        const code = switch (code_val) {
+            .integer => |v| v,
+            .float => |v| @as(i64, @intFromFloat(v)),
+            else => return,
+        };
+        if (code == 0) return;
+
+        const msg = if (parsed.value.object.get("msg")) |msg_val|
+            (if (msg_val == .string) msg_val.string else "")
+        else
+            "";
+
+        log.warn("lark {s} failed with API code {d}: {s}", .{ op, code, msg });
+        if (messageSuggestsPermissionIssue(msg)) {
+            log.warn("lark {s} likely requires additional app permissions/scopes in Feishu/Lark console", .{op});
+        }
+        return error.LarkApiError;
+    }
+
     fn extractCardActionOpenId(event: std.json.Value) ?[]const u8 {
         if (event != .object) return null;
 
@@ -603,6 +646,7 @@ pub const LarkChannel = struct {
         defer self.allocator.free(resp.body);
 
         if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        try validateBusinessResponse(self.allocator, "tenant_access_token", resp.body);
 
         const resp_body = resp.body;
         if (resp_body.len == 0) return error.LarkApiError;
@@ -616,88 +660,167 @@ pub const LarkChannel = struct {
         return self.allocator.dupe(u8, token_val.string);
     }
 
-    /// Send a message to a Lark chat via the Open API.
-    /// POST /im/v1/messages?receive_id_type=chat_id
-    /// On 401, invalidates cached token and retries once.
-    pub fn sendMessage(self: *LarkChannel, recipient: []const u8, text: []const u8) !void {
+    /// POST body to url with Lark bearer auth, retrying once on 401 token expiry.
+    fn postWithTokenRetry(self: *LarkChannel, url: []const u8, body: []const u8) !void {
         const token = try self.getTenantAccessToken();
         defer self.allocator.free(token);
 
-        const base = self.apiBase();
-
-        // Build URL
-        var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{base});
-        const url = url_fbs.getWritten();
-
-        // Build inner content JSON: {"text":"..."}
-        var content_buf: [4096]u8 = undefined;
-        var content_fbs = std.io.fixedBufferStream(&content_buf);
-        const cw = content_fbs.writer();
-        try cw.writeAll("{\"text\":");
-        try root.appendJsonStringW(cw, text);
-        try cw.writeAll("}");
-        const content_json = content_fbs.getWritten();
-
-        // Build outer body JSON
-        var body_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        const w = fbs.writer();
-        try w.writeAll("{\"receive_id\":\"");
-        try w.writeAll(recipient);
-        try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
-        // Escape the content JSON string for embedding
-        try root.appendJsonStringW(w, content_json);
-        try w.writeAll("}");
-        const body = fbs.getWritten();
-
-        // Build auth header
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Bearer {s}", .{token});
-        const auth_value = auth_fbs.getWritten();
-
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
         var auth_header_buf: [576]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
-        const send_resp = http_util.curlPostWithStatus(
-            self.allocator,
-            url,
-            body,
-            &.{auth_header},
-        ) catch return error.LarkApiError;
-        defer self.allocator.free(send_resp.body);
 
-        if (send_resp.status_code == 401) {
-            // Token expired — invalidate cache and retry once
+        const resp = http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
+
+        if (resp.status_code == 401) {
             self.invalidateToken();
             const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
             defer self.allocator.free(new_token);
 
-            var retry_auth_buf: [512]u8 = undefined;
-            var retry_auth_fbs = std.io.fixedBufferStream(&retry_auth_buf);
-            try retry_auth_fbs.writer().print("Bearer {s}", .{new_token});
-            const retry_auth_value = retry_auth_fbs.getWritten();
+            var retry_buf: [512]u8 = undefined;
+            const retry_value = std.fmt.bufPrint(&retry_buf, "Bearer {s}", .{new_token}) catch return error.LarkApiError;
+            var retry_header_buf: [576]u8 = undefined;
+            const retry_header = std.fmt.bufPrint(&retry_header_buf, "Authorization: {s}", .{retry_value}) catch return error.LarkApiError;
 
-            var retry_auth_header_buf: [576]u8 = undefined;
-            const retry_auth_header = std.fmt.bufPrint(&retry_auth_header_buf, "Authorization: {s}", .{retry_auth_value}) catch return error.LarkApiError;
-            const retry_resp = http_util.curlPostWithStatus(
-                self.allocator,
-                url,
-                body,
-                &.{retry_auth_header},
-            ) catch return error.LarkApiError;
+            const retry_resp = http_util.curlPostWithStatus(self.allocator, url, body, &.{retry_header}) catch return error.LarkApiError;
             defer self.allocator.free(retry_resp.body);
 
             if (!statusCodeIsSuccess(retry_resp.status_code)) {
                 return error.LarkApiError;
             }
+            try validateBusinessResponse(self.allocator, "send_message", retry_resp.body);
             return;
         }
 
-        if (!statusCodeIsSuccess(send_resp.status_code)) {
-            return error.LarkApiError;
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        try validateBusinessResponse(self.allocator, "send_message", resp.body);
+    }
+
+    fn buildRichCardContent(buf: []u8, payload: root.Channel.OutboundPayload) ![]const u8 {
+        var card_fbs = std.io.fixedBufferStream(buf);
+        const writer = card_fbs.writer();
+
+        try writer.writeAll("{\"schema\":\"2.0\"");
+        if (payload.card_title.len > 0) {
+            try writer.writeAll(",\"header\":{\"title\":{\"tag\":\"plain_text\",\"content\":");
+            try root.appendJsonStringW(writer, payload.card_title);
+            try writer.writeAll("}}");
         }
+        try writer.writeAll(",\"body\":{\"elements\":[");
+
+        var first_element = true;
+        if (payload.text.len > 0) {
+            first_element = false;
+            try writer.writeAll("{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":");
+            try root.appendJsonStringW(writer, payload.text);
+            try writer.writeAll("}}");
+        }
+        for (payload.card_sections) |section| {
+            if (!first_element) try writer.writeByte(',');
+            first_element = false;
+
+            var section_buf: [4096]u8 = undefined;
+            var section_fbs = std.io.fixedBufferStream(&section_buf);
+            if (section.title.len > 0) {
+                try section_fbs.writer().print("**{s}**\n{s}", .{ section.title, section.body });
+            } else {
+                try section_fbs.writer().writeAll(section.body);
+            }
+
+            try writer.writeAll("{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":");
+            try root.appendJsonStringW(writer, section_fbs.getWritten());
+            try writer.writeAll("}}");
+        }
+
+        const has_action_groups = for (payload.action_groups) |group| {
+            if (group.actions.len > 0) break true;
+        } else false;
+
+        if (has_action_groups) {
+            for (payload.action_groups) |group| {
+                if (group.actions.len == 0) continue;
+                if (!first_element) try writer.writeByte(',');
+                first_element = false;
+                try writer.writeAll("{\"tag\":\"action\",\"actions\":[");
+                var first_button = true;
+                for (group.actions) |button| {
+                    if (!first_button) try writer.writeByte(',');
+                    first_button = false;
+                    try writer.writeAll("{\"tag\":\"button\",\"text\":{\"tag\":\"plain_text\",\"content\":");
+                    try root.appendJsonStringW(writer, button.label);
+                    try writer.writeAll("},\"type\":\"primary\",\"value\":{\"choice_id\":");
+                    try root.appendJsonStringW(writer, button.id);
+                    try writer.writeAll("}}");
+                }
+                try writer.writeAll("]}");
+            }
+        } else if (payload.choices.len > 0) {
+            if (!first_element) try writer.writeByte(',');
+            try writer.writeAll("{\"tag\":\"action\",\"actions\":[");
+            for (payload.choices, 0..) |choice, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writer.writeAll("{\"tag\":\"button\",\"text\":{\"tag\":\"plain_text\",\"content\":");
+                try root.appendJsonStringW(writer, choice.label);
+                try writer.writeAll("},\"type\":\"primary\",\"value\":{\"submit_text\":");
+                try root.appendJsonStringW(writer, choice.submit_text);
+                try writer.writeAll(",\"choice_id\":");
+                try root.appendJsonStringW(writer, choice.id);
+                try writer.writeAll("}}");
+            }
+            try writer.writeAll("]}");
+        }
+
+        try writer.writeAll("]}}");
+        return card_fbs.getWritten();
+    }
+
+    /// Send a plain text message to a Lark chat via the Open API.
+    /// POST /im/v1/messages?receive_id_type=chat_id
+    pub fn sendMessage(self: *LarkChannel, recipient: []const u8, text: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
+        const url = url_fbs.getWritten();
+
+        var content_buf: [4096]u8 = undefined;
+        var content_fbs = std.io.fixedBufferStream(&content_buf);
+        try content_fbs.writer().writeAll("{\"text\":");
+        try root.appendJsonStringW(content_fbs.writer(), text);
+        try content_fbs.writer().writeAll("}");
+
+        var body_buf: [8192]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        const w = body_fbs.writer();
+        try w.writeAll("{\"receive_id\":\"");
+        try w.writeAll(recipient);
+        try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
+        try root.appendJsonStringW(w, content_fbs.getWritten());
+        try w.writeAll("}");
+
+        try self.postWithTokenRetry(url, body_fbs.getWritten());
+    }
+
+    /// Send a rich interactive card to a Lark chat via the Open API.
+    /// Renders as a Lark Card 2.0 (schema 2.0) interactive message.
+    pub fn sendRichMessage(self: *LarkChannel, recipient: []const u8, payload: root.Channel.OutboundPayload) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
+        const url = url_fbs.getWritten();
+
+        var card_buf: [16384]u8 = undefined;
+        const card_content = try buildRichCardContent(&card_buf, payload);
+        var body_buf: [20480]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        const bw = body_fbs.writer();
+        try bw.writeAll("{\"receive_id\":\"");
+        try bw.writeAll(recipient);
+        try bw.writeAll("\",\"msg_type\":\"interactive\",\"content\":");
+        try root.appendJsonStringW(bw, card_content);
+        try bw.writeAll("}");
+
+        try self.postWithTokenRetry(url, body_fbs.getWritten());
     }
 
     fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
@@ -1018,7 +1141,12 @@ pub const LarkChannel = struct {
 
         while (self.running.load(.acquire)) {
             const maybe_message = ws.readMessage() catch |err| {
-                log.warn("lark websocket read failed: {}", .{err});
+                const err_name = @errorName(err);
+                if (std.mem.eql(u8, err_name, "ConnectionClosed") or std.mem.eql(u8, err_name, "EndOfStream")) {
+                    log.info("lark websocket closed by remote, reconnecting", .{});
+                } else {
+                    log.warn("lark websocket read failed: {}", .{err});
+                }
                 break;
             };
             if (maybe_message == null) break;
@@ -1097,6 +1225,11 @@ pub const LarkChannel = struct {
         try self.sendMessage(target, message);
     }
 
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichMessage(target, payload);
+    }
+
     fn vtableName(ptr: *anyopaque) []const u8 {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
         return self.channelName();
@@ -1111,6 +1244,7 @@ pub const LarkChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
     };
@@ -2182,6 +2316,62 @@ test "lark stripAtPlaceholders preserves normal @ mentions" {
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Hello @john how are you?", result);
 }
+
+test "lark messageSuggestsPermissionIssue matches english keywords" {
+    try std.testing.expect(LarkChannel.messageSuggestsPermissionIssue("forbidden: missing permission scope"));
+    try std.testing.expect(LarkChannel.messageSuggestsPermissionIssue("Unauthorized app scope"));
+    try std.testing.expect(!LarkChannel.messageSuggestsPermissionIssue("request timeout"));
+}
+
+test "lark messageSuggestsPermissionIssue matches chinese keyword" {
+    try std.testing.expect(LarkChannel.messageSuggestsPermissionIssue("需要开放权限"));
+}
+
+test "lark validateBusinessResponse accepts success code" {
+    try LarkChannel.validateBusinessResponse(std.testing.allocator, "send_message", "{\"code\":0,\"msg\":\"ok\"}");
+}
+
+test "lark validateBusinessResponse rejects nonzero code" {
+    try std.testing.expectError(
+        error.LarkApiError,
+        LarkChannel.validateBusinessResponse(std.testing.allocator, "send_message", "{\"code\":999,\"msg\":\"forbidden\"}"),
+    );
+}
+
+test "lark buildRichCardContent preserves submit text for choice buttons" {
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
+        .{ .id = "no", .label = "No", .submit_text = "Cancel action" },
+    };
+
+    var buf: [4096]u8 = undefined;
+    const body = try LarkChannel.buildRichCardContent(&buf, .{
+        .text = "Pick one option.",
+        .choices = &choices,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"submit_text\":\"Confirm action\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"choice_id\":\"yes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Yes\"") != null);
+}
+
+test "lark buildRichCardContent uses action group button ids directly" {
+    const buttons = [_]outbound.ActionButton{
+        .{ .id = "approve", .label = "Approve" },
+    };
+    const groups = [_]outbound.ActionGroup{.{ .actions = &buttons }};
+
+    var buf: [4096]u8 = undefined;
+    const body = try LarkChannel.buildRichCardContent(&buf, .{
+        .card_title = "Review",
+        .action_groups = &groups,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"choice_id\":\"approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"submit_text\"") == null);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // WebSocket Tests
 // ════════════════════════════════════════════════════════════════════════════

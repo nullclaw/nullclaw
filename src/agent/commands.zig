@@ -248,6 +248,37 @@ fn setDefaultProvider(self: anytype, provider_name: []const u8) !void {
     self.default_provider = owned_provider;
 }
 
+fn setProfileSystemPrompt(self: anytype, prompt: ?[]const u8) !void {
+    if (!@hasField(@TypeOf(self.*), "profile_system_prompt")) return;
+
+    const owned_prompt = if (prompt) |value|
+        try self.allocator.dupe(u8, value)
+    else
+        null;
+
+    if (@hasField(@TypeOf(self.*), "profile_system_prompt_owned")) {
+        if (self.profile_system_prompt_owned and self.profile_system_prompt != null) {
+            self.allocator.free(self.profile_system_prompt.?);
+        }
+        self.profile_system_prompt_owned = false;
+    }
+
+    self.profile_system_prompt = owned_prompt;
+    if (@hasField(@TypeOf(self.*), "profile_system_prompt_owned")) {
+        self.profile_system_prompt_owned = owned_prompt != null;
+    }
+}
+
+fn activeRuntimeProviderName(self: anytype) ?[]const u8 {
+    if (@hasField(@TypeOf(self.*), "provider")) {
+        return self.provider.getName();
+    }
+    if (@hasField(@TypeOf(self.*), "default_provider")) {
+        return self.default_provider;
+    }
+    return null;
+}
+
 fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     if (!@hasField(@TypeOf(self.*), "configured_providers")) return false;
     for (self.configured_providers) |entry| {
@@ -640,6 +671,209 @@ test "applyHotReloadConfig restores resolved defaults and invalidates prompt cac
     try std.testing.expect(!dummy.system_prompt_has_conversation_context);
     try std.testing.expect(dummy.workspace_prompt_fingerprint == null);
     try std.testing.expect(dummy.system_prompt_model_name == null);
+}
+
+const HotReloadProviderStub = struct {
+    name: []const u8,
+
+    fn provider(self: *@This()) providers.Provider {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        return .{
+            .content = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try allocator.dupe(u8, "test-model"),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(ptr: *anyopaque) []const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.name;
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable = providers.Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+};
+
+test "applyHotReloadConfig updates active profile overrides when runtime provider matches" {
+    const allocator = std.testing.allocator;
+
+    var provider_stub = HotReloadProviderStub{ .name = "ollama" };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        provider: providers.Provider,
+        profile_name: ?[]const u8,
+        profile_system_prompt: ?[]const u8,
+        profile_system_prompt_owned: bool,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+        has_system_prompt: bool,
+        system_prompt_has_conversation_context: bool,
+        workspace_prompt_fingerprint: ?u64,
+        system_prompt_model_name: ?[]u8,
+    }{
+        .allocator = allocator,
+        .provider = provider_stub.provider(),
+        .profile_name = "coder",
+        .profile_system_prompt = "Old profile prompt",
+        .profile_system_prompt_owned = false,
+        .model_name = "qwen2.5-coder:7b",
+        .model_name_owned = false,
+        .default_provider = "ollama",
+        .default_provider_owned = false,
+        .default_model = "qwen2.5-coder:7b",
+        .temperature = 0.2,
+        .has_system_prompt = true,
+        .system_prompt_has_conversation_context = true,
+        .workspace_prompt_fingerprint = 99,
+        .system_prompt_model_name = try allocator.dupe(u8, "old-model"),
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.profile_system_prompt_owned and dummy.profile_system_prompt != null) allocator.free(dummy.profile_system_prompt.?);
+    defer if (dummy.system_prompt_model_name) |model_name| allocator.free(model_name);
+
+    const agents = [_]config_types.NamedAgentConfig{
+        .{
+            .name = "coder",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+            .system_prompt = "New profile prompt",
+            .temperature = 0.4,
+        },
+    };
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .default_temperature = 0.7,
+        .agents = &agents,
+        .allocator = allocator,
+    };
+
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 8), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 4), summary.applied);
+    try std.testing.expectEqual(@as(usize, 5), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", dummy.model_name);
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", dummy.default_model);
+    try std.testing.expectEqualStrings("ollama", dummy.default_provider);
+    try std.testing.expectEqualStrings("New profile prompt", dummy.profile_system_prompt.?);
+    try std.testing.expect(dummy.profile_system_prompt_owned);
+    try std.testing.expectEqual(@as(f64, 0.4), dummy.temperature);
+    try std.testing.expect(!dummy.has_system_prompt);
+    try std.testing.expect(!dummy.system_prompt_has_conversation_context);
+    try std.testing.expect(dummy.workspace_prompt_fingerprint == null);
+    try std.testing.expect(dummy.system_prompt_model_name == null);
+}
+
+test "applyHotReloadConfig clears removed profile overrides and skips provider rebuilds" {
+    const allocator = std.testing.allocator;
+
+    var provider_stub = HotReloadProviderStub{ .name = "ollama" };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        provider: providers.Provider,
+        profile_name: ?[]const u8,
+        profile_system_prompt: ?[]const u8,
+        profile_system_prompt_owned: bool,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+    }{
+        .allocator = allocator,
+        .provider = provider_stub.provider(),
+        .profile_name = "coder",
+        .profile_system_prompt = try allocator.dupe(u8, "Old profile prompt"),
+        .profile_system_prompt_owned = true,
+        .model_name = "qwen2.5-coder:7b",
+        .model_name_owned = false,
+        .default_provider = "ollama",
+        .default_provider_owned = false,
+        .default_model = "qwen2.5-coder:7b",
+        .temperature = 0.2,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.profile_system_prompt_owned and dummy.profile_system_prompt != null) allocator.free(dummy.profile_system_prompt.?);
+
+    const agents = [_]config_types.NamedAgentConfig{
+        .{
+            .name = "coder",
+            .provider = "openai",
+            .model = "gpt-4.1-mini",
+            .system_prompt = null,
+            .temperature = null,
+        },
+    };
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .default_temperature = 0.7,
+        .agents = &agents,
+        .allocator = allocator,
+    };
+
+    // Regression: profile reload must not free borrowed prompt memory or fake a provider switch
+    // when the session would still be bound to the old provider runtime.
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 6), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 2), summary.applied);
+    try std.testing.expectEqual(@as(usize, 7), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", dummy.model_name);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", dummy.default_model);
+    try std.testing.expectEqualStrings("ollama", dummy.default_provider);
+    try std.testing.expect(dummy.profile_system_prompt == null);
+    try std.testing.expect(!dummy.profile_system_prompt_owned);
+    try std.testing.expectEqual(@as(f64, 0.7), dummy.temperature);
 }
 
 test "splitPrimaryModelRef parses provider model format" {
@@ -2691,8 +2925,14 @@ fn hotReloadValueJson(
 
 fn applyHotReloadConfig(self: anytype, cfg: *const config_module.Config) !HotReloadSummary {
     var summary = HotReloadSummary{};
+    const has_active_profile = @hasField(@TypeOf(self.*), "profile_name") and self.profile_name != null;
 
     for (hot_reload_paths) |path| {
+        if (has_active_profile and std.mem.eql(u8, path, "agents.defaults.model.primary")) {
+            summary.skipped += 1;
+            continue;
+        }
+
         const value_json = hotReloadValueJson(self.allocator, cfg, path) catch {
             summary.failed += 1;
             continue;
@@ -2713,6 +2953,96 @@ fn applyHotReloadConfig(self: anytype, cfg: *const config_module.Config) !HotRel
             summary.applied += 1;
         } else {
             summary.skipped += 1;
+        }
+    }
+
+    // Profile-aware reload: only hot-apply profile settings that can be reconciled
+    // with the current runtime provider. Provider swaps still require a fresh session.
+    if (@hasField(@TypeOf(self.*), "profile_name")) {
+        if (self.profile_name) |pname| {
+            for (cfg.agents) |*acfg| {
+                if (std.mem.eql(u8, acfg.name, pname)) {
+                    const runtime_provider_name = activeRuntimeProviderName(self) orelse "";
+                    const provider_matches_runtime = provider_names.providerNamesMatchIgnoreCase(
+                        runtime_provider_name,
+                        acfg.provider,
+                    );
+
+                    if (@hasField(@TypeOf(self.*), "default_provider") and
+                        !provider_names.providerNamesMatchIgnoreCase(self.default_provider, acfg.provider))
+                    {
+                        if (provider_matches_runtime) {
+                            summary.attempted += 1;
+                            const provider_updated = blk: {
+                                setDefaultProvider(self, acfg.provider) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile provider metadata update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (provider_updated) summary.applied += 1;
+                        } else {
+                            summary.skipped += 1;
+                            log.warn(
+                                "Hot reload skipped profile provider change for {s}: runtime provider {s} requires a fresh session to switch to {s}",
+                                .{ pname, runtime_provider_name, acfg.provider },
+                            );
+                        }
+                    }
+
+                    if (!std.mem.eql(u8, self.model_name, acfg.model)) {
+                        if (!provider_matches_runtime) {
+                            summary.skipped += 1;
+                            log.warn(
+                                "Hot reload skipped profile model update for {s}: provider switch to {s} was not applied",
+                                .{ pname, acfg.provider },
+                            );
+                        } else {
+                            summary.attempted += 1;
+                            const model_updated = blk: {
+                                setModelName(self, acfg.model) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile model update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (model_updated) {
+                                if (@hasField(@TypeOf(self.*), "default_model")) {
+                                    self.default_model = self.model_name;
+                                }
+                                summary.applied += 1;
+                            }
+                        }
+                    }
+
+                    if (@hasField(@TypeOf(self.*), "profile_system_prompt")) {
+                        const old_prompt = self.profile_system_prompt orelse "";
+                        const new_prompt = acfg.system_prompt orelse "";
+                        if (!std.mem.eql(u8, old_prompt, new_prompt)) {
+                            summary.attempted += 1;
+                            const prompt_updated = blk: {
+                                setProfileSystemPrompt(self, if (new_prompt.len > 0) new_prompt else null) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile system prompt update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (prompt_updated) summary.applied += 1;
+                        }
+                    }
+
+                    const new_temp = acfg.temperature orelse cfg.default_temperature;
+                    if (self.temperature != new_temp) {
+                        summary.attempted += 1;
+                        self.temperature = new_temp;
+                        summary.applied += 1;
+                    }
+                    break;
+                }
+            }
         }
     }
 

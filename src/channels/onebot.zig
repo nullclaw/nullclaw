@@ -223,7 +223,7 @@ pub const OneBotChannel = struct {
     }
 
     pub fn healthCheck(self: *OneBotChannel) bool {
-        return self.running.load(.acquire);
+        return self.running.load(.acquire) and self.connected.load(.acquire);
     }
 
     /// Set the event bus for publishing inbound messages.
@@ -394,11 +394,22 @@ pub const OneBotChannel = struct {
             headers = &headers_buf;
         }
 
-        const resp = root.http_util.curlPost(self.allocator, url, body, headers) catch |err| {
+        const resp = root.http_util.curlPostWithStatus(self.allocator, url, body, headers) catch |err| {
             log.err("OneBot API POST failed: {}", .{err});
             return error.OneBotApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp.body);
+
+        if (resp.status_code < 200 or resp.status_code >= 300) {
+            log.err("OneBot API returned HTTP status {d}", .{resp.status_code});
+            if (resp.status_code == 401 or resp.status_code == 403) return error.OneBotAuthError;
+            return error.OneBotApiError;
+        }
+
+        ensureOneBotApiSuccess(self.allocator, resp.body) catch |err| {
+            log.err("OneBot API returned failure payload: {}", .{err});
+            return err;
+        };
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -617,6 +628,55 @@ fn buildSendApiUrl(buf: []u8, ws_url: []const u8) ![]const u8 {
     return fbs.getWritten();
 }
 
+fn messageSuggestsAuthIssue(msg: []const u8) bool {
+    if (msg.len == 0) return false;
+
+    var lower_buf: [256]u8 = undefined;
+    const n = @min(msg.len, lower_buf.len);
+    for (msg[0..n], 0..) |c, i| {
+        lower_buf[i] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..n];
+
+    return std.mem.indexOf(u8, lower, "auth") != null or
+        std.mem.indexOf(u8, lower, "token") != null or
+        std.mem.indexOf(u8, lower, "unauthorized") != null or
+        std.mem.indexOf(u8, lower, "forbidden") != null or
+        std.mem.indexOf(u8, lower, "permission") != null;
+}
+
+/// OneBot typically returns {"status":"ok","retcode":0,...} on success.
+fn ensureOneBotApiSuccess(allocator: std.mem.Allocator, resp_body: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return error.OneBotApiError;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.OneBotApiError;
+
+    const status = if (parsed.value.object.get("status")) |v|
+        (if (v == .string) v.string else "")
+    else
+        "";
+
+    const retcode: i64 = if (parsed.value.object.get("retcode")) |v| switch (v) {
+        .integer => v.integer,
+        .number_string => std.fmt.parseInt(i64, v.number_string, 10) catch -1,
+        else => -1,
+    } else 0;
+
+    if (std.mem.eql(u8, status, "ok") and retcode == 0) return;
+
+    const wording = if (parsed.value.object.get("wording")) |v|
+        (if (v == .string) v.string else "")
+    else
+        "";
+
+    // Common OneBot auth failures appear as 401/403-like retcodes or auth wording.
+    if (retcode == 401 or retcode == 403 or retcode == 1403 or messageSuggestsAuthIssue(wording)) {
+        return error.OneBotAuthError;
+    }
+    return error.OneBotApiError;
+}
+
 /// Get a string field from a JSON object value.
 fn getJsonString(val: std.json.Value, key: []const u8) ?[]const u8 {
     if (val != .object) return null;
@@ -812,6 +872,14 @@ test "buildSendApiUrl preserves https default port elision" {
     try std.testing.expectEqualStrings("https://bot.example.com/send_msg", result);
 }
 
+test "ensureOneBotApiSuccess validates success and failure payloads" {
+    const alloc = std.testing.allocator;
+    try ensureOneBotApiSuccess(alloc, "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1}}");
+    try std.testing.expectError(error.OneBotApiError, ensureOneBotApiSuccess(alloc, "not-json"));
+    try std.testing.expectError(error.OneBotApiError, ensureOneBotApiSuccess(alloc, "{\"status\":\"failed\",\"retcode\":1200}"));
+    try std.testing.expectError(error.OneBotAuthError, ensureOneBotApiSuccess(alloc, "{\"status\":\"failed\",\"retcode\":1403,\"wording\":\"token invalid\"}"));
+}
+
 test "config_types.OneBotConfig defaults" {
     const config = config_types.OneBotConfig{};
     try std.testing.expectEqualStrings("ws://localhost:6700", config.url);
@@ -831,6 +899,18 @@ test "OneBotChannel init stores config" {
     try std.testing.expectEqualStrings("/bot", ch.config.group_trigger_prefix.?);
     try std.testing.expectEqualStrings("onebot", ch.channelName());
     try std.testing.expect(!ch.healthCheck());
+}
+
+test "OneBotChannel healthCheck requires websocket connection" {
+    const alloc = std.testing.allocator;
+    var ch = OneBotChannel.init(alloc, .{});
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.connected.store(true, .release);
+    try std.testing.expect(ch.healthCheck());
 }
 
 test "OneBotChannel vtable compiles" {

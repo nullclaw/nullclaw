@@ -63,6 +63,11 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Agent = struct {
+    const TextPreview = struct {
+        slice: []const u8,
+        truncated: bool,
+    };
+
     const VerboseLevel = enum {
         off,
         on,
@@ -251,6 +256,7 @@ pub const Agent = struct {
     default_model: []const u8 = "anthropic/claude-sonnet-4",
     profile_name: ?[]const u8 = null,
     profile_system_prompt: ?[]const u8 = null,
+    profile_system_prompt_owned: bool = false,
     model_routes: []const config_types.ModelRouteConfig = &.{},
     model_pinned_by_user: bool = false,
     last_route_trace: ?[]u8 = null,
@@ -577,6 +583,7 @@ pub const Agent = struct {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.profile_system_prompt_owned and self.profile_system_prompt != null) self.allocator.free(self.profile_system_prompt.?);
         if (self.workspace_dir_owned) self.allocator.free(self.workspace_dir);
         if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.last_route_trace) |trace| self.allocator.free(trace);
@@ -862,18 +869,89 @@ pub const Agent = struct {
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
+        // Specific "let me <action-verb>" and "i'll/i will <action-verb>" phrases.
+        // Kept as explicit verb+phrase pairs to avoid false-positives on conclusory
+        // statements like "I'll note that…", "Let me know if…", or "I will summarize…".
         const ascii_patterns = [_][]const u8{
+            // try / retry / attempt
             "i'll try",
             "i will try",
             "let me try",
-            "i'll check",
-            "i will check",
-            "let me check",
             "i'll retry",
             "i will retry",
             "let me retry",
             "i'll attempt",
             "i will attempt",
+            "let me attempt",
+            // check / look / verify
+            "i'll check",
+            "i will check",
+            "let me check",
+            "i'll look into",
+            "i will look into",
+            "let me look into",
+            "i'll look up",
+            "i will look up",
+            "let me look up",
+            "i'll verify",
+            "i will verify",
+            "let me verify",
+            // fetch / get / retrieve
+            "i'll fetch",
+            "i will fetch",
+            "let me fetch",
+            "i'll get the",
+            "i will get the",
+            "let me get the",
+            "i'll get that",
+            "i will get that",
+            "let me get that",
+            "i'll get this",
+            "i will get this",
+            "let me get this",
+            "i'll get it",
+            "i will get it",
+            "let me get it",
+            "i'll retrieve",
+            "i will retrieve",
+            "let me retrieve",
+            // find / search
+            "i'll find",
+            "i will find",
+            "let me find",
+            "i'll search",
+            "i will search",
+            "let me search",
+            // read / open / load
+            "i'll read",
+            "i will read",
+            "let me read",
+            "i'll open",
+            "i will open",
+            "let me open",
+            "i'll load",
+            "i will load",
+            "let me load",
+            // run / execute
+            "i'll run the",
+            "i will run the",
+            "let me run the",
+            "i'll run that",
+            "i will run that",
+            "let me run that",
+            "i'll run it",
+            "i will run it",
+            "let me run it",
+            "i'll execute the",
+            "i will execute the",
+            "let me execute the",
+            "i'll execute that",
+            "i will execute that",
+            "let me execute that",
+            "i'll execute it",
+            "i will execute it",
+            "let me execute it",
+            // do / do that
             "i'll do that now",
             "i will do that now",
             "doing that now",
@@ -1720,6 +1798,7 @@ pub const Agent = struct {
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
                 .tools = self.tools,
+                .timezone = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC",
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
@@ -1834,14 +1913,6 @@ pub const Agent = struct {
             }
         }
 
-        // Record agent event
-        const start_event = ObserverEvent{ .llm_request = .{
-            .provider = self.provider.getName(),
-            .model = turn_model_name,
-            .messages_count = self.history.items.len,
-        } };
-        self.observer.recordEvent(&start_event);
-
         const turn_token_limit = context_tokens.resolveContextTokens(self.token_limit_override, turn_model_name);
         const turn_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(self.max_tokens_override, turn_model_name);
         const turn_token_limit_cap: u32 = @intCast(@min(turn_token_limit, @as(u64, std.math.maxInt(u32))));
@@ -1907,6 +1978,7 @@ pub const Agent = struct {
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
             if (is_streaming) {
+                self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
                     self.allocator,
@@ -1926,14 +1998,7 @@ pub const Agent = struct {
                     self.stream_ctx.?,
                 ) catch |err| retry_stream: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-                    const fail_event = ObserverEvent{ .llm_response = .{
-                        .provider = self.provider.getName(),
-                        .model = turn_model_name,
-                        .duration_ms = fail_duration,
-                        .success = false,
-                        .error_message = @errorName(err),
-                    } };
-                    self.observer.recordEvent(&fail_event);
+                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
@@ -1949,6 +2014,7 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, true);
                         break :retry_stream self.provider.streamChat(
                             self.allocator,
@@ -1984,6 +2050,7 @@ pub const Agent = struct {
                     .model = stream_result.model,
                 };
             } else {
+                self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
                 response = self.provider.chat(
                     self.allocator,
@@ -2002,14 +2069,7 @@ pub const Agent = struct {
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-                    const fail_event = ObserverEvent{ .llm_response = .{
-                        .provider = self.provider.getName(),
-                        .model = turn_model_name,
-                        .duration_ms = fail_duration,
-                        .success = false,
-                        .error_message = @errorName(err),
-                    } };
-                    self.observer.recordEvent(&fail_event);
+                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
@@ -2025,6 +2085,7 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
@@ -2062,6 +2123,7 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
@@ -2093,6 +2155,7 @@ pub const Agent = struct {
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
+                    self.recordLlmRequestEvent(turn_model_name, messages);
                     self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
                     break :retry_blk self.provider.chat(
                         self.allocator,
@@ -2121,6 +2184,7 @@ pub const Agent = struct {
                                 turn_max_tokens,
                             );
                             response_attempt = 3;
+                            self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
                             self.logLlmRequest(iteration + 1, 3, turn_model_name, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
@@ -2151,14 +2215,6 @@ pub const Agent = struct {
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-            const resp_event = ObserverEvent{ .llm_response = .{
-                .provider = self.provider.getName(),
-                .model = turn_model_name,
-                .duration_ms = duration_ms,
-                .success = true,
-                .error_message = null,
-            } };
-            self.observer.recordEvent(&resp_event);
 
             const response_text = response.contentOrEmpty();
 
@@ -2178,6 +2234,11 @@ pub const Agent = struct {
 
             self.total_tokens += normalized_usage.total_tokens;
             self.last_turn_usage = normalized_usage;
+            if (normalized_usage.total_tokens > 0) {
+                const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_usage.total_tokens };
+                self.observer.recordMetric(&usage_metric);
+            }
+            self.recordLlmResponseEvent(turn_model_name, duration_ms, &response);
             self.emitUsageRecord(&response, true);
             const use_native = response.hasToolCalls();
 
@@ -2252,8 +2313,7 @@ pub const Agent = struct {
 
                 if (trimmed_display_text.len == 0) {
                     self.freeResponseFields(&response);
-                    if (!is_streaming and
-                        empty_response_retry_count < 1 and
+                    if (empty_response_retry_count < 1 and
                         iteration + 1 < self.max_tool_iterations)
                     {
                         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") });
@@ -2267,8 +2327,9 @@ pub const Agent = struct {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
-                if (!is_streaming and
-                    forced_follow_through_count < 2 and
+                // This applies in both streaming and non-streaming paths: the follow-up
+                // iteration will stream its own chunks independently.
+                if (forced_follow_through_count < 2 and
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
@@ -2471,11 +2532,25 @@ pub const Agent = struct {
                     );
                 }
 
+                var tool_args_buf: [1024]u8 = undefined;
+                var tool_detail_buf: [1024]u8 = undefined;
+                const tool_args = if (self.log_llm_io)
+                    toolArgsObserverDetail(&tool_args_buf, call.arguments_json)
+                else
+                    null;
+                const tool_detail = if (self.log_llm_io) blk: {
+                    const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
+                    break :blk toolResultObserverDetail(&tool_detail_buf, scrubbed_output);
+                } else if (!result.success)
+                    result.output
+                else
+                    null;
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
                     .duration_ms = tool_duration,
                     .success = result.success,
-                    .detail = if (result.success) null else result.output,
+                    .args = tool_args,
+                    .detail = tool_detail,
                 } };
                 self.observer.recordEvent(&tool_event);
 
@@ -2545,6 +2620,8 @@ pub const Agent = struct {
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
+        const summary_timer_start = std.time.milliTimestamp();
+        self.recordLlmRequestEvent(self.model_name, summary_messages);
         self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
@@ -2560,7 +2637,9 @@ pub const Agent = struct {
             },
             self.model_name,
             self.temperature,
-        ) catch {
+        ) catch |err| {
+            const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - summary_timer_start)));
+            self.recordLlmFailureEvent(self.model_name, fail_duration, @errorName(err));
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             self.savePrevTurnContext(turn_ctx);
             const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -2568,9 +2647,33 @@ pub const Agent = struct {
             return fallback;
         };
         self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
+        const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - summary_timer_start)));
+        const summary_text = summary_response.contentOrEmpty();
+        var normalized_summary_usage = summary_response.usage;
+        if (normalized_summary_usage.total_tokens == 0 and
+            (normalized_summary_usage.prompt_tokens > 0 or normalized_summary_usage.completion_tokens > 0))
+        {
+            normalized_summary_usage.total_tokens = normalized_summary_usage.prompt_tokens +| normalized_summary_usage.completion_tokens;
+        }
+        if (normalized_summary_usage.total_tokens == 0 and
+            normalized_summary_usage.prompt_tokens == 0 and
+            normalized_summary_usage.completion_tokens == 0 and
+            summary_text.len > 0)
+        {
+            normalized_summary_usage.completion_tokens = estimate_text_tokens(summary_text);
+            normalized_summary_usage.total_tokens = normalized_summary_usage.completion_tokens;
+        }
+        summary_response.usage = normalized_summary_usage;
+        self.total_tokens += normalized_summary_usage.total_tokens;
+        self.last_turn_usage = normalized_summary_usage;
+        if (normalized_summary_usage.total_tokens > 0) {
+            const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_summary_usage.total_tokens };
+            self.observer.recordMetric(&usage_metric);
+        }
+        self.recordLlmResponseEvent(self.model_name, summary_duration_ms, &summary_response);
+        self.emitUsageRecord(&summary_response, true);
         defer self.freeResponseFields(&summary_response);
 
-        const summary_text = summary_response.contentOrEmpty();
         const prefixed = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
         errdefer self.allocator.free(prefixed);
 
@@ -2909,11 +3012,155 @@ pub const Agent = struct {
 
     const LLM_LOG_MAX_BYTES: usize = 8192;
 
-    fn llmLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
-        if (text.len <= LLM_LOG_MAX_BYTES) {
+    fn previewText(text: []const u8, max_bytes: usize) TextPreview {
+        if (text.len <= max_bytes) {
             return .{ .slice = text, .truncated = false };
         }
-        return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
+        return .{ .slice = text[0..max_bytes], .truncated = true };
+    }
+
+    fn llmLogPreview(text: []const u8) TextPreview {
+        return previewText(text, LLM_LOG_MAX_BYTES);
+    }
+
+    fn llmRequestObserverDetail(buf: []u8, messages: []const ChatMessage) ?[]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        const max_messages = @min(messages.len, 6);
+        for (messages[0..max_messages], 0..) |msg, idx| {
+            const preview = previewText(msg.content, 240);
+            const parts_count: usize = if (msg.content_parts) |parts| parts.len else 0;
+            w.print(
+                "#{d} role={s} bytes={d} parts={d} content={f}{s}",
+                .{
+                    idx + 1,
+                    msg.role.toSlice(),
+                    msg.content.len,
+                    parts_count,
+                    std.json.fmt(preview.slice, .{}),
+                    if (preview.truncated) " [truncated]" else "",
+                },
+            ) catch break;
+            if (idx + 1 < max_messages) {
+                w.writeByte('\n') catch break;
+            }
+        }
+        if (messages.len > max_messages) {
+            w.print("\n... {d} more messages", .{messages.len - max_messages}) catch {};
+        }
+        const written = fbs.getWritten();
+        if (written.len == 0) return null;
+        return written;
+    }
+
+    fn llmResponseObserverDetail(buf: []u8, response: *const ChatResponse) ?[]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+
+        const content = response.contentOrEmpty();
+        const content_preview = previewText(content, 400);
+        w.print(
+            "content_bytes={d} content={f}{s}",
+            .{
+                content.len,
+                std.json.fmt(content_preview.slice, .{}),
+                if (content_preview.truncated) " [truncated]" else "",
+            },
+        ) catch return null;
+
+        if (response.reasoning_content) |reasoning| {
+            const reasoning_preview = previewText(reasoning, 240);
+            w.print(
+                "\nreasoning_bytes={d} reasoning={f}{s}",
+                .{
+                    reasoning.len,
+                    std.json.fmt(reasoning_preview.slice, .{}),
+                    if (reasoning_preview.truncated) " [truncated]" else "",
+                },
+            ) catch {};
+        }
+
+        const max_tool_calls = @min(response.tool_calls.len, 4);
+        for (response.tool_calls[0..max_tool_calls], 0..) |tc, idx| {
+            const args_preview = previewText(tc.arguments, 200);
+            w.print(
+                "\ntool#{d} id={s} name={s} args={f}{s}",
+                .{
+                    idx + 1,
+                    if (tc.id.len > 0) tc.id else "-",
+                    tc.name,
+                    std.json.fmt(args_preview.slice, .{}),
+                    if (args_preview.truncated) " [truncated]" else "",
+                },
+            ) catch {};
+        }
+        if (response.tool_calls.len > max_tool_calls) {
+            w.print("\n... {d} more tool calls", .{response.tool_calls.len - max_tool_calls}) catch {};
+        }
+
+        const written = fbs.getWritten();
+        if (written.len == 0) return null;
+        return written;
+    }
+
+    fn toolArgsObserverDetail(buf: []u8, arguments_json: []const u8) ?[]const u8 {
+        const preview = previewText(arguments_json, @min(buf.len, 512));
+        if (preview.slice.len == 0) return null;
+        var fbs = std.io.fixedBufferStream(buf);
+        fbs.writer().print("{f}{s}", .{
+            std.json.fmt(preview.slice, .{}),
+            if (preview.truncated) " [truncated]" else "",
+        }) catch return null;
+        return fbs.getWritten();
+    }
+
+    fn toolResultObserverDetail(buf: []u8, output: []const u8) ?[]const u8 {
+        const preview = previewText(output, @min(buf.len, 512));
+        if (preview.slice.len == 0) return null;
+        var fbs = std.io.fixedBufferStream(buf);
+        fbs.writer().print("{f}{s}", .{
+            std.json.fmt(preview.slice, .{}),
+            if (preview.truncated) " [truncated]" else "",
+        }) catch return null;
+        return fbs.getWritten();
+    }
+
+    fn recordLlmRequestEvent(self: *Agent, model_name: []const u8, messages: []const ChatMessage) void {
+        var detail_buf: [2048]u8 = undefined;
+        const event = ObserverEvent{ .llm_request = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .messages_count = messages.len,
+            .detail = if (self.log_llm_io) llmRequestObserverDetail(&detail_buf, messages) else null,
+        } };
+        self.observer.recordEvent(&event);
+    }
+
+    fn recordLlmResponseEvent(self: *Agent, model_name: []const u8, duration_ms: u64, response: *const ChatResponse) void {
+        var detail_buf: [2048]u8 = undefined;
+        const event = ObserverEvent{ .llm_response = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .duration_ms = duration_ms,
+            .success = true,
+            .error_message = null,
+            .prompt_tokens = response.usage.prompt_tokens,
+            .completion_tokens = response.usage.completion_tokens,
+            .total_tokens = response.usage.total_tokens,
+            .detail = if (self.log_llm_io) llmResponseObserverDetail(&detail_buf, response) else null,
+        } };
+        self.observer.recordEvent(&event);
+    }
+
+    fn recordLlmFailureEvent(self: *Agent, model_name: []const u8, duration_ms: u64, err_name: []const u8) void {
+        const event = ObserverEvent{ .llm_response = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .duration_ms = duration_ms,
+            .success = false,
+            .error_message = err_name,
+        } };
+        self.observer.recordEvent(&event);
     }
 
     fn logLlmRequest(
@@ -3966,6 +4213,74 @@ fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {
     return null;
 }
 
+const RecordingObserver = struct {
+    const Self = @This();
+
+    llm_request_count: usize = 0,
+    llm_response_count: usize = 0,
+    llm_failure_count: usize = 0,
+    tool_iterations_exhausted_count: usize = 0,
+    turn_complete_count: usize = 0,
+    tokens_used_metric_total: u64 = 0,
+    last_llm_response_total_tokens: ?u32 = null,
+    llm_request_message_counts: [8]usize = [_]usize{0} ** 8,
+    llm_request_message_counts_len: usize = 0,
+
+    const vtable = Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = getName,
+    };
+
+    fn observer(self: *Self) Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn resolve(ptr: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        switch (event.*) {
+            .llm_request => |e| {
+                self.llm_request_count += 1;
+                if (self.llm_request_message_counts_len < self.llm_request_message_counts.len) {
+                    self.llm_request_message_counts[self.llm_request_message_counts_len] = e.messages_count;
+                    self.llm_request_message_counts_len += 1;
+                }
+            },
+            .llm_response => |e| {
+                self.llm_response_count += 1;
+                if (!e.success) self.llm_failure_count += 1;
+                self.last_llm_response_total_tokens = e.total_tokens;
+            },
+            .tool_iterations_exhausted => {
+                self.tool_iterations_exhausted_count += 1;
+            },
+            .turn_complete => {
+                self.turn_complete_count += 1;
+            },
+            else => {},
+        }
+    }
+
+    fn recordMetric(ptr: *anyopaque, metric: *const observability.ObserverMetric) void {
+        const self = resolve(ptr);
+        switch (metric.*) {
+            .tokens_used => |v| self.tokens_used_metric_total += v,
+            else => {},
+        }
+    }
+
+    fn flush(_: *anyopaque) void {}
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "recording-test";
+    }
+};
+
 test "Agent.fromConfig resolves token limit from model lookup when unset" {
     const allocator = std.testing.allocator;
     var cfg = Config{
@@ -4859,6 +5174,97 @@ test "turn still retries non-rate-limited provider failures once" {
 
     try std.testing.expectError(error.ProviderFailed, agent.turn("hello"));
     try std.testing.expectEqual(@as(u32, 2), state.calls);
+}
+
+test "turn records llm request for immediate context-compaction retry" {
+    const RecoveryProvider = struct {
+        const State = struct {
+            calls: u32 = 0,
+        };
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            if (state.calls == 1) return error.ContextLengthExceeded;
+            return .{
+                .content = try allocator.dupe(u8, "recovered"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "recovery-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = RecoveryProvider.State{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RecoveryProvider.chatWithSystem,
+        .chat = RecoveryProvider.chat,
+        .supportsNativeTools = RecoveryProvider.supportsNativeTools,
+        .getName = RecoveryProvider.getName,
+        .deinit = RecoveryProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var observer = RecordingObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+    for (0..7) |idx| {
+        const content = try std.fmt.allocPrint(allocator, "m{d}", .{idx});
+        try agent.history.append(allocator, .{
+            .role = if (idx % 2 == 0) .user else .assistant,
+            .content = content,
+        });
+    }
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "[Context compacted]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "recovered") != null);
+    try std.testing.expectEqual(@as(u32, 2), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.llm_failure_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_message_counts_len);
+    try std.testing.expect(observer.llm_request_message_counts[1] < observer.llm_request_message_counts[0]);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
 }
 
 test "slash /help returns help text" {
@@ -7388,6 +7794,248 @@ test "Agent tool-limit summary preserves provider session_id" {
     try std.testing.expectEqualStrings("telegram:chat123", provider_state.summary_session_id.?);
 }
 
+test "Agent tool-limit summary records observer events and token metric" {
+    const NoopTool = struct {
+        const Self = @This();
+        pub const tool_name = "noop";
+        pub const tool_description = "noop";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+
+    const SummaryProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+
+            if (self.calls == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop"),
+                    .name = try allocator.dupe(u8, "noop"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "summary"),
+                .tool_calls = &.{},
+                .usage = .{ .total_tokens = 5 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "summary-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = SummaryProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummaryProvider.chatWithSystem,
+        .chat = SummaryProvider.chat,
+        .supportsNativeTools = SummaryProvider.supportsNativeTools,
+        .getName = SummaryProvider.getName,
+        .deinit = SummaryProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop_tool = NoopTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var observer = RecordingObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("trigger summary");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
+    try std.testing.expectEqual(@as(usize, 0), observer.llm_failure_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), observer.tokens_used_metric_total);
+    try std.testing.expectEqual(@as(?u32, 5), observer.last_llm_response_total_tokens);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), agent.tokensUsed());
+    try std.testing.expectEqual(@as(u32, 5), agent.last_turn_usage.total_tokens);
+}
+
+test "Agent tool-limit summary records llm failure when summary call fails" {
+    const NoopTool = struct {
+        const Self = @This();
+        pub const tool_name = "noop";
+        pub const tool_description = "noop";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+
+    const SummaryFailProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+
+            if (self.calls == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop"),
+                    .name = try allocator.dupe(u8, "noop"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return error.ProviderFailed;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "summary-fail-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = SummaryFailProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummaryFailProvider.chatWithSystem,
+        .chat = SummaryFailProvider.chat,
+        .supportsNativeTools = SummaryFailProvider.supportsNativeTools,
+        .getName = SummaryFailProvider.getName,
+        .deinit = SummaryFailProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop_tool = NoopTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var observer = RecordingObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("trigger summary failure");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.llm_failure_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool")), observer.tokens_used_metric_total);
+}
+
 test "bindMemoryTools wires memory tools to sqlite backend" {
     const allocator = std.testing.allocator;
 
@@ -7983,6 +8631,26 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll look into that for you"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I will fetch the file now"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me search for that"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll run the tool now"));
+    // Regression: "let me get/fetch/find" must be caught (was the exact failure mode with vikunja-mcp)
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Found the Workstream Board (project ID 4). Let me get the Kanban columns (buckets) for it."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me fetch the list of projects."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me look up the tasks now."));
+}
+
+test "Agent shouldForceActionFollowThrough ignores conclusory english statements" {
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me know if you need anything else."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me show you how this works with a small example."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me list the main tradeoffs before the code."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I will call this helper once during initialization."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I'll use a simple example to explain the flow."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me get straight to the point."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I'll note that this is a known limitation."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I will summarize what I found: the directory contains 3 files."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
 }
 
 test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
@@ -8178,6 +8846,270 @@ test "Agent returns NoResponseContent after repeated empty final responses" {
 
     try std.testing.expectError(error.NoResponseContent, agent.turn("hello"));
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "Agent retries empty streaming response once" {
+    const EmptyThenRecoveredStreamingProvider = struct {
+        const Self = @This();
+
+        call_count: usize = 0,
+        saw_empty_retry_prompt: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldUseStreamChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 2) {
+                for (request.messages) |msg| {
+                    if (msg.role == .user and
+                        std.mem.indexOf(u8, msg.content, "Your previous reply was empty") != null)
+                    {
+                        self.saw_empty_retry_prompt = true;
+                        break;
+                    }
+                }
+                callback(callback_ctx, providers.StreamChunk.textDelta("recovered"));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{
+                    .content = try allocator.dupe(u8, "recovered"),
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = null,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "empty-then-recovered-streaming-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamCollector = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!chunk.is_final and chunk.delta.len > 0) {
+                self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+            }
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.chunks.deinit(allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = EmptyThenRecoveredStreamingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = EmptyThenRecoveredStreamingProvider.chatWithSystem,
+        .chat = EmptyThenRecoveredStreamingProvider.chat,
+        .supportsNativeTools = EmptyThenRecoveredStreamingProvider.supportsNativeTools,
+        .getName = EmptyThenRecoveredStreamingProvider.getName,
+        .deinit = EmptyThenRecoveredStreamingProvider.deinitFn,
+        .supports_streaming = EmptyThenRecoveredStreamingProvider.supportsStreaming,
+        .stream_chat = EmptyThenRecoveredStreamingProvider.streamChat,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    var collector = StreamCollector{};
+    defer collector.deinit(allocator);
+    agent.stream_callback = StreamCollector.callback;
+    agent.stream_ctx = @ptrCast(&collector);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqualStrings("recovered", collector.chunks.items);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_empty_retry_prompt);
+}
+
+test "Agent forces follow-through retry for streaming deferred promise" {
+    const DeferredPromiseStreamingProvider = struct {
+        const Self = @This();
+
+        call_count: usize = 0,
+        saw_follow_through_prompt: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldUseStreamChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 2) {
+                for (request.messages) |msg| {
+                    if (msg.role == .user and
+                        std.mem.indexOf(u8, msg.content, "You just promised to take action now") != null)
+                    {
+                        self.saw_follow_through_prompt = true;
+                        break;
+                    }
+                }
+                callback(callback_ctx, providers.StreamChunk.textDelta("I cannot access that tool in this environment."));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{
+                    .content = try allocator.dupe(u8, "I cannot access that tool in this environment."),
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            // Regression: A2A streaming replies like this must trigger a follow-up iteration.
+            const deferred = "Found the Workstream Board (project ID 4). Let me get the Kanban columns (buckets) for it.";
+            callback(callback_ctx, providers.StreamChunk.textDelta(deferred));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, deferred),
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "deferred-promise-streaming-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamCollector = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!chunk.is_final and chunk.delta.len > 0) {
+                self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+            }
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.chunks.deinit(allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = DeferredPromiseStreamingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = DeferredPromiseStreamingProvider.chatWithSystem,
+        .chat = DeferredPromiseStreamingProvider.chat,
+        .supportsNativeTools = DeferredPromiseStreamingProvider.supportsNativeTools,
+        .getName = DeferredPromiseStreamingProvider.getName,
+        .deinit = DeferredPromiseStreamingProvider.deinitFn,
+        .supports_streaming = DeferredPromiseStreamingProvider.supportsStreaming,
+        .stream_chat = DeferredPromiseStreamingProvider.streamChat,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    var collector = StreamCollector{};
+    defer collector.deinit(allocator);
+    agent.stream_callback = StreamCollector.callback;
+    agent.stream_ctx = @ptrCast(&collector);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("I cannot access that tool in this environment.", response);
+    try std.testing.expect(std.mem.indexOf(u8, collector.chunks.items, "Let me get the Kanban columns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collector.chunks.items, "I cannot access that tool in this environment.") != null);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_follow_through_prompt);
 }
 
 test "Agent.fromConfig sets exec_security=full for full autonomy" {

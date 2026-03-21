@@ -10,6 +10,7 @@ const json_util = @import("json_util.zig");
 const version = @import("version.zig");
 const platform = @import("platform.zig");
 const http_util = @import("http_util.zig");
+const sse_client = @import("sse_client.zig");
 const verbose = @import("verbose.zig");
 const Allocator = std.mem.Allocator;
 
@@ -203,7 +204,10 @@ pub const McpServer = struct {
                 allocator.free(resp.body);
                 return error.HttpBadStatus;
             }
-            return resp.body;
+            errdefer allocator.free(resp.body);
+            const normalized = try extractJsonFromSse(allocator, resp.body);
+            if (normalized.ptr != resp.body.ptr) allocator.free(resp.body);
+            return normalized;
         }
 
         const stdin = self.child.?.stdin orelse return error.NoStdin;
@@ -261,6 +265,10 @@ pub const McpServer = struct {
         var header_count: usize = 0;
 
         headers_buf[header_count] = .{ .name = "Content-Type", .value = "application/json" };
+        header_count += 1;
+
+        if (header_count >= headers_buf.len) return error.TooManyHeaders;
+        headers_buf[header_count] = .{ .name = "Accept", .value = "application/json, text/event-stream" };
         header_count += 1;
 
         if (self.mcp_session_id) |sid| {
@@ -562,7 +570,49 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
     return all_tools.toOwnedSlice(allocator);
 }
 
+/// Extract JSON-RPC body from an SSE-formatted MCP HTTP response.
+/// Many MCP servers (playwright-mcp, firecrawl-mcp, mattermost-mcp) return
+/// responses in SSE format: "event: message\ndata: {json}\n".
+/// If the body is plain JSON or not SSE, return the original owned buffer.
+fn extractJsonFromSse(allocator: Allocator, body: []u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return body;
+
+    // Fast path: already valid JSON.
+    if (trimmed.ptr == body.ptr and trimmed.len == body.len and (trimmed[0] == '{' or trimmed[0] == '[')) {
+        return body;
+    }
+    if (trimmed[0] == '{' or trimmed[0] == '[') {
+        return try allocator.dupe(u8, trimmed);
+    }
+
+    const events = try sse_client.parseEvents(allocator, body);
+    defer {
+        for (events) |*event| event.deinit(allocator);
+        allocator.free(events);
+    }
+
+    var first_payload: ?[]const u8 = null;
+    for (events) |event| {
+        const data = std.mem.trim(u8, event.data, " \t\r\n");
+        if (data.len == 0) continue;
+        if (first_payload == null) first_payload = data;
+        if (data[0] == '{' or data[0] == '[') {
+            return try allocator.dupe(u8, data);
+        }
+    }
+
+    // Not SSE, or SSE payload is not JSON-RPC; return the most useful fallback.
+    if (first_payload) |payload| return try allocator.dupe(u8, payload);
+    return body;
+}
+
 // ── Tests ───────────────────────────────────────────────────────
+
+fn freeExtractedTestBody(input: []u8, output: []u8) void {
+    if (output.ptr != input.ptr) std.testing.allocator.free(input);
+    std.testing.allocator.free(output);
+}
 
 test "McpServer init fields" {
     const cfg = McpServerConfig{
@@ -767,4 +817,99 @@ test "extractMcpSessionIdFromHeaders parses LF headers" {
     const hdr = "HTTP/1.1 200 OK\nMCP-Session-Id: zzz\nX: y\n";
     const got = McpServer.extractMcpSessionIdFromHeaders(hdr) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("zzz", got);
+}
+
+test "extractJsonFromSse passes through plain JSON" {
+    const json = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    const got = try extractJsonFromSse(std.testing.allocator, json);
+    defer freeExtractedTestBody(json, got);
+    try std.testing.expectEqualStrings(json, got);
+}
+
+test "extractJsonFromSse extracts data from SSE format" {
+    const sse = try std.testing.allocator.dupe(u8,
+        \\event: message
+        \\data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}
+        \\
+    );
+    const expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}";
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer freeExtractedTestBody(sse, got);
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "extractJsonFromSse handles SSE with CRLF line endings" {
+    const sse = try std.testing.allocator.dupe(u8, "event: message\r\ndata: {\"ok\":true}\r\n");
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer freeExtractedTestBody(sse, got);
+    try std.testing.expectEqualStrings("{\"ok\":true}", got);
+}
+
+test "extractJsonFromSse handles data prefix without optional space" {
+    const sse = try std.testing.allocator.dupe(u8,
+        \\event: message
+        \\data:{"ok":true}
+        \\
+    );
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer freeExtractedTestBody(sse, got);
+    try std.testing.expectEqualStrings("{\"ok\":true}", got);
+}
+
+test "extractJsonFromSse handles SSE with multiple data lines" {
+    const sse = try std.testing.allocator.dupe(u8,
+        \\event: message
+        \\data: {"jsonrpc":"2.0",
+        \\data: "id":2,"result":{"tools":[]}}
+        \\
+    );
+    const expected = "{\"jsonrpc\":\"2.0\",\n\"id\":2,\"result\":{\"tools\":[]}}";
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer freeExtractedTestBody(sse, got);
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "extractJsonFromSse returns original for empty body" {
+    const body = try std.testing.allocator.dupe(u8, "");
+    const got = try extractJsonFromSse(std.testing.allocator, body);
+    defer freeExtractedTestBody(body, got);
+    try std.testing.expectEqualStrings("", got);
+}
+
+test "extractJsonFromSse returns original for non-SSE non-JSON body" {
+    const body = try std.testing.allocator.dupe(u8, "some random text that is neither JSON nor SSE");
+    const got = try extractJsonFromSse(std.testing.allocator, body);
+    defer freeExtractedTestBody(body, got);
+    try std.testing.expectEqualStrings(body, got);
+}
+
+test "extractJsonFromSse handles SSE with id field (firecrawl format)" {
+    const sse = try std.testing.allocator.dupe(u8,
+        \\event: message
+        \\id: abc-123_def
+        \\data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}
+        \\
+    );
+    const expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}";
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer freeExtractedTestBody(sse, got);
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "extractJsonFromSse reuses plain JSON buffer" {
+    // Regression: sendRequest must not leak the original HTTP body when no SSE
+    // extraction is needed.
+    const body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    const got = try extractJsonFromSse(std.testing.allocator, body);
+    defer freeExtractedTestBody(body, got);
+    try std.testing.expectEqual(body.ptr, got.ptr);
+}
+
+test "extractJsonFromSse reuses non-SSE fallback buffer" {
+    // Regression: non-SSE bodies should stay owned by the caller so the HTTP
+    // transport does not orphan the original allocation.
+    const body = try std.testing.allocator.dupe(u8, "not json and not sse");
+    const got = try extractJsonFromSse(std.testing.allocator, body);
+    defer freeExtractedTestBody(body, got);
+    try std.testing.expectEqual(body.ptr, got.ptr);
 }

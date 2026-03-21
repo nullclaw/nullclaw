@@ -34,6 +34,13 @@ fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
     return false;
 }
 
+fn containsCandidateKey(candidates: []const memory_mod.RetrievalCandidate, key: []const u8) bool {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.key, key)) return true;
+    }
+    return false;
+}
+
 fn isInternalMemoryKey(key: []const u8) bool {
     return memory_mod.isInternalMemoryKey(key);
 }
@@ -144,19 +151,18 @@ pub fn loadContextWithRuntime(
     user_message: []const u8,
     session_id: ?[]const u8,
 ) ![]const u8 {
-    const candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
+    const scoped_candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
         return try allocator.dupe(u8, "");
     };
-    defer memory_mod.retrieval.freeCandidates(allocator, candidates);
-
-    if (candidates.len == 0) return try allocator.dupe(u8, "");
+    defer memory_mod.retrieval.freeCandidates(allocator, scoped_candidates);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
+    var appended: usize = 0;
     var wrote_header = false;
 
-    for (candidates) |cand| {
+    for (scoped_candidates) |cand| {
         if (isInternalMemoryKey(cand.key)) continue;
         if (extractMarkdownMemoryKey(cand.snippet)) |extracted| {
             if (isInternalMemoryKey(extracted)) continue;
@@ -169,8 +175,34 @@ pub fn loadContextWithRuntime(
         const sanitized = try sanitizeMemoryText(allocator, snippet);
         defer allocator.free(sanitized);
         try std.fmt.format(w, "- {s}: {s}\n", .{ cand.key, sanitized });
-        if (buf.items.len >= MAX_CONTEXT_BYTES) break;
+        appended += 1;
+        if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
+
+    if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES and session_id != null) {
+        const global_entries = rt.memory.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
+        defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
+
+        if (global_entries) |entries| {
+            for (entries) |entry| {
+                if (entry.session_id != null) continue; // keep scoped isolation (no cross-session bleed)
+                if (containsCandidateKey(scoped_candidates, entry.key)) continue;
+                if (isInternalMemoryEntry(entry)) continue;
+
+                if (!wrote_header) {
+                    try w.writeAll("[Memory context]\n");
+                    wrote_header = true;
+                }
+                const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+                const sanitized = try sanitizeMemoryText(allocator, content);
+                defer allocator.free(sanitized);
+                try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+                appended += 1;
+                if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+            }
+        }
+    }
+
     if (!wrote_header) return try allocator.dupe(u8, "");
     try w.writeAll("\n");
 
@@ -428,4 +460,55 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
     const context = try loadContextWithRuntime(allocator, &rt, "привет", null);
     defer allocator.free(context);
     try std.testing.expectEqualStrings("", context);
+}
+
+test "loadContextWithRuntime with session_id includes global entries but not other sessions" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("sess_a_fact", "session A favorite", .core, "sess-a");
+    try mem.store("global_fact", "global favorite", .core, null);
+    try mem.store("sess_b_fact", "session B favorite", .core, "sess-b");
+
+    const resolved = memory_mod.ResolvedConfig{
+        .primary_backend = "test",
+        .retrieval_mode = "keyword",
+        .vector_mode = "none",
+        .embedding_provider = "none",
+        .rollout_mode = "off",
+        .vector_sync_mode = "best_effort",
+        .hygiene_enabled = false,
+        .snapshot_enabled = false,
+        .cache_enabled = false,
+        .semantic_cache_enabled = false,
+        .summarizer_enabled = false,
+        .source_count = 0,
+        .fallback_policy = "degrade",
+    };
+    var rt = memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = resolved,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+
+    const context = try loadContextWithRuntime(allocator, &rt, "favorite", "sess-a");
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "global_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "sess_b_fact") == null);
 }

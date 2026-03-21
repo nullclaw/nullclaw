@@ -5,6 +5,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const cron_gateway = @import("cron_gateway.zig");
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 /// CronUpdate tool — update a cron job's expression, command, or enabled state.
@@ -40,6 +41,20 @@ pub const CronUpdateTool = struct {
         if (expression) |expr| {
             _ = cron.normalizeExpression(expr) catch
                 return ToolResult.fail("Invalid cron expression");
+        }
+
+        const gateway_body = cron_gateway.buildUpdateBody(allocator, job_id, expression, command, null, null, enabled) catch null;
+        if (gateway_body) |json_body| {
+            defer allocator.free(json_body);
+            switch (cron.requestGatewayPost(allocator, "/cron/update", json_body)) {
+                .unavailable => {},
+                .response => |resp| {
+                    if (resp.status_code >= 200 and resp.status_code < 300) {
+                        return ToolResult{ .success = true, .output = resp.body };
+                    }
+                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                },
+            }
         }
 
         var scheduler = loadScheduler(allocator) catch {
@@ -170,4 +185,15 @@ test "cron_update_invalid_expression" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid cron expression") != null);
+}
+
+test "cron_update gateway request body keeps enabled false" {
+    const body = try cron_gateway.buildUpdateBody(std.testing.allocator, "job-42", null, "echo hi", null, null, false);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("job-42", parsed.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("echo hi", parsed.value.object.get("command").?.string);
+    try std.testing.expect(!parsed.value.object.get("enabled").?.bool);
 }

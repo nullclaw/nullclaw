@@ -234,7 +234,24 @@ Additional expectations by change type:
 
 If full validation is impractical, document what was run and what was skipped.
 
-### 8.1 Git Hooks
+### 8.1 Test Coverage Mandate
+
+**Every code change must be accompanied by tests.** No exceptions.
+
+- **Behavior changes**: add or update tests that directly exercise the changed code path.
+- **Bug fixes**: add a regression test that reproduces the original failure *before* the fix and passes after.
+- **Logging-only or pure error-propagation changes** (e.g., `catch |err|` + `log.err(...)`): unit testing may not be practical. In this case add a comment near the change explaining why formal test coverage is omitted. Example:
+  ```zig
+  // NOTE: No unit test for this log path — would require a mock session manager.
+  // Covered by manual integration testing against a running NullClaw instance.
+  ```
+- **Error path resource cleanup**: when a function allocates resources before returning an error, always free them before the `return error.Foo`. Verify with `zig build test` that the test allocator reports 0 leaks.
+- Tests that were added to cover a specific fix must have a comment citing the bug they guard against, e.g.:
+  ```zig
+  // Regression: GLM-5 returns content=null on context-limit; parseNativeResponse must not silently succeed.
+  ```
+
+### 8.2 Git Hooks
 
 The repository ships with pre-configured hooks in `.githooks/`. Activate once per clone:
 

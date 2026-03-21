@@ -1,14 +1,31 @@
 const std = @import("std");
 const Atomic = @import("portable_atomic.zig").Atomic;
+const fs_compat = @import("fs_compat.zig");
 
 /// Events the observer can record.
 pub const ObserverEvent = union(enum) {
     agent_start: struct { provider: []const u8, model: []const u8 },
-    llm_request: struct { provider: []const u8, model: []const u8, messages_count: usize },
-    llm_response: struct { provider: []const u8, model: []const u8, duration_ms: u64, success: bool, error_message: ?[]const u8 },
+    llm_request: struct { provider: []const u8, model: []const u8, messages_count: usize, detail: ?[]const u8 = null },
+    llm_response: struct {
+        provider: []const u8,
+        model: []const u8,
+        duration_ms: u64,
+        success: bool,
+        error_message: ?[]const u8,
+        prompt_tokens: ?u32 = null,
+        completion_tokens: ?u32 = null,
+        total_tokens: ?u32 = null,
+        detail: ?[]const u8 = null,
+    },
     agent_end: struct { duration_ms: u64, tokens_used: ?u64 },
     tool_call_start: struct { tool: []const u8 },
-    tool_call: struct { tool: []const u8, duration_ms: u64, success: bool, detail: ?[]const u8 = null },
+    tool_call: struct {
+        tool: []const u8,
+        duration_ms: u64,
+        success: bool,
+        args: ?[]const u8 = null,
+        detail: ?[]const u8 = null,
+    },
     tool_iterations_exhausted: struct { iterations: u32 },
     turn_scored: struct {
         score: f32,
@@ -84,13 +101,22 @@ pub const Observer = struct {
     }
 };
 
-const MAX_TOOL_CALL_DETAIL_LEN: usize = 256;
+const MAX_TOOL_CALL_DETAIL_LEN: usize = 1024;
+const MAX_LLM_DETAIL_LEN: usize = 2048;
 
-fn detailForObserver(detail: ?[]const u8) ?[]const u8 {
+fn truncateForObserver(detail: ?[]const u8, max_len: usize) ?[]const u8 {
     const raw = detail orelse return null;
     if (raw.len == 0) return null;
-    if (raw.len <= MAX_TOOL_CALL_DETAIL_LEN) return raw;
-    return raw[0..MAX_TOOL_CALL_DETAIL_LEN];
+    if (raw.len <= max_len) return raw;
+    return raw[0..max_len];
+}
+
+fn toolDetailForObserver(detail: ?[]const u8) ?[]const u8 {
+    return truncateForObserver(detail, MAX_TOOL_CALL_DETAIL_LEN);
+}
+
+fn llmDetailForObserver(detail: ?[]const u8) ?[]const u8 {
+    return truncateForObserver(detail, MAX_LLM_DETAIL_LEN);
 }
 
 // ── NoopObserver ─────────────────────────────────────────────────────
@@ -145,7 +171,7 @@ pub const LogObserver = struct {
             .agent_end => |e| std.log.info("agent.end duration_ms={d}", .{e.duration_ms}),
             .tool_call_start => |e| std.log.info("tool.start tool={s}", .{e.tool}),
             .tool_call => |e| {
-                if (detailForObserver(e.detail)) |detail| {
+                if (toolDetailForObserver(e.detail)) |detail| {
                     std.log.info("tool.call tool={s} duration_ms={d} success={} detail={s}", .{ e.tool, e.duration_ms, e.success, detail });
                 } else {
                     std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success });
@@ -213,7 +239,7 @@ pub const VerboseObserver = struct {
                 stderr.print("> Tool {s}\n", .{e.tool}) catch {};
             },
             .tool_call => |e| {
-                if (detailForObserver(e.detail)) |detail| {
+                if (toolDetailForObserver(e.detail)) |detail| {
                     stderr.print("< Tool {s} (success={}, duration_ms={d}, detail={s})\n", .{ e.tool, e.success, e.duration_ms, detail }) catch {};
                 } else {
                     stderr.print("< Tool {s} (success={}, duration_ms={d})\n", .{ e.tool, e.success, e.duration_ms }) catch {};
@@ -333,7 +359,7 @@ pub const FileObserver = struct {
 
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
-            else => std.fs.cwd().makePath(parent) catch {},
+            else => fs_compat.makePath(parent) catch {},
         };
     }
 
@@ -347,7 +373,7 @@ pub const FileObserver = struct {
             .agent_end => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"agent_end\",\"duration_ms\":{d}}}", .{e.duration_ms}) catch return,
             .tool_call_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call_start\",\"tool\":{f}}}", .{std.json.fmt(e.tool, .{})}) catch return,
             .tool_call => |e| blk: {
-                if (detailForObserver(e.detail)) |detail| {
+                if (toolDetailForObserver(e.detail)) |detail| {
                     break :blk std.fmt.bufPrint(
                         &buf,
                         "{{\"event\":\"tool_call\",\"tool\":{f},\"duration_ms\":{d},\"success\":{},\"detail\":{f}}}",
@@ -634,17 +660,37 @@ pub const OtelObserver = struct {
                 const start = if (self.contextForCurrentThread(now)) |ctx| ctx.start_ns else now;
                 var dur_buf: [20]u8 = undefined;
                 const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
-                self.addSpan("agent.end", start, now, &.{
-                    .{ .key = "duration_ms", .value = dur_str },
-                });
+                var attrs: [2]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "duration_ms", .value = dur_str };
+                attr_len += 1;
+                if (e.tokens_used) |tokens_used| {
+                    var token_buf: [20]u8 = undefined;
+                    const token_str = std.fmt.bufPrint(&token_buf, "{d}", .{tokens_used}) catch "0";
+                    attrs[attr_len] = .{ .key = "tokens_used", .value = token_str };
+                    attr_len += 1;
+                }
+                self.addSpan("agent.end", start, now, attrs[0..attr_len]);
                 self.clearCurrentTrace();
+                self.flushLocked();
             },
             .llm_request => |e| {
                 _ = self.requests_total.fetchAdd(1, .monotonic);
-                self.addSpan("llm.request", now, now, &.{
-                    .{ .key = "provider", .value = e.provider },
-                    .{ .key = "model", .value = e.model },
-                });
+                var attrs: [4]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "provider", .value = e.provider };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "model", .value = e.model };
+                attr_len += 1;
+                var count_buf: [20]u8 = undefined;
+                const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{e.messages_count}) catch "0";
+                attrs[attr_len] = .{ .key = "messages_count", .value = count_str };
+                attr_len += 1;
+                if (llmDetailForObserver(e.detail)) |detail| {
+                    attrs[attr_len] = .{ .key = "detail", .value = detail };
+                    attr_len += 1;
+                }
+                self.addSpan("llm.request", now, now, attrs[0..attr_len]);
             },
             .llm_response => |e| {
                 if (!e.success) {
@@ -652,12 +698,43 @@ pub const OtelObserver = struct {
                 }
                 var dur_buf: [20]u8 = undefined;
                 const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
-                self.addSpan("llm.response", now -| (e.duration_ms * 1_000_000), now, &.{
-                    .{ .key = "provider", .value = e.provider },
-                    .{ .key = "model", .value = e.model },
-                    .{ .key = "duration_ms", .value = dur_str },
-                    .{ .key = "success", .value = if (e.success) "true" else "false" },
-                });
+                var attrs: [9]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "provider", .value = e.provider };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "model", .value = e.model };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "duration_ms", .value = dur_str };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "success", .value = if (e.success) "true" else "false" };
+                attr_len += 1;
+                if (e.prompt_tokens) |prompt_tokens| {
+                    var prompt_buf: [20]u8 = undefined;
+                    const prompt_str = std.fmt.bufPrint(&prompt_buf, "{d}", .{prompt_tokens}) catch "0";
+                    attrs[attr_len] = .{ .key = "prompt_tokens", .value = prompt_str };
+                    attr_len += 1;
+                }
+                if (e.completion_tokens) |completion_tokens| {
+                    var completion_buf: [20]u8 = undefined;
+                    const completion_str = std.fmt.bufPrint(&completion_buf, "{d}", .{completion_tokens}) catch "0";
+                    attrs[attr_len] = .{ .key = "completion_tokens", .value = completion_str };
+                    attr_len += 1;
+                }
+                if (e.total_tokens) |total_tokens| {
+                    var total_buf: [20]u8 = undefined;
+                    const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{total_tokens}) catch "0";
+                    attrs[attr_len] = .{ .key = "total_tokens", .value = total_str };
+                    attr_len += 1;
+                }
+                if (e.error_message) |error_message| {
+                    attrs[attr_len] = .{ .key = "error_message", .value = error_message };
+                    attr_len += 1;
+                }
+                if (llmDetailForObserver(e.detail)) |detail| {
+                    attrs[attr_len] = .{ .key = "detail", .value = detail };
+                    attr_len += 1;
+                }
+                self.addSpan("llm.response", now -| (e.duration_ms * 1_000_000), now, attrs[0..attr_len]);
             },
             .tool_call_start => |e| {
                 self.addSpan("tool.start", now, now, &.{
@@ -667,20 +744,23 @@ pub const OtelObserver = struct {
             .tool_call => |e| {
                 var dur_buf: [20]u8 = undefined;
                 const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
-                if (detailForObserver(e.detail)) |detail| {
-                    self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, &.{
-                        .{ .key = "tool", .value = e.tool },
-                        .{ .key = "duration_ms", .value = dur_str },
-                        .{ .key = "success", .value = if (e.success) "true" else "false" },
-                        .{ .key = "detail", .value = detail },
-                    });
-                } else {
-                    self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, &.{
-                        .{ .key = "tool", .value = e.tool },
-                        .{ .key = "duration_ms", .value = dur_str },
-                        .{ .key = "success", .value = if (e.success) "true" else "false" },
-                    });
+                var attrs: [5]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "tool", .value = e.tool };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "duration_ms", .value = dur_str };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "success", .value = if (e.success) "true" else "false" };
+                attr_len += 1;
+                if (toolDetailForObserver(e.args)) |args| {
+                    attrs[attr_len] = .{ .key = "args", .value = args };
+                    attr_len += 1;
                 }
+                if (toolDetailForObserver(e.detail)) |detail| {
+                    attrs[attr_len] = .{ .key = "detail", .value = detail };
+                    attr_len += 1;
+                }
+                self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, attrs[0..attr_len]);
             },
             .tool_iterations_exhausted => |e| {
                 var iter_buf: [20]u8 = undefined;
@@ -747,6 +827,7 @@ pub const OtelObserver = struct {
             .turn_complete => {
                 self.addSpan("turn.complete", now, now, &.{});
                 self.clearCurrentTrace();
+                self.flushLocked();
             },
             .channel_message => |e| {
                 self.addSpan("channel.message", now, now, &.{
@@ -1761,11 +1842,12 @@ test "OtelObserver resets trace after turn_complete" {
     const second = ObserverEvent{ .llm_request = .{ .provider = "b", .model = "m", .messages_count = 1 } };
 
     obs.recordEvent(&first);
+    const first_trace_id = otel.spans.items[0].trace_id;
     obs.recordEvent(&complete);
     obs.recordEvent(&second);
 
-    try std.testing.expectEqual(@as(usize, 3), otel.spans.items.len);
-    try std.testing.expect(!std.mem.eql(u8, &otel.spans.items[0].trace_id, &otel.spans.items[2].trace_id));
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    try std.testing.expect(!std.mem.eql(u8, &first_trace_id, &otel.spans.items[0].trace_id));
 }
 
 test "OtelObserver isolates trace context per thread" {
@@ -1780,9 +1862,9 @@ test "OtelObserver isolates trace context per thread" {
                 .model = "m",
                 .messages_count = 1,
             } };
-            const complete = ObserverEvent{ .turn_complete = {} };
+            const tick = ObserverEvent{ .heartbeat_tick = {} };
             obs.recordEvent(&request);
-            obs.recordEvent(&complete);
+            obs.recordEvent(&tick);
         }
     };
 
@@ -1800,14 +1882,14 @@ test "OtelObserver span building on all event types" {
     defer otel.deinit();
     const obs = otel.observer();
 
-    // Record 9 events (under batch threshold of 10) to verify all types produce spans
+    // Keep this set below the batch threshold and avoid flush boundaries so
+    // each recorded event remains inspectable in the in-memory span buffer.
     const events = [_]ObserverEvent{
         .{ .agent_start = .{ .provider = "test", .model = "test" } },
         .{ .llm_request = .{ .provider = "test", .model = "test", .messages_count = 1 } },
         .{ .llm_response = .{ .provider = "test", .model = "test", .duration_ms = 100, .success = true, .error_message = null } },
         .{ .tool_call_start = .{ .tool = "shell" } },
         .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
-        .{ .turn_complete = {} },
         .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "test", .message = "oops" } },
@@ -1816,22 +1898,15 @@ test "OtelObserver span building on all event types" {
         obs.recordEvent(event);
     }
 
-    try std.testing.expectEqual(@as(usize, 9), otel.spans.items.len);
+    try std.testing.expectEqual(@as(usize, 8), otel.spans.items.len);
     try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
     try std.testing.expectEqualStrings("llm.request", otel.spans.items[1].name);
     try std.testing.expectEqualStrings("llm.response", otel.spans.items[2].name);
     try std.testing.expectEqualStrings("tool.start", otel.spans.items[3].name);
     try std.testing.expectEqualStrings("tool.call", otel.spans.items[4].name);
-    try std.testing.expectEqualStrings("turn.complete", otel.spans.items[5].name);
-    try std.testing.expectEqualStrings("channel.message", otel.spans.items[6].name);
-    try std.testing.expectEqualStrings("heartbeat.tick", otel.spans.items[7].name);
-    try std.testing.expectEqualStrings("error", otel.spans.items[8].name);
-
-    // Verify agent_end works too (10th event triggers batch flush)
-    const end_event = ObserverEvent{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } };
-    obs.recordEvent(&end_event);
-    // After flush, spans are cleared
-    try std.testing.expect(otel.spans.items.len < 10);
+    try std.testing.expectEqualStrings("channel.message", otel.spans.items[5].name);
+    try std.testing.expectEqualStrings("heartbeat.tick", otel.spans.items[6].name);
+    try std.testing.expectEqualStrings("error", otel.spans.items[7].name);
 }
 
 test "OtelObserver span attributes" {
@@ -1874,6 +1949,114 @@ test "OtelObserver tool_call includes detail attribute" {
             try std.testing.expectEqualStrings("permission denied", attr.value);
         }
     }
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver llm_request includes detail attribute" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .llm_request = .{
+        .provider = "openrouter",
+        .model = "claude",
+        .messages_count = 2,
+        .detail = "#1 role=user content=\"hello\"",
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    var found_messages_count = false;
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "messages_count")) {
+            found_messages_count = true;
+            try std.testing.expectEqualStrings("2", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("#1 role=user content=\"hello\"", attr.value);
+        }
+    }
+    try std.testing.expect(found_messages_count);
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver llm_response includes usage and detail attributes" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .llm_response = .{
+        .provider = "openrouter",
+        .model = "claude",
+        .duration_ms = 150,
+        .success = true,
+        .error_message = null,
+        .prompt_tokens = 11,
+        .completion_tokens = 7,
+        .total_tokens = 18,
+        .detail = "content=\"hello back\"",
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    var found_prompt = false;
+    var found_completion = false;
+    var found_total = false;
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "prompt_tokens")) {
+            found_prompt = true;
+            try std.testing.expectEqualStrings("11", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "completion_tokens")) {
+            found_completion = true;
+            try std.testing.expectEqualStrings("7", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "total_tokens")) {
+            found_total = true;
+            try std.testing.expectEqualStrings("18", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("content=\"hello back\"", attr.value);
+        }
+    }
+    try std.testing.expect(found_prompt);
+    try std.testing.expect(found_completion);
+    try std.testing.expect(found_total);
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver tool_call includes args attribute" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 12,
+        .success = true,
+        .args = "{\"command\":\"pwd\"}",
+        .detail = "\"/tmp\"",
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    var found_args = false;
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "args")) {
+            found_args = true;
+            try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("\"/tmp\"", attr.value);
+        }
+    }
+    try std.testing.expect(found_args);
     try std.testing.expect(found_detail);
 }
 
@@ -1977,19 +2160,47 @@ test "OtelObserver JSON serialization" {
 test "OtelObserver JSON multiple spans" {
     var otel = OtelObserver.init(std.testing.allocator, null, null);
     defer otel.deinit();
-    const obs = otel.observer();
-
     const e1 = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
-    obs.recordEvent(&e1);
-    const e2 = ObserverEvent{ .turn_complete = {} };
-    obs.recordEvent(&e2);
+    otel.observer().recordEvent(&e1);
+    const e2 = ObserverEvent{ .heartbeat_tick = {} };
+    otel.observer().recordEvent(&e2);
 
     const json = try otel.serializeSpans();
     defer std.testing.allocator.free(json);
 
     // Two spans separated by comma
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent.start\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"turn.complete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"heartbeat.tick\"") != null);
+}
+
+test "OtelObserver flushes buffered spans on turn complete" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    obs.recordEvent(&start);
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+
+    const complete = ObserverEvent{ .turn_complete = {} };
+    obs.recordEvent(&complete);
+
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+}
+
+test "OtelObserver flushes buffered spans on agent end" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    obs.recordEvent(&start);
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+
+    const end = ObserverEvent{ .agent_end = .{ .duration_ms = 12, .tokens_used = 3 } };
+    obs.recordEvent(&end);
+
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
 }
 
 test "OtelObserver batch flush at 10 spans" {

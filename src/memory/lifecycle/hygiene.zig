@@ -135,7 +135,7 @@ fn archiveOldFiles(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
     const archive_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
     defer allocator.free(archive_path);
 
-    std.fs.cwd().makePath(archive_path) catch {};
+    fs_compat.makePath(archive_path) catch {};
 
     const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(config.archive_after_days)) * 24 * 60 * 60;
     var moved: u64 = 0;
@@ -488,7 +488,7 @@ test "runIfDue preserves archived markdown chunks before purge" {
 
     const archive_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
-    try std.fs.cwd().makePath(archive_path);
+    try fs_compat.makePath(archive_path);
 
     var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
     defer archive_dir.close();
@@ -536,7 +536,7 @@ test "runIfDue deletes old archives when memory is unavailable" {
 
     const archive_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
-    try std.fs.cwd().makePath(archive_path);
+    try fs_compat.makePath(archive_path);
 
     var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
     defer archive_dir.close();

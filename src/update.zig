@@ -351,6 +351,12 @@ fn downloadAndInstall(
 /// Download a URL directly to a file using curl.
 /// Streams the data to avoid memory buffer limits.
 /// Returns the number of bytes downloaded.
+inline fn logDownloadToFileError(comptime fmt: []const u8, args: anytype) void {
+    // Regression #599: tests may convert CurlFailed into SkipZigTest when a local
+    // curl policy disables file:// support. Avoid tripping logged-errors first.
+    if (!builtin.is_test) log.err(fmt, args);
+}
+
 fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.File) !usize {
     const argv = &[_][]const u8{ "curl", "-sfL", "--max-time", "60", url };
     var child = std.process.Child.init(argv, allocator);
@@ -358,7 +364,7 @@ fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.F
     child.stderr_behavior = .Ignore;
 
     child.spawn() catch |err| {
-        log.err("curl spawn failed: {}", .{err});
+        logDownloadToFileError("curl spawn failed: {}", .{err});
         return error.CurlFailed;
     };
 
@@ -370,7 +376,7 @@ fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.F
 
     while (true) {
         const bytes_read = stdout.read(&buffer) catch |err| {
-            log.err("curl read failed: {}", .{err});
+            logDownloadToFileError("curl read failed: {}", .{err});
             _ = child.kill() catch {};
             _ = child.wait() catch {};
             return error.CurlFailed;
@@ -379,7 +385,7 @@ fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.F
         if (bytes_read == 0) break;
 
         file.writeAll(buffer[0..bytes_read]) catch |err| {
-            log.err("download write failed: {}", .{err});
+            logDownloadToFileError("download write failed: {}", .{err});
             _ = child.kill() catch {};
             _ = child.wait() catch {};
             return err;
@@ -388,13 +394,13 @@ fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.F
     }
 
     const term = child.wait() catch |err| {
-        log.err("curl wait failed: {}", .{err});
+        logDownloadToFileError("curl wait failed: {}", .{err});
         return error.CurlFailed;
     };
 
     switch (term) {
         .Exited => |code| if (code != 0) {
-            log.err("curl exited with code: {}", .{code});
+            logDownloadToFileError("curl exited with code: {}", .{code});
             return error.CurlFailed;
         },
         else => return error.CurlFailed,
@@ -510,6 +516,8 @@ test "downloadToFile streams from local file URL" {
         file_url,
         &dst_file,
     ) catch |err| {
+        // Regression #599: a local ~/.curlrc can disable file:// support even when
+        // curl is installed. That environment mismatch should skip this test cleanly.
         if (err == error.CurlFailed) return error.SkipZigTest;
         return err;
     };

@@ -139,7 +139,7 @@ fn join_path(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]u8 {
 fn ensure_parent_dir(path: []const u8) !void {
     const maybe_parent = std.fs.path.dirname(path);
     if (maybe_parent) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+        fs_compat.makePath(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -203,13 +203,13 @@ fn append_line(path: []const u8, line: []const u8, allocator: std.mem.Allocator)
 }
 
 fn scaffold_workspace(allocator: std.mem.Allocator, workspace: []const u8) !usize {
-    std.fs.cwd().makePath(workspace) catch |err| switch (err) {
+    fs_compat.makePath(workspace) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
     const memory_dir = try join_path(allocator, workspace, "memory");
-    std.fs.cwd().makePath(memory_dir) catch |err| switch (err) {
+    fs_compat.makePath(memory_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };

@@ -836,7 +836,7 @@ pub const SessionManager = struct {
             std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
-                    std.fs.cwd().makePath(parent) catch return;
+                    fs_compat.makePath(parent) catch return;
                 },
             };
         }
@@ -1327,13 +1327,15 @@ pub const SessionManager = struct {
             break :blk owned_api_key;
         };
 
-        var holder = providers.ProviderHolder.fromConfig(
+        var holder = providers.ProviderHolder.fromConfigWithApiMode(
             self.allocator,
             profile.provider,
             provider_api_key,
             self.config.getProviderBaseUrl(profile.provider),
             self.config.getProviderNativeTools(profile.provider),
             self.config.getProviderUserAgent(profile.provider),
+            self.config.getProviderApiMode(profile.provider),
+            self.config.getProviderMaxStreamingPromptBytes(profile.provider),
         );
         return .{
             .provider = holder.provider(),
@@ -2036,6 +2038,58 @@ const MockProvider = struct {
     fn mockDeinit(_: *anyopaque) void {}
 };
 
+const CapturePromptProvider = struct {
+    response: []const u8 = "ok",
+    captured_system: ?[]const u8 = null,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *CapturePromptProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *CapturePromptProvider = @ptrCast(@alignCast(ptr));
+        if (request.messages.len > 0 and request.messages[0].role == .system) {
+            self.captured_system = request.messages[0].content;
+        }
+        return .{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "capture_prompt";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
 const MockStreamingProvider = struct {
     response: []const u8,
 
@@ -2662,6 +2716,50 @@ test "getOrCreate uses named agent workspace namespace when workspace_path is se
     try testing.expect(session.owned_memory_session_id != null);
     try testing.expectEqualStrings("agent:coder-agent", session.agent.memory_session_id.?);
     try testing.expectEqualStrings(expected_workspace, session.agent.workspace_dir);
+}
+
+test "getOrCreate preserves named agent system prompt when workspace_path is set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    defer testing.allocator.free(config_path);
+
+    const expected_prompt = "Focus on implementation and tests.";
+
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agents = &.{
+        .{
+            .name = "Coder Agent",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+            .system_prompt = expected_prompt,
+            .workspace_path = "agents/coder-agent",
+        },
+    };
+
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:coder-agent:telegram:group:-100123");
+    try testing.expectEqualStrings(expected_prompt, session.agent.profile_system_prompt.?);
+    try expectPathEndsWith(session.agent.workspace_dir, "/agents/coder-agent");
+
+    var capture = CapturePromptProvider{};
+    session.agent.provider = capture.provider();
+
+    const response = try session.agent.turn("hello");
+    defer testing.allocator.free(response);
+
+    try testing.expectEqualStrings("ok", response);
+    try testing.expect(capture.captured_system != null);
+    try testing.expect(std.mem.indexOf(u8, capture.captured_system.?, expected_prompt) != null);
+    try testing.expect(std.mem.indexOf(u8, capture.captured_system.?, "Profile: Coder Agent") != null);
 }
 
 test "getOrCreate auto-provisioned peer uses dedicated runtime workspace" {

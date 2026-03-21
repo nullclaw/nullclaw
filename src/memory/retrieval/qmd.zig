@@ -228,7 +228,7 @@ pub const QmdAdapter = struct {
             return 0;
 
         // Ensure export directory exists
-        std.fs.cwd().makePath(export_dir) catch |err| {
+        fs_compat.makePath(export_dir) catch |err| {
             log.warn("failed to create session export dir '{s}': {}", .{ export_dir, err });
             return 0;
         };

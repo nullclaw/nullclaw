@@ -141,7 +141,7 @@ pub const FileWriteTool = struct {
             std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
-                    std.fs.cwd().makePath(parent) catch |e| {
+                    fs_compat.makePath(parent) catch |e| {
                         const msg = try std.fmt.allocPrint(allocator, "Failed to create directory: {}", .{e});
                         return ToolResult{ .success = false, .output = "", .error_msg = msg };
                     };

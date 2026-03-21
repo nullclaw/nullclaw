@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
@@ -143,7 +144,7 @@ fn attachmentCacheDirPath(allocator: std.mem.Allocator) ![]u8 {
 fn ensureAttachmentCacheDir(cache_dir: []const u8) !void {
     std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => try std.fs.cwd().makePath(cache_dir),
+        else => try fs_compat.makePath(cache_dir),
     };
 }
 
@@ -845,6 +846,9 @@ pub const QQChannel = struct {
     }
 
     pub fn healthCheck(self: *QQChannel) bool {
+        if (self.config.receive_mode == .websocket) {
+            return self.running.load(.acquire) and self.ws_fd.load(.acquire) != invalid_socket;
+        }
         const result = fetchAccessToken(self.allocator, self.config.app_id, self.config.app_secret) catch return false;
         self.allocator.free(result.token);
         return true;
@@ -2127,6 +2131,22 @@ test "qq QQChannel init stores config" {
     try std.testing.expect(ch.healthCheck());
     try std.testing.expect(!ch.has_sequence.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), ch.heartbeat_interval_ms.load(.acquire));
+}
+
+test "qq healthCheck websocket requires running socket" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .receive_mode = .websocket });
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    const fake_socket: std.posix.socket_t = if (builtin.os.tag == .windows)
+        @ptrFromInt(1)
+    else
+        42;
+    ch.ws_fd.store(fake_socket, .release);
+    try std.testing.expect(ch.healthCheck());
 }
 
 test "qq QQChannel vtable compiles" {
