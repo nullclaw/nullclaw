@@ -580,8 +580,23 @@ pub const EmailConfig = struct {
     password: []const u8 = "",
     from_address: []const u8 = "",
     poll_interval_secs: u64 = 60,
+    max_body_bytes: u64 = 51200,
+    signature_file: []const u8 = "",
     allow_from: []const []const u8 = &.{},
     consent_granted: bool = true,
+    pii_redaction: bool = false,
+    pii_spacy: bool = false,
+    /// Save email attachments from allowed senders to disk.
+    attachment_save_enabled: bool = false,
+    /// Directory to save attachments to (relative to working dir or absolute).
+    attachment_save_dir: []const u8 = "workspace/docs",
+    /// Allowed file extensions for attachment saving (lowercase, with leading dot).
+    attachment_extensions: []const []const u8 = &.{ ".pdf", ".docx" },
+    /// Maximum attachment size in bytes (default 20MB).
+    attachment_max_bytes: u64 = 20 * 1024 * 1024,
+    /// Use IMAP IDLE for persistent connection instead of polling (default: true).
+    /// Falls back to polling if server lacks IDLE capability.
+    imap_idle: bool = true,
 };
 
 pub const LineConfig = struct {

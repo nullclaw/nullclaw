@@ -95,6 +95,7 @@ pub const ChannelManager = struct {
             .telegram => |ls| ls.last_activity.load(.acquire),
             .signal => |ls| ls.last_activity.load(.acquire),
             .matrix => |ls| ls.last_activity.load(.acquire),
+            .email => |ls| ls.last_activity.load(.acquire),
             .max => |ls| ls.last_activity.load(.acquire),
         };
     }
@@ -104,6 +105,7 @@ pub const ChannelManager = struct {
             .telegram => |ls| ls.stop_requested.store(true, .release),
             .signal => |ls| ls.stop_requested.store(true, .release),
             .matrix => |ls| ls.stop_requested.store(true, .release),
+            .email => |ls| ls.stop_requested.store(true, .release),
             .max => |ls| ls.stop_requested.store(true, .release),
         }
     }
@@ -113,6 +115,7 @@ pub const ChannelManager = struct {
             .telegram => |ls| self.allocator.destroy(ls),
             .signal => |ls| self.allocator.destroy(ls),
             .matrix => |ls| self.allocator.destroy(ls),
+            .email => |ls| self.allocator.destroy(ls),
             .max => |ls| self.allocator.destroy(ls),
         }
     }
@@ -997,7 +1000,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     }
     if (channel_catalog.isBuildEnabled(.email)) {
         expected_total += config.channels.email.len;
-        expected_send_only += config.channels.email.len;
+        expected_polling += config.channels.email.len;
     }
     if (channel_catalog.isBuildEnabled(.dingtalk)) {
         expected_total += config.channels.dingtalk.len;
