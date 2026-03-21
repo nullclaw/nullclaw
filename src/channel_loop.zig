@@ -62,6 +62,17 @@ fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
 }
 
+fn shouldSuppressEmailReply(reply: []const u8) bool {
+    return std.mem.startsWith(u8, std.mem.trimLeft(u8, reply, " \t\n"), "[NO_REPLY]");
+}
+
+fn resolvePiiRedactorPath(allocator: std.mem.Allocator, workspace_dir: []const u8) ?[]u8 {
+    if (workspace_dir.len == 0) {
+        return std.fs.path.join(allocator, &.{ "scripts", "pii_redactor.py" }) catch null;
+    }
+    return std.fs.path.join(allocator, &.{ workspace_dir, "scripts", "pii_redactor.py" }) catch null;
+}
+
 fn detailedProviderErrorForDisplay(
     allocator: std.mem.Allocator,
     err: anyerror,
@@ -1863,8 +1874,16 @@ fn splitEmailTarget(target: []const u8) struct { addr: []const u8, subject: []co
 // Spawn the Python pii_redactor.py script, piping content via stdin.
 // On any error, returns null so the caller can fall back to the original text.
 
-fn redactPii(allocator: std.mem.Allocator, content: []const u8, msg_id: []const u8, sender: []const u8, use_spacy: bool) ?[]u8 {
-    const script = "/home/nullclaw/.nullclaw/workspace/scripts/pii_redactor.py";
+fn redactPii(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    content: []const u8,
+    msg_id: []const u8,
+    sender: []const u8,
+    use_spacy: bool,
+) ?[]u8 {
+    const script = resolvePiiRedactorPath(allocator, workspace_dir) orelse return null;
+    defer allocator.free(script);
 
     var argv_buf: [8][]const u8 = undefined;
     var argc: usize = 0;
@@ -1945,8 +1964,14 @@ fn redactPii(allocator: std.mem.Allocator, content: []const u8, msg_id: []const 
     return stdout;
 }
 
-fn deredactPii(allocator: std.mem.Allocator, text: []const u8, msg_id: []const u8) ?[]u8 {
-    const script = "/home/nullclaw/.nullclaw/workspace/scripts/pii_redactor.py";
+fn deredactPii(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    text: []const u8,
+    msg_id: []const u8,
+) ?[]u8 {
+    const script = resolvePiiRedactorPath(allocator, workspace_dir) orelse return null;
+    defer allocator.free(script);
 
     const id_arg = std.fmt.allocPrint(allocator, "--id={s}", .{msg_id}) catch return null;
     defer allocator.free(id_arg);
@@ -2258,7 +2283,7 @@ fn processIncomingEmail(
     defer if (redacted_content) |rc| allocator.free(rc);
 
     const content_for_llm = if (pii_enabled) pii_blk: {
-        redacted_content = redactPii(allocator, wrapped, uid, sender_addr, em_ptr.config.pii_spacy);
+        redacted_content = redactPii(allocator, config.workspace_dir, wrapped, uid, sender_addr, em_ptr.config.pii_spacy);
         if (redacted_content) |rc| {
             break :pii_blk rc;
         } else {
@@ -2291,7 +2316,7 @@ fn processIncomingEmail(
     defer if (deredacted_reply) |dr| allocator.free(dr);
 
     const final_reply = if (pii_enabled) deredact_blk: {
-        deredacted_reply = deredactPii(allocator, reply, uid);
+        deredacted_reply = deredactPii(allocator, config.workspace_dir, reply, uid);
         if (deredacted_reply) |dr| {
             break :deredact_blk dr;
         } else {
@@ -2302,7 +2327,7 @@ fn processIncomingEmail(
 
     // If the agent prefixes its reply with [NO_REPLY], suppress the email reply.
     // Used for unknown sender triage where the agent handles routing via tools.
-    if (std.mem.startsWith(u8, std.mem.trimLeft(u8, final_reply, " \t\n"), "[NO_REPLY]")) {
+    if (shouldSuppressEmailReply(final_reply)) {
         log.info("Email reply suppressed by [NO_REPLY] marker for {s}", .{sender_addr});
         return;
     }
@@ -2377,7 +2402,7 @@ fn runEmailPollLoop(
             defer if (redacted_content) |rc| allocator.free(rc);
 
             const content_for_llm = if (pii_enabled) blk: {
-                redacted_content = redactPii(allocator, msg.content, msg.id, msg.sender, em_ptr.config.pii_spacy);
+                redacted_content = redactPii(allocator, config.workspace_dir, msg.content, msg.id, msg.sender, em_ptr.config.pii_spacy);
                 if (redacted_content) |rc| {
                     break :blk rc;
                 } else {
@@ -2385,6 +2410,9 @@ fn runEmailPollLoop(
                     break :blk msg.content;
                 }
             } else msg.content;
+
+            setScheduleToolContext(runtime.tools, "email", em_ptr.config.account_id, msg.sender);
+            defer setScheduleToolContext(runtime.tools, null, null, null);
 
             const reply = runtime.session_mgr.processMessage(session_key, content_for_llm, null) catch |err| {
                 log.err("Email agent error: {}", .{err});
@@ -2409,7 +2437,7 @@ fn runEmailPollLoop(
             defer if (deredacted_reply) |dr| allocator.free(dr);
 
             const final_reply = if (pii_enabled) blk: {
-                deredacted_reply = deredactPii(allocator, reply, msg.id);
+                deredacted_reply = deredactPii(allocator, config.workspace_dir, reply, msg.id);
                 if (deredacted_reply) |dr| {
                     break :blk dr;
                 } else {
@@ -2417,6 +2445,11 @@ fn runEmailPollLoop(
                     break :blk reply;
                 }
             } else reply;
+
+            if (shouldSuppressEmailReply(final_reply)) {
+                log.info("Email reply suppressed by [NO_REPLY] marker for {s}", .{msg.sender});
+                continue;
+            }
 
             if (msg.reply_target) |target| {
                 const recipient = splitEmailTarget(target);
@@ -2724,6 +2757,25 @@ test "shouldSuppressGroupReply suppresses only group replies with marker" {
     try std.testing.expect(shouldSuppressGroupReply(true, "ok [NO_REPLY]"));
     try std.testing.expect(!shouldSuppressGroupReply(false, "ok [NO_REPLY]"));
     try std.testing.expect(!shouldSuppressGroupReply(true, "regular reply"));
+}
+
+test "shouldSuppressEmailReply requires NO_REPLY prefix after optional whitespace" {
+    // Regression: email poll fallback must honor the same [NO_REPLY] contract as IDLE mode.
+    try std.testing.expect(shouldSuppressEmailReply("[NO_REPLY] skip"));
+    try std.testing.expect(shouldSuppressEmailReply(" \n\t[NO_REPLY] skip"));
+    try std.testing.expect(!shouldSuppressEmailReply("ok [NO_REPLY]"));
+}
+
+test "resolvePiiRedactorPath uses workspace scripts directory" {
+    // Regression: email PII redaction must not hardcode /home/nullclaw on macOS/Windows.
+    const allocator = std.testing.allocator;
+    const path = resolvePiiRedactorPath(allocator, "/tmp/nullclaw-workspace") orelse return error.TestUnexpectedResult;
+    defer allocator.free(path);
+
+    const expected = try std.fs.path.join(allocator, &.{ "/tmp/nullclaw-workspace", "scripts", "pii_redactor.py" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "isStopLikeCommand matches stop and abort variants" {

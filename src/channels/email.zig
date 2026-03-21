@@ -1,6 +1,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
 
 /// Email channel — IMAP polling for inbound, SMTP for outbound.
 pub const EmailChannel = struct {
@@ -1708,6 +1709,69 @@ pub fn hasAllowedExtension(filename: []const u8, allowed: []const []const u8) bo
     return false;
 }
 
+fn isWindowsForbiddenFilenameChar(c: u8) bool {
+    return switch (c) {
+        '<', '>', ':', '"', '/', '\\', '|', '?', '*' => true,
+        else => c < 0x20,
+    };
+}
+
+fn isWindowsReservedBaseName(name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(name, "CON")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "PRN")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "AUX")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "NUL")) return true;
+
+    if (name.len == 4) {
+        if (std.ascii.eqlIgnoreCase(name[0..3], "COM") and name[3] >= '1' and name[3] <= '9') return true;
+        if (std.ascii.eqlIgnoreCase(name[0..3], "LPT") and name[3] >= '1' and name[3] <= '9') return true;
+    }
+    return false;
+}
+
+fn sanitizeAttachmentFilenameComponent(out: []u8, input: []const u8) []const u8 {
+    if (out.len == 0) return "";
+
+    var leaf_start: usize = 0;
+    for (input, 0..) |c, idx| {
+        if (c == '/' or c == '\\') leaf_start = idx + 1;
+    }
+    const leaf = input[leaf_start..];
+    if (leaf.len == 0) {
+        out[0] = '_';
+        return out[0..1];
+    }
+
+    const n = @min(leaf.len, out.len);
+    var w: usize = 0;
+    for (leaf[0..n]) |c| {
+        out[w] = if (isWindowsForbiddenFilenameChar(c)) '_' else c;
+        w += 1;
+    }
+
+    while (w > 0 and (out[w - 1] == ' ' or out[w - 1] == '.')) : (w -= 1) {}
+    if (w == 0) {
+        out[0] = '_';
+        w = 1;
+    }
+
+    const base = if (std.mem.indexOfScalar(u8, out[0..w], '.')) |dot|
+        out[0..dot]
+    else
+        out[0..w];
+    if (isWindowsReservedBaseName(base)) {
+        if (w < out.len) {
+            std.mem.copyBackwards(u8, out[1 .. w + 1], out[0..w]);
+            out[0] = '_';
+            w += 1;
+        } else {
+            out[0] = '_';
+        }
+    }
+
+    return out[0..w];
+}
+
 /// Extract filename from a Content-Disposition header value.
 /// E.g. "attachment; filename=\"report.pdf\"" → "report.pdf"
 fn extractAttachmentFilename(header_value: []const u8) ?[]const u8 {
@@ -1791,7 +1855,9 @@ pub fn extractAndSaveAttachments(
             }
         }
 
-        const fname = filename orelse continue;
+        const raw_fname = filename orelse continue;
+        var safe_fname_buf: [240]u8 = undefined;
+        const fname = sanitizeAttachmentFilenameComponent(&safe_fname_buf, raw_fname);
         if (!hasAllowedExtension(fname, allowed_extensions)) continue;
 
         // Decode body
@@ -1825,16 +1891,16 @@ pub fn extractAndSaveAttachments(
         defer allocator.free(decoded);
 
         // Ensure save directory exists
-        std.fs.cwd().makePath(save_dir) catch |err| {
+        fs_compat.makePath(save_dir) catch |err| {
             log.warn("Failed to create attachment dir {s}: {}", .{ save_dir, err });
             continue;
         };
 
         // Build unique filename: uid_originalname
-        var path_buf: [512]u8 = undefined;
-        var path_fbs = std.io.fixedBufferStream(&path_buf);
-        path_fbs.writer().print("{s}/{s}_{s}", .{ save_dir, uid, fname }) catch continue;
-        const file_path = path_fbs.getWritten();
+        const prefixed_name = std.fmt.allocPrint(allocator, "{s}_{s}", .{ uid, fname }) catch continue;
+        defer allocator.free(prefixed_name);
+        const file_path = std.fs.path.join(allocator, &.{ save_dir, prefixed_name }) catch continue;
+        defer allocator.free(file_path);
 
         // Write file
         const file = std.fs.cwd().createFile(file_path, .{}) catch |err| {
@@ -2911,6 +2977,13 @@ test "extractAttachmentFilename returns null for no filename" {
     try std.testing.expect(extractAttachmentFilename("attachment") == null);
 }
 
+test "sanitizeAttachmentFilenameComponent strips traversal and invalid characters" {
+    // Regression: email attachments must not preserve path traversal segments or Windows-invalid filename bytes.
+    var buf: [128]u8 = undefined;
+    const sanitized = sanitizeAttachmentFilenameComponent(&buf, "..\\nested/report:Q1*?.pdf ");
+    try std.testing.expectEqualStrings("report_Q1__.pdf", sanitized);
+}
+
 test "attachment config defaults" {
     const config = config_types.EmailConfig{};
     try std.testing.expect(!config.attachment_save_enabled);
@@ -2928,6 +3001,47 @@ test "extractAndSaveAttachments returns empty for non-multipart" {
     const result = try extractAndSaveAttachments(allocator, raw, "/tmp/test-att", &allowed, 1024 * 1024, "1");
     defer allocator.free(result);
     try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "extractAndSaveAttachments saves sanitized attachment into requested directory" {
+    // Regression: attachment saves must use portable path joins and sanitized filenames.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const save_dir = try std.fs.path.join(allocator, &.{ base, "attachments", "mail" });
+    defer allocator.free(save_dir);
+
+    const raw =
+        "Content-Type: multipart/mixed; boundary=\"abc\"\r\n" ++
+        "\r\n" ++
+        "--abc\r\n" ++
+        "Content-Disposition: attachment; filename=\"..\\\\reports/report:Q1*?.pdf\"\r\n" ++
+        "Content-Transfer-Encoding: base64\r\n" ++
+        "\r\n" ++
+        "SGVsbG8=\r\n" ++
+        "--abc--\r\n";
+    const allowed = [_][]const u8{".pdf"};
+
+    const result = try extractAndSaveAttachments(allocator, raw, save_dir, &allowed, 1024 * 1024, "42");
+    defer {
+        for (result) |att| att.deinit(allocator);
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("report_Q1__.pdf", result[0].filename);
+
+    const expected_path = try std.fs.path.join(allocator, &.{ save_dir, "42_report_Q1__.pdf" });
+    defer allocator.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, result[0].path);
+
+    const saved = try std.fs.cwd().readFileAlloc(allocator, expected_path, 32);
+    defer allocator.free(saved);
+    try std.testing.expectEqualStrings("Hello", saved);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
