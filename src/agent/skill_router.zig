@@ -589,7 +589,7 @@ test "SkillRouter_empty_skills" {
 
 test "SkillRouter_donna_full_skill_set" {
     const alloc = testing.allocator;
-    // Simulate Donna's actual skill set
+    // Simulate Donna's actual skill set (enriched descriptions)
     const names = &[_][]const u8{
         "meeting-planner",
         "imap-email",
@@ -601,18 +601,22 @@ test "SkillRouter_donna_full_skill_set" {
         "toggl-invoice",
         "agent-browser",
         "gh",
+        "text-writer",
+        "report-generation",
     };
     const descs = &[_][]const u8{
-        "Manage Daisha's consultation appointments via the OpenClaw API",
-        "Advanced email operations via the Python IMAP SMTP plugin",
-        "Search the Wellenberg knowledge base for cursussen workshops and practical info",
-        "Run coding tasks via Claude Code or Codex in isolated project directories",
+        "Afspraken beheren agenda consult inplannen afspraak maken annuleren beschikbare dagen planning OpenClaw API Daisha consulten appointments scheduling kalender",
+        "Email zoeken doorzoeken inbox beheren mails lezen mailbox IMAP folders berichten verplaatsen email thread conversatie mail sturen naar nieuwe ontvanger",
+        "RAG kennisbank zoeken doorzoeken Wellenberg cursussen workshops praktische info Spiritueel Dagje Uit Daisha healing reiki tarieven locatie openingstijden knowledge base kennisbase opzoeken informatie vinden",
+        "Coding taken uitvoeren code schrijven programmeren bug fixen feature bouwen refactoren project aanmaken git commit pull request Claude Code Codex development software script maken",
         "Manage GitHub repositories issues and pull requests via the gh CLI",
-        "Read write and organize documents on the Synology NAS",
-        "Create and edit Word docx documents via a Python wrapper",
-        "Fetch monthly time reports from Toggl Track and generate PDF invoice",
-        "Browse websites and extract content using a headless browser",
+        "Synology NAS bestanden documenten opslaan lezen verplaatsen mappen organiseren bestanden kopieren NAS folder opslag document bewaren rapport opslaan file management",
+        "Word documenten maken bewerken docx genereren Word bestand document opmaken tabel invoegen Word template briefhoofd document formatteren",
+        "Toggl Track time tracking fetch uren urenoverzicht tijdregistratie weekly report maandoverzicht facturatie invoice factuur genereren klant-uren billable hours time entries Toggl API",
+        "Browser automation website openen webpagina bekijken scrapen screenshot formulier invullen inloggen zoeken op internet link openen URL bezoeken web navigatie Playwright webbrowsing informatie opzoeken online uitzoeken",
         "GitHub CLI wrapper for repository operations",
+        "Teksten schrijven brief artikel voorstel rapport mail opstellen document schrijven tekst componeren offerte notitie samenvatting lange tekst Word document concept maken draft",
+        "PDF rapporten genereren benchmark performance overzicht skill analyse model vergelijking statistieken metrics dashboard rapportage evaluatie session digest systeem prestaties",
     };
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
@@ -663,5 +667,32 @@ test "SkillRouter_donna_full_skill_set" {
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 7), r[0].index); // toggl-invoice
+    }
+
+    // Test 7: Uren overzicht → toggl-invoice (substring: "uren" in "urenoverzicht")
+    {
+        const r = router.route(alloc, "Stuur me een overzicht van mijn uren van de afgelopen week", 3);
+        defer freeScored(alloc, r);
+        try testing.expect(r.len >= 1);
+        try testing.expectEqual(@as(usize, 7), r[0].index); // toggl-invoice
+    }
+
+    // Test 8: RAG zoeken → rag-knowledge (exact: "RAG", "zoeken")
+    {
+        const r = router.route(alloc, "Zoek in de RAG naar informatie over de GGZ workshop", 3);
+        defer freeScored(alloc, r);
+        try testing.expect(r.len >= 1);
+        try testing.expectEqual(@as(usize, 2), r[0].index); // rag-knowledge
+    }
+
+    // Test 9: Text writer → text-writer or related skill
+    {
+        const r = router.route(alloc, "Schrijf een opzet voor de workshop en sla het op als Word document", 3);
+        defer freeScored(alloc, r);
+        try testing.expect(r.len >= 1);
+        // Should match a writing/document skill. Log the actual index for debugging.
+        // text-writer=10, docx-tool=6, nas-documents=5, rag-knowledge=2
+        const idx = r[0].index;
+        try testing.expect(idx == 10 or idx == 6 or idx == 5 or idx == 2);
     }
 }
