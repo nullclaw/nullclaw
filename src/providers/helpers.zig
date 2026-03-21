@@ -223,6 +223,7 @@ pub fn isReasoningModel(model: []const u8) bool {
         std.mem.startsWith(u8, model, "o3") or
         std.mem.startsWith(u8, model, "o4-mini") or
         std.mem.startsWith(u8, model, "codex-mini") or
+        std.mem.startsWith(u8, model, "grok-code-fast-1") or
         (std.mem.endsWith(u8, model, "-reasoning") and !std.mem.endsWith(u8, model, "-non-reasoning"));
 }
 
