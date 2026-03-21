@@ -919,6 +919,19 @@ fn appendSkillsSection(
         const scored = router.route(allocator, routing_message.?, max_active);
         defer skill_router.freeScored(allocator, scored);
 
+        {
+            const prompt_log = std.log.scoped(.skill_router);
+            if (scored.len > 0) {
+                for (scored) |s| {
+                    if (s.index < skill_list.len) {
+                        prompt_log.warn("matched '{s}' (score={d:.3})", .{ skill_list[s.index].name, s.score });
+                    }
+                }
+            } else {
+                prompt_log.warn("no match (skills={d})", .{skill_list.len});
+            }
+        }
+
         for (scored, 0..) |s, si| {
             if (s.index < skill_list.len and skill_list[s.index].available) {
                 active_mask[s.index] = true;

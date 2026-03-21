@@ -1319,6 +1319,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("task_contracts_max_checkpoints")) |v| {
                 if (v == .integer) self.agent.task_contracts_max_checkpoints = @intCast(v.integer);
             }
+            // Skill routing
+            if (ag.object.get("skill_routing_enabled")) |v| {
+                if (v == .bool) self.agent.skill_routing_enabled = v.bool;
+            }
+            if (ag.object.get("skill_routing_max_active")) |v| {
+                if (v == .integer) self.agent.skill_routing_max_active = @intCast(v.integer);
+            }
         }
     }
 
