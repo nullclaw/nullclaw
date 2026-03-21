@@ -209,14 +209,33 @@ fn tokenizeAndFilter(allocator: std.mem.Allocator, text: []const u8) [][]const u
 }
 
 /// Count how many tokens from `a` appear in `b`.
+/// Uses substring matching: "zoeken" matches "doorzoeken", "opzoeken", etc.
+/// Exact matches score a full hit; substring matches score a partial hit (0.5)
+/// to prefer exact matches while still capturing morphological variants.
 fn countOverlap(a: []const []const u8, b: []const []const u8) usize {
     var hits: usize = 0;
     for (a) |tok_a| {
+        if (tok_a.len < 3) continue; // skip very short tokens for substring matching
+        var found_exact = false;
+        var found_sub = false;
         for (b) |tok_b| {
             if (std.mem.eql(u8, tok_a, tok_b)) {
-                hits += 1;
+                found_exact = true;
                 break;
             }
+            // Substring: either token contains the other (min 3 chars to avoid noise)
+            if (tok_b.len >= 3) {
+                if (std.mem.indexOf(u8, tok_b, tok_a) != null or
+                    std.mem.indexOf(u8, tok_a, tok_b) != null)
+                {
+                    found_sub = true;
+                }
+            }
+        }
+        if (found_exact) {
+            hits += 2; // full hit (will be halved by caller's normalization)
+        } else if (found_sub) {
+            hits += 1; // partial hit
         }
     }
     return hits;
@@ -321,10 +340,11 @@ test "tokenizeAndFilter_single_char_filtered" {
     try testing.expectEqual(@as(usize, 2), tokens.len);
 }
 
-test "countOverlap_basic" {
+test "countOverlap_exact" {
     const a = &[_][]const u8{ "meeting", "planner", "afspraak" };
     const b = &[_][]const u8{ "meeting", "consultation", "appointments" };
-    try testing.expectEqual(@as(usize, 1), countOverlap(a, b));
+    // "meeting" exact = 2
+    try testing.expectEqual(@as(usize, 2), countOverlap(a, b));
 }
 
 test "countOverlap_no_match" {
@@ -333,16 +353,39 @@ test "countOverlap_no_match" {
     try testing.expectEqual(@as(usize, 0), countOverlap(a, b));
 }
 
-test "countOverlap_full_match" {
+test "countOverlap_full_exact_match" {
     const a = &[_][]const u8{ "coding", "git" };
     const b = &[_][]const u8{ "coding", "git", "project" };
-    try testing.expectEqual(@as(usize, 2), countOverlap(a, b));
+    // 2 exact matches = 4
+    try testing.expectEqual(@as(usize, 4), countOverlap(a, b));
 }
 
 test "countOverlap_empty" {
     const a = &[_][]const u8{};
     const b = &[_][]const u8{ "coding" };
     try testing.expectEqual(@as(usize, 0), countOverlap(a, b));
+}
+
+test "countOverlap_substring_match" {
+    // "zoeken" is a substring of "doorzoeken" and "opzoeken"
+    const a = &[_][]const u8{ "zoeken", "email" };
+    const b = &[_][]const u8{ "doorzoeken", "opzoeken", "inbox" };
+    // "zoeken" substring = 1, "email" no match = 0
+    try testing.expectEqual(@as(usize, 1), countOverlap(a, b));
+}
+
+test "countOverlap_exact_preferred_over_substring" {
+    const a = &[_][]const u8{"zoeken"};
+    const b = &[_][]const u8{ "zoeken", "doorzoeken" };
+    // exact match = 2 (not 1 for substring)
+    try testing.expectEqual(@as(usize, 2), countOverlap(a, b));
+}
+
+test "countOverlap_short_tokens_skipped" {
+    const a = &[_][]const u8{ "ab", "rag" };
+    const b = &[_][]const u8{ "abc", "rag", "knowledge" };
+    // "ab" skipped (len < 3), "rag" exact = 2
+    try testing.expectEqual(@as(usize, 2), countOverlap(a, b));
 }
 
 test "isStopWord_dutch" {
