@@ -15,9 +15,9 @@ threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Set type='agent' to run as autonomous agent task (default: shell). Optional: model, prompt, channel, account_id, chat_id.";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Set type='agent' to run as autonomous agent task (default: shell). Always provide a descriptive 'name' — it is used as the email subject when delivering results.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent' (autonomous agent task)"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs (default: config primary model)"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command or agent prompt"},"type":{"type":"string","enum":["shell","agent"],"description":"Job type: 'shell' (default) or 'agent' (autonomous agent task)"},"prompt":{"type":"string","description":"Agent prompt (for type=agent; falls back to command)"},"model":{"type":"string","description":"Model override for agent jobs (default: config primary model)"},"name":{"type":"string","description":"Descriptive job name, used as email subject for delivery notifications"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -140,6 +140,7 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             const is_agent = if (root.getString(args, "type")) |t| std.ascii.eqlIgnoreCase(t, "agent") else false;
+            const job_name = root.getString(args, "name");
 
             const delivery_cfg: cron.DeliveryConfig = if (chat_id) |cid| .{
                 .mode = .always,
@@ -161,6 +162,8 @@ pub const ScheduleTool = struct {
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 };
             };
+
+            if (job_name) |n| job.name = try scheduler.allocator.dupe(u8, n);
 
             // Set delivery config if chat_id is provided (agent jobs get delivery via addAgentJob)
             if (!is_agent) {
@@ -201,6 +204,7 @@ pub const ScheduleTool = struct {
             defer scheduler.deinit();
 
             const is_agent = if (root.getString(args, "type")) |t| std.ascii.eqlIgnoreCase(t, "agent") else false;
+            const job_name = root.getString(args, "name");
 
             const job = if (is_agent) blk: {
                 const prompt = root.getString(args, "prompt") orelse command;
@@ -215,6 +219,8 @@ pub const ScheduleTool = struct {
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 };
             };
+
+            if (job_name) |n| job.name = try scheduler.allocator.dupe(u8, n);
 
             // Set delivery config if chat_id is provided
             if (chat_id) |cid| {

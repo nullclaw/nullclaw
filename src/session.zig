@@ -1012,6 +1012,11 @@ pub const SessionManager = struct {
                 const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
                 schedule_tool.setContext(channel, account_id, chat_id);
             }
+            if (std.mem.eql(u8, tool.name(), "spawn")) {
+                const spawn_tool: *tools_mod.spawn.SpawnTool = @ptrCast(@alignCast(tool.ptr));
+                spawn_tool.default_channel = channel;
+                spawn_tool.default_chat_id = chat_id;
+            }
         }
     }
 

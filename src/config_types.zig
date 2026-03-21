@@ -236,10 +236,12 @@ pub const AgentConfig = struct {
     skill_evolution_max_per_day: u32 = 3,
     /// Cooldown between evolution triggers for the same skill (minutes).
     skill_evolution_cooldown_minutes: u32 = 30,
-    /// Enable plan gate: first turn is tool-free planning, user confirms before tool execution.
-    plan_gate_enabled: bool = false,
-    /// Channels where plan gate is active. Empty = all channels (when plan_gate_enabled is true).
-    plan_gate_channels: []const []const u8 = &.{},
+    /// Enable task contract system (pre/post verification).
+    task_contracts_enabled: bool = false,
+    /// Provider/model for contract generation (cheap/fast model recommended).
+    task_contracts_model: []const u8 = "",
+    /// Maximum checkpoints per contract.
+    task_contracts_max_checkpoints: u8 = 5,
 };
 
 pub const ToolsConfig = struct {

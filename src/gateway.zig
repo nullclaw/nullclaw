@@ -2460,6 +2460,8 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
             const wa_peer_kind = if (wa_is_group) "group" else "direct";
             const wa_peer_id = wa_group_id orelse wa_sender_id;
 
+            std.log.scoped(.gateway).info("whatsapp: {s} msg from {s} session={s}", .{ wa_peer_kind, wa_sender_id, wa_session_key });
+
             if (ctx.state.event_bus) |eb| {
                 var meta_buf: [384]u8 = undefined;
                 const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
@@ -2522,6 +2524,8 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
             const wa_chat_target_ns = whatsappReplyTarget(b);
             const wa_peer_kind = if (wa_is_group) "group" else "direct";
             const wa_peer_id = wa_group_id orelse wa_sender_ns;
+
+            std.log.scoped(.gateway).info("whatsapp: {s} msg from {s} session={s}", .{ wa_peer_kind, wa_sender_ns, wa_session_key });
 
             if (ctx.state.event_bus) |eb| {
                 var meta_buf: [384]u8 = undefined;
@@ -3929,6 +3933,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     defer gateway_thread_observer.deinit();
     var runtime_observer: ?*observability.RuntimeObserver = null;
     defer if (runtime_observer) |obs| obs.destroy();
+    var rag_obs_ptr: ?*observability.RagObserver = null;
+    defer if (rag_obs_ptr) |ptr| allocator.destroy(ptr);
     var a2a_registry = a2a.TaskRegistry.init(allocator);
     defer a2a_registry.deinit();
     const needs_local_agent = event_bus == null;
@@ -3936,6 +3942,25 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
         try applyRuntimeProviderOverrides(cfg);
+
+        // Build extra observers: GatewayThreadObserver + optional RagObserver
+        var extra_obs_storage: [2]observability.Observer = undefined;
+        var extra_obs_count: usize = 0;
+        extra_obs_storage[extra_obs_count] = gateway_thread_observer.observer();
+        extra_obs_count += 1;
+
+        if (cfg.diagnostics.rag_url) |rag_url| {
+            if (cfg.diagnostics.rag_token) |rag_token| {
+                rag_obs_ptr = allocator.create(observability.RagObserver) catch null;
+                if (rag_obs_ptr) |ptr| {
+                    ptr.* = .{ .base_url = rag_url, .bearer_token = rag_token };
+                    extra_obs_storage[extra_obs_count] = ptr.observer();
+                    extra_obs_count += 1;
+                    std.log.scoped(.gateway).info("RagObserver attached to gateway", .{});
+                }
+            }
+        }
+
         runtime_observer = try observability.RuntimeObserver.create(
             allocator,
             .{
@@ -3945,7 +3970,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .otel_service_name = cfg.diagnostics.otel_service_name,
             },
             cfg.diagnostics.otel_headers,
-            &.{gateway_thread_observer.observer()},
+            extra_obs_storage[0..extra_obs_count],
         );
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,

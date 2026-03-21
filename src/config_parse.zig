@@ -1225,12 +1225,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("auto_disable_vision_on_error")) |v| {
                 if (v == .bool) self.agent.auto_disable_vision_on_error = v.bool;
             }
-            if (ag.object.get("plan_gate_enabled")) |v| {
-                if (v == .bool) self.agent.plan_gate_enabled = v.bool;
-            }
-            if (ag.object.get("plan_gate_channels")) |v| {
-                if (v == .array) self.agent.plan_gate_channels = try parseStringArray(self.allocator, v.array);
-            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {
@@ -1259,6 +1253,16 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     self.agent.tool_filter_groups = try fg_list.toOwnedSlice(self.allocator);
                 }
+            }
+            // Task contracts
+            if (ag.object.get("task_contracts_enabled")) |v| {
+                if (v == .bool) self.agent.task_contracts_enabled = v.bool;
+            }
+            if (ag.object.get("task_contracts_model")) |v| {
+                if (v == .string) self.agent.task_contracts_model = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("task_contracts_max_checkpoints")) |v| {
+                if (v == .integer) self.agent.task_contracts_max_checkpoints = @intCast(v.integer);
             }
         }
     }

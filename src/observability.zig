@@ -32,6 +32,15 @@ pub const ObserverEvent = union(enum) {
         tool_calls: u32 = 0,
         tool_failures: u32 = 0,
     },
+    contract_verified: struct {
+        session_id: []const u8 = "",
+        task_summary: []const u8,
+        checkpoints_passed: u8,
+        checkpoints_total: u8,
+        model: []const u8 = "",
+        skill: []const u8 = "general",
+        duration_ms: u64 = 0,
+    },
     turn_complete: void,
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
@@ -147,6 +156,7 @@ pub const LogObserver = struct {
             .tool_retry => |e| std.log.info("tool.retry tool={s} attempt={d} backoff_ms={d} class={s}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }),
             .evolution_trigger => |e| std.log.info("evolution.trigger skill={s} type={s} score={d:.2} model={s}", .{ e.skill, e.trigger_type, e.score, e.model }),
             .digest_ready => |e| std.log.info("digest.ready session={s} prefs={d} insights={d} patterns={d}", .{ e.session_id, e.user_preferences.len, e.tool_insights.len, e.task_patterns.len }),
+            .contract_verified => |e| std.log.info("contract.verified summary=\"{s}\" passed={d}/{d} skill={s} model={s}", .{ e.task_summary, e.checkpoints_passed, e.checkpoints_total, e.skill, e.model }),
             .turn_complete => std.log.info("turn.complete", .{}),
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
@@ -351,6 +361,7 @@ pub const FileObserver = struct {
             .tool_retry => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_retry\",\"tool\":\"{s}\",\"attempt\":{d},\"backoff_ms\":{d},\"class\":\"{s}\"}}", .{ e.tool, e.attempt, e.backoff_ms, e.error_class }) catch return,
             .evolution_trigger => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"evolution_trigger\",\"skill\":\"{s}\",\"type\":\"{s}\",\"score\":{d:.2},\"model\":\"{s}\"}}", .{ e.skill, e.trigger_type, e.score, e.model }) catch return,
             .digest_ready => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"digest_ready\",\"session_id\":\"{s}\",\"prefs\":{d},\"insights\":{d}}}", .{ e.session_id, e.user_preferences.len, e.tool_insights.len }) catch return,
+            .contract_verified => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"contract_verified\",\"passed\":{d},\"total\":{d},\"skill\":\"{s}\",\"model\":\"{s}\"}}", .{ e.checkpoints_passed, e.checkpoints_total, e.skill, e.model }) catch return,
             .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":{f},\"direction\":{f}}}", .{ std.json.fmt(e.channel, .{}), std.json.fmt(e.direction, .{}) }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
@@ -718,6 +729,19 @@ pub const OtelObserver = struct {
                 self.addSpan("digest.ready", now, now, &.{
                     .{ .key = "session_id", .value = e.session_id },
                     .{ .key = "summary", .value = e.summary },
+                });
+            },
+            .contract_verified => |e| {
+                var passed_buf: [8]u8 = undefined;
+                const passed_str = std.fmt.bufPrint(&passed_buf, "{d}", .{e.checkpoints_passed}) catch "0";
+                var total_buf: [8]u8 = undefined;
+                const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{e.checkpoints_total}) catch "0";
+                self.addSpan("contract.verified", now, now, &.{
+                    .{ .key = "task_summary", .value = e.task_summary },
+                    .{ .key = "checkpoints_passed", .value = passed_str },
+                    .{ .key = "checkpoints_total", .value = total_str },
+                    .{ .key = "skill", .value = e.skill },
+                    .{ .key = "model", .value = e.model },
                 });
             },
             .turn_complete => {

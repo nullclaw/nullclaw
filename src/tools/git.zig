@@ -12,9 +12,9 @@ pub const GitTool = struct {
     allowed_paths: []const []const u8 = &.{},
 
     pub const tool_name = "git_operations";
-    pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash).";
+    pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, push).";
     pub const tool_params =
-        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"File paths (for add). Prefer array for multiple files."},"branch":{"type":"string","description":"Branch name (for checkout)"},"files":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Files to diff. Prefer array for multiple files."},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash","push"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"File paths (for add). Prefer array for multiple files."},"branch":{"type":"string","description":"Branch name (for checkout)"},"files":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Files to diff. Prefer array for multiple files."},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -143,7 +143,7 @@ pub const GitTool = struct {
             break :blk cwd;
         } else self.workspace_dir;
 
-        const GitOp = enum { status, diff, log, branch, commit, add, checkout, stash };
+        const GitOp = enum { status, diff, log, branch, commit, add, checkout, stash, push };
         const op_map = std.StaticStringMap(GitOp).initComptime(.{
             .{ "status", .status },
             .{ "diff", .diff },
@@ -153,6 +153,7 @@ pub const GitTool = struct {
             .{ "add", .add },
             .{ "checkout", .checkout },
             .{ "stash", .stash },
+            .{ "push", .push },
         });
 
         if (op_map.get(operation)) |op| return switch (op) {
@@ -164,6 +165,7 @@ pub const GitTool = struct {
             .add => self.gitAdd(allocator, effective_cwd, args),
             .checkout => self.gitCheckout(allocator, effective_cwd, args),
             .stash => self.gitStash(allocator, effective_cwd, args),
+            .push => self.gitPush(allocator, effective_cwd),
         };
 
         const msg = try std.fmt.allocPrint(allocator, "Unknown operation: {s}", .{operation});
@@ -403,6 +405,24 @@ pub const GitTool = struct {
         const msg = try std.fmt.allocPrint(allocator, "Unknown stash action: {s}", .{action});
         return ToolResult{ .success = false, .output = "", .error_msg = msg };
     }
+
+    fn gitPush(self: *GitTool, allocator: std.mem.Allocator, git_cwd: []const u8) !ToolResult {
+        // Push current branch to origin, setting upstream if needed
+        const result = try self.runGit(allocator, git_cwd, &.{ "push", "-u", "origin", "HEAD" });
+        defer allocator.free(result.stderr);
+        if (!result.success) {
+            defer allocator.free(result.stdout);
+            const err_msg = try allocator.dupe(u8, result.stderr);
+            return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
+        }
+        // git push writes progress to stderr; combine both for useful output
+        if (result.stderr.len > 0) {
+            defer allocator.free(result.stdout);
+            const combined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.stdout, result.stderr });
+            return ToolResult{ .success = true, .output = combined };
+        }
+        return ToolResult{ .success = true, .output = result.stdout };
+    }
 };
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -433,7 +453,7 @@ test "git rejects missing operation" {
 test "git rejects unknown operation" {
     var gt = GitTool{ .workspace_dir = "/tmp" };
     const t = gt.tool();
-    const parsed = try root.parseTestArgs("{\"operation\": \"push\"}");
+    const parsed = try root.parseTestArgs("{\"operation\": \"rebase\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
