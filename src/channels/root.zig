@@ -53,7 +53,7 @@ pub fn wildcardWarningTriggeredForTest(comptime scope: []const u8) bool {
 // Shared Types
 // ════════════════════════════════════════════════════════════════════════════
 
-/// A saved email attachment.
+/// A file attachment extracted from an inbound message (e.g. email).
 pub const Attachment = struct {
     /// On-disk file path (allocator-owned).
     path: []const u8,
@@ -85,7 +85,7 @@ pub const ChannelMessage = struct {
     sender_uuid: ?[]const u8 = null,
     /// Group ID (Signal-specific: for group chats).
     group_id: ?[]const u8 = null,
-    /// Saved attachments (email channel only). Caller owns.
+    /// File attachments extracted from the message (e.g. email).
     attachments: []const Attachment = &.{},
 
     pub fn deinit(self: *const ChannelMessage, allocator: std.mem.Allocator) void {
