@@ -37,6 +37,7 @@ pub const prompt = @import("prompt.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
 pub const turn_scorer = @import("turn_scorer.zig");
+pub const skill_router = @import("skill_router.zig");
 pub const retry = @import("retry.zig");
 pub const session_digest = @import("session_digest.zig");
 pub const task_contract = @import("task_contract.zig");
@@ -394,6 +395,8 @@ pub const Agent = struct {
     routed_skill: ?[]const u8 = null,
     /// Max skills loaded as Active when routing is enabled.
     skill_routing_max_active: u32 = 3,
+    /// Skill affinity history for routing stickiness (ring buffer of recent skill names).
+    skill_affinity_history: ?skill_router.AffinityHistory = null,
 
     /// Skill evolution performance tracker (detects improvement opportunities).
     /// Heap-allocated because the tracker is ~11 KB (32 skill slots × ring buffers).
@@ -537,6 +540,15 @@ pub const Agent = struct {
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .skill_routing_enabled = cfg.agent.skill_routing_enabled,
             .skill_routing_max_active = cfg.agent.skill_routing_max_active,
+            .skill_affinity_history = if (cfg.agent.skill_routing_enabled and cfg.agent.skill_routing_affinity_depth > 0)
+                skill_router.AffinityHistory.init(
+                    allocator,
+                    cfg.agent.skill_routing_affinity_depth,
+                    cfg.agent.skill_routing_affinity_bonus,
+                    cfg.agent.skill_routing_affinity_decay_step,
+                )
+            else
+                null,
             .task_contracts_enabled = cfg.agent.task_contracts_enabled,
             .task_contracts_model = cfg.agent.task_contracts_model,
             .task_contracts_max_checkpoints = cfg.agent.task_contracts_max_checkpoints,
@@ -599,6 +611,7 @@ pub const Agent = struct {
         self.interrupted_tools.deinit(self.allocator);
         self.tool_state_mu.unlock();
         if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
+        if (self.skill_affinity_history) |*ah| ah.deinit();
         if (self.evolution_tracker) |tracker| self.allocator.destroy(tracker);
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
@@ -1805,6 +1818,7 @@ pub const Agent = struct {
                 .skill_routing_message = if (self.skill_routing_enabled) effective_user_message else null,
                 .skill_routing_max_active = self.skill_routing_max_active,
                 .matched_skill_out = if (self.skill_routing_enabled) &routed_skill else null,
+                .skill_affinity_history = if (self.skill_affinity_history) |*ah| ah else null,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
             });
             // Store routed skill for turn-level attribution. Ownership transfers
@@ -1816,6 +1830,8 @@ pub const Agent = struct {
                 if (self.prev_turn_skill_owned) |prev| self.allocator.free(prev);
                 self.prev_turn_skill_owned = rs;
                 self.routed_skill = rs;
+                // Push into affinity history for sticky routing on follow-up turns.
+                if (self.skill_affinity_history) |*ah| ah.push(rs);
             } else if (self.prev_turn_skill_owned) |prev| {
                 // Retain previous skill attribution for this turn
                 self.routed_skill = prev;

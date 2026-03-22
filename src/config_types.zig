@@ -256,6 +256,12 @@ pub const AgentConfig = struct {
     skill_routing_enabled: bool = false,
     /// Maximum number of skills to load as Active (full text) when routing is enabled.
     skill_routing_max_active: u32 = 3,
+    /// Bonus score added for skills that were recently active (affinity).
+    skill_routing_affinity_bonus: f32 = 0.5,
+    /// Number of recent turns to consider for affinity decay.
+    skill_routing_affinity_depth: u32 = 5,
+    /// Linear decay step per turn of history (most recent = 1.0, decreases by this per turn).
+    skill_routing_affinity_decay_step: f32 = 0.2,
     /// Enable post-session digest generation for learning from conversations.
     session_digest_enabled: bool = false,
     /// Minimum turns before a digest is generated.

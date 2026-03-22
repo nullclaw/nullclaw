@@ -1326,6 +1326,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("skill_routing_max_active")) |v| {
                 if (v == .integer) self.agent.skill_routing_max_active = @intCast(v.integer);
             }
+            if (ag.object.get("skill_routing_affinity_bonus")) |v| {
+                if (v == .float) self.agent.skill_routing_affinity_bonus = @floatCast(v.float);
+            }
+            if (ag.object.get("skill_routing_affinity_depth")) |v| {
+                if (v == .integer) self.agent.skill_routing_affinity_depth = @intCast(v.integer);
+            }
+            if (ag.object.get("skill_routing_affinity_decay_step")) |v| {
+                if (v == .float) self.agent.skill_routing_affinity_decay_step = @floatCast(v.float);
+            }
         }
     }
 

@@ -26,6 +26,10 @@ const MAX_SKILL_TOKENS: usize = 64;
 /// Maximum number of tokens extracted from the user message.
 const MAX_MESSAGE_TOKENS: usize = 128;
 
+/// Cap for the normalization denominator. Skills with more tokens than this
+/// are not further penalized, preventing long descriptions from diluting scores.
+const NORM_TOKEN_CAP: f32 = 16.0;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
@@ -36,9 +40,68 @@ pub const ScoredSkill = struct {
     score: f32,
 };
 
+/// Ring buffer of recently matched skill names for affinity decay.
+/// Stored externally (e.g., on the Agent) and passed to route() calls.
+pub const AffinityHistory = struct {
+    /// Ring buffer of skill names (heap-allocated copies). null = empty slot.
+    buffer: []?[]const u8,
+    /// Write position (next slot to overwrite).
+    head: usize = 0,
+    /// Number of entries written (capped at buffer.len).
+    count: usize = 0,
+    /// Bonus score for full affinity (most recent turn).
+    bonus: f32,
+    /// Decay step subtracted per turn of distance.
+    decay_step: f32,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, depth: u32, bonus: f32, decay_step: f32) ?AffinityHistory {
+        const buf = allocator.alloc(?[]const u8, depth) catch return null;
+        @memset(buf, null);
+        return .{ .buffer = buf, .bonus = bonus, .decay_step = decay_step, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *AffinityHistory) void {
+        for (self.buffer) |entry| {
+            if (entry) |name| self.allocator.free(name);
+        }
+        self.allocator.free(self.buffer);
+        self.buffer = &.{};
+    }
+
+    /// Record that a skill was matched this turn (dupes the name).
+    pub fn push(self: *AffinityHistory, skill_name: []const u8) void {
+        if (self.buffer[self.head]) |old| self.allocator.free(old);
+        self.buffer[self.head] = self.allocator.dupe(u8, skill_name) catch null;
+        self.head = (self.head + 1) % self.buffer.len;
+        if (self.count < self.buffer.len) self.count += 1;
+    }
+
+    /// Compute the affinity score for a given skill name.
+    /// Most recent entry gets bonus × 1.0, second gets bonus × (1.0 - decay_step), etc.
+    pub fn affinityScore(self: *const AffinityHistory, skill_name: []const u8) f32 {
+        if (self.count == 0) return 0.0;
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            const pos = if (self.head >= i + 1)
+                self.head - i - 1
+            else
+                self.buffer.len - (i + 1 - self.head);
+            if (self.buffer[pos]) |name| {
+                if (std.mem.eql(u8, name, skill_name)) {
+                    const decay = 1.0 - @as(f32, @floatFromInt(i)) * self.decay_step;
+                    return self.bonus * @max(decay, 0.0);
+                }
+            }
+        }
+        return 0.0;
+    }
+};
+
 /// Pre-computed keyword index for a single skill.
 const SkillKeywordEntry = struct {
     skill_index: usize,
+    name: []const u8, // non-owned, valid for router lifetime
     name_tokens: [][]const u8,
     desc_tokens: [][]const u8,
 };
@@ -63,6 +126,7 @@ pub const SkillRouter = struct {
         for (skill_names, skill_descriptions, 0..) |name, desc, i| {
             entries[i] = .{
                 .skill_index = i,
+                .name = name,
                 .name_tokens = tokenizeAndFilter(allocator, name),
                 .desc_tokens = tokenizeAndFilter(allocator, desc),
             };
@@ -89,13 +153,14 @@ pub const SkillRouter = struct {
         allocator: std.mem.Allocator,
         user_message: []const u8,
         limit: u32,
+        affinity: ?*const AffinityHistory,
     ) []ScoredSkill {
         if (self.entries.len == 0 or limit == 0) return &.{};
 
         const msg_tokens = tokenizeAndFilter(allocator, user_message);
         defer freeTokens(allocator, msg_tokens);
 
-        if (msg_tokens.len == 0) return &.{};
+        if (msg_tokens.len == 0 and affinity == null) return &.{};
 
         // Score each skill
         var scores = allocator.alloc(ScoredSkill, self.entries.len) catch return &.{};
@@ -109,13 +174,17 @@ pub const SkillRouter = struct {
             const total_entry_tokens = entry.name_tokens.len + entry.desc_tokens.len;
             if (total_entry_tokens == 0) continue;
 
-            // Weighted score normalized by total tokens
+            // Weighted score normalized by total tokens (capped to avoid penalizing rich descriptions)
             const raw = (@as(f32, @floatFromInt(name_hits)) * NAME_WEIGHT +
                 @as(f32, @floatFromInt(desc_hits))) /
-                @as(f32, @floatFromInt(total_entry_tokens));
+                @min(@as(f32, @floatFromInt(total_entry_tokens)), NORM_TOKEN_CAP);
 
-            if (raw >= MIN_SCORE_THRESHOLD) {
-                scores[count] = .{ .index = entry.skill_index, .score = raw };
+            // Add affinity boost from recent skill history
+            const affinity_boost = if (affinity) |ah| ah.affinityScore(entry.name) else 0.0;
+            const effective = raw + affinity_boost;
+
+            if (effective >= MIN_SCORE_THRESHOLD) {
+                scores[count] = .{ .index = entry.skill_index, .score = effective };
                 count += 1;
             }
         }
@@ -431,7 +500,7 @@ test "SkillRouter_route_meeting_query" {
     defer router.deinit();
 
     // "meeting" matches skill name "meeting-planner" (name weight 3x)
-    const results = router.route(alloc, "Schedule a meeting with the client", 3);
+    const results = router.route(alloc,"Schedule a meeting with the client", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -449,7 +518,7 @@ test "SkillRouter_route_coding_query" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "Deploy the coding project to production", 3);
+    const results = router.route(alloc,"Deploy the coding project to production", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -467,7 +536,7 @@ test "SkillRouter_route_email_query" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "Search through my email inbox", 3);
+    const results = router.route(alloc,"Search through my email inbox", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -486,7 +555,7 @@ test "SkillRouter_route_respects_limit" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "Show me the tasks operations status", 2);
+    const results = router.route(alloc,"Show me the tasks operations status", 2, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len <= 2);
@@ -499,7 +568,7 @@ test "SkillRouter_route_no_match_returns_empty" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "Vertel me een grap", 3);
+    const results = router.route(alloc,"Vertel me een grap", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expectEqual(@as(usize, 0), results.len);
@@ -512,7 +581,7 @@ test "SkillRouter_route_empty_message" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "", 3);
+    const results = router.route(alloc,"", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expectEqual(@as(usize, 0), results.len);
@@ -529,7 +598,7 @@ test "SkillRouter_route_name_match_weighs_more" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "Check my email", 2);
+    const results = router.route(alloc,"Check my email", 2, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -550,7 +619,7 @@ test "SkillRouter_route_dutch_query" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "Wat zijn de cursussen bij Wellenberg?", 2);
+    const results = router.route(alloc,"Wat zijn de cursussen bij Wellenberg?", 2, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -568,7 +637,7 @@ test "SkillRouter_route_sorted_descending" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc, "Run the tasks operations management", 3);
+    const results = router.route(alloc,"Run the tasks operations management", 3, null);
     defer freeScored(alloc, results);
 
     // Verify sorted descending
@@ -582,7 +651,7 @@ test "SkillRouter_empty_skills" {
     var router = SkillRouter.init(alloc, &.{}, &.{});
     defer router.deinit();
 
-    const results = router.route(alloc, "hello", 3);
+    const results = router.route(alloc,"hello", 3, null);
     defer freeScored(alloc, results);
     try testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -623,7 +692,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 1: Appointment query → meeting-planner
     {
-        const r = router.route(alloc, "Plan een afspraak bij Daisha", 3);
+        const r = router.route(alloc,"Plan een afspraak bij Daisha", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 0), r[0].index); // meeting-planner
@@ -631,7 +700,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 2: Email query → imap-email
     {
-        const r = router.route(alloc, "Zoek in mijn email naar de factuur", 3);
+        const r = router.route(alloc,"Zoek in mijn email naar de factuur", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 1), r[0].index); // imap-email
@@ -639,7 +708,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 3: Knowledge query → rag-knowledge
     {
-        const r = router.route(alloc, "Welke cursussen biedt Wellenberg aan?", 3);
+        const r = router.route(alloc,"Welke cursussen biedt Wellenberg aan?", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 2), r[0].index); // rag-knowledge
@@ -647,7 +716,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 4: Coding query → coding-agent
     {
-        const r = router.route(alloc, "Fix the bug in the coding project", 3);
+        const r = router.route(alloc,"Fix the bug in the coding project", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 3), r[0].index); // coding-agent
@@ -655,7 +724,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 5: NAS query → nas-documents
     {
-        const r = router.route(alloc, "Sla dit document op de NAS", 3);
+        const r = router.route(alloc,"Sla dit document op de NAS", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 5), r[0].index); // nas-documents
@@ -663,7 +732,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 6: Invoice query → toggl-invoice
     {
-        const r = router.route(alloc, "Maak de maandelijkse Toggl invoice", 3);
+        const r = router.route(alloc,"Maak de maandelijkse Toggl invoice", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 7), r[0].index); // toggl-invoice
@@ -671,7 +740,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 7: Uren overzicht → toggl-invoice (substring: "uren" in "urenoverzicht")
     {
-        const r = router.route(alloc, "Stuur me een overzicht van mijn uren van de afgelopen week", 3);
+        const r = router.route(alloc,"Stuur me een overzicht van mijn uren van de afgelopen week", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 7), r[0].index); // toggl-invoice
@@ -679,7 +748,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 8: RAG zoeken → rag-knowledge (exact: "RAG", "zoeken")
     {
-        const r = router.route(alloc, "Zoek in de RAG naar informatie over de GGZ workshop", 3);
+        const r = router.route(alloc,"Zoek in de RAG naar informatie over de GGZ workshop", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 2), r[0].index); // rag-knowledge
@@ -687,7 +756,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 9: Text writer → text-writer or related skill
     {
-        const r = router.route(alloc, "Schrijf een opzet voor de workshop en sla het op als Word document", 3);
+        const r = router.route(alloc,"Schrijf een opzet voor de workshop en sla het op als Word document", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         // Should match a writing/document skill. Log the actual index for debugging.
@@ -695,4 +764,104 @@ test "SkillRouter_donna_full_skill_set" {
         const idx = r[0].index;
         try testing.expect(idx == 10 or idx == 6 or idx == 5 or idx == 2);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Affinity History Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "AffinityHistory_push_and_score" {
+    const alloc = testing.allocator;
+    var ah = AffinityHistory.init(alloc, 5, 0.5, 0.2) orelse return error.SkipZigTest;
+    defer ah.deinit();
+
+    ah.push("coding-agent");
+    // Most recent → bonus × 1.0 = 0.5
+    try testing.expectApproxEqAbs(@as(f32, 0.5), ah.affinityScore("coding-agent"), 0.001);
+    // Unknown skill → 0
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ah.affinityScore("meeting-planner"), 0.001);
+}
+
+test "AffinityHistory_decay" {
+    const alloc = testing.allocator;
+    var ah = AffinityHistory.init(alloc, 5, 0.5, 0.2) orelse return error.SkipZigTest;
+    defer ah.deinit();
+
+    ah.push("coding-agent");
+    ah.push("meeting-planner"); // coding-agent is now 1 turn old
+
+    // meeting-planner (most recent) → 0.5 × 1.0 = 0.5
+    try testing.expectApproxEqAbs(@as(f32, 0.5), ah.affinityScore("meeting-planner"), 0.001);
+    // coding-agent (1 turn ago) → 0.5 × 0.8 = 0.4
+    try testing.expectApproxEqAbs(@as(f32, 0.4), ah.affinityScore("coding-agent"), 0.001);
+}
+
+test "AffinityHistory_ring_buffer_wraps" {
+    const alloc = testing.allocator;
+    var ah = AffinityHistory.init(alloc, 3, 0.5, 0.2) orelse return error.SkipZigTest;
+    defer ah.deinit();
+
+    ah.push("skill-a");
+    ah.push("skill-b");
+    ah.push("skill-c");
+    ah.push("skill-d"); // skill-a is evicted
+
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ah.affinityScore("skill-a"), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), ah.affinityScore("skill-d"), 0.001);
+}
+
+test "AffinityHistory_empty_returns_zero" {
+    const alloc = testing.allocator;
+    var ah = AffinityHistory.init(alloc, 5, 0.5, 0.2) orelse return error.SkipZigTest;
+    defer ah.deinit();
+
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ah.affinityScore("anything"), 0.001);
+}
+
+test "SkillRouter_route_with_affinity_boosts_vague_message" {
+    const alloc = testing.allocator;
+    const names = &[_][]const u8{ "meeting-planner", "coding-agent", "imap-email" };
+    const descs = &[_][]const u8{
+        "Manage consultation appointments",
+        "Run coding tasks via Claude Code",
+        "Advanced email operations via IMAP",
+    };
+    var router = SkillRouter.init(alloc, names, descs);
+    defer router.deinit();
+
+    // Without affinity: "ja doe maar" should match nothing
+    const no_affinity = router.route(alloc, "ja doe maar", 3, null);
+    defer freeScored(alloc, no_affinity);
+    try testing.expectEqual(@as(usize, 0), no_affinity.len);
+
+    // With affinity: coding-agent was recently active → should match
+    var ah = AffinityHistory.init(alloc, 5, 0.5, 0.2) orelse return error.SkipZigTest;
+    defer ah.deinit();
+    ah.push("coding-agent");
+
+    const with_affinity = router.route(alloc, "ja doe maar", 3, &ah);
+    defer freeScored(alloc, with_affinity);
+    try testing.expect(with_affinity.len >= 1);
+    try testing.expectEqual(@as(usize, 1), with_affinity[0].index); // coding-agent
+}
+
+test "SkillRouter_route_affinity_plus_keywords_combined" {
+    const alloc = testing.allocator;
+    const names = &[_][]const u8{ "meeting-planner", "coding-agent" };
+    const descs = &[_][]const u8{
+        "Manage consultation appointments",
+        "Run coding tasks via Claude Code",
+    };
+    var router = SkillRouter.init(alloc, names, descs);
+    defer router.deinit();
+
+    var ah = AffinityHistory.init(alloc, 5, 0.5, 0.2) orelse return error.SkipZigTest;
+    defer ah.deinit();
+    ah.push("coding-agent");
+
+    // "Start Phase 2" has no keyword match, but affinity gives coding-agent a boost
+    const results = router.route(alloc, "Start Phase 2", 3, &ah);
+    defer freeScored(alloc, results);
+    try testing.expect(results.len >= 1);
+    try testing.expectEqual(@as(usize, 1), results[0].index); // coding-agent
 }
