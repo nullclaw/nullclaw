@@ -460,6 +460,68 @@ Telegram forum topics：
 - 如果省略 `match.account_id`，该 binding 可匹配该 channel 下的任意 Telegram 账号。
 - 只有同一个 nullclaw 实例运行多个 Telegram bot 账号/token 时，不同 account id 才有意义。
 
+### Web UI / Browser Relay
+
+`channels.web` 用于浏览器 UI / 扩展通过 WebSocket 接入，默认路径是 `/ws`。
+
+示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "127.0.0.1",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "pairing",
+          "allowed_origins": ["http://localhost:5173"]
+        }
+      }
+    }
+  }
+}
+```
+
+实用规则：
+
+- 想使用“先连上再配对”的本地体验，保持 `listen = "127.0.0.1"`。
+- 在 local transport 下，只有 loopback 才允许未鉴权的 WebSocket upgrade；这样 UI 才能先连上，再发送 `pairing_request`。
+- 如果把 `listen` 改成 `0.0.0.0` 或其他非 loopback 地址，那么 WebSocket upgrade 一开始就必须带上 channel token：
+  - `ws://host:32123/ws?token=<auth_token>`
+  - 或 `Authorization: Bearer <auth_token>`
+- 非 loopback bind 下，不要假设 local `pairing_request` 还能在未鉴权连接上工作；这个 pairing-first 流程本来就是只给 loopback 用的。
+- `message_auth_mode = "pairing"` 表示每条 `user_message` 都要带上 pairing 流程返回的 UI `access_token`。
+- `message_auth_mode = "token"` 只支持 local transport，并且要求使用配置或环境变量中的稳定 token。此模式下，UI 每条 `user_message` 发送 `auth_token`，而不是 pairing JWT。
+- `auth_token` 既可以加固 WebSocket upgrade，在非 loopback bind 时也会变成必需项。
+- WebSocket 端点用的是 `/ws`。`/pair` 属于 HTTP gateway API，不是 web channel 的 WebSocket 配对入口。
+- 对于 headless/LAN 场景，更稳妥的运维路径仍然是 SSH 隧道，或者在 loopback 绑定前面加反向代理。
+
+远程 / 无头设备示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "0.0.0.0",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "token",
+          "allowed_origins": ["https://chat-ui.example.com"]
+        }
+      }
+    }
+  }
+}
+```
+
 Max 示例：
 
 ```json

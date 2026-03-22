@@ -46,7 +46,7 @@ pub const CronAddTool = struct {
                 return ToolResult.fail("Invalid delay format");
         }
 
-        const gateway_body = cron_gateway.buildAddBody(allocator, expression, delay, command, null, null, null) catch null;
+        const gateway_body = cron_gateway.buildAddBody(allocator, expression, delay, command, null, null, null, null) catch null;
         if (gateway_body) |json_body| {
             defer allocator.free(json_body);
             switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
@@ -99,7 +99,7 @@ pub const CronAddTool = struct {
 
         if (delay) |d| {
             const job = if (is_agent)
-                scheduler.addAgentOnce(d, prompt, model) catch |err| {
+                scheduler.addAgentOnce(d, prompt, model, .{}) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot agent task: {s}", .{@errorName(err)});
                     return ToolResult{ .success = false, .output = "", .error_msg = msg };
                 }
@@ -216,7 +216,7 @@ test "cron_add schema has command" {
 }
 
 test "cron_add gateway request body preserves delay and command" {
-    const body = try cron_gateway.buildAddBody(std.testing.allocator, null, "30m", "echo later", null, null, null);
+    const body = try cron_gateway.buildAddBody(std.testing.allocator, null, "30m", "echo later", null, null, null, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});

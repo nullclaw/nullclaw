@@ -1,4 +1,6 @@
-**Official website:** [nullclaw.io](https://nullclaw.io)
+Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
+
+[nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
 
 <p align="center">
   <img src="nullclaw.png" alt="nullclaw" width="200" />
@@ -671,8 +673,10 @@ Use `channels.web` for browser UI events (WebChannel v1):
 - `message_auth_mode` controls inbound `user_message` auth:
   - `"pairing"` (default): send `pairing_request`, receive `pairing_result`, include UI `access_token` in every `user_message`.
   - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
-- `auth_token` is optional hardening for WebSocket upgrade and required when binding non-loopback addresses.
-- Remote host: set `"listen": "0.0.0.0"` and terminate TLS at proxy/CDN (`wss://...`).
+- `auth_token` hardens the WebSocket upgrade and becomes required when binding non-loopback addresses.
+- Unauthenticated WebSocket upgrade is loopback-only. Pairing-first local UX works on `127.0.0.1`, but a public/LAN bind must authenticate the `/ws` upgrade on the first hop with `?token=<auth_token>` or `Authorization: Bearer <auth_token>`.
+- `/ws` is the WebSocket endpoint. `/pair` belongs to the HTTP gateway API and is not part of the web channel handshake.
+- Remote/headless host: if you bind `"listen": "0.0.0.0"`, prefer a stable configured token plus `message_auth_mode: "token"` behind TLS/reverse proxy, or keep loopback bind and expose it through SSH tunnel/proxy.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
 - For orchestration, use local token mode with a stable token from config or env (`NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`).
 - Relay transport (outbound agent socket) is configured via:

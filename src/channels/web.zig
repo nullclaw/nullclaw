@@ -113,6 +113,14 @@ pub const WebChannel = struct {
 
     const WsServer = websocket.Server(WsHandler);
 
+    fn publicBindTokenRequiredLogMessage(message_auth_mode: MessageAuthMode) []const u8 {
+        return switch (message_auth_mode) {
+            .pairing => "WS connection rejected: token required for non-loopback bind; local pairing_request is loopback-only. Use /ws?token=<auth_token> (or Authorization header), keep listen=127.0.0.1, or use an SSH tunnel/reverse proxy.",
+            .token => "WS connection rejected: token required for non-loopback bind; use /ws?token=<auth_token> (or Authorization header).",
+            .invalid => "WS connection rejected: token required for non-loopback bind.",
+        };
+    }
+
     const vtable = root.Channel.VTable{
         .start = wsStart,
         .stop = wsStop,
@@ -1668,7 +1676,7 @@ pub const WebChannel = struct {
             } else {
                 // Pairing-first local UX: allow unauthenticated upgrade only on loopback.
                 if (pairing_mod.isPublicBind(web_channel.listen_address)) {
-                    log.warn("WS connection rejected: token required for non-loopback bind", .{});
+                    log.warn("{s}", .{publicBindTokenRequiredLogMessage(web_channel.message_auth_mode)});
                     return error.Forbidden;
                 }
                 if (web_channel.message_auth_mode == .token) {
@@ -2331,6 +2339,12 @@ test "WebChannel local pairing code never expires" {
 
     ch.relay_pairing_issued_at = std.time.timestamp() - 86_400;
     try std.testing.expect(!ch.relayPairingCodeExpired());
+}
+
+test "WebChannel public bind token guidance mentions loopback-only pairing" {
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.pairing), "loopback-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.pairing), "/ws?token=<auth_token>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.token), "Authorization header") != null);
 }
 
 test "WebChannel relay pairing log message hides code" {

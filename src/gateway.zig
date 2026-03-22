@@ -2479,6 +2479,8 @@ fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     try buf.appendSlice(allocator, if (job.one_shot) "true" else "false");
     try buf.appendSlice(allocator, ",\"job_type\":");
     try appendJsonStringBuf(buf, allocator, job.job_type.asStr());
+    try buf.appendSlice(allocator, ",\"session_target\":");
+    try appendJsonStringBuf(buf, allocator, job.session_target.asStr());
     try buf.appendSlice(allocator, ",\"enabled\":");
     try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
     try buf.appendSlice(allocator, ",\"delete_after_run\":");
@@ -2495,6 +2497,20 @@ fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     if (job.delivery.account_id) |account_id| try appendJsonStringBuf(buf, allocator, account_id) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, ",\"delivery_to\":");
     if (job.delivery.to) |to| try appendJsonStringBuf(buf, allocator, to) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_peer_kind\":");
+    if (job.delivery.peer_kind) |peer_kind| {
+        try appendJsonStringBuf(buf, allocator, switch (peer_kind) {
+            .direct => "direct",
+            .group => "group",
+            .channel => "channel",
+        });
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"delivery_peer_id\":");
+    if (job.delivery.peer_id) |peer_id| try appendJsonStringBuf(buf, allocator, peer_id) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_thread_id\":");
+    if (job.delivery.thread_id) |thread_id| try appendJsonStringBuf(buf, allocator, thread_id) else try buf.appendSlice(allocator, "null");
     try buf.appendSlice(allocator, ",\"delivery_best_effort\":");
     try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
     try buf.appendSlice(allocator, ",\"created_at_s\":");
@@ -2592,11 +2608,36 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     const prompt_opt = cronObjectStringField(obj, "prompt");
     const command_opt = cronObjectStringField(obj, "command");
     const model_opt = cronObjectStringField(obj, "model");
+    const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
+        cron_mod.SessionTarget.parseStrict(raw) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid session_target\"}";
+            return;
+        }
+    else
+        cron_mod.SessionTarget.isolated;
     const delivery_mode_opt = cronObjectStringField(obj, "delivery_mode");
     const delivery_channel_opt = cronObjectStringField(obj, "delivery_channel");
     const delivery_account_id_opt = cronObjectStringField(obj, "delivery_account_id");
     const delivery_to_opt = cronObjectStringField(obj, "delivery_to");
+    const delivery_peer_kind = blk: {
+        const raw = cronObjectStringField(obj, "delivery_peer_kind") orelse break :blk null;
+        if (std.mem.eql(u8, raw, "direct")) break :blk agent_routing.ChatType.direct;
+        if (std.mem.eql(u8, raw, "group")) break :blk agent_routing.ChatType.group;
+        if (std.mem.eql(u8, raw, "channel")) break :blk agent_routing.ChatType.channel;
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid delivery_peer_kind\"}";
+        return;
+    };
+    const delivery_peer_id_opt = cronObjectStringField(obj, "delivery_peer_id");
+    const delivery_thread_id_opt = cronObjectStringField(obj, "delivery_thread_id");
     const delivery_best_effort = cronObjectBoolField(obj, "delivery_best_effort") orelse true;
+
+    if (prompt_opt == null and session_target != .isolated) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"session_target requires prompt\"}";
+        return;
+    }
 
     const sched = lockSharedSchedulerForRequest() orelse {
         g_shared_scheduler_mutex.unlock();
@@ -2606,7 +2647,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
     };
     defer g_shared_scheduler_mutex.unlock();
 
-    const delivery = cron_mod.DeliveryConfig{
+    const delivery = cron_mod.enrichDeliveryRouting(.{
         .mode = if (delivery_mode_opt) |raw|
             cron_mod.DeliveryMode.parse(raw)
         else if (delivery_channel_opt != null or delivery_account_id_opt != null or delivery_to_opt != null)
@@ -2616,15 +2657,18 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         .channel = delivery_channel_opt,
         .account_id = delivery_account_id_opt,
         .to = delivery_to_opt,
+        .peer_kind = delivery_peer_kind,
+        .peer_id = delivery_peer_id_opt,
+        .thread_id = delivery_thread_id_opt,
         .best_effort = delivery_best_effort,
         .channel_owned = false,
         .account_id_owned = false,
         .to_owned = false,
-    };
+    });
 
     const job_ptr = if (delay_opt) |delay|
         if (prompt_opt != null)
-            sched.addAgentOnce(delay, prompt_opt.?, model_opt) catch |err| {
+            sched.addAgentOnce(delay, prompt_opt.?, model_opt, delivery) catch |err| {
                 ctx.response_status = "400 Bad Request";
                 ctx.response_body = if (err == error.MaxTasksReached)
                     "{\"error\":\"max tasks reached\"}"
@@ -2680,6 +2724,7 @@ fn handleCronAdd(ctx: *WebhookHandlerContext) void {
         };
     };
 
+    job_ptr.session_target = session_target;
     cron_mod.saveJobs(sched) catch {};
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -2860,6 +2905,14 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     const command = cronObjectStringField(obj, "command");
     const prompt = cronObjectStringField(obj, "prompt");
     const model = cronObjectStringField(obj, "model");
+    const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
+        cron_mod.SessionTarget.parseStrict(raw) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid session_target\"}";
+            return;
+        }
+    else
+        null;
     const paused_opt = cronObjectBoolField(obj, "paused");
     const enabled_explicit = cronObjectBoolField(obj, "enabled");
     const enabled_opt = if (enabled_explicit) |enabled| enabled else if (paused_opt) |paused| !paused else null;
@@ -2872,11 +2925,25 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     };
     defer g_shared_scheduler_mutex.unlock();
 
+    if (session_target != null) {
+        const existing = sched.getJob(id) orelse {
+            ctx.response_status = "404 Not Found";
+            ctx.response_body = "{\"error\":\"job not found\"}";
+            return;
+        };
+        if (existing.job_type != .agent) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"session_target requires agent job\"}";
+            return;
+        }
+    }
+
     const patch = cron_mod.CronJobPatch{
         .expression = expression,
         .command = command,
         .prompt = prompt,
         .model = model,
+        .session_target = session_target,
         .enabled = enabled_opt,
     };
 
@@ -5670,7 +5737,7 @@ test "handleCronAdd preserves delivery routing fields" {
         "POST /cron/add HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
         "Content-Type: application/json\r\n\r\n" ++
-        "{\"expression\":\"*/10 * * * *\",\"prompt\":\"Check \\\"traffic\\\"\",\"model\":\"openrouter/anthropic/claude-sonnet-4\",\"delivery_mode\":\"always\",\"delivery_channel\":\"telegram\",\"delivery_account_id\":\"backup\",\"delivery_to\":\"chat-42\",\"delivery_best_effort\":false}";
+        "{\"expression\":\"*/10 * * * *\",\"prompt\":\"Check \\\"traffic\\\"\",\"model\":\"openrouter/anthropic/claude-sonnet-4\",\"session_target\":\"main\",\"delivery_mode\":\"always\",\"delivery_channel\":\"telegram\",\"delivery_account_id\":\"backup\",\"delivery_to\":\"chat-42\",\"delivery_peer_kind\":\"group\",\"delivery_peer_id\":\"-100123\",\"delivery_thread_id\":\"77\",\"delivery_best_effort\":false}";
 
     var ctx = WebhookHandlerContext{
         .root_allocator = req_allocator,
@@ -5690,10 +5757,18 @@ test "handleCronAdd preserves delivery routing fields" {
     try std.testing.expectEqual(cron_mod.DeliveryMode.always, jobs[0].delivery.mode);
     try std.testing.expectEqualStrings("Check \"traffic\"", jobs[0].command);
     try std.testing.expectEqualStrings("Check \"traffic\"", jobs[0].prompt.?);
+    try std.testing.expectEqual(cron_mod.SessionTarget.main, jobs[0].session_target);
     try std.testing.expectEqualStrings("telegram", jobs[0].delivery.channel.?);
     try std.testing.expectEqualStrings("backup", jobs[0].delivery.account_id.?);
     try std.testing.expectEqualStrings("chat-42", jobs[0].delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, jobs[0].delivery.peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", jobs[0].delivery.peer_id.?);
+    try std.testing.expectEqualStrings("77", jobs[0].delivery.thread_id.?);
     try std.testing.expect(!jobs[0].delivery.best_effort);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, req_allocator, ctx.response_body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("main", parsed.value.object.get("session_target").?.string);
 }
 
 test "handleCronAdd supports one-shot delay payloads" {
@@ -5733,6 +5808,228 @@ test "handleCronAdd supports one-shot delay payloads" {
     try std.testing.expect(jobs[0].one_shot);
     try std.testing.expect(std.mem.startsWith(u8, jobs[0].expression, "@once:"));
     try std.testing.expectEqualStrings("echo once", jobs[0].command);
+}
+
+test "handleCronAdd preserves delivery routing for one-shot agent payloads" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"delay\":\"5m\",\"prompt\":\"Summarize incidents\",\"session_target\":\"main\",\"delivery_mode\":\"always\",\"delivery_channel\":\"matrix\",\"delivery_account_id\":\"backup\",\"delivery_to\":\"!room:example\",\"delivery_peer_kind\":\"group\",\"delivery_peer_id\":\"!room:example\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expect(jobs[0].one_shot);
+    try std.testing.expectEqual(cron_mod.JobType.agent, jobs[0].job_type);
+    try std.testing.expectEqual(cron_mod.SessionTarget.main, jobs[0].session_target);
+    try std.testing.expectEqualStrings("matrix", jobs[0].delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", jobs[0].delivery.account_id.?);
+    try std.testing.expectEqualStrings("!room:example", jobs[0].delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, jobs[0].delivery.peer_kind.?);
+    try std.testing.expectEqualStrings("!room:example", jobs[0].delivery.peer_id.?);
+}
+
+test "handleCronAdd rejects session_target for shell jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"command\":\"echo hello\",\"session_target\":\"main\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "session_target requires prompt") != null);
+}
+
+test "handleCronAdd rejects invalid session_target" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"prompt\":\"Summarize\",\"session_target\":\"primary\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
+}
+
+test "handleCronUpdate accepts session_target" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"session_target\":\"main\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqual(cron_mod.SessionTarget.main, scheduler.listJobs()[0].session_target);
+}
+
+test "handleCronUpdate rejects session_target for shell jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("* * * * *", "echo hello");
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"session_target\":\"main\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "session_target requires agent job") != null);
+}
+
+test "handleCronUpdate rejects invalid session_target" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"session_target\":\"primary\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
 }
 
 test "constants are set correctly" {

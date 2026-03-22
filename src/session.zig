@@ -1006,11 +1006,27 @@ pub const SessionManager = struct {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse parseChannelFromSessionKey(session_key)) else parseChannelFromSessionKey(session_key);
         const chat_id = parsePeerIdFromSessionKey(session_key);
         const account_id = if (conversation_context) |ctx| ctx.account_id else null;
+        const peer_kind = if (conversation_context) |ctx|
+            if (ctx.is_group) |is_group|
+                if (is_group) agent_routing.ChatType.group else agent_routing.ChatType.direct
+            else
+                null
+        else
+            null;
+        const peer_id = if (conversation_context) |ctx| blk: {
+            if (ctx.is_group) |is_group| {
+                if (is_group) {
+                    if (ctx.group_id) |group_id| break :blk group_id;
+                }
+            }
+            if (ctx.peer_id) |value| break :blk value;
+            break :blk chat_id;
+        } else chat_id;
 
         for (tools) |tool| {
             if (std.mem.eql(u8, tool.name(), "schedule")) {
                 const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-                schedule_tool.setContext(channel, account_id, chat_id);
+                schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, null);
             }
             if (std.mem.eql(u8, tool.name(), "spawn")) {
                 const spawn_tool: *tools_mod.spawn.SpawnTool = @ptrCast(@alignCast(tool.ptr));

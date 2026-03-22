@@ -44,11 +44,14 @@ fn setScheduleToolContext(
     channel: ?[]const u8,
     account_id: ?[]const u8,
     chat_id: ?[]const u8,
+    peer_kind: ?agent_routing.ChatType,
+    peer_id: ?[]const u8,
+    thread_id: ?[]const u8,
 ) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
             const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-            schedule_tool.setContext(channel, account_id, chat_id);
+            schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, thread_id);
             break;
         }
     }
@@ -803,8 +806,24 @@ fn processTelegramMessage(
     }
 
     // Set ScheduleTool context for delivery.
-    setScheduleToolContext(runtime.tools, "telegram", tg_ptr.account_id, sender);
-    defer setScheduleToolContext(runtime.tools, null, null, null);
+    var schedule_thread_buf: [32]u8 = undefined;
+    const schedule_thread_id = if (is_group)
+        if (telegram.targetThreadId(sender)) |thread_id|
+            std.fmt.bufPrint(&schedule_thread_buf, "{d}", .{thread_id}) catch null
+        else
+            null
+    else
+        null;
+    setScheduleToolContext(
+        runtime.tools,
+        "telegram",
+        tg_ptr.account_id,
+        sender,
+        if (is_group) .group else .direct,
+        if (is_group) telegram.targetChatId(sender) else sender,
+        schedule_thread_id,
+    );
+    defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
     const conversation_context = buildConversationContext(.{
@@ -1614,8 +1633,16 @@ pub fn runSignalLoop(
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "signal", sg_ptr.account_id, schedule_chat_id);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "signal",
+                sg_ptr.account_id,
+                schedule_chat_id,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) signalGroupPeerId(msg.reply_target) else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
             // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
@@ -2283,8 +2310,8 @@ fn processIncomingEmail(
     } else wrapped;
 
     // Set ScheduleTool context so subagents know the originating channel.
-    setScheduleToolContext(runtime.tools, "email", em_ptr.config.account_id, sender_addr);
-    defer setScheduleToolContext(runtime.tools, null, null, null);
+    setScheduleToolContext(runtime.tools, "email", em_ptr.config.account_id, sender_addr, .direct, sender_addr, null);
+    defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     const reply = runtime.session_mgr.processMessage(session_key, content_for_llm, null) catch |err| {
         log.err("Email agent error: {}", .{err});
@@ -2491,8 +2518,16 @@ pub fn runMatrixLoop(
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "matrix", mx_ptr.account_id, schedule_chat_id);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "matrix",
+                mx_ptr.account_id,
+                schedule_chat_id,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) matrixRoomPeerId(msg.reply_target) else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
             var key_buf: [192]u8 = undefined;
             const room_peer_id = matrixRoomPeerId(msg.reply_target);
@@ -2626,8 +2661,16 @@ pub fn runMaxLoop(
 
         for (messages) |msg| {
             const reply_target = msg.reply_target orelse msg.sender;
-            setScheduleToolContext(runtime.tools, "max", mx_ptr.account_id, reply_target);
-            defer setScheduleToolContext(runtime.tools, null, null, null);
+            setScheduleToolContext(
+                runtime.tools,
+                "max",
+                mx_ptr.account_id,
+                reply_target,
+                if (msg.is_group) .group else .direct,
+                if (msg.is_group) reply_target else msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
             max_mod.setInteractiveOwnerContext(msg.sender);
             defer max_mod.setInteractiveOwnerContext(null);
 

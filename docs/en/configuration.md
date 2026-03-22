@@ -518,6 +518,68 @@ About `account_id`:
 - If `match.account_id` is omitted, the binding can match any Telegram account for that channel.
 - Different account ids are only useful when the same nullclaw instance runs multiple Telegram bot accounts/tokens.
 
+### Web UI / Browser Relay
+
+Use `channels.web` for browser UI / extension traffic over WebSocket (`/ws` by default).
+
+Example:
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "127.0.0.1",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "pairing",
+          "allowed_origins": ["http://localhost:5173"]
+        }
+      }
+    }
+  }
+}
+```
+
+Practical rules:
+
+- Keep `listen = "127.0.0.1"` for the pairing-first local UX.
+- In local transport, unauthenticated WebSocket upgrade is allowed only on loopback. This is what lets a UI connect first and then send `pairing_request`.
+- If you change `listen` to `0.0.0.0` or another non-loopback address, the WebSocket upgrade must already include the channel token:
+  - `ws://host:32123/ws?token=<auth_token>`
+  - or `Authorization: Bearer <auth_token>`
+- For non-loopback bind, do not expect local `pairing_request` to work before the socket is authenticated. The pairing-first flow is loopback-only by design.
+- `message_auth_mode = "pairing"` means each `user_message` must carry the UI `access_token` returned by the pairing flow.
+- `message_auth_mode = "token"` is local-transport only and requires a stable token from config or env. In this mode, the UI sends `auth_token` on each `user_message` instead of a pairing JWT.
+- `auth_token` hardens the WebSocket upgrade and becomes mandatory for non-loopback bind.
+- Use `/ws` for the WebSocket endpoint. `/pair` belongs to the HTTP gateway API, not the web channel WebSocket flow.
+- For headless/LAN access, the safest operator path is still SSH tunnel or reverse proxy in front of a loopback-bound web channel.
+
+Remote/headless example:
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "0.0.0.0",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "token",
+          "allowed_origins": ["https://chat-ui.example.com"]
+        }
+      }
+    }
+  }
+}
+```
+
 Effect on delivery:
 
 - Incoming Telegram updates are handled by the account that received them.

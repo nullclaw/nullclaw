@@ -168,6 +168,39 @@ fn appendOllamaImageValue(
     try buf.append(allocator, '"');
 }
 
+fn appendThinkField(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+) !void {
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse {
+        try buf.appendSlice(allocator, ",\"think\":false");
+        return;
+    };
+    if (std.mem.eql(u8, effort, "none")) {
+        try buf.appendSlice(allocator, ",\"think\":false");
+        return;
+    }
+    try buf.appendSlice(allocator, ",\"think\":");
+    if (ollamaUsesThinkLevels(model)) {
+        try root.appendJsonString(buf, allocator, effort);
+        return;
+    }
+    try buf.appendSlice(allocator, "true");
+}
+
+// GPT-OSS is the documented Ollama exception: it requires string levels rather than booleans.
+fn ollamaUsesThinkLevels(model: []const u8) bool {
+    var lower_buf: [160]u8 = undefined;
+    const lower_len = @min(model.len, lower_buf.len);
+    for (model[0..lower_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..lower_len];
+    return std.mem.indexOf(u8, lower, "gpt-oss") != null;
+}
+
 /// Ollama LLM provider.
 ///
 /// Endpoints:
@@ -223,11 +256,11 @@ pub const OllamaProvider = struct {
     ) ![]const u8 {
         if (system_prompt) |sys| {
             return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"system","content":"{s}"}},{{"role":"user","content":"{s}"}}],"stream":false,"options":{{"temperature":{d:.2}}}}}
+                \\{{"model":"{s}","messages":[{{"role":"system","content":"{s}"}},{{"role":"user","content":"{s}"}}],"stream":false,"think":false,"options":{{"temperature":{d:.2}}}}}
             , .{ model, sys, message, temperature });
         } else {
             return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"stream":false,"options":{{"temperature":{d:.2}}}}}
+                \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"stream":false,"think":false,"options":{{"temperature":{d:.2}}}}}
             , .{ model, message, temperature });
         }
     }
@@ -265,7 +298,7 @@ pub const OllamaProvider = struct {
         }
 
         // Empty response
-        return try allocator.dupe(u8, "");
+        return error.NoResponseContent;
     }
 
     /// Create a Provider interface from this OllamaProvider.
@@ -401,6 +434,7 @@ fn buildChatRequestBody(
     }
 
     try buf.append(allocator, ']');
+    try appendThinkField(&buf, allocator, model, request.reasoning_effort);
 
     if (request.tools) |tools| {
         if (tools.len > 0) {
@@ -444,6 +478,7 @@ test "buildRequestBody with system" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "llama3") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "system") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "temperature") != null);
 }
@@ -464,13 +499,11 @@ test "parseResponse extracts content" {
     try std.testing.expectEqualStrings("Hello from Ollama!", result);
 }
 
-test "parseResponse empty content" {
+test "parseResponse empty content returns NoResponseContent" {
     const body =
         \\{"message":{"role":"assistant","content":""}}
     ;
-    const result = try OllamaProvider.parseResponse(std.testing.allocator, body);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
+    try std.testing.expectError(error.NoResponseContent, OllamaProvider.parseResponse(std.testing.allocator, body));
 }
 
 test "supportsNativeTools returns true" {
@@ -635,6 +668,52 @@ test "ollama buildChatRequestBody includes native tools" {
     try std.testing.expectEqualStrings("web_search", function_obj.get("name").?.string);
     try std.testing.expectEqualStrings("Search the web", function_obj.get("description").?.string);
     try std.testing.expect(function_obj.get("parameters").? == .object);
+}
+
+test "ollama buildChatRequestBody sends think disabled by default" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":false") != null);
+}
+
+test "ollama buildChatRequestBody enables think for standard thinking models" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .model = "qwen3",
+        .reasoning_effort = "high",
+    }, "qwen3", 0.7);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const think = parsed.value.object.get("think").?;
+    try std.testing.expect(think == .bool);
+    try std.testing.expect(think.bool);
+}
+
+test "ollama buildChatRequestBody maps reasoning_effort to think level for gpt-oss" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .model = "gpt-oss:20b",
+        .reasoning_effort = "xhigh",
+    }, "gpt-oss:20b", 0.7);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const think = parsed.value.object.get("think").?;
+    try std.testing.expect(think == .string);
+    try std.testing.expectEqualStrings("high", think.string);
 }
 
 test "extractToolNameAndArgs with nested tool_call wrapper" {
