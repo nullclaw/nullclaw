@@ -93,7 +93,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  workspace <{s}> [ARGS]
     \\  capabilities [--json]
     \\  models <{s}> [ARGS]
-    \\  auth <{s}> <provider> [--import-codex]
+    \\  auth <{s}> <provider> [--device-code|--import-codex]
     \\  update [--check] [--yes]
     \\
 ,
@@ -3560,15 +3560,19 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 
     if (std.mem.eql(u8, subcmd, "login")) {
-        var import_codex = false;
-        for (rest) |arg| {
-            if (std.mem.eql(u8, arg, "--import-codex")) import_codex = true;
-        }
+        const login_mode = parseAuthLoginMode(rest) catch |err| {
+            switch (err) {
+                error.UnknownAuthOption => std.debug.print("Unknown auth login option.\n\n", .{}),
+                error.ConflictingAuthLoginMode => std.debug.print("Choose only one auth login mode.\n\n", .{}),
+            }
+            printAuthUsage();
+            std.process.exit(1);
+        };
 
-        if (import_codex) {
-            runAuthImportCodex(allocator, codex, auth_mod);
-        } else {
-            runAuthDeviceCodeLogin(allocator, codex, auth_mod);
+        switch (login_mode) {
+            .browser => runAuthBrowserLogin(allocator, codex, auth_mod),
+            .device_code => runAuthDeviceCodeLogin(allocator, codex, auth_mod),
+            .import_codex => runAuthImportCodex(allocator, codex, auth_mod),
         }
     } else if (std.mem.eql(u8, subcmd, "status")) {
         if (auth_mod.loadCredential(allocator, codex.CREDENTIAL_KEY) catch null) |token| {
@@ -3614,6 +3618,28 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 }
 
+const AuthLoginMode = enum {
+    browser,
+    device_code,
+    import_codex,
+};
+
+fn parseAuthLoginMode(args: []const []const u8) !AuthLoginMode {
+    var mode: AuthLoginMode = .browser;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--device-code")) {
+            if (mode != .browser) return error.ConflictingAuthLoginMode;
+            mode = .device_code;
+        } else if (std.mem.eql(u8, arg, "--import-codex")) {
+            if (mode != .browser) return error.ConflictingAuthLoginMode;
+            mode = .import_codex;
+        } else {
+            return error.UnknownAuthOption;
+        }
+    }
+    return mode;
+}
+
 // ── Update ─────────────────────────────────────────────────────────
 
 fn runUpdate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -3643,7 +3669,8 @@ fn printAuthUsage() void {
         \\Usage: nullclaw auth <{s}> <provider> [options]
         \\
         \\Commands:
-        \\  login <provider>                    Authenticate via device code flow
+        \\  login <provider>                    Authenticate via browser callback flow
+        \\  login <provider> --device-code      Authenticate via device code flow
         \\  login <provider> --import-codex     Import from Codex CLI (~/.codex/auth.json)
         \\  status <provider>                   Show authentication status
         \\  logout <provider>                   Remove stored credentials
@@ -3653,6 +3680,7 @@ fn printAuthUsage() void {
         \\
         \\Examples:
         \\  nullclaw auth login openai-codex
+        \\  nullclaw auth login openai-codex --device-code
         \\  nullclaw auth login openai-codex --import-codex
         \\  nullclaw auth status openai-codex
         \\  nullclaw auth logout openai-codex
@@ -3660,12 +3688,65 @@ fn printAuthUsage() void {
     , .{AUTH_SUBCOMMANDS}), .{});
 }
 
+fn runAuthBrowserLogin(
+    allocator: std.mem.Allocator,
+    codex: type,
+    auth_mod: type,
+) void {
+    std.debug.print("Starting OpenAI Codex browser authentication...\n\n", .{});
+
+    var session = auth_mod.startBrowserAuthSession(allocator, .{
+        .client_id = codex.OAUTH_CLIENT_ID,
+        .authorize_url = codex.OAUTH_AUTHORIZE_URL,
+        .scope = codex.OAUTH_SCOPE,
+    }) catch {
+        std.debug.print("Failed to start local OAuth callback server.\n", .{});
+        std.debug.print("Alternatives:\n", .{});
+        std.debug.print("  nullclaw auth login openai-codex --device-code\n", .{});
+        std.debug.print("  nullclaw auth login openai-codex --import-codex\n", .{});
+        std.process.exit(1);
+    };
+    defer session.deinit(allocator);
+
+    const browser_opened = tryOpenBrowserUrl(allocator, session.auth_url);
+    if (browser_opened) {
+        std.debug.print("Opened your browser for authentication.\n", .{});
+    } else {
+        std.debug.print("Could not open a browser automatically.\n", .{});
+    }
+
+    std.debug.print("If needed, open this URL manually:\n", .{});
+    std.debug.print("  {s}\n\n", .{session.auth_url});
+    std.debug.print("Waiting for authorization on {s}\n", .{session.redirect_uri});
+
+    const token = session.waitForCallback(
+        allocator,
+        codex.OAUTH_TOKEN_URL,
+        codex.OAUTH_CLIENT_ID,
+        600,
+    ) catch |err| {
+        switch (err) {
+            error.AuthorizationDenied => std.debug.print("Authorization denied.\n", .{}),
+            error.AuthorizationTimeout => std.debug.print("Authorization timed out.\n", .{}),
+            error.AuthorizationCodeExchangeFailed => std.debug.print("Authorization code exchange failed.\n", .{}),
+            else => std.debug.print("Authorization failed: {}\n", .{err}),
+        }
+        std.debug.print("Alternatives:\n", .{});
+        std.debug.print("  nullclaw auth login openai-codex --device-code\n", .{});
+        std.debug.print("  nullclaw auth login openai-codex --import-codex\n", .{});
+        std.process.exit(1);
+    };
+    defer token.deinit(allocator);
+
+    saveAndPrintResult(allocator, codex, auth_mod, token);
+}
+
 fn runAuthDeviceCodeLogin(
     allocator: std.mem.Allocator,
     codex: type,
     auth_mod: type,
 ) void {
-    std.debug.print("Starting OpenAI Codex authentication...\n\n", .{});
+    std.debug.print("Starting OpenAI Codex device-code authentication...\n\n", .{});
 
     const dc = auth_mod.startDeviceCodeFlow(
         allocator,
@@ -3675,6 +3756,7 @@ fn runAuthDeviceCodeLogin(
     ) catch {
         std.debug.print("Failed to start device code flow (likely Cloudflare block).\n", .{});
         std.debug.print("Alternative:\n", .{});
+        std.debug.print("  nullclaw auth login openai-codex                  (browser flow)\n", .{});
         std.debug.print("  nullclaw auth login openai-codex --import-codex   (import from Codex CLI)\n", .{});
         std.process.exit(1);
     };
@@ -3702,6 +3784,29 @@ fn runAuthDeviceCodeLogin(
     defer token.deinit(allocator);
 
     saveAndPrintResult(allocator, codex, auth_mod, token);
+}
+
+fn tryOpenBrowserUrl(allocator: std.mem.Allocator, url: []const u8) bool {
+    if (builtin.is_test) return true;
+
+    const argv: []const []const u8 = switch (builtin.os.tag) {
+        .macos => &.{ "open", url },
+        .linux => &.{ "xdg-open", url },
+        .windows => &.{ "cmd.exe", "/c", "start", "", url },
+        else => return false,
+    };
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return false;
+
+    const term = child.wait() catch return false;
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn runAuthImportCodex(
@@ -3911,7 +4016,26 @@ test "top level usage stays aligned with current subcommand synopses" {
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "history <" ++ HISTORY_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "workspace <" ++ WORKSPACE_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "models <" ++ MODELS_SUBCOMMANDS ++ "> [ARGS]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "auth <" ++ AUTH_SUBCOMMANDS ++ "> <provider> [--import-codex]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "auth <" ++ AUTH_SUBCOMMANDS ++ "> <provider> [--device-code|--import-codex]"));
+}
+
+test "parseAuthLoginMode defaults to browser flow" {
+    try std.testing.expectEqual(AuthLoginMode.browser, try parseAuthLoginMode(&.{}));
+}
+
+test "parseAuthLoginMode accepts explicit device code mode" {
+    try std.testing.expectEqual(AuthLoginMode.device_code, try parseAuthLoginMode(&.{"--device-code"}));
+}
+
+test "parseAuthLoginMode accepts import mode" {
+    try std.testing.expectEqual(AuthLoginMode.import_codex, try parseAuthLoginMode(&.{"--import-codex"}));
+}
+
+test "parseAuthLoginMode rejects conflicting modes" {
+    try std.testing.expectError(
+        error.ConflictingAuthLoginMode,
+        parseAuthLoginMode(&.{ "--device-code", "--import-codex" }),
+    );
 }
 
 test "configureWindowsConsoleUtf8 is safe to call" {

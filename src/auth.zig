@@ -1,7 +1,8 @@
-//! Unified OAuth 2.0 module — PKCE, device code flow, credential store.
+//! Unified OAuth 2.0 module — PKCE, browser auth, device code flow, credential store.
 //!
 //! Provides reusable OAuth primitives for all providers:
 //! - PKCE challenge generation (RFC 7636)
+//! - Authorization code flow with localhost callback
 //! - Token storage with filesystem-based credential store (~/.nullclaw/auth.json)
 //! - Device Authorization Grant flow (RFC 8628)
 
@@ -9,6 +10,7 @@ const std = @import("std");
 const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
+const url_percent = @import("url_percent.zig");
 
 // ── PKCE (RFC 7636) ────────────────────────────────────────────────────
 
@@ -677,6 +679,460 @@ fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) !OAuthToke
     };
 }
 
+// ── Browser Authorization Code Flow ────────────────────────────────────
+
+const MAX_HTTP_REQUEST_BYTES: usize = 8192;
+const CALLBACK_ACCEPT_POLL_MS: u64 = 50;
+const CALLBACK_READ_TIMEOUT_SECS: i64 = 5;
+
+pub const BrowserAuthOptions = struct {
+    client_id: []const u8,
+    authorize_url: []const u8,
+    scope: []const u8,
+    listen_host: []const u8 = "127.0.0.1",
+    redirect_host: []const u8 = "localhost",
+    listen_port: u16 = 0,
+};
+
+pub const BrowserAuthSession = struct {
+    server: std.net.Server,
+    auth_url: []u8,
+    redirect_uri: []u8,
+    state: []u8,
+    pkce: PkceChallenge,
+    listen_port: u16,
+
+    pub fn deinit(self: *BrowserAuthSession, allocator: std.mem.Allocator) void {
+        self.server.deinit();
+        allocator.free(self.auth_url);
+        allocator.free(self.redirect_uri);
+        allocator.free(self.state);
+        self.pkce.deinit(allocator);
+    }
+
+    pub fn waitForCallback(
+        self: *BrowserAuthSession,
+        allocator: std.mem.Allocator,
+        token_url: []const u8,
+        client_id: []const u8,
+        timeout_s: u32,
+    ) !OAuthToken {
+        const deadline_ms = std.time.milliTimestamp() + (@as(i64, timeout_s) * std.time.ms_per_s);
+
+        while (std.time.milliTimestamp() < deadline_ms) {
+            var conn = self.server.accept() catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.Thread.sleep(CALLBACK_ACCEPT_POLL_MS * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return error.CallbackListenFailed,
+            };
+            defer conn.stream.close();
+
+            configureReadTimeout(&conn.stream, CALLBACK_READ_TIMEOUT_SECS);
+
+            var request_buf: [MAX_HTTP_REQUEST_BYTES]u8 = undefined;
+            const request = readHttpRequest(&conn.stream, &request_buf) catch {
+                writeTextResponse(&conn.stream, "400 Bad Request", "Invalid OAuth callback request") catch {};
+                continue;
+            };
+
+            var callback = parseCallbackRequest(allocator, request) catch {
+                writeTextResponse(&conn.stream, "400 Bad Request", "Invalid OAuth callback request") catch {};
+                continue;
+            };
+            defer callback.deinit(allocator);
+
+            if (!std.mem.eql(u8, callback.path, "/auth/callback")) {
+                writeTextResponse(&conn.stream, "404 Not Found", "Not Found") catch {};
+                continue;
+            }
+
+            if (callback.params.state) |state| {
+                if (!std.mem.eql(u8, state, self.state)) {
+                    writeTextResponse(&conn.stream, "400 Bad Request", "OAuth state mismatch") catch {};
+                    continue;
+                }
+            } else {
+                writeTextResponse(&conn.stream, "400 Bad Request", "Missing OAuth state") catch {};
+                continue;
+            }
+
+            if (callback.params.error_code) |_| {
+                writeTextResponse(&conn.stream, "403 Forbidden", "Authorization was denied") catch {};
+                return error.AuthorizationDenied;
+            }
+
+            const code = callback.params.code orelse {
+                writeTextResponse(&conn.stream, "400 Bad Request", "Missing authorization code") catch {};
+                return error.AuthorizationFailed;
+            };
+
+            const token = exchangeAuthorizationCode(
+                allocator,
+                token_url,
+                client_id,
+                self.redirect_uri,
+                self.pkce.verifier,
+                code,
+            ) catch {
+                writeTextResponse(&conn.stream, "502 Bad Gateway", "Failed to exchange authorization code") catch {};
+                return error.AuthorizationCodeExchangeFailed;
+            };
+
+            writeHtmlResponse(&conn.stream, "200 OK", successHtml) catch {};
+            return token;
+        }
+
+        return error.AuthorizationTimeout;
+    }
+};
+
+pub fn startBrowserAuthSession(
+    allocator: std.mem.Allocator,
+    opts: BrowserAuthOptions,
+) !BrowserAuthSession {
+    const pkce = try generatePkce(allocator);
+    errdefer pkce.deinit(allocator);
+
+    const state = try generateStateToken(allocator);
+    errdefer allocator.free(state);
+
+    const addr = try std.net.Address.resolveIp(opts.listen_host, opts.listen_port);
+    var server = try addr.listen(.{
+        .reuse_address = true,
+        .force_nonblocking = true,
+    });
+    errdefer server.deinit();
+
+    const actual_port = server.listen_address.in.getPort();
+    const redirect_uri = try std.fmt.allocPrint(
+        allocator,
+        "http://{s}:{d}/auth/callback",
+        .{ opts.redirect_host, actual_port },
+    );
+    errdefer allocator.free(redirect_uri);
+
+    const auth_url = try buildAuthorizationUrl(
+        allocator,
+        opts.authorize_url,
+        opts.client_id,
+        redirect_uri,
+        opts.scope,
+        pkce.challenge,
+        state,
+    );
+    errdefer allocator.free(auth_url);
+
+    return .{
+        .server = server,
+        .auth_url = auth_url,
+        .redirect_uri = redirect_uri,
+        .state = state,
+        .pkce = pkce,
+        .listen_port = actual_port,
+    };
+}
+
+pub fn exchangeAuthorizationCode(
+    allocator: std.mem.Allocator,
+    token_url: []const u8,
+    client_id: []const u8,
+    redirect_uri: []const u8,
+    code_verifier: []const u8,
+    code: []const u8,
+) !OAuthToken {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const encoded_code = try url_percent.encode(allocator, code);
+    defer allocator.free(encoded_code);
+    const encoded_redirect_uri = try url_percent.encode(allocator, redirect_uri);
+    defer allocator.free(encoded_redirect_uri);
+    const encoded_client_id = try url_percent.encode(allocator, client_id);
+    defer allocator.free(encoded_client_id);
+    const encoded_code_verifier = try url_percent.encode(allocator, code_verifier);
+    defer allocator.free(encoded_code_verifier);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "grant_type=authorization_code&code={s}&redirect_uri={s}&client_id={s}&code_verifier={s}",
+        .{ encoded_code, encoded_redirect_uri, encoded_client_id, encoded_code_verifier },
+    );
+    defer allocator.free(payload);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = token_url },
+        .method = .POST,
+        .payload = payload,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .name = "User-Agent", .value = "nullClaw/1.0" },
+        },
+        .response_writer = &aw.writer,
+    });
+    if (result.status != .ok) return error.AuthorizationCodeExchangeFailed;
+
+    const resp_body = aw.writer.buffer[0..aw.writer.end];
+    return parseTokenResponse(allocator, resp_body) catch error.AuthorizationCodeExchangeFailed;
+}
+
+fn generateStateToken(allocator: std.mem.Allocator) ![]u8 {
+    var random_bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    return base64UrlEncodeAlloc(allocator, &random_bytes);
+}
+
+fn buildAuthorizationUrl(
+    allocator: std.mem.Allocator,
+    authorize_url: []const u8,
+    client_id: []const u8,
+    redirect_uri: []const u8,
+    scope: []const u8,
+    code_challenge: []const u8,
+    state: []const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, authorize_url);
+    try buf.append(allocator, '?');
+
+    var first = true;
+    try appendQueryParam(&buf, allocator, &first, "response_type", "code");
+    try appendQueryParam(&buf, allocator, &first, "client_id", client_id);
+    try appendQueryParam(&buf, allocator, &first, "redirect_uri", redirect_uri);
+    try appendQueryParam(&buf, allocator, &first, "scope", scope);
+    try appendQueryParam(&buf, allocator, &first, "code_challenge", code_challenge);
+    try appendQueryParam(&buf, allocator, &first, "code_challenge_method", "S256");
+    try appendQueryParam(&buf, allocator, &first, "state", state);
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn appendQueryParam(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    first: *bool,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (!first.*) try buf.append(allocator, '&');
+    first.* = false;
+    try buf.appendSlice(allocator, key);
+    try buf.append(allocator, '=');
+    try url_percent.appendPercentEncodedList(buf, allocator, value);
+}
+
+const CallbackRequest = struct {
+    path: []const u8,
+    params: CallbackParams,
+
+    fn deinit(self: *CallbackRequest, allocator: std.mem.Allocator) void {
+        self.params.deinit(allocator);
+    }
+};
+
+const CallbackParams = struct {
+    code: ?[]u8 = null,
+    state: ?[]u8 = null,
+    error_code: ?[]u8 = null,
+    error_description: ?[]u8 = null,
+
+    fn deinit(self: *CallbackParams, allocator: std.mem.Allocator) void {
+        if (self.code) |value| allocator.free(value);
+        if (self.state) |value| allocator.free(value);
+        if (self.error_code) |value| allocator.free(value);
+        if (self.error_description) |value| allocator.free(value);
+    }
+};
+
+fn parseCallbackRequest(allocator: std.mem.Allocator, request: []const u8) !CallbackRequest {
+    const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse return error.InvalidCallbackRequest;
+    const first_line = request[0..first_line_end];
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    const method = parts.next() orelse return error.InvalidCallbackRequest;
+    const target = parts.next() orelse return error.InvalidCallbackRequest;
+    _ = parts.next() orelse return error.InvalidCallbackRequest;
+
+    if (!std.mem.eql(u8, method, "GET")) return error.InvalidCallbackRequest;
+    if (target.len == 0 or target[0] != '/') return error.InvalidCallbackRequest;
+
+    const query_idx = std.mem.indexOfScalar(u8, target, '?');
+    const path = if (query_idx) |idx| target[0..idx] else target;
+    const query = if (query_idx) |idx| target[idx + 1 ..] else "";
+
+    return .{
+        .path = path,
+        .params = try parseCallbackParams(allocator, query),
+    };
+}
+
+fn parseCallbackParams(allocator: std.mem.Allocator, query: []const u8) !CallbackParams {
+    var params = CallbackParams{};
+    errdefer params.deinit(allocator);
+
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        const key = pair[0..eq_idx];
+        const value = if (eq_idx < pair.len) pair[eq_idx + 1 ..] else "";
+        const decoded = try urlDecodeAlloc(allocator, value);
+        errdefer allocator.free(decoded);
+
+        if (std.mem.eql(u8, key, "code")) {
+            if (params.code == null) {
+                params.code = decoded;
+                continue;
+            }
+        } else if (std.mem.eql(u8, key, "state")) {
+            if (params.state == null) {
+                params.state = decoded;
+                continue;
+            }
+        } else if (std.mem.eql(u8, key, "error")) {
+            if (params.error_code == null) {
+                params.error_code = decoded;
+                continue;
+            }
+        } else if (std.mem.eql(u8, key, "error_description")) {
+            if (params.error_description == null) {
+                params.error_description = decoded;
+                continue;
+            }
+        }
+
+        allocator.free(decoded);
+    }
+
+    return params;
+}
+
+fn urlDecodeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+        if (c == '+') {
+            try buf.append(allocator, ' ');
+            i += 1;
+            continue;
+        }
+
+        if (c == '%' and i + 2 < input.len) {
+            const hi = std.fmt.charToDigit(input[i + 1], 16) catch {
+                try buf.append(allocator, c);
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(input[i + 2], 16) catch {
+                try buf.append(allocator, c);
+                i += 1;
+                continue;
+            };
+            try buf.append(allocator, @as(u8, hi * 16 + lo));
+            i += 3;
+            continue;
+        }
+
+        try buf.append(allocator, c);
+        i += 1;
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn parseContentLength(request: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, request, "\r\n");
+    _ = lines.next() orelse return null;
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon_idx = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon_idx], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+        const value = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
+        return std.fmt.parseInt(usize, value, 10) catch null;
+    }
+    return null;
+}
+
+fn readHttpRequest(stream: *std.net.Stream, buf: []u8) ![]const u8 {
+    var used: usize = 0;
+    var expected_total: ?usize = null;
+
+    while (used < buf.len) {
+        const n = stream.read(buf[used..]) catch |err| switch (err) {
+            error.WouldBlock, error.ConnectionTimedOut => return error.CallbackReadFailed,
+            else => return err,
+        };
+        if (n == 0) return error.CallbackReadFailed;
+        used += n;
+
+        if (expected_total == null) {
+            if (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n")) |header_end_idx| {
+                const header_end = header_end_idx + 4;
+                const content_length = parseContentLength(buf[0..header_end]) orelse 0;
+                expected_total = header_end + content_length;
+                if (expected_total.? > buf.len) return error.CallbackRequestTooLarge;
+            }
+        }
+
+        if (expected_total) |total| {
+            if (used >= total) return buf[0..used];
+        }
+    }
+
+    return error.CallbackRequestTooLarge;
+}
+
+fn configureReadTimeout(stream: *std.net.Stream, timeout_s: i64) void {
+    if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
+
+    const timeout = std.posix.timeval{
+        .sec = @intCast(timeout_s),
+        .usec = 0,
+    };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        &std.mem.toBytes(timeout),
+    ) catch {};
+}
+
+fn writeTextResponse(stream: *std.net.Stream, status: []const u8, body: []const u8) !void {
+    try writeHttpResponse(stream, status, "text/plain; charset=utf-8", body);
+}
+
+fn writeHtmlResponse(stream: *std.net.Stream, status: []const u8, body: []const u8) !void {
+    try writeHttpResponse(stream, status, "text/html; charset=utf-8", body);
+}
+
+fn writeHttpResponse(
+    stream: *std.net.Stream,
+    status: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+) !void {
+    var header_buf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{ status, content_type, body.len },
+    );
+    try stream.writeAll(header);
+    try stream.writeAll(body);
+}
+
+const successHtml =
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>nullClaw Login</title></head>" ++
+    "<body><h1>Authentication complete</h1><p>You can close this browser window and return to nullClaw.</p></body></html>";
+
 // ════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════
@@ -860,6 +1316,154 @@ test "parseTokenResponse handles missing refresh_token in response" {
 
     try std.testing.expectEqualStrings("refreshed_access", token.access_token);
     try std.testing.expect(token.refresh_token == null);
+}
+
+test "buildAuthorizationUrl includes required authorization-code parameters" {
+    const url = try buildAuthorizationUrl(
+        std.testing.allocator,
+        "https://auth.example.com/oauth/authorize",
+        "client-123",
+        "http://localhost:1455/auth/callback",
+        "openid profile email offline_access",
+        "challenge-xyz",
+        "state-abc",
+    );
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.indexOf(u8, url, "response_type=code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "client_id=client-123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "scope=openid%20profile%20email%20offline_access") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge=challenge-xyz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "state=state-abc") != null);
+}
+
+test "parseCallbackParams decodes percent-encoded query values" {
+    var params = try parseCallbackParams(
+        std.testing.allocator,
+        "code=abc%20123&state=state-1&error_description=access+denied",
+    );
+    defer params.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("abc 123", params.code.?);
+    try std.testing.expectEqualStrings("state-1", params.state.?);
+    try std.testing.expectEqualStrings("access denied", params.error_description.?);
+}
+
+test "browser auth session exchanges authorization code via localhost callback" {
+    const TestTokenServer = struct {
+        const Ctx = struct {
+            ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+            port: u16 = 0,
+            saw_grant_type: bool = false,
+            saw_code: bool = false,
+            saw_client_id: bool = false,
+            saw_redirect_uri: bool = false,
+            saw_code_verifier: bool = false,
+        };
+
+        fn run(ctx: *Ctx) void {
+            const addr = std.net.Address.resolveIp("127.0.0.1", 0) catch return;
+            var server = addr.listen(.{ .reuse_address = true }) catch return;
+            defer server.deinit();
+
+            ctx.port = server.listen_address.in.getPort();
+            ctx.ready.store(true, .release);
+
+            var conn = server.accept() catch return;
+            defer conn.stream.close();
+
+            configureReadTimeout(&conn.stream, CALLBACK_READ_TIMEOUT_SECS);
+
+            var request_buf: [MAX_HTTP_REQUEST_BYTES]u8 = undefined;
+            const request = readHttpRequest(&conn.stream, &request_buf) catch return;
+
+            ctx.saw_grant_type = std.mem.indexOf(u8, request, "grant_type=authorization_code") != null;
+            ctx.saw_code = std.mem.indexOf(u8, request, "code=browser-code-123") != null;
+            ctx.saw_client_id = std.mem.indexOf(u8, request, "client_id=client-browser") != null;
+            ctx.saw_redirect_uri = std.mem.indexOf(u8, request, "redirect_uri=http%3A%2F%2Flocalhost%3A") != null;
+            ctx.saw_code_verifier = std.mem.indexOf(u8, request, "code_verifier=") != null;
+
+            writeHttpResponse(
+                &conn.stream,
+                "200 OK",
+                "application/json",
+                "{\"access_token\":\"browser-at\",\"refresh_token\":\"browser-rt\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
+            ) catch {};
+        }
+    };
+
+    const CallbackClient = struct {
+        const Ctx = struct {
+            port: u16,
+            state: []const u8,
+        };
+
+        fn run(ctx: *const Ctx) void {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+
+            const addr = std.net.Address.resolveIp("127.0.0.1", ctx.port) catch return;
+            var stream = std.net.tcpConnectToAddress(addr) catch return;
+            defer stream.close();
+
+            var req_buf: [2048]u8 = undefined;
+            const request = std.fmt.bufPrint(
+                &req_buf,
+                "GET /auth/callback?code=browser-code-123&state={s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n",
+                .{ ctx.state, ctx.port },
+            ) catch return;
+            stream.writeAll(request) catch return;
+
+            var resp_buf: [512]u8 = undefined;
+            _ = stream.read(&resp_buf) catch {};
+        }
+    };
+
+    var token_ctx = TestTokenServer.Ctx{};
+    const token_thread = try std.Thread.spawn(.{}, TestTokenServer.run, .{&token_ctx});
+    defer token_thread.join();
+
+    while (!token_ctx.ready.load(.acquire)) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    const token_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/oauth/token",
+        .{token_ctx.port},
+    );
+    defer std.testing.allocator.free(token_url);
+
+    var session = try startBrowserAuthSession(std.testing.allocator, .{
+        .client_id = "client-browser",
+        .authorize_url = "https://auth.example.com/oauth/authorize",
+        .scope = "openid profile email offline_access",
+    });
+    defer session.deinit(std.testing.allocator);
+
+    const callback_ctx = CallbackClient.Ctx{
+        .port = session.listen_port,
+        .state = session.state,
+    };
+    const callback_thread = try std.Thread.spawn(.{}, CallbackClient.run, .{&callback_ctx});
+    defer callback_thread.join();
+
+    const token = try session.waitForCallback(
+        std.testing.allocator,
+        token_url,
+        "client-browser",
+        3,
+    );
+    defer token.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("browser-at", token.access_token);
+    try std.testing.expectEqualStrings("browser-rt", token.refresh_token.?);
+    try std.testing.expect(token_ctx.saw_grant_type);
+    try std.testing.expect(token_ctx.saw_code);
+    try std.testing.expect(token_ctx.saw_client_id);
+    try std.testing.expect(token_ctx.saw_redirect_uri);
+    try std.testing.expect(token_ctx.saw_code_verifier);
 }
 
 test "Allocating writer deinit frees full buffer — no invalid free on sub-slice (issue #42)" {

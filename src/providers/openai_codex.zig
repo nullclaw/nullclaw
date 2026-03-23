@@ -1,7 +1,7 @@
 //! OpenAI Codex provider — connects to ChatGPT subscription API via OAuth tokens.
 //!
 //! Uses the Codex Responses API at chatgpt.com/backend-api/codex/responses,
-//! authenticated via OAuth device code flow (RFC 8628). Users with ChatGPT
+//! authenticated via OAuth browser or device-code login. Users with ChatGPT
 //! Plus/Pro subscriptions can use this without separate API tokens.
 
 const std = @import("std");
@@ -21,6 +21,7 @@ const StreamChatResult = root.StreamChatResult;
 
 pub const CODEX_API_URL = "https://chatgpt.com/backend-api/codex/responses";
 pub const OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
 pub const OAUTH_DEVICE_URL = "https://auth.openai.com/oauth/device/code";
 pub const OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
 pub const OAUTH_SCOPE = "openid profile email offline_access";

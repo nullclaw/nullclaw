@@ -74,7 +74,8 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw doctor` | Run diagnostics |
 | `nullclaw update --check` | Check for updates without installing |
 | `nullclaw update --yes` | Install updates without prompting |
-| `nullclaw auth login openai-codex` | Authenticate `openai-codex` via OAuth device flow |
+| `nullclaw auth login openai-codex` | Authenticate `openai-codex` via browser-based OAuth flow |
+| `nullclaw auth login openai-codex --device-code` | Authenticate `openai-codex` via OAuth device flow |
 | `nullclaw auth login openai-codex --import-codex` | Import auth from `~/.codex/auth.json` |
 | `nullclaw auth status openai-codex` | Show authentication state |
 | `nullclaw auth logout openai-codex` | Remove stored credentials |

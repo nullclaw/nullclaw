@@ -226,6 +226,7 @@ fn printProviderNextSteps(
 
     if (std.mem.eql(u8, canonical, "openai-codex")) {
         try out.writeAll("    1. Authenticate:  nullclaw auth login openai-codex\n");
+        try out.writeAll("       Headless:      nullclaw auth login openai-codex --device-code\n");
         try out.writeAll("       Alternative:   nullclaw auth login openai-codex --import-codex\n");
         try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
         try out.writeAll("       Then type:         Hello!\n");

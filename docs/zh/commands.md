@@ -60,7 +60,8 @@
 | `nullclaw doctor` | 执行系统诊断 |
 | `nullclaw update --check` | 仅检查是否有更新 |
 | `nullclaw update --yes` | 自动确认并安装更新 |
-| `nullclaw auth login openai-codex` | 为 `openai-codex` 做 OAuth 登录 |
+| `nullclaw auth login openai-codex` | 通过浏览器回调为 `openai-codex` 做 OAuth 登录 |
+| `nullclaw auth login openai-codex --device-code` | 通过设备码为 `openai-codex` 做 OAuth 登录 |
 | `nullclaw auth login openai-codex --import-codex` | 从 `~/.codex/auth.json` 导入登录态 |
 | `nullclaw auth status openai-codex` | 查看认证状态 |
 | `nullclaw auth logout openai-codex` | 删除本地认证信息 |
