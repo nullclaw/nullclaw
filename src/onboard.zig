@@ -912,7 +912,7 @@ pub fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
 // ── Quick setup ──────────────────────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config.
-pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, model: ?[]const u8, memory_backend: ?[]const u8) !void {
+pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, model: ?[]const u8, memory_backend: ?[]const u8, user_name: ?[]const u8, agent_name: ?[]const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
@@ -924,25 +924,23 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     defer cfg.deinit();
     try ensureSecretsEncryptionEnabled(&cfg);
 
-    // Apply overrides
-    var provider_overridden = false;
-    var custom_base_url: ?[]const u8 = null;
+    // Only Anthropic is supported as a provider
     if (provider) |p| {
-        const info = resolveProviderForQuickSetup(p) orelse return error.UnknownProvider;
-        cfg.default_provider = try cfg.allocator.dupe(u8, info.key);
-        provider_overridden = true;
-        // Extract base_url for custom provider
-        if (std.mem.startsWith(u8, info.key, "custom:")) {
-            custom_base_url = info.key["custom:".len..];
+        const canonical = canonicalProviderName(p);
+        if (!std.mem.eql(u8, canonical, "anthropic")) {
+            try stdout.writeAll("  Error: Only Anthropic is supported as a provider.\n");
+            try stdout.writeAll("  Run again without --provider or use --provider anthropic.\n\n");
+            try stdout.flush();
+            return error.OnlyAnthropicSupported;
         }
     }
+    cfg.default_provider = "anthropic";
     if (api_key) |key| {
         // Store in providers section for the default provider (arena frees old values)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
         entries[0] = .{
             .name = try cfg.allocator.dupe(u8, cfg.default_provider),
             .api_key = try cfg.allocator.dupe(u8, key),
-            .base_url = custom_base_url,
         };
         cfg.providers = entries;
     }
@@ -955,10 +953,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
 
     // Set default model based on provider
     if (model) |m| {
-        // Use the explicitly provided model
         cfg.default_model = try cfg.allocator.dupe(u8, m);
-    } else if (provider_overridden) {
-        cfg.default_model = defaultModelForProvider(cfg.default_provider);
     } else if (cfg.default_model == null or std.mem.eql(u8, cfg.default_model.?, "anthropic/claude-sonnet-4")) {
         cfg.default_model = defaultModelForProvider(cfg.default_provider);
     }
@@ -975,8 +970,20 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         else => return err,
     };
 
+    // Store names in config
+    if (user_name) |name| {
+        cfg.user_name = try cfg.allocator.dupe(u8, name);
+    }
+    if (agent_name) |name| {
+        cfg.agent_name = try cfg.allocator.dupe(u8, name);
+    }
+
     // Scaffold workspace files
-    try scaffoldWorkspaceForConfig(allocator, &cfg, &ProjectContext{});
+    const ctx = ProjectContext{
+        .user_name = cfg.user_name orelse "User",
+        .agent_name = cfg.agent_name orelse "krustyklaw",
+    };
+    try scaffoldWorkspaceForConfig(allocator, &cfg, &ctx);
 
     // Save config so subsequent commands can find it
     try cfg.save();
@@ -1934,56 +1941,20 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     defer cfg.deinit();
     try ensureSecretsEncryptionEnabled(&cfg);
 
-    // ── Step 1: Provider selection ──
-    try out.writeAll("  Step 1/8: Select a provider\n");
+    // ── Step 1: Provider (Anthropic only) ──
+    var provider_idx: usize = 0;
+    try out.writeAll("  Step 1/8: Provider\n");
+    try out.writeAll("  -> Anthropic (Claude)\n\n");
+    cfg.default_provider = "anthropic";
+    // Find anthropic index in known_providers
     for (known_providers, 0..) |p, i| {
-        try out.print("    [{d}] {s}\n", .{ i + 1, p.label });
-    }
-    try out.print("    [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
-    try out.writeAll("  Choice [1]: ");
-    const provider_idx = promptChoice(out, &input_buf, known_providers.len + 1, 0) orelse {
-        try out.writeAll("\n  Aborted.\n");
-        try out.flush();
-        return;
-    };
-
-    if (provider_idx < known_providers.len) {
-        const provider = known_providers[provider_idx];
-        cfg.default_provider = provider.key;
-        try out.print("  -> {s}\n\n", .{provider.label});
-    } else {
-        // Custom provider - prompt for URL
-        var custom_url_buf: [512]u8 = undefined;
-        try out.writeAll("\n  Custom provider configuration:\n");
-        try out.writeAll("  Enter OpenAI-compatible endpoint URL (e.g., https://api.example.com/v1): ");
-        const custom_url = prompt(out, &custom_url_buf, "", "") orelse {
-            try out.writeAll("\n  Aborted.\n");
-            try out.flush();
-            return;
-        };
-        if (custom_url.len == 0) {
-            try out.writeAll("\n  Error: Custom provider URL cannot be empty\n");
-            try out.flush();
-            return;
+        if (std.mem.eql(u8, p.key, "anthropic")) {
+            provider_idx = i;
+            break;
         }
-        if (!isValidCustomProviderUrl(custom_url)) {
-            try out.writeAll("\n  Error: endpoint must be http(s) and include a version segment like /v1\n");
-            try out.flush();
-            return;
-        }
-        const custom_provider_key = try std.fmt.allocPrint(cfg.allocator, "custom:{s}", .{custom_url});
-        cfg.default_provider = custom_provider_key;
-
-        // Add to providers section with base_url
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .base_url = try cfg.allocator.dupe(u8, custom_url) };
-        cfg.providers = entries;
-
-        try out.print("  -> Custom: {s}\n\n", .{custom_url});
     }
 
-    const is_azure_provider = provider_idx < known_providers.len and
-        std.mem.eql(u8, known_providers[provider_idx].key, "azure");
+    const is_azure_provider = false;
 
     var provider_base_url: ?[]const u8 = null;
     if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
@@ -2481,6 +2452,24 @@ pub fn scaffoldWorkspace(
 
     const had_legacy_user_content = try hasLegacyUserContentIndicators(allocator, workspace_dir);
 
+    // Compute templates for IDENTITY.md and USER.md (needed for legacy detection).
+    const identity_tmpl = try identityTemplate(allocator, ctx);
+    defer allocator.free(identity_tmpl);
+    const user_tmpl = try userTemplate(allocator, ctx);
+    defer allocator.free(user_tmpl);
+
+    // If user already provided names during setup, skip BOOTSTRAP.md entirely —
+    // the identity discovery conversation is unnecessary.
+    const names_provided = !std.mem.eql(u8, ctx.user_name, "User") or
+        !std.mem.eql(u8, ctx.agent_name, "krustyklaw");
+    if (names_provided) {
+        try skipBootstrap(allocator, workspace_dir, bootstrap_provider);
+    } else {
+        // BOOTSTRAP.md lifecycle must run BEFORE overwriting IDENTITY.md/USER.md,
+        // because it detects legacy workspaces by comparing file content to templates.
+        try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content, bootstrap_provider);
+    }
+
     // SOUL.md (personality traits — loaded by prompt.zig)
     const soul_tmpl = try soulTemplate(allocator, ctx);
     defer allocator.free(soul_tmpl);
@@ -2496,21 +2485,15 @@ pub fn scaffoldWorkspace(
     try storeOrWriteIfMissing(allocator, workspace_dir, "CONFIG.md", configTemplate(), bootstrap_provider);
 
     // IDENTITY.md (identity config — loaded by prompt.zig)
-    const identity_tmpl = try identityTemplate(allocator, ctx);
-    defer allocator.free(identity_tmpl);
-    try storeOrWriteIfMissing(allocator, workspace_dir, "IDENTITY.md", identity_tmpl, bootstrap_provider);
+    // Always overwrite: contains agent name from config.
+    try storeOrOverwrite(allocator, workspace_dir, "IDENTITY.md", identity_tmpl, bootstrap_provider);
 
     // USER.md (user profile — loaded by prompt.zig)
-    const user_tmpl = try userTemplate(allocator, ctx);
-    defer allocator.free(user_tmpl);
-    try storeOrWriteIfMissing(allocator, workspace_dir, "USER.md", user_tmpl, bootstrap_provider);
+    // Always overwrite: contains user name from config.
+    try storeOrOverwrite(allocator, workspace_dir, "USER.md", user_tmpl, bootstrap_provider);
 
     // HEARTBEAT.md (periodic tasks — loaded by prompt.zig)
     try storeOrWriteIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate(), bootstrap_provider);
-
-    // BOOTSTRAP.md lifecycle:
-    // one-shot onboarding instructions with persisted state marker.
-    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content, bootstrap_provider);
 }
 
 pub const ResetWorkspacePromptFilesOptions = struct {
@@ -2673,6 +2656,48 @@ fn storeOrWriteIfMissing(
         return;
     }
     try writeIfMissing(allocator, dir, filename, content);
+}
+
+/// Always overwrite — used for files that contain user-specific data (names).
+fn storeOrOverwrite(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    filename: []const u8,
+    content: []const u8,
+    bp: ?bootstrap_mod.BootstrapProvider,
+) !void {
+    if (bp) |provider| {
+        try provider.store(filename, content);
+        return;
+    }
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
+    defer allocator.free(path);
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(content);
+}
+
+/// Skip BOOTSTRAP.md entirely — names were provided during setup so identity
+/// discovery is unnecessary. Delete BOOTSTRAP.md if it exists, mark onboarding complete.
+fn skipBootstrap(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    bp: ?bootstrap_mod.BootstrapProvider,
+) !void {
+    // Delete BOOTSTRAP.md if it exists (file-based only; memory-backed providers
+    // don't expose a delete method, but won't have created it either).
+    _ = bp;
+    const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
+    defer allocator.free(bootstrap_path);
+    std.fs.deleteFileAbsolute(bootstrap_path) catch {};
+
+    // Mark onboarding as completed
+    var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
+    defer state.deinit(allocator);
+    if (state.onboarding_completed_at == null) {
+        try markOnboardingCompletedAt(allocator, &state);
+        try writeWorkspaceOnboardingState(allocator, workspace_dir, &state);
+    }
 }
 
 fn ensureBootstrapLifecycle(
@@ -2976,13 +3001,30 @@ fn configTemplate() []const u8 {
 }
 
 fn identityTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    _ = ctx;
-    return allocator.dupe(u8, WORKSPACE_IDENTITY_TEMPLATE);
+    return std.fmt.allocPrint(allocator,
+        \\# IDENTITY.md - Who Am I?
+        \\
+        \\- **Name:** {s}
+        \\- **Creature:** AI assistant
+        \\- **Vibe:** {s}
+        \\- **Emoji:** _(pick one that feels right)_
+        \\- **Avatar:** _(workspace-relative path, http(s) URL, or data URI)_
+        \\
+    , .{ ctx.agent_name, ctx.communication_style });
 }
 
 fn userTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
-    _ = ctx;
-    return allocator.dupe(u8, WORKSPACE_USER_TEMPLATE);
+    return std.fmt.allocPrint(allocator,
+        \\# USER.md - About Your Human
+        \\
+        \\- **Name:** {s}
+        \\- **Timezone:** {s}
+        \\
+        \\## Context
+        \\
+        \\_(What do they care about? What projects are they working on? Build this over time.)_
+        \\
+    , .{ ctx.user_name, ctx.timezone });
 }
 
 fn heartbeatTemplate() []const u8 {
@@ -4079,7 +4121,7 @@ test "identityTemplate contains agent name" {
     const tmpl = try identityTemplate(std.testing.allocator, &ProjectContext{ .agent_name = "TestBot" });
     defer std.testing.allocator.free(tmpl);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "IDENTITY.md - Who Am I?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "**Name:**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "**Name:** TestBot") != null);
 }
 
 test "userTemplate contains user info" {
@@ -4087,7 +4129,8 @@ test "userTemplate contains user info" {
     const tmpl = try userTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(tmpl);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "USER.md - About Your Human") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "Learn about the person you're helping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "**Name:** Alice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "**Timezone:** PST") != null);
 }
 
 test "heartbeatTemplate is non-empty" {

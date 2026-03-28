@@ -393,34 +393,20 @@ input:focus, select:focus { border-color: var(--accent); }
     </div>
 
     <div class="wizard-card">
-      <!-- Step 0: Provider -->
+      <!-- Step 0: Names -->
       <div class="wizard-step active" id="step-0">
-        <div class="step-title">Choose your AI provider</div>
-        <div class="step-desc">Select who powers your assistant. OpenRouter is a great first choice — it gives you access to many models with one API key.</div>
+        <div class="step-title" id="step-0-title">Welcome! Let's get to know each other</div>
+        <div class="step-desc" id="step-0-desc">Tell us your name and choose a name for your AI assistant.</div>
         <div id="wizard-error" class="error-msg"></div>
-        <div class="provider-grid">
-          <div class="provider-card selected" data-provider="openrouter" onclick="selectProvider(this)">
-            <div class="p-name">OpenRouter</div>
-            <div class="p-desc">50+ models, one key</div>
-          </div>
-          <div class="provider-card" data-provider="anthropic" onclick="selectProvider(this)">
-            <div class="p-name">Anthropic</div>
-            <div class="p-desc">Claude models direct</div>
-          </div>
-          <div class="provider-card" data-provider="openai" onclick="selectProvider(this)">
-            <div class="p-name">OpenAI</div>
-            <div class="p-desc">GPT models direct</div>
-          </div>
-          <div class="provider-card" data-provider="ollama" onclick="selectProvider(this)">
-            <div class="p-name">Ollama</div>
-            <div class="p-desc">Local AI, no key needed</div>
-          </div>
+        <div class="field-group">
+          <label class="field-label">Your Name</label>
+          <input type="text" id="user-name-input" placeholder="Enter your name" autocomplete="off">
         </div>
-        <div class="provider-other">
-          Other provider? <a onclick="showAllProviders()">Show all options →</a>
+        <div class="field-group">
+          <label class="field-label">Agent Name</label>
+          <input type="text" id="agent-name-input" placeholder="Give your AI assistant a name" autocomplete="off">
         </div>
-        <div id="all-providers-wrap" style="margin-top:12px;display:none;">
-          <label class="field-label">Provider</label>
+        <div id="all-providers-wrap" style="display:none;">
           <select id="provider-select"></select>
         </div>
         <div class="wizard-actions" style="margin-top:20px;">
@@ -430,20 +416,16 @@ input:focus, select:focus { border-color: var(--accent); }
 
       <!-- Step 1: API Key -->
       <div class="wizard-step" id="step-1">
-        <div class="step-title" id="apikey-title">Enter your API key</div>
-        <div class="step-desc" id="apikey-desc">Your API key is stored locally and never sent anywhere except directly to your chosen provider.</div>
+        <div class="step-title" id="apikey-title">Enter your Anthropic API key</div>
+        <div class="step-desc" id="apikey-desc">Your API key is stored locally and never sent anywhere except directly to Anthropic.</div>
         <div id="wizard-error-1" class="error-msg"></div>
         <div class="field-group" id="apikey-field">
           <label class="field-label">API Key</label>
           <input type="password" id="api-key-input" placeholder="Paste your API key here" autocomplete="off">
-          <div class="field-hint" id="apikey-hint">Get your key from the provider's dashboard.</div>
-        </div>
-        <div class="field-group">
-          <label class="field-label">Model <span style="color:var(--text2);font-weight:400;text-transform:none">(optional)</span></label>
-          <input type="text" id="model-input" placeholder="Leave blank to use the default model">
+          <div class="field-hint" id="apikey-hint">Get your key at console.anthropic.com</div>
         </div>
         <div class="wizard-actions">
-          <button class="btn btn-secondary" onclick="goStep(0)">← Back</button>
+          <button class="btn btn-secondary" id="back-btn" onclick="goStep(0)">← Back</button>
           <button class="btn btn-primary" id="setup-btn" onclick="doSetup()">Set Up →</button>
         </div>
       </div>
@@ -453,7 +435,7 @@ input:focus, select:focus { border-color: var(--accent); }
         <div style="text-align:center;padding:16px 0;">
           <div style="font-size:48px;margin-bottom:16px;">✓</div>
           <div class="step-title" style="font-size:22px;">You're all set!</div>
-          <div class="step-desc" style="margin-top:8px;">KrustyKlaw is configured and ready to go.</div>
+          <div class="step-desc" style="margin-top:8px;" id="done-desc">KrustyKlaw is configured and ready to go.</div>
           <button class="btn btn-primary" style="margin-top:24px;max-width:220px;margin-left:auto;margin-right:auto;" onclick="startChat()">Start Chatting →</button>
         </div>
       </div>
@@ -464,7 +446,7 @@ input:focus, select:focus { border-color: var(--accent); }
 <!-- ── Chat Interface ── -->
 <div id="chat" class="screen">
   <div class="chat-header">
-    <span class="chat-logo">KrustyKlaw</span>
+    <span class="chat-logo" id="chat-agent-name">KrustyKlaw</span>
     <span class="chat-model" id="chat-model-label"></span>
     <button class="chat-btn" onclick="newConversation()">New chat</button>
     <button class="chat-btn" onclick="goToSetup()">Settings</button>
@@ -473,13 +455,13 @@ input:focus, select:focus { border-color: var(--accent); }
   <div id="messages">
     <div class="welcome-msg" id="welcome-msg">
       <div class="big">Hello 👋</div>
-      <div class="sub">I'm KrustyKlaw, your AI assistant. Ask me anything — I can help with code, writing, research, analysis, and more.</div>
+      <div class="sub" id="welcome-sub">I'm KrustyKlaw, your AI assistant. Ask me anything — I can help with code, writing, research, analysis, and more.</div>
     </div>
   </div>
 
   <div class="chat-footer">
     <div class="input-row">
-      <textarea id="chat-input" rows="1" placeholder="Message KrustyKlaw…" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <textarea id="chat-input" rows="1" placeholder="Message KrustyKlaw…" onkeydown="handleKey(event)" oninput="autoResize(this)" data-default-placeholder="Message KrustyKlaw…"></textarea>
       <button class="send-btn" id="send-btn" onclick="sendMessage()" title="Send (Enter)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
@@ -494,28 +476,33 @@ input:focus, select:focus { border-color: var(--accent); }
 <script>
 // ── State ──
 let currentStep = 0;
-let selectedProvider = 'openrouter';
+let selectedProvider = 'anthropic';
+let isFirstTime = false;
 let history = [];  // [{role:'user'|'assistant', content:'...'}]
 let isLoading = false;
 let providersList = [];
 
 // ── Init ──
 async function init() {
+  selectedProvider = 'anthropic';
   try {
     const r = await fetch('/api/status');
     const data = await r.json();
     if (data.configured) {
+      // Pre-fill from existing config
+      if (data.user_name) document.getElementById('user-name-input').value = data.user_name;
+      if (data.agent_name) document.getElementById('agent-name-input').value = data.agent_name;
+      if (data.agent_name) updateAgentNameUI(data.agent_name);
       const model = data.model || data.provider || '';
       document.getElementById('chat-model-label').textContent = model;
-      showScreen('chat');
     } else {
-      await loadProviders();
-      showScreen('setup');
+      isFirstTime = true;
     }
   } catch(e) {
-    await loadProviders();
-    showScreen('setup');
+    isFirstTime = true;
   }
+  // Always start on setup — names and API key first
+  showScreen('setup');
 }
 
 async function loadProviders() {
@@ -555,6 +542,25 @@ function showAllProviders() {
 function goStep(n) {
   document.getElementById('wizard-error').style.display = 'none';
   document.getElementById('wizard-error-1').style.display = 'none';
+
+  // Validate names before advancing from step 0
+  if (currentStep === 0 && n === 1) {
+    const userName = document.getElementById('user-name-input').value.trim();
+    const agentName = document.getElementById('agent-name-input').value.trim();
+    if (!userName) {
+      const err = document.getElementById('wizard-error');
+      err.textContent = 'Please enter your name.';
+      err.style.display = 'block';
+      return;
+    }
+    if (!agentName) {
+      const err = document.getElementById('wizard-error');
+      err.textContent = 'Please enter a name for your agent.';
+      err.style.display = 'block';
+      return;
+    }
+  }
+
   document.querySelectorAll('.wizard-step').forEach(s => s.classList.remove('active'));
   document.querySelectorAll('.dot').forEach((d,i) => {
     d.classList.remove('active','done');
@@ -576,7 +582,7 @@ function getEffectiveProvider() {
 }
 
 function updateApiKeyStep() {
-  const p = getEffectiveProvider();
+  const p = 'anthropic';
   const noKey = ['ollama','lm-studio','lmstudio','claude-cli','codex-cli','gemini-cli','openai-codex'];
   const needsKey = !noKey.includes(p);
   const field = document.getElementById('apikey-field');
@@ -584,7 +590,12 @@ function updateApiKeyStep() {
   const desc = document.getElementById('apikey-desc');
   const input = document.getElementById('api-key-input');
 
-  if (!needsKey) {
+  if (isFirstTime) {
+    field.style.display = 'block';
+    title.textContent = 'Enter your Anthropic API key';
+    desc.textContent = 'Your key is stored locally and sent only to Anthropic. You can add other providers later.';
+    document.getElementById('apikey-hint').textContent = 'Get your key at console.anthropic.com';
+  } else if (!needsKey) {
     field.style.display = 'none';
     title.textContent = 'Configure ' + p;
     desc.textContent = 'No API key needed for ' + p + '. Click Set Up to continue.';
@@ -608,13 +619,10 @@ function updateApiKeyStep() {
 async function doSetup() {
   const btn = document.getElementById('setup-btn');
   const errEl = document.getElementById('wizard-error-1');
-  const p = getEffectiveProvider();
-  const noKey = ['ollama','lm-studio','lmstudio','claude-cli','codex-cli','gemini-cli','openai-codex'];
   const apiKey = document.getElementById('api-key-input').value.trim();
-  const model = document.getElementById('model-input').value.trim();
 
-  if (!noKey.includes(p) && !apiKey) {
-    errEl.textContent = 'Please enter your API key.';
+  if (!apiKey) {
+    errEl.textContent = 'Please enter your Anthropic API key.';
     errEl.style.display = 'block';
     return;
   }
@@ -623,10 +631,13 @@ async function doSetup() {
   btn.textContent = 'Setting up…';
   errEl.style.display = 'none';
 
+  const userName = document.getElementById('user-name-input').value.trim();
+  const agentName = document.getElementById('agent-name-input').value.trim();
+
   try {
-    const body = { provider: p };
-    if (apiKey) body.api_key = apiKey;
-    if (model) body.model = model;
+    const body = { provider: 'anthropic', api_key: apiKey };
+    if (userName) body.user_name = userName;
+    if (agentName) body.agent_name = agentName;
 
     const r = await fetch('/api/setup', {
       method: 'POST',
@@ -638,7 +649,10 @@ async function doSetup() {
       errEl.textContent = data.error;
       errEl.style.display = 'block';
     } else {
-      goStep(2);
+      // Update chat UI with agent name and go straight to chat
+      const displayName = agentName || 'KrustyKlaw';
+      updateAgentNameUI(displayName);
+      startChat();
     }
   } catch(e) {
     errEl.textContent = 'Setup failed: ' + e.message;
@@ -649,6 +663,16 @@ async function doSetup() {
   }
 }
 
+function updateAgentNameUI(name) {
+  document.title = name + ' — KrustyKlaw';
+  const logo = document.getElementById('chat-agent-name');
+  if (logo) logo.textContent = name;
+  const sub = document.getElementById('welcome-sub');
+  if (sub) sub.textContent = "I'm " + name + ", your AI assistant. Ask me anything — I can help with code, writing, research, analysis, and more.";
+  const input = document.getElementById('chat-input');
+  if (input) input.placeholder = 'Message ' + name + '…';
+}
+
 function startChat() {
   history = [];
   showScreen('chat');
@@ -656,9 +680,10 @@ function startChat() {
 }
 
 function goToSetup() {
+  document.getElementById('step-0-title').textContent = 'Update your settings';
+  document.getElementById('step-0-desc').textContent = 'Update your name or agent name, then re-enter your Anthropic API key.';
   showScreen('setup');
   goStep(0);
-  loadProviders();
 }
 
 // ── Chat ──

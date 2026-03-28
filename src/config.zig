@@ -147,8 +147,10 @@ pub const Config = struct {
     workspace_dir_override: ?[]const u8 = null, // User-specified workspace path (if set, overrides default)
     providers: []const ProviderEntry = &.{},
     audio_media: AudioMediaConfig = .{},
-    default_provider: []const u8 = "openrouter",
+    default_provider: []const u8 = "anthropic",
     default_model: ?[]const u8 = null,
+    user_name: ?[]const u8 = null,
+    agent_name: ?[]const u8 = null,
     legacy_default_provider_detected: bool = false,
     legacy_default_model_detected: bool = false,
     default_temperature: f64 = 0.7,
@@ -864,6 +866,16 @@ pub const Config = struct {
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
+        }
+        if (self.user_name) |name| {
+            try w.print("  \"user_name\": ", .{});
+            try writePrettyJsonInline(self.allocator, w, name, "");
+            try w.print(",\n", .{});
+        }
+        if (self.agent_name) |name| {
+            try w.print("  \"agent_name\": ", .{});
+            try writePrettyJsonInline(self.allocator, w, name, "");
+            try w.print(",\n", .{});
         }
 
         // models.providers
@@ -3450,7 +3462,7 @@ test "json parse empty object uses defaults" {
     const json = "{}";
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
+    try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expectEqual(@as(f64, 0.7), cfg.default_temperature);
     try std.testing.expect(cfg.secrets.encrypt);
 }
@@ -4279,7 +4291,7 @@ test "applyEnvOverrides does not crash on default config" {
     // Should not crash even when no KRUSTYKLAW_* env vars are set
     cfg.applyEnvOverrides();
     // Default values should remain intact
-    try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
+    try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
     try std.testing.expect(cfg.default_model == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
 }

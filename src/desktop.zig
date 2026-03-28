@@ -51,7 +51,10 @@ fn extractHeader(raw: []const u8, name: []const u8) ?[]const u8 {
     var pos: usize = 0;
     // Skip request line
     while (pos + 1 < raw.len) {
-        if (raw[pos] == '\r' and raw[pos + 1] == '\n') { pos += 2; break; }
+        if (raw[pos] == '\r' and raw[pos + 1] == '\n') {
+            pos += 2;
+            break;
+        }
         pos += 1;
     }
     while (pos < raw.len) {
@@ -143,18 +146,26 @@ fn appendJsonString(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 
 fn handleStatus(allocator: std.mem.Allocator) ![]u8 {
     var cfg = Config.load(allocator) catch {
-        return allocator.dupe(u8, "{\"configured\":false}");
+        return allocator.dupe(u8, "{\"configured\":false,\"first_time\":true}");
     };
     defer cfg.deinit();
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    try out.appendSlice(allocator, "{\"configured\":true,\"provider\":");
+    try out.appendSlice(allocator, "{\"configured\":true,\"first_time\":false,\"provider\":");
     try appendJsonString(&out, allocator, cfg.default_provider);
     if (cfg.default_model) |m| {
         try out.appendSlice(allocator, ",\"model\":");
         try appendJsonString(&out, allocator, m);
+    }
+    if (cfg.agent_name) |name| {
+        try out.appendSlice(allocator, ",\"agent_name\":");
+        try appendJsonString(&out, allocator, name);
+    }
+    if (cfg.user_name) |name| {
+        try out.appendSlice(allocator, ",\"user_name\":");
+        try appendJsonString(&out, allocator, name);
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
@@ -193,9 +204,11 @@ fn handleProviders(allocator: std.mem.Allocator) ![]u8 {
 
 fn handleSetup(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     const SetupReq = struct {
-        provider: []const u8 = "openrouter",
+        provider: []const u8 = "anthropic",
         api_key: ?[]const u8 = null,
         model: ?[]const u8 = null,
+        user_name: ?[]const u8 = null,
+        agent_name: ?[]const u8 = null,
     };
     const parsed = std.json.parseFromSlice(SetupReq, allocator, body, .{
         .ignore_unknown_fields = true,
@@ -205,7 +218,7 @@ fn handleSetup(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     defer parsed.deinit();
     const req = parsed.value;
 
-    onboard.runQuickSetup(allocator, req.api_key, req.provider, req.model, null) catch |err| {
+    onboard.runQuickSetup(allocator, req.api_key, req.provider, req.model, null, req.user_name, req.agent_name) catch |err| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
         try out.appendSlice(allocator, "{\"error\":");
@@ -274,7 +287,10 @@ fn runAgentTurn(
         bootstrap_mod.createProvider(allocator, cfg.memory.backend, mem_opt, cfg.workspace_dir) catch null;
     defer if (bootstrap_provider) |bp| bp.deinit();
 
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{}, bootstrap_provider);
+    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{
+        .user_name = cfg.user_name orelse "User",
+        .agent_name = cfg.agent_name orelse "krustyklaw",
+    }, bootstrap_provider);
 
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .http_enabled = cfg.http_request.enabled,

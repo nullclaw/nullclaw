@@ -2292,9 +2292,14 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             },
             else => return err,
         },
-        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.model, parsed.memory_backend) catch |err| switch (err) {
+        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.model, parsed.memory_backend, null, null) catch |err| switch (err) {
             error.InsecurePlaintextSecrets => {
                 yc.config.Config.printValidationError(error.InsecurePlaintextSecrets);
+                std.process.exit(1);
+            },
+            error.OnlyAnthropicSupported => {
+                std.debug.print("Only Anthropic is supported as a provider.\n", .{});
+                std.debug.print("Run again without --provider or use --provider anthropic.\n", .{});
                 std.process.exit(1);
             },
             error.UnknownProvider => {

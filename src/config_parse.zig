@@ -709,6 +709,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    if (root.get("user_name")) |v| {
+        if (v == .string) self.user_name = try self.allocator.dupe(u8, v.string);
+    }
+    if (root.get("agent_name")) |v| {
+        if (v == .string) self.agent_name = try self.allocator.dupe(u8, v.string);
+    }
+
     // Model routes
     if (root.get("model_routes")) |v| {
         if (v == .array) {
