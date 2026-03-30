@@ -265,3 +265,51 @@ brew uninstall nullclaw
 - [Configuration](./configuration.md)
 - [Usage and Operations](./usage.md)
 - [Commands](./commands.md)
+
+## Docker Troubleshooting
+
+### AccessDenied Error During Onboarding
+
+If you encounter `error: AccessDenied` when running Docker compose onboarding:
+
+```bash
+docker compose --profile agent run --rm agent onboard --interactive
+# Error at step 8: AccessDenied
+```
+
+**Cause:** The default workspace path `/nullclaw-data/.nullclaw/workspace` may have permission issues with the Docker volume mount.
+
+**Solution 1: Use a custom workspace path**
+
+When prompted at step 8, enter a simpler path:
+
+```
+Step 8/8: Workspace path [/nullclaw-data/.nullclaw/workspace]: /tmp/nullclaw-workspace
+```
+
+**Solution 2: Fix volume permissions**
+
+Ensure the Docker volume is properly mounted in `docker-compose.yml`:
+
+```yaml
+volumes:
+  - nullclaw-data:/nullclaw-data
+```
+
+Then recreate the volume:
+
+```bash
+docker compose down -v
+docker compose --profile agent run --rm agent onboard --interactive
+```
+
+**Solution 3: Run with explicit volume mount**
+
+```bash
+docker run --rm -it \
+  -v nullclaw-data:/nullclaw-data \
+  ghcr.io/nullclaw/nullclaw:latest \
+  onboard --interactive
+```
+
+At step 8, use: `/nullclaw-data/workspace`
