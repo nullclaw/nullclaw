@@ -1,6 +1,17 @@
 const std = @import("std");
 const root = @import("root.zig");
 
+const text_helpers = @import("text_helpers.zig");
+
+/// Re-exported so error_classify.zig can call these without importing text_helpers directly.
+pub fn sliceEqlAsciiFold(a: []const u8, b: []const u8) bool {
+    return text_helpers.sliceEqlAsciiFold(a, b);
+}
+
+pub fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
+    return text_helpers.containsAsciiFold(haystack, needle);
+}
+
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
@@ -35,53 +46,27 @@ pub fn isNonRetryable(err_msg: []const u8) bool {
 
 /// Check if an error message indicates context window exhaustion.
 pub fn isContextExhausted(err_msg: []const u8) bool {
-    // Case-insensitive match against common patterns from LLM providers.
-    var lower_buf: [512]u8 = undefined;
-    const check_len = @min(err_msg.len, lower_buf.len);
-    for (err_msg[0..check_len], 0..) |c, idx| {
-        lower_buf[idx] = std.ascii.toLower(c);
-    }
-    const lower = lower_buf[0..check_len];
+    return text_helpers.isContextExhaustedText(err_msg);
+}
 
-    const has_context = std.mem.indexOf(u8, lower, "context") != null;
-    const has_token = std.mem.indexOf(u8, lower, "token") != null;
-    if (has_context and (std.mem.indexOf(u8, lower, "length") != null or
-        std.mem.indexOf(u8, lower, "maximum") != null or
-        std.mem.indexOf(u8, lower, "window") != null or
-        std.mem.indexOf(u8, lower, "exceed") != null))
-        return true;
-    if (has_token and (std.mem.indexOf(u8, lower, "limit") != null or
-        std.mem.indexOf(u8, lower, "too many") != null or
-        std.mem.indexOf(u8, lower, "maximum") != null or
-        std.mem.indexOf(u8, lower, "exceed") != null))
-        return true;
-    if (std.mem.indexOf(u8, lower, "413") != null and std.mem.indexOf(u8, lower, "too large") != null) return true;
-    return false;
+/// Exposed so error_classify.zig can call this predicate directly.
+pub fn isContextExhaustedText(text: []const u8) bool {
+    return text_helpers.isContextExhaustedText(text);
 }
 
 /// Check if an error message indicates a rate-limit (429) error.
 pub fn isRateLimited(err_msg: []const u8) bool {
-    var lower_buf: [512]u8 = undefined;
-    const check_len = @min(err_msg.len, lower_buf.len);
-    for (err_msg[0..check_len], 0..) |c, idx| {
-        lower_buf[idx] = std.ascii.toLower(c);
-    }
-    const lower = lower_buf[0..check_len];
+    return text_helpers.isRateLimitedText(err_msg);
+}
 
-    if (std.mem.indexOf(u8, lower, "ratelimited") != null or
-        std.mem.indexOf(u8, lower, "rate limited") != null or
-        std.mem.indexOf(u8, lower, "rate_limit") != null or
-        std.mem.indexOf(u8, lower, "too many requests") != null or
-        std.mem.indexOf(u8, lower, "quota exceeded") != null or
-        std.mem.indexOf(u8, lower, "throttle") != null)
-    {
-        return true;
-    }
+/// Exposed so error_classify.zig can call this predicate directly.
+pub fn isRateLimitedText(text: []const u8) bool {
+    return text_helpers.isRateLimitedText(text);
+}
 
-    return std.mem.indexOf(u8, lower, "429") != null and
-        (std.mem.indexOf(u8, lower, "rate") != null or
-            std.mem.indexOf(u8, lower, "limit") != null or
-            std.mem.indexOf(u8, lower, "too many") != null);
+/// Exposed so error_classify.zig can call this predicate directly.
+pub fn isVisionUnsupportedText(text: []const u8) bool {
+    return text_helpers.isVisionUnsupportedText(text);
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.

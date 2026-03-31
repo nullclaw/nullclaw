@@ -1,3 +1,5 @@
+const reliable = @import("reliable.zig");
+
 const std = @import("std");
 
 pub const ApiErrorKind = enum {
@@ -16,94 +18,6 @@ pub fn kindToError(kind: ApiErrorKind) anyerror {
     };
 }
 
-fn sliceEqlAsciiFold(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (sliceEqlAsciiFold(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-pub fn isRateLimitedText(text: []const u8) bool {
-    if (text.len == 0) return false;
-
-    if (containsAsciiFold(text, "ratelimited") or
-        containsAsciiFold(text, "rate limited") or
-        containsAsciiFold(text, "rate_limit") or
-        containsAsciiFold(text, "too many requests") or
-        containsAsciiFold(text, "throttle") or
-        containsAsciiFold(text, "quota exceeded"))
-    {
-        return true;
-    }
-
-    return containsAsciiFold(text, "429") and
-        (containsAsciiFold(text, "rate") or
-            containsAsciiFold(text, "limit") or
-            containsAsciiFold(text, "too many"));
-}
-
-pub fn isContextExhaustedText(text: []const u8) bool {
-    if (text.len == 0) return false;
-
-    if (containsAsciiFold(text, "context length exceeded") or
-        containsAsciiFold(text, "contextlengthexceeded") or
-        containsAsciiFold(text, "maximum context length") or
-        containsAsciiFold(text, "context window") or
-        containsAsciiFold(text, "prompt is too long") or
-        containsAsciiFold(text, "input is too long"))
-    {
-        return true;
-    }
-
-    const has_context = containsAsciiFold(text, "context");
-    const has_token = containsAsciiFold(text, "token");
-
-    if (has_context and (containsAsciiFold(text, "length") or
-        containsAsciiFold(text, "maximum") or
-        containsAsciiFold(text, "window") or
-        containsAsciiFold(text, "exceed")))
-    {
-        return true;
-    }
-    if (has_token and (containsAsciiFold(text, "limit") or
-        containsAsciiFold(text, "maximum") or
-        containsAsciiFold(text, "too many") or
-        containsAsciiFold(text, "exceed")))
-    {
-        return true;
-    }
-
-    return containsAsciiFold(text, "413") and containsAsciiFold(text, "too large");
-}
-
-pub fn isVisionUnsupportedText(text: []const u8) bool {
-    if (text.len == 0) return false;
-
-    if (containsAsciiFold(text, "does not support image") or
-        containsAsciiFold(text, "doesn't support image") or
-        containsAsciiFold(text, "image input not supported") or
-        containsAsciiFold(text, "no endpoints found that support image input") or
-        containsAsciiFold(text, "vision not supported") or
-        containsAsciiFold(text, "multimodal not supported") or
-        containsAsciiFold(text, "not a multimodal model"))
-    {
-        return true;
-    }
-
-    return false;
-}
 
 fn parseStatusCode(value: std.json.Value) ?u16 {
     return switch (value) {
@@ -191,7 +105,7 @@ fn extractErrorFields(root_obj: anytype) ?struct {
         if (root_obj.get("type")) |v| {
             if (v == .string) {
                 type_name = v.string;
-                if (containsAsciiFold(v.string, "error")) has_error_signal = true;
+                if (reliable.containsAsciiFold(v.string, "error")) has_error_signal = true;
             }
         }
     }
@@ -277,19 +191,19 @@ fn classifyFromFields(
     }
 
     if (message) |msg| {
-        if (isRateLimitedText(msg)) return .rate_limited;
-        if (isContextExhaustedText(msg)) return .context_exhausted;
-        if (isVisionUnsupportedText(msg)) return .vision_unsupported;
+        if (reliable.isRateLimitedText(msg)) return .rate_limited;
+        if (reliable.isContextExhaustedText(msg)) return .context_exhausted;
+        if (reliable.isVisionUnsupportedText(msg)) return .vision_unsupported;
     }
     if (type_name) |typ| {
-        if (isRateLimitedText(typ)) return .rate_limited;
-        if (isContextExhaustedText(typ)) return .context_exhausted;
-        if (isVisionUnsupportedText(typ)) return .vision_unsupported;
+        if (reliable.isRateLimitedText(typ)) return .rate_limited;
+        if (reliable.isContextExhaustedText(typ)) return .context_exhausted;
+        if (reliable.isVisionUnsupportedText(typ)) return .vision_unsupported;
     }
     if (code) |raw_code| {
-        if (isRateLimitedText(raw_code)) return .rate_limited;
-        if (isContextExhaustedText(raw_code)) return .context_exhausted;
-        if (isVisionUnsupportedText(raw_code)) return .vision_unsupported;
+        if (reliable.isRateLimitedText(raw_code)) return .rate_limited;
+        if (reliable.isContextExhaustedText(raw_code)) return .context_exhausted;
+        if (reliable.isVisionUnsupportedText(raw_code)) return .vision_unsupported;
     }
 
     return .other;
@@ -367,7 +281,7 @@ fn classifyTopLevelError(root_obj: anytype) ?ApiErrorKind {
     if (root_obj.get("type")) |v| {
         if (v == .string) {
             type_name = v.string;
-            if (containsAsciiFold(v.string, "error")) has_error_signal = true;
+            if (reliable.containsAsciiFold(v.string, "error")) has_error_signal = true;
         }
     }
 
