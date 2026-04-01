@@ -109,6 +109,10 @@ pub const DiagnosticsConfig = struct {
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    /// RAG API base URL for turn score benchmarking (e.g. "http://127.0.0.1:8080/api/v1").
+    rag_url: ?[]const u8 = null,
+    /// Bearer token for the RAG API.
+    rag_token: ?[]const u8 = null,
     otel_headers: []const OtelHeaderEntry = &.{},
     /// Optional max length for user-visible provider/API errors after scrubbing.
     /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
@@ -216,6 +220,11 @@ pub const ToolFilterGroup = struct {
     keywords: []const []const u8 = &.{},
 };
 
+pub const SubagentConfig = struct {
+    max_iterations: u32 = 15,
+    max_concurrent: u32 = 4,
+};
+
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 1000,
@@ -247,6 +256,37 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+    /// Enable keyword-based skill routing. When true, skills are selected per-turn
+    /// based on user message relevance instead of the always/not-always flag.
+    skill_routing_enabled: bool = false,
+    /// Maximum number of skills to load as Active (full text) when routing is enabled.
+    skill_routing_max_active: u32 = 3,
+    /// Bonus score added for skills that were recently active (affinity).
+    skill_routing_affinity_bonus: f32 = 0.5,
+    /// Number of recent turns to consider for affinity decay.
+    skill_routing_affinity_depth: u32 = 5,
+    /// Linear decay step per turn of history (most recent = 1.0, decreases by this per turn).
+    skill_routing_affinity_decay_step: f32 = 0.2,
+    /// Enable post-session digest generation for learning from conversations.
+    session_digest_enabled: bool = false,
+    /// Minimum turns before a digest is generated.
+    session_digest_min_turns: u32 = 3,
+    /// Generate digest on /new or /reset.
+    session_digest_on_reset: bool = true,
+    /// Generate digest on session eviction (idle timeout).
+    session_digest_on_eviction: bool = true,
+    /// Enable skill evolution trigger detection.
+    skill_evolution_enabled: bool = false,
+    /// Max evolution triggers per skill per day.
+    skill_evolution_max_per_day: u32 = 3,
+    /// Cooldown between evolution triggers for the same skill (minutes).
+    skill_evolution_cooldown_minutes: u32 = 30,
+    /// Enable task contract system (pre/post verification).
+    task_contracts_enabled: bool = false,
+    /// Provider/model for contract generation (cheap/fast model recommended).
+    task_contracts_model: []const u8 = "",
+    /// Maximum checkpoints per contract.
+    task_contracts_max_checkpoints: u8 = 5,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
@@ -497,6 +537,15 @@ pub const WhatsAppConfig = struct {
     group_policy: []const u8 = "allowlist",
 };
 
+pub const WhatsAppWebConfig = struct {
+    account_id: []const u8 = "default",
+    sidecar_url: []const u8 = "http://127.0.0.1:7100",
+    auth_token: []const u8 = "",
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+};
+
 pub const IrcConfig = struct {
     account_id: []const u8 = "default",
     host: []const u8,
@@ -585,8 +634,23 @@ pub const EmailConfig = struct {
     password: []const u8 = "",
     from_address: []const u8 = "",
     poll_interval_secs: u64 = 60,
+    max_body_bytes: u64 = 51200,
+    signature_file: []const u8 = "",
     allow_from: []const []const u8 = &.{},
     consent_granted: bool = true,
+    pii_redaction: bool = false,
+    pii_spacy: bool = false,
+    /// Save email attachments from allowed senders to disk.
+    attachment_save_enabled: bool = false,
+    /// Directory to save attachments to (relative to working dir or absolute).
+    attachment_save_dir: []const u8 = "workspace/docs",
+    /// Allowed file extensions for attachment saving (lowercase, with leading dot).
+    attachment_extensions: []const []const u8 = &.{ ".pdf", ".docx" },
+    /// Maximum attachment size in bytes (default 20MB).
+    attachment_max_bytes: u64 = 20 * 1024 * 1024,
+    /// Use IMAP IDLE for persistent connection instead of polling (default: true).
+    /// Falls back to polling if server lacks IDLE capability.
+    imap_idle: bool = true,
 };
 
 pub const LineConfig = struct {
@@ -895,6 +959,7 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
+    whatsapp_web: []const WhatsAppWebConfig = &.{},
     teams: []const TeamsConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
@@ -950,6 +1015,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
+    }
+    pub fn whatsappWebPrimary(self: *const ChannelsConfig) ?WhatsAppWebConfig {
+        return primaryAccount(WhatsAppWebConfig, self.whatsapp_web);
     }
     pub fn teamsPrimary(self: *const ChannelsConfig) ?TeamsConfig {
         return primaryAccount(TeamsConfig, self.teams);

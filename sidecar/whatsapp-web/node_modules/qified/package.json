@@ -1,0 +1,58 @@
+{
+  "name": "qified",
+  "version": "0.6.0",
+  "description": "Task and Message Queues with Multiple Providers",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.cjs",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "queue",
+    "task",
+    "message",
+    "provider",
+    "qified"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredwray/qified.git"
+  },
+  "author": "Jared Wray <me@jaredwray.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/jaredwray/qified/issues"
+  },
+  "homepage": "https://github.com/jaredwray/qified#readme",
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.10",
+    "@vitest/coverage-v8": "^4.0.16",
+    "rimraf": "^6.1.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "hookified": "^1.14.0"
+  },
+  "scripts": {
+    "lint": "biome check --write --error-on-warnings",
+    "test": "pnpm lint && vitest run --coverage",
+    "test:ci": "biome check --error-on-warnings && vitest run --coverage",
+    "clean": "rimraf ./dist ./coverage ./site/dist",
+    "build": "rimraf ./dist && tsup src/index.ts --format cjs,esm --dts --clean",
+    "build:publish": "pnpm build && pnpm publish --access public --no-git-checks"
+  }
+}

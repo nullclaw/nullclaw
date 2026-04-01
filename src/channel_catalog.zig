@@ -27,6 +27,7 @@ pub const ChannelId = enum {
     external,
     nostr,
     web,
+    whatsapp_web,
     max,
 };
 
@@ -63,7 +64,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .wechat, .key = "wechat", .label = "WeChat", .configured_message = "WeChat configured", .listener_mode = .webhook_only },
     .{ .id = .wecom, .key = "wecom", .label = "WeCom", .configured_message = "WeCom configured", .listener_mode = .webhook_only },
     .{ .id = .signal, .key = "signal", .label = "Signal", .configured_message = "Signal configured", .listener_mode = .polling },
-    .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .send_only },
+    .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .polling },
     .{ .id = .line, .key = "line", .label = "Line", .configured_message = "Line configured", .listener_mode = .webhook_only },
     .{ .id = .qq, .key = "qq", .label = "QQ", .configured_message = "QQ configured", .listener_mode = .gateway_loop },
     .{ .id = .onebot, .key = "onebot", .label = "OneBot", .configured_message = "OneBot configured", .listener_mode = .gateway_loop },
@@ -71,6 +72,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .external, .key = "external", .label = "External", .configured_message = "External channel configured", .listener_mode = .gateway_loop },
     .{ .id = .nostr, .key = "nostr", .label = "Nostr", .configured_message = "Nostr configured", .listener_mode = .gateway_loop },
     .{ .id = .web, .key = "web", .label = "Web", .configured_message = "Web configured", .listener_mode = .gateway_loop },
+    .{ .id = .whatsapp_web, .key = "whatsapp_web", .label = "WhatsApp Web", .configured_message = "WhatsApp Web configured", .listener_mode = .webhook_only },
     .{ .id = .max, .key = "max", .label = "Max", .configured_message = "Max configured", .listener_mode = .polling },
 };
 
@@ -100,6 +102,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .external => true,
         .nostr => build_options.enable_channel_nostr,
         .web => build_options.enable_channel_web,
+        .whatsapp_web => build_options.enable_channel_whatsapp_web,
         .max => build_options.enable_channel_max,
     };
 }
@@ -129,6 +132,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "external")) return true;
     if (comptime std.mem.eql(u8, key, "nostr")) return build_options.enable_channel_nostr;
     if (comptime std.mem.eql(u8, key, "web")) return build_options.enable_channel_web;
+    if (comptime std.mem.eql(u8, key, "whatsapp_web")) return build_options.enable_channel_whatsapp_web;
     if (comptime std.mem.eql(u8, key, "max")) return build_options.enable_channel_max;
     return true;
 }
@@ -159,6 +163,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .external => cfg.channels.external.len,
         .nostr => if (cfg.channels.nostr != null) 1 else 0,
         .web => cfg.channels.web.len,
+        .whatsapp_web => cfg.channels.whatsapp_web.len,
         .max => cfg.channels.max.len,
     };
 }

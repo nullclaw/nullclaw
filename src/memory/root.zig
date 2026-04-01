@@ -309,6 +309,19 @@ pub const MemoryEntry = struct {
     timestamp: []const u8,
     session_id: ?[]const u8 = null,
     score: ?f64 = null,
+    /// L0 abstract (~50-100 tokens). Null if not yet generated.
+    abstract: ?[]const u8 = null,
+    /// L1 overview (~300-500 tokens). Null if not yet generated.
+    overview: ?[]const u8 = null,
+
+    /// Return content at the requested depth, falling back to full content.
+    pub fn atDepth(self: *const MemoryEntry, depth: ContextDepth) []const u8 {
+        return switch (depth) {
+            .abstract => self.abstract orelse self.content,
+            .overview => self.overview orelse self.content,
+            .full => self.content,
+        };
+    }
 
     /// Free all allocated strings owned by this entry.
     pub fn deinit(self: *const MemoryEntry, allocator: std.mem.Allocator) void {
@@ -317,10 +330,24 @@ pub const MemoryEntry = struct {
         allocator.free(self.content);
         allocator.free(self.timestamp);
         if (self.session_id) |sid| allocator.free(sid);
+        if (self.abstract) |a| allocator.free(a);
+        if (self.overview) |o| allocator.free(o);
         switch (self.category) {
             .custom => |name| allocator.free(name),
             else => {},
         }
+    }
+};
+
+pub const ContextDepth = enum {
+    abstract,
+    overview,
+    full,
+
+    pub fn fromString(s: []const u8) ContextDepth {
+        if (std.mem.eql(u8, s, "overview")) return .overview;
+        if (std.mem.eql(u8, s, "full")) return .full;
+        return .abstract;
     }
 };
 
@@ -424,6 +451,8 @@ pub const Memory = struct {
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
+        /// Optional: update L0 abstract and/or L1 overview for a stored memory.
+        updateTiers: ?*const fn (ptr: *anyopaque, key: []const u8, abstract_text: ?[]const u8, overview_text: ?[]const u8) anyerror!void = null,
     };
 
     pub fn name(self: Memory) []const u8 {
@@ -499,6 +528,14 @@ pub const Memory = struct {
 
     pub fn deinit(self: Memory) void {
         self.vtable.deinit(self.ptr);
+    }
+
+    /// Update L0 abstract and/or L1 overview for a stored memory key.
+    /// No-op if the backend does not support tiered storage.
+    pub fn updateTiers(self: Memory, key: []const u8, abstract_text: ?[]const u8, overview_text: ?[]const u8) !void {
+        if (self.vtable.updateTiers) |f| {
+            return f(self.ptr, key, abstract_text, overview_text);
+        }
     }
 
     /// Hybrid search: combine keyword recall with optional vector similarity.

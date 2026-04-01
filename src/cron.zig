@@ -887,7 +887,8 @@ pub const CronScheduler = struct {
                         job.last_output = null;
                         // Deliver error notification
                         if (out_bus) |b| {
-                            _ = deliverResult(self.allocator, job.delivery, "cron job failed to start", false, b) catch {};
+                            const jn = job.name orelse job.id;
+                            _ = deliverResult(self.allocator, job.delivery, "cron job failed to start", false, b, jn) catch {};
                         }
                         continue;
                     };
@@ -909,7 +910,8 @@ pub const CronScheduler = struct {
 
                     if (out_bus) |b| {
                         const output = job.last_output orelse "";
-                        _ = deliverResult(self.allocator, job.delivery, output, success, b) catch {};
+                        const jn = job.name orelse job.id;
+                        _ = deliverResult(self.allocator, job.delivery, output, success, b, jn) catch {};
                     }
                 },
                 .agent => {
@@ -923,10 +925,11 @@ pub const CronScheduler = struct {
                         job.last_output = self.allocator.dupe(u8, agent_output) catch null;
 
                         if (out_bus) |b| {
+                            const jn = job.name orelse job.id;
                             if (job.session_target == .main) {
-                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, job.name orelse job.id) catch {};
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, jn) catch {};
                             } else {
-                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b, jn) catch {};
                             }
                         }
                     } else {
@@ -937,7 +940,8 @@ pub const CronScheduler = struct {
                             if (job.last_output) |old| self.allocator.free(old);
                             job.last_output = null;
                             if (out_bus) |b| {
-                                _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b) catch {};
+                                const jn = job.name orelse job.id;
+                                _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b, jn) catch {};
                             }
                             continue;
                         };
@@ -946,10 +950,11 @@ pub const CronScheduler = struct {
                         job.last_status = if (exec_result.success) "ok" else "error";
                         if (job.last_output) |old| self.allocator.free(old);
                         if (out_bus) |b| {
+                            const jn = job.name orelse job.id;
                             if (job.session_target == .main) {
-                                _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, job.name orelse job.id) catch {};
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, jn) catch {};
                             } else {
-                                _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                                _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b, jn) catch {};
                             }
                         }
 
@@ -990,7 +995,7 @@ pub const CronScheduler = struct {
     }
 };
 
-const AgentRunResult = struct {
+pub const AgentRunResult = struct {
     success: bool,
     output: []const u8,
 };
@@ -1113,7 +1118,7 @@ fn preferAgentExecPath(self_exe_path: []const u8) []const u8 {
     return self_exe_path;
 }
 
-fn runAgentJob(
+pub fn runAgentJob(
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
     prompt: []const u8,
@@ -1368,6 +1373,12 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk false;
         };
+        const name: ?[]const u8 = blk: {
+            if (obj.get("name")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
 
         // Load delivery config
         const delivery_mode = blk: {
@@ -1441,6 +1452,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .job_type = job_type,
             .session_target = session_target,
             .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
+            .name = if (name) |n| try scheduler.allocator.dupe(u8, n) else null,
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
@@ -1466,12 +1478,14 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
 
 /// Deliver a cron job result to a channel via the outbound bus.
 /// Returns true if a message was published, false if delivery was skipped.
+/// `job_name` is used to generate a meaningful email subject line; pass null for the legacy default.
 pub fn deliverResult(
     allocator: std.mem.Allocator,
     delivery: DeliveryConfig,
     output: []const u8,
     success: bool,
     out_bus: *bus.Bus,
+    job_name: ?[]const u8,
 ) !bool {
     // Skip if mode is none
     if (delivery.mode == .none) return false;
@@ -1490,11 +1504,22 @@ pub fn deliverResult(
     // Skip empty output
     if (output.len == 0) return false;
 
+    // Build output with Subject header for email channels.
+    // The email channel extracts "Subject: <line>\n" from the message;
+    // other channels display it as the first line, which is fine as context.
+    const final_output = if (output.len > 0 and !std.mem.startsWith(u8, output, "Subject: ")) blk: {
+        const status_tag = if (success) "" else " [FAILED]";
+        const name = job_name orelse "Scheduled task";
+        break :blk try std.fmt.allocPrint(allocator, "Subject: {s}{s}\n{s}", .{ name, status_tag, output });
+    } else null;
+    defer if (final_output) |fo| allocator.free(fo);
+    const msg_output = final_output orelse output;
+
     const chat_id = delivery.to orelse "default";
     const msg = if (delivery.account_id) |account_id|
-        try bus.makeOutboundWithAccount(allocator, channel, account_id, chat_id, output)
+        try bus.makeOutboundWithAccount(allocator, channel, account_id, chat_id, msg_output)
     else
-        try bus.makeOutbound(allocator, channel, chat_id, output);
+        try bus.makeOutbound(allocator, channel, chat_id, msg_output);
     out_bus.publishOutbound(msg) catch |err| {
         // If best_effort, swallow the error after cleaning up
         if (delivery.best_effort) {
@@ -1652,7 +1677,11 @@ const JsonCronJob = struct {
 };
 
 /// Get the default cron.json path: ~/.nullclaw/cron.json
+/// In test builds, uses a temp path to avoid clobbering production data.
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
+    if (comptime builtin.is_test) {
+        return try allocator.dupe(u8, "/tmp/.nullclaw-test/cron.json");
+    }
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.json" });
@@ -1660,10 +1689,15 @@ fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
 
 /// Ensure the ~/.nullclaw directory exists.
 fn ensureCronDir(allocator: std.mem.Allocator) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
-    defer allocator.free(dir);
+    const dir = if (comptime builtin.is_test)
+        "/tmp/.nullclaw-test"
+    else blk: {
+        const home = try platform.getHomeDir(allocator);
+        defer allocator.free(home);
+        const d = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+        break :blk d;
+    };
+    defer if (!builtin.is_test) allocator.free(dir);
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -1735,6 +1769,13 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
         try buf.appendSlice(scheduler.allocator, ",");
         try json_util.appendJsonKey(&buf, scheduler.allocator, "delete_after_run");
         try buf.appendSlice(scheduler.allocator, if (job.delete_after_run) "true" else "false");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "name");
+        if (job.name) |name| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, name);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
         try buf.appendSlice(scheduler.allocator, ",");
         try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "session_target", job.session_target.asStr());
 
@@ -1816,6 +1857,10 @@ pub fn reloadJobs(scheduler: *CronScheduler) !void {
         }
         return err;
     };
+    // Guard: never replace populated in-memory jobs with an empty disk state.
+    // This prevents wiping the scheduler when cron.json is temporarily missing
+    // (e.g. during atomic write) or empty due to a truncated write.
+    if (loaded.jobs.items.len == 0 and scheduler.jobs.items.len > 0) return;
     std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
 }
 
@@ -3218,7 +3263,7 @@ test "deliverResult creates correct OutboundMessage" {
         .to = "chat123",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus, "Test Job");
     try std.testing.expect(delivered);
 
     // Consume and verify the message
@@ -3226,7 +3271,7 @@ test "deliverResult creates correct OutboundMessage" {
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("telegram", msg.channel);
     try std.testing.expectEqualStrings("chat123", msg.chat_id);
-    try std.testing.expectEqualStrings("job output here", msg.content);
+    try std.testing.expectEqualStrings("Subject: Test Job\njob output here", msg.content);
 }
 
 test "deliverResult preserves account routing when delivery account_id is set" {
@@ -3241,13 +3286,14 @@ test "deliverResult preserves account routing when delivery account_id is set" {
         .to = "chat123",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus, "Test Job");
     try std.testing.expect(delivered);
 
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
     try std.testing.expect(msg.account_id != null);
     try std.testing.expectEqualStrings("backup", msg.account_id.?);
+    try std.testing.expectEqualStrings("Subject: Test Job\njob output here", msg.content);
 }
 
 test "deliverResult with mode none does nothing" {
@@ -3261,7 +3307,7 @@ test "deliverResult with mode none does nothing" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus, null);
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -3277,7 +3323,7 @@ test "deliverResult with no channel does nothing" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus, null);
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -3293,7 +3339,7 @@ test "deliverResult on_success skips on failure" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "error output", false, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "error output", false, &test_bus, null);
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -3309,7 +3355,7 @@ test "deliverResult on_error skips on success" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "ok output", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "ok output", true, &test_bus, null);
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -3325,14 +3371,14 @@ test "deliverResult on_error delivers on failure" {
         .to = "room42",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "crash log", false, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "crash log", false, &test_bus, "Crash Monitor");
     try std.testing.expect(delivered);
 
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("room42", msg.chat_id);
-    try std.testing.expectEqualStrings("crash log", msg.content);
+    try std.testing.expectEqualStrings("Subject: Crash Monitor [FAILED]\ncrash log", msg.content);
 }
 
 test "deliverResult uses default chat_id when to is null" {
@@ -3346,12 +3392,13 @@ test "deliverResult uses default chat_id when to is null" {
         .to = null,
     };
 
-    const delivered = try deliverResult(allocator, delivery, "hello", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "hello", true, &test_bus, null);
     try std.testing.expect(delivered);
 
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("default", msg.chat_id);
+    try std.testing.expectEqualStrings("Subject: Scheduled task\nhello", msg.content);
 }
 
 test "deliverResult skips empty output" {
@@ -3365,7 +3412,7 @@ test "deliverResult skips empty output" {
         .to = "chat1",
     };
 
-    const delivered = try deliverResult(allocator, delivery, "", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "", true, &test_bus, null);
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
 }
@@ -3383,7 +3430,7 @@ test "deliverResult best_effort swallows closed bus error" {
     };
 
     // Should not return error because best_effort is true
-    const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus);
+    const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus, null);
     try std.testing.expect(!delivered);
 }
 
@@ -3511,7 +3558,7 @@ test "agent job delivers result via bus" {
     defer msg.deinit(allocator);
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("general", msg.chat_id);
-    try std.testing.expectEqualStrings("Summarize today's news", msg.content);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Summarize today's news") != null);
 }
 
 test "collectChildOutputWithTimeout disables timeout when set to zero" {

@@ -96,6 +96,7 @@ pub const NamedAgentConfig = config_types.NamedAgentConfig;
 pub const McpServerConfig = config_types.McpServerConfig;
 pub const ModelPricing = config_types.ModelPricing;
 pub const ToolsConfig = config_types.ToolsConfig;
+pub const SubagentConfig = config_types.SubagentConfig;
 pub const ProviderEntry = config_types.ProviderEntry;
 pub const AudioMediaConfig = config_types.AudioMediaConfig;
 pub const DmScope = config_types.DmScope;
@@ -186,6 +187,7 @@ pub const Config = struct {
     hardware: HardwareConfig = .{},
     security: SecurityConfig = .{},
     tools: ToolsConfig = .{},
+    subagent: SubagentConfig = .{},
     session: SessionConfig = .{},
 
     // Convenience aliases for backward-compat flat access used by other modules.
@@ -2929,7 +2931,7 @@ test "validation rejects external channel with invalid timeout_ms" {
     const external_accounts = [_]ExternalChannelConfig{
         .{
             .account_id = "main",
-            .runtime_name = "whatsapp_web",
+            .runtime_name = "custom_whatsapp",
             .transport = .{
                 .command = "nullclaw-plugin-whatsapp-web",
                 .timeout_ms = 0,
@@ -3026,7 +3028,7 @@ test "validation rejects external channel config that is not a JSON object" {
     const external_accounts = [_]ExternalChannelConfig{
         .{
             .account_id = "main",
-            .runtime_name = "whatsapp_web",
+            .runtime_name = "custom_whatsapp",
             .transport = .{ .command = "plugin" },
             .plugin_config_json = "\"oops\"",
         },
@@ -3363,6 +3365,28 @@ test "json parse agent token_limit explicit remains false when omitted" {
     try std.testing.expect(!cfg.agent.token_limit_explicit);
     try std.testing.expect(cfg.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC", cfg.agent.timezone);
+}
+
+test "json parse subagent section" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"subagent": {"max_iterations": 50, "max_concurrent": 8}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 50), cfg.subagent.max_iterations);
+    try std.testing.expectEqual(@as(u32, 8), cfg.subagent.max_concurrent);
+}
+
+test "json parse subagent defaults when omitted" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 15), cfg.subagent.max_iterations);
+    try std.testing.expectEqual(@as(u32, 4), cfg.subagent.max_concurrent);
 }
 
 test "json parse composio section" {
@@ -5459,7 +5483,7 @@ test "parse external channel preserves invalid timeout for validation" {
     const allocator = arena.allocator();
 
     const json =
-        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"whatsapp_web","transport":{"command":"nullclaw-plugin-whatsapp-web","timeout_ms":0}}}}}}
+        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"custom_whatsapp","transport":{"command":"nullclaw-plugin-whatsapp-web","timeout_ms":0}}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -5476,7 +5500,7 @@ test "parse external channel rejects timeout with wrong type" {
     const allocator = arena.allocator();
 
     const json =
-        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"whatsapp_web","transport":{"command":"nullclaw-plugin-whatsapp-web","timeout_ms":"slow"}}}}}}
+        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"custom_whatsapp","transport":{"command":"nullclaw-plugin-whatsapp-web","timeout_ms":"slow"}}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -5493,7 +5517,7 @@ test "parse external channel rejects scalar config at validation time" {
     const allocator = arena.allocator();
 
     const json =
-        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"whatsapp_web","transport":{"command":"nullclaw-plugin-whatsapp-web"},"config":"oops"}}}}}
+        \\{"channels":{"external":{"accounts":{"wa-web":{"runtime_name":"custom_whatsapp","transport":{"command":"nullclaw-plugin-whatsapp-web"},"config":"oops"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);

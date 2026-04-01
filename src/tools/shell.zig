@@ -123,7 +123,7 @@ pub const ShellTool = struct {
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
     pub const tool_params =
-        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"},"stdin":{"type":"string","description":"Data to pipe to the command's stdin (use this for large JSON payloads instead of inline arguments)"}},"required":["command"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -140,6 +140,7 @@ pub const ShellTool = struct {
         const command_input = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
         const command = normalizeCommandInput(command_input);
+        const stdin_data = root.getString(args, "stdin");
 
         // Validate command against security policy
         if (self.policy) |pol| {
@@ -227,6 +228,7 @@ pub const ShellTool = struct {
                     .cwd = effective_cwd,
                     .env_map = &env,
                     .max_output_bytes = self.max_output_bytes,
+                    .stdin_data = stdin_data,
                 });
             }
 
@@ -237,6 +239,7 @@ pub const ShellTool = struct {
                 .cwd = effective_cwd,
                 .env_map = &env,
                 .max_output_bytes = self.max_output_bytes,
+                .stdin_data = stdin_data,
             });
         } else blk: {
             const shell_cmd = platform.getShell();
@@ -246,6 +249,7 @@ pub const ShellTool = struct {
                 .cwd = effective_cwd,
                 .env_map = &env,
                 .max_output_bytes = self.max_output_bytes,
+                .stdin_data = stdin_data,
             });
         };
         defer allocator.free(result.stderr);

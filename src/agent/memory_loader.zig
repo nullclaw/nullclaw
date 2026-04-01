@@ -103,8 +103,9 @@ pub fn loadContext(
             try w.writeAll("[Memory context]\n");
             wrote_header = true;
         }
-        // Truncate individual entry content to prevent a single large memory from blowing the budget
-        const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+        // Use abstract tier when available — falls back to full content for older entries
+        const tier_content = entry.atDepth(.abstract);
+        const content = truncateUtf8(tier_content, MAX_CONTEXT_BYTES / 2);
         const sanitized = try sanitizeMemoryText(allocator, content);
         defer allocator.free(sanitized);
         try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
@@ -123,7 +124,8 @@ pub fn loadContext(
                     try w.writeAll("[Memory context]\n");
                     wrote_header = true;
                 }
-                const content = truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+                const tier_content = entry.atDepth(.abstract);
+                const content = truncateUtf8(tier_content, MAX_CONTEXT_BYTES / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
                 try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });

@@ -214,14 +214,17 @@ pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u
     return try buf.toOwnedSlice(allocator);
 }
 
-/// Check if a model name indicates an OpenAI reasoning model
-/// (o1, o3, o4-mini, gpt-5*, codex-mini).
+/// Check if a model name indicates a reasoning model
+/// (o1, o3, o4-mini, gpt-5*, codex-mini, or any model ending in "-reasoning"
+/// but NOT "-non-reasoning").
 pub fn isReasoningModel(model: []const u8) bool {
     return std.mem.startsWith(u8, model, "gpt-5") or
         std.mem.startsWith(u8, model, "o1") or
         std.mem.startsWith(u8, model, "o3") or
         std.mem.startsWith(u8, model, "o4-mini") or
-        std.mem.startsWith(u8, model, "codex-mini");
+        std.mem.startsWith(u8, model, "codex-mini") or
+        std.mem.startsWith(u8, model, "grok-code-fast-1") or
+        (std.mem.endsWith(u8, model, "-reasoning") and !std.mem.endsWith(u8, model, "-non-reasoning"));
 }
 
 /// Append model-specific generation controls to a JSON request body buffer:
@@ -848,6 +851,15 @@ test "appendGenerationFields normalizes xhigh reasoning effort for gpt-5" {
     try std.testing.expectEqualStrings("high", obj.get("reasoning_effort").?.string);
     try std.testing.expect(obj.get("temperature") == null);
     try std.testing.expectEqual(@as(i64, 2048), obj.get("max_completion_tokens").?.integer);
+}
+
+test "isReasoningModel detects xAI reasoning suffix" {
+    try std.testing.expect(isReasoningModel("grok-4.20-beta-0309-reasoning"));
+    try std.testing.expect(isReasoningModel("grok-4.20-experimental-beta-0304-reasoning"));
+    try std.testing.expect(!isReasoningModel("grok-4.20-beta-0309-non-reasoning"));
+    try std.testing.expect(!isReasoningModel("grok-4.20-multi-agent-beta-0309"));
+    try std.testing.expect(isReasoningModel("o3-mini"));
+    try std.testing.expect(!isReasoningModel("grok-3"));
 }
 
 test "appendGeminiThinkingConfig uses thinkingLevel for gemini-3 flash" {

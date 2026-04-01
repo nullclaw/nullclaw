@@ -240,6 +240,81 @@ fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Extract a boolean field from TOML [skill] section (e.g. `always = true`).
+fn parseTomlBoolField(toml_bytes: []const u8, key: []const u8) ?bool {
+    var in_skill_section = false;
+    var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+
+        const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
+        if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
+            in_skill_section = std.mem.eql(u8, section_line, "[skill]");
+            continue;
+        }
+        if (!in_skill_section) continue;
+
+        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
+        if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+        const raw_value = std.mem.trim(u8, stripTomlInlineComment(line[eq_idx + 1 ..]), " \t\r");
+        if (std.mem.eql(u8, raw_value, "true")) return true;
+        if (std.mem.eql(u8, raw_value, "false")) return false;
+        return null;
+    }
+    return null;
+}
+
+/// Extract a string array field from TOML [skill] section (e.g. `requires_bins = ["git", "python3"]`).
+/// Returns allocated slices; caller owns the outer slice and each inner slice.
+fn parseTomlStringArray(allocator: std.mem.Allocator, toml_bytes: []const u8, key: []const u8) ![]const []const u8 {
+    var in_skill_section = false;
+    var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+
+        const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
+        if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
+            in_skill_section = std.mem.eql(u8, section_line, "[skill]");
+            continue;
+        }
+        if (!in_skill_section) continue;
+
+        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
+        if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+        // Found the key — parse the array value after '='
+        const after_eq = std.mem.trim(u8, line[eq_idx + 1 ..], " \t\r");
+        const bracket_start = std.mem.indexOfScalar(u8, after_eq, '[') orelse return &.{};
+        const bracket_end = std.mem.indexOfScalar(u8, after_eq, ']') orelse return &.{};
+        if (bracket_end <= bracket_start) return &.{};
+
+        const inner = after_eq[bracket_start + 1 .. bracket_end];
+        var items: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (items.items) |item| allocator.free(item);
+            items.deinit(allocator);
+        }
+
+        var rest = inner;
+        while (rest.len > 0) {
+            const prefix = parseTomlStringPrefix(rest) orelse break;
+            try items.append(allocator, try allocator.dupe(u8, prefix.value));
+            rest = rest[prefix.consumed..];
+            // Skip whitespace and commas
+            while (rest.len > 0 and (rest[0] == ' ' or rest[0] == ',' or rest[0] == '\t')) {
+                rest = rest[1..];
+            }
+        }
+        return try items.toOwnedSlice(allocator);
+    }
+    return &.{};
+}
+
 // ── Frontmatter Parsing ─────────────────────────────────────────
 //
 // SKILL.md files may contain YAML frontmatter — a `---`-delimited block at the
@@ -303,7 +378,6 @@ fn splitFrontmatter(content: []const u8) ?FrontmatterSplit {
     }
     return null;
 }
-
 /// Extract a simple `key: value` string from YAML-subset frontmatter lines.
 /// Handles bare values, single-quoted, and double-quoted values.
 /// Returns a slice into the `meta` buffer — caller must dupe.
@@ -557,6 +631,10 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
             try allocator.dupe(u8, "");
 
+        const toml_always = parseTomlBoolField(toml, "always") orelse false;
+        const toml_requires_bins = parseTomlStringArray(allocator, toml, "requires_bins") catch &.{};
+        const toml_requires_env = parseTomlStringArray(allocator, toml, "requires_env") catch &.{};
+
         return Skill{
             .name = name,
             .version = version,
@@ -564,9 +642,9 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
             .author = author,
             .instructions = instructions,
             .enabled = true,
-            .always = false,
-            .requires_bins = &.{},
-            .requires_env = &.{},
+            .always = toml_always,
+            .requires_bins = toml_requires_bins,
+            .requires_env = toml_requires_env,
             .path = path,
         };
     }
@@ -2409,6 +2487,8 @@ test "loadSkill reads metadata from SKILL.toml" {
             \\description = "TOML metadata"
             \\version = "1.2.3"
             \\author = "toml-author"
+            \\always = true
+            \\requires_bins = ["git", "python3"]
         );
     }
 
@@ -2424,6 +2504,10 @@ test "loadSkill reads metadata from SKILL.toml" {
     try std.testing.expectEqualStrings("1.2.3", skill.version);
     try std.testing.expectEqualStrings("TOML metadata", skill.description);
     try std.testing.expectEqualStrings("toml-author", skill.author);
+    try std.testing.expect(skill.always);
+    try std.testing.expectEqual(@as(usize, 2), skill.requires_bins.len);
+    try std.testing.expectEqualStrings("git", skill.requires_bins[0]);
+    try std.testing.expectEqualStrings("python3", skill.requires_bins[1]);
 }
 
 test "loadSkill prefers SKILL.toml metadata over skill.json" {
@@ -4326,6 +4410,60 @@ test "freeSyncResult frees message" {
     freeSyncResult(allocator, &result);
 }
 
+test "parseTomlBoolField parses true" {
+    const toml = "[skill]\nalways = true\n";
+    try std.testing.expectEqual(@as(?bool, true), parseTomlBoolField(toml, "always"));
+}
+
+test "parseTomlBoolField parses false" {
+    const toml = "[skill]\nalways = false\n";
+    try std.testing.expectEqual(@as(?bool, false), parseTomlBoolField(toml, "always"));
+}
+
+test "parseTomlBoolField returns null for missing key" {
+    const toml = "[skill]\nname = \"test\"\n";
+    try std.testing.expectEqual(@as(?bool, null), parseTomlBoolField(toml, "always"));
+}
+
+test "parseTomlBoolField ignores wrong section" {
+    const toml = "[other]\nalways = true\n[skill]\nname = \"x\"\n";
+    try std.testing.expectEqual(@as(?bool, null), parseTomlBoolField(toml, "always"));
+}
+
+test "parseTomlStringArray parses list" {
+    const allocator = std.testing.allocator;
+    const toml = "[skill]\nrequires_bins = [\"git\", \"docker\", \"python3\"]\n";
+    const arr = try parseTomlStringArray(allocator, toml, "requires_bins");
+    defer freeStringArray(allocator, arr);
+    try std.testing.expectEqual(@as(usize, 3), arr.len);
+    try std.testing.expectEqualStrings("git", arr[0]);
+    try std.testing.expectEqualStrings("docker", arr[1]);
+    try std.testing.expectEqualStrings("python3", arr[2]);
+}
+
+test "parseTomlStringArray returns empty for missing key" {
+    const allocator = std.testing.allocator;
+    const toml = "[skill]\nname = \"test\"\n";
+    const arr = try parseTomlStringArray(allocator, toml, "requires_bins");
+    try std.testing.expectEqual(@as(usize, 0), arr.len);
+}
+
+test "parseTomlStringArray handles single element" {
+    const allocator = std.testing.allocator;
+    const toml = "[skill]\nrequires_bins = [\"claude\"]\n";
+    const arr = try parseTomlStringArray(allocator, toml, "requires_bins");
+    defer freeStringArray(allocator, arr);
+    try std.testing.expectEqual(@as(usize, 1), arr.len);
+    try std.testing.expectEqualStrings("claude", arr[0]);
+}
+
+test "parseTomlStringArray handles empty array" {
+    const allocator = std.testing.allocator;
+    const toml = "[skill]\nrequires_bins = []\n";
+    const arr = try parseTomlStringArray(allocator, toml, "requires_bins");
+    try std.testing.expectEqual(@as(usize, 0), arr.len);
+}
+
 // ── Frontmatter Parsing Tests ───────────────────────────────────
 
 test "splitFrontmatter valid block" {
@@ -4505,6 +4643,30 @@ test "parseFrontmatterStringArray block sequence ignores comments" {
     try std.testing.expectEqualStrings("git", arr[1]);
 }
 
+test "TOML always=false defaults correctly" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/no-always");
+    {
+        const f = try tmp.dir.createFile("skills/no-always/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll("[skill]\nname = \"no-always\"\n");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "no-always" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expect(!skill.always);
+    try std.testing.expectEqual(@as(usize, 0), skill.requires_bins.len);
+}
+
 test "parseFrontmatterSkill full frontmatter" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4531,24 +4693,24 @@ test "parseFrontmatterSkill full frontmatter" {
         );
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(base);
-    const skill_dir = try std.fs.path.join(allocator, &.{ base, "ctx-skill" });
-    defer allocator.free(skill_dir);
+    const base2 = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base2);
+    const ctx_skill_dir = try std.fs.path.join(allocator, &.{ base2, "ctx-skill" });
+    defer allocator.free(ctx_skill_dir);
 
-    const skill = try parseFrontmatterSkill(allocator, skill_dir);
-    defer freeSkill(allocator, &skill);
+    const ctx_skill = try parseFrontmatterSkill(allocator, ctx_skill_dir);
+    defer freeSkill(allocator, &ctx_skill);
 
-    try std.testing.expectEqualStrings("context7", skill.name);
-    try std.testing.expectEqualStrings("1.0.0", skill.version);
-    try std.testing.expectEqualStrings("Retrieve docs via API", skill.description);
-    try std.testing.expectEqualStrings("opencode", skill.author);
-    try std.testing.expect(skill.always);
-    try std.testing.expectEqual(@as(usize, 1), skill.requires_bins.len);
-    try std.testing.expectEqualStrings("curl", skill.requires_bins[0]);
-    try std.testing.expectEqual(@as(usize, 1), skill.requires_env.len);
-    try std.testing.expectEqualStrings("API_KEY", skill.requires_env[0]);
-    try std.testing.expectEqualStrings("\n# Context7\nInstructions here.\n", skill.instructions);
+    try std.testing.expectEqualStrings("context7", ctx_skill.name);
+    try std.testing.expectEqualStrings("1.0.0", ctx_skill.version);
+    try std.testing.expectEqualStrings("Retrieve docs via API", ctx_skill.description);
+    try std.testing.expectEqualStrings("opencode", ctx_skill.author);
+    try std.testing.expect(ctx_skill.always);
+    try std.testing.expectEqual(@as(usize, 1), ctx_skill.requires_bins.len);
+    try std.testing.expectEqualStrings("curl", ctx_skill.requires_bins[0]);
+    try std.testing.expectEqual(@as(usize, 1), ctx_skill.requires_env.len);
+    try std.testing.expectEqualStrings("API_KEY", ctx_skill.requires_env[0]);
+    try std.testing.expectEqualStrings("\n# Context7\nInstructions here.\n", ctx_skill.instructions);
 }
 
 test "parseFrontmatterSkill missing name falls back to dirname" {

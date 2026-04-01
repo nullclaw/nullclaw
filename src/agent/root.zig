@@ -36,6 +36,12 @@ pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
+pub const turn_scorer = @import("turn_scorer.zig");
+pub const skill_router = @import("skill_router.zig");
+pub const retry = @import("retry.zig");
+pub const session_digest = @import("session_digest.zig");
+pub const task_contract = @import("task_contract.zig");
+const skillforge_evolution = @import("../skillforge_evolution.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
@@ -315,6 +321,10 @@ pub const Agent = struct {
     status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
+    /// When true, suppresses intermediate text output to stdout during the tool
+    /// loop.  Used in single-message (``-m``) mode so that cron / subprocess
+    /// callers only see the final response on stdout.
+    suppress_intermediate_output: bool = false,
     log_llm_io: bool = false,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
@@ -323,6 +333,13 @@ pub const Agent = struct {
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
+
+    /// Task contract configuration (pre/post verification).
+    task_contracts_enabled: bool = false,
+    task_contracts_model: []const u8 = "",
+    task_contracts_max_checkpoints: u8 = 5,
+    /// Active contract for the current turn (set during contract generation, cleared after verification).
+    current_contract: ?task_contract.TaskContract = null,
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
@@ -366,6 +383,25 @@ pub const Agent = struct {
 
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
+
+    /// Tool execution context from the previous turn (for deferred feedback scoring).
+    prev_turn_context: ?turn_scorer.TurnContext = null,
+    /// Owned copy of the previous turn's skill name (heap-allocated, freed on replacement).
+    prev_turn_skill_owned: ?[]const u8 = null,
+
+    /// Enable keyword-based skill routing (select top-N skills per turn).
+    skill_routing_enabled: bool = false,
+    /// Top-matched skill from the router for current turn (not owned; points to prev_turn_skill_owned).
+    routed_skill: ?[]const u8 = null,
+    /// Max skills loaded as Active when routing is enabled.
+    skill_routing_max_active: u32 = 3,
+    /// Skill affinity history for routing stickiness (ring buffer of recent skill names).
+    skill_affinity_history: ?skill_router.AffinityHistory = null,
+
+    /// Skill evolution performance tracker (detects improvement opportunities).
+    /// Heap-allocated because the tracker is ~11 KB (32 skill slots × ring buffers).
+    evolution_tracker: ?*skillforge_evolution.SkillPerformanceTracker = null,
+
 
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
@@ -502,6 +538,29 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
+            .skill_routing_enabled = cfg.agent.skill_routing_enabled,
+            .skill_routing_max_active = cfg.agent.skill_routing_max_active,
+            .skill_affinity_history = if (cfg.agent.skill_routing_enabled and cfg.agent.skill_routing_affinity_depth > 0)
+                skill_router.AffinityHistory.init(
+                    allocator,
+                    cfg.agent.skill_routing_affinity_depth,
+                    cfg.agent.skill_routing_affinity_bonus,
+                    cfg.agent.skill_routing_affinity_decay_step,
+                )
+            else
+                null,
+            .task_contracts_enabled = cfg.agent.task_contracts_enabled,
+            .task_contracts_model = cfg.agent.task_contracts_model,
+            .task_contracts_max_checkpoints = cfg.agent.task_contracts_max_checkpoints,
+            .evolution_tracker = if (cfg.agent.skill_evolution_enabled) blk: {
+                const tracker = try allocator.create(skillforge_evolution.SkillPerformanceTracker);
+                tracker.* = skillforge_evolution.SkillPerformanceTracker.init(.{
+                    .enabled = true,
+                    .max_per_skill_per_day = cfg.agent.skill_evolution_max_per_day,
+                    .cooldown_minutes = cfg.agent.skill_evolution_cooldown_minutes,
+                });
+                break :blk tracker;
+            } else null,
             .default_exec_security = resolved_exec_security,
             .exec_security = resolved_exec_security,
             .default_exec_ask = resolved_exec_ask,
@@ -511,6 +570,25 @@ pub const Agent = struct {
             .has_system_prompt = false,
             .last_turn_compacted = false,
         };
+    }
+
+    /// Save turn context for deferred scoring, managing the owned skill string.
+    fn savePrevTurnContext(self: *Agent, ctx: turn_scorer.TurnContext) void {
+        // If ctx.skill already points to our owned copy (set during tool tracking),
+        // just save the context — no need to dupe or free.
+        if (self.prev_turn_skill_owned) |s| {
+            if (ctx.skill.ptr == s.ptr) {
+                self.prev_turn_context = ctx;
+                return;
+            }
+        }
+        // ctx.skill is a string literal (e.g. "general") — dupe it.
+        const owned = self.allocator.dupe(u8, ctx.skill) catch null;
+        if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
+        self.prev_turn_skill_owned = owned;
+        var saved = ctx;
+        saved.skill = owned orelse "general";
+        self.prev_turn_context = saved;
     }
 
     pub fn deinit(self: *Agent) void {
@@ -532,6 +610,9 @@ pub const Agent = struct {
         for (self.interrupted_tools.items) |name| self.allocator.free(name);
         self.interrupted_tools.deinit(self.allocator);
         self.tool_state_mu.unlock();
+        if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
+        if (self.skill_affinity_history) |*ah| ah.deinit();
+        if (self.evolution_tracker) |tracker| self.allocator.destroy(tracker);
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
         }
@@ -931,6 +1012,7 @@ pub const Agent = struct {
         return false;
     }
 
+    /// Check if the plan gate should be active for the current session's channel.
     fn hasModelRouteHint(self: *const Agent, hint: []const u8) bool {
         for (self.model_routes) |route| {
             if (std.mem.eql(u8, route.hint, hint)) return true;
@@ -1606,6 +1688,54 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
+        // ── Score previous turn with user feedback (deferred scoring) ──
+        if (self.prev_turn_context) |prev_ctx| {
+            const feedback = turn_scorer.detectFeedback(user_message);
+            const score = turn_scorer.scoreTurn(prev_ctx, feedback);
+            const scored_event = ObserverEvent{ .turn_scored = .{
+                .score = score.score,
+                .tool_count = score.tool_count,
+                .tool_failures = score.tool_failures,
+                .signals = @bitCast(score.signals),
+                .model = prev_ctx.model,
+                .session_id = self.memory_session_id orelse "",
+                .skill = prev_ctx.skill,
+            } };
+            self.observer.recordEvent(&scored_event);
+
+            // ── Skill evolution: check for improvement triggers ──
+            if (self.evolution_tracker) |tracker| {
+                const now_ts = std.time.timestamp();
+                if (tracker.recordScore(
+                    prev_ctx.model,
+                    score.score,
+                    score.tool_failures,
+                    score.signals.tool_failure,
+                    score.signals.explicit_negative,
+                    now_ts,
+                )) |trigger| {
+                    const evo_event = ObserverEvent{ .evolution_trigger = .{
+                        .skill = trigger.skill_name,
+                        .trigger_type = trigger.trigger_type.toSlice(),
+                        .score = trigger.score,
+                        .model = prev_ctx.model,
+                        .tool_failures = trigger.tool_failures,
+                        .context = "Auto-detected by evolution tracker",
+                    } };
+                    self.observer.recordEvent(&evo_event);
+
+                    // Persist trigger to memory (best-effort)
+                    if (self.mem_rt) |rt| {
+                        skillforge_evolution.storeTrigger(rt.memory, &trigger, self.allocator);
+                    }
+                }
+            }
+
+            if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
+            self.prev_turn_skill_owned = null;
+            self.prev_turn_context = null;
+        }
+
         const turn_input = commands.planTurnInput(user_message);
         const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
@@ -1653,6 +1783,12 @@ pub const Agent = struct {
             }
         }
 
+        // When skill routing is enabled, rebuild prompt every turn so the
+        // router can select skills based on the current user message.
+        if (self.skill_routing_enabled and self.has_system_prompt) {
+            self.has_system_prompt = false;
+        }
+
         const turn_has_conversation_context = self.conversation_context != null;
         const turn_conversation_context_fingerprint = if (self.conversation_context) |ctx|
             ctx.senderFingerprint()
@@ -1670,6 +1806,7 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
+            var routed_skill: ?[]const u8 = null;
             const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
@@ -1678,8 +1815,29 @@ pub const Agent = struct {
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
+                .skill_routing_message = if (self.skill_routing_enabled) effective_user_message else null,
+                .skill_routing_max_active = self.skill_routing_max_active,
+                .matched_skill_out = if (self.skill_routing_enabled) &routed_skill else null,
+                .skill_affinity_history = if (self.skill_affinity_history) |*ah| ah else null,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
             });
+            // Store routed skill for turn-level attribution. Ownership transfers
+            // to prev_turn_skill_owned; freed on next turn or agent deinit.
+            // When the router matches a skill, update attribution. When it doesn't,
+            // keep the previous skill name — follow-up messages in a session
+            // ("ja doe maar", "commit en push") belong to the same skill context.
+            if (routed_skill) |rs| {
+                if (self.prev_turn_skill_owned) |prev| self.allocator.free(prev);
+                self.prev_turn_skill_owned = rs;
+                self.routed_skill = rs;
+                // Push into affinity history for sticky routing on follow-up turns.
+                if (self.skill_affinity_history) |*ah| ah.push(rs);
+            } else if (self.prev_turn_skill_owned) |prev| {
+                // Retain previous skill attribution for this turn
+                self.routed_skill = prev;
+            } else {
+                self.routed_skill = null;
+            }
             const final_system = if (self.profile_system_prompt) |profile_prompt|
                 if (profile_prompt.len > 0) blk: {
                     defer self.allocator.free(full_system);
@@ -1776,12 +1934,34 @@ pub const Agent = struct {
         const turn_token_limit_cap: u32 = @intCast(@min(turn_token_limit, @as(u64, std.math.maxInt(u32))));
         const turn_max_tokens = @min(turn_max_tokens_raw, turn_token_limit_cap);
 
+        // ── Task contract: generate pre-task checkpoints (best-effort) ──
+        if (self.task_contracts_enabled) {
+            self.current_contract = task_contract.generateContract(
+                self.allocator,
+                self.provider,
+                self.task_contracts_model,
+                effective_user_message,
+                self.memory_session_id orelse "",
+                turn_model_name,
+                self.routed_skill orelse "general",
+                self.task_contracts_max_checkpoints,
+            );
+            if (self.current_contract) |c| {
+                log.info("contract: \"{s}\" ({d} checkpoints)", .{ c.task_summary, c.checkpoints.len });
+            }
+        }
+
         // Tool call loop — reuse a single arena across iterations (retains pages)
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer iter_arena.deinit();
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
+        var turn_ctx = turn_scorer.TurnContext{
+            .model = self.model_name,
+            // Use routed skill as initial attribution; tool-name fallback only if unrouted.
+            .skill = self.routed_skill orelse "general",
+        };
         var empty_response_retry_count: u32 = 0;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
@@ -2227,6 +2407,40 @@ pub const Agent = struct {
                     _ = rt.drainOutbox(self.allocator);
                 }
 
+                // ── Turn scorer: save context for deferred feedback scoring ──
+                self.savePrevTurnContext(turn_ctx);
+
+                // ── Task contract: verify checkpoints and persist result ──
+                if (self.current_contract) |*contract| {
+                    var result = task_contract.verifyContract(contract, turn_ctx, final_text);
+                    // duration = now - contract creation timestamp (seconds → ms approximation)
+                    const now_s = std.time.timestamp();
+                    result.duration_ms = if (now_s > contract.timestamp)
+                        @intCast(@as(u64, @intCast(now_s - contract.timestamp)) * 1000)
+                    else
+                        0;
+                    log.info("contract verified: {d}/{d} passed", .{ result.checkpoints_passed, result.checkpoints_total });
+
+                    task_contract.persistResult(self.allocator, result) catch |err| {
+                        log.warn("contract persist failed: {s}", .{@errorName(err)});
+                    };
+
+                    // Emit observer event for RAG pipeline
+                    const cv_event = ObserverEvent{ .contract_verified = .{
+                        .session_id = result.session_id,
+                        .task_summary = result.task_summary,
+                        .checkpoints_passed = result.checkpoints_passed,
+                        .checkpoints_total = result.checkpoints_total,
+                        .model = result.model,
+                        .skill = result.skill,
+                        .duration_ms = result.duration_ms,
+                    } };
+                    self.observer.recordEvent(&cv_event);
+
+                    task_contract.deinitContract(self.allocator, contract);
+                    self.current_contract = null;
+                }
+
                 const complete_event = ObserverEvent{ .turn_complete = {} };
                 self.observer.recordEvent(&complete_event);
 
@@ -2253,7 +2467,10 @@ pub const Agent = struct {
             // There are tool calls — print intermediary text.
             // In tests, stdout is used by Zig's test runner protocol (`--listen`),
             // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
+            // In subprocess/single-message mode, intermediate output is suppressed
+            // so that only the final response appears on stdout (prevents cron jobs
+            // from delivering reasoning/tool-call text in emails).
+            if (!builtin.is_test and !self.suppress_intermediate_output and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
@@ -2353,6 +2570,14 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&tool_event);
 
+                // ── Turn scorer: track tool outcomes ──
+                turn_ctx.tools_called += 1;
+                turn_ctx.has_tool_calls = true;
+                if (!result.success) turn_ctx.tools_failed += 1;
+                // Skill attribution: use routed skill name from skill router.
+                // When no skill was routed, keep "general" — avoids polluting
+                // performance reports with raw tool names (shell, file_read, etc.).
+
                 try results_buf.append(self.allocator, result);
             }
 
@@ -2363,7 +2588,7 @@ pub const Agent = struct {
                 arena,
                 "{s}\n\nReflect on the tool results above and decide your next steps. " ++
                     "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
-                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
+                    "Transient errors (timeout/network/rate-limit) are automatically retried with backoff — if a tool still failed after retries, try an alternative approach or inform the user.",
                 .{scrubbed_results},
             );
             try self.history.append(self.allocator, .{
@@ -2380,6 +2605,7 @@ pub const Agent = struct {
         // ── Graceful degradation: tool iterations exhausted ──────────
         // Instead of returning an error, ask the LLM to summarize what it
         // has accomplished so far and return that as the final response.
+        turn_ctx.max_iterations_hit = true;
         const exhausted_event = ObserverEvent{ .tool_iterations_exhausted = .{ .iterations = self.max_tool_iterations } };
         self.observer.recordEvent(&exhausted_event);
         log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
@@ -2395,6 +2621,7 @@ pub const Agent = struct {
         // Build messages for the summary call
         const summary_messages = self.buildMessageSlice() catch {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            self.savePrevTurnContext(turn_ctx);
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -2423,6 +2650,7 @@ pub const Agent = struct {
             const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - summary_timer_start)));
             self.recordLlmFailureEvent(self.model_name, fail_duration, @errorName(err));
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            self.savePrevTurnContext(turn_ctx);
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
@@ -2468,6 +2696,7 @@ pub const Agent = struct {
         self.last_turn_compacted = self.autoCompactHistory() catch false;
         self.trimHistory();
 
+        self.prev_turn_context = turn_ctx;
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
 
@@ -2703,39 +2932,82 @@ pub const Agent = struct {
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const previous_memory_session_id = tools_mod.setThreadMemorySessionId(self.memory_session_id);
                 defer _ = tools_mod.setThreadMemorySessionId(previous_memory_session_id);
-                const result = t.execute(tool_allocator, args) catch |err| {
+
+                // ── Retry loop with exponential backoff ──
+                const policy = retry.default_policy;
+                var attempt: u8 = 0;
+                while (true) {
+                    const result = t.execute(tool_allocator, args) catch |err| {
+                        const err_name = @errorName(err);
+                        if (verbose_mod.isVerbose()) {
+                            log.info("tool result: name={s} error={s}", .{ call.name, err_name });
+                        }
+                        const class = retry.classifyError(err_name, "");
+                        if (retry.shouldRetry(policy, class, attempt)) {
+                            const bo = retry.backoffMs(policy, attempt);
+                            const retry_event = ObserverEvent{ .tool_retry = .{
+                                .tool = call.name,
+                                .attempt = attempt + 1,
+                                .backoff_ms = bo,
+                                .error_class = "transient",
+                            } };
+                            self.observer.recordEvent(&retry_event);
+                            std.Thread.sleep(bo * std.time.ns_per_ms);
+                            attempt += 1;
+                            continue;
+                        }
+                        return .{
+                            .name = call.name,
+                            .output = err_name,
+                            .success = false,
+                            .tool_call_id = call.tool_call_id,
+                        };
+                    };
+
+                    // Check for interrupt
+                    const was_interrupted = !result.success and
+                        ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
+                            std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
+                    if (was_interrupted) {
+                        self.noteInterruptedTool(trimmed_call_name) catch {};
+                    }
+
+                    // Retry on soft failure (result.success == false, not interrupted)
+                    if (!result.success and !was_interrupted) {
+                        const output = result.error_msg orelse result.output;
+                        const class = retry.classifyError("", output);
+                        if (retry.shouldRetry(policy, class, attempt)) {
+                            const bo = retry.backoffMs(policy, attempt);
+                            const retry_event = ObserverEvent{ .tool_retry = .{
+                                .tool = call.name,
+                                .attempt = attempt + 1,
+                                .backoff_ms = bo,
+                                .error_class = "transient",
+                            } };
+                            self.observer.recordEvent(&retry_event);
+                            std.Thread.sleep(bo * std.time.ns_per_ms);
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+
                     if (verbose_mod.isVerbose()) {
-                        log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
+                        if (result.success) {
+                            const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
+                            log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
+                        } else {
+                            const error_msg = result.error_msg orelse result.output;
+                            const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
+                            log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
+                        }
                     }
                     return .{
                         .name = call.name,
-                        .output = @errorName(err),
-                        .success = false,
+                        .output = if (result.success) result.output else (result.error_msg orelse result.output),
+                        .success = result.success,
                         .tool_call_id = call.tool_call_id,
                     };
-                };
-                const was_interrupted = !result.success and
-                    ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
-                        std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
-                if (was_interrupted) {
-                    self.noteInterruptedTool(trimmed_call_name) catch {};
                 }
-                if (verbose_mod.isVerbose()) {
-                    if (result.success) {
-                        const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
-                        log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
-                    } else {
-                        const error_msg = result.error_msg orelse result.output;
-                        const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
-                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
-                    }
-                }
-                return .{
-                    .name = call.name,
-                    .output = if (result.success) result.output else (result.error_msg orelse result.output),
-                    .success = result.success,
-                    .tool_call_id = call.tool_call_id,
-                };
             }
         }
 
@@ -3108,7 +3380,10 @@ pub const Agent = struct {
         dirs: *std.ArrayListUnmanaged([]const u8),
         raw_dir: []const u8,
     ) !void {
-        const trimmed = std.mem.trimRight(u8, raw_dir, "/\\");
+        // Strip trailing glob wildcards (e.g. "/home/user/*" -> "/home/user")
+        // so prefix matching works correctly for multimodal allowed_dirs.
+        const deglobbed = std.mem.trimRight(u8, raw_dir, "/*\\");
+        const trimmed = if (deglobbed.len > 0) deglobbed else std.mem.trimRight(u8, raw_dir, "/\\");
         if (trimmed.len == 0) return;
 
         if (!containsMultimodalDir(dirs.items, trimmed)) {

@@ -2785,7 +2785,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .tracker = &tracker,
     };
 
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
+    var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, config.subagent);
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     var subagent_manager_needs_err_cleanup = true;
     errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
@@ -2831,6 +2831,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     if (mem_rt) |*rt| {
         yc.tools.bindMemoryRuntime(tools, rt);
     }
+    yc.tools.enableTierGeneration(tools, true);
 
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
@@ -3324,7 +3325,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .tracker = &tracker,
     };
 
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
+    var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, config.subagent);
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     var subagent_manager_needs_err_cleanup = true;
     errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
@@ -3370,6 +3371,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     if (mem_rt) |*rt| {
         yc.tools.bindMemoryRuntime(tools, rt);
     }
+    yc.tools.enableTierGeneration(tools, true);
 
     const runtime_observer = try yc.observability.RuntimeObserver.create(
         allocator,

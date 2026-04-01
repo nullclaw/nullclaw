@@ -472,6 +472,12 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    whatsapp_web_sidecar_url: []const u8 = "",
+    whatsapp_web_auth_token: []const u8 = "",
+    whatsapp_web_allow_from: []const []const u8 = &.{},
+    whatsapp_web_group_allow_from: []const []const u8 = &.{},
+    whatsapp_web_group_policy: []const u8 = "allowlist",
+    whatsapp_web_account_id: []const u8 = "default",
     wechat_account_id: []const u8 = "default",
     wechat_allow_from: []const []const u8 = &.{},
     wechat_callback_token: []const u8 = "",
@@ -680,6 +686,15 @@ pub fn extractBearerToken(auth_header: []const u8) ?[]const u8 {
         return auth_header[prefix.len..];
     }
     return null;
+}
+
+/// Validate a single configured bearer token. Empty config keeps backwards
+/// compatibility by allowing unauthenticated requests.
+pub fn validateConfiguredBearerToken(auth_header: ?[]const u8, expected_token: []const u8) bool {
+    if (expected_token.len == 0) return true;
+    const header = auth_header orelse return false;
+    const bearer = extractBearerToken(header) orelse return false;
+    return std.mem.eql(u8, bearer, expected_token);
 }
 
 /// Returns true when a webhook request should be accepted for the current
@@ -2381,6 +2396,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/wechat", .handler = handleWeChatWebhookRoute },
     .{ .path = "/wecom", .handler = handleWeComWebhookRoute },
     .{ .path = "/qq", .handler = handleQqWebhookRoute },
+    .{ .path = "/whatsapp_web", .handler = handleWhatsAppWebWebhookRoute },
     .{ .path = "/max", .handler = handleMaxWebhookRoute },
     .{ .path = "/api/messages", .handler = handleTeamsWebhookRoute },
 };
@@ -3156,6 +3172,8 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
             const wa_peer_kind = if (wa_is_group) "group" else "direct";
             const wa_peer_id = wa_group_id orelse wa_sender_id;
 
+            std.log.scoped(.gateway).info("whatsapp: {s} msg from {s} session={s}", .{ wa_peer_kind, wa_sender_id, wa_session_key });
+
             if (ctx.state.event_bus) |eb| {
                 var meta_buf: [384]u8 = undefined;
                 const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
@@ -3219,6 +3237,8 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
             const wa_peer_kind = if (wa_is_group) "group" else "direct";
             const wa_peer_id = wa_group_id orelse wa_sender_ns;
 
+            std.log.scoped(.gateway).info("whatsapp: {s} msg from {s} session={s}", .{ wa_peer_kind, wa_sender_ns, wa_session_key });
+
             if (ctx.state.event_bus) |eb| {
                 var meta_buf: [384]u8 = undefined;
                 const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
@@ -3246,6 +3266,154 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 } else {
                     ctx.response_body = "{\"status\":\"received\"}";
                 }
+            } else {
+                ctx.response_body = "{\"status\":\"received\"}";
+            }
+        } else {
+            ctx.response_body = "{\"status\":\"received\"}";
+        }
+    } else {
+        ctx.response_body = "{\"status\":\"received\"}";
+    }
+}
+
+fn handleWhatsAppWebWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_whatsapp_web) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"whatsapp_web channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    const auth_header = extractHeader(ctx.raw_request, "Authorization");
+    if (!validateConfiguredBearerToken(auth_header, ctx.state.whatsapp_web_auth_token)) {
+        ctx.response_status = "401 Unauthorized";
+        ctx.response_body = "{\"error\":\"unauthorized\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "whatsapp_web")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    // Parse the simplified sidecar payload
+    const waw_allow_from = ctx.state.whatsapp_web_allow_from;
+    const waw_group_allow_from = ctx.state.whatsapp_web_group_allow_from;
+    const waw_group_policy = ctx.state.whatsapp_web_group_policy;
+    const waw_account_id = ctx.state.whatsapp_web_account_id;
+
+    const sender = jsonStringField(body, "from");
+    const is_group = blk: {
+        // Simple JSON boolean check for "is_group":true
+        if (std.mem.indexOf(u8, body, "\"is_group\":true")) |_| break :blk true;
+        break :blk false;
+    };
+    const group_id = jsonStringField(body, "group_id");
+
+    // Apply allowlist — skip for LID-format senders (WhatsApp internal IDs
+    // that lack a real phone number; already authenticated by the WA session).
+    // Check reply_to field — if it contains "@lid" this is a LID-format message
+    // (WhatsApp internal ID without a real phone number). Skip allowlist for these
+    // since they're already authenticated by the WhatsApp session itself.
+    const reply_to_raw = jsonStringField(body, "reply_to");
+    const sender_is_lid = if (reply_to_raw) |rt| std.mem.indexOf(u8, rt, "@lid") != null else false;
+    if (!sender_is_lid) {
+        if (!is_group) {
+            if (waw_allow_from.len > 0) {
+                if (sender) |s| {
+                    if (!channels.isAllowed(waw_allow_from, s)) {
+                        ctx.response_body = "{\"status\":\"unauthorized\"}";
+                        return;
+                    }
+                }
+            }
+        } else {
+            if (std.mem.eql(u8, waw_group_policy, "disabled")) {
+                ctx.response_body = "{\"status\":\"unauthorized\"}";
+                return;
+            }
+            if (!std.mem.eql(u8, waw_group_policy, "open")) {
+                const effective = if (waw_group_allow_from.len > 0) waw_group_allow_from else waw_allow_from;
+                if (sender) |s| {
+                    if (effective.len == 0 or !channels.isAllowed(effective, s)) {
+                        ctx.response_body = "{\"status\":\"unauthorized\"}";
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    const raw_text = jsonStringField(body, "text");
+    const media_type = jsonStringField(body, "media_type");
+    const media_path = jsonStringField(body, "media_path");
+
+    // Build message content: prepend media markers to text if media is attached
+    const msg_text: ?[]const u8 = blk: {
+        if (media_path) |mp| {
+            if (media_type) |mtype| {
+                // Map media type to the appropriate marker
+                const marker = if (std.mem.eql(u8, mtype, "image") or std.mem.eql(u8, mtype, "sticker"))
+                    "[IMAGE:"
+                else if (std.mem.eql(u8, mtype, "audio"))
+                    "[AUDIO:"
+                else if (std.mem.eql(u8, mtype, "video"))
+                    "[VIDEO:"
+                else if (std.mem.eql(u8, mtype, "document"))
+                    "[DOCUMENT:"
+                else
+                    "[FILE:";
+                const text_part = raw_text orelse "";
+                const has_text = text_part.len > 0;
+                // Format: "[MARKER:path]\ntext" or "[MARKER:path]"
+                const content = std.fmt.allocPrint(ctx.req_allocator, "{s}{s}]{s}{s}", .{
+                    marker,
+                    mp,
+                    if (has_text) "\n" else "",
+                    text_part,
+                }) catch break :blk raw_text;
+                break :blk content;
+            }
+        }
+        break :blk raw_text;
+    };
+
+    if (msg_text) |mt| {
+        const reply_to = reply_to_raw;
+        const wa_sender = sender orelse "unknown";
+        const session_key = reply_to orelse wa_sender;
+        const wa_peer_kind = if (is_group) "group" else "direct";
+        const wa_peer_id = group_id orelse wa_sender;
+
+        if (ctx.state.event_bus) |eb| {
+            var meta_buf: [384]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                waw_account_id,
+                wa_peer_kind,
+                wa_peer_id,
+            }) catch null;
+            _ = publishToBus(eb, ctx.state.allocator, "whatsapp_web", wa_sender, reply_to orelse wa_sender, mt, session_key, meta);
+            ctx.response_body = "{\"status\":\"received\"}";
+        } else if (ctx.session_mgr_opt) |sm| {
+            const reply: ?[]const u8 = sm.processMessage(session_key, mt, null) catch |err| blk: {
+                ctx.response_body = userFacingAgentErrorJson(err);
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                ctx.response_body = ctx.req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
             } else {
                 ctx.response_body = "{\"status\":\"received\"}";
             }
@@ -4925,6 +5093,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     defer gateway_thread_observer.deinit();
     var runtime_observer: ?*observability.RuntimeObserver = null;
     defer if (runtime_observer) |obs| obs.destroy();
+    var rag_obs_ptr: ?*observability.RagObserver = null;
+    defer if (rag_obs_ptr) |ptr| allocator.destroy(ptr);
     var a2a_registry = a2a.TaskRegistry.init(allocator);
     defer a2a_registry.deinit();
     const needs_local_agent = event_bus == null;
@@ -4932,6 +5102,25 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
         try applyRuntimeProviderOverrides(cfg);
+
+        // Build extra observers: GatewayThreadObserver + optional RagObserver
+        var extra_obs_storage: [2]observability.Observer = undefined;
+        var extra_obs_count: usize = 0;
+        extra_obs_storage[extra_obs_count] = gateway_thread_observer.observer();
+        extra_obs_count += 1;
+
+        if (cfg.diagnostics.rag_url) |rag_url| {
+            if (cfg.diagnostics.rag_token) |rag_token| {
+                rag_obs_ptr = allocator.create(observability.RagObserver) catch null;
+                if (rag_obs_ptr) |ptr| {
+                    ptr.* = .{ .base_url = rag_url, .bearer_token = rag_token };
+                    extra_obs_storage[extra_obs_count] = ptr.observer();
+                    extra_obs_count += 1;
+                    std.log.scoped(.gateway).info("RagObserver attached to gateway", .{});
+                }
+            }
+        }
+
         runtime_observer = try observability.RuntimeObserver.create(
             allocator,
             .{
@@ -4941,7 +5130,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .otel_service_name = cfg.diagnostics.otel_service_name,
             },
             cfg.diagnostics.otel_headers,
-            &.{gateway_thread_observer.observer()},
+            extra_obs_storage[0..extra_obs_count],
         );
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
@@ -4967,6 +5156,14 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.whatsapp_groups = wa_cfg.groups;
             state.whatsapp_group_policy = wa_cfg.group_policy;
             state.whatsapp_account_id = wa_cfg.account_id;
+        }
+        if (cfg.channels.whatsappWebPrimary()) |waw_cfg| {
+            state.whatsapp_web_sidecar_url = waw_cfg.sidecar_url;
+            state.whatsapp_web_auth_token = waw_cfg.auth_token;
+            state.whatsapp_web_allow_from = waw_cfg.allow_from;
+            state.whatsapp_web_group_allow_from = waw_cfg.group_allow_from;
+            state.whatsapp_web_group_policy = waw_cfg.group_policy;
+            state.whatsapp_web_account_id = waw_cfg.account_id;
         }
         if (cfg.channels.linePrimary()) |line_cfg| {
             state.line_channel_secret = line_cfg.channel_secret;
@@ -5037,7 +5234,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
-                    mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
+                    mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, cfg.subagent);
                     mgr.observer = runtime_observer.?.backendObserver();
                     mgr.task_runner = subagent_runner.runTaskWithTools;
                     subagent_manager_opt = mgr;
@@ -5074,6 +5271,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
+                tools_mod.enableTierGeneration(tools_slice, true);
                 session_mgr_opt = sm;
             }
         }
@@ -6173,6 +6371,20 @@ test "extractBearerToken returns null for empty string" {
 test "extractBearerToken returns null for just Bearer" {
     // "Bearer " is 7 chars, "Bearer" is 6 — no space
     try std.testing.expect(extractBearerToken("Bearer") == null);
+}
+
+test "validateConfiguredBearerToken allows empty config" {
+    try std.testing.expect(validateConfiguredBearerToken(null, ""));
+}
+
+test "validateConfiguredBearerToken accepts matching bearer" {
+    try std.testing.expect(validateConfiguredBearerToken("Bearer secret123", "secret123"));
+}
+
+test "validateConfiguredBearerToken rejects missing or wrong bearer" {
+    try std.testing.expect(!validateConfiguredBearerToken(null, "secret123"));
+    try std.testing.expect(!validateConfiguredBearerToken("Basic secret123", "secret123"));
+    try std.testing.expect(!validateConfiguredBearerToken("Bearer wrong", "secret123"));
 }
 
 // ── JSON helper tests ────────────────────────────────────────────

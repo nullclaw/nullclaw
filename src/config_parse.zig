@@ -1011,6 +1011,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.diagnostics.token_usage_ledger_max_lines = @intCast(v.integer);
                 }
             }
+            if (diag.object.get("rag_url")) |v| {
+                if (v == .string) self.diagnostics.rag_url = try self.allocator.dupe(u8, v.string);
+            }
+            if (diag.object.get("rag_token")) |v| {
+                if (v == .string) self.diagnostics.rag_token = try self.allocator.dupe(u8, v.string);
+            }
             var has_nested_otel_endpoint = false;
             var has_nested_otel_service_name = false;
             var has_nested_otel_headers = false;
@@ -1302,6 +1308,44 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     self.agent.tool_filter_groups = try fg_list.toOwnedSlice(self.allocator);
                 }
+            }
+            // Task contracts
+            if (ag.object.get("task_contracts_enabled")) |v| {
+                if (v == .bool) self.agent.task_contracts_enabled = v.bool;
+            }
+            if (ag.object.get("task_contracts_model")) |v| {
+                if (v == .string) self.agent.task_contracts_model = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("task_contracts_max_checkpoints")) |v| {
+                if (v == .integer) self.agent.task_contracts_max_checkpoints = @intCast(v.integer);
+            }
+            // Skill routing
+            if (ag.object.get("skill_routing_enabled")) |v| {
+                if (v == .bool) self.agent.skill_routing_enabled = v.bool;
+            }
+            if (ag.object.get("skill_routing_max_active")) |v| {
+                if (v == .integer) self.agent.skill_routing_max_active = @intCast(v.integer);
+            }
+            if (ag.object.get("skill_routing_affinity_bonus")) |v| {
+                if (v == .float) self.agent.skill_routing_affinity_bonus = @floatCast(v.float);
+            }
+            if (ag.object.get("skill_routing_affinity_depth")) |v| {
+                if (v == .integer) self.agent.skill_routing_affinity_depth = @intCast(v.integer);
+            }
+            if (ag.object.get("skill_routing_affinity_decay_step")) |v| {
+                if (v == .float) self.agent.skill_routing_affinity_decay_step = @floatCast(v.float);
+            }
+        }
+    }
+
+    // Subagent
+    if (root.get("subagent")) |sa| {
+        if (sa == .object) {
+            if (sa.object.get("max_iterations")) |v| {
+                if (v == .integer) self.subagent.max_iterations = @intCast(v.integer);
+            }
+            if (sa.object.get("max_concurrent")) |v| {
+                if (v == .integer) self.subagent.max_concurrent = @intCast(v.integer);
             }
         }
     }

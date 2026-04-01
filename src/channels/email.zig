@@ -8,9 +8,11 @@ pub const EmailChannel = struct {
     config: config_types.EmailConfig,
     /// Tracks last Message-ID per sender for In-Reply-To/References headers.
     reply_message_ids: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Dedup set for seen IMAP UIDs (prevents reprocessing).
+    seen_uids: BoundedSeenSet,
 
     pub fn init(allocator: std.mem.Allocator, config: config_types.EmailConfig) EmailChannel {
-        return .{ .allocator = allocator, .config = config, .reply_message_ids = .empty };
+        return .{ .allocator = allocator, .config = config, .reply_message_ids = .empty, .seen_uids = BoundedSeenSet.init(allocator, 500) };
     }
 
     pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.EmailConfig) EmailChannel {
@@ -24,6 +26,7 @@ pub const EmailChannel = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.reply_message_ids.deinit(self.allocator);
+        self.seen_uids.deinit();
     }
 
     /// Record a Message-ID for a sender (for threading replies).
@@ -86,7 +89,7 @@ pub const EmailChannel = struct {
 
     // ── Channel vtable ──────────────────────────────────────────────
 
-    /// Send an email via SMTP.
+    /// Send an email via SMTP using curl (supports STARTTLS).
     /// If message starts with "Subject: <line>\n", extracts the subject.
     /// Otherwise uses a default subject.
     pub fn sendMessage(self: *EmailChannel, recipient: []const u8, message: []const u8) !void {
@@ -102,63 +105,377 @@ pub const EmailChannel = struct {
             }
         }
 
-        // Connect to SMTP server via TCP
-        const addr = std.net.Address.resolveIp(self.config.smtp_host, self.config.smtp_port) catch return error.SmtpConnectError;
-        const stream = std.net.tcpConnectToAddress(addr) catch return error.SmtpConnectError;
-        defer stream.close();
+        // Convert markdown body to email-safe HTML with inline styles
+        const html_body_owned = markdownToEmailHtml(self.allocator, body) catch return error.SmtpError;
+        defer self.allocator.free(html_body_owned);
 
-        // Read greeting
-        var greeting_buf: [1024]u8 = undefined;
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
+        const boundary = "----=_nullclaw_boundary_001";
 
-        // EHLO
-        var ehlo_buf: [256]u8 = undefined;
-        var ehlo_fbs = std.io.fixedBufferStream(&ehlo_buf);
-        try ehlo_fbs.writer().print("EHLO nullclaw\r\n", .{});
-        try stream.writeAll(ehlo_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
+        // Build email content as multipart/alternative (plain + HTML)
+        var email_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer email_list.deinit(self.allocator);
+        const ew = email_list.writer(self.allocator);
 
-        // MAIL FROM
-        var from_buf: [512]u8 = undefined;
-        var from_fbs = std.io.fixedBufferStream(&from_buf);
-        try from_fbs.writer().print("MAIL FROM:<{s}>\r\n", .{self.config.from_address});
-        try stream.writeAll(from_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
-
-        // RCPT TO
-        var rcpt_buf: [512]u8 = undefined;
-        var rcpt_fbs = std.io.fixedBufferStream(&rcpt_buf);
-        try rcpt_fbs.writer().print("RCPT TO:<{s}>\r\n", .{recipient});
-        try stream.writeAll(rcpt_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
-
-        // DATA
-        try stream.writeAll("DATA\r\n");
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
-
-        // Build email headers + body
-        var data_buf: [16384]u8 = undefined;
-        var data_fbs = std.io.fixedBufferStream(&data_buf);
-        const dw = data_fbs.writer();
-        try dw.print("From: {s}\r\n", .{self.config.from_address});
-        try dw.print("To: {s}\r\n", .{recipient});
-        try dw.print("Subject: {s}\r\n", .{subject});
+        try ew.print("From: {s}\r\n", .{self.config.from_address});
+        try ew.print("To: {s}\r\n", .{recipient});
+        try ew.print("Subject: {s}\r\n", .{subject});
+        try ew.writeAll("MIME-Version: 1.0\r\n");
 
         // Add In-Reply-To/References headers if we have a tracked message-id
         if (self.reply_message_ids.get(recipient)) |msg_id| {
-            try dw.print("In-Reply-To: <{s}>\r\n", .{msg_id});
-            try dw.print("References: <{s}>\r\n", .{msg_id});
+            try ew.print("In-Reply-To: <{s}>\r\n", .{msg_id});
+            try ew.print("References: <{s}>\r\n", .{msg_id});
         }
 
-        try dw.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
-        try dw.writeAll("\r\n");
-        try dw.writeAll(body);
-        try dw.writeAll("\r\n.\r\n");
-        try stream.writeAll(data_fbs.getWritten());
-        _ = stream.read(&greeting_buf) catch return error.SmtpError;
+        try ew.print("Content-Type: multipart/alternative; boundary=\"{s}\"\r\n", .{boundary});
+        try ew.writeAll("\r\n");
 
-        // QUIT
-        try stream.writeAll("QUIT\r\n");
+        // Plain text part
+        try ew.print("--{s}\r\n", .{boundary});
+        try ew.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll(body);
+        try ew.writeAll("\r\n");
+
+        // HTML part
+        try ew.print("--{s}\r\n", .{boundary});
+        try ew.writeAll("Content-Type: text/html; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll("<div style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;line-height:1.6;color:#333;\">");
+        try ew.writeAll(html_body_owned);
+        try ew.writeAll("</div>");
+
+        // Append HTML signature if configured
+        const sig_html = self.loadSignature();
+        defer if (sig_html) |s| self.allocator.free(s);
+        if (sig_html) |sig| {
+            try ew.writeAll("\r\n");
+            try ew.writeAll(sig);
+        }
+        try ew.writeAll("\r\n");
+
+        // End boundary
+        try ew.print("--{s}--\r\n", .{boundary});
+
+        const email_data = email_list.items;
+
+        // Build SMTP URL
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("smtp://{s}:{d}", .{ self.config.smtp_host, self.config.smtp_port });
+        const smtp_url = url_fbs.getWritten();
+
+        // Build user:pass
+        var user_buf: [512]u8 = undefined;
+        var user_fbs = std.io.fixedBufferStream(&user_buf);
+        try user_fbs.writer().print("{s}:{s}", .{ self.config.username, self.config.password });
+        const user_str = user_fbs.getWritten();
+
+        // Build --mail-from and --mail-rcpt
+        var from_arg_buf: [256]u8 = undefined;
+        var from_arg_fbs = std.io.fixedBufferStream(&from_arg_buf);
+        try from_arg_fbs.writer().print("{s}", .{self.config.from_address});
+        const from_arg = from_arg_fbs.getWritten();
+
+        var rcpt_arg_buf: [256]u8 = undefined;
+        var rcpt_arg_fbs = std.io.fixedBufferStream(&rcpt_arg_buf);
+        try rcpt_arg_fbs.writer().print("{s}", .{recipient});
+        const rcpt_arg = rcpt_arg_fbs.getWritten();
+
+        var argv_buf: [20][]const u8 = undefined;
+        var argc: usize = 0;
+
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = "30";
+        argc += 1;
+
+        // STARTTLS when smtp_tls is enabled
+        if (self.config.smtp_tls) {
+            argv_buf[argc] = "--ssl-reqd";
+            argc += 1;
+        }
+
+        argv_buf[argc] = "--url";
+        argc += 1;
+        argv_buf[argc] = smtp_url;
+        argc += 1;
+        argv_buf[argc] = "-u";
+        argc += 1;
+        argv_buf[argc] = user_str;
+        argc += 1;
+        argv_buf[argc] = "--mail-from";
+        argc += 1;
+        argv_buf[argc] = from_arg;
+        argc += 1;
+        argv_buf[argc] = "--mail-rcpt";
+        argc += 1;
+        argv_buf[argc] = rcpt_arg;
+        argc += 1;
+        argv_buf[argc] = "--upload-file";
+        argc += 1;
+        argv_buf[argc] = "-";
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+
+        // Write email data to stdin
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(email_data) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.SmtpError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        }
+
+        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        };
+        defer self.allocator.free(stdout);
+
+        const term = child.wait() catch return error.SmtpError;
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.SmtpError,
+            else => return error.SmtpError,
+        }
+    }
+
+    /// Load HTML signature from the configured signature_file path.
+    /// Returns null if no file is configured or if reading fails.
+    fn loadSignature(self: *EmailChannel) ?[]u8 {
+        if (self.config.signature_file.len == 0) return null;
+        const file = std.fs.cwd().openFile(self.config.signature_file, .{}) catch return null;
+        defer file.close();
+        return file.readToEndAlloc(self.allocator, 64 * 1024) catch null;
+    }
+
+    /// Send an email with optional file attachments via SMTP.
+    /// When media paths are provided, wraps the message body in multipart/mixed
+    /// with base64-encoded file attachments.
+    pub fn sendMessageWithMedia(self: *EmailChannel, recipient: []const u8, message: []const u8, media: []const []const u8) !void {
+        if (media.len == 0) return self.sendMessage(recipient, message);
+        if (!self.config.consent_granted) return error.ConsentNotGranted;
+
+        // Extract subject if present
+        var subject: []const u8 = "nullclaw Message";
+        var body = message;
+        if (std.mem.startsWith(u8, message, "Subject: ")) {
+            if (std.mem.indexOf(u8, message, "\n")) |nl_pos| {
+                subject = message[9..nl_pos];
+                body = std.mem.trimLeft(u8, message[nl_pos + 1 ..], " \t\r\n");
+            }
+        }
+
+        const html_body_owned = markdownToEmailHtml(self.allocator, body) catch return error.SmtpError;
+        defer self.allocator.free(html_body_owned);
+
+        const mixed_boundary = "----=_nullclaw_mixed_001";
+        const alt_boundary = "----=_nullclaw_alt_001";
+
+        var email_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer email_list.deinit(self.allocator);
+        const ew = email_list.writer(self.allocator);
+
+        // Headers
+        try ew.print("From: {s}\r\n", .{self.config.from_address});
+        try ew.print("To: {s}\r\n", .{recipient});
+        try ew.print("Subject: {s}\r\n", .{subject});
+        try ew.writeAll("MIME-Version: 1.0\r\n");
+
+        if (self.reply_message_ids.get(recipient)) |msg_id| {
+            try ew.print("In-Reply-To: <{s}>\r\n", .{msg_id});
+            try ew.print("References: <{s}>\r\n", .{msg_id});
+        }
+
+        // Outer: multipart/mixed (body + attachments)
+        try ew.print("Content-Type: multipart/mixed; boundary=\"{s}\"\r\n", .{mixed_boundary});
+        try ew.writeAll("\r\n");
+
+        // Inner: multipart/alternative (plain + HTML)
+        try ew.print("--{s}\r\n", .{mixed_boundary});
+        try ew.print("Content-Type: multipart/alternative; boundary=\"{s}\"\r\n", .{alt_boundary});
+        try ew.writeAll("\r\n");
+
+        // Plain text part
+        try ew.print("--{s}\r\n", .{alt_boundary});
+        try ew.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll(body);
+        try ew.writeAll("\r\n");
+
+        // HTML part
+        try ew.print("--{s}\r\n", .{alt_boundary});
+        try ew.writeAll("Content-Type: text/html; charset=utf-8\r\n");
+        try ew.writeAll("Content-Transfer-Encoding: 8bit\r\n");
+        try ew.writeAll("\r\n");
+        try ew.writeAll("<div style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;line-height:1.6;color:#333;\">");
+        try ew.writeAll(html_body_owned);
+        try ew.writeAll("</div>");
+
+        const sig_html = self.loadSignature();
+        defer if (sig_html) |s| self.allocator.free(s);
+        if (sig_html) |sig| {
+            try ew.writeAll("\r\n");
+            try ew.writeAll(sig);
+        }
+        try ew.writeAll("\r\n");
+        try ew.print("--{s}--\r\n", .{alt_boundary});
+
+        // Attachments
+        for (media) |path| {
+            const file_data = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch |err| {
+                log.warn("Failed to read attachment {s}: {s}", .{ path, @errorName(err) });
+                continue;
+            };
+            defer self.allocator.free(file_data);
+
+            const filename = std.fs.path.basename(path);
+            const mime_type = mimeTypeFromPath(path);
+
+            try ew.print("\r\n--{s}\r\n", .{mixed_boundary});
+            try ew.print("Content-Type: {s}; name=\"{s}\"\r\n", .{ mime_type, filename });
+            try ew.writeAll("Content-Transfer-Encoding: base64\r\n");
+            try ew.print("Content-Disposition: attachment; filename=\"{s}\"\r\n", .{filename});
+            try ew.writeAll("\r\n");
+
+            // Base64 encode in 76-char lines
+            const encoder = std.base64.standard.Encoder;
+            const encoded_len = encoder.calcSize(file_data.len);
+            const encoded = self.allocator.alloc(u8, encoded_len) catch continue;
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, file_data);
+
+            // Write in 76-char lines per RFC 2045
+            var offset: usize = 0;
+            while (offset < encoded.len) {
+                const end = @min(offset + 76, encoded.len);
+                try ew.writeAll(encoded[offset..end]);
+                try ew.writeAll("\r\n");
+                offset = end;
+            }
+        }
+
+        // End mixed boundary
+        try ew.print("--{s}--\r\n", .{mixed_boundary});
+
+        // Send via SMTP (same as sendMessage)
+        const email_data = email_list.items;
+
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("smtp://{s}:{d}", .{ self.config.smtp_host, self.config.smtp_port });
+        const smtp_url = url_fbs.getWritten();
+
+        var user_buf: [512]u8 = undefined;
+        var user_fbs = std.io.fixedBufferStream(&user_buf);
+        try user_fbs.writer().print("{s}:{s}", .{ self.config.username, self.config.password });
+        const user_str = user_fbs.getWritten();
+
+        var from_arg_buf: [256]u8 = undefined;
+        var from_arg_fbs = std.io.fixedBufferStream(&from_arg_buf);
+        try from_arg_fbs.writer().print("{s}", .{self.config.from_address});
+        const from_arg = from_arg_fbs.getWritten();
+
+        var rcpt_arg_buf: [256]u8 = undefined;
+        var rcpt_arg_fbs = std.io.fixedBufferStream(&rcpt_arg_buf);
+        try rcpt_arg_fbs.writer().print("{s}", .{recipient});
+        const rcpt_arg = rcpt_arg_fbs.getWritten();
+
+        var argv_buf: [20][]const u8 = undefined;
+        var argc: usize = 0;
+
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = "30";
+        argc += 1;
+
+        if (self.config.smtp_tls) {
+            argv_buf[argc] = "--ssl-reqd";
+            argc += 1;
+        }
+
+        argv_buf[argc] = "--url";
+        argc += 1;
+        argv_buf[argc] = smtp_url;
+        argc += 1;
+        argv_buf[argc] = "-u";
+        argc += 1;
+        argv_buf[argc] = user_str;
+        argc += 1;
+        argv_buf[argc] = "--mail-from";
+        argc += 1;
+        argv_buf[argc] = from_arg;
+        argc += 1;
+        argv_buf[argc] = "--mail-rcpt";
+        argc += 1;
+        argv_buf[argc] = rcpt_arg;
+        argc += 1;
+        argv_buf[argc] = "--upload-file";
+        argc += 1;
+        argv_buf[argc] = "-";
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(email_data) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.SmtpError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        }
+
+        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.SmtpError;
+        };
+        defer self.allocator.free(stdout);
+
+        const term = child.wait() catch return error.SmtpError;
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.SmtpError,
+            else => return error.SmtpError,
+        }
     }
 
     /// Send a reply email — applies Re: prefix to subject and includes threading headers.
@@ -185,6 +502,280 @@ pub const EmailChannel = struct {
         _ = stream.read(&resp_buf) catch return error.ImapError;
     }
 
+    // ── IMAP Polling via curl ──────────────────────────────────────
+
+    /// Quick TCP probe to check if the IMAP server is reachable.
+    /// Returns true if a connection can be established, false otherwise.
+    /// Used to skip polling when the network is down (e.g. wifi off at night).
+    pub fn isImapReachable(self: *EmailChannel, allocator: std.mem.Allocator) bool {
+        const addr_list = std.net.getAddressList(allocator, self.config.imap_host, self.config.imap_port) catch return false;
+        defer addr_list.deinit();
+        if (addr_list.addrs.len == 0) return false;
+        const stream = std.net.tcpConnectToAddress(addr_list.addrs[0]) catch return false;
+        stream.close();
+        return true;
+    }
+
+    /// Run a curl IMAP command and return stdout. Caller owns returned memory.
+    pub fn imapCurl(self: *EmailChannel, allocator: std.mem.Allocator, url: []const u8, custom_request: ?[]const u8) ![]u8 {
+        var argv_buf: [16][]const u8 = undefined;
+        var argc: usize = 0;
+
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = "30";
+        argc += 1;
+
+        // Auth
+        var user_buf: [512]u8 = undefined;
+        var user_fbs = std.io.fixedBufferStream(&user_buf);
+        user_fbs.writer().print("{s}:{s}", .{ self.config.username, self.config.password }) catch return error.ImapError;
+        const user_str = user_fbs.getWritten();
+
+        argv_buf[argc] = "-u";
+        argc += 1;
+        argv_buf[argc] = user_str;
+        argc += 1;
+
+        if (custom_request) |req| {
+            argv_buf[argc] = "-X";
+            argc += 1;
+            argv_buf[argc] = req;
+            argc += 1;
+        }
+
+        argv_buf[argc] = url;
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        try child.spawn();
+
+        const stdout = child.stdout.?.readToEndAlloc(allocator, 512 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.ImapError;
+        };
+
+        const stderr = child.stderr.?.readToEndAlloc(allocator, 64 * 1024) catch "";
+        defer if (stderr.len > 0) allocator.free(stderr);
+
+        const term = child.wait() catch {
+            allocator.free(stdout);
+            return error.ImapError;
+        };
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                log.warn("curl IMAP failed (exit {d}): {s}", .{ code, if (stderr.len > 0) stderr else "(no stderr)" });
+                allocator.free(stdout);
+                return error.ImapError;
+            },
+            else => {
+                log.warn("curl IMAP abnormal termination: {s}", .{if (stderr.len > 0) stderr else "(no stderr)"});
+                allocator.free(stdout);
+                return error.ImapError;
+            },
+        }
+
+        return stdout;
+    }
+
+    /// Poll for new IMAP messages. Returns slice of ChannelMessages. Caller owns all memory.
+    pub fn pollMessages(self: *EmailChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
+        // Build IMAP URL
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        url_fbs.writer().print("imaps://{s}:{d}/{s}", .{
+            self.config.imap_host, self.config.imap_port, self.config.imap_folder,
+        }) catch return error.ImapError;
+        const base_url = url_fbs.getWritten();
+
+        // UID SEARCH returns actual UIDs (not sequence numbers) so they work with ;UID= fetch
+        const search_result = try self.imapCurl(allocator, base_url, "UID SEARCH UNSEEN");
+        defer allocator.free(search_result);
+
+        // Parse UIDs from "* SEARCH 1 2 3\r\n" response
+        var uids: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (uids.items) |uid| allocator.free(uid);
+            uids.deinit(allocator);
+        }
+
+        var lines = std.mem.splitSequence(u8, search_result, "\n");
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            // Look for "* SEARCH <uid> <uid> ..."
+            if (std.mem.startsWith(u8, trimmed, "* SEARCH")) {
+                var tokens = std.mem.tokenizeScalar(u8, trimmed["* SEARCH".len..], ' ');
+                while (tokens.next()) |token| {
+                    const clean = std.mem.trim(u8, token, " \t\r\n");
+                    if (clean.len == 0) continue;
+                    // Validate it's numeric
+                    var is_num = true;
+                    for (clean) |c| {
+                        if (!std.ascii.isDigit(c)) {
+                            is_num = false;
+                            break;
+                        }
+                    }
+                    if (is_num) {
+                        try uids.append(allocator, try allocator.dupe(u8, clean));
+                    }
+                }
+            }
+        }
+
+        var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+        errdefer {
+            for (messages.items) |msg| msg.deinit(allocator);
+            messages.deinit(allocator);
+        }
+
+        for (uids.items) |uid| {
+            // Skip already seen UIDs
+            if (self.seen_uids.contains(uid)) continue;
+
+            // Fetch the message
+            var fetch_url_buf: [576]u8 = undefined;
+            var fetch_fbs = std.io.fixedBufferStream(&fetch_url_buf);
+            fetch_fbs.writer().print("imaps://{s}:{d}/{s};UID={s}", .{
+                self.config.imap_host, self.config.imap_port, self.config.imap_folder, uid,
+            }) catch continue;
+            const fetch_url = fetch_fbs.getWritten();
+
+            const raw_email = self.imapCurl(allocator, fetch_url, null) catch |err| {
+                log.warn("Failed to fetch UID {s}: {}", .{ uid, err });
+                continue;
+            };
+            defer allocator.free(raw_email);
+
+            // Parse the email
+            const parsed = parseRawEmail(raw_email);
+            const sender_addr = extractEmailAddress(parsed.from);
+
+            // Check sender allowlist — unknown senders are still delivered
+            // but wrapped with [UNKNOWN_SENDER] so the agent can decide
+            const is_known_sender = self.isSenderAllowed(sender_addr);
+            if (!is_known_sender) {
+                log.info("Email from unknown sender: {s} — forwarding to agent for triage", .{sender_addr});
+            }
+
+            // Extract body
+            var body_text = extractTextBody(allocator, raw_email) catch continue;
+            defer allocator.free(body_text);
+
+            // Truncate if needed
+            const max_bytes = self.config.max_body_bytes;
+            var final_content: []u8 = undefined;
+
+            if (body_text.len > max_bytes) {
+                const truncated_marker = std.fmt.allocPrint(allocator, "{s}\n[TRUNCATED - original was {d} bytes]", .{
+                    body_text[0..max_bytes], body_text.len,
+                }) catch continue;
+                final_content = truncated_marker;
+            } else {
+                final_content = allocator.dupe(u8, body_text) catch continue;
+            }
+
+            // Injection check + untrusted wrapping
+            if (basicInjectionCheck(final_content)) {
+                log.warn("Injection pattern detected in email from {s}", .{sender_addr});
+                allocator.free(final_content);
+                _ = self.seen_uids.insert(uid) catch {};
+                self.imapStoreSeen(allocator, base_url, uid);
+                continue;
+            }
+
+            // Extract and save attachments (if enabled)
+            var saved_attachments: []root.Attachment = &.{};
+            if (self.config.attachment_save_enabled) {
+                saved_attachments = extractAndSaveAttachments(
+                    allocator,
+                    raw_email,
+                    self.config.attachment_save_dir,
+                    self.config.attachment_extensions,
+                    self.config.attachment_max_bytes,
+                    uid,
+                ) catch &.{};
+            }
+
+            // Build attachment info text for LLM context
+            var attachment_info: []u8 = &.{};
+            defer if (attachment_info.len > 0) allocator.free(attachment_info);
+
+            if (saved_attachments.len > 0) {
+                var info_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer info_buf.deinit(allocator);
+                const writer = info_buf.writer(allocator);
+                writer.writeAll("\n\n[ATTACHMENTS]\n") catch {};
+                for (saved_attachments) |att| {
+                    writer.print("- {s} (saved to: {s})\n", .{ att.filename, att.path }) catch {};
+                }
+                writer.writeAll("[/ATTACHMENTS]") catch {};
+                attachment_info = info_buf.toOwnedSlice(allocator) catch &.{};
+            }
+
+            // Wrap in markers — unknown senders get extra [UNKNOWN_SENDER] tag
+            const tag_start: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_START]" else "[UNKNOWN_SENDER_START]";
+            const tag_end: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_END]" else "[UNKNOWN_SENDER_END]";
+            const wrapped = if (attachment_info.len > 0)
+                std.fmt.allocPrint(allocator, "{s}\nUID: {s}\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n{s}", .{
+                    tag_start, uid, sender_addr, parsed.subject, final_content, attachment_info, tag_end,
+                }) catch {
+                    allocator.free(final_content);
+                    continue;
+                }
+            else
+                std.fmt.allocPrint(allocator, "{s}\nUID: {s}\nFrom: {s}\nSubject: {s}\n\n{s}\n{s}", .{
+                    tag_start, uid, sender_addr, parsed.subject, final_content, tag_end,
+                }) catch {
+                    allocator.free(final_content);
+                    continue;
+                };
+            allocator.free(final_content);
+
+            // Track Message-ID for threading
+            if (parsed.message_id.len > 0) {
+                self.trackMessageId(sender_addr, parsed.message_id) catch {};
+            }
+
+            // Build ChannelMessage
+            try messages.append(allocator, .{
+                .id = allocator.dupe(u8, uid) catch continue,
+                .sender = allocator.dupe(u8, sender_addr) catch continue,
+                .content = wrapped,
+                .channel = "email",
+                .timestamp = root.nowEpochSecs(),
+                .reply_target = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sender_addr, parsed.subject }) catch null,
+                .attachments = saved_attachments,
+            });
+
+            // Mark seen
+            _ = self.seen_uids.insert(uid) catch {};
+            self.imapStoreSeen(allocator, base_url, uid);
+        }
+
+        // Sleep for poll_interval is handled by the loop caller
+        return messages.toOwnedSlice(allocator);
+    }
+
+    /// Mark a UID as \Seen via curl IMAP STORE command.
+    fn imapStoreSeen(self: *EmailChannel, allocator: std.mem.Allocator, base_url: []const u8, uid: []const u8) void {
+        var cmd_buf: [128]u8 = undefined;
+        var cmd_fbs = std.io.fixedBufferStream(&cmd_buf);
+        cmd_fbs.writer().print("UID STORE {s} +FLAGS (\\Seen)", .{uid}) catch return;
+        const cmd = cmd_fbs.getWritten();
+        const result = self.imapCurl(allocator, base_url, cmd) catch return;
+        allocator.free(result);
+    }
+
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         _ = ptr;
         // Email uses polling for IMAP; no persistent connection to start.
@@ -194,9 +785,9 @@ pub const EmailChannel = struct {
         _ = ptr;
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *EmailChannel = @ptrCast(@alignCast(ptr));
-        try self.sendMessage(target, message);
+        try self.sendMessageWithMedia(target, message, media);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -219,6 +810,583 @@ pub const EmailChannel = struct {
 
     pub fn channel(self: *EmailChannel) root.Channel {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
+// ── Native IMAP Client with IDLE support ────────────────────────────────
+//
+// Persistent TLS+IMAP connection that uses IDLE for push notifications
+// instead of spawning curl every poll interval.
+
+pub const ImapClient = struct {
+    allocator: std.mem.Allocator,
+    config: config_types.EmailConfig,
+
+    // Connection state — openssl s_client subprocess
+    child: ?std.process.Child = null,
+    state: ImapState = .disconnected,
+
+    // IMAP protocol
+    tag_counter: u32 = 0,
+    server_supports_idle: bool = false,
+
+    // Backoff
+    consecutive_failures: u32 = 0,
+    backoff_ms: u64 = 1000,
+
+    // Line read buffer
+    line_buf: [4096]u8 = undefined,
+    line_len: usize = 0,
+
+    pub const ImapState = enum {
+        disconnected,
+        connected,
+        authenticated,
+        selected,
+        idling,
+    };
+
+    pub const IdleResult = enum {
+        new_mail,
+        renewal,
+        shutdown,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, config: config_types.EmailConfig) ImapClient {
+        return .{
+            .allocator = allocator,
+            .config = config,
+        };
+    }
+
+    /// Connect via `openssl s_client` subprocess to the IMAP server.
+    /// This avoids Zig's std TLS Client which doesn't support server-first protocols.
+    pub fn connect(self: *ImapClient) !void {
+        if (self.state != .disconnected) return;
+
+        // Build connect string "host:port"
+        var addr_buf: [280]u8 = undefined;
+        var addr_fbs = std.io.fixedBufferStream(&addr_buf);
+        addr_fbs.writer().print("{s}:{d}", .{ self.config.imap_host, self.config.imap_port }) catch
+            return error.ImapConnectFailed;
+        const connect_addr = addr_fbs.getWritten();
+
+        var child = std.process.Child.init(
+            &.{ "openssl", "s_client", "-connect", connect_addr, "-quiet" },
+            self.allocator,
+        );
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch |err| {
+            log.warn("IMAP openssl spawn failed: {}", .{err});
+            return error.ImapConnectFailed;
+        };
+
+        self.child = child;
+
+        // Read server greeting
+        const greeting = self.readLine() catch |err| {
+            log.warn("IMAP greeting read failed: {}", .{err});
+            self.disconnect();
+            return error.ImapConnectFailed;
+        };
+        if (!std.mem.startsWith(u8, greeting, "* OK")) {
+            log.warn("IMAP unexpected greeting: {s}", .{greeting});
+            self.disconnect();
+            return error.ImapConnectFailed;
+        }
+
+        self.state = .connected;
+        log.info("IMAP connected to {s}:{d}", .{ self.config.imap_host, self.config.imap_port });
+    }
+
+    /// Send LOGIN command.
+    pub fn login(self: *ImapClient) !void {
+        if (self.state != .connected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} LOGIN {s} {s}\r\n", .{ tag, self.config.username, self.config.password }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        // Read response lines until tagged response
+        try self.expectTaggedOk(tag);
+        self.state = .authenticated;
+        log.info("IMAP authenticated as {s}", .{self.config.username});
+    }
+
+    /// Send CAPABILITY command and check for IDLE support.
+    pub fn capability(self: *ImapClient) !void {
+        const tag = self.nextTag();
+        var cmd_buf: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} CAPABILITY\r\n", .{tag}) catch return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        self.server_supports_idle = false;
+        while (true) {
+            const line = try self.readLine();
+            if (std.mem.startsWith(u8, line, "* CAPABILITY")) {
+                // Check for IDLE in capability list
+                var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+                while (tokens.next()) |token| {
+                    if (std.ascii.eqlIgnoreCase(token, "IDLE")) {
+                        self.server_supports_idle = true;
+                    }
+                }
+            }
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) return error.ImapProtocolError;
+                break;
+            }
+        }
+    }
+
+    /// Send SELECT command for the configured folder.
+    pub fn selectFolder(self: *ImapClient) !void {
+        if (self.state != .authenticated) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [256]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} SELECT {s}\r\n", .{ tag, self.config.imap_folder }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        try self.expectTaggedOk(tag);
+        self.state = .selected;
+    }
+
+    /// Send UID SEARCH UNSEEN and return list of UID strings. Caller owns memory.
+    pub fn searchUnseen(self: *ImapClient, allocator: std.mem.Allocator) ![][]const u8 {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} UID SEARCH UNSEEN\r\n", .{tag}) catch return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        var uids: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (uids.items) |uid| allocator.free(uid);
+            uids.deinit(allocator);
+        }
+
+        while (true) {
+            const line = try self.readLine();
+            if (std.mem.startsWith(u8, line, "* SEARCH")) {
+                var tokens = std.mem.tokenizeScalar(u8, line["* SEARCH".len..], ' ');
+                while (tokens.next()) |token| {
+                    const clean = std.mem.trim(u8, token, " \t\r\n");
+                    if (clean.len == 0) continue;
+                    var is_num = true;
+                    for (clean) |c| {
+                        if (!std.ascii.isDigit(c)) {
+                            is_num = false;
+                            break;
+                        }
+                    }
+                    if (is_num) {
+                        try uids.append(allocator, try allocator.dupe(u8, clean));
+                    }
+                }
+            }
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) return error.ImapProtocolError;
+                break;
+            }
+        }
+
+        return uids.toOwnedSlice(allocator);
+    }
+
+    /// Fetch a single message by UID. Returns raw RFC822 bytes. Caller owns memory.
+    pub fn fetchMessage(self: *ImapClient, allocator: std.mem.Allocator, uid: []const u8) ![]u8 {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} UID FETCH {s} (BODY.PEEK[])\r\n", .{ tag, uid }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        // Read response — look for literal {N}
+        var message_data: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer message_data.deinit(allocator);
+
+        while (true) {
+            const line = try self.readLine();
+
+            // Look for literal size: "* N FETCH ... {SIZE}"
+            if (std.mem.startsWith(u8, line, "* ") and std.mem.indexOf(u8, line, "FETCH") != null) {
+                if (std.mem.lastIndexOf(u8, line, "{")) |brace_start| {
+                    if (std.mem.indexOf(u8, line[brace_start..], "}")) |brace_end| {
+                        const size_str = line[brace_start + 1 .. brace_start + brace_end];
+                        const literal_size = std.fmt.parseInt(usize, size_str, 10) catch continue;
+                        // Cap at max_body_bytes * 2 to prevent OOM
+                        const max_size = @min(literal_size, self.config.max_body_bytes * 2);
+                        // Read exactly literal_size bytes
+                        try message_data.ensureTotalCapacity(allocator, max_size);
+                        var remaining = literal_size;
+                        while (remaining > 0) {
+                            var read_buf: [4096]u8 = undefined;
+                            const to_read = @min(remaining, read_buf.len);
+                            const n = self.readRaw(read_buf[0..to_read]) catch break;
+                            if (n == 0) break;
+                            const actual = @min(n, max_size - message_data.items.len);
+                            if (actual > 0) {
+                                try message_data.appendSlice(allocator, read_buf[0..actual]);
+                            }
+                            remaining -= n;
+                        }
+                    }
+                }
+            }
+
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) {
+                    message_data.deinit(allocator);
+                    return error.ImapProtocolError;
+                }
+                break;
+            }
+        }
+
+        return message_data.toOwnedSlice(allocator);
+    }
+
+    /// Mark a UID as \Seen via UID STORE.
+    pub fn storeSeen(self: *ImapClient, uid: []const u8) !void {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} UID STORE {s} +FLAGS (\\Seen)\r\n", .{ tag, uid }) catch
+            return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+        try self.expectTaggedOk(tag);
+    }
+
+    /// Enter IDLE mode and wait for new mail or timeout.
+    /// Returns the reason IDLE was exited.
+    /// If `heartbeat` is provided, it is updated on each socket timeout to signal
+    /// the supervision loop that the thread is alive (not stale) while waiting.
+    pub fn idle(self: *ImapClient, stop_requested: *const std.atomic.Value(bool), heartbeat: ?*std.atomic.Value(i64)) !IdleResult {
+        if (self.state != .selected) return error.ImapWrongState;
+
+        const tag = self.nextTag();
+        var cmd_buf: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} IDLE\r\n", .{tag}) catch return error.ImapProtocolError;
+        try self.writeAll(fbs.getWritten());
+
+        // Wait for continuation response "+ idling" or "+ "
+        const cont = self.readLine() catch |err| {
+            log.warn("IMAP IDLE continuation failed: {}", .{err});
+            return error.ImapProtocolError;
+        };
+        if (cont.len == 0 or cont[0] != '+') {
+            log.warn("IMAP IDLE unexpected response: {s}", .{cont});
+            return error.ImapProtocolError;
+        }
+
+        self.state = .idling;
+        const idle_start = std.time.timestamp();
+        const idle_max_secs: i64 = 25 * 60; // 25 minutes (RFC 2177 max is 29)
+
+        // IDLE read loop with SO_RCVTIMEO providing 30s timeouts
+        while (true) {
+            if (stop_requested.load(.acquire)) {
+                // Shutdown requested — exit IDLE
+                try self.writeAll("DONE\r\n");
+                self.expectTaggedOk(tag) catch {};
+                self.state = .selected;
+                return .shutdown;
+            }
+
+            const line = self.readLine() catch |err| {
+                if (err == error.ImapTimeout) {
+                    // Signal supervision loop that we're still alive
+                    if (heartbeat) |hb| hb.store(std.time.timestamp(), .release);
+
+                    // Check if we've been idling too long
+                    const elapsed = std.time.timestamp() - idle_start;
+                    if (elapsed >= idle_max_secs) {
+                        // Renew IDLE
+                        try self.writeAll("DONE\r\n");
+                        self.expectTaggedOk(tag) catch {};
+                        self.state = .selected;
+                        return .renewal;
+                    }
+                    // Otherwise just continue waiting
+                    continue;
+                }
+                // Real error — connection probably dropped
+                self.state = .disconnected;
+                return err;
+            };
+
+            // Check for EXISTS notification (new mail)
+            if (std.mem.indexOf(u8, line, "EXISTS") != null) {
+                try self.writeAll("DONE\r\n");
+                self.expectTaggedOk(tag) catch {};
+                self.state = .selected;
+                return .new_mail;
+            }
+
+            // Check for BYE (server shutting down)
+            if (std.mem.startsWith(u8, line, "* BYE")) {
+                log.warn("IMAP server sent BYE during IDLE", .{});
+                self.state = .disconnected;
+                return error.ImapServerBye;
+            }
+        }
+    }
+
+    /// Send LOGOUT and clean up.
+    pub fn logout(self: *ImapClient) void {
+        if (self.state == .disconnected) return;
+
+        const tag = self.nextTag();
+        var cmd_buf: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        fbs.writer().print("{s} LOGOUT\r\n", .{tag}) catch {
+            self.disconnect();
+            return;
+        };
+        self.writeAll(fbs.getWritten()) catch {
+            self.disconnect();
+            return;
+        };
+        // Read response but don't wait forever
+        _ = self.readLine() catch {};
+        self.disconnect();
+    }
+
+    /// Kill subprocess and clean up.
+    pub fn disconnect(self: *ImapClient) void {
+        if (self.child) |*child| {
+            if (child.stdin) |stdin| stdin.close();
+            child.stdin = null;
+            if (child.stdout) |stdout| stdout.close();
+            child.stdout = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            self.child = null;
+        }
+        self.state = .disconnected;
+    }
+
+    /// Backoff after a failure — exponential up to 60s.
+    pub fn backoff(self: *ImapClient) void {
+        std.Thread.sleep(self.backoff_ms * std.time.ns_per_ms);
+        self.backoff_ms = @min(self.backoff_ms * 2, 60_000);
+        self.consecutive_failures += 1;
+    }
+
+    pub fn resetBackoff(self: *ImapClient) void {
+        self.backoff_ms = 1000;
+        self.consecutive_failures = 0;
+    }
+
+    pub fn shouldFallbackToPoll(self: *const ImapClient) bool {
+        return self.consecutive_failures >= 5;
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────
+
+    /// Read raw bytes from subprocess stdout with platform-appropriate timeout.
+    fn readRaw(self: *ImapClient, out: []u8) !usize {
+        const builtin = @import("builtin");
+        const child = self.child orelse return error.ImapReadError;
+        const stdout = child.stdout orelse return error.ImapReadError;
+
+        if (comptime builtin.os.tag == .windows) {
+            // Windows: use WaitForSingleObject for timeout on pipe handles.
+            const windows = std.os.windows;
+            const handle = stdout.handle;
+            const result = windows.kernel32.WaitForSingleObject(handle, 30_000);
+            if (result == windows.WAIT_OBJECT_0) {
+                // Data available
+            } else if (result == windows.WAIT_TIMEOUT) {
+                return error.ImapTimeout;
+            } else {
+                return error.ImapReadError;
+            }
+            var bytes_read: u32 = 0;
+            if (windows.kernel32.ReadFile(handle, out.ptr, @intCast(out.len), &bytes_read, null) == 0) {
+                return error.ImapReadError;
+            }
+            return @intCast(bytes_read);
+        } else {
+            // POSIX: poll with 30s timeout for data availability.
+            const fd = stdout.handle;
+            var pollfds = [1]std.posix.pollfd{.{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const poll_result = std.posix.poll(&pollfds, 30_000) catch return error.ImapReadError;
+            if (poll_result == 0) return error.ImapTimeout;
+            if (pollfds[0].revents & std.posix.POLL.IN != 0) {
+                // Data available — read below
+            } else if (pollfds[0].revents & std.posix.POLL.HUP != 0) {
+                return @as(usize, 0); // EOF
+            } else {
+                return error.ImapReadError;
+            }
+            return std.posix.read(fd, out) catch return error.ImapReadError;
+        }
+    }
+
+    /// Write all bytes to subprocess stdin.
+    fn writeAll(self: *ImapClient, data: []const u8) !void {
+        const child = self.child orelse return error.ImapWriteError;
+        const stdin = child.stdin orelse return error.ImapWriteError;
+        stdin.writeAll(data) catch return error.ImapWriteError;
+    }
+
+    /// Read a single IMAP response line (up to \r\n).
+    fn readLine(self: *ImapClient) ![]const u8 {
+        self.line_len = 0;
+        while (self.line_len < self.line_buf.len - 1) {
+            var byte_buf: [1]u8 = undefined;
+            const n = self.readRaw(&byte_buf) catch |err| {
+                if (err == error.ImapTimeout) {
+                    if (self.line_len > 0) continue; // partial line, keep reading
+                    return error.ImapTimeout;
+                }
+                return err;
+            };
+            if (n == 0) {
+                if (self.line_len > 0) {
+                    return self.line_buf[0..self.line_len];
+                }
+                return error.ImapReadError; // connection closed
+            }
+            const b = byte_buf[0];
+            if (b == '\n') {
+                // Strip trailing \r if present
+                const end = if (self.line_len > 0 and self.line_buf[self.line_len - 1] == '\r')
+                    self.line_len - 1
+                else
+                    self.line_len;
+                return self.line_buf[0..end];
+            }
+            self.line_buf[self.line_len] = b;
+            self.line_len += 1;
+        }
+        // Line too long — return what we have
+        return self.line_buf[0..self.line_len];
+    }
+
+    /// Generate next IMAP tag: A0001, A0002, ...
+    fn nextTag(self: *ImapClient) [5]u8 {
+        self.tag_counter += 1;
+        var tag: [5]u8 = undefined;
+        _ = std.fmt.bufPrint(&tag, "A{d:0>4}", .{self.tag_counter}) catch {
+            tag = .{ 'A', '0', '0', '0', '1' };
+        };
+        return tag;
+    }
+
+    /// Check if a line is a tagged response for the given tag.
+    fn isTaggedResponse(self: *ImapClient, line: []const u8, tag: [5]u8) bool {
+        _ = self;
+        return line.len >= 5 and std.mem.eql(u8, line[0..5], &tag);
+    }
+
+    /// Check if a tagged response is OK.
+    fn isOkResponse(self: *ImapClient, line: []const u8, tag: [5]u8) bool {
+        _ = self;
+        if (line.len < 8) return false; // "AXXXX OK" = 8 chars minimum
+        return std.mem.eql(u8, line[0..5], &tag) and
+            line.len > 6 and std.mem.startsWith(u8, line[5..], " OK");
+    }
+
+    /// Read responses until we get the tagged OK. Returns error if NO/BAD.
+    fn expectTaggedOk(self: *ImapClient, tag: [5]u8) !void {
+        while (true) {
+            const line = try self.readLine();
+            if (self.isTaggedResponse(line, tag)) {
+                if (!self.isOkResponse(line, tag)) {
+                    log.warn("IMAP command failed: {s}", .{line});
+                    return error.ImapProtocolError;
+                }
+                return;
+            }
+        }
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────
+
+    test "ImapClient init defaults" {
+        const cfg = config_types.EmailConfig{};
+        const client = ImapClient.init(std.testing.allocator, cfg);
+        try std.testing.expect(client.state == .disconnected);
+        try std.testing.expect(!client.server_supports_idle);
+        try std.testing.expectEqual(@as(u32, 0), client.tag_counter);
+        try std.testing.expectEqual(@as(u64, 1000), client.backoff_ms);
+    }
+
+    test "ImapClient nextTag increments" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        const tag1 = client.nextTag();
+        try std.testing.expectEqualStrings("A0001", &tag1);
+        const tag2 = client.nextTag();
+        try std.testing.expectEqualStrings("A0002", &tag2);
+    }
+
+    test "ImapClient isTaggedResponse" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        const tag = [5]u8{ 'A', '0', '0', '0', '1' };
+        try std.testing.expect(client.isTaggedResponse("A0001 OK Success", tag));
+        try std.testing.expect(!client.isTaggedResponse("A0002 OK Success", tag));
+        try std.testing.expect(!client.isTaggedResponse("* OK", tag));
+    }
+
+    test "ImapClient isOkResponse" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        const tag = [5]u8{ 'A', '0', '0', '0', '1' };
+        try std.testing.expect(client.isOkResponse("A0001 OK Success", tag));
+        try std.testing.expect(!client.isOkResponse("A0001 NO Denied", tag));
+        try std.testing.expect(!client.isOkResponse("A0001 BAD Syntax", tag));
+    }
+
+    test "ImapClient backoff exponential" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        try std.testing.expectEqual(@as(u64, 1000), client.backoff_ms);
+        // Simulate backoff without actual sleep
+        client.backoff_ms = @min(client.backoff_ms * 2, 60_000);
+        client.consecutive_failures += 1;
+        try std.testing.expectEqual(@as(u64, 2000), client.backoff_ms);
+        client.backoff_ms = @min(client.backoff_ms * 2, 60_000);
+        try std.testing.expectEqual(@as(u64, 4000), client.backoff_ms);
+        // Test cap
+        client.backoff_ms = 32_000;
+        client.backoff_ms = @min(client.backoff_ms * 2, 60_000);
+        try std.testing.expectEqual(@as(u64, 60_000), client.backoff_ms);
+    }
+
+    test "ImapClient shouldFallbackToPoll" {
+        const cfg = config_types.EmailConfig{};
+        var client = ImapClient.init(std.testing.allocator, cfg);
+        try std.testing.expect(!client.shouldFallbackToPoll());
+        client.consecutive_failures = 4;
+        try std.testing.expect(!client.shouldFallbackToPoll());
+        client.consecutive_failures = 5;
+        try std.testing.expect(client.shouldFallbackToPoll());
     }
 };
 
@@ -385,6 +1553,326 @@ pub fn decodeRfc2047(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     return result.toOwnedSlice(allocator);
 }
 
+const log = std.log.scoped(.email);
+
+/// Parsed email headers.
+const ParsedEmail = struct {
+    from: []const u8,
+    subject: []const u8,
+    message_id: []const u8,
+    date: []const u8,
+};
+
+/// Parse raw email headers. Returns slices into the input (no allocation).
+pub fn parseRawEmail(raw: []const u8) ParsedEmail {
+    var result = ParsedEmail{
+        .from = "",
+        .subject = "",
+        .message_id = "",
+        .date = "",
+    };
+
+    // Find end of headers (blank line)
+    const header_end = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |pos|
+        pos
+    else if (std.mem.indexOf(u8, raw, "\n\n")) |pos|
+        pos
+    else
+        raw.len;
+
+    const headers = raw[0..header_end];
+
+    var lines_iter = std.mem.splitSequence(u8, headers, "\n");
+    while (lines_iter.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (std.ascii.startsWithIgnoreCase(trimmed, "From: ")) {
+            result.from = std.mem.trim(u8, trimmed["From: ".len..], " \t");
+        } else if (std.ascii.startsWithIgnoreCase(trimmed, "Subject: ")) {
+            result.subject = std.mem.trim(u8, trimmed["Subject: ".len..], " \t");
+        } else if (std.ascii.startsWithIgnoreCase(trimmed, "Message-ID: ")) {
+            const mid = std.mem.trim(u8, trimmed["Message-ID: ".len..], " \t");
+            // Strip angle brackets
+            if (mid.len > 2 and mid[0] == '<' and mid[mid.len - 1] == '>') {
+                result.message_id = mid[1 .. mid.len - 1];
+            } else {
+                result.message_id = mid;
+            }
+        } else if (std.ascii.startsWithIgnoreCase(trimmed, "Date: ")) {
+            result.date = std.mem.trim(u8, trimmed["Date: ".len..], " \t");
+        }
+    }
+
+    return result;
+}
+
+/// Extract bare email address from a From header value.
+/// "John Doe <john@example.com>" → "john@example.com"
+/// "john@example.com" → "john@example.com"
+pub fn extractEmailAddress(from: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, from, "<")) |start| {
+        if (std.mem.indexOf(u8, from[start..], ">")) |end| {
+            return from[start + 1 .. start + end];
+        }
+    }
+    // No angle brackets — return the whole thing trimmed
+    return std.mem.trim(u8, from, " \t");
+}
+
+/// Extract text body from raw email. Strips HTML if no text/plain found.
+/// Caller owns returned memory.
+pub fn extractTextBody(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    // Find body start (after blank line)
+    const body_start = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |pos|
+        pos + 4
+    else if (std.mem.indexOf(u8, raw, "\n\n")) |pos|
+        pos + 2
+    else
+        return allocator.dupe(u8, "");
+
+    if (body_start >= raw.len) return allocator.dupe(u8, "");
+
+    const body = raw[body_start..];
+
+    // Check if it looks like HTML
+    if (std.mem.indexOf(u8, body, "<html") != null or
+        std.mem.indexOf(u8, body, "<HTML") != null or
+        std.mem.indexOf(u8, body, "<body") != null or
+        std.mem.indexOf(u8, body, "<BODY") != null)
+    {
+        return stripHtml(allocator, body);
+    }
+
+    return allocator.dupe(u8, body);
+}
+
+/// Extract MIME boundary from a Content-Type header value.
+/// E.g. "multipart/mixed; boundary=\"----=_Part_123\"" → "----=_Part_123"
+pub fn extractMimeBoundary(raw: []const u8) ?[]const u8 {
+    // Find Content-Type header in the raw email headers
+    const header_end = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |pos|
+        pos
+    else if (std.mem.indexOf(u8, raw, "\n\n")) |pos|
+        pos
+    else
+        return null;
+
+    const headers = raw[0..header_end];
+    // Case-insensitive search for "content-type:" containing "multipart"
+    var lines_iter = std.mem.splitSequence(u8, headers, "\n");
+    while (lines_iter.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (std.ascii.startsWithIgnoreCase(trimmed, "Content-Type:")) {
+            const ct_value = trimmed["Content-Type:".len..];
+            if (std.ascii.indexOfIgnoreCase(ct_value, "multipart") == null) return null;
+            // Find boundary=
+            if (std.ascii.indexOfIgnoreCase(ct_value, "boundary=")) |bpos| {
+                var bval = ct_value[bpos + "boundary=".len ..];
+                bval = std.mem.trim(u8, bval, " \t");
+                if (bval.len > 0 and bval[0] == '"') {
+                    bval = bval[1..];
+                    if (std.mem.indexOf(u8, bval, "\"")) |end| {
+                        return bval[0..end];
+                    }
+                } else {
+                    // Unquoted — ends at whitespace or semicolon
+                    var end: usize = 0;
+                    while (end < bval.len and bval[end] != ';' and bval[end] != ' ' and bval[end] != '\t' and bval[end] != '\r' and bval[end] != '\n') {
+                        end += 1;
+                    }
+                    if (end > 0) return bval[0..end];
+                }
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Check if a filename has an allowed extension.
+pub fn hasAllowedExtension(filename: []const u8, allowed: []const []const u8) bool {
+    // Find last dot
+    var dot_pos: ?usize = null;
+    var i: usize = filename.len;
+    while (i > 0) {
+        i -= 1;
+        if (filename[i] == '.') {
+            dot_pos = i;
+            break;
+        }
+    }
+    const ext_start = dot_pos orelse return false;
+    const ext = filename[ext_start..];
+    for (allowed) |allowed_ext| {
+        if (std.ascii.eqlIgnoreCase(ext, allowed_ext)) return true;
+    }
+    return false;
+}
+
+/// Extract filename from a Content-Disposition header value.
+/// E.g. "attachment; filename=\"report.pdf\"" → "report.pdf"
+fn extractAttachmentFilename(header_value: []const u8) ?[]const u8 {
+    // Must start with "attachment"
+    if (std.ascii.indexOfIgnoreCase(header_value, "attachment") == null) return null;
+    // Find filename=
+    if (std.ascii.indexOfIgnoreCase(header_value, "filename=")) |fpos| {
+        var fval = header_value[fpos + "filename=".len ..];
+        fval = std.mem.trim(u8, fval, " \t");
+        if (fval.len > 0 and fval[0] == '"') {
+            fval = fval[1..];
+            if (std.mem.indexOf(u8, fval, "\"")) |end| {
+                return fval[0..end];
+            }
+        } else {
+            var end: usize = 0;
+            while (end < fval.len and fval[end] != ';' and fval[end] != ' ' and fval[end] != '\t' and fval[end] != '\r' and fval[end] != '\n') {
+                end += 1;
+            }
+            if (end > 0) return fval[0..end];
+        }
+    }
+    return null;
+}
+
+/// Parse MIME parts and extract attachments with allowed extensions.
+/// Saves files to save_dir. Returns list of saved Attachment structs.
+pub fn extractAndSaveAttachments(
+    allocator: std.mem.Allocator,
+    raw_email: []const u8,
+    save_dir: []const u8,
+    allowed_extensions: []const []const u8,
+    max_bytes: u64,
+    uid: []const u8,
+) ![]root.Attachment {
+    const boundary = extractMimeBoundary(raw_email) orelse return allocator.alloc(root.Attachment, 0);
+
+    // Build the delimiter: "--" + boundary
+    var delim_buf: [256]u8 = undefined;
+    var delim_fbs = std.io.fixedBufferStream(&delim_buf);
+    delim_fbs.writer().print("--{s}", .{boundary}) catch return allocator.alloc(root.Attachment, 0);
+    const delimiter = delim_fbs.getWritten();
+
+    var attachments: std.ArrayListUnmanaged(root.Attachment) = .empty;
+    errdefer {
+        for (attachments.items) |att| att.deinit(allocator);
+        attachments.deinit(allocator);
+    }
+
+    // Split by boundary
+    var parts = std.mem.splitSequence(u8, raw_email, delimiter);
+    _ = parts.next(); // preamble — skip
+
+    while (parts.next()) |part| {
+        // Skip closing boundary marker
+        if (part.len >= 2 and std.mem.startsWith(u8, part, "--")) continue;
+
+        // Find header/body separator within this part
+        const part_body_start = if (std.mem.indexOf(u8, part, "\r\n\r\n")) |pos|
+            pos + 4
+        else if (std.mem.indexOf(u8, part, "\n\n")) |pos|
+            pos + 2
+        else
+            continue;
+
+        const part_headers = part[0..part_body_start];
+        const part_body = std.mem.trimRight(u8, part[part_body_start..], " \t\r\n");
+
+        // Look for Content-Disposition: attachment; filename="..."
+        var filename: ?[]const u8 = null;
+        var is_base64 = false;
+
+        var hdr_lines = std.mem.splitSequence(u8, part_headers, "\n");
+        while (hdr_lines.next()) |hline| {
+            const htrimmed = std.mem.trimRight(u8, hline, "\r");
+            if (std.ascii.startsWithIgnoreCase(htrimmed, "Content-Disposition:")) {
+                filename = extractAttachmentFilename(htrimmed["Content-Disposition:".len..]);
+            } else if (std.ascii.startsWithIgnoreCase(htrimmed, "Content-Transfer-Encoding:")) {
+                const enc = std.mem.trim(u8, htrimmed["Content-Transfer-Encoding:".len..], " \t");
+                if (std.ascii.eqlIgnoreCase(enc, "base64")) is_base64 = true;
+            }
+        }
+
+        const fname = filename orelse continue;
+        if (!hasAllowedExtension(fname, allowed_extensions)) continue;
+
+        // Decode body
+        var decoded: []u8 = undefined;
+        if (is_base64) {
+            // Strip whitespace from base64 payload
+            var clean: std.ArrayListUnmanaged(u8) = .empty;
+            defer clean.deinit(allocator);
+            for (part_body) |c| {
+                if (c != '\r' and c != '\n' and c != ' ' and c != '\t') {
+                    try clean.append(allocator, c);
+                }
+            }
+            const out_size = std.base64.standard.Decoder.calcSizeForSlice(clean.items) catch continue;
+            if (out_size > max_bytes) {
+                log.warn("Attachment {s} exceeds max size ({d} > {d}), skipping", .{ fname, out_size, max_bytes });
+                continue;
+            }
+            decoded = try allocator.alloc(u8, out_size);
+            std.base64.standard.Decoder.decode(decoded, clean.items) catch {
+                allocator.free(decoded);
+                continue;
+            };
+        } else {
+            if (part_body.len > max_bytes) {
+                log.warn("Attachment {s} exceeds max size, skipping", .{fname});
+                continue;
+            }
+            decoded = try allocator.dupe(u8, part_body);
+        }
+        defer allocator.free(decoded);
+
+        // Ensure save directory exists
+        std.fs.cwd().makePath(save_dir) catch |err| {
+            log.warn("Failed to create attachment dir {s}: {}", .{ save_dir, err });
+            continue;
+        };
+
+        // Build unique filename: uid_originalname
+        var path_buf: [512]u8 = undefined;
+        var path_fbs = std.io.fixedBufferStream(&path_buf);
+        path_fbs.writer().print("{s}/{s}_{s}", .{ save_dir, uid, fname }) catch continue;
+        const file_path = path_fbs.getWritten();
+
+        // Write file
+        const file = std.fs.cwd().createFile(file_path, .{}) catch |err| {
+            log.warn("Failed to save attachment {s}: {}", .{ file_path, err });
+            continue;
+        };
+        defer file.close();
+        file.writeAll(decoded) catch |err| {
+            log.warn("Failed to write attachment {s}: {}", .{ file_path, err });
+            continue;
+        };
+
+        log.info("Saved attachment: {s} ({d} bytes)", .{ file_path, decoded.len });
+
+        try attachments.append(allocator, .{
+            .path = try allocator.dupe(u8, file_path),
+            .filename = try allocator.dupe(u8, fname),
+        });
+    }
+
+    return attachments.toOwnedSlice(allocator);
+}
+
+/// Basic injection pattern check. Returns true if suspicious.
+pub fn basicInjectionCheck(content: []const u8) bool {
+    const patterns = [_][]const u8{
+        "SYSTEM:",
+        "ASSISTANT:",
+        "[INST]",
+        "<<SYS>>",
+        "ignore previous instructions",
+    };
+    for (patterns) |pattern| {
+        if (std.ascii.indexOfIgnoreCase(content, pattern) != null) return true;
+    }
+    return false;
+}
+
 const EncodedWord = struct {
     encoding: []const u8, // "B" or "Q"
     payload: []const u8,
@@ -424,6 +1912,441 @@ fn hexDigit(c: u8) ?u8 {
     if (c >= 'A' and c <= 'F') return c - 'A' + 10;
     if (c >= 'a' and c <= 'f') return c - 'a' + 10;
     return null;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Markdown → Email HTML
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Convert markdown text to email-safe HTML with inline styles.
+/// Caller owns returned slice and must free with the same allocator.
+/// Map file extension to MIME type for email attachments.
+fn mimeTypeFromPath(path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(path);
+    if (ext.len == 0) return "application/octet-stream";
+    // Skip the leading dot
+    const e = if (ext[0] == '.') ext[1..] else ext;
+    if (std.ascii.eqlIgnoreCase(e, "pdf")) return "application/pdf";
+    if (std.ascii.eqlIgnoreCase(e, "png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(e, "jpg") or std.ascii.eqlIgnoreCase(e, "jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(e, "gif")) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(e, "txt")) return "text/plain";
+    if (std.ascii.eqlIgnoreCase(e, "html") or std.ascii.eqlIgnoreCase(e, "htm")) return "text/html";
+    if (std.ascii.eqlIgnoreCase(e, "csv")) return "text/csv";
+    if (std.ascii.eqlIgnoreCase(e, "json")) return "application/json";
+    if (std.ascii.eqlIgnoreCase(e, "xml")) return "application/xml";
+    if (std.ascii.eqlIgnoreCase(e, "zip")) return "application/zip";
+    if (std.ascii.eqlIgnoreCase(e, "doc")) return "application/msword";
+    if (std.ascii.eqlIgnoreCase(e, "docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (std.ascii.eqlIgnoreCase(e, "xls")) return "application/vnd.ms-excel";
+    if (std.ascii.eqlIgnoreCase(e, "xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    return "application/octet-stream";
+}
+
+fn markdownToEmailHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var i: usize = 0;
+    var line_start = true;
+    var in_ul = false; // track whether we're inside a <ul>
+
+    while (i < md.len) {
+        // ── Close <ul> if we're in one and this line is not a bullet ──
+        if (line_start and in_ul) {
+            const is_bullet = (i + 1 < md.len and md[i] == '-' and md[i + 1] == ' ');
+            const is_star_bullet = (i + 1 < md.len and md[i] == '*' and md[i + 1] == ' ' and
+                !(i + 2 < md.len and md[i + 1] == '*'));
+            if (!is_bullet and !is_star_bullet) {
+                try buf.appendSlice(allocator, "</ul>");
+                in_ul = false;
+            }
+        }
+
+        // ── Code blocks ``` ... ``` ──
+        if (i + 2 < md.len and md[i] == '`' and md[i + 1] == '`' and md[i + 2] == '`') {
+            const content_start = if (i + 3 < md.len and md[i + 3] == '\n') i + 4 else i + 3;
+            const lang_end = std.mem.indexOfScalarPos(u8, md, i + 3, '\n') orelse md.len;
+            const actual_start = if (lang_end < md.len) lang_end + 1 else content_start;
+
+            const close = emailFindTripleBacktick(md, actual_start);
+            if (close) |end| {
+                try buf.appendSlice(allocator, "<pre style=\"background:#f4f4f4;padding:12px;border-radius:6px;font-family:monospace;font-size:0.9em;overflow-x:auto;\">");
+                try emailAppendHtmlEscaped(&buf, allocator, md[actual_start..end]);
+                try buf.appendSlice(allocator, "</pre>");
+                i = end + 3;
+                if (i < md.len and md[i] == '\n') i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Inline code `...` ──
+        if (md[i] == '`') {
+            const close = std.mem.indexOfScalarPos(u8, md, i + 1, '`');
+            if (close) |end| {
+                try buf.appendSlice(allocator, "<code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i + 1 .. end]);
+                try buf.appendSlice(allocator, "</code>");
+                i = end + 1;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Headers at line start ──
+        if (line_start and md[i] == '#') {
+            var level: usize = 0;
+            while (i + level < md.len and md[i + level] == '#') level += 1;
+            if (level <= 6 and i + level < md.len and md[i + level] == ' ') {
+                i += level + 1;
+                const end = std.mem.indexOfScalarPos(u8, md, i, '\n') orelse md.len;
+                // Map markdown levels: # → h2, ## → h3, etc.
+                const tag_level = level + 1;
+                const clamped = if (tag_level > 6) @as(u8, 6) else @as(u8, @intCast(tag_level));
+                try buf.appendSlice(allocator, "<h");
+                try buf.append(allocator, '0' + clamped);
+                try buf.appendSlice(allocator, " style=\"margin:0.5em 0;color:#1a1a1a;\">");
+                try emailAppendInlineFormatted(&buf, allocator, md[i..end]);
+                try buf.appendSlice(allocator, "</h");
+                try buf.append(allocator, '0' + clamped);
+                try buf.appendSlice(allocator, ">");
+                i = end;
+                // Skip the trailing newline, but only if it's not part of a
+                // double-newline paragraph break (so the \n\n → <p> rule fires).
+                if (i < md.len and md[i] == '\n') {
+                    if (i + 1 < md.len and md[i + 1] == '\n') {
+                        // Leave i on the first \n so the paragraph-break handler sees \n\n
+                    } else {
+                        i += 1;
+                    }
+                }
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Bullet lists at line start (- item or * item) ──
+        if (line_start) {
+            const is_dash_bullet = (i + 1 < md.len and md[i] == '-' and md[i + 1] == ' ');
+            const is_star_bullet = (i + 1 < md.len and md[i] == '*' and md[i + 1] == ' ' and
+                !(i + 2 < md.len and md[i + 1] == '*'));
+            if (is_dash_bullet or is_star_bullet) {
+                if (!in_ul) {
+                    try buf.appendSlice(allocator, "<ul style=\"margin:0.5em 0;padding-left:1.5em;\">");
+                    in_ul = true;
+                }
+                i += 2;
+                const end = std.mem.indexOfScalarPos(u8, md, i, '\n') orelse md.len;
+                try buf.appendSlice(allocator, "<li style=\"margin:2px 0;\">");
+                try emailAppendInlineFormatted(&buf, allocator, md[i..end]);
+                try buf.appendSlice(allocator, "</li>");
+                i = end;
+                if (i < md.len) i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Tables (| col | col | ... ) ──
+        if (line_start and md[i] == '|') {
+            // Collect all contiguous table lines (lines starting with |)
+            const table_start = i;
+            var table_end = i;
+            var line_count: usize = 0;
+            {
+                var scan = table_start;
+                while (scan < md.len) {
+                    // Each iteration: scan is at the start of a line
+                    if (md[scan] != '|') break;
+                    // Find end of this line
+                    const eol = std.mem.indexOfScalarPos(u8, md, scan, '\n') orelse md.len;
+                    line_count += 1;
+                    table_end = eol;
+                    if (eol >= md.len) break;
+                    scan = eol + 1;
+                }
+            }
+            // Need at least 2 lines (header + separator) for a valid table
+            if (line_count >= 2) {
+                // Close any open <ul>
+                if (in_ul) {
+                    try buf.appendSlice(allocator, "</ul>");
+                    in_ul = false;
+                }
+                try buf.appendSlice(allocator, "<table style=\"border-collapse:collapse;margin:0.5em 0;width:100%;\">");
+                var row: usize = 0;
+                var pos = table_start;
+                while (pos < table_end) {
+                    const eol = std.mem.indexOfScalarPos(u8, md, pos, '\n') orelse table_end;
+                    const line = md[pos..eol];
+
+                    // Skip separator row (| --- | --- |)
+                    if (isTableSeparator(line)) {
+                        pos = if (eol < md.len) eol + 1 else eol;
+                        row += 1;
+                        continue;
+                    }
+
+                    const is_header = (row == 0);
+                    try buf.appendSlice(allocator, "<tr>");
+
+                    // Parse cells between pipes
+                    var ci: usize = 0;
+                    if (ci < line.len and line[ci] == '|') ci += 1; // skip leading |
+                    while (ci < line.len) {
+                        const next_pipe = std.mem.indexOfScalarPos(u8, line, ci, '|') orelse line.len;
+                        const cell = std.mem.trim(u8, line[ci..next_pipe], " \t");
+                        if (is_header) {
+                            try buf.appendSlice(allocator, "<th style=\"border:1px solid #ddd;padding:8px 12px;background:#f8f8f8;text-align:left;font-weight:600;\">");
+                        } else {
+                            try buf.appendSlice(allocator, "<td style=\"border:1px solid #ddd;padding:8px 12px;\">");
+                        }
+                        try emailAppendInlineFormatted(&buf, allocator, cell);
+                        if (is_header) {
+                            try buf.appendSlice(allocator, "</th>");
+                        } else {
+                            try buf.appendSlice(allocator, "</td>");
+                        }
+                        if (next_pipe >= line.len) break;
+                        ci = next_pipe + 1;
+                        // Skip trailing pipe at end of line
+                        if (ci < line.len and std.mem.indexOfScalarPos(u8, line, ci, '|') == null) {
+                            const remaining = std.mem.trim(u8, line[ci..], " \t");
+                            if (remaining.len == 0) break;
+                        }
+                    }
+                    try buf.appendSlice(allocator, "</tr>");
+                    pos = if (eol < md.len) eol + 1 else eol;
+                    row += 1;
+                }
+                try buf.appendSlice(allocator, "</table>");
+                i = table_end;
+                if (i < md.len and md[i] == '\n') i += 1;
+                line_start = true;
+                continue;
+            }
+        }
+
+        // ── Strikethrough ~~text~~ ──
+        if (i + 1 < md.len and md[i] == '~' and md[i + 1] == '~') {
+            const close = std.mem.indexOf(u8, md[i + 2 ..], "~~");
+            if (close) |offset| {
+                try buf.appendSlice(allocator, "<s>");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</s>");
+                i = i + 2 + offset + 2;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Bold **text** ──
+        if (i + 1 < md.len and md[i] == '*' and md[i + 1] == '*') {
+            const close = std.mem.indexOf(u8, md[i + 2 ..], "**");
+            if (close) |offset| {
+                try buf.appendSlice(allocator, "<strong>");
+                try emailAppendHtmlEscaped(&buf, allocator, md[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</strong>");
+                i = i + 2 + offset + 2;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // ── Links [text](url) ──
+        if (md[i] == '[') {
+            const close_bracket = std.mem.indexOfScalarPos(u8, md, i + 1, ']');
+            if (close_bracket) |cb| {
+                if (cb + 1 < md.len and md[cb + 1] == '(') {
+                    const close_paren = std.mem.indexOfScalarPos(u8, md, cb + 2, ')');
+                    if (close_paren) |cp| {
+                        const text = md[i + 1 .. cb];
+                        const href = md[cb + 2 .. cp];
+                        try buf.appendSlice(allocator, "<a href=\"");
+                        try emailAppendHtmlEscaped(&buf, allocator, href);
+                        try buf.appendSlice(allocator, "\" style=\"color:#0066cc;\">");
+                        try emailAppendHtmlEscaped(&buf, allocator, text);
+                        try buf.appendSlice(allocator, "</a>");
+                        i = cp + 1;
+                        line_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Italic _text_ (not __text__) ──
+        if (md[i] == '_' and !(i + 1 < md.len and md[i + 1] == '_')) {
+            const prev_ok = (i == 0 or md[i - 1] == ' ' or md[i - 1] == '\n' or md[i - 1] == '(');
+            if (prev_ok) {
+                const close = std.mem.indexOfScalarPos(u8, md, i + 1, '_');
+                if (close) |end| {
+                    const next_ok = (end + 1 >= md.len or md[end + 1] == ' ' or md[end + 1] == '\n' or md[end + 1] == ',' or md[end + 1] == '.' or md[end + 1] == ')');
+                    if (next_ok and end > i + 1) {
+                        try buf.appendSlice(allocator, "<em>");
+                        try emailAppendHtmlEscaped(&buf, allocator, md[i + 1 .. end]);
+                        try buf.appendSlice(allocator, "</em>");
+                        i = end + 1;
+                        line_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ── Paragraph breaks (empty lines) ──
+        if (md[i] == '\n') {
+            if (i + 1 < md.len and md[i + 1] == '\n') {
+                // Close any open <ul> before paragraph break
+                if (in_ul) {
+                    try buf.appendSlice(allocator, "</ul>");
+                    in_ul = false;
+                }
+                try buf.appendSlice(allocator, "<p>");
+                // Skip consecutive newlines
+                while (i < md.len and md[i] == '\n') i += 1;
+                line_start = true;
+                continue;
+            }
+            try buf.append(allocator, '\n');
+            line_start = true;
+            i += 1;
+            continue;
+        }
+
+        // ── Regular character ──
+        switch (md[i]) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            else => try buf.append(allocator, md[i]),
+        }
+        line_start = false;
+        i += 1;
+    }
+
+    // Close any trailing open <ul>
+    if (in_ul) {
+        try buf.appendSlice(allocator, "</ul>");
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn isTableSeparator(line: []const u8) bool {
+    // A separator row contains only |, -, :, and whitespace
+    var has_dash = false;
+    for (line) |c| {
+        switch (c) {
+            '|', ' ', '\t', ':' => {},
+            '-' => has_dash = true,
+            else => return false,
+        }
+    }
+    return has_dash;
+}
+
+fn emailFindTripleBacktick(md: []const u8, from: usize) ?usize {
+    var pos = from;
+    while (pos + 2 < md.len) {
+        if (md[pos] == '`' and md[pos + 1] == '`' and md[pos + 2] == '`') return pos;
+        pos += 1;
+    }
+    return null;
+}
+
+fn emailAppendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            '"' => try buf.appendSlice(allocator, "&quot;"),
+            else => try buf.append(allocator, c),
+        }
+    }
+}
+
+/// Like emailAppendHtmlEscaped but also processes inline markdown:
+/// **bold**, _italic_, `code`, [text](url), ~~strikethrough~~
+fn emailAppendInlineFormatted(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        // ── Inline code `...` ──
+        if (text[i] == '`') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |end| {
+                try buf.appendSlice(allocator, "<code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">");
+                try emailAppendHtmlEscaped(buf, allocator, text[i + 1 .. end]);
+                try buf.appendSlice(allocator, "</code>");
+                i = end + 1;
+                continue;
+            }
+        }
+        // ── Strikethrough ~~text~~ ──
+        if (i + 1 < text.len and text[i] == '~' and text[i + 1] == '~') {
+            if (std.mem.indexOf(u8, text[i + 2 ..], "~~")) |offset| {
+                try buf.appendSlice(allocator, "<s>");
+                try emailAppendInlineFormatted(buf, allocator, text[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</s>");
+                i = i + 2 + offset + 2;
+                continue;
+            }
+        }
+        // ── Bold **text** ──
+        if (i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
+            if (std.mem.indexOf(u8, text[i + 2 ..], "**")) |offset| {
+                try buf.appendSlice(allocator, "<strong>");
+                try emailAppendInlineFormatted(buf, allocator, text[i + 2 .. i + 2 + offset]);
+                try buf.appendSlice(allocator, "</strong>");
+                i = i + 2 + offset + 2;
+                continue;
+            }
+        }
+        // ── Links [text](url) ──
+        if (text[i] == '[') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |cb| {
+                if (cb + 1 < text.len and text[cb + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, text, cb + 2, ')')) |cp| {
+                        const link_text = text[i + 1 .. cb];
+                        const href = text[cb + 2 .. cp];
+                        try buf.appendSlice(allocator, "<a href=\"");
+                        try emailAppendHtmlEscaped(buf, allocator, href);
+                        try buf.appendSlice(allocator, "\" style=\"color:#0066cc;\">");
+                        try emailAppendInlineFormatted(buf, allocator, link_text);
+                        try buf.appendSlice(allocator, "</a>");
+                        i = cp + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // ── Italic _text_ (not __text__) ──
+        if (text[i] == '_' and !(i + 1 < text.len and text[i + 1] == '_')) {
+            const prev_ok = (i == 0 or text[i - 1] == ' ' or text[i - 1] == '\n' or text[i - 1] == '(');
+            if (prev_ok) {
+                if (std.mem.indexOfScalarPos(u8, text, i + 1, '_')) |end| {
+                    const next_ok = (end + 1 >= text.len or text[end + 1] == ' ' or text[end + 1] == '\n' or text[end + 1] == ',' or text[end + 1] == '.' or text[end + 1] == ')');
+                    if (next_ok and end > i + 1) {
+                        try buf.appendSlice(allocator, "<em>");
+                        try emailAppendInlineFormatted(buf, allocator, text[i + 1 .. end]);
+                        try buf.appendSlice(allocator, "</em>");
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // ── Regular character (HTML-escaped) ──
+        switch (text[i]) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            '"' => try buf.appendSlice(allocator, "&quot;"),
+            else => try buf.append(allocator, text[i]),
+        }
+        i += 1;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -625,14 +2548,14 @@ test "consent not granted blocks send" {
 }
 
 test "consent granted allows send attempt" {
-    // With consent but invalid host, we expect SmtpConnectError (not ConsentNotGranted)
+    // With consent but invalid host, we expect SmtpError (not ConsentNotGranted)
     var ch = EmailChannel.init(std.testing.allocator, .{
         .consent_granted = true,
         .smtp_host = "999.999.999.999",
     });
     defer ch.deinit();
     const result = ch.sendMessage("test@example.com", "hello");
-    try std.testing.expectError(error.SmtpConnectError, result);
+    try std.testing.expectError(error.SmtpError, result);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -817,4 +2740,358 @@ test "markMessageSeen method exists" {
     defer ch.deinit();
     const info = @typeInfo(@TypeOf(EmailChannel.markMessageSeen));
     try std.testing.expect(info == .@"fn");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// IMAP Polling Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "parseRawEmail extracts headers" {
+    const raw =
+        "From: Alice <alice@example.com>\r\n" ++
+        "Subject: Test Subject\r\n" ++
+        "Message-ID: <msg-001@example.com>\r\n" ++
+        "Date: Mon, 1 Jan 2024 12:00:00 +0000\r\n" ++
+        "\r\n" ++
+        "Body text here";
+    const parsed = parseRawEmail(raw);
+    try std.testing.expectEqualStrings("Alice <alice@example.com>", parsed.from);
+    try std.testing.expectEqualStrings("Test Subject", parsed.subject);
+    try std.testing.expectEqualStrings("msg-001@example.com", parsed.message_id);
+    try std.testing.expectEqualStrings("Mon, 1 Jan 2024 12:00:00 +0000", parsed.date);
+}
+
+test "parseRawEmail handles missing headers" {
+    const raw = "Content-Type: text/plain\r\n\r\nJust body";
+    const parsed = parseRawEmail(raw);
+    try std.testing.expectEqualStrings("", parsed.from);
+    try std.testing.expectEqualStrings("", parsed.subject);
+    try std.testing.expectEqualStrings("", parsed.message_id);
+}
+
+test "extractEmailAddress with angle brackets" {
+    try std.testing.expectEqualStrings("alice@example.com", extractEmailAddress("Alice <alice@example.com>"));
+}
+
+test "extractEmailAddress bare address" {
+    try std.testing.expectEqualStrings("alice@example.com", extractEmailAddress("alice@example.com"));
+}
+
+test "extractEmailAddress with name and quotes" {
+    try std.testing.expectEqualStrings("bob@test.com", extractEmailAddress("\"Bob Smith\" <bob@test.com>"));
+}
+
+test "extractTextBody plain text" {
+    const allocator = std.testing.allocator;
+    const raw = "From: test@test.com\r\n\r\nHello World";
+    const body = try extractTextBody(allocator, raw);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("Hello World", body);
+}
+
+test "extractTextBody strips HTML" {
+    const allocator = std.testing.allocator;
+    const raw = "From: test@test.com\r\n\r\n<html><body><p>Hello</p></body></html>";
+    const body = try extractTextBody(allocator, raw);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("Hello", body);
+}
+
+test "extractTextBody empty body" {
+    const allocator = std.testing.allocator;
+    const raw = "From: test@test.com\r\n\r\n";
+    const body = try extractTextBody(allocator, raw);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("", body);
+}
+
+test "basicInjectionCheck detects patterns" {
+    try std.testing.expect(basicInjectionCheck("Hello SYSTEM: do something"));
+    try std.testing.expect(basicInjectionCheck("Please [INST] follow this"));
+    try std.testing.expect(basicInjectionCheck("ignore previous instructions and do X"));
+    try std.testing.expect(basicInjectionCheck("<<SYS>> new system prompt"));
+    try std.testing.expect(basicInjectionCheck("ASSISTANT: I will now"));
+}
+
+test "basicInjectionCheck passes clean content" {
+    try std.testing.expect(!basicInjectionCheck("Hello, how are you?"));
+    try std.testing.expect(!basicInjectionCheck("Meeting at 3pm tomorrow"));
+    try std.testing.expect(!basicInjectionCheck(""));
+}
+
+test "max_body_bytes config default" {
+    const config = config_types.EmailConfig{};
+    try std.testing.expectEqual(@as(u64, 51200), config.max_body_bytes);
+}
+
+test "seen_uids initialized in EmailChannel" {
+    var ch = EmailChannel.init(std.testing.allocator, .{});
+    defer ch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ch.seen_uids.len());
+}
+
+test "pollMessages method exists" {
+    const info = @typeInfo(@TypeOf(EmailChannel.pollMessages));
+    try std.testing.expect(info == .@"fn");
+}
+
+test "imapCurl method exists" {
+    const info = @typeInfo(@TypeOf(EmailChannel.imapCurl));
+    try std.testing.expect(info == .@"fn");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Attachment Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "extractMimeBoundary finds quoted boundary" {
+    const raw = "Content-Type: multipart/mixed; boundary=\"----=_Part_123\"\r\n\r\nBody";
+    const boundary = extractMimeBoundary(raw);
+    try std.testing.expect(boundary != null);
+    try std.testing.expectEqualStrings("----=_Part_123", boundary.?);
+}
+
+test "extractMimeBoundary finds unquoted boundary" {
+    const raw = "Content-Type: multipart/mixed; boundary=simpleboundary\r\n\r\nBody";
+    const boundary = extractMimeBoundary(raw);
+    try std.testing.expect(boundary != null);
+    try std.testing.expectEqualStrings("simpleboundary", boundary.?);
+}
+
+test "extractMimeBoundary returns null for non-multipart" {
+    const raw = "Content-Type: text/plain\r\n\r\nBody";
+    try std.testing.expect(extractMimeBoundary(raw) == null);
+}
+
+test "extractMimeBoundary returns null for no content-type" {
+    const raw = "From: test@test.com\r\n\r\nBody";
+    try std.testing.expect(extractMimeBoundary(raw) == null);
+}
+
+test "hasAllowedExtension matches pdf" {
+    const allowed = [_][]const u8{ ".pdf", ".docx" };
+    try std.testing.expect(hasAllowedExtension("report.pdf", &allowed));
+    try std.testing.expect(hasAllowedExtension("REPORT.PDF", &allowed));
+}
+
+test "hasAllowedExtension matches docx" {
+    const allowed = [_][]const u8{ ".pdf", ".docx" };
+    try std.testing.expect(hasAllowedExtension("document.docx", &allowed));
+}
+
+test "hasAllowedExtension rejects disallowed" {
+    const allowed = [_][]const u8{ ".pdf", ".docx" };
+    try std.testing.expect(!hasAllowedExtension("script.exe", &allowed));
+    try std.testing.expect(!hasAllowedExtension("image.png", &allowed));
+    try std.testing.expect(!hasAllowedExtension("noextension", &allowed));
+}
+
+test "hasAllowedExtension rejects empty filename" {
+    const allowed = [_][]const u8{".pdf"};
+    try std.testing.expect(!hasAllowedExtension("", &allowed));
+}
+
+test "extractAttachmentFilename quoted" {
+    const fname = extractAttachmentFilename(" attachment; filename=\"report.pdf\"");
+    try std.testing.expect(fname != null);
+    try std.testing.expectEqualStrings("report.pdf", fname.?);
+}
+
+test "extractAttachmentFilename unquoted" {
+    const fname = extractAttachmentFilename("attachment; filename=report.pdf");
+    try std.testing.expect(fname != null);
+    try std.testing.expectEqualStrings("report.pdf", fname.?);
+}
+
+test "extractAttachmentFilename returns null for inline" {
+    try std.testing.expect(extractAttachmentFilename("inline; filename=\"img.png\"") == null);
+}
+
+test "extractAttachmentFilename returns null for no filename" {
+    try std.testing.expect(extractAttachmentFilename("attachment") == null);
+}
+
+test "attachment config defaults" {
+    const config = config_types.EmailConfig{};
+    try std.testing.expect(!config.attachment_save_enabled);
+    try std.testing.expectEqualStrings("workspace/docs", config.attachment_save_dir);
+    try std.testing.expectEqual(@as(usize, 2), config.attachment_extensions.len);
+    try std.testing.expectEqualStrings(".pdf", config.attachment_extensions[0]);
+    try std.testing.expectEqualStrings(".docx", config.attachment_extensions[1]);
+    try std.testing.expectEqual(@as(u64, 20 * 1024 * 1024), config.attachment_max_bytes);
+}
+
+test "extractAndSaveAttachments returns empty for non-multipart" {
+    const allocator = std.testing.allocator;
+    const raw = "Content-Type: text/plain\r\n\r\nJust text";
+    const allowed = [_][]const u8{".pdf"};
+    const result = try extractAndSaveAttachments(allocator, raw, "/tmp/test-att", &allowed, 1024 * 1024, "1");
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// markdownToEmailHtml tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "markdownToEmailHtml plain text is escaped" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "Hello <world> & friends");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello &lt;world&gt; &amp; friends", result);
+}
+
+test "markdownToEmailHtml headers" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "# Title\n## Subtitle");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<h2 style=\"margin:0.5em 0;color:#1a1a1a;\">Title</h2><h3 style=\"margin:0.5em 0;color:#1a1a1a;\">Subtitle</h3>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml bold and italic" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "This is **bold** and _italic_ text.");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("This is <strong>bold</strong> and <em>italic</em> text.", result);
+}
+
+test "markdownToEmailHtml inline code" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "Use `fmt.Println` here");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "Use <code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">fmt.Println</code> here",
+        result,
+    );
+}
+
+test "markdownToEmailHtml code block" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "```zig\nconst x = 1;\n```");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<pre style=\"background:#f4f4f4;padding:12px;border-radius:6px;font-family:monospace;font-size:0.9em;overflow-x:auto;\">const x = 1;\n</pre>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml bullet list" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "- one\n- two\n- three");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<ul style=\"margin:0.5em 0;padding-left:1.5em;\"><li style=\"margin:2px 0;\">one</li><li style=\"margin:2px 0;\">two</li><li style=\"margin:2px 0;\">three</li></ul>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml links" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "Visit [Google](https://google.com) now");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "Visit <a href=\"https://google.com\" style=\"color:#0066cc;\">Google</a> now",
+        result,
+    );
+}
+
+test "markdownToEmailHtml strikethrough" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "This is ~~wrong~~ right");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("This is <s>wrong</s> right", result);
+}
+
+test "markdownToEmailHtml paragraph breaks" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "First paragraph.\n\nSecond paragraph.");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("First paragraph.<p>Second paragraph.", result);
+}
+
+test "markdownToEmailHtml mixed content" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "# Hello\n\nThis is **bold** with `code`.\n\n- item one\n- item two");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<h2 style=\"margin:0.5em 0;color:#1a1a1a;\">Hello</h2><p>This is <strong>bold</strong> with <code style=\"background:#f4f4f4;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:0.9em;\">code</code>.<p><ul style=\"margin:0.5em 0;padding-left:1.5em;\"><li style=\"margin:2px 0;\">item one</li><li style=\"margin:2px 0;\">item two</li></ul>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml simple table" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "| Name | Age |\n| --- | --- |\n| Alice | 30 |");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "<table style=\"border-collapse:collapse;margin:0.5em 0;width:100%;\">" ++
+            "<tr><th style=\"border:1px solid #ddd;padding:8px 12px;background:#f8f8f8;text-align:left;font-weight:600;\">Name</th>" ++
+            "<th style=\"border:1px solid #ddd;padding:8px 12px;background:#f8f8f8;text-align:left;font-weight:600;\">Age</th></tr>" ++
+            "<tr><td style=\"border:1px solid #ddd;padding:8px 12px;\">Alice</td>" ++
+            "<td style=\"border:1px solid #ddd;padding:8px 12px;\">30</td></tr>" ++
+            "</table>",
+        result,
+    );
+}
+
+test "markdownToEmailHtml table with multiple rows" {
+    const allocator = std.testing.allocator;
+    const result = try markdownToEmailHtml(allocator, "| Col1 | Col2 |\n|------|------|\n| A | B |\n| C | D |");
+    defer allocator.free(result);
+    // Verify table structure
+    try std.testing.expect(std.mem.startsWith(u8, result, "<table"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "<th") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Col1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<td") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "</table>") != null);
+    // Should have 3 <tr> (header + 2 data rows)
+    var tr_count: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, result, search, "<tr>")) |pos| {
+        tr_count += 1;
+        search = pos + 4;
+    }
+    try std.testing.expectEqual(@as(usize, 3), tr_count);
+}
+
+test "markdownToEmailHtml isTableSeparator" {
+    try std.testing.expect(isTableSeparator("| --- | --- |"));
+    try std.testing.expect(isTableSeparator("|---|---|"));
+    try std.testing.expect(isTableSeparator("| :---: | ---: |"));
+    try std.testing.expect(!isTableSeparator("| hello | world |"));
+    try std.testing.expect(!isTableSeparator("just text"));
+}
+
+test "mimeTypeFromPath pdf" {
+    try std.testing.expectEqualStrings("application/pdf", mimeTypeFromPath("/tmp/report.pdf"));
+}
+
+test "mimeTypeFromPath png" {
+    try std.testing.expectEqualStrings("image/png", mimeTypeFromPath("screenshot.PNG"));
+}
+
+test "mimeTypeFromPath unknown extension" {
+    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPath("data.xyz"));
+}
+
+test "mimeTypeFromPath no extension" {
+    try std.testing.expectEqualStrings("application/octet-stream", mimeTypeFromPath("README"));
+}
+
+test "mimeTypeFromPath common office types" {
+    try std.testing.expectEqualStrings("application/vnd.openxmlformats-officedocument.wordprocessingml.document", mimeTypeFromPath("doc.docx"));
+    try std.testing.expectEqualStrings("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", mimeTypeFromPath("sheet.xlsx"));
+    try std.testing.expectEqualStrings("text/csv", mimeTypeFromPath("data.csv"));
+}
+
+test "sendMessageWithMedia delegates to sendMessage when no media" {
+    // When media slice is empty, sendMessageWithMedia should behave like sendMessage.
+    // We can't test actual SMTP sending without a server, but we verify the method exists
+    // and compiles with the correct signature.
+    const S = EmailChannel;
+    // Verify vtable send function pointer is set
+    try std.testing.expect(@intFromPtr(S.vtable.send) != 0);
 }

@@ -1,0 +1,19 @@
+[Unit]
+Description=NullClaw WhatsApp Web Sidecar (Baileys)
+After=network.target
+PartOf=nullclaw.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.nullclaw/sidecar/whatsapp-web
+ExecStart=/usr/bin/node %h/.nullclaw/sidecar/whatsapp-web/index.js
+Restart=on-failure
+RestartSec=5
+Environment=NULLCLAW_GATEWAY_URL=http://127.0.0.1:8080
+Environment=SIDECAR_PORT=7100
+Environment=WA_CREDENTIALS_DIR=%h/.nullclaw/credentials/whatsapp_web
+# Set SIDECAR_AUTH_TOKEN via EnvironmentFile or override
+# EnvironmentFile=%h/.nullclaw/whatsapp-web.env
+
+[Install]
+WantedBy=default.target

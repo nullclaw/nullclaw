@@ -31,6 +31,7 @@ const fs_compat = @import("fs_compat.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
+const email = @import("channels/email.zig");
 const max_mod = @import("channels/max.zig");
 const channels_mod = @import("channels/root.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
@@ -1116,7 +1117,7 @@ pub const ChannelRuntime = struct {
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
         if (subagent_manager) |mgr| {
-            mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, .{});
+            mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, config.subagent);
             mgr.task_runner = subagent_runner.runTaskWithTools;
             errdefer {
                 mgr.deinit();
@@ -1180,6 +1181,20 @@ pub const ChannelRuntime = struct {
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
+        // Observer — RuntimeObserver with optional RagObserver as extra
+        var rag_obs_ptr: ?*observability.RagObserver = null;
+        var rag_observer_slice: []const observability.Observer = &.{};
+        var rag_obs_storage: [1]observability.Observer = undefined;
+        if (config.diagnostics.rag_url) |rag_url| {
+            if (config.diagnostics.rag_token) |rag_token| {
+                rag_obs_ptr = allocator.create(observability.RagObserver) catch null;
+                if (rag_obs_ptr) |ptr| {
+                    ptr.* = .{ .base_url = rag_url, .bearer_token = rag_token };
+                    rag_obs_storage[0] = ptr.observer();
+                    rag_observer_slice = &rag_obs_storage;
+                }
+            }
+        }
         const runtime_observer = try observability.RuntimeObserver.create(
             allocator,
             .{
@@ -1189,7 +1204,7 @@ pub const ChannelRuntime = struct {
                 .otel_service_name = config.diagnostics.otel_service_name,
             },
             config.diagnostics.otel_headers,
-            &.{},
+            rag_observer_slice,
         );
         errdefer runtime_observer.destroy();
         const obs = runtime_observer.observer();
@@ -1223,6 +1238,7 @@ pub const ChannelRuntime = struct {
             self.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(tools, rt);
         }
+        tools_mod.enableTierGeneration(tools, true);
         return self;
     }
 
@@ -1728,6 +1744,26 @@ pub const MatrixLoopState = struct {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// EmailLoopState — shared state between supervisor and polling thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const EmailLoopState = struct {
+    /// Updated after each pollMessages() — epoch seconds.
+    last_activity: Atomic(i64),
+    /// Supervisor sets this to ask the polling thread to stop.
+    stop_requested: Atomic(bool),
+    /// Thread handle for join().
+    thread: ?std.Thread = null,
+
+    pub fn init() EmailLoopState {
+        return .{
+            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .stop_requested = Atomic(bool).init(false),
+        };
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // MaxLoopState — shared state between supervisor and polling thread
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1751,6 +1787,7 @@ pub const PollingState = union(enum) {
     telegram: *TelegramLoopState,
     signal: *SignalLoopState,
     matrix: *MatrixLoopState,
+    email: *EmailLoopState,
     max: *MaxLoopState,
 };
 
@@ -1829,6 +1866,627 @@ pub fn spawnMatrixPolling(
         .thread = thread,
         .state = .{ .matrix = mx_ls },
     };
+}
+
+pub fn spawnEmailPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const em_ls = try allocator.create(EmailLoopState);
+    errdefer allocator.destroy(em_ls);
+    em_ls.* = EmailLoopState.init();
+
+    const em_ptr: *email.EmailChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 2 * 1024 * 1024 },
+        runEmailLoop,
+        .{ allocator, config, runtime, em_ls, em_ptr },
+    );
+    em_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .email = em_ls },
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+/// Split an email reply_target ("addr\x00subject") into address and subject parts.
+fn splitEmailTarget(target: []const u8) struct { addr: []const u8, subject: []const u8 } {
+    if (std.mem.indexOfScalar(u8, target, 0)) |sep| {
+        return .{ .addr = target[0..sep], .subject = target[sep + 1 ..] };
+    }
+    return .{ .addr = target, .subject = "" };
+}
+
+// ── PII redaction helpers ─────────────────────────────────────────────────
+// Spawn the Python pii_redactor.py script, piping content via stdin.
+// On any error, returns null so the caller can fall back to the original text.
+
+fn redactPii(allocator: std.mem.Allocator, content: []const u8, msg_id: []const u8, sender: []const u8, use_spacy: bool) ?[]u8 {
+    const script = "/home/nullclaw/.nullclaw/workspace/scripts/pii_redactor.py";
+
+    var argv_buf: [8][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "python3";
+    argc += 1;
+    argv_buf[argc] = script;
+    argc += 1;
+    argv_buf[argc] = "redact";
+    argc += 1;
+
+    // Build --id=<msg_id> string
+    const id_arg = std.fmt.allocPrint(allocator, "--id={s}", .{msg_id}) catch return null;
+    defer allocator.free(id_arg);
+    argv_buf[argc] = id_arg;
+    argc += 1;
+
+    // Build --sender=<sender>
+    var sender_arg: ?[]u8 = null;
+    defer if (sender_arg) |s| allocator.free(s);
+    if (sender.len > 0) {
+        sender_arg = std.fmt.allocPrint(allocator, "--sender={s}", .{sender}) catch return null;
+        argv_buf[argc] = sender_arg.?;
+        argc += 1;
+    }
+
+    if (use_spacy) {
+        argv_buf[argc] = "--spacy";
+        argc += 1;
+    }
+
+    const argv = argv_buf[0..argc];
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        log.warn("PII redact spawn error: {}", .{err});
+        return null;
+    };
+
+    // Write content to stdin, then close
+    if (child.stdin) |*stdin_stream| {
+        stdin_stream.writeAll(content) catch {};
+        stdin_stream.close();
+        child.stdin = null;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1_048_576) catch |err| {
+        log.warn("PII redact stdout read error: {}", .{err});
+        _ = child.wait() catch {};
+        return null;
+    };
+    // Read stderr but discard
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 65_536) catch "";
+    defer if (stderr.len > 0) allocator.free(stderr);
+
+    const term = child.wait() catch |err| {
+        log.warn("PII redact wait error: {}", .{err});
+        allocator.free(stdout);
+        return null;
+    };
+
+    const exit_ok = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    if (!exit_ok) {
+        log.warn("PII redact exited with error", .{});
+        if (stderr.len > 0) log.warn("PII redact stderr: {s}", .{stderr});
+        allocator.free(stdout);
+        return null;
+    }
+
+    return stdout;
+}
+
+fn deredactPii(allocator: std.mem.Allocator, text: []const u8, msg_id: []const u8) ?[]u8 {
+    const script = "/home/nullclaw/.nullclaw/workspace/scripts/pii_redactor.py";
+
+    const id_arg = std.fmt.allocPrint(allocator, "--id={s}", .{msg_id}) catch return null;
+    defer allocator.free(id_arg);
+
+    const argv = [_][]const u8{ "python3", script, "deredact", id_arg };
+
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        log.warn("PII deredact spawn error: {}", .{err});
+        return null;
+    };
+
+    if (child.stdin) |*stdin_stream| {
+        stdin_stream.writeAll(text) catch {};
+        stdin_stream.close();
+        child.stdin = null;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1_048_576) catch |err| {
+        log.warn("PII deredact stdout read error: {}", .{err});
+        _ = child.wait() catch {};
+        return null;
+    };
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 65_536) catch "";
+    defer if (stderr.len > 0) allocator.free(stderr);
+
+    const term = child.wait() catch |err| {
+        log.warn("PII deredact wait error: {}", .{err});
+        allocator.free(stdout);
+        return null;
+    };
+
+    const exit_ok = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    if (!exit_ok) {
+        log.warn("PII deredact exited with error", .{});
+        if (stderr.len > 0) log.warn("PII deredact stderr: {s}", .{stderr});
+        allocator.free(stdout);
+        return null;
+    }
+
+    return stdout;
+}
+
+// runEmailLoop — polling thread function
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Thread-entry function for Email IMAP.
+/// Dispatches to IDLE mode (persistent connection) or polling (curl) based on config.
+pub fn runEmailLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *EmailLoopState,
+    em_ptr: *email.EmailChannel,
+) void {
+    loop_state.last_activity.store(std.time.timestamp(), .release);
+
+    if (em_ptr.config.imap_idle) {
+        runEmailIdleLoop(allocator, config, runtime, loop_state, em_ptr);
+    } else {
+        runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+    }
+}
+
+/// IDLE-based email loop — persistent TLS+IMAP connection with push notifications.
+fn runEmailIdleLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *EmailLoopState,
+    em_ptr: *email.EmailChannel,
+) void {
+    var imap = email.ImapClient.init(allocator, em_ptr.config);
+    defer imap.disconnect();
+
+    var evict_counter: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        // ── Connect phase ────────────────────────────────────────────
+        imap.connect() catch {
+            imap.backoff();
+            if (imap.shouldFallbackToPoll()) {
+                log.warn("IMAP IDLE: too many connect failures, falling back to poll mode", .{});
+                runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+                return;
+            }
+            continue;
+        };
+
+        imap.login() catch {
+            imap.disconnect();
+            imap.backoff();
+            if (imap.shouldFallbackToPoll()) {
+                log.warn("IMAP IDLE: login failures, falling back to poll mode", .{});
+                runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+                return;
+            }
+            continue;
+        };
+
+        imap.capability() catch {
+            imap.disconnect();
+            imap.backoff();
+            continue;
+        };
+
+        if (!imap.server_supports_idle) {
+            log.info("IMAP server lacks IDLE capability, using poll mode", .{});
+            imap.logout();
+            runEmailPollLoop(allocator, config, runtime, loop_state, em_ptr);
+            return;
+        }
+
+        imap.selectFolder() catch {
+            imap.disconnect();
+            imap.backoff();
+            continue;
+        };
+
+        // Connected successfully
+        imap.resetBackoff();
+        log.info("IMAP IDLE mode active", .{});
+
+        // ── Main IDLE loop ───────────────────────────────────────────
+        inner: while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+            // Check for unseen messages before entering IDLE
+            const uids = imap.searchUnseen(allocator) catch break :inner;
+            defer {
+                for (uids) |uid| allocator.free(uid);
+                allocator.free(uids);
+            }
+
+            // Process new messages
+            for (uids) |uid| {
+                if (em_ptr.seen_uids.contains(uid)) continue;
+
+                // Fetch raw email via native IMAP
+                const raw_email = imap.fetchMessage(allocator, uid) catch |err| {
+                    log.warn("IMAP IDLE: failed to fetch UID {s}: {}", .{ uid, err });
+                    continue;
+                };
+                defer allocator.free(raw_email);
+
+                // Reuse existing email processing pipeline
+                processIncomingEmail(allocator, config, runtime, em_ptr, uid, raw_email);
+
+                // Mark seen on the server
+                imap.storeSeen(uid) catch {};
+            }
+
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            health.markComponentOk("email");
+
+            evict_counter += 1;
+            if (evict_counter >= 100) {
+                evict_counter = 0;
+                _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+            }
+
+            // Enter IDLE — blocks until new mail, timeout renewal, or shutdown
+            const result = imap.idle(&loop_state.stop_requested, &loop_state.last_activity) catch break :inner;
+            switch (result) {
+                .new_mail => continue :inner, // loop back to searchUnseen
+                .renewal => continue :inner, // 25-min renewal
+                .shutdown => {
+                    imap.logout();
+                    return;
+                },
+            }
+        }
+
+        // Broke out of inner loop — reconnect
+        imap.disconnect();
+        imap.backoff();
+    }
+
+    // Clean shutdown
+    imap.logout();
+}
+
+/// Process a single incoming email — extracted from the poll loop for reuse.
+/// Handles parsing, allowlist check, PII, agent dispatch, and reply.
+fn processIncomingEmail(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    em_ptr: *email.EmailChannel,
+    uid: []const u8,
+    raw_email_data: []const u8,
+) void {
+    const parsed = email.parseRawEmail(raw_email_data);
+    const sender_addr = email.extractEmailAddress(parsed.from);
+
+    const is_known_sender = em_ptr.isSenderAllowed(sender_addr);
+    if (!is_known_sender) {
+        log.info("Email from unknown sender: {s} — forwarding to agent for triage", .{sender_addr});
+    }
+
+    var body_text = email.extractTextBody(allocator, raw_email_data) catch return;
+    defer allocator.free(body_text);
+
+    const max_bytes = em_ptr.config.max_body_bytes;
+    var final_content: []u8 = undefined;
+
+    if (body_text.len > max_bytes) {
+        final_content = std.fmt.allocPrint(allocator, "{s}\n[TRUNCATED - original was {d} bytes]", .{
+            body_text[0..max_bytes], body_text.len,
+        }) catch return;
+    } else {
+        final_content = allocator.dupe(u8, body_text) catch return;
+    }
+
+    // Injection check
+    if (email.basicInjectionCheck(final_content)) {
+        log.warn("Injection pattern detected in email from {s}", .{sender_addr});
+        allocator.free(final_content);
+        _ = em_ptr.seen_uids.insert(uid) catch {};
+        return;
+    }
+
+    // Extract and save attachments
+    var saved_attachments: []channels_mod.Attachment = &.{};
+    if (em_ptr.config.attachment_save_enabled) {
+        saved_attachments = email.extractAndSaveAttachments(
+            allocator,
+            raw_email_data,
+            em_ptr.config.attachment_save_dir,
+            em_ptr.config.attachment_extensions,
+            em_ptr.config.attachment_max_bytes,
+            uid,
+        ) catch &.{};
+    }
+
+    // Build attachment info text
+    var attachment_info: []u8 = &.{};
+    defer if (attachment_info.len > 0) allocator.free(attachment_info);
+
+    if (saved_attachments.len > 0) {
+        var info_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer info_buf.deinit(allocator);
+        const writer = info_buf.writer(allocator);
+        writer.writeAll("\n\n[ATTACHMENTS]\n") catch {};
+        for (saved_attachments) |att| {
+            writer.print("- {s} (saved to: {s})\n", .{ att.filename, att.path }) catch {};
+        }
+        writer.writeAll("[/ATTACHMENTS]") catch {};
+        attachment_info = info_buf.toOwnedSlice(allocator) catch &.{};
+    }
+
+    // Wrap with security markers
+    const tag_start: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_START]" else "[UNKNOWN_SENDER_START]";
+    const tag_end: []const u8 = if (is_known_sender) "[UNTRUSTED_EMAIL_END]" else "[UNKNOWN_SENDER_END]";
+    const wrapped = if (attachment_info.len > 0)
+        std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}{s}\n{s}", .{
+            tag_start, sender_addr, parsed.subject, final_content, attachment_info, tag_end,
+        }) catch {
+            allocator.free(final_content);
+            return;
+        }
+    else
+        std.fmt.allocPrint(allocator, "{s}\nFrom: {s}\nSubject: {s}\n\n{s}\n{s}", .{
+            tag_start, sender_addr, parsed.subject, final_content, tag_end,
+        }) catch {
+            allocator.free(final_content);
+            return;
+        };
+    allocator.free(final_content);
+    defer allocator.free(wrapped);
+
+    // Track Message-ID for threading
+    if (parsed.message_id.len > 0) {
+        em_ptr.trackMessageId(sender_addr, parsed.message_id) catch {};
+    }
+
+    // Mark as seen in dedup set
+    _ = em_ptr.seen_uids.insert(uid) catch {};
+
+    // ── Agent dispatch ───────────────────────────────────────────
+    var key_buf: [192]u8 = undefined;
+    var routed_session_key: ?[]const u8 = null;
+    defer if (routed_session_key) |key| allocator.free(key);
+
+    const session_key = blk: {
+        const route = agent_routing.resolveRouteWithSession(allocator, .{
+            .channel = "email",
+            .account_id = em_ptr.config.account_id,
+            .peer = .{
+                .kind = .direct,
+                .id = sender_addr,
+            },
+        }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ em_ptr.config.account_id, sender_addr }) catch sender_addr;
+
+        allocator.free(route.main_session_key);
+        routed_session_key = route.session_key;
+        break :blk route.session_key;
+    };
+
+    // PII redaction (pre-LLM)
+    const pii_enabled = em_ptr.config.pii_redaction;
+    var redacted_content: ?[]u8 = null;
+    defer if (redacted_content) |rc| allocator.free(rc);
+
+    const content_for_llm = if (pii_enabled) pii_blk: {
+        redacted_content = redactPii(allocator, wrapped, uid, sender_addr, em_ptr.config.pii_spacy);
+        if (redacted_content) |rc| {
+            break :pii_blk rc;
+        } else {
+            log.warn("PII redaction failed, using original content", .{});
+            break :pii_blk wrapped;
+        }
+    } else wrapped;
+
+    // Set ScheduleTool context so subagents know the originating channel.
+    setScheduleToolContext(runtime.tools, "email", em_ptr.config.account_id, sender_addr, .direct, sender_addr, null);
+    defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
+
+    const reply = runtime.session_mgr.processMessage(session_key, content_for_llm, null) catch |err| {
+        log.err("Email agent error: {}", .{err});
+        const err_msg: []const u8 = switch (err) {
+            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+            error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+            error.NoResponseContent => "Model returned an empty response. Please try again.",
+            error.AllProvidersFailed => "All configured providers failed for this request.",
+            error.OutOfMemory => "Out of memory.",
+            else => "An error occurred. Try again.",
+        };
+        em_ptr.sendReply(sender_addr, parsed.subject, err_msg) catch |send_err| log.err("failed to send email error reply: {}", .{send_err});
+        return;
+    };
+    defer allocator.free(reply);
+
+    // PII de-redaction (post-LLM)
+    var deredacted_reply: ?[]u8 = null;
+    defer if (deredacted_reply) |dr| allocator.free(dr);
+
+    const final_reply = if (pii_enabled) deredact_blk: {
+        deredacted_reply = deredactPii(allocator, reply, uid);
+        if (deredacted_reply) |dr| {
+            break :deredact_blk dr;
+        } else {
+            log.warn("PII de-redaction failed, using redacted reply", .{});
+            break :deredact_blk reply;
+        }
+    } else reply;
+
+    // If the agent prefixes its reply with [NO_REPLY], suppress the email reply.
+    // Used for unknown sender triage where the agent handles routing via tools.
+    if (std.mem.startsWith(u8, std.mem.trimLeft(u8, final_reply, " \t\n"), "[NO_REPLY]")) {
+        log.info("Email reply suppressed by [NO_REPLY] marker for {s}", .{sender_addr});
+        return;
+    }
+
+    em_ptr.sendReply(sender_addr, parsed.subject, final_reply) catch |err| {
+        log.warn("Email send error: {}", .{err});
+    };
+}
+
+/// Curl-based polling loop (fallback when IDLE is unavailable or disabled).
+fn runEmailPollLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *EmailLoopState,
+    em_ptr: *email.EmailChannel,
+) void {
+    var evict_counter: u32 = 0;
+    var consecutive_net_failures: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        // Skip polling when the network is unreachable (e.g. wifi off at night).
+        // Uses exponential backoff: 30s, 60s, 120s, ... up to 5 minutes.
+        if (!em_ptr.isImapReachable(allocator)) {
+            consecutive_net_failures +|= 1;
+            if (consecutive_net_failures == 1) {
+                log.info("Email: IMAP server unreachable, pausing poll until network returns", .{});
+            }
+            const shift: u6 = @intCast(@min(consecutive_net_failures, 3));
+            const backoff: u64 = @min(@as(u64, 30) << shift, 300);
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            std.Thread.sleep(backoff * std.time.ns_per_s);
+            continue;
+        }
+        if (consecutive_net_failures > 0) {
+            log.info("Email: network restored after {d} failed probes, resuming poll", .{consecutive_net_failures});
+            consecutive_net_failures = 0;
+        }
+
+        const messages = em_ptr.pollMessages(allocator) catch |err| {
+            log.warn("Email poll error: {}", .{err});
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            std.Thread.sleep(5 * std.time.ns_per_s);
+            continue;
+        };
+
+        loop_state.last_activity.store(std.time.timestamp(), .release);
+
+        for (messages) |msg| {
+            var key_buf: [192]u8 = undefined;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+
+            const session_key = blk: {
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "email",
+                    .account_id = em_ptr.config.account_id,
+                    .peer = .{
+                        .kind = .direct,
+                        .id = msg.sender,
+                    },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ em_ptr.config.account_id, msg.sender }) catch msg.sender;
+
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            // PII redaction (pre-LLM)
+            const pii_enabled = em_ptr.config.pii_redaction;
+            var redacted_content: ?[]u8 = null;
+            defer if (redacted_content) |rc| allocator.free(rc);
+
+            const content_for_llm = if (pii_enabled) blk: {
+                redacted_content = redactPii(allocator, msg.content, msg.id, msg.sender, em_ptr.config.pii_spacy);
+                if (redacted_content) |rc| {
+                    break :blk rc;
+                } else {
+                    log.warn("PII redaction failed, using original content", .{});
+                    break :blk msg.content;
+                }
+            } else msg.content;
+
+            const reply = runtime.session_mgr.processMessage(session_key, content_for_llm, null) catch |err| {
+                log.err("Email agent error: {}", .{err});
+                const err_msg: []const u8 = switch (err) {
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+                    error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.AllProvidersFailed => "All configured providers failed for this request.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again.",
+                };
+                if (msg.reply_target) |target| {
+                    const recipient = splitEmailTarget(target);
+                    em_ptr.sendReply(recipient.addr, recipient.subject, err_msg) catch |send_err| log.err("failed to send email error reply: {}", .{send_err});
+                }
+                continue;
+            };
+            defer allocator.free(reply);
+
+            // PII de-redaction (post-LLM)
+            var deredacted_reply: ?[]u8 = null;
+            defer if (deredacted_reply) |dr| allocator.free(dr);
+
+            const final_reply = if (pii_enabled) blk: {
+                deredacted_reply = deredactPii(allocator, reply, msg.id);
+                if (deredacted_reply) |dr| {
+                    break :blk dr;
+                } else {
+                    log.warn("PII de-redaction failed, using redacted reply", .{});
+                    break :blk reply;
+                }
+            } else reply;
+
+            if (msg.reply_target) |target| {
+                const recipient = splitEmailTarget(target);
+                em_ptr.sendReply(recipient.addr, recipient.subject, final_reply) catch |err| {
+                    log.warn("Email send error: {}", .{err});
+                };
+            }
+        }
+
+        if (messages.len > 0) {
+            for (messages) |msg| {
+                msg.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+
+        health.markComponentOk("email");
+
+        // Sleep for poll interval
+        const sleep_ns = @as(u64, em_ptr.config.poll_interval_secs) * std.time.ns_per_s;
+        std.Thread.sleep(sleep_ns);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2236,6 +2894,29 @@ test "MatrixLoopState stop_requested toggle" {
 
 test "MatrixLoopState last_activity update" {
     var state = MatrixLoopState.init();
+    const before = state.last_activity.load(.acquire);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std.time.timestamp(), .release);
+    const after = state.last_activity.load(.acquire);
+    try std.testing.expect(after >= before);
+}
+
+test "EmailLoopState init defaults" {
+    const state = EmailLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    try std.testing.expect(state.thread == null);
+    try std.testing.expect(state.last_activity.load(.acquire) > 0);
+}
+
+test "EmailLoopState stop_requested toggle" {
+    var state = EmailLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    state.stop_requested.store(true, .release);
+    try std.testing.expect(state.stop_requested.load(.acquire));
+}
+
+test "EmailLoopState last_activity update" {
+    var state = EmailLoopState.init();
     const before = state.last_activity.load(.acquire);
     std.Thread.sleep(10 * std.time.ns_per_ms);
     state.last_activity.store(std.time.timestamp(), .release);

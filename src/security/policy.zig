@@ -184,13 +184,14 @@ pub const SecurityPolicy = struct {
         // Reject oversized commands — never silently truncate
         if (command.len > MAX_ANALYSIS_LEN) return false;
 
-        // Block subshell/expansion operators
-        if (containsStr(command, "`") or containsStr(command, "$(") or containsStr(command, "${")) {
+        // Block subshell/expansion operators (only outside single quotes —
+        // single quotes prevent shell expansion, so `'{"key": "${val}"}'` is safe).
+        if (containsOutsideSingleQuotes(command, "`") or containsOutsideSingleQuotes(command, "$(") or containsOutsideSingleQuotes(command, "${")) {
             return false;
         }
 
-        // Block process substitution
-        if (containsStr(command, "<(") or containsStr(command, ">(")) {
+        // Block process substitution (only outside single quotes)
+        if (containsOutsideSingleQuotes(command, "<(") or containsOutsideSingleQuotes(command, ">(")) {
             return false;
         }
 
@@ -413,8 +414,16 @@ fn containsUnsafeRedirection(s: []const u8) bool {
         while (target_start < s.len and (s[target_start] == ' ' or s[target_start] == '\t')) : (target_start += 1) {}
         if (target_start >= s.len) return true;
 
-        // File descriptor duplication (e.g. `2>&1`) is not allowed.
-        if (s[target_start] == '&') return true;
+        // File descriptor duplication (e.g. `2>&1`, `2>&-`) — safe, allow it.
+        if (s[target_start] == '&') {
+            // Skip past the fd-dup target so the outer loop doesn't re-scan it.
+            var fd_end = target_start + 1;
+            while (fd_end < s.len and s[fd_end] != ' ' and s[fd_end] != '\t' and
+                s[fd_end] != '\n' and s[fd_end] != ';' and s[fd_end] != '|') : (fd_end += 1)
+            {}
+            if (fd_end > 0) i = fd_end - 1;
+            continue;
+        }
 
         // Parse redirect target token, honoring quotes.
         var target_end = target_start;
@@ -721,6 +730,34 @@ fn containsStr(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
 
+/// Check if `needle` appears outside of single-quoted regions.
+/// Single quotes in shell prevent all expansion — `${`, `$(`, and backticks
+/// inside single quotes are literal text, not shell operators.
+fn containsOutsideSingleQuotes(command: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return false;
+    var in_single_quote = false;
+    var i: usize = 0;
+    while (i < command.len) : (i += 1) {
+        // Outside single quotes, a backslash escapes the next character
+        // (including a single quote: \'). Inside single quotes, backslash
+        // is literal — POSIX shells have no escape mechanism in single quotes.
+        if (!in_single_quote and command[i] == '\\' and i + 1 < command.len) {
+            i += 1; // skip escaped character
+            continue;
+        }
+        if (command[i] == '\'') {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if (!in_single_quote and i + needle.len <= command.len) {
+            if (std.mem.eql(u8, command[i..][0..needle.len], needle)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /// Detect `%VARNAME%` patterns used by cmd.exe for environment variable expansion.
 fn hasPercentVar(s: []const u8) bool {
     var i: usize = 0;
@@ -893,6 +930,49 @@ test "quoted greater-than is not treated as redirection" {
 test "command injection dollar brace blocked" {
     const p = SecurityPolicy{};
     try std.testing.expect(!p.isCommandAllowed("echo ${IFS}cat${IFS}/etc/passwd"));
+}
+
+test "dollar brace inside single quotes is allowed" {
+    const allowed = [_][]const u8{"*"};
+    const p = SecurityPolicy{ .allowed_commands = &allowed };
+    // JSON payloads inside single quotes are safe — shell does not expand inside ''
+    try std.testing.expect(p.isCommandAllowed("echo '{\"key\": \"${value}\"}'"));
+    try std.testing.expect(p.isCommandAllowed("python3 script.py '{\"args\": \"${HOME}\"}'"));
+    // But outside single quotes is still blocked
+    try std.testing.expect(!p.isCommandAllowed("echo ${HOME}"));
+    try std.testing.expect(!p.isCommandAllowed("echo '${safe}' ${unsafe}"));
+}
+
+test "backtick inside single quotes is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo 'use `code` here'"));
+    // But outside single quotes is still blocked
+    try std.testing.expect(!p.isCommandAllowed("echo `whoami`"));
+}
+
+test "dollar paren inside single quotes is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo '$(not expanded)'"));
+    try std.testing.expect(!p.isCommandAllowed("echo $(expanded)"));
+}
+
+test "process substitution inside single quotes is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo '<(not a substitution)'"));
+    try std.testing.expect(!p.isCommandAllowed("diff <(ls dir1) <(ls dir2)"));
+}
+
+test "containsOutsideSingleQuotes edge cases" {
+    // Empty needle
+    try std.testing.expect(!containsOutsideSingleQuotes("anything", ""));
+    // Entirely inside quotes
+    try std.testing.expect(!containsOutsideSingleQuotes("echo '${HOME}'", "${"));
+    // Mixed: inside and outside
+    try std.testing.expect(containsOutsideSingleQuotes("echo '${ok}' ${bad}", "${"));
+    // No quotes at all
+    try std.testing.expect(containsOutsideSingleQuotes("echo ${bad}", "${"));
+    // Adjacent quotes
+    try std.testing.expect(!containsOutsideSingleQuotes("echo '${a}''${b}'", "${"));
 }
 
 test "command env var prefix with allowed cmd" {

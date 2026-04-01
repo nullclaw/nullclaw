@@ -235,7 +235,32 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 continue;
             };
             switch (tick_result.outcome) {
-                .processed => log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count}),
+                .processed => {
+                    log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count});
+
+                    // Execute collected tasks as agent subprocesses.
+                    const tasks = heartbeat_engine.collectTasks(allocator) catch |err| {
+                        log.warn("heartbeat collectTasks failed: {s}", .{@errorName(err)});
+                        next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+                        std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                        continue;
+                    };
+                    defer heartbeat_mod.HeartbeatEngine.freeTasks(allocator, tasks);
+
+                    for (tasks) |task| {
+                        log.info("heartbeat executing task: {s}", .{task});
+                        const result = cron.runAgentJob(allocator, config.workspace_dir, task, config.default_model, config.scheduler.agent_timeout_secs) catch |err| {
+                            log.warn("heartbeat agent task failed: {s}", .{@errorName(err)});
+                            continue;
+                        };
+                        defer allocator.free(result.output);
+                        if (result.success) {
+                            log.info("heartbeat task completed successfully", .{});
+                        } else {
+                            log.warn("heartbeat task finished with error", .{});
+                        }
+                    }
+                },
                 .skipped_empty_file => log.debug("heartbeat tick skipped: HEARTBEAT.md has no actionable content", .{}),
                 .skipped_missing_file => log.debug("heartbeat tick skipped: HEARTBEAT.md is missing", .{}),
             }

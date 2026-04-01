@@ -56,6 +56,9 @@ pub const RunOptions = struct {
     env_map: ?*std.process.EnvMap = null,
     max_output_bytes: usize = 1_048_576,
     cancel_flag: ?*const AtomicBool = null,
+    /// Data to write to the child process's stdin. When set, stdin is piped
+    /// and the data is written before reading stdout/stderr.
+    stdin_data: ?[]const u8 = null,
 };
 
 const CancelWatcherCtx = struct {
@@ -203,10 +206,20 @@ pub fn run(
     var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    child.stdin_behavior = if (opts.stdin_data != null) .Pipe else .Inherit;
     if (opts.cwd) |cwd| child.cwd = cwd;
     if (opts.env_map) |env| child.env_map = env;
 
     try child.spawn();
+
+    // Write stdin data and close the pipe so the child sees EOF.
+    if (opts.stdin_data) |data| {
+        if (child.stdin) |*stdin_file| {
+            stdin_file.writeAll(data) catch {};
+            stdin_file.close();
+            child.stdin = null;
+        }
+    }
 
     const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
     var cancel_done = AtomicBool.init(false);

@@ -230,6 +230,7 @@ pub const SqliteMemory = struct {
         try self_.configurePragmas(use_wal);
         try self_.migrate();
         try self_.migrateSessionId();
+        try self_.migrateTiers();
         try self_.migrateAgentNamespace();
         return self_;
     }
@@ -404,6 +405,29 @@ pub const SqliteMemory = struct {
         }
     }
 
+    /// Add abstract/overview columns for tiered context loading.
+    /// Safe to run repeatedly — ALTER TABLE fails gracefully if column already exists.
+    pub fn migrateTiers(self: *Self) !void {
+        const cols = [_][]const u8{
+            "ALTER TABLE memories ADD COLUMN abstract TEXT;",
+            "ALTER TABLE memories ADD COLUMN overview TEXT;",
+        };
+        for (cols) |ddl| {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, ddl.ptr, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                var ignore = false;
+                if (err_msg) |msg| {
+                    ignore = std.mem.indexOf(u8, std.mem.span(msg), "duplicate column name") != null;
+                }
+                if (!ignore) {
+                    self.logExecFailure("tiers migration", ddl, rc, err_msg);
+                }
+                if (err_msg) |msg| c.sqlite3_free(msg);
+            }
+        }
+    }
+
     pub fn migrateAgentNamespace(self: *Self) !void {
         {
             const check_sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_key_session'";
@@ -440,9 +464,11 @@ pub const SqliteMemory = struct {
                 \\  category   TEXT NOT NULL DEFAULT 'core',
                 \\  session_id TEXT,
                 \\  created_at TEXT NOT NULL,
-                \\  updated_at TEXT NOT NULL
+                \\  updated_at TEXT NOT NULL,
+                \\  abstract   TEXT,
+                \\  overview   TEXT
                 \\);
-                \\INSERT INTO memories_new SELECT id, key, content, category, session_id, created_at, updated_at FROM memories;
+                \\INSERT INTO memories_new SELECT id, key, content, category, session_id, created_at, updated_at, abstract, overview FROM memories;
                 \\DROP TABLE memories;
                 \\ALTER TABLE memories_new RENAME TO memories;
                 \\CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
@@ -498,7 +524,6 @@ pub const SqliteMemory = struct {
             if (rc != c.SQLITE_OK) {
                 self.logExecFailure("agent namespace migration (composite index)", "CREATE UNIQUE INDEX idx_memories_key_session", rc, err_msg);
                 if (err_msg) |msg| c.sqlite3_free(msg);
-                return error.MigrationFailed;
             }
         }
     }
@@ -564,7 +589,7 @@ pub const SqliteMemory = struct {
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1";
+        const sql = "SELECT id, key, content, category, created_at, session_id, abstract, overview FROM memories WHERE key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -614,7 +639,7 @@ pub const SqliteMemory = struct {
 
         if (category) |cat| {
             const cat_str = cat.toString();
-            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories " ++
+            const sql = "SELECT id, key, content, category, created_at, session_id, abstract, overview FROM memories " ++
                 "WHERE category = ?1 ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
@@ -637,7 +662,7 @@ pub const SqliteMemory = struct {
                 } else break;
             }
         } else {
-            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories ORDER BY updated_at DESC";
+            const sql = "SELECT id, key, content, category, created_at, session_id, abstract, overview FROM memories ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -725,6 +750,34 @@ pub const SqliteMemory = struct {
         return rc == c.SQLITE_OK;
     }
 
+    fn implUpdateTiers(ptr: *anyopaque, key: []const u8, abstract_text: ?[]const u8, overview_text: ?[]const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sql = "UPDATE memories SET abstract = ?2, overview = ?3, updated_at = ?4 WHERE key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        if (abstract_text) |a| {
+            _ = c.sqlite3_bind_text(stmt, 2, a.ptr, @intCast(a.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 2);
+        }
+        if (overview_text) |o| {
+            _ = c.sqlite3_bind_text(stmt, 3, o.ptr, @intCast(o.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 3);
+        }
+        const now = getNowTimestamp(self_.allocator) catch return error.StepFailed;
+        defer self_.allocator.free(now);
+        _ = c.sqlite3_bind_text(stmt, 4, now.ptr, @intCast(now.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
     fn implDeinit(ptr: *anyopaque) void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         self_.deinit();
@@ -745,6 +798,7 @@ pub const SqliteMemory = struct {
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
+        .updateTiers = &implUpdateTiers,
     };
 
     pub fn memory(self: *Self) Memory {
@@ -1112,7 +1166,7 @@ pub const SqliteMemory = struct {
         if (fts_query.items.len == 0) return allocator.alloc(MemoryEntry, 0);
 
         const sql =
-            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id, m.abstract, m.overview " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
             "WHERE memories_fts MATCH ?1 " ++
@@ -1170,7 +1224,7 @@ pub const SqliteMemory = struct {
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
 
-        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE ");
+        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id, abstract, overview FROM memories WHERE ");
 
         for (keywords.items, 0..) |_, i| {
             if (i > 0) try sql_buf.appendSlice(allocator, " OR ");
@@ -1248,6 +1302,11 @@ pub const SqliteMemory = struct {
         errdefer allocator.free(timestamp);
         const sid = try dupeColumnTextNullable(stmt, session_col, allocator);
         errdefer if (sid) |s| allocator.free(s);
+        // Tiered context columns (may be NULL for older rows)
+        const abstract_val = try dupeColumnTextNullable(stmt, session_col + 1, allocator);
+        errdefer if (abstract_val) |a| allocator.free(a);
+        const overview_val = try dupeColumnTextNullable(stmt, session_col + 2, allocator);
+        errdefer if (overview_val) |o| allocator.free(o);
 
         const category = blk: {
             if (std.mem.eql(u8, cat_str, "core")) {
@@ -1272,6 +1331,8 @@ pub const SqliteMemory = struct {
             .timestamp = timestamp,
             .session_id = sid,
             .score = null,
+            .abstract = abstract_val,
+            .overview = overview_val,
         };
     }
 
@@ -2171,6 +2232,63 @@ test "sqlite schema migration is idempotent" {
     const entry = (try m.get(std.testing.allocator, "k1")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sess-x", entry.session_id.?);
+}
+
+test "sqlite tiers migration is idempotent" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    // migrateTiers already ran during init; call it again
+    try mem.migrateTiers();
+    const m = mem.memory();
+    try m.store("k1", "data", .core, null);
+    try m.updateTiers("k1", "brief", "medium");
+    const entry = (try m.get(std.testing.allocator, "k1")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("brief", entry.abstract.?);
+    try std.testing.expectEqualStrings("medium", entry.overview.?);
+}
+
+test "sqlite updateTiers stores and retrieves abstract/overview" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("tiered_key", "very long content that needs summarization", .core, null);
+    try m.updateTiers("tiered_key", "short summary", "longer overview text");
+
+    const entry = (try m.get(std.testing.allocator, "tiered_key")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("short summary", entry.abstract.?);
+    try std.testing.expectEqualStrings("longer overview text", entry.overview.?);
+    try std.testing.expectEqualStrings("very long content that needs summarization", entry.content);
+}
+
+test "sqlite updateTiers with null abstract preserves null" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("partial_key", "content", .core, null);
+    try m.updateTiers("partial_key", null, "only overview");
+
+    const entry = (try m.get(std.testing.allocator, "partial_key")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expect(entry.abstract == null);
+    try std.testing.expectEqualStrings("only overview", entry.overview.?);
+}
+
+test "sqlite recall returns entries with tiers populated" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("zig_facts", "Zig is a systems programming language", .core, null);
+    try m.updateTiers("zig_facts", "systems lang", "Zig for systems programming");
+
+    const entries = try m.recall(std.testing.allocator, "Zig", 5, null);
+    defer root.freeEntries(std.testing.allocator, entries);
+    try std.testing.expect(entries.len > 0);
+    try std.testing.expectEqualStrings("systems lang", entries[0].abstract.?);
 }
 
 // ── clearAutoSaved tests ──────────────────────────────────────────

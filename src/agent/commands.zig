@@ -16,6 +16,7 @@ const control_plane = @import("../control_plane.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
+const session_digest = @import("session_digest.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -1975,7 +1976,122 @@ fn handleSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try self.allocator.dupe(u8, "Invalid TTL duration.");
         return try std.fmt.allocPrint(self.allocator, "Session TTL set to {d}s.", .{self.session_ttl_secs.?});
     }
-    return try self.allocator.dupe(u8, "Unknown /session command. Use: /session ttl <duration|off>");
+    if (std.ascii.eqlIgnoreCase(sub, "status")) {
+        return try formatSessionStatus(self);
+    }
+    if (std.ascii.eqlIgnoreCase(sub, "digest")) {
+        return try handleSessionDigestCommand(self);
+    }
+    if (std.ascii.eqlIgnoreCase(sub, "end")) {
+        return try handleSessionEndCommand(self);
+    }
+    return try self.allocator.dupe(u8, "Unknown /session command. Use: /session ttl|status|digest|end");
+}
+
+fn formatSessionStatus(self: anytype) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const w = out.writer(self.allocator);
+
+    const session_id = self.memory_session_id orelse "unknown";
+    try w.print("Session: {s}\n", .{session_id});
+    try w.print("Messages: {d}\n", .{self.history.items.len});
+
+    // Count user/assistant turns
+    var user_turns: u32 = 0;
+    var assistant_turns: u32 = 0;
+    for (self.history.items) |msg| {
+        if (msg.role == .user) user_turns += 1;
+        if (msg.role == .assistant) assistant_turns += 1;
+    }
+    try w.print("User turns: {d}\n", .{user_turns});
+    try w.print("Assistant turns: {d}\n", .{assistant_turns});
+
+    if (self.session_ttl_secs) |ttl| {
+        try w.print("TTL: {d}s\n", .{ttl});
+    } else {
+        try w.print("TTL: off\n", .{});
+    }
+
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn handleSessionDigestCommand(self: anytype) ![]const u8 {
+    const history = self.history.items;
+    if (history.len == 0) {
+        return try self.allocator.dupe(u8, "No messages in session — nothing to digest.");
+    }
+
+    // Build DigestMessage list from history
+    var messages: std.ArrayListUnmanaged(session_digest.DigestMessage) = .empty;
+    defer messages.deinit(self.allocator);
+
+    for (history) |msg| {
+        if (msg.role == .system) continue;
+        try messages.append(self.allocator, .{
+            .role = msg.role.toSlice(),
+            .content = msg.content,
+        });
+    }
+
+    if (messages.items.len == 0) {
+        return try self.allocator.dupe(u8, "No non-system messages to digest.");
+    }
+
+    const digest = try session_digest.generateDigest(self.allocator, messages.items, .{});
+    defer digest.deinit(self.allocator);
+
+    if (digest.isEmpty()) {
+        return try std.fmt.allocPrint(self.allocator, "Digest empty (no patterns found).\n{s}", .{digest.summary});
+    }
+
+    // Store if memory is available
+    if (memoryRuntimePtr(self)) |rt| {
+        const session_id = self.memory_session_id orelse "agent";
+        session_digest.storeDigest(rt.memory, session_id, &digest, self.allocator);
+    }
+
+    // Format output
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const w = out.writer(self.allocator);
+
+    try w.print("{s}\n", .{digest.summary});
+    if (digest.user_preferences.len > 0) {
+        try w.print("Preferences ({d}):\n", .{digest.user_preferences.len});
+        for (digest.user_preferences) |pref| {
+            try w.print("  - {s}\n", .{pref});
+        }
+    }
+    if (digest.tool_insights.len > 0) {
+        try w.print("Tool insights ({d}):\n", .{digest.tool_insights.len});
+        for (digest.tool_insights) |insight| {
+            try w.print("  - {s}\n", .{insight});
+        }
+    }
+
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn handleSessionEndCommand(self: anytype) ![]const u8 {
+    // Generate and store digest, then clear history via clearHistory()
+    const digest_output = handleSessionDigestCommand(self) catch |err| blk: {
+        break :blk try std.fmt.allocPrint(self.allocator, "Digest failed: {s}", .{@errorName(err)});
+    };
+    defer self.allocator.free(digest_output);
+
+    // Clear history the proper way
+    if (@hasDecl(@TypeOf(self.*), "clearHistory")) {
+        self.clearHistory();
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const w = out.writer(self.allocator);
+
+    try w.print("Session ended.\n{s}", .{digest_output});
+
+    return try out.toOwnedSlice(self.allocator);
 }
 
 fn handleFocusCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -2542,7 +2658,6 @@ fn handleStopCommand(self: anytype) ![]const u8 {
         clearPendingExecCommand(self);
         cleared_pending = true;
     }
-
     if (findSubagentManager(self)) |manager| {
         var running: u32 = 0;
         manager.mutex.lock();

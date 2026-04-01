@@ -169,6 +169,8 @@ pub const Session = struct {
     turn_count: u64,
     turn_running: std.atomic.Value(bool),
     mutex: std.Thread.Mutex,
+    /// Whether a digest has already been generated for this session.
+    digest_generated: bool = false,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
@@ -1026,6 +1028,11 @@ pub const SessionManager = struct {
                 const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
                 schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, null);
             }
+            if (std.mem.eql(u8, tool.name(), "spawn")) {
+                const spawn_tool: *tools_mod.spawn.SpawnTool = @ptrCast(@alignCast(tool.ptr));
+                spawn_tool.default_channel = channel;
+                spawn_tool.default_chat_id = chat_id;
+            }
         }
     }
 
@@ -1595,6 +1602,12 @@ pub const SessionManager = struct {
             session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
         }
 
+        // Pre-reset: flush final turn score and generate digest before clearing session
+        if (turn_input.clear_session) {
+            self.flushFinalTurnScore(session);
+            self.maybeGenerateDigest(session, .reset);
+        }
+
         // Persist messages via session store
         if (session.agent.session_store) |store| {
             if (turn_input.clear_session) {
@@ -1867,6 +1880,10 @@ pub const SessionManager = struct {
         for (to_remove.items) |key| {
             if (self.sessions.fetchRemove(key)) |kv| {
                 const session = kv.value;
+                // Pre-eviction: flush any unscored final turn
+                self.flushFinalTurnScore(session);
+                // Pre-eviction: generate session digest (best-effort)
+                self.maybeGenerateDigest(session, .eviction);
                 session.deinit(self.allocator);
                 self.allocator.destroy(session);
                 evicted += 1;
@@ -1878,6 +1895,104 @@ pub const SessionManager = struct {
         }
 
         return evicted;
+    }
+
+    /// Emit a turn_scored event for the last (unscored) turn of a session.
+    /// Normally, scoring is deferred to the next user message — but at session
+    /// end there is no next message, so we flush with neutral feedback.
+    fn flushFinalTurnScore(self: *SessionManager, session: *Session) void {
+        const prev_ctx = session.agent.prev_turn_context orelse return;
+        const turn_scorer = @import("agent/turn_scorer.zig");
+        const score = turn_scorer.scoreTurn(prev_ctx, .{});
+        const scored_event = observability.ObserverEvent{ .turn_scored = .{
+            .score = score.score,
+            .tool_count = score.tool_count,
+            .tool_failures = score.tool_failures,
+            .signals = @bitCast(score.signals),
+            .model = prev_ctx.model,
+            .session_id = session.session_key,
+            .skill = prev_ctx.skill,
+        } };
+        self.observer.recordEvent(&scored_event);
+        if (session.agent.prev_turn_skill_owned) |s| self.allocator.free(s);
+        session.agent.prev_turn_skill_owned = null;
+        session.agent.prev_turn_context = null;
+    }
+
+    const DigestTrigger = enum { eviction, reset };
+
+    /// Generate a session digest if conditions are met (best-effort).
+    fn maybeGenerateDigest(self: *SessionManager, session: *Session, trigger: DigestTrigger) void {
+        const digest_mod = agent_mod.session_digest;
+
+        // Check config
+        if (!self.config.agent.session_digest_enabled) return;
+        switch (trigger) {
+            .eviction => if (!self.config.agent.session_digest_on_eviction) return,
+            .reset => if (!self.config.agent.session_digest_on_reset) return,
+        }
+
+        // Check minimum turns
+        if (session.turn_count < self.config.agent.session_digest_min_turns) return;
+
+        // Already generated?
+        if (session.digest_generated) return;
+
+        // Need memory backend
+        const mem = self.mem orelse return;
+
+        // Build message list from agent history
+        const history = session.agent.history.items;
+        if (history.len == 0) return;
+
+        var messages: std.ArrayListUnmanaged(digest_mod.DigestMessage) = .empty;
+        defer messages.deinit(self.allocator);
+
+        for (history) |msg| {
+            if (msg.role == .system) continue;
+            messages.append(self.allocator, .{
+                .role = msg.role.toSlice(),
+                .content = msg.content,
+            }) catch continue;
+        }
+
+        if (messages.items.len == 0) return;
+
+        const digest_config = digest_mod.SessionDigestConfig{
+            .enabled = true,
+            .min_turns = self.config.agent.session_digest_min_turns,
+        };
+
+        const digest = digest_mod.generateDigest(
+            self.allocator,
+            messages.items,
+            digest_config,
+        ) catch {
+            log.warn("session digest generation failed for {s}", .{session.session_key});
+            return;
+        };
+        defer digest.deinit(self.allocator);
+
+        if (digest.isEmpty()) return;
+
+        digest_mod.storeDigest(mem, session.session_key, &digest, self.allocator);
+        session.digest_generated = true;
+
+        // Forward digest to observer pipeline (→ RAG API)
+        const digest_event = observability.ObserverEvent{ .digest_ready = .{
+            .session_id = session.session_key,
+            .summary = digest.summary,
+            .user_preferences = digest.user_preferences,
+            .tool_insights = digest.tool_insights,
+            .task_patterns = digest.task_patterns,
+        } };
+        self.observer.recordEvent(&digest_event);
+
+        log.info("session digest generated for {s}: {d} prefs, {d} insights", .{
+            session.session_key,
+            digest.user_preferences.len,
+            digest.tool_insights.len,
+        });
     }
 };
 
