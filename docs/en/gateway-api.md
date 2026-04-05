@@ -22,7 +22,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 - [Security](./security.md): come here when a security review needs the concrete HTTP auth and endpoint surface
 - [Configuration](./configuration.md): return here after editing `gateway` settings to validate the API-facing behavior
 
-## Endpoints
+ ## Endpoints
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
@@ -40,6 +40,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
 | `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 endpoint |
+| `/api/v1/health` | GET | `Authorization: Bearer <token>` | REST Admin API — structured health with component detail (requires `gateway.admin_api: true`) |
 
 ## Quick Examples
 
@@ -294,12 +295,72 @@ Include `contextId` in the message to group tasks into a conversation. All messa
 | -32005 | ContentTypeNotSupportedError | Incompatible content types |
 | -32007 | AuthenticatedExtendedCardNotConfiguredError | Extended card not available |
 
+## REST Admin API (`/api/v1/`)
+
+The REST Admin API provides programmatic access to runtime state for trusted clients such as the NullClaw iOS app. It is **opt-in** and disabled by default.
+
+### Enabling
+
+Add `"admin_api": true` under the `gateway` key in `config.json`:
+
+```json
+{
+  "gateway": {
+    "require_pairing": true,
+    "admin_api": true
+  }
+}
+```
+
+When `admin_api` is `false` (the default), every request to `/api/v1/*` returns:
+
+```json
+{"success":false,"data":null,"error":{"code":"ADMIN_API_DISABLED","message":"Set gateway.admin_api=true in config.json to enable the REST admin API"}}
+```
+
+### Auth
+
+The same Bearer token used for `/webhook` and `/cron` is required. Requests without a valid token receive `401 Unauthorized`.
+
+### Response envelope
+
+All Admin API responses use a consistent JSON envelope:
+
+```json
+{"success":true,"data":{...},"error":null}
+{"success":false,"data":null,"error":{"code":"ERROR_CODE","message":"human-readable message"}}
+```
+
+### Phase 0 endpoints
+
+#### `GET /api/v1/health`
+
+Returns structured component health, PID, and uptime.
+
+```json
+{
+  "success": true,
+  "data": {
+    "status": "ok",
+    "pid": 12345,
+    "uptime_seconds": 3600,
+    "components": {
+      "gateway": {"status": "ok", "restart_count": 0}
+    }
+  },
+  "error": null
+}
+```
+
+`status` is `"ok"` when all components report `"ok"`, otherwise `"degraded"`.
+
 ## Security Guidance
 
 1. Keep `gateway.require_pairing = true`.
 2. Keep gateway on loopback (`127.0.0.1`) and expose externally through tunnel/proxy.
 3. Treat bearer tokens as secrets; do not commit or log them.
 4. Treat Max webhook secrets the same way: randomize them per account and do not reuse one secret across multiple bots.
+5. Only enable `gateway.admin_api = true` when a trusted client (e.g. NullClaw iOS app) requires it.
 
 ## Next Steps
 

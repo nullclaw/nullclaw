@@ -1443,6 +1443,11 @@ pub const GatewayConfig = struct {
     /// Default 30s. Raise this when accepting large payloads (e.g. images)
     /// over slow or high-latency connections.
     request_timeout_secs: u64 = 30,
+    /// Enable the REST Admin API at /api/v1/*.
+    /// Default false (opt-in).  Requires a valid Bearer token when pairing
+    /// is enabled.  Set to true only when the NullClaw iOS app or another
+    /// trusted client needs programmatic access.
+    admin_api: bool = false,
 };
 
 // ── A2A (Agent-to-Agent) protocol config ────────────────────────

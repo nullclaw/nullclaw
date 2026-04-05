@@ -222,7 +222,8 @@
   "gateway": {
     "port": 3000,
     "host": "127.0.0.1",
-    "require_pairing": true
+    "require_pairing": true,
+    "admin_api": false
   },
 
   "tunnel": {
