@@ -40,7 +40,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
 | `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 endpoint |
-| `/api/v1/health` | GET | `Authorization: Bearer <token>` | REST Admin API — structured health with component detail (requires `gateway.admin_api: true`) |
+| `/api/status` | GET | `Authorization: Bearer <token>` | REST Admin API — version, pid, uptime, overall status, and component health detail (requires `gateway.admin_api: true`) |
 
 ## Quick Examples
 
@@ -295,7 +295,7 @@ Include `contextId` in the message to group tasks into a conversation. All messa
 | -32005 | ContentTypeNotSupportedError | Incompatible content types |
 | -32007 | AuthenticatedExtendedCardNotConfiguredError | Extended card not available |
 
-## REST Admin API (`/api/v1/`)
+## REST Admin API (`/api/`)
 
 The REST Admin API provides programmatic access to runtime state for trusted clients such as the NullClaw iOS app. It is **opt-in** and disabled by default.
 
@@ -312,7 +312,7 @@ Add `"admin_api": true` under the `gateway` key in `config.json`:
 }
 ```
 
-When `admin_api` is `false` (the default), every request to `/api/v1/*` returns:
+When `admin_api` is `false` (the default), every request to `/api/*` returns:
 
 ```json
 {"success":false,"data":null,"error":{"code":"ADMIN_API_DISABLED","message":"Set gateway.admin_api=true in config.json to enable the REST admin API"}}
@@ -331,19 +331,34 @@ All Admin API responses use a consistent JSON envelope:
 {"success":false,"data":null,"error":{"code":"ERROR_CODE","message":"human-readable message"}}
 ```
 
-### Phase 0 endpoints
+### Endpoints
 
-#### `GET /api/v1/health`
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/status` | GET | Version, pid, uptime, overall status, and component health |
+| `/api/config?path=<dotted>` | GET | Read a single config value |
+| `/api/models` | GET | List configured providers (no key values) |
+| `/api/cron` | GET | List all scheduled jobs |
+| `/api/cron` | POST | Create a recurring cron job |
+| `/api/cron/once` | POST | Create a one-shot delayed job |
+| `/api/cron/:id/run` | POST | Trigger a job immediately |
+| `/api/cron/:id/pause` | POST | Pause a job |
+| `/api/cron/:id/resume` | POST | Resume a paused job |
+| `/api/cron/:id` | PATCH | Update job fields |
+| `/api/cron/:id` | DELETE | Remove a job |
 
-Returns structured component health, PID, and uptime.
+#### `GET /api/status`
+
+Returns version, pid, uptime, overall health status, and per-component detail.
 
 ```json
 {
   "success": true,
   "data": {
-    "status": "ok",
+    "version": "v2026.4.4",
     "pid": 12345,
     "uptime_seconds": 3600,
+    "status": "ok",
     "components": {
       "gateway": {"status": "ok", "restart_count": 0}
     }

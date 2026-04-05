@@ -1,4 +1,4 @@
-//! ApiContext — per-request context for /api/v1/* handlers.
+//! ApiContext — per-request context for /api/* handlers.
 //!
 //! Mirrors the WebhookHandlerContext pattern used throughout gateway.zig:
 //! raw HTTP bytes in, structured response fields out.  Handlers set
@@ -11,17 +11,18 @@
 
 const std = @import("std");
 const Config = @import("../config.zig").Config;
+const cron_mod = @import("../cron.zig");
 
 // ── Constants ────────────────────────────────────────────────────────
 
 pub const CONTENT_TYPE_JSON = "application/json";
 
-/// Maximum path segment length accepted in /api/v1/* routes.
+/// Maximum path segment length accepted in /api/* routes.
 pub const MAX_PATH_SEGMENT = 128;
 
 // ── ApiContext ───────────────────────────────────────────────────────
 
-/// Per-request context passed to every /api/v1/* handler.
+/// Per-request context passed to every /api/* handler.
 ///
 /// Lifetime: stack-allocated in the dispatch loop, valid for the duration
 /// of a single request.  Handlers must not store pointers to this struct.
@@ -32,12 +33,18 @@ pub const ApiContext = struct {
     raw_request: []const u8,
     /// HTTP method string, e.g. "GET", "POST".
     method: []const u8,
-    /// Request target including query string, e.g. "/api/v1/health".
+    /// Request target including query string, e.g. "/api/status".
     target: []const u8,
     /// Base path without query string.
     base_path: []const u8,
     /// Active config, or null when the gateway was started without one.
     config_opt: ?*const Config,
+    /// Live CronScheduler pointer, already mutex-locked by the dispatch caller.
+    /// Null when the scheduler is not running.  Handlers must not unlock it.
+    scheduler_opt: ?*cron_mod.CronScheduler = null,
+    /// Dynamic path segment extracted by the router (e.g. the ":id" portion
+    /// of "/api/v1/cron/:id/run").  Set by dispatch() before calling the handler.
+    path_param: ?[]const u8 = null,
 
     // ── Response fields (set by handler) ────────────────────────────
 
@@ -116,10 +123,10 @@ fn extractBody(raw: []const u8) ?[]const u8 {
 test "ApiContext setJson sets status and body" {
     var ctx = ApiContext{
         .allocator = std.testing.allocator,
-        .raw_request = "GET /api/v1/health HTTP/1.1\r\n\r\n",
+        .raw_request = "GET /api/status HTTP/1.1\r\n\r\n",
         .method = "GET",
-        .target = "/api/v1/health",
-        .base_path = "/api/v1/health",
+        .target = "/api/status",
+        .base_path = "/api/status",
         .config_opt = null,
     };
     ctx.setJson("200 OK", "{\"status\":\"ok\"}");
@@ -131,10 +138,10 @@ test "ApiContext setJson sets status and body" {
 test "ApiContext sendSuccess wraps data in envelope" {
     var ctx = ApiContext{
         .allocator = std.testing.allocator,
-        .raw_request = "GET /api/v1/health HTTP/1.1\r\n\r\n",
+        .raw_request = "GET /api/status HTTP/1.1\r\n\r\n",
         .method = "GET",
-        .target = "/api/v1/health",
-        .base_path = "/api/v1/health",
+        .target = "/api/status",
+        .base_path = "/api/status",
         .config_opt = null,
     };
     try ctx.sendSuccess("{\"version\":\"1.0\"}");
@@ -150,10 +157,10 @@ test "ApiContext sendSuccess wraps data in envelope" {
 test "ApiContext sendError wraps error in envelope" {
     var ctx = ApiContext{
         .allocator = std.testing.allocator,
-        .raw_request = "GET /api/v1/health HTTP/1.1\r\n\r\n",
+        .raw_request = "GET /api/status HTTP/1.1\r\n\r\n",
         .method = "GET",
-        .target = "/api/v1/health",
-        .base_path = "/api/v1/health",
+        .target = "/api/status",
+        .base_path = "/api/status",
         .config_opt = null,
     };
     try ctx.sendError("403 Forbidden", "FORBIDDEN", "Admin API is disabled");
@@ -164,13 +171,13 @@ test "ApiContext sendError wraps error in envelope" {
 }
 
 test "ApiContext body extracts CRLF-delimited body" {
-    const raw = "POST /api/v1/health HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+    const raw = "POST /api/status HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
     const ctx = ApiContext{
         .allocator = std.testing.allocator,
         .raw_request = raw,
         .method = "POST",
-        .target = "/api/v1/health",
-        .base_path = "/api/v1/health",
+        .target = "/api/status",
+        .base_path = "/api/status",
         .config_opt = null,
     };
     const b = ctx.body();
@@ -179,13 +186,13 @@ test "ApiContext body extracts CRLF-delimited body" {
 }
 
 test "ApiContext body returns null for bodyless request" {
-    const raw = "GET /api/v1/health HTTP/1.1\r\n\r\n";
+    const raw = "GET /api/status HTTP/1.1\r\n\r\n";
     const ctx = ApiContext{
         .allocator = std.testing.allocator,
         .raw_request = raw,
         .method = "GET",
-        .target = "/api/v1/health",
-        .base_path = "/api/v1/health",
+        .target = "/api/status",
+        .base_path = "/api/status",
         .config_opt = null,
     };
     try std.testing.expect(ctx.body() == null);
