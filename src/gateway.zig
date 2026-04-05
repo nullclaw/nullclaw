@@ -5222,7 +5222,40 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         var response_body: []const u8 = "";
         var pair_response_buf: [256]u8 = undefined;
 
-        if (findCronRouteDescriptor(base_path)) |desc| {
+        if (std.mem.startsWith(u8, base_path, "/api/")) {
+            // REST Admin API — opt-in, Bearer-auth guarded.
+            // Checked first so /api/cron/* is handled by the structured API
+            // rather than the legacy /cron handlers below.
+            const auth_header = extractHeader(raw, "Authorization");
+            const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+            const api_auth_ok = if (pairing_guard) |g|
+                if (!g.requirePairing())
+                    true
+                else if (!g.hasPairedTokens())
+                    false
+                else
+                    isWebhookAuthorized(pairing_guard, bearer)
+            else
+                true;
+            const api_result = api.dispatch(
+                req_allocator,
+                raw,
+                method_str,
+                target,
+                base_path,
+                config_opt,
+                api_auth_ok,
+                lockSharedSchedulerForRequest(),
+            );
+            g_shared_scheduler_mutex.unlock();
+            // Write the response immediately so we can safely free an allocated body.
+            writeHttpResponse(&conn.stream, api_result.status, CONTENT_TYPE_JSON, api_result.body);
+            if (api_result.allocated) req_allocator.free(api_result.body);
+            // Skip the generic response write below.
+            response_status = "";
+            response_body = "";
+        } else if (findCronRouteDescriptor(base_path)) |desc| {
             // Auth check for /cron endpoints:
             // - No pairing guard → allow (pairing not configured)
             // - Pairing disabled → allow
@@ -5484,35 +5517,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     }
                 }
             },
-        } else if (std.mem.startsWith(u8, base_path, "/api/v1/") or std.mem.eql(u8, base_path, "/api/v1")) {
-            // REST Admin API — opt-in, Bearer-auth guarded.
-            const auth_header = extractHeader(raw, "Authorization");
-            const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
-            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
-            const api_auth_ok = if (pairing_guard) |g|
-                if (!g.requirePairing())
-                    true
-                else if (!g.hasPairedTokens())
-                    false
-                else
-                    isWebhookAuthorized(pairing_guard, bearer)
-            else
-                true;
-            const api_result = api.dispatch(
-                req_allocator,
-                raw,
-                method_str,
-                target,
-                base_path,
-                config_opt,
-                api_auth_ok,
-            );
-            // Write the response immediately so we can safely free an allocated body.
-            writeHttpResponse(&conn.stream, api_result.status, CONTENT_TYPE_JSON, api_result.body);
-            if (api_result.allocated) req_allocator.free(api_result.body);
-            // Skip the generic response write below.
-            response_status = "";
-            response_body = "";
         } else {
             response_status = "404 Not Found";
             response_body = "{\"error\":\"not found\"}";
