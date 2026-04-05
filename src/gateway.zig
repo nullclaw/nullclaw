@@ -37,6 +37,7 @@ const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const cron_mod = @import("cron.zig");
+const api = @import("api/api.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 
@@ -5483,6 +5484,35 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     }
                 }
             },
+        } else if (std.mem.startsWith(u8, base_path, "/api/v1/") or std.mem.eql(u8, base_path, "/api/v1")) {
+            // REST Admin API — opt-in, Bearer-auth guarded.
+            const auth_header = extractHeader(raw, "Authorization");
+            const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+            const api_auth_ok = if (pairing_guard) |g|
+                if (!g.requirePairing())
+                    true
+                else if (!g.hasPairedTokens())
+                    false
+                else
+                    isWebhookAuthorized(pairing_guard, bearer)
+            else
+                true;
+            const api_result = api.dispatch(
+                req_allocator,
+                raw,
+                method_str,
+                target,
+                base_path,
+                config_opt,
+                api_auth_ok,
+            );
+            // Write the response immediately so we can safely free an allocated body.
+            writeHttpResponse(&conn.stream, api_result.status, CONTENT_TYPE_JSON, api_result.body);
+            if (api_result.allocated) req_allocator.free(api_result.body);
+            // Skip the generic response write below.
+            response_status = "";
+            response_body = "";
         } else {
             response_status = "404 Not Found";
             response_body = "{\"error\":\"not found\"}";
