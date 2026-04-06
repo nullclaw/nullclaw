@@ -95,7 +95,6 @@ pub const MarkdownMemory = struct {
         return days;
     }
 
-
     fn corePath(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{self.workspace_dir});
     }

@@ -550,6 +550,75 @@ check "DELETE /api/memory/nonexistent → 404" "404" "$S" "$B" '.error.code == "
 
 echo ""
 
+# ── Phase 8: Polish (doctor, spec, memory/stats, memory/search, memory/:key GET, history) ──
+
+echo "-- Phase 8: Polish"
+
+# GET /api/doctor — deep health report
+api GET /doctor
+check "GET /api/doctor → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/doctor has ready field" "200" "$S" "$B" '(.data.ready | type) == "boolean"'
+check "GET /api/doctor has pid" "200" "$S" "$B" '(.data.pid | type) == "number"'
+check "GET /api/doctor has uptime_seconds" "200" "$S" "$B" '(.data.uptime_seconds | type) == "number"'
+check "GET /api/doctor has components object" "200" "$S" "$B" '(.data.components | type) == "object"'
+
+# GET /api/spec — OpenAPI 3.1 document
+api GET /spec
+check "GET /api/spec → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/spec has openapi field" "200" "$S" "$B" '(.data.openapi | type) == "string"'
+check "GET /api/spec openapi version is 3.1.x" "200" "$S" "$B" '(.data.openapi | startswith("3.1."))'
+
+# GET /api/memory/stats — backend name + count
+api GET /memory/stats
+# may return 503 if no memory backend is configured; both outcomes are valid
+if [ "$S" = "200" ]; then
+    check "GET /api/memory/stats → 200" "200" "$S" "$B" '.success == true'
+    check "GET /api/memory/stats has backend field" "200" "$S" "$B" '(.data.backend | type) == "string"'
+    check "GET /api/memory/stats has count field" "200" "$S" "$B" '(.data.count | type) == "number"'
+else
+    check "GET /api/memory/stats → 503 (no backend)" "503" "$S" "$B" '.error.code == "MEMORY_UNAVAILABLE"'
+fi
+
+# POST /api/memory/search — full-text search
+api POST /memory/search \
+    -H "Content-Type: application/json" \
+    -d '{"query":"test","limit":5}'
+if [ "$S" = "200" ]; then
+    check "POST /api/memory/search → 200" "200" "$S" "$B" '.success == true'
+    check "POST /api/memory/search has entries array" "200" "$S" "$B" '(.data.entries | type) == "array"'
+    check "POST /api/memory/search has backend field" "200" "$S" "$B" '(.data.backend | type) == "string"'
+else
+    check "POST /api/memory/search → 503 (no backend)" "503" "$S" "$B" '.error.code == "MEMORY_UNAVAILABLE"'
+fi
+
+# POST /api/memory/search — missing query → 400
+api POST /memory/search \
+    -H "Content-Type: application/json" \
+    -d '{}'
+check "POST /api/memory/search missing query → 400" "400" "$S" "$B" '.error.code == "BAD_REQUEST"'
+
+# GET /api/memory/:key — non-existent key
+api GET '/memory/e2e-nonexistent-key-phase8'
+if [ "$S" = "404" ]; then
+    check "GET /api/memory/:key non-existent → 404" "404" "$S" "$B" '.error.code == "NOT_FOUND"'
+else
+    check "GET /api/memory/:key no backend → 503" "503" "$S" "$B" '.error.code == "MEMORY_UNAVAILABLE"'
+fi
+
+# GET /api/history — list conversation sessions
+api GET /history
+check "GET /api/history → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/history has sessions array" "200" "$S" "$B" '(.data.sessions | type) == "array"'
+check "GET /api/history has total field" "200" "$S" "$B" '(.data.total | type) == "number"'
+check "GET /api/history has source field" "200" "$S" "$B" '(.data.source | type) == "string"'
+
+# GET /api/history?limit=1 — pagination param accepted
+api GET '/history?limit=1&offset=0'
+check "GET /api/history?limit=1 → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/history?limit=1 sessions count <= 1" "200" "$S" "$B" '(.data.sessions | length) <= 1'
+
+echo ""
+
 # ── Results ───────────────────────────────────────────────────────────────────
 
 TOTAL=$((PASS + FAIL))

@@ -76,6 +76,13 @@ pub const registry: []const Endpoint = &.{
     // Phase 3 — Memory
     .{ .method = "GET", .path = "/api/memory", .handler = handleMemoryList },
     .{ .method = "DELETE", .path = "/api/memory/:key", .handler = handleMemoryDelete },
+    // Phase 8 — Polish
+    .{ .method = "GET", .path = "/api/doctor", .handler = handleDoctor },
+    .{ .method = "GET", .path = "/api/spec", .handler = handleSpec },
+    .{ .method = "GET", .path = "/api/memory/stats", .handler = handleMemoryStats },
+    .{ .method = "POST", .path = "/api/memory/search", .handler = handleMemorySearch },
+    .{ .method = "GET", .path = "/api/memory/:key", .handler = handleMemoryGet },
+    .{ .method = "GET", .path = "/api/history", .handler = handleHistory },
 };
 
 // ── Dispatcher ───────────────────────────────────────────────────────
@@ -1933,6 +1940,469 @@ fn writeMemoryEntryJson(
     }
 }
 
+// ── Phase 8 handlers ────────────────────────────────────────────────
+
+/// GET /api/doctor
+///
+/// Deep health report: per-component status, timestamps, restart counts, and
+/// overall readiness.  Goes beyond GET /api/status by including `last_ok`,
+/// `updated_at`, and a separate `"ready"` field derived from the registry
+/// readiness check.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "pid": 12345,
+///     "uptime_seconds": 3600,
+///     "ready": true,
+///     "components": {
+///       "gateway": {
+///         "status": "ok",
+///         "restart_count": 0,
+///         "updated_at": "2026-04-06T00:00:00Z",
+///         "last_ok": "2026-04-06T00:00:00Z",
+///         "last_error": null
+///       }
+///     }
+///   },
+///   "error": null
+/// }
+/// ```
+fn handleDoctor(ctx: *ApiContext) anyerror!void {
+    const snap = health.snapshot();
+
+    // Determine overall readiness.
+    var all_ready = true;
+    {
+        var iter = snap.components.iterator();
+        while (iter.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) {
+                all_ready = false;
+                break;
+            }
+        }
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+
+    try w.print(
+        "{{\"pid\":{d},\"uptime_seconds\":{d},\"ready\":{s},\"components\":{{",
+        .{ snap.pid, snap.uptime_seconds, if (all_ready) "true" else "false" },
+    );
+
+    var iter = snap.components.iterator();
+    var first = true;
+    while (iter.next()) |entry| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        const ch = entry.value_ptr;
+        const updated_at_str = ch.updated_at[0..ch.updated_at_len];
+        try w.print(
+            "\"{s}\":{{\"status\":\"{s}\",\"restart_count\":{d},\"updated_at\":{f}",
+            .{
+                entry.key_ptr.*,
+                ch.status,
+                ch.restart_count,
+                std.json.fmt(updated_at_str, .{}),
+            },
+        );
+        if (ch.last_ok) |lo| {
+            const lo_str = lo[0..ch.last_ok_len];
+            try w.print(",\"last_ok\":{f}", .{std.json.fmt(lo_str, .{})});
+        } else {
+            try w.writeAll(",\"last_ok\":null");
+        }
+        if (ch.last_error) |le| {
+            try w.print(",\"last_error\":{f}", .{std.json.fmt(le, .{})});
+        } else {
+            try w.writeAll(",\"last_error\":null");
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll("}}");
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// GET /api/spec
+///
+/// Returns a static OpenAPI 3.1 JSON document describing all registered
+/// REST Admin API endpoints.  The spec is embedded as a comptime string so
+/// there is zero runtime cost and no allocations.
+///
+/// Response: the OpenAPI document wrapped in the standard success envelope.
+fn handleSpec(ctx: *ApiContext) anyerror!void {
+    // Static OpenAPI 3.1 document.  Kept in a comptime string to avoid any
+    // runtime allocation for this hot path.
+    const SPEC =
+        \\{"openapi":"3.1.0","info":{"title":"NullClaw REST Admin API","version":"1.0.0","description":"Authenticated REST surface for managing a running nullclaw gateway instance."},"servers":[{"url":"http://localhost:3000","description":"Local gateway"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}}},"paths":{"/api/status":{"get":{"summary":"Runtime status","description":"Returns version, pid, uptime, and per-component health.","responses":{"200":{"description":"Status object"}}}}},"/api/doctor":{"get":{"summary":"Deep health report","description":"Per-component status with timestamps, restart counts, and readiness.","responses":{"200":{"description":"Doctor report"}}}}},"/api/spec":{"get":{"summary":"OpenAPI spec","description":"Returns this OpenAPI 3.1 document.","responses":{"200":{"description":"OpenAPI document"}}}}},"/api/config":{"get":{"summary":"Read config value","parameters":[{"name":"path","in":"query","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"Config value"},"400":{"description":"Missing path parameter"}}}}},"/api/models":{"get":{"summary":"List providers","description":"Lists configured providers without exposing API keys.","responses":{"200":{"description":"Provider list"}}}}},"/api/cron":{"get":{"summary":"List cron jobs"},"post":{"summary":"Create recurring cron job"}}},"/api/cron/once":{"post":{"summary":"Create one-shot delayed job"}}},"/api/cron/{id}":{"patch":{"summary":"Update cron job"},"delete":{"summary":"Delete cron job"}}},"/api/cron/{id}/run":{"post":{"summary":"Trigger job immediately"}}},"/api/cron/{id}/pause":{"post":{"summary":"Pause a job"}}},"/api/cron/{id}/resume":{"post":{"summary":"Resume a paused job"}}},"/api/channels":{"get":{"summary":"List configured channels"}}},"/api/channels/{name}":{"get":{"summary":"Get channel detail"}}},"/api/skills":{"get":{"summary":"List installed skills"}}},"/api/skills/install":{"post":{"summary":"Install a skill"}}},"/api/skills/{name}":{"delete":{"summary":"Remove an installed skill"}}},"/api/agent":{"post":{"summary":"Invoke agent (synchronous)"}}},"/api/agent/stream":{"post":{"summary":"Invoke agent (SSE streaming — 501 until transport upgraded)"}}},"/api/agent/sessions":{"get":{"summary":"List active sessions"}}},"/api/agent/sessions/{id}":{"delete":{"summary":"Terminate and remove a session"}}},"/api/memory":{"get":{"summary":"List memory entries"}}},"/api/memory/stats":{"get":{"summary":"Memory backend statistics"}}},"/api/memory/search":{"post":{"summary":"Full-text memory search"}}},"/api/memory/{key}":{"get":{"summary":"Get a memory entry by key"},"delete":{"summary":"Delete a memory entry by key"}}},"/api/history":{"get":{"summary":"List conversation history sessions"}}}}
+    ;
+    try ctx.sendSuccess(SPEC);
+}
+
+/// GET /api/memory/stats
+///
+/// Returns the configured memory backend name and total entry count.
+/// Requires a live session manager with a configured memory backend.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": { "backend": "sqlite", "count": 42 },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   MEMORY_UNAVAILABLE — no memory backend is configured.
+fn handleMemoryStats(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+    const mem = sm.mem orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+
+    const count = mem.count() catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "memory.count() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "MEMORY_ERROR", msg);
+        return;
+    };
+
+    const data = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"backend\":{f},\"count\":{d}}}",
+        .{ std.json.fmt(mem.name(), .{}), count },
+    );
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// POST /api/memory/search
+///
+/// Full-text search over memory entries using the backend's recall() method.
+///
+/// Request body (JSON):
+/// ```json
+/// { "query": "...", "limit": 10, "session": "opt-session-id" }
+/// ```
+/// `limit` defaults to 20.  `session` is optional.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "entries": [...],
+///     "total": 5,
+///     "backend": "sqlite"
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   MEMORY_UNAVAILABLE — no memory backend is configured.
+///   MISSING_BODY       — no request body.
+///   INVALID_JSON       — body is not valid JSON.
+///   MISSING_FIELD      — `query` field is absent or empty.
+fn handleMemorySearch(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+    const mem = sm.mem orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+
+    const raw_body = ctx.body() orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_BODY", "request body required");
+        return;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be valid JSON");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be a JSON object");
+        return;
+    }
+    const obj = parsed.value.object;
+
+    const query: []const u8 = blk: {
+        const v = obj.get("query") orelse {
+            try ctx.sendError("400 Bad Request", "MISSING_FIELD", "'query' field is required");
+            return;
+        };
+        if (v != .string or v.string.len == 0) {
+            try ctx.sendError("400 Bad Request", "MISSING_FIELD", "'query' must be a non-empty string");
+            return;
+        }
+        break :blk v.string;
+    };
+
+    const limit: usize = blk: {
+        if (obj.get("limit")) |lv| {
+            if (lv == .integer and lv.integer > 0) break :blk @intCast(lv.integer);
+        }
+        break :blk 20;
+    };
+
+    const session_filter: ?[]const u8 = blk: {
+        const sv = obj.get("session") orelse break :blk null;
+        if (sv == .string and sv.string.len > 0) break :blk sv.string;
+        break :blk null;
+    };
+
+    const entries = mem.recall(ctx.allocator, query, limit, session_filter) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "memory.recall() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "MEMORY_ERROR", msg);
+        return;
+    };
+    defer memory_mod.freeEntries(ctx.allocator, entries);
+
+    const backend_name = mem.name();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+
+    try w.writeAll("{\"entries\":[");
+    for (entries, 0..) |*entry, i| {
+        if (i > 0) try w.writeByte(',');
+        try writeMemoryEntryJson(ctx.allocator, w, entry);
+    }
+    try w.print("],\"total\":{d},\"backend\":{f}}}", .{
+        entries.len,
+        std.json.fmt(backend_name, .{}),
+    });
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// GET /api/memory/:key
+///
+/// Retrieve a single memory entry by its key.  The key is percent-decoded
+/// before lookup so that keys containing '/' or ':' can be addressed.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "id": "...", "key": "greeting", "content": "Hello world",
+///     "category": "core", "timestamp": "...", "session_id": null, "score": null
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   MEMORY_UNAVAILABLE — no memory backend is configured.
+///   NOT_FOUND          — no entry with that key.
+fn handleMemoryGet(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+    const mem = sm.mem orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+
+    const raw_key = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_PARAM", "memory key required in path");
+        return;
+    };
+
+    const key = try percentDecode(ctx.allocator, raw_key);
+    defer ctx.allocator.free(key);
+
+    const entry_opt = mem.get(ctx.allocator, key) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "memory.get() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "MEMORY_ERROR", msg);
+        return;
+    };
+
+    if (entry_opt == null) {
+        try ctx.sendError("404 Not Found", "NOT_FOUND", "no memory entry with that key");
+        return;
+    }
+
+    var entry = entry_opt.?;
+    defer entry.deinit(ctx.allocator);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+    try writeMemoryEntryJson(ctx.allocator, w, &entry);
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// GET /api/history
+///
+/// List conversation history sessions from the durable session store.
+/// Falls back to listing active in-memory sessions when no session store
+/// is available.
+///
+/// Query parameters (all optional):
+///   ?limit=<n>    — max sessions to return (default 50)
+///   ?offset=<n>   — pagination offset (default 0)
+///
+/// Response shape (session store available):
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "sessions": [
+///       { "session_id": "telegram:chat123", "message_count": 10,
+///         "first_message_at": "2026-04-01T00:00:00Z",
+///         "last_message_at": "2026-04-06T12:00:00Z" }
+///     ],
+///     "total": 1,
+///     "source": "session_store"
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Response shape (fallback to active sessions):
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "sessions": [
+///       { "session_key": "api:default", "created_at": 1712345678,
+///         "last_active": 1712349278, "turn_count": 5 }
+///     ],
+///     "total": 1,
+///     "source": "active_sessions"
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   SESSION_MANAGER_UNAVAILABLE — no session manager is running.
+fn handleHistory(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "SESSION_MANAGER_UNAVAILABLE", "no session manager is running");
+        return;
+    };
+
+    const limit: usize = blk: {
+        const v = extractQueryParam(ctx.target, "limit") orelse break :blk 50;
+        const n = std.fmt.parseInt(usize, v, 10) catch break :blk 50;
+        if (n == 0) break :blk 50;
+        break :blk n;
+    };
+    const offset: usize = blk: {
+        const v = extractQueryParam(ctx.target, "offset") orelse break :blk 0;
+        break :blk std.fmt.parseInt(usize, v, 10) catch 0;
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+
+    // Prefer the durable session store when available.
+    if (sm.session_store) |store| {
+        const sessions = store.listSessions(ctx.allocator, limit, offset) catch |err| switch (err) {
+            error.NotSupported => null,
+            else => {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "listSessions failed: {s}", .{@errorName(err)});
+                defer ctx.allocator.free(msg);
+                try ctx.sendError("500 Internal Server Error", "HISTORY_ERROR", msg);
+                return;
+            },
+        };
+
+        if (sessions) |sess_slice| {
+            defer memory_mod.freeSessionInfos(ctx.allocator, sess_slice);
+
+            const total = store.countSessions() catch sess_slice.len;
+
+            try w.writeAll("{\"sessions\":[");
+            for (sess_slice, 0..) |info, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.print(
+                    "{{\"session_id\":{f},\"message_count\":{d},\"first_message_at\":{f},\"last_message_at\":{f}}}",
+                    .{
+                        std.json.fmt(info.session_id, .{}),
+                        info.message_count,
+                        std.json.fmt(info.first_message_at, .{}),
+                        std.json.fmt(info.last_message_at, .{}),
+                    },
+                );
+            }
+            try w.print("],\"total\":{d},\"source\":\"session_store\"}}", .{total});
+
+            const data = try ctx.allocator.dupe(u8, buf.items);
+            defer ctx.allocator.free(data);
+            try ctx.sendSuccess(data);
+            return;
+        }
+    }
+
+    // Fallback: list active in-memory sessions.
+    try w.writeAll("{\"sessions\":[");
+    var total: usize = 0;
+    {
+        sm.mutex.lock();
+        defer sm.mutex.unlock();
+
+        var it = sm.sessions.iterator();
+        var idx: usize = 0;
+        var written: usize = 0;
+        while (it.next()) |entry| {
+            if (idx < offset) {
+                idx += 1;
+                continue;
+            }
+            if (written >= limit) break;
+            const session = entry.value_ptr.*;
+            if (written > 0) try w.writeByte(',');
+            try w.print(
+                "{{\"session_key\":{f},\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d}}}",
+                .{
+                    std.json.fmt(session.session_key, .{}),
+                    session.created_at,
+                    session.last_active,
+                    session.turn_count,
+                },
+            );
+            written += 1;
+            idx += 1;
+        }
+        total = sm.sessions.count();
+    }
+    try w.print("],\"total\":{d},\"source\":\"active_sessions\"}}", .{total});
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 fn makeEnabledCfg() Config {
     var cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
@@ -3185,4 +3655,294 @@ test "DELETE /api/memory/:key percent-decodes the key" {
     // 404 is expected from NoneMemory; what matters is we didn't get 500 or 503.
     try std.testing.expectEqualStrings("404 Not Found", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "NOT_FOUND") != null);
+}
+
+// ── Phase 8 tests ─────────────────────────────────────────────────────
+
+test "GET /api/doctor returns pid uptime ready and components" {
+    health.reset();
+    health.markComponentOk("gateway");
+
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/doctor HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/doctor",
+        "/api/doctor",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"pid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"uptime_seconds\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"components\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"gateway\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"restart_count\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"updated_at\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"last_ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"last_error\"") != null);
+}
+
+test "GET /api/doctor ready false when component errored" {
+    health.reset();
+    health.markComponentError("db", "connection refused");
+
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/doctor HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/doctor",
+        "/api/doctor",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"ready\":false") != null);
+}
+
+test "GET /api/spec returns OpenAPI document" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/spec HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/spec",
+        "/api/spec",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "openapi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "NullClaw REST Admin API") != null);
+}
+
+test "GET /api/memory/stats returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory/stats HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory/stats",
+        "/api/memory/stats",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MEMORY_UNAVAILABLE") != null);
+}
+
+test "GET /api/memory/stats returns backend and count" {
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory/stats HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory/stats",
+        "/api/memory/stats",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"backend\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"count\"") != null);
+}
+
+test "POST /api/memory/search returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const raw = "POST /api/memory/search HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"query\":\"hello\"}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "POST",
+        "/api/memory/search",
+        "/api/memory/search",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MEMORY_UNAVAILABLE") != null);
+}
+
+test "POST /api/memory/search missing body returns 400" {
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "POST /api/memory/search HTTP/1.1\r\n\r\n",
+        "POST",
+        "/api/memory/search",
+        "/api/memory/search",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_BODY") != null);
+}
+
+test "POST /api/memory/search missing query field returns 400" {
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const raw = "POST /api/memory/search HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "POST",
+        "/api/memory/search",
+        "/api/memory/search",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_FIELD") != null);
+}
+
+test "POST /api/memory/search returns entries array with NoneMemory" {
+    // NoneMemory.recall() always returns an empty slice — confirms wiring works.
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const raw = "POST /api/memory/search HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"query\":\"hello\",\"limit\":5}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "POST",
+        "/api/memory/search",
+        "/api/memory/search",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"backend\"") != null);
+}
+
+test "GET /api/memory/:key returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory/mykey HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory/mykey",
+        "/api/memory/mykey",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MEMORY_UNAVAILABLE") != null);
+}
+
+test "GET /api/memory/:key returns 404 when not found via NoneMemory" {
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory/mykey HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory/mykey",
+        "/api/memory/mykey",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("404 Not Found", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "NOT_FOUND") != null);
+}
+
+test "GET /api/history returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/history HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/history",
+        "/api/history",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "SESSION_MANAGER_UNAVAILABLE") != null);
+}
+
+test "GET /api/history returns active sessions fallback" {
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+    // No session_store configured — falls back to active sessions.
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/history HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/history",
+        "/api/history",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"sessions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"source\":\"active_sessions\"") != null);
 }

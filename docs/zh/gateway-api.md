@@ -312,7 +312,13 @@ curl -X POST \
 | `/api/agent/sessions` | GET | 列出活跃的 agent 会话 |
 | `/api/agent/sessions/:id` | DELETE | 终止指定 agent 会话 |
 | `/api/memory` | GET | 列出记忆条目；支持过滤参数：`?category=`、`?session=`、`?q=`（全文检索）、`?limit=`、`?include_internal=true` |
+| `/api/memory/stats` | GET | 记忆后端名称及条目总数 |
+| `/api/memory/search` | POST | 全文记忆搜索（请求体：`{"query":"...","limit":10}`） |
+| `/api/memory/:key` | GET | 按 key 获取单条记忆条目 |
 | `/api/memory/:key` | DELETE | 按 key 删除记忆条目 |
+| `/api/doctor` | GET | 深度健康报告：各组件状态、时间戳、重启次数与就绪状态 |
+| `/api/spec` | GET | 所有管理 API 端点的 OpenAPI 3.1 规范文档 |
+| `/api/history` | GET | 列出对话历史会话 |
 
 #### `POST /api/agent`
 
@@ -385,6 +391,122 @@ curl -X POST \
 ```
 
 未配置记忆后端时返回 `503 MEMORY_UNAVAILABLE`。
+
+#### `GET /api/doctor`
+
+深度健康报告。包含各组件的 `updated_at`、`last_ok`、`last_error`、`restart_count` 以及顶层 `ready` 布尔值。
+
+```json
+{
+  "success": true,
+  "data": {
+    "pid": 12345,
+    "uptime_seconds": 3600,
+    "ready": true,
+    "components": {
+      "gateway": {
+        "status": "ok",
+        "restart_count": 0,
+        "updated_at": "2026-04-06T12:00:00Z",
+        "last_ok": "2026-04-06T12:00:00Z",
+        "last_error": null
+      }
+    }
+  },
+  "error": null
+}
+```
+
+`ready` 仅在所有已注册组件均报告 `"ok"` 时为 `true`。
+
+#### `GET /api/spec`
+
+返回 REST 管理 API 的完整 OpenAPI 3.1 JSON 文档，包裹在标准成功信封中。可用于生成客户端 SDK 或导入 Postman 等工具。
+
+#### `GET /api/memory/stats`
+
+返回后端名称及条目总数。
+
+```json
+{ "success": true, "data": { "backend": "sqlite", "count": 42 }, "error": null }
+```
+
+未配置记忆后端时返回 `503 MEMORY_UNAVAILABLE`。
+
+#### `POST /api/memory/search`
+
+通过后端的 `recall()` 方法执行全文搜索。
+
+请求体：
+
+```json
+{ "query": "项目截止日期", "limit": 10, "session": "可选-会话-id" }
+```
+
+`limit` 默认为 20；`session` 可选，用于将搜索范围限定到指定会话。
+
+响应结构与 `GET /api/memory` 相同（包含 `entries`/`total`/`backend` 信封）。
+
+未配置记忆后端时返回 `503 MEMORY_UNAVAILABLE`。
+
+#### `GET /api/memory/:key`
+
+按 key 返回单条记忆条目。查找前会对 key 进行百分号解码（如 `%2F` → `/`、`%3A` → `:`）。key 不存在时返回 `404 NOT_FOUND`。
+
+未配置记忆后端时返回 `503 MEMORY_UNAVAILABLE`。
+
+#### `GET /api/history`
+
+列出对话历史会话。已配置持久化会话存储（SQLite 后端）时返回持久化的会话元数据；否则回退为列出当前内存中的活跃会话。
+
+查询参数：
+
+| 参数 | 说明 |
+|------|------|
+| `?limit=<n>` | 最大返回会话数（默认 50） |
+| `?offset=<n>` | 分页偏移量（默认 0） |
+
+响应（会话存储）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "session_id": "telegram:chat123",
+        "message_count": 10,
+        "first_message_at": "2026-04-01T00:00:00Z",
+        "last_message_at": "2026-04-06T12:00:00Z"
+      }
+    ],
+    "total": 1,
+    "source": "session_store"
+  },
+  "error": null
+}
+```
+
+响应（内存回退）：
+
+```json
+{
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "session_id": "api:default",
+        "message_count": 3,
+        "first_message_at": null,
+        "last_message_at": null
+      }
+    ],
+    "total": 1,
+    "source": "memory"
+  },
+  "error": null
+}
+```
 
 ## 鉴权与安全建议
 
