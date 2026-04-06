@@ -361,6 +361,8 @@ All Admin API responses use a consistent JSON envelope:
 | `/api/agent/stream` | POST | SSE streaming variant — returns 501 until gateway transport supports chunked responses |
 | `/api/agent/sessions` | GET | List active agent sessions |
 | `/api/agent/sessions/:id` | DELETE | Terminate an agent session |
+| `/api/memory` | GET | List memory entries; filter with `?category=`, `?session=`, `?q=` (FTS), `?limit=`, `?include_internal=true` |
+| `/api/memory/:key` | DELETE | Delete a memory entry by key |
 
 #### `GET /api/status`
 
@@ -419,6 +421,52 @@ Lists active sessions with key, turn count, and last-active timestamp.
 #### `DELETE /api/agent/sessions/:id`
 
 Terminates the named session and frees its resources. Returns `404` if the session does not exist.
+
+#### `GET /api/memory`
+
+Lists memory entries from the configured backend. All query parameters are optional:
+
+| Parameter | Description |
+|-----------|-------------|
+| `?category=<name>` | Filter by category: `core`, `daily`, `conversation`, or a custom name |
+| `?session=<id>` | Filter by session ID |
+| `?q=<text>` | Full-text search via the backend's `recall()` — overrides `category`/`session` filters |
+| `?limit=<n>` | Max entries (default 100 for list, 20 for search) |
+| `?include_internal=true` | Include autosave/bootstrap internal keys (excluded by default) |
+
+Returns `503 MEMORY_UNAVAILABLE` when no memory backend is configured.
+
+```json
+{
+  "success": true,
+  "data": {
+    "entries": [
+      {
+        "id": "1",
+        "key": "greeting",
+        "content": "Hello world",
+        "category": "core",
+        "timestamp": "2026-04-06T00:00:00Z",
+        "session_id": null,
+        "score": null
+      }
+    ],
+    "total": 1,
+    "backend": "sqlite"
+  },
+  "error": null
+}
+```
+
+#### `DELETE /api/memory/:key`
+
+Deletes a memory entry by key. The key is percent-decoded before lookup (e.g. `%2F` → `/`). Returns `404 NOT_FOUND` if no entry with that key exists.
+
+```json
+{ "success": true, "data": { "key": "greeting", "deleted": true }, "error": null }
+```
+
+Returns `503 MEMORY_UNAVAILABLE` when no memory backend is configured.
 
 ## Security Guidance
 

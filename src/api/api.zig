@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const health = @import("../health.zig");
 const version = @import("../version.zig");
 const config_mutator = @import("../config_mutator.zig");
+const memory_mod = @import("../memory/root.zig");
 const cron_mod = @import("../cron.zig");
 const agent_routing = @import("../agent_routing.zig");
 const skillforge = @import("../skillforge.zig");
@@ -72,6 +73,9 @@ pub const registry: []const Endpoint = &.{
     .{ .method = "POST", .path = "/api/agent/stream", .handler = handleAgentStream },
     .{ .method = "GET", .path = "/api/agent/sessions", .handler = handleAgentSessionList },
     .{ .method = "DELETE", .path = "/api/agent/sessions/:id", .handler = handleAgentSessionDelete },
+    // Phase 3 — Memory
+    .{ .method = "GET", .path = "/api/memory", .handler = handleMemoryList },
+    .{ .method = "DELETE", .path = "/api/memory/:key", .handler = handleMemoryDelete },
 };
 
 // ── Dispatcher ───────────────────────────────────────────────────────
@@ -1738,6 +1742,197 @@ fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+// ── Phase 3 handlers ────────────────────────────────────────────────
+
+/// GET /api/memory
+///
+/// List memory entries from the configured backend.
+///
+/// Query parameters (all optional):
+///   ?category=<name>          — filter by category (core, daily, conversation, or custom name)
+///   ?session=<id>             — filter by session_id
+///   ?q=<text>                 — full-text keyword search via recall() instead of list()
+///   ?limit=<n>                — max entries to return (default 100; search default 20)
+///   ?include_internal=true    — include autosave/bootstrap keys (excluded by default)
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "entries": [
+///       {
+///         "id": "...",
+///         "key": "greeting",
+///         "content": "Hello world",
+///         "category": "core",
+///         "timestamp": "2026-04-06T00:00:00Z",
+///         "session_id": null,
+///         "score": null
+///       }
+///     ],
+///     "total": 1,
+///     "backend": "sqlite"
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   MEMORY_UNAVAILABLE — no memory backend is configured.
+fn handleMemoryList(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+    const mem = sm.mem orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+
+    // Parse optional query parameters.
+    const category_str = extractQueryParam(ctx.target, "category");
+    const session_filter = extractQueryParam(ctx.target, "session");
+    const search_query = extractQueryParam(ctx.target, "q");
+    const include_internal = blk: {
+        const v = extractQueryParam(ctx.target, "include_internal") orelse break :blk false;
+        break :blk std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+    };
+
+    // Determine effective limit.
+    const default_limit: usize = if (search_query != null) 20 else 100;
+    const limit: usize = blk: {
+        const v = extractQueryParam(ctx.target, "limit") orelse break :blk default_limit;
+        const n = std.fmt.parseInt(usize, v, 10) catch break :blk default_limit;
+        if (n == 0) break :blk default_limit;
+        break :blk n;
+    };
+
+    // Fetch entries.
+    const entries = if (search_query) |q|
+        try mem.recall(ctx.allocator, q, limit, session_filter)
+    else blk: {
+        const cat: ?memory_mod.MemoryCategory = if (category_str) |cs|
+            memory_mod.MemoryCategory.fromString(cs)
+        else
+            null;
+        break :blk try mem.list(ctx.allocator, cat, session_filter);
+    };
+    defer memory_mod.freeEntries(ctx.allocator, entries);
+
+    const backend_name = mem.name();
+
+    // Build JSON response.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+
+    try w.writeAll("{\"entries\":[");
+    var written: usize = 0;
+    var total: usize = 0;
+    for (entries) |*entry| {
+        if (!include_internal and memory_mod.isInternalMemoryKey(entry.key)) continue;
+        // Apply limit for list() (recall() already limits).
+        if (search_query == null and total >= limit) break;
+        total += 1;
+        if (written > 0) try w.writeByte(',');
+        written += 1;
+        try writeMemoryEntryJson(ctx.allocator, w, entry);
+    }
+    try w.print("],\"total\":{d},\"backend\":{f}}}", .{
+        total,
+        std.json.fmt(backend_name, .{}),
+    });
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// DELETE /api/memory/:key
+///
+/// Delete a memory entry by its key.  The key is URL-decoded before lookup
+/// so that keys containing '/' or ':' can be addressed safely.
+///
+/// Response shape:
+/// ```json
+/// { "success": true, "data": { "key": "greeting", "deleted": true }, "error": null }
+/// ```
+///
+/// Errors:
+///   MEMORY_UNAVAILABLE — no memory backend is configured.
+///   NOT_FOUND          — no entry with that key exists.
+fn handleMemoryDelete(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+    const mem = sm.mem orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+
+    const raw_key = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_PARAM", "memory key required in path");
+        return;
+    };
+
+    // Decode percent-encoded characters (e.g. %2F → '/', %3A → ':').
+    const key = try percentDecode(ctx.allocator, raw_key);
+    defer ctx.allocator.free(key);
+
+    const deleted = mem.forget(key) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "memory.forget() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "MEMORY_ERROR", msg);
+        return;
+    };
+
+    if (!deleted) {
+        try ctx.sendError("404 Not Found", "NOT_FOUND", "no memory entry with that key");
+        return;
+    }
+
+    const data = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"key\":{f},\"deleted\":true}}",
+        .{std.json.fmt(key, .{})},
+    );
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// Serialize a single MemoryEntry to JSON and write it to `w`.
+/// Caller owns the entry memory — this function does not free anything.
+fn writeMemoryEntryJson(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    entry: *const memory_mod.MemoryEntry,
+) !void {
+    _ = allocator;
+    const cat_str = entry.category.toString();
+    try w.print(
+        "{{\"id\":{f},\"key\":{f},\"content\":{f},\"category\":{f},\"timestamp\":{f}",
+        .{
+            std.json.fmt(entry.id, .{}),
+            std.json.fmt(entry.key, .{}),
+            std.json.fmt(entry.content, .{}),
+            std.json.fmt(cat_str, .{}),
+            std.json.fmt(entry.timestamp, .{}),
+        },
+    );
+    if (entry.session_id) |sid| {
+        try w.print(",\"session_id\":{f}", .{std.json.fmt(sid, .{})});
+    } else {
+        try w.writeAll(",\"session_id\":null");
+    }
+    if (entry.score) |s| {
+        try w.print(",\"score\":{d:.6}}}", .{s});
+    } else {
+        try w.writeAll(",\"score\":null}");
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 fn makeEnabledCfg() Config {
     var cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
@@ -2748,4 +2943,246 @@ test "percentDecode handles multiple encoded chars" {
     const decoded = try percentDecode(std.testing.allocator, "a%3Ab%3Ac");
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualStrings("a:b:c", decoded);
+}
+
+// ── Phase 3 tests ─────────────────────────────────────────────────────
+
+// Minimal mock provider used to construct a SessionManager for memory tests.
+// Only fields required by SessionManager.init wiring need to be populated;
+// no chat/completion calls are made in memory handler tests.
+const MockProviderForMemoryTest = struct {
+    const providers_mod = @import("../providers/root.zig");
+
+    fn implChatWithSystem(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return error.NotSupported;
+    }
+    fn implChat(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: providers_mod.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers_mod.ChatResponse {
+        return error.NotSupported;
+    }
+    fn implSupportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn implGetName(_: *anyopaque) []const u8 {
+        return "mock-memory-test";
+    }
+    fn implDeinit(_: *anyopaque) void {}
+
+    const vtable = providers_mod.Provider.VTable{
+        .chatWithSystem = &implChatWithSystem,
+        .chat = &implChat,
+        .supportsNativeTools = &implSupportsNativeTools,
+        .getName = &implGetName,
+        .deinit = &implDeinit,
+    };
+
+    var _instance: MockProviderForMemoryTest = .{};
+
+    pub fn provider() providers_mod.Provider {
+        return .{ .ptr = @ptrCast(&_instance), .vtable = &vtable };
+    }
+};
+
+fn makeTestSessionManagerWithMem(none_mem: *memory_mod.NoneMemory) session_mod.SessionManager {
+    const observability = @import("../observability.zig");
+    var noop = observability.NoopObserver{};
+    const cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
+    // NOTE: cfg is a local variable here; we need a stable address.
+    // Use a comptime-stored config.  Since tests are single-threaded, this is safe.
+    const static_cfg = struct {
+        var c: Config = undefined;
+    };
+    static_cfg.c = cfg;
+    return session_mod.SessionManager.init(
+        std.testing.allocator,
+        &static_cfg.c,
+        MockProviderForMemoryTest.provider(),
+        &.{},
+        none_mem.memory(),
+        noop.observer(),
+        null,
+        null,
+    );
+}
+
+test "GET /api/memory returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory",
+        "/api/memory",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MEMORY_UNAVAILABLE") != null);
+}
+
+test "GET /api/memory returns 503 when session manager has no memory backend" {
+    var cfg = makeEnabledCfg();
+    // Build a minimal SessionManager with mem = null.
+    const observability = @import("../observability.zig");
+    var noop = observability.NoopObserver{};
+    const static_cfg2 = struct {
+        var c: Config = undefined;
+    };
+    static_cfg2.c = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
+    var sm = session_mod.SessionManager.init(
+        std.testing.allocator,
+        &static_cfg2.c,
+        MockProviderForMemoryTest.provider(),
+        &.{},
+        null, // no memory backend
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory",
+        "/api/memory",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MEMORY_UNAVAILABLE") != null);
+}
+
+test "GET /api/memory returns empty list from NoneMemory backend" {
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory",
+        "/api/memory",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"entries\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"total\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"backend\":\"none\"") != null);
+}
+
+test "GET /api/memory with ?q= uses recall (returns empty from NoneMemory)" {
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/memory?q=hello HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/memory?q=hello",
+        "/api/memory",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"entries\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"total\":0") != null);
+}
+
+test "DELETE /api/memory/:key returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "DELETE /api/memory/somekey HTTP/1.1\r\n\r\n",
+        "DELETE",
+        "/api/memory/somekey",
+        "/api/memory/somekey",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MEMORY_UNAVAILABLE") != null);
+}
+
+test "DELETE /api/memory/:key returns 404 when key not found" {
+    // NoneMemory.forget always returns false — simulates key not found.
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "DELETE /api/memory/greeting HTTP/1.1\r\n\r\n",
+        "DELETE",
+        "/api/memory/greeting",
+        "/api/memory/greeting",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("404 Not Found", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "NOT_FOUND") != null);
+}
+
+test "DELETE /api/memory/:key percent-decodes the key" {
+    // Verify that %2F in the key is decoded before lookup.
+    // NoneMemory always returns false for forget(), so we get 404 —
+    // but we confirm the path routing resolves without error.
+    var cfg = makeEnabledCfg();
+    var none_mem = memory_mod.NoneMemory.init();
+    var sm = makeTestSessionManagerWithMem(&none_mem);
+    defer sm.deinit();
+
+    const result = dispatch(
+        std.testing.allocator,
+        "DELETE /api/memory/some%2Fkey HTTP/1.1\r\n\r\n",
+        "DELETE",
+        "/api/memory/some%2Fkey",
+        "/api/memory/some%2Fkey",
+        &cfg,
+        true,
+        null,
+        &sm,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    // 404 is expected from NoneMemory; what matters is we didn't get 500 or 503.
+    try std.testing.expectEqualStrings("404 Not Found", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "NOT_FOUND") != null);
 }

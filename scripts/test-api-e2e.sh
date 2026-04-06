@@ -192,6 +192,9 @@ cat > "$E2E_DIR/config.json" <<EOF
         "OPENROUTER_API_KEY": "e2e-fake-api-key"
       }
     }
+  },
+  "memory": {
+    "backend": "sqlite"
   }
 }
 EOF
@@ -511,6 +514,39 @@ check "DELETE /api/agent/sessions/:id returns session_key" "200" "$S" "$B" '.dat
 # DELETE again — should return 404
 api DELETE /agent/sessions/api%3Ae2e-test
 check "DELETE /api/agent/sessions/:id non-existent → 404" "404" "$S" "$B" '.error.code == "SESSION_NOT_FOUND"'
+
+echo ""
+
+# ── Phase 3: Memory ───────────────────────────────────────────────────────────
+
+echo "-- Phase 3: Memory"
+
+# GET /api/memory — list all entries (sqlite backend; may be empty or have bootstrap entries)
+api GET /memory
+check "GET /api/memory → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/memory has entries array" "200" "$S" "$B" '(.data.entries | type) == "array"'
+check "GET /api/memory has total field" "200" "$S" "$B" '(.data.total | type) == "number"'
+check "GET /api/memory has backend field" "200" "$S" "$B" '(.data.backend | type) == "string"'
+
+# GET /api/memory?include_internal=true — include internal keys
+api GET '/memory?include_internal=true'
+check "GET /api/memory?include_internal=true → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/memory?include_internal=true has entries" "200" "$S" "$B" '(.data.entries | type) == "array"'
+
+# GET /api/memory?category=core — filter by category
+api GET '/memory?category=core'
+check "GET /api/memory?category=core → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/memory?category=core all entries are core" "200" "$S" "$B" \
+    '[.data.entries[] | select(.category != "core")] | length == 0'
+
+# GET /api/memory?q=hello — keyword search (FTS; sqlite backend)
+api GET '/memory?q=hello'
+check "GET /api/memory?q=hello → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/memory?q=hello has entries" "200" "$S" "$B" '(.data.entries | type) == "array"'
+
+# DELETE /api/memory/:key — delete a key that definitely does not exist
+api DELETE '/memory/e2e-nonexistent-key-12345'
+check "DELETE /api/memory/nonexistent → 404" "404" "$S" "$B" '.error.code == "NOT_FOUND"'
 
 echo ""
 

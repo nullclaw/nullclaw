@@ -311,6 +311,8 @@ curl -X POST \
 | `/api/agent/stream` | POST | SSE 流式变体 — 网关 HTTP 传输层支持分块响应前返回 501 |
 | `/api/agent/sessions` | GET | 列出活跃的 agent 会话 |
 | `/api/agent/sessions/:id` | DELETE | 终止指定 agent 会话 |
+| `/api/memory` | GET | 列出记忆条目；支持过滤参数：`?category=`、`?session=`、`?q=`（全文检索）、`?limit=`、`?include_internal=true` |
+| `/api/memory/:key` | DELETE | 按 key 删除记忆条目 |
 
 #### `POST /api/agent`
 
@@ -337,6 +339,52 @@ curl -X POST \
   "error": null
 }
 ```
+
+#### `GET /api/memory`
+
+从已配置的记忆后端列出记忆条目。所有查询参数均为可选：
+
+| 参数 | 说明 |
+|------|------|
+| `?category=<name>` | 按类别过滤：`core`、`daily`、`conversation` 或自定义名称 |
+| `?session=<id>` | 按会话 ID 过滤 |
+| `?q=<text>` | 全文搜索（调用后端 `recall()`），忽略 `category`/`session` 过滤 |
+| `?limit=<n>` | 最大返回条数（列表默认 100，搜索默认 20） |
+| `?include_internal=true` | 包含 autosave/bootstrap 内部 key（默认不包含） |
+
+未配置记忆后端时返回 `503 MEMORY_UNAVAILABLE`。
+
+```json
+{
+  "success": true,
+  "data": {
+    "entries": [
+      {
+        "id": "1",
+        "key": "greeting",
+        "content": "Hello world",
+        "category": "core",
+        "timestamp": "2026-04-06T00:00:00Z",
+        "session_id": null,
+        "score": null
+      }
+    ],
+    "total": 1,
+    "backend": "sqlite"
+  },
+  "error": null
+}
+```
+
+#### `DELETE /api/memory/:key`
+
+按 key 删除记忆条目。key 在查找前会进行百分号解码（如 `%2F` → `/`）。key 不存在时返回 `404 NOT_FOUND`。
+
+```json
+{ "success": true, "data": { "key": "greeting", "deleted": true }, "error": null }
+```
+
+未配置记忆后端时返回 `503 MEMORY_UNAVAILABLE`。
 
 ## 鉴权与安全建议
 
