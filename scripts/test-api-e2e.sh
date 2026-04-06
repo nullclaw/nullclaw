@@ -617,6 +617,102 @@ api GET '/history?limit=1&offset=0'
 check "GET /api/history?limit=1 → 200" "200" "$S" "$B" '.success == true'
 check "GET /api/history?limit=1 sessions count <= 1" "200" "$S" "$B" '(.data.sessions | length) <= 1'
 
+# GET /api/history/:session_id — specific session (may be empty if nothing recorded)
+api GET '/history/e2e-nonexistent-session-99'
+check "GET /api/history/:session_id → 200 (empty messages)" "200" "$S" "$B" '.success == true'
+check "GET /api/history/:session_id has messages array" "200" "$S" "$B" '(.data.messages | type) == "array"'
+check "GET /api/history/:session_id has total field" "200" "$S" "$B" '(.data.total | type) == "number"'
+check "GET /api/history/:session_id has limit/offset fields" "200" "$S" "$B" '(.data.limit | type) == "number" and (.data.offset | type) == "number"'
+
+echo ""
+
+# ── Phase 8 Parity: Cron runs ─────────────────────────────────────────────────
+
+echo "-- Phase 8 Parity: Cron runs"
+
+# Create a fresh job for runs testing
+api POST /cron \
+    -H "Content-Type: application/json" \
+    -d '{"expression":"0 0 1 1 *","prompt":"runs-test"}'
+check "POST /api/cron create for runs test → 200" "200" "$S" "$B" '.success == true'
+RUNS_JOB_ID=$(echo "$B" | jq -r '.data.id // empty')
+
+if [ -n "$RUNS_JOB_ID" ]; then
+    api GET "/cron/${RUNS_JOB_ID}/runs"
+    check "GET /api/cron/:id/runs → 200" "200" "$S" "$B" '.success == true'
+    check "GET /api/cron/:id/runs has job_id" "200" "$S" "$B" ".data.job_id == \"${RUNS_JOB_ID}\""
+    check "GET /api/cron/:id/runs has runs array" "200" "$S" "$B" '(.data.runs | type) == "array"'
+    check "GET /api/cron/:id/runs has total" "200" "$S" "$B" '(.data.total | type) == "number"'
+
+    api GET "/cron/${RUNS_JOB_ID}/runs?limit=1"
+    check "GET /api/cron/:id/runs?limit=1 → 200" "200" "$S" "$B" '.success == true'
+    check "GET /api/cron/:id/runs?limit=1 runs count <= 1" "200" "$S" "$B" '(.data.runs | length) <= 1'
+
+    # Clean up
+    api DELETE "/cron/${RUNS_JOB_ID}"
+    check "DELETE /api/cron runs-test job → 200" "200" "$S" "$B" '.success == true'
+else
+    echo "  SKIP  cron runs sub-tests (create did not return an id)"
+fi
+
+# Nonexistent job id → 404
+api GET "/cron/nonexistent-job-for-runs/runs"
+check "GET /api/cron/nonexistent/runs → 404" "404" "$S" "$B" '.error.code == "JOB_NOT_FOUND"'
+
+echo ""
+
+# ── Phase 8 Parity: Memory reindex / drain-outbox ────────────────────────────
+
+echo "-- Phase 8 Parity: Memory reindex / drain-outbox"
+
+api POST /memory/reindex
+if [ "$S" = "200" ]; then
+    check "POST /api/memory/reindex → 200" "200" "$S" "$B" '.success == true'
+    check "POST /api/memory/reindex has reindexed count" "200" "$S" "$B" '(.data.reindexed | type) == "number"'
+else
+    check "POST /api/memory/reindex → 503 (no session mgr)" "503" "$S" "$B" '.success == false'
+fi
+
+api POST /memory/drain-outbox
+if [ "$S" = "200" ]; then
+    check "POST /api/memory/drain-outbox → 200" "200" "$S" "$B" '.success == true'
+    check "POST /api/memory/drain-outbox has drained count" "200" "$S" "$B" '(.data.drained | type) == "number"'
+else
+    check "POST /api/memory/drain-outbox → 503 (no session mgr)" "503" "$S" "$B" '.success == false'
+fi
+
+echo ""
+
+# ── Phase 8 Parity: Models info / refresh ────────────────────────────────────
+
+echo "-- Phase 8 Parity: Models info / refresh"
+
+api GET /models/infini-ai
+check "GET /api/models/infini-ai → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/models/infini-ai has name field" "200" "$S" "$B" '(.data.name | type) == "string"'
+check "GET /api/models/infini-ai has canonical_provider" "200" "$S" "$B" '(.data.canonical_provider | type) == "string"'
+check "GET /api/models/infini-ai has context_info" "200" "$S" "$B" '(.data.context_info | type) == "string"'
+
+api GET /models/openai
+check "GET /api/models/openai → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/models/openai has name field" "200" "$S" "$B" '.data.name == "openai"'
+
+api POST /models/refresh
+check "POST /api/models/refresh → 501 (CLI only)" "501" "$S" "$B" '.error.code == "NOT_IMPLEMENTED"'
+
+echo ""
+
+# ── Phase 8 Parity: Capabilities ─────────────────────────────────────────────
+
+echo "-- Phase 8 Parity: Capabilities"
+
+api GET /capabilities
+check "GET /api/capabilities → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/capabilities has version" "200" "$S" "$B" '(.data.version | type) == "string"'
+check "GET /api/capabilities has channels array" "200" "$S" "$B" '(.data.channels | type) == "array"'
+check "GET /api/capabilities has tools array" "200" "$S" "$B" '(.data.tools | type) == "array"'
+check "GET /api/capabilities has active_memory_backend" "200" "$S" "$B" '(.data.active_memory_backend | type) == "string"'
+
 echo ""
 
 # ── Results ───────────────────────────────────────────────────────────────────

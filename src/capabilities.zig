@@ -255,7 +255,13 @@ pub fn buildManifestJson(
     }
     try w.writeAll("\n  ],\n");
 
-    try w.writeAll("  \"tools\": {\n");
+    // Top-level "tools" array — flat list of all estimated/runtime tool names.
+    // Callers that need structured detail can use "tools_detail" below.
+    try w.writeAll("  \"tools\": ");
+    try appendJsonStringArray(w, runtime_loaded_names);
+    try w.writeAll(",\n");
+
+    try w.writeAll("  \"tools_detail\": {\n");
     try w.writeAll("    \"runtime_loaded\": ");
     try appendJsonStringArray(w, runtime_loaded_names);
     try w.writeAll(",\n");
