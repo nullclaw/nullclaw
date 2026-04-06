@@ -10,8 +10,8 @@
 //!   6. account     — channel + account_id only
 //!   7. channel_only— channel only (no account_id/peer/guild/team/roles)
 //!
-//! If no binding matches, the default agent is used (first in agents list,
-//! or "main" if the list is empty).
+//! If no binding matches, the default agent is always the reserved root
+//! agent id `"main"`.
 
 const std = @import("std");
 const config_types = @import("config_types.zig");

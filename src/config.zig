@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_routing = @import("agent_routing.zig");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
 const model_refs = @import("model_refs.zig");
@@ -171,6 +172,11 @@ fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentC
         if (agent_cfg.api_key) |api_key| allocator.free(api_key);
     }
     allocator.free(agents);
+}
+
+fn namedAgentUsesReservedRootId(agent_name: []const u8) bool {
+    var agent_buf: [64]u8 = undefined;
+    return std.mem.eql(u8, agent_routing.normalizeId(&agent_buf, agent_name), "main");
 }
 
 // ── Top-level Config ────────────────────────────────────────────
@@ -1314,6 +1320,7 @@ pub const Config = struct {
         InvalidWebRelayPairingCodeTtl,
         InvalidWebRelayUiTokenTtl,
         InvalidWebRelayTokenTtl,
+        ReservedMainAgentName,
         InsecurePlaintextSecrets,
     };
 
@@ -1335,6 +1342,11 @@ pub const Config = struct {
         }
         if (!config_types.AgentConfig.isValidTimezone(self.agent.timezone)) {
             return ValidationError.InvalidAgentTimezone;
+        }
+        for (self.agents) |agent_cfg| {
+            if (namedAgentUsesReservedRootId(agent_cfg.name)) {
+                return ValidationError.ReservedMainAgentName;
+            }
         }
         if (self.gateway.port == 0) {
             return ValidationError.InvalidPort;
@@ -1523,6 +1535,7 @@ pub const Config = struct {
             ValidationError.InvalidWebRelayPairingCodeTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_pairing_code_ttl_secs must be in [60, 300].\n", .{}),
             ValidationError.InvalidWebRelayUiTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_ui_token_ttl_secs must be in [300, 2592000].\n", .{}),
             ValidationError.InvalidWebRelayTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_token_ttl_secs must be in [3600, 31536000].\n", .{}),
+            ValidationError.ReservedMainAgentName => std.debug.print("Config error: agents.list names must not normalize to 'main' because that id is reserved for the root agent.\n", .{}),
         }
     }
 
@@ -1770,6 +1783,26 @@ test "validation passes for defaults" {
         .allocator = std.testing.allocator,
     };
     try cfg.validate();
+}
+
+test "validation rejects named agent that normalizes to main" {
+    // Regression: routed `agent:main:*` sessions must always resolve to the
+    // root config, so named agents cannot collide with the reserved `main` id.
+    const agents = [_]NamedAgentConfig{
+        .{
+            .name = "Main",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/model",
+        .agents = &agents,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(Config.ValidationError.ReservedMainAgentName, cfg.validate());
 }
 
 test "validation rejects plaintext secrets" {

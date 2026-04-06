@@ -432,7 +432,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
       "url": "https://mcp.example.com/rpc",
       "timeout_ms": 10000,
       "headers": {
-        "Authorization": "Bearer ${MCP_TOKEN}"
+        "Authorization": "Bearer example-token"
       }
     }
   },
@@ -479,6 +479,10 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   }
 }
 ```
+
+Config values are literal. NullClaw does not expand `${VAR}` inside `config.json`
+strings, including custom header values. If you need environment-based secrets,
+render `config.json` ahead of time with your own deployment tooling.
 
 Telegram forum topics:
 

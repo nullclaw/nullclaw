@@ -3,6 +3,8 @@ const observability = @import("observability.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 
+const log = std.log.scoped(.heartbeat);
+
 const MAX_HEARTBEAT_FILE_BYTES: usize = 64 * 1024;
 
 pub const TickOutcome = enum {
@@ -15,6 +17,58 @@ pub const TickResult = struct {
     outcome: TickOutcome,
     task_count: usize = 0,
 };
+
+fn parseTasksInternal(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    task_line_numbers: ?*std.ArrayListUnmanaged(usize),
+) ![][]const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |task| allocator.free(task);
+        list.deinit(allocator);
+    }
+
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    var line_number: usize = 1;
+    while (iter.next()) |line| : (line_number += 1) {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "- ")) continue;
+
+        const task = std.mem.trimLeft(u8, trimmed[2..], " \t");
+        if (task.len == 0) continue;
+
+        try list.append(allocator, try allocator.dupe(u8, task));
+        if (task_line_numbers) |numbers| {
+            try numbers.append(allocator, line_number);
+        }
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
+fn logProcessedTasks(source: []const u8, task_count: usize, task_line_numbers: []const usize) void {
+    log.debug("heartbeat tick: loaded HEARTBEAT.md via {s}; parsed {d} actionable task(s)", .{ source, task_count });
+    for (task_line_numbers, 0..) |line_number, task_index| {
+        log.debug("heartbeat tick: task {d} matched a markdown bullet on line {d}", .{ task_index + 1, line_number });
+    }
+}
+
+fn tickFromContent(allocator: std.mem.Allocator, source: []const u8, content: []const u8) !TickResult {
+    if (HeartbeatEngine.isContentEffectivelyEmpty(content)) {
+        log.debug("heartbeat tick: {s} HEARTBEAT.md had no actionable tasks after markdown filtering", .{source});
+        return .{ .outcome = .skipped_empty_file, .task_count = 0 };
+    }
+
+    var task_line_numbers: std.ArrayListUnmanaged(usize) = .empty;
+    defer task_line_numbers.deinit(allocator);
+
+    const tasks = try parseTasksInternal(allocator, content, &task_line_numbers);
+    defer HeartbeatEngine.freeTasks(allocator, tasks);
+
+    logProcessedTasks(source, tasks.len, task_line_numbers.items);
+    return .{ .outcome = .processed, .task_count = tasks.len };
+}
 
 /// Heartbeat engine — reads HEARTBEAT.md and processes periodic tasks.
 pub const HeartbeatEngine = struct {
@@ -35,24 +89,7 @@ pub const HeartbeatEngine = struct {
 
     /// Parse tasks from HEARTBEAT.md content (lines starting with `- `).
     pub fn parseTasks(allocator: std.mem.Allocator, content: []const u8) ![][]const u8 {
-        var list: std.ArrayListUnmanaged([]const u8) = .empty;
-        errdefer {
-            for (list.items) |task| allocator.free(task);
-            list.deinit(allocator);
-        }
-
-        var iter = std.mem.splitScalar(u8, content, '\n');
-        while (iter.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (std.mem.startsWith(u8, trimmed, "- ")) {
-                const task = std.mem.trimLeft(u8, trimmed[2..], " \t");
-                if (task.len > 0) {
-                    try list.append(allocator, try allocator.dupe(u8, task));
-                }
-            }
-        }
-
-        return list.toOwnedSlice(allocator);
+        return parseTasksInternal(allocator, content, null);
     }
 
     /// Collect tasks from the HEARTBEAT.md file in the workspace.
@@ -63,7 +100,7 @@ pub const HeartbeatEngine = struct {
             if (bp_content) |content| {
                 defer allocator.free(content);
                 if (isContentEffectivelyEmpty(content)) return &.{};
-                return parseTasks(allocator, content);
+                return parseTasksInternal(allocator, content, null);
             }
             return &.{};
         }
@@ -82,7 +119,7 @@ pub const HeartbeatEngine = struct {
         defer allocator.free(content);
 
         if (isContentEffectivelyEmpty(content)) return &.{};
-        return parseTasks(allocator, content);
+        return parseTasksInternal(allocator, content, null);
     }
 
     pub fn freeTasks(allocator: std.mem.Allocator, tasks: []const []const u8) void {
@@ -110,13 +147,9 @@ pub const HeartbeatEngine = struct {
             const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch null;
             if (bp_content) |content| {
                 defer allocator.free(content);
-                if (isContentEffectivelyEmpty(content)) {
-                    return .{ .outcome = .skipped_empty_file, .task_count = 0 };
-                }
-                const tasks = try self.collectTasks(allocator);
-                defer freeTasks(allocator, tasks);
-                return .{ .outcome = .processed, .task_count = tasks.len };
+                return tickFromContent(allocator, "bootstrap provider", content);
             }
+            log.debug("heartbeat tick: bootstrap provider could not load HEARTBEAT.md", .{});
             return .{ .outcome = .skipped_missing_file, .task_count = 0 };
         }
 
@@ -125,21 +158,17 @@ pub const HeartbeatEngine = struct {
         defer allocator.free(heartbeat_path);
 
         const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return .{ .outcome = .skipped_missing_file, .task_count = 0 },
+            error.FileNotFound => {
+                log.debug("heartbeat tick: workspace HEARTBEAT.md is missing before task scan", .{});
+                return .{ .outcome = .skipped_missing_file, .task_count = 0 };
+            },
             else => return err,
         };
         defer file.close();
 
         const content = try file.readToEndAlloc(allocator, MAX_HEARTBEAT_FILE_BYTES);
         defer allocator.free(content);
-        if (isContentEffectivelyEmpty(content)) {
-            return .{ .outcome = .skipped_empty_file, .task_count = 0 };
-        }
-
-        const tasks = try self.collectTasks(allocator);
-        defer freeTasks(allocator, tasks);
-
-        return .{ .outcome = .processed, .task_count = tasks.len };
+        return tickFromContent(allocator, "workspace file", content);
     }
 
     /// Create a default HEARTBEAT.md if it doesn't exist.
@@ -284,6 +313,29 @@ test "parseTasks mixed markdown" {
     try std.testing.expectEqualStrings("Task B", tasks[1]);
 }
 
+test "parseTasksInternal tracks actionable line numbers" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\# Periodic Tasks
+        \\
+        \\- Check status
+        \\Not a task
+        \\  - Review calendar
+        \\
+        \\- Send summary
+    ;
+
+    var task_line_numbers: std.ArrayListUnmanaged(usize) = .empty;
+    defer task_line_numbers.deinit(allocator);
+
+    // Regression: issue #703 only surfaced the aggregate task count for processed ticks.
+    const tasks = try parseTasksInternal(allocator, content, &task_line_numbers);
+    defer HeartbeatEngine.freeTasks(allocator, tasks);
+
+    try std.testing.expectEqual(@as(usize, 3), tasks.len);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 3, 5, 7 }, task_line_numbers.items);
+}
+
 test "HeartbeatEngine init clamps interval" {
     const engine = HeartbeatEngine.init(true, 2, "/tmp", null);
     try std.testing.expectEqual(@as(u32, 5), engine.interval_minutes);
@@ -300,4 +352,94 @@ test "isContentEffectivelyEmpty mirrors OpenClaw file gating semantics" {
     try std.testing.expect(HeartbeatEngine.isContentEffectivelyEmpty("## Tasks\n- [ ]\n+ [x]\n* [X]"));
     try std.testing.expect(!HeartbeatEngine.isContentEffectivelyEmpty("Check status"));
     try std.testing.expect(!HeartbeatEngine.isContentEffectivelyEmpty("#TODO keep this"));
+}
+
+test "HeartbeatEngine tick processes workspace tasks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "HEARTBEAT.md",
+        .data =
+        \\# Periodic Tasks
+        \\- Check status
+        \\- Review calendar
+        ,
+    });
+
+    const engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
+    const result = try engine.tick(allocator);
+
+    try std.testing.expectEqual(TickOutcome.processed, result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), result.task_count);
+}
+
+test "HeartbeatEngine tick processes bootstrap-provider tasks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "HEARTBEAT.md",
+        .data =
+        \\# Periodic Tasks
+        \\- Check status
+        \\- Review calendar
+        ,
+    });
+
+    var bootstrap_provider = bootstrap_mod.FileBootstrapProvider.init(allocator, workspace_dir);
+    var engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
+    engine.bootstrap_provider = bootstrap_provider.provider();
+
+    const result = try engine.tick(allocator);
+
+    try std.testing.expectEqual(TickOutcome.processed, result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), result.task_count);
+}
+
+test "HeartbeatEngine tick skips missing heartbeat file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    const engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
+    const result = try engine.tick(allocator);
+
+    try std.testing.expectEqual(TickOutcome.skipped_missing_file, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.task_count);
+}
+
+test "HeartbeatEngine tick skips comment-only heartbeat file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "HEARTBEAT.md",
+        .data =
+        \\# Periodic Tasks
+        \\
+        \\- [ ]
+        ,
+    });
+
+    const engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
+    const result = try engine.tick(allocator);
+
+    try std.testing.expectEqual(TickOutcome.skipped_empty_file, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.task_count);
 }

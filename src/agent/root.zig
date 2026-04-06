@@ -2486,6 +2486,7 @@ pub const Agent = struct {
 
     fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
         if (!std.mem.eql(u8, call.name, "file_write") and
+            !std.mem.eql(u8, call.name, "file_append") and
             !std.mem.eql(u8, call.name, "file_edit") and
             !std.mem.eql(u8, call.name, "file_edit_hashed")) return false;
 
@@ -7115,6 +7116,11 @@ test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
         .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"target\":\"L1:abc\",\"new_text\":\"b\"}" },
     };
     try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
+
+    const calls_append_match = [_]ParsedToolCall{
+        .{ .name = "file_append", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"content\":\"\\nmore guidance\"}" },
+    };
+    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_append_match));
 
     const calls_no_match = [_]ParsedToolCall{
         .{ .name = "file_write", .arguments_json = "{\"path\":\"README.md\",\"content\":\"x\"}" },

@@ -534,6 +534,7 @@ pub const LarkConfig = struct {
     allow_from: []const []const u8 = &.{},
     receive_mode: LarkReceiveMode = .websocket,
     port: ?u16 = null,
+    reaction_emojis: []const []const u8 = &.{},
 };
 
 pub const DingTalkConfig = struct {

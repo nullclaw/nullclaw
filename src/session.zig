@@ -126,6 +126,9 @@ fn sessionAgentId(session_key: []const u8) ?[]const u8 {
 
 fn findProfileForSessionKey(config: *const Config, session_key: []const u8) ?config_types.NamedAgentConfig {
     const normalized_agent_id = sessionAgentId(session_key) orelse return null;
+    // `agent:main:*` is the reserved root session namespace and must always
+    // resolve to the top-level config rather than a named subagent.
+    if (std.mem.eql(u8, normalized_agent_id, "main")) return null;
 
     for (config.agents) |agent_profile| {
         var norm_buf: [64]u8 = undefined;
@@ -3268,6 +3271,30 @@ test "getOrCreate falls back to default config for unknown routed agent id" {
     defer sm.deinit();
 
     const session = try sm.getOrCreate("agent:missing:telegram:group:-100123");
+    try testing.expect(session.provider_holder == null);
+    try testing.expect(session.agent.profile_name == null);
+    try testing.expectEqualStrings("test/mock-model", session.agent.model_name);
+    try testing.expectEqualStrings("openrouter", session.agent.default_provider);
+}
+
+test "getOrCreate keeps routed main session on root config when named agent normalizes to main" {
+    // Regression: routed fallback sessions must keep using the root config even
+    // when a named agent normalizes to `main`.
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.default_provider = "openrouter";
+    cfg.agents = &.{
+        .{
+            .name = "Main",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+        },
+    };
+
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:main:telegram:group:-100123");
     try testing.expect(session.provider_holder == null);
     try testing.expect(session.agent.profile_name == null);
     try testing.expectEqualStrings("test/mock-model", session.agent.model_name);
