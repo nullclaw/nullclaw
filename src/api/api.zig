@@ -1462,7 +1462,6 @@ fn handleSkillDelete(ctx: *ApiContext) anyerror!void {
     try ctx.sendSuccess(data);
 }
 
-
 // ── Phase 7 handlers ────────────────────────────────────────────────
 
 /// POST /api/agent
@@ -1514,18 +1513,18 @@ fn handleAgentInvoke(ctx: *ApiContext) anyerror!void {
     }
 
     const message_val = parsed.value.object.get("message") orelse {
-        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "\"message\" field is required");
+        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "'message' field is required");
         return;
     };
     const message: []const u8 = switch (message_val) {
         .string => |s| s,
         else => {
-            try ctx.sendError("400 Bad Request", "BAD_REQUEST", "\"message\" must be a string");
+            try ctx.sendError("400 Bad Request", "BAD_REQUEST", "'message' must be a string");
             return;
         },
     };
     if (message.len == 0) {
-        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "\"message\" must not be empty");
+        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "'message' must not be empty");
         return;
     }
 
@@ -1739,7 +1738,6 @@ fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-t/delete))
 // ── Tests ─────────────────────────────────────────────────────────────
 fn makeEnabledCfg() Config {
     var cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
@@ -2605,7 +2603,6 @@ test "DELETE /api/cron/:id unknown id returns 404" {
     try std.testing.expectEqualStrings("404 Not Found", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "JOB_NOT_FOUND") != null);
 }
-
 
 // ── Phase 7 tests ─────────────────────────────────────────────────────
 

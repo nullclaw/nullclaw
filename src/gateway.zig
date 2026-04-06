@@ -5031,7 +5031,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
         // the bus + channel runtime. However, A2A requires a synchronous session manager
         // for request-response JSON-RPC, so also init when A2A is enabled.
-        if (needs_local_agent or cfg.a2a.enabled) {
+        if (needs_local_agent or cfg.a2a.enabled or cfg.gateway.admin_api) {
             sec_tracker_opt = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
             sec_policy_opt = .{
                 .autonomy = cfg.autonomy.level,

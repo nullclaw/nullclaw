@@ -3,14 +3,20 @@
 #
 # Usage:
 #   ./scripts/test-api-e2e.sh
+#   INFINI_AI_KEY=sk-... ./scripts/test-api-e2e.sh
 #
 # Prerequisites:
-#   - nullclaw binary at zig-out/bin/nullclaw (run `zig build` first)
-#   - curl, jq available on PATH
+#   - nullclaw binary at zig-out/bin/nullclaw (run `zig build -Doptimize=ReleaseSmall` first)
+#   - curl, jq, python3 available on PATH
+#
+# LLM key resolution (in priority order):
+#   1. INFINI_AI_KEY env var
+#   2. ~/.nullclaw/config.json models.providers.infini-ai.api_key
+#   3. (empty — POST /api/agent invocation checks will fail)
 #
 # The script:
 #   1. Writes a temp config to /tmp/nullclaw-e2e/config.json
-#   2. Starts the gateway (which also starts scheduler via daemon.run)
+#   2. Starts the gateway (which also starts scheduler + session manager via daemon.run)
 #   3. Waits for it to be ready
 #   4. Runs all API checks
 #   5. Kills the gateway and reports pass/fail counts
@@ -25,6 +31,31 @@ PORT=19871
 BASE="http://127.0.0.1:${PORT}/api"
 TOKEN="e2e-test-token"
 AUTH="Authorization: Bearer ${TOKEN}"
+
+# ── LLM key resolution ────────────────────────────────────────────────────────
+
+_resolve_infini_ai_key() {
+    python3 - <<'PYEOF' 2>/dev/null || echo ""
+import json, os
+cfg = os.path.expanduser("~/.nullclaw/config.json")
+try:
+    with open(cfg) as f:
+        d = json.load(f)
+    print(d.get("models", {}).get("providers", {}).get("infini-ai", {}).get("api_key", ""))
+except Exception:
+    print("")
+PYEOF
+}
+
+INFINI_AI_KEY="${INFINI_AI_KEY:-$(_resolve_infini_ai_key)}"
+INFINI_AI_BASE_URL="${INFINI_AI_BASE_URL:-https://cloud.infini-ai.com/maas/coding/v1}"
+
+if [ -z "$INFINI_AI_KEY" ]; then
+    echo "WARNING: INFINI_AI_KEY not set and not found in ~/.nullclaw/config.json."
+    echo "         POST /api/agent invocation checks will fail (500/503)."
+    echo "         Set INFINI_AI_KEY=<key> to enable full e2e coverage."
+    echo ""
+fi
 
 PASS=0
 FAIL=0
@@ -81,6 +112,21 @@ api() {
     B=$(cat "$E2E_DIR/resp.json" 2>/dev/null || echo "")
 }
 
+api_agent() {
+    # api_agent <method> <path> [curl-args...]
+    # Like api() but with a longer timeout for real LLM round-trips.
+    local method="$1"; shift
+    local path="$1"; shift
+    local resp
+    resp=$(curl -s --max-time 90 -o "$E2E_DIR/resp.json" -w "%{http_code}" \
+        -X "$method" \
+        -H "$AUTH" \
+        "$@" \
+        "${BASE}${path}")
+    S="$resp"
+    B=$(cat "$E2E_DIR/resp.json" 2>/dev/null || echo "")
+}
+
 # ── setup ────────────────────────────────────────────────────────────────────
 
 echo "==> Setting up e2e environment at $E2E_DIR"
@@ -90,12 +136,21 @@ mkdir -p "$E2E_DIR"
 # Write config using the OBJECT format for multi-account channels.
 # The parser expects: "channel": {"accounts": {"id": {...}}}
 # NOT the array format: "channel": [{"account_id": "...", ...}]
-cat > "$E2E_DIR/config.json" <<'EOF'
+# INFINI_AI_KEY and INFINI_AI_BASE_URL are resolved above (env or ~/.nullclaw/config.json).
+cat > "$E2E_DIR/config.json" <<EOF
 {
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openai/gpt-4o"
+        "primary": "infini-ai/glm-5"
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "infini-ai": {
+        "api_key": "${INFINI_AI_KEY}",
+        "base_url": "${INFINI_AI_BASE_URL}"
       }
     }
   },
@@ -405,9 +460,8 @@ echo ""
 
 echo "-- Phase 7: Agent control"
 
-# POST /api/agent — one-shot invocation
-# The agent runtime IS running in daemon mode, so these should succeed.
-api POST /agent \
+# POST /api/agent — one-shot invocation (real LLM call; uses api_agent for 90s timeout)
+api_agent POST /agent \
     -H "Content-Type: application/json" \
     -d '{"message":"Reply with exactly the word: pong","session":"api:e2e-test"}'
 check "POST /api/agent → 200" "200" "$S" "$B" '.success == true'
@@ -416,19 +470,19 @@ check "POST /api/agent has session field" "200" "$S" "$B" '.data.session == "api
 check "POST /api/agent has turn_count field" "200" "$S" "$B" '(.data.turn_count | type) == "number"'
 
 # POST /api/agent — second turn (turn count increments)
-api POST /agent \
+api_agent POST /agent \
     -H "Content-Type: application/json" \
     -d '{"message":"Reply with exactly the word: ping","session":"api:e2e-test"}'
 check "POST /api/agent second turn → 200" "200" "$S" "$B" '.success == true'
 check "POST /api/agent second turn has session field" "200" "$S" "$B" '.data.session == "api:e2e-test"'
 
-# POST /api/agent — missing message → 400
+# POST /api/agent — missing message → 400 (no LLM call needed)
 api POST /agent \
     -H "Content-Type: application/json" \
     -d '{"session":"api:e2e-test"}'
 check "POST /api/agent missing message → 400" "400" "$S" "$B" '.error.code == "BAD_REQUEST"'
 
-# POST /api/agent — empty message → 400
+# POST /api/agent — empty message → 400 (no LLM call needed)
 api POST /agent \
     -H "Content-Type: application/json" \
     -d '{"message":"","session":"api:e2e-test"}'
