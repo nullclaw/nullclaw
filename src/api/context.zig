@@ -12,6 +12,7 @@
 const std = @import("std");
 const Config = @import("../config.zig").Config;
 const cron_mod = @import("../cron.zig");
+const session_mod = @import("../session.zig");
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -42,6 +43,10 @@ pub const ApiContext = struct {
     /// Live CronScheduler pointer, already mutex-locked by the dispatch caller.
     /// Null when the scheduler is not running.  Handlers must not unlock it.
     scheduler_opt: ?*cron_mod.CronScheduler = null,
+    /// Live SessionManager pointer, shared with the gateway worker loop.
+    /// Null when the gateway was started without an agent session manager.
+    /// Handlers that invoke agent.turn() must lock session.mutex themselves.
+    session_mgr: ?*session_mod.SessionManager = null,
     /// Dynamic path segment extracted by the router (e.g. the ":id" portion
     /// of "/api/v1/cron/:id/run").  Set by dispatch() before calling the handler.
     path_param: ?[]const u8 = null,

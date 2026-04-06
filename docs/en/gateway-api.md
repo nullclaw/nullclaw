@@ -337,6 +337,10 @@ All Admin API responses use a consistent JSON envelope:
 |---|---|---|
 | `/api/status` | GET | Version, pid, uptime, overall status, and component health |
 | `/api/config?path=<dotted>` | GET | Read a single config value |
+| `/api/config` | PATCH | Mutate a config value (allowlisted paths only) |
+| `/api/config` | DELETE | Unset a config value |
+| `/api/config/reload` | POST | Hot-reload config from disk |
+| `/api/config/validate` | POST | Validate config without applying |
 | `/api/models` | GET | List configured providers (no key values) |
 | `/api/cron` | GET | List all scheduled jobs |
 | `/api/cron` | POST | Create a recurring cron job |
@@ -346,6 +350,17 @@ All Admin API responses use a consistent JSON envelope:
 | `/api/cron/:id/resume` | POST | Resume a paused job |
 | `/api/cron/:id` | PATCH | Update job fields |
 | `/api/cron/:id` | DELETE | Remove a job |
+| `/api/channels` | GET | List configured channels and health status |
+| `/api/channels/:name` | GET | Detail for a single channel type |
+| `/api/skills` | GET | List installed skills |
+| `/api/skills/:name` | POST | Install a skill |
+| `/api/skills/:name` | DELETE | Uninstall a skill |
+| `/api/mcp` | GET | List configured MCP servers (env/header values redacted) |
+| `/api/mcp/:name` | GET | Detail for a single MCP server |
+| `/api/agent` | POST | One-shot agent invocation (body: `{"message":"...","session":"..."}`) |
+| `/api/agent/stream` | POST | SSE streaming variant — returns 501 until gateway transport supports chunked responses |
+| `/api/agent/sessions` | GET | List active agent sessions |
+| `/api/agent/sessions/:id` | DELETE | Terminate an agent session |
 
 #### `GET /api/status`
 
@@ -368,6 +383,42 @@ Returns version, pid, uptime, overall health status, and per-component detail.
 ```
 
 `status` is `"ok"` when all components report `"ok"`, otherwise `"degraded"`.
+
+#### `POST /api/agent`
+
+Sends a message to the agent and waits for a response. Useful for single-message fire-and-wait use cases (e.g. menubar apps, iOS shortcuts, CLI dashboards). Not a replacement for A2A, which handles multi-turn delegation.
+
+Request body:
+
+```json
+{ "message": "summarise open issues", "session": "my-session" }
+```
+
+`session` is optional; defaults to `"api:default"`. Session keys containing `:` must be percent-encoded as `%3A` in URL paths.
+
+Response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "response": "Here are the open issues...",
+    "session": "my-session",
+    "turn_count": 1
+  },
+  "error": null
+}
+```
+
+`POST /api/agent/stream` returns `501 Not Implemented` — the gateway HTTP transport is a single-write model and chunked SSE is not yet supported.
+
+#### `GET /api/agent/sessions`
+
+Lists active sessions with key, turn count, and last-active timestamp.
+
+#### `DELETE /api/agent/sessions/:id`
+
+Terminates the named session and frees its resources. Returns `404` if the session does not exist.
 
 ## Security Guidance
 

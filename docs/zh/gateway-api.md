@@ -270,12 +270,81 @@ curl -X POST \
 | -32005 | ContentTypeNotSupportedError | 内容类型不兼容 |
 | -32007 | AuthenticatedExtendedCardNotConfiguredError | 未配置扩展卡片 |
 
+## REST 管理 API（`/api/`）
+
+通过在 `config.json` 中设置 `gateway.admin_api: true` 启用。使用与 webhook 相同的 Bearer token 鉴权。
+
+所有响应均使用统一 JSON 信封：
+
+```json
+{ "success": true,  "data": {...},  "error": null }
+{ "success": false, "data": null,   "error": {"code":"...", "message":"..."} }
+```
+
+### 端点
+
+| 端点 | Method | 说明 |
+|---|---|---|
+| `/api/status` | GET | 版本、pid、运行时长、整体状态与组件健康 |
+| `/api/config?path=<dot路径>` | GET | 读取单个配置项 |
+| `/api/config` | PATCH | 修改配置项（仅限白名单路径） |
+| `/api/config` | DELETE | 删除配置项 |
+| `/api/config/reload` | POST | 从磁盘热重载配置 |
+| `/api/config/validate` | POST | 校验配置但不应用 |
+| `/api/models` | GET | 列出已配置的 provider（不返回密钥） |
+| `/api/cron` | GET | 列出所有定时任务 |
+| `/api/cron` | POST | 新建周期性 cron 任务 |
+| `/api/cron/once` | POST | 新建一次性延迟任务 |
+| `/api/cron/:id/run` | POST | 立即触发任务 |
+| `/api/cron/:id/pause` | POST | 暂停任务 |
+| `/api/cron/:id/resume` | POST | 恢复任务 |
+| `/api/cron/:id` | PATCH | 更新任务字段 |
+| `/api/cron/:id` | DELETE | 删除任务 |
+| `/api/channels` | GET | 列出已配置的 channel 及其健康状态 |
+| `/api/channels/:name` | GET | 指定 channel 类型的详情 |
+| `/api/skills` | GET | 列出已安装的 skill |
+| `/api/skills/:name` | POST | 安装 skill |
+| `/api/skills/:name` | DELETE | 卸载 skill |
+| `/api/mcp` | GET | 列出已配置的 MCP server（env/header 值已脱敏） |
+| `/api/mcp/:name` | GET | 指定 MCP server 的详情 |
+| `/api/agent` | POST | 单次 agent 调用（请求体：`{"message":"...","session":"..."}`） |
+| `/api/agent/stream` | POST | SSE 流式变体 — 网关 HTTP 传输层支持分块响应前返回 501 |
+| `/api/agent/sessions` | GET | 列出活跃的 agent 会话 |
+| `/api/agent/sessions/:id` | DELETE | 终止指定 agent 会话 |
+
+#### `POST /api/agent`
+
+向 agent 发送消息并等待响应，适用于单次触发场景（菜单栏 App、iOS 快捷指令、CLI 仪表板等）。
+
+请求体：
+
+```json
+{ "message": "总结未解决的 issue", "session": "my-session" }
+```
+
+`session` 可选，默认为 `"api:default"`。包含 `:` 的会话 key 在 URL 路径中须以 `%3A` 进行百分号编码。
+
+响应：
+
+```json
+{
+  "success": true,
+  "data": {
+    "response": "以下是未解决的 issue……",
+    "session": "my-session",
+    "turn_count": 1
+  },
+  "error": null
+}
+```
+
 ## 鉴权与安全建议
 
 1. 保持 `gateway.require_pairing = true`。
 2. 网关优先绑定 `127.0.0.1`，外网访问通过 tunnel/反向代理。
 3. token 视为密钥，不写入公开仓库或日志。
 4. Max webhook secret 同理：每个账号使用独立随机值，不跨 bot 复用。
+5. 仅在可信客户端（如 NullClaw iOS App）需要时开启 `gateway.admin_api = true`。
 
 ## 下一步
 

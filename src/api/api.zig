@@ -30,6 +30,7 @@ const cron_mod = @import("../cron.zig");
 const agent_routing = @import("../agent_routing.zig");
 const skillforge = @import("../skillforge.zig");
 const Config = @import("../config.zig").Config;
+const session_mod = @import("../session.zig");
 const ApiContext = @import("context.zig").ApiContext;
 
 // ── Endpoint registry ────────────────────────────────────────────────
@@ -66,6 +67,11 @@ pub const registry: []const Endpoint = &.{
     .{ .method = "GET", .path = "/api/skills", .handler = handleSkillList },
     .{ .method = "POST", .path = "/api/skills/install", .handler = handleSkillInstall },
     .{ .method = "DELETE", .path = "/api/skills/:name", .handler = handleSkillDelete },
+    // Phase 7 — Agent control
+    .{ .method = "POST", .path = "/api/agent", .handler = handleAgentInvoke },
+    .{ .method = "POST", .path = "/api/agent/stream", .handler = handleAgentStream },
+    .{ .method = "GET", .path = "/api/agent/sessions", .handler = handleAgentSessionList },
+    .{ .method = "DELETE", .path = "/api/agent/sessions/:id", .handler = handleAgentSessionDelete },
 };
 
 // ── Dispatcher ───────────────────────────────────────────────────────
@@ -87,16 +93,22 @@ pub const DispatchResult = struct {
 /// The caller is responsible for unlocking it after this function returns.
 /// Pass null when no scheduler is running (scheduler endpoints return 503).
 ///
+/// `session_mgr_opt` is the live SessionManager, shared with the gateway worker
+/// loop.  Pass null when no session manager is running (agent endpoints return
+/// 503).  Handlers that invoke agent.turn() must lock session.mutex themselves
+/// using the Session.mutex field.
+///
 /// Parameters:
-///   allocator      — request-scoped arena allocator
-///   raw_request    — full raw HTTP bytes
-///   method         — HTTP method string
-///   target         — full request target (may include query string)
-///   base_path      — target without query string
-///   config_opt     — active config or null
-///   auth_ok        — true when the bearer token has already been validated
-///                    by the caller (gateway.zig) using isWebhookAuthorized.
-///   scheduler_opt  — live CronScheduler (already mutex-locked by caller), or null.
+///   allocator       — request-scoped arena allocator
+///   raw_request     — full raw HTTP bytes
+///   method          — HTTP method string
+///   target          — full request target (may include query string)
+///   base_path       — target without query string
+///   config_opt      — active config or null
+///   auth_ok         — true when the bearer token has already been validated
+///                     by the caller (gateway.zig) using isWebhookAuthorized.
+///   scheduler_opt   — live CronScheduler (already mutex-locked by caller), or null.
+///   session_mgr_opt — live SessionManager shared pointer, or null.
 pub fn dispatch(
     allocator: std.mem.Allocator,
     raw_request: []const u8,
@@ -106,6 +118,7 @@ pub fn dispatch(
     config_opt: ?*const Config,
     auth_ok: bool,
     scheduler_opt: ?*cron_mod.CronScheduler,
+    session_mgr_opt: ?*session_mod.SessionManager,
 ) DispatchResult {
     // Guard: admin_api must be explicitly enabled in gateway config.
     const enabled = if (config_opt) |cfg| cfg.gateway.admin_api else false;
@@ -136,6 +149,7 @@ pub fn dispatch(
         .base_path = base_path,
         .config_opt = config_opt,
         .scheduler_opt = scheduler_opt,
+        .session_mgr = session_mgr_opt,
     };
 
     // Pass 1: exact match.
@@ -1448,6 +1462,284 @@ fn handleSkillDelete(ctx: *ApiContext) anyerror!void {
     try ctx.sendSuccess(data);
 }
 
+
+// ── Phase 7 handlers ────────────────────────────────────────────────
+
+/// POST /api/agent
+///
+/// One-shot agent invocation.  Finds or creates a session for the given
+/// session key, runs a single agent.turn(), and returns the response.
+///
+/// Request body (JSON):
+/// ```json
+/// { "message": "...", "session": "api:default" }
+/// ```
+/// `session` is optional; defaults to `"api:default"` when omitted.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "session": "api:default",
+///     "response": "...",
+///     "turn_count": 1
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   SESSION_MANAGER_UNAVAILABLE — no session manager is running (gateway
+///     started without an agent runtime).
+///   BAD_REQUEST                 — missing or empty `message` field.
+///   AGENT_ERROR                 — agent.turn() returned an error.
+fn handleAgentInvoke(ctx: *ApiContext) anyerror!void {
+    // Validate inputs first so callers always get 400 before 503.
+    const body_bytes = ctx.body() orelse {
+        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "request body is required");
+        return;
+    };
+
+    // Parse JSON body: { "message": "...", "session": "..." }
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, body_bytes, .{}) catch {
+        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "invalid JSON body");
+        return;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "body must be a JSON object");
+        return;
+    }
+
+    const message_val = parsed.value.object.get("message") orelse {
+        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "\"message\" field is required");
+        return;
+    };
+    const message: []const u8 = switch (message_val) {
+        .string => |s| s,
+        else => {
+            try ctx.sendError("400 Bad Request", "BAD_REQUEST", "\"message\" must be a string");
+            return;
+        },
+    };
+    if (message.len == 0) {
+        try ctx.sendError("400 Bad Request", "BAD_REQUEST", "\"message\" must not be empty");
+        return;
+    }
+
+    const session_key: []const u8 = blk: {
+        if (parsed.value.object.get("session")) |sv| {
+            if (sv == .string and sv.string.len > 0) break :blk sv.string;
+        }
+        break :blk "api:default";
+    };
+
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "SESSION_MANAGER_UNAVAILABLE", "no agent session manager is running");
+        return;
+    };
+
+    const response = sm.processMessage(session_key, message, null) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "agent.turn() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "AGENT_ERROR", msg);
+        return;
+    };
+    defer sm.allocator.free(response);
+
+    // Retrieve turn count from the session.
+    var turn_count: u64 = 0;
+    {
+        sm.mutex.lock();
+        defer sm.mutex.unlock();
+        if (sm.sessions.get(session_key)) |session| {
+            turn_count = session.turn_count;
+        }
+    }
+
+    const data = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"session\":{f},\"response\":{f},\"turn_count\":{d}}}",
+        .{
+            std.json.fmt(session_key, .{}),
+            std.json.fmt(response, .{}),
+            turn_count,
+        },
+    );
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// POST /api/agent/stream
+///
+/// SSE streaming variant of agent invocation.
+///
+/// NOTE: The current gateway HTTP transport uses a single-write response
+/// model and does not support persistent chunked-transfer SSE connections.
+/// This endpoint returns 501 Not Implemented until the gateway transport
+/// is upgraded to support long-lived streaming responses.
+fn handleAgentStream(ctx: *ApiContext) anyerror!void {
+    try ctx.sendError(
+        "501 Not Implemented",
+        "NOT_IMPLEMENTED",
+        "SSE streaming requires persistent connections not yet supported by the gateway HTTP transport; use POST /api/agent for synchronous invocation",
+    );
+}
+
+/// GET /api/agent/sessions
+///
+/// List all active agent sessions with their metadata.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "sessions": [
+///       {
+///         "session_key": "telegram:chat123",
+///         "created_at": 1710000000,
+///         "last_active": 1710001000,
+///         "turn_count": 5,
+///         "turn_running": false
+///       }
+///     ],
+///     "total": 1
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   SESSION_MANAGER_UNAVAILABLE — no session manager is running.
+fn handleAgentSessionList(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "SESSION_MANAGER_UNAVAILABLE", "no agent session manager is running");
+        return;
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+
+    var total: usize = 0;
+
+    try w.writeAll("{\"sessions\":[");
+    {
+        sm.mutex.lock();
+        defer sm.mutex.unlock();
+
+        var it = sm.sessions.iterator();
+        var first = true;
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            if (!first) try w.writeByte(',');
+            first = false;
+            total += 1;
+            try w.print(
+                "{{\"session_key\":{f},\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d},\"turn_running\":{}}}",
+                .{
+                    std.json.fmt(session.session_key, .{}),
+                    session.created_at,
+                    session.last_active,
+                    session.turn_count,
+                    session.turn_running.load(.seq_cst),
+                },
+            );
+        }
+    }
+    try w.print("],\"total\":{d}}}", .{total});
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// DELETE /api/agent/sessions/:id
+///
+/// Terminate and remove a session by its URL-encoded session key.
+/// The `:id` path parameter is the session key (e.g. `api:default`).
+///
+/// URL-encoded colons (%3A) are decoded before lookup.
+///
+/// Response shape:
+/// ```json
+/// { "success": true, "data": { "session_key": "api:default", "terminated": true }, "error": null }
+/// ```
+///
+/// Errors:
+///   SESSION_MANAGER_UNAVAILABLE — no session manager is running.
+///   SESSION_NOT_FOUND           — no session with that key exists.
+fn handleAgentSessionDelete(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "SESSION_MANAGER_UNAVAILABLE", "no agent session manager is running");
+        return;
+    };
+
+    const raw_id = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_PARAM", "session key required in path");
+        return;
+    };
+
+    // Decode percent-encoded characters (common: %3A → ':').
+    const session_key = try percentDecode(ctx.allocator, raw_id);
+    defer ctx.allocator.free(session_key);
+
+    // Remove the session from the live map under lock.
+    const removed = blk: {
+        sm.mutex.lock();
+        defer sm.mutex.unlock();
+        if (sm.sessions.fetchRemove(session_key)) |kv| {
+            kv.value.deinit(sm.allocator);
+            sm.allocator.destroy(kv.value);
+            break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (!removed) {
+        try ctx.sendError("404 Not Found", "SESSION_NOT_FOUND", "no active session with that key");
+        return;
+    }
+
+    const data = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"session_key\":{f},\"terminated\":true}}",
+        .{std.json.fmt(session_key, .{})},
+    );
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// Decode percent-encoded bytes in a URL path segment.
+/// Only replaces the most common encoding (%XX hex pairs).
+/// Returns a heap-allocated copy; caller must free.
+fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const hi = input[i + 1];
+            const lo = input[i + 2];
+            const decoded = (std.fmt.charToDigit(hi, 16) catch null);
+            const decoded_lo = (std.fmt.charToDigit(lo, 16) catch null);
+            if (decoded != null and decoded_lo != null) {
+                const byte: u8 = (decoded.? << 4) | decoded_lo.?;
+                try out.append(allocator, byte);
+                i += 3;
+                continue;
+            }
+        }
+        try out.append(allocator, input[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+t/delete))
 // ── Tests ─────────────────────────────────────────────────────────────
 fn makeEnabledCfg() Config {
     var cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
@@ -1467,6 +1759,7 @@ test "dispatch returns 403 when admin_api disabled" {
         &cfg,
         true,
         null,
+        null,
     );
     try std.testing.expectEqualStrings("403 Forbidden", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "ADMIN_API_DISABLED") != null);
@@ -1483,6 +1776,7 @@ test "dispatch returns 401 when not authorized" {
         &cfg,
         false,
         null,
+        null,
     );
     try std.testing.expectEqualStrings("401 Unauthorized", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "UNAUTHORIZED") != null);
@@ -1498,6 +1792,7 @@ test "dispatch returns 404 for unknown route" {
         "/api/unknown",
         &cfg,
         true,
+        null,
         null,
     );
     try std.testing.expectEqualStrings("404 Not Found", result.status);
@@ -1517,6 +1812,7 @@ test "dispatch GET /api/status returns success envelope with components" {
         "/api/status",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1540,6 +1836,7 @@ test "dispatch method mismatch returns 404" {
         &cfg,
         true,
         null,
+        null,
     );
     try std.testing.expectEqualStrings("404 Not Found", result.status);
 }
@@ -1557,6 +1854,7 @@ test "dispatch GET /api/status returns version and uptime" {
         "/api/status",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1578,6 +1876,7 @@ test "dispatch GET /api/config missing param returns 400" {
         &cfg,
         true,
         null,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("400 Bad Request", result.status);
@@ -1597,6 +1896,7 @@ test "GET /api/channels returns empty array when no channels configured" {
         "/api/channels",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1622,6 +1922,7 @@ test "GET /api/channels lists configured channels" {
         "/api/channels",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1653,6 +1954,7 @@ test "GET /api/channels status reflects health registry" {
         &cfg,
         true,
         null,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -1673,6 +1975,7 @@ test "GET /api/channels/:name returns channel detail" {
         "/api/channels/discord",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1696,6 +1999,7 @@ test "GET /api/channels/:name unconfigured type returns empty accounts" {
         &cfg,
         true,
         null,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -1712,6 +2016,7 @@ test "GET /api/channels/:name unknown type returns 404" {
         "/api/channels/nonexistent",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1732,6 +2037,7 @@ test "GET /api/skills returns success envelope in test mode" {
         "/api/skills",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1755,6 +2061,7 @@ test "POST /api/skills/install returns 503 in test mode" {
         &cfg,
         true,
         null,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
@@ -1771,6 +2078,7 @@ test "POST /api/skills/install missing body returns 400" {
         "/api/skills/install",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1789,6 +2097,7 @@ test "POST /api/skills/install missing name and url returns 400" {
         "/api/skills/install",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1810,6 +2119,7 @@ test "DELETE /api/skills/:name unsafe name returns 400" {
         "/api/skills/..",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1834,6 +2144,7 @@ test "DELETE /api/skills/:name returns success in test mode" {
         "/api/skills/my-skill",
         &cfg,
         true,
+        null,
         null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
@@ -1860,6 +2171,7 @@ test "dispatch GET /api/models returns provider list" {
         &cfg,
         true,
         null,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -1884,6 +2196,7 @@ test "dispatch GET /api/models no config returns 403 disabled" {
         "/api/models",
         null, // no config → admin_api=false → 403
         true,
+        null,
         null,
     );
     try std.testing.expectEqualStrings("403 Forbidden", result.status);
@@ -1951,6 +2264,7 @@ test "GET /api/cron returns 503 when scheduler unavailable" {
         &cfg,
         true,
         null, // no scheduler
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
@@ -1971,6 +2285,7 @@ test "GET /api/cron returns empty array when no jobs" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -1993,6 +2308,7 @@ test "GET /api/cron lists jobs" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2016,6 +2332,7 @@ test "POST /api/cron creates job" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2039,6 +2356,7 @@ test "POST /api/cron missing expression returns 400" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("400 Bad Request", result.status);
@@ -2061,6 +2379,7 @@ test "POST /api/cron/once creates one-shot job" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2085,6 +2404,7 @@ test "POST /api/cron/once with expression returns 400" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("400 Bad Request", result.status);
@@ -2117,6 +2437,7 @@ test "POST /api/cron/:id/run triggers job" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2140,6 +2461,7 @@ test "POST /api/cron/:id/run unknown id returns 404" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("404 Not Found", result.status);
@@ -2166,6 +2488,7 @@ test "POST /api/cron/:id/pause pauses job" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2194,6 +2517,7 @@ test "POST /api/cron/:id/resume resumes job" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2225,6 +2549,7 @@ test "PATCH /api/cron/:id updates job command" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2252,6 +2577,7 @@ test "DELETE /api/cron/:id deletes job" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("200 OK", result.status);
@@ -2273,8 +2599,156 @@ test "DELETE /api/cron/:id unknown id returns 404" {
         &cfg,
         true,
         &scheduler,
+        null,
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("404 Not Found", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "JOB_NOT_FOUND") != null);
+}
+
+
+// ── Phase 7 tests ─────────────────────────────────────────────────────
+
+test "POST /api/agent returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "POST /api/agent HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"message\":\"hello\"}",
+        "POST",
+        "/api/agent",
+        "/api/agent",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "SESSION_MANAGER_UNAVAILABLE") != null);
+}
+
+test "POST /api/agent returns 400 for missing body" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "POST /api/agent HTTP/1.1\r\n\r\n",
+        "POST",
+        "/api/agent",
+        "/api/agent",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "BAD_REQUEST") != null);
+}
+
+test "POST /api/agent returns 400 for missing message field" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "POST /api/agent HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"session\":\"test\"}",
+        "POST",
+        "/api/agent",
+        "/api/agent",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "BAD_REQUEST") != null);
+}
+
+test "POST /api/agent returns 400 for empty message" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "POST /api/agent HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"message\":\"\"}",
+        "POST",
+        "/api/agent",
+        "/api/agent",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "BAD_REQUEST") != null);
+}
+
+test "POST /api/agent/stream returns 501" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "POST /api/agent/stream HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"message\":\"hello\"}",
+        "POST",
+        "/api/agent/stream",
+        "/api/agent/stream",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("501 Not Implemented", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "NOT_IMPLEMENTED") != null);
+}
+
+test "GET /api/agent/sessions returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/agent/sessions HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/agent/sessions",
+        "/api/agent/sessions",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "SESSION_MANAGER_UNAVAILABLE") != null);
+}
+
+test "DELETE /api/agent/sessions/:id returns 503 when no session manager" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "DELETE /api/agent/sessions/api%3Adefault HTTP/1.1\r\n\r\n",
+        "DELETE",
+        "/api/agent/sessions/api%3Adefault",
+        "/api/agent/sessions/api%3Adefault",
+        &cfg,
+        true,
+        null,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "SESSION_MANAGER_UNAVAILABLE") != null);
+}
+
+test "percentDecode decodes %3A to colon" {
+    const decoded = try percentDecode(std.testing.allocator, "api%3Adefault");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("api:default", decoded);
+}
+
+test "percentDecode passes through plain text unchanged" {
+    const decoded = try percentDecode(std.testing.allocator, "plain-text");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("plain-text", decoded);
+}
+
+test "percentDecode handles multiple encoded chars" {
+    const decoded = try percentDecode(std.testing.allocator, "a%3Ab%3Ac");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("a:b:c", decoded);
 }
