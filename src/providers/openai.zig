@@ -87,7 +87,7 @@ pub const OpenAiProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices == .array and choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
                     if (msg.object.get("content")) |content| {
                         if (content == .string) {
@@ -118,7 +118,7 @@ pub const OpenAiProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices == .array and choices.array.items.len > 0) {
                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
                 const msg_obj = msg.object;
 
@@ -134,7 +134,10 @@ pub const OpenAiProvider = struct {
 
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
 
-                if (msg_obj.get("tool_calls")) |tc_arr| {
+                // Regression: GLM-5 (and some other providers) return `"tool_calls": null`
+                // instead of omitting the key or returning an empty array.  Accessing
+                // `.array` on a `.null` Value panics in Debug and segfaults in ReleaseSmall.
+                if (msg_obj.get("tool_calls")) |tc_arr| if (tc_arr == .array) {
                     for (tc_arr.array.items) |tc| {
                         const tc_obj = tc.object;
                         const id = if (tc_obj.get("id")) |i| (if (i == .string) try allocator.dupe(u8, i.string) else try allocator.dupe(u8, "unknown")) else try allocator.dupe(u8, "unknown");
@@ -151,7 +154,7 @@ pub const OpenAiProvider = struct {
                             });
                         }
                     }
-                }
+                };
 
                 // Parse usage
                 var usage = TokenUsage{};
@@ -551,6 +554,23 @@ test "parseNativeResponse model field extracted" {
         std.testing.allocator.free(response.model);
     }
     try std.testing.expectEqualStrings("gpt-4o-2024-05-13", response.model);
+}
+
+test "parseNativeResponse tool_calls null does not crash" {
+    // Regression: GLM-5 returns "tool_calls": null in the message object.
+    // parseNativeResponse must not panic when tool_calls is JSON null.
+    const body =
+        \\{"choices":[{"message":{"content":"pong","reasoning_content":"thinking","role":"assistant","tool_calls":null}}],"model":"glm-5","usage":{"prompt_tokens":12,"completion_tokens":16,"total_tokens":28}}
+    ;
+    const response = try OpenAiProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c| std.testing.allocator.free(c);
+        if (response.reasoning_content) |rc| std.testing.allocator.free(rc);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(response.tool_calls.len == 0);
+    try std.testing.expectEqualStrings("pong", response.content.?);
 }
 
 test "buildRequestBody includes temperature zero" {

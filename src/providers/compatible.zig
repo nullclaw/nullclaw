@@ -1058,7 +1058,7 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices == .array and choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
                     const msg_obj = msg.object;
 
@@ -1090,7 +1090,7 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices == .array and choices.array.items.len > 0) {
                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
                 const msg_obj = msg.object;
 
@@ -1130,7 +1130,10 @@ pub const OpenAiCompatibleProvider = struct {
                     tool_calls_list.deinit(allocator);
                 }
 
-                if (msg_obj.get("tool_calls")) |tc_arr| {
+                // Regression: GLM-5 (and some other providers) return `"tool_calls": null`
+                // instead of omitting the key or returning an empty array.  Accessing
+                // `.array` on a `.null` Value panics in Debug and segfaults in ReleaseSmall.
+                if (msg_obj.get("tool_calls")) |tc_arr| if (tc_arr == .array) {
                     for (tc_arr.array.items) |tc| {
                         const tc_obj = tc.object;
                         const id = if (tc_obj.get("id")) |i| (if (i == .string) try allocator.dupe(u8, i.string) else try allocator.dupe(u8, "unknown")) else try allocator.dupe(u8, "unknown");
@@ -1147,7 +1150,7 @@ pub const OpenAiCompatibleProvider = struct {
                             });
                         }
                     }
-                }
+                };
 
                 // Treat a response with no content, no tool calls, and no reasoning as empty.
                 // This happens when the model hits its context limit and returns finish_reason=length
@@ -2009,6 +2012,39 @@ test "parseNativeResponse null content with native tool calls succeeds" {
     try std.testing.expect(result.tool_calls.len == 1);
     try std.testing.expectEqualStrings("list_dir", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
+}
+
+test "parseNativeResponse tool_calls null does not crash" {
+    // Regression: GLM-5 on infini-ai returns "tool_calls": null in the message.
+    // Both parseTextResponse and parseNativeResponse must not panic on this shape.
+    const body =
+        \\{"choices":[{"finish_reason":"stop","message":{"content":"pong","reasoning_content":"thinking","role":"assistant","tool_calls":null}}],"model":"glm-5","usage":{"prompt_tokens":12,"completion_tokens":16,"total_tokens":28}}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+    }
+    try std.testing.expect(result.tool_calls.len == 0);
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("pong", result.content.?);
+}
+
+test "parseTextResponse tool_calls null does not crash" {
+    // Regression: same shape, non-native parse path.
+    const body =
+        \\{"choices":[{"message":{"content":"pong","tool_calls":null}}]}
+    ;
+    const text = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("pong", text);
 }
 
 test "buildChatRequestBody emits thinking param for GLM when reasoning_effort set" {
