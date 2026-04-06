@@ -2041,7 +2041,7 @@ fn handleSpec(ctx: *ApiContext) anyerror!void {
     // Static OpenAPI 3.1 document.  Kept in a comptime string to avoid any
     // runtime allocation for this hot path.
     const SPEC =
-        \\{"openapi":"3.1.0","info":{"title":"NullClaw REST Admin API","version":"1.0.0","description":"Authenticated REST surface for managing a running nullclaw gateway instance."},"servers":[{"url":"http://localhost:3000","description":"Local gateway"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}}},"paths":{"/api/status":{"get":{"summary":"Runtime status","description":"Returns version, pid, uptime, and per-component health.","responses":{"200":{"description":"Status object"}}}}},"/api/doctor":{"get":{"summary":"Deep health report","description":"Per-component status with timestamps, restart counts, and readiness.","responses":{"200":{"description":"Doctor report"}}}}},"/api/spec":{"get":{"summary":"OpenAPI spec","description":"Returns this OpenAPI 3.1 document.","responses":{"200":{"description":"OpenAPI document"}}}}},"/api/config":{"get":{"summary":"Read config value","parameters":[{"name":"path","in":"query","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"Config value"},"400":{"description":"Missing path parameter"}}}}},"/api/models":{"get":{"summary":"List providers","description":"Lists configured providers without exposing API keys.","responses":{"200":{"description":"Provider list"}}}}},"/api/cron":{"get":{"summary":"List cron jobs"},"post":{"summary":"Create recurring cron job"}}},"/api/cron/once":{"post":{"summary":"Create one-shot delayed job"}}},"/api/cron/{id}":{"patch":{"summary":"Update cron job"},"delete":{"summary":"Delete cron job"}}},"/api/cron/{id}/run":{"post":{"summary":"Trigger job immediately"}}},"/api/cron/{id}/pause":{"post":{"summary":"Pause a job"}}},"/api/cron/{id}/resume":{"post":{"summary":"Resume a paused job"}}},"/api/channels":{"get":{"summary":"List configured channels"}}},"/api/channels/{name}":{"get":{"summary":"Get channel detail"}}},"/api/skills":{"get":{"summary":"List installed skills"}}},"/api/skills/install":{"post":{"summary":"Install a skill"}}},"/api/skills/{name}":{"delete":{"summary":"Remove an installed skill"}}},"/api/agent":{"post":{"summary":"Invoke agent (synchronous)"}}},"/api/agent/stream":{"post":{"summary":"Invoke agent (SSE streaming — 501 until transport upgraded)"}}},"/api/agent/sessions":{"get":{"summary":"List active sessions"}}},"/api/agent/sessions/{id}":{"delete":{"summary":"Terminate and remove a session"}}},"/api/memory":{"get":{"summary":"List memory entries"}}},"/api/memory/stats":{"get":{"summary":"Memory backend statistics"}}},"/api/memory/search":{"post":{"summary":"Full-text memory search"}}},"/api/memory/{key}":{"get":{"summary":"Get a memory entry by key"},"delete":{"summary":"Delete a memory entry by key"}}},"/api/history":{"get":{"summary":"List conversation history sessions"}}}}
+        \\{"openapi":"3.1.0","info":{"title":"NullClaw REST Admin API","version":"1.0.0","description":"Authenticated REST surface for managing a running nullclaw gateway instance."},"servers":[{"url":"http://localhost:3000","description":"Local gateway"}],"security":[{"bearerAuth":[]}],"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}}},"paths":{"/api/status":{"get":{"summary":"Runtime status","description":"Returns version, pid, uptime, and per-component health.","responses":{"200":{"description":"Status object"}}}},"/api/doctor":{"get":{"summary":"Deep health report","description":"Per-component status with timestamps, restart counts, and readiness.","responses":{"200":{"description":"Doctor report"}}}},"/api/spec":{"get":{"summary":"OpenAPI spec","description":"Returns this OpenAPI 3.1 document.","responses":{"200":{"description":"OpenAPI document"}}}},"/api/config":{"get":{"summary":"Read config value","parameters":[{"name":"path","in":"query","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"Config value"},"400":{"description":"Missing path parameter"}}}},"/api/models":{"get":{"summary":"List providers","description":"Lists configured providers without exposing API keys.","responses":{"200":{"description":"Provider list"}}}},"/api/cron":{"get":{"summary":"List cron jobs"},"post":{"summary":"Create recurring cron job"}},"/api/cron/once":{"post":{"summary":"Create one-shot delayed job"}},"/api/cron/{id}":{"patch":{"summary":"Update cron job"},"delete":{"summary":"Delete cron job"}},"/api/cron/{id}/run":{"post":{"summary":"Trigger job immediately"}},"/api/cron/{id}/pause":{"post":{"summary":"Pause a job"}},"/api/cron/{id}/resume":{"post":{"summary":"Resume a paused job"}},"/api/channels":{"get":{"summary":"List configured channels"}},"/api/channels/{name}":{"get":{"summary":"Get channel detail"}},"/api/skills":{"get":{"summary":"List installed skills"}},"/api/skills/install":{"post":{"summary":"Install a skill"}},"/api/skills/{name}":{"delete":{"summary":"Remove an installed skill"}},"/api/agent":{"post":{"summary":"Invoke agent (synchronous)"}},"/api/agent/stream":{"post":{"summary":"Invoke agent (SSE streaming — 501 until transport upgraded)"}},"/api/agent/sessions":{"get":{"summary":"List active sessions"}},"/api/agent/sessions/{id}":{"delete":{"summary":"Terminate and remove a session"}},"/api/memory":{"get":{"summary":"List memory entries"}},"/api/memory/stats":{"get":{"summary":"Memory backend statistics"}},"/api/memory/search":{"post":{"summary":"Full-text memory search"}},"/api/memory/{key}":{"get":{"summary":"Get a memory entry by key"},"delete":{"summary":"Delete a memory entry by key"}},"/api/history":{"get":{"summary":"List conversation history sessions"}}}}
     ;
     try ctx.sendSuccess(SPEC);
 }
@@ -2115,7 +2115,7 @@ fn handleMemoryStats(ctx: *ApiContext) anyerror!void {
 ///   MEMORY_UNAVAILABLE — no memory backend is configured.
 ///   MISSING_BODY       — no request body.
 ///   INVALID_JSON       — body is not valid JSON.
-///   MISSING_FIELD      — `query` field is absent or empty.
+///   BAD_REQUEST        — `query` field is absent or empty.
 fn handleMemorySearch(ctx: *ApiContext) anyerror!void {
     const sm = ctx.session_mgr orelse {
         try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
@@ -2144,11 +2144,11 @@ fn handleMemorySearch(ctx: *ApiContext) anyerror!void {
 
     const query: []const u8 = blk: {
         const v = obj.get("query") orelse {
-            try ctx.sendError("400 Bad Request", "MISSING_FIELD", "'query' field is required");
+            try ctx.sendError("400 Bad Request", "BAD_REQUEST", "'query' field is required");
             return;
         };
         if (v != .string or v.string.len == 0) {
-            try ctx.sendError("400 Bad Request", "MISSING_FIELD", "'query' must be a non-empty string");
+            try ctx.sendError("400 Bad Request", "BAD_REQUEST", "'query' must be a non-empty string");
             return;
         }
         break :blk v.string;
@@ -3833,7 +3833,8 @@ test "POST /api/memory/search missing query field returns 400" {
     );
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("400 Bad Request", result.status);
-    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_FIELD") != null);
+    // Regression: missing query field must return BAD_REQUEST (not MISSING_FIELD).
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "BAD_REQUEST") != null);
 }
 
 test "POST /api/memory/search returns entries array with NoneMemory" {
