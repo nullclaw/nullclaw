@@ -52,57 +52,62 @@ pub const Endpoint = struct {
 
 /// Comptime-built slice of all registered /api/* endpoints.
 pub const registry: []const Endpoint = &.{
-    // Phase 1
+    // Runtime / observability
     .{ .method = "GET", .path = "/api/status", .handler = handleStatus },
+    .{ .method = "GET", .path = "/api/doctor", .handler = handleDoctor },
+    .{ .method = "GET", .path = "/api/spec", .handler = handleSpec },
+    .{ .method = "GET", .path = "/api/capabilities", .handler = handleCapabilities },
+    // Config
     .{ .method = "GET", .path = "/api/config", .handler = handleConfig },
-    .{ .method = "GET", .path = "/api/models", .handler = handleModels },
-    // Phase 2 — cron
-    .{ .method = "GET", .path = "/api/cron", .handler = handleCronList },
-    .{ .method = "POST", .path = "/api/cron", .handler = handleCronCreate },
-    .{ .method = "POST", .path = "/api/cron/once", .handler = handleCronCreateOnce },
-    .{ .method = "POST", .path = "/api/cron/:id/run", .handler = handleCronRun },
-    .{ .method = "POST", .path = "/api/cron/:id/pause", .handler = handleCronPause },
-    .{ .method = "POST", .path = "/api/cron/:id/resume", .handler = handleCronResume },
-    .{ .method = "PATCH", .path = "/api/cron/:id", .handler = handleCronUpdate },
-    .{ .method = "DELETE", .path = "/api/cron/:id", .handler = handleCronDelete },
-    // Phase 4 — channels
-    .{ .method = "GET", .path = "/api/channels", .handler = handleChannelList },
-    .{ .method = "GET", .path = "/api/channels/:name", .handler = handleChannelGet },
-    // Phase 4 — skills
-    .{ .method = "GET", .path = "/api/skills", .handler = handleSkillList },
-    .{ .method = "POST", .path = "/api/skills/install", .handler = handleSkillInstall },
-    .{ .method = "DELETE", .path = "/api/skills/:name", .handler = handleSkillDelete },
-    // Phase 5 — config mutation
     .{ .method = "PATCH", .path = "/api/config", .handler = handleConfigSet },
     .{ .method = "DELETE", .path = "/api/config", .handler = handleConfigUnset },
     .{ .method = "POST", .path = "/api/config/reload", .handler = handleConfigReload },
     .{ .method = "POST", .path = "/api/config/validate", .handler = handleConfigValidate },
-    // Phase 6 — MCP server management
+    // Models
+    .{ .method = "GET", .path = "/api/models", .handler = handleModels },
+    .{ .method = "GET", .path = "/api/models/:name", .handler = handleModelsInfo },
+    .{ .method = "POST", .path = "/api/models/refresh", .handler = handleModelsRefresh },
+    // Cron
+    .{ .method = "GET", .path = "/api/cron", .handler = handleCronList },
+    .{ .method = "GET", .path = "/api/cron/:id", .handler = handleCronGet },
+    .{ .method = "POST", .path = "/api/cron", .handler = handleCronCreate },
+    .{ .method = "POST", .path = "/api/cron/once", .handler = handleCronCreateOnce },
+    .{ .method = "PATCH", .path = "/api/cron/:id", .handler = handleCronUpdate },
+    .{ .method = "DELETE", .path = "/api/cron/:id", .handler = handleCronDelete },
+    .{ .method = "POST", .path = "/api/cron/:id/run", .handler = handleCronRun },
+    .{ .method = "POST", .path = "/api/cron/:id/pause", .handler = handleCronPause },
+    .{ .method = "POST", .path = "/api/cron/:id/resume", .handler = handleCronResume },
+    .{ .method = "GET", .path = "/api/cron/:id/runs", .handler = handleCronRuns },
+    // Channels
+    .{ .method = "GET", .path = "/api/channels", .handler = handleChannelList },
+    .{ .method = "GET", .path = "/api/channels/:name", .handler = handleChannelGet },
+    // Skills
+    .{ .method = "GET", .path = "/api/skills", .handler = handleSkillList },
+    .{ .method = "GET", .path = "/api/skills/:name", .handler = handleSkillGet },
+    .{ .method = "POST", .path = "/api/skills/install", .handler = handleSkillInstall },
+    .{ .method = "DELETE", .path = "/api/skills/:name", .handler = handleSkillDelete },
+    // MCP servers
     .{ .method = "GET", .path = "/api/mcp", .handler = handleMcpList },
     .{ .method = "GET", .path = "/api/mcp/:name", .handler = handleMcpGet },
-    // Phase 7 — Agent control
+    // Agent sessions
     .{ .method = "POST", .path = "/api/agent", .handler = handleAgentInvoke },
     .{ .method = "POST", .path = "/api/agent/stream", .handler = handleAgentStream },
     .{ .method = "GET", .path = "/api/agent/sessions", .handler = handleAgentSessionList },
+    .{ .method = "GET", .path = "/api/agent/sessions/:id", .handler = handleAgentSessionGet },
     .{ .method = "DELETE", .path = "/api/agent/sessions/:id", .handler = handleAgentSessionDelete },
-    // Phase 3 — Memory
+    // Memory
     .{ .method = "GET", .path = "/api/memory", .handler = handleMemoryList },
-    .{ .method = "DELETE", .path = "/api/memory/:key", .handler = handleMemoryDelete },
-    // Phase 8 — Polish
-    .{ .method = "GET", .path = "/api/doctor", .handler = handleDoctor },
-    .{ .method = "GET", .path = "/api/spec", .handler = handleSpec },
+    .{ .method = "POST", .path = "/api/memory", .handler = handleMemoryStore },
     .{ .method = "GET", .path = "/api/memory/stats", .handler = handleMemoryStats },
     .{ .method = "POST", .path = "/api/memory/search", .handler = handleMemorySearch },
-    .{ .method = "GET", .path = "/api/memory/:key", .handler = handleMemoryGet },
-    .{ .method = "GET", .path = "/api/history", .handler = handleHistory },
-    // Parity gaps — CLI commands exposed as REST
-    .{ .method = "GET", .path = "/api/cron/:id/runs", .handler = handleCronRuns },
-    .{ .method = "GET", .path = "/api/history/:session_id", .handler = handleHistorySession },
     .{ .method = "POST", .path = "/api/memory/reindex", .handler = handleMemoryReindex },
     .{ .method = "POST", .path = "/api/memory/drain-outbox", .handler = handleMemoryDrainOutbox },
-    .{ .method = "GET", .path = "/api/models/:name", .handler = handleModelsInfo },
-    .{ .method = "POST", .path = "/api/models/refresh", .handler = handleModelsRefresh },
-    .{ .method = "GET", .path = "/api/capabilities", .handler = handleCapabilities },
+    .{ .method = "GET", .path = "/api/memory/:key", .handler = handleMemoryGet },
+    .{ .method = "PATCH", .path = "/api/memory/:key", .handler = handleMemoryUpdate },
+    .{ .method = "DELETE", .path = "/api/memory/:key", .handler = handleMemoryDelete },
+    // History
+    .{ .method = "GET", .path = "/api/history", .handler = handleHistory },
+    .{ .method = "GET", .path = "/api/history/:session_id", .handler = handleHistorySession },
 };
 
 // ── Dispatcher ───────────────────────────────────────────────────────
@@ -485,6 +490,37 @@ fn handleCronList(ctx: *ApiContext) anyerror!void {
     }
     try w.writeByte(']');
 
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// GET /api/cron/:id
+///
+/// Return detail for a single scheduled job by its ID.
+///
+/// Response: the job object wrapped in the success envelope.
+///
+/// Errors:
+///   SCHEDULER_UNAVAILABLE — scheduler is not running.
+///   JOB_NOT_FOUND         — no job with that ID exists.
+fn handleCronGet(ctx: *ApiContext) anyerror!void {
+    const sched = ctx.scheduler_opt orelse {
+        try ctx.sendError("503 Service Unavailable", "SCHEDULER_UNAVAILABLE", "scheduler not running");
+        return;
+    };
+    const id = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_ID", "job id required in path");
+        return;
+    };
+    const job_ptr = sched.getJob(id) orelse {
+        try ctx.sendError("404 Not Found", "JOB_NOT_FOUND", "no job with that id");
+        return;
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    try appendCronJobJson(&buf, ctx.allocator, job_ptr.*);
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -1288,6 +1324,66 @@ fn handleSkillList(ctx: *ApiContext) anyerror!void {
     try w.writeAll("]}");
 
     const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// GET /api/skills/:name
+///
+/// Return detail for a single installed skill by name.
+/// Checks that the named directory exists under the skillforge output_dir.
+///
+/// Response shape:
+/// ```json
+/// { "success": true, "data": { "name": "my-skill", "path": "./skills/my-skill" }, "error": null }
+/// ```
+///
+/// Errors:
+///   SKILL_NOT_FOUND — no skill directory with that name exists.
+fn handleSkillGet(ctx: *ApiContext) anyerror!void {
+    const name = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_PARAM", "skill name required in path");
+        return;
+    };
+
+    // Reject path traversal attempts.
+    if (std.mem.indexOf(u8, name, "/") != null or
+        std.mem.indexOf(u8, name, "\\") != null or
+        std.mem.eql(u8, name, "..") or
+        std.mem.eql(u8, name, "."))
+    {
+        try ctx.sendError("404 Not Found", "SKILL_NOT_FOUND", "invalid skill name");
+        return;
+    }
+
+    const sf_cfg = skillforge.SkillForgeConfig{};
+    const skill_path = try std.fs.path.join(ctx.allocator, &.{ sf_cfg.output_dir, name });
+    defer ctx.allocator.free(skill_path);
+
+    const exists = if (builtin.is_test) false else blk: {
+        var d = std.fs.cwd().openDir(skill_path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => break :blk false,
+            else => return err,
+        };
+        d.close();
+        break :blk true;
+    };
+
+    if (!exists) {
+        try ctx.sendError("404 Not Found", "SKILL_NOT_FOUND", "no skill with that name is installed");
+        return;
+    }
+
+    const escaped_name = try jsonEscapeString(ctx.allocator, name);
+    defer ctx.allocator.free(escaped_name);
+    const escaped_path = try jsonEscapeString(ctx.allocator, skill_path);
+    defer ctx.allocator.free(escaped_path);
+
+    const data = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"name\":\"{s}\",\"path\":\"{s}\"}}",
+        .{ escaped_name, escaped_path },
+    );
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
 }
@@ -2136,6 +2232,65 @@ fn handleAgentSessionList(ctx: *ApiContext) anyerror!void {
     try ctx.sendSuccess(data);
 }
 
+/// GET /api/agent/sessions/:id
+///
+/// Return detail for a single active agent session by its session key.
+/// The `:id` path parameter is the session key (e.g. `api:default`).
+/// URL-encoded colons (%3A) are decoded before lookup.
+///
+/// Response shape:
+/// ```json
+/// { "success": true, "data": {
+///   "session_key": "api:default",
+///   "created_at": 1712345678, "last_active": 1712349278,
+///   "turn_count": 5, "turn_running": false
+/// }, "error": null }
+/// ```
+///
+/// Errors:
+///   SESSION_MANAGER_UNAVAILABLE — no session manager is running.
+///   SESSION_NOT_FOUND           — no session with that key exists.
+fn handleAgentSessionGet(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "SESSION_MANAGER_UNAVAILABLE", "no agent session manager is running");
+        return;
+    };
+
+    const raw_id = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_PARAM", "session key required in path");
+        return;
+    };
+
+    const session_key = try percentDecode(ctx.allocator, raw_id);
+    defer ctx.allocator.free(session_key);
+
+    sm.mutex.lock();
+    defer sm.mutex.unlock();
+
+    const session = sm.sessions.get(session_key) orelse {
+        try ctx.sendError("404 Not Found", "SESSION_NOT_FOUND", "no session with that key");
+        return;
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+    try w.print(
+        "{{\"session_key\":{f},\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d},\"turn_running\":{}}}",
+        .{
+            std.json.fmt(session.session_key, .{}),
+            session.created_at,
+            session.last_active,
+            session.turn_count,
+            session.turn_running.load(.seq_cst),
+        },
+    );
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
 /// DELETE /api/agent/sessions/:id
 ///
 /// Terminate and remove a session by its URL-encoded session key.
@@ -2321,6 +2476,93 @@ fn handleMemoryList(ctx: *ApiContext) anyerror!void {
     });
 
     const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// POST /api/memory
+///
+/// Store a new memory entry (or overwrite an existing one with the same key).
+///
+/// Body:
+/// ```json
+/// {
+///   "key":        "greeting",
+///   "content":    "The user prefers formal language.",
+///   "category":   "core",        // optional — defaults to "core"
+///   "session_id": "telegram:42"  // optional
+/// }
+/// ```
+///
+/// Response shape:
+/// ```json
+/// { "success": true, "data": { "key": "greeting", "stored": true }, "error": null }
+/// ```
+///
+/// Errors:
+///   MEMORY_UNAVAILABLE — no memory backend is configured.
+///   MISSING_FIELD      — key or content is absent.
+fn handleMemoryStore(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+    const mem = sm.mem orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+
+    const raw_body = ctx.body() orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_BODY", "request body required");
+        return;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be valid JSON");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be a JSON object");
+        return;
+    }
+    const obj = parsed.value.object;
+
+    const key_val = obj.get("key") orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_FIELD", "key field required");
+        return;
+    };
+    if (key_val != .string or key_val.string.len == 0) {
+        try ctx.sendError("400 Bad Request", "MISSING_FIELD", "key must be a non-empty string");
+        return;
+    }
+    const key = key_val.string;
+
+    const content_val = obj.get("content") orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_FIELD", "content field required");
+        return;
+    };
+    if (content_val != .string) {
+        try ctx.sendError("400 Bad Request", "MISSING_FIELD", "content must be a string");
+        return;
+    }
+    const content = content_val.string;
+
+    const category_str = if (obj.get("category")) |v| if (v == .string) v.string else "core" else "core";
+    const category = memory_mod.MemoryCategory.fromString(category_str);
+
+    const session_id: ?[]const u8 = if (obj.get("session_id")) |v| if (v == .string) v.string else null else null;
+
+    mem.store(key, content, category, session_id) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "memory.store() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "MEMORY_ERROR", msg);
+        return;
+    };
+
+    const escaped_key = try jsonEscapeString(ctx.allocator, key);
+    defer ctx.allocator.free(escaped_key);
+    const data = try std.fmt.allocPrint(ctx.allocator, "{{\"key\":\"{s}\",\"stored\":true}}", .{escaped_key});
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
 }
@@ -2661,6 +2903,93 @@ fn handleMemorySearch(ctx: *ApiContext) anyerror!void {
     });
 
     const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// PATCH /api/memory/:key
+///
+/// Update the content and/or category of an existing memory entry.
+/// Returns 404 if no entry with that key exists; use POST /api/memory to create.
+///
+/// Body:
+/// ```json
+/// {
+///   "content":  "Updated preference text.",  // optional — omit to keep existing
+///   "category": "daily"                       // optional — omit to keep existing
+/// }
+/// ```
+///
+/// Response shape:
+/// ```json
+/// { "success": true, "data": { "key": "greeting", "updated": true }, "error": null }
+/// ```
+///
+/// Errors:
+///   MEMORY_UNAVAILABLE — no memory backend is configured.
+///   NOT_FOUND          — no entry with that key exists.
+fn handleMemoryUpdate(ctx: *ApiContext) anyerror!void {
+    const sm = ctx.session_mgr orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+    const mem = sm.mem orelse {
+        try ctx.sendError("503 Service Unavailable", "MEMORY_UNAVAILABLE", "no memory backend is configured");
+        return;
+    };
+
+    const raw_key = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_PARAM", "memory key required in path");
+        return;
+    };
+    const key = try percentDecode(ctx.allocator, raw_key);
+    defer ctx.allocator.free(key);
+
+    // Fetch the existing entry so we can preserve fields the caller doesn't touch.
+    const existing_opt = mem.get(ctx.allocator, key) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "memory.get() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "MEMORY_ERROR", msg);
+        return;
+    };
+    if (existing_opt == null) {
+        try ctx.sendError("404 Not Found", "NOT_FOUND", "no memory entry with that key");
+        return;
+    }
+    var existing = existing_opt.?;
+    defer existing.deinit(ctx.allocator);
+
+    const raw_body = ctx.body() orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_BODY", "request body required");
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be valid JSON");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be a JSON object");
+        return;
+    }
+    const obj = parsed.value.object;
+
+    const new_content = if (obj.get("content")) |v| if (v == .string) v.string else existing.content else existing.content;
+    const new_category = if (obj.get("category")) |v|
+        if (v == .string) memory_mod.MemoryCategory.fromString(v.string) else existing.category
+    else
+        existing.category;
+
+    mem.store(key, new_content, new_category, existing.session_id) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "memory.store() failed: {s}", .{@errorName(err)});
+        defer ctx.allocator.free(msg);
+        try ctx.sendError("500 Internal Server Error", "MEMORY_ERROR", msg);
+        return;
+    };
+
+    const escaped_key = try jsonEscapeString(ctx.allocator, key);
+    defer ctx.allocator.free(escaped_key);
+    const data = try std.fmt.allocPrint(ctx.allocator, "{{\"key\":\"{s}\",\"updated\":true}}", .{escaped_key});
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
 }

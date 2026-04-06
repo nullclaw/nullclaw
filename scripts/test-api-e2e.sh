@@ -245,9 +245,9 @@ check "GET /api/status with wrong token → 401" "401" "$S" ""
 
 echo ""
 
-# ── Phase 1: Status / Config read / Models ────────────────────────────────────
+# ── Status / Config read / Models ────────────────────────────────────────────
 
-echo "-- Phase 1: Status / Config read / Models"
+echo "-- Status / Config read / Models"
 
 api GET /status
 check "GET /api/status → 200" "200" "$S" "$B" '.success == true'
@@ -264,9 +264,9 @@ check "GET /api/models → 200" "200" "$S" "$B" '.success == true'
 
 echo ""
 
-# ── Phase 2: Cron CRUD ────────────────────────────────────────────────────────
+# ── Cron CRUD ────────────────────────────────────────────────────────────────
 
-echo "-- Phase 2: Cron CRUD"
+echo "-- Cron CRUD"
 
 api GET /cron
 check "GET /api/cron → 200" "200" "$S" "$B" '.success == true'
@@ -279,7 +279,9 @@ check "POST /api/cron create → 200" "200" "$S" "$B" '.success == true'
 CRON_ID=$(echo "$B" | jq -r '.data.id // empty')
 
 if [ -n "$CRON_ID" ]; then
-    # Note: there is no GET /api/cron/:id endpoint; use GET /api/cron (list) instead.
+    api GET "/cron/${CRON_ID}"
+    check "GET /api/cron/:id → 200" "200" "$S" "$B" '.success == true'
+    check "GET /api/cron/:id has correct id" "200" "$S" "$B" ".data.id == \"${CRON_ID}\""
 
     api POST "/cron/${CRON_ID}/pause"
     check "POST /api/cron/:id/pause → 200" "200" "$S" "$B" '.success == true'
@@ -322,9 +324,9 @@ check "PATCH /api/cron/nonexistent → 404" "404" "$S" "$B" '.success == false'
 
 echo ""
 
-# ── Phase 4: Channels ─────────────────────────────────────────────────────────
+# ── Channels ──────────────────────────────────────────────────────────────────
 
-echo "-- Phase 4: Channels"
+echo "-- Channels"
 
 api GET /channels
 check "GET /api/channels → 200" "200" "$S" "$B" '.success == true'
@@ -355,12 +357,15 @@ check "GET /api/channels/nonexistent → 404" "404" "$S" "$B" '.success == false
 
 echo ""
 
-# ── Phase 4: Skills ───────────────────────────────────────────────────────────
+# ── Skills ────────────────────────────────────────────────────────────────────
 
-echo "-- Phase 4: Skills"
+echo "-- Skills"
 
 api GET /skills
 check "GET /api/skills → 200" "200" "$S" "$B" '.success == true'
+
+api GET /skills/nonexistent-skill-e2e
+check "GET /api/skills/nonexistent → 404" "404" "$S" "$B" '.success == false'
 
 # Path traversal: the router may normalize '..' away (→ 404) or the handler
 # catches it (→ 400).  Both are valid rejections.
@@ -394,9 +399,9 @@ fi
 
 echo ""
 
-# ── Phase 5: Config mutation ──────────────────────────────────────────────────
+# ── Config mutation ───────────────────────────────────────────────────────────
 
-echo "-- Phase 5: Config mutation"
+echo "-- Config mutation"
 
 api PATCH /config \
     -H "Content-Type: application/json" \
@@ -435,9 +440,9 @@ check "POST /api/config/reload → 200" "200" "$S" "$B" '.success == true'
 
 echo ""
 
-# ── Phase 6: MCP server management ───────────────────────────────────────────
+# ── MCP server management ─────────────────────────────────────────────────────
 
-echo "-- Phase 6: MCP server management"
+echo "-- MCP server management"
 
 api GET /mcp
 check "GET /api/mcp → 200" "200" "$S" "$B" '.success == true'
@@ -459,9 +464,9 @@ check "GET /api/mcp/nonexistent → 404" "404" "$S" "$B" '.error.code == "MCP_NO
 
 echo ""
 
-# ── Phase 7: Agent control ────────────────────────────────────────────────────
+# ── Agent control ─────────────────────────────────────────────────────────────
 
-echo "-- Phase 7: Agent control"
+echo "-- Agent control"
 
 # POST /api/agent — one-shot invocation (real LLM call; uses api_agent for 90s timeout)
 api_agent POST /agent \
@@ -504,6 +509,15 @@ check "GET /api/agent/sessions has sessions array" "200" "$S" "$B" '(.data.sessi
 check "GET /api/agent/sessions has total field" "200" "$S" "$B" '(.data.total | type) == "number"'
 check "GET /api/agent/sessions lists e2e session" "200" "$S" "$B" '[.data.sessions[] | select(.session_key == "api:e2e-test")] | length > 0'
 
+# GET /api/agent/sessions/:id — fetch the specific session we just created
+api GET /agent/sessions/api%3Ae2e-test
+check "GET /api/agent/sessions/:id → 200" "200" "$S" "$B" '.success == true'
+check "GET /api/agent/sessions/:id has session_key" "200" "$S" "$B" '.data.session_key == "api:e2e-test"'
+
+# GET /api/agent/sessions/:id — non-existent session → 404
+api GET /agent/sessions/nonexistent%3Asession
+check "GET /api/agent/sessions/nonexistent → 404" "404" "$S" "$B" '.error.code == "SESSION_NOT_FOUND"'
+
 # DELETE /api/agent/sessions/:id — terminate the session we just created
 # ':' must be percent-encoded as %3A in the URL path segment.
 api DELETE /agent/sessions/api%3Ae2e-test
@@ -517,9 +531,9 @@ check "DELETE /api/agent/sessions/:id non-existent → 404" "404" "$S" "$B" '.er
 
 echo ""
 
-# ── Phase 3: Memory ───────────────────────────────────────────────────────────
+# ── Memory ────────────────────────────────────────────────────────────────────
 
-echo "-- Phase 3: Memory"
+echo "-- Memory"
 
 # GET /api/memory — list all entries (sqlite backend; may be empty or have bootstrap entries)
 api GET /memory
@@ -544,15 +558,55 @@ api GET '/memory?q=hello'
 check "GET /api/memory?q=hello → 200" "200" "$S" "$B" '.success == true'
 check "GET /api/memory?q=hello has entries" "200" "$S" "$B" '(.data.entries | type) == "array"'
 
+# POST /api/memory — store a new entry
+api POST /memory \
+    -H "Content-Type: application/json" \
+    -d '{"key":"e2e-memory-test-key","content":"hello e2e world","category":"core"}'
+if [ "$S" = "200" ] || [ "$S" = "201" ]; then
+    PASS=$((PASS + 1))
+    echo "  PASS  POST /api/memory store → $S"
+else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("POST /api/memory store → expected 200/201, got $S; body: ${B:0:200}")
+    echo "  FAIL  POST /api/memory store → $S (expected 200 or 201)"
+fi
+
+# PATCH /api/memory/:key — update the entry we just stored
+api PATCH '/memory/e2e-memory-test-key' \
+    -H "Content-Type: application/json" \
+    -d '{"content":"updated e2e content"}'
+if [ "$S" = "200" ]; then
+    check "PATCH /api/memory/:key update → 200" "200" "$S" "$B" '.success == true'
+else
+    check "PATCH /api/memory/:key update → 200" "200" "$S" "$B" '.success == true'
+fi
+
+# PATCH /api/memory/:key — non-existent key → 404
+api PATCH '/memory/e2e-nonexistent-patch-key' \
+    -H "Content-Type: application/json" \
+    -d '{"content":"should not exist"}'
+check "PATCH /api/memory/nonexistent → 404" "404" "$S" "$B" '.error.code == "NOT_FOUND"'
+
+# DELETE /api/memory/:key — clean up the key we stored
+api DELETE '/memory/e2e-memory-test-key'
+if [ "$S" = "200" ] || [ "$S" = "404" ]; then
+    PASS=$((PASS + 1))
+    echo "  PASS  DELETE /api/memory/e2e-memory-test-key → $S"
+else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("DELETE /api/memory/e2e-memory-test-key → expected 200/404, got $S")
+    echo "  FAIL  DELETE /api/memory/e2e-memory-test-key → $S"
+fi
+
 # DELETE /api/memory/:key — delete a key that definitely does not exist
 api DELETE '/memory/e2e-nonexistent-key-12345'
 check "DELETE /api/memory/nonexistent → 404" "404" "$S" "$B" '.error.code == "NOT_FOUND"'
 
 echo ""
 
-# ── Phase 8: Polish (doctor, spec, memory/stats, memory/search, memory/:key GET, history) ──
+# ── Doctor / Spec / Memory stats / History ────────────────────────────────────
 
-echo "-- Phase 8: Polish"
+echo "-- Doctor / Spec / Memory stats / History"
 
 # GET /api/doctor — deep health report
 api GET /doctor
@@ -626,9 +680,9 @@ check "GET /api/history/:session_id has limit/offset fields" "200" "$S" "$B" '(.
 
 echo ""
 
-# ── Phase 8 Parity: Cron runs ─────────────────────────────────────────────────
+# ── Cron runs ─────────────────────────────────────────────────────────────────
 
-echo "-- Phase 8 Parity: Cron runs"
+echo "-- Cron runs"
 
 # Create a fresh job for runs testing
 api POST /cron \
@@ -661,9 +715,9 @@ check "GET /api/cron/nonexistent/runs → 404" "404" "$S" "$B" '.error.code == "
 
 echo ""
 
-# ── Phase 8 Parity: Memory reindex / drain-outbox ────────────────────────────
+# ── Memory reindex / drain-outbox ────────────────────────────────────────────
 
-echo "-- Phase 8 Parity: Memory reindex / drain-outbox"
+echo "-- Memory reindex / drain-outbox"
 
 api POST /memory/reindex
 if [ "$S" = "200" ]; then
@@ -683,9 +737,9 @@ fi
 
 echo ""
 
-# ── Phase 8 Parity: Models info / refresh ────────────────────────────────────
+# ── Models info / refresh ─────────────────────────────────────────────────────
 
-echo "-- Phase 8 Parity: Models info / refresh"
+echo "-- Models info / refresh"
 
 api GET /models/infini-ai
 check "GET /api/models/infini-ai → 200" "200" "$S" "$B" '.success == true'
@@ -702,9 +756,9 @@ check "POST /api/models/refresh → 501 (CLI only)" "501" "$S" "$B" '.error.code
 
 echo ""
 
-# ── Phase 8 Parity: Capabilities ─────────────────────────────────────────────
+# ── Capabilities ─────────────────────────────────────────────────────────────
 
-echo "-- Phase 8 Parity: Capabilities"
+echo "-- Capabilities"
 
 api GET /capabilities
 check "GET /api/capabilities → 200" "200" "$S" "$B" '.success == true'
