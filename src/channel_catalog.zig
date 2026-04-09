@@ -63,7 +63,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .wechat, .key = "wechat", .label = "WeChat", .configured_message = "WeChat configured", .listener_mode = .webhook_only },
     .{ .id = .wecom, .key = "wecom", .label = "WeCom", .configured_message = "WeCom configured", .listener_mode = .webhook_only },
     .{ .id = .signal, .key = "signal", .label = "Signal", .configured_message = "Signal configured", .listener_mode = .polling },
-    .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .send_only },
+    .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .polling },
     .{ .id = .line, .key = "line", .label = "Line", .configured_message = "Line configured", .listener_mode = .webhook_only },
     .{ .id = .qq, .key = "qq", .label = "QQ", .configured_message = "QQ configured", .listener_mode = .gateway_loop },
     .{ .id = .onebot, .key = "onebot", .label = "OneBot", .configured_message = "OneBot configured", .listener_mode = .gateway_loop },

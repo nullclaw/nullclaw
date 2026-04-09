@@ -4,6 +4,7 @@ const channel_loop = @import("channel_loop.zig");
 const channels_root = @import("channels/root.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const email_mod = @import("channels/email.zig");
 const max_mod = @import("channels/max.zig");
 const agent_routing = @import("agent_routing.zig");
 
@@ -35,6 +36,11 @@ fn signalPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.C
     return std.fmt.allocPrint(allocator, "{s}|{s}", .{ sg_ptr.http_url, sg_ptr.account }) catch null;
 }
 
+fn emailPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.Channel) ?[]u8 {
+    const em_ptr: *const email_mod.EmailChannel = @ptrCast(@alignCast(channel.ptr));
+    return allocator.dupe(u8, em_ptr.config.username) catch null;
+}
+
 pub const polling_descriptors = [_]PollingDescriptor{
     .{
         .channel_name = "telegram",
@@ -49,6 +55,11 @@ pub const polling_descriptors = [_]PollingDescriptor{
     .{
         .channel_name = "matrix",
         .spawn = channel_loop.spawnMatrixPolling,
+    },
+    .{
+        .channel_name = "email",
+        .spawn = channel_loop.spawnEmailPolling,
+        .source_key = emailPollingSourceKey,
     },
     .{
         .channel_name = "max",
@@ -227,6 +238,15 @@ fn deriveMaixcamPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routin
     return .{ .kind = .direct, .id = input.chat_id };
 }
 
+fn defaultEmailAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.emailPrimary()) |ec| return ec.account_id;
+    return null;
+}
+
+fn deriveEmailPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routing.PeerRef {
+    return .{ .kind = .direct, .id = input.sender_id };
+}
+
 fn defaultMaxAccount(config: *const Config, _: []const u8) ?[]const u8 {
     if (config.channels.maxPrimary()) |mc| return mc.account_id;
     return null;
@@ -325,6 +345,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .derive_peer = deriveWebPeer,
     },
     .{
+        .channel_name = "email",
+        .default_account_id = defaultEmailAccount,
+        .derive_peer = deriveEmailPeer,
+    },
+    .{
         .channel_name = "max",
         .default_account_id = defaultMaxAccount,
         .derive_peer = deriveMaxPeer,
@@ -362,6 +387,7 @@ test "findPollingDescriptor returns known polling adapters" {
     try std.testing.expect(findPollingDescriptor("telegram") != null);
     try std.testing.expect(findPollingDescriptor("signal") != null);
     try std.testing.expect(findPollingDescriptor("matrix") != null);
+    try std.testing.expect(findPollingDescriptor("email") != null);
     try std.testing.expect(findPollingDescriptor("max") != null);
     try std.testing.expect(findPollingDescriptor("discord") == null);
 }
