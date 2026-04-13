@@ -11,8 +11,8 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 ```bash
 # Requires exactly Zig 0.15.2 (verify: zig version)
 zig build                           # dev build
-zig build -Doptimize=ReleaseSmall   # release build (target: <1 MB binary)
-zig build test --summary all        # run all 5,300+ tests (must pass with 0 leaks)
+zig build -Doptimize=ReleaseSmall   # release build
+zig build test --summary all        # run all 6,300+ tests (must pass with 0 leaks)
 zig fmt src/                        # format all source files
 zig fmt --check src/                # check formatting (used by pre-commit hook)
 ```
@@ -45,7 +45,7 @@ git config core.hooksPath .githooks
 
 ## Project Overview
 
-NullClaw is an autonomous AI assistant runtime written in Zig 0.15.2. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
+NullClaw is an autonomous AI assistant runtime written in Zig 0.15.2. Hard constraints: ~2.7 MB minimal binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
 
 ## Architecture
 
@@ -74,7 +74,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 
 ### Subsystem Directories
 
-- `src/providers/` - AI model providers. 9 core implementations + 41+ OpenAI-compatible services via `compatible.zig`. Factory in `factory.zig`, single source of truth for provider URLs and auth styles.
+- `src/providers/` - AI model providers. 12 core implementations + 92+ OpenAI-compatible services via `compatible.zig`. Factory in `factory.zig`, single source of truth for provider URLs and auth styles.
 - `src/channels/` - Messaging channels. Each implements `Channel.VTable` (`start`, `stop`, `send`, `name`, `healthCheck`). Factory in `root.zig`.
 - `src/tools/` - Tool implementations. Each implements `Tool.VTable` (`execute`, `name`, `description`, `parameters_json`). Tools receive args as `JsonObjectMap` and return `ToolResult`. Factory in `root.zig`.
 - `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, ClickHouse, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.

@@ -10,7 +10,7 @@ Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](ht
 
 <p align="center">
   <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>
-  <strong>678 KB binary. ~1 MB RAM. Boots in <2 ms. Runs on anything with a CPU.</strong>
+  <strong>~2.7 MB minimal binary. ~1 MB RAM. Boots in <2 ms. Runs on anything with a CPU.</strong>
 </p>
 
 <p align="center">
@@ -25,20 +25,20 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
 
 ```
-678 KB binary · <2 ms startup · 5,300+ tests · 50+ providers · 19 channels · Pluggable everything
+~2.7 MB binary · <2 ms startup · 6,300+ tests · 100+ providers · 24 channels · Pluggable everything
 ```
 
 ### Features
 
-- **Impossibly Small:** 678 KB static binary — no runtime, no VM, no framework overhead.
+- **Impossibly Small:** ~2.7 MB minimal static binary — no runtime, no VM, no framework overhead.
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 50+ providers, 19 channels, 35+ tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 100+ providers, 24 channels, 38+ tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
 ### Why nullclaw
 
-- **Lean by default:** Zig compiles to a tiny static binary. No allocator overhead, no garbage collector, no runtime.
+- **Lean by default:** Zig compiles to a small static binary. No allocator overhead, no garbage collector, no runtime.
 - **Secure by design:** pairing, strict sandboxing (landlock, firejail, bubblewrap, docker), explicit allowlists, workspace scoping, encrypted secrets.
 - **Fully swappable:** core systems are vtable interfaces (providers, channels, tools, memory, tunnels, peripherals, observers, runtimes).
 - **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
@@ -52,9 +52,9 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **Language** | TypeScript | Python | Go | Rust | **Zig** |
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
-| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **5,300+** |
-| **Source Files** | ~400+ | — | — | ~120 | **~230** |
+| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **~2.7 MB** |
+| **Tests** | — | — | — | 1,017 | **6,300+** |
+| **Source Files** | ~400+ | — | — | ~120 | **~260** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
 > Measured with `/usr/bin/time -l` on ReleaseSmall builds. nullclaw is a static binary with zero runtime dependencies.
@@ -216,8 +216,8 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
-| **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
+| **AI Models** | `Provider` | 100+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and 92+ OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost, Web, Teams, Max, WeChat, WeCom | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, memory_store, memory_recall, memory_forget, memory_list, browser_open, screenshot, composio, http_request, web_fetch, web_search, delegate, schedule, hardware_info, hardware_memory, pushover, message, spawn, git, image, i2c, spi, and more | Any capability |
 | **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
@@ -786,8 +786,8 @@ Build and tests are pinned to **Zig 0.15.2**.
 
 ```bash
 zig build                          # Dev build
-zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 5,300+ tests
+zig build -Doptimize=ReleaseSmall  # Release build (~2.7 MB)
+zig build test --summary all       # 6,300+ tests
 ```
 
 ### Channel Flow Coverage
@@ -804,10 +804,10 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 
 ```
 Language:     Zig 0.15.2
-Source files: ~250
-Lines of code: ~249,000
-Tests:        5,300+
-Binary:       678 KB (ReleaseSmall)
+Source files: ~260
+Lines of code: ~237,000
+Tests:        6,300+
+Binary:       ~2.7 MB (ReleaseSmall minimal) / ~4.1 MB (full)
 Peak RSS:     ~1 MB
 Startup:      <2 ms (Apple Silicon)
 Dependencies: 0 (besides libc + optional SQLite)
@@ -823,10 +823,10 @@ src/
   agent.zig             Agent loop, auto-compaction, tool dispatch
   daemon.zig            Daemon supervisor with exponential backoff
   gateway.zig           HTTP gateway (rate limiting, idempotency, pairing)
-  channels/             19 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
-  providers/            50+ AI provider integrations
+  channels/             24 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, web, teams, max, wechat, wecom, ...)
+  providers/            100+ AI provider integrations (12 core + 92+ compatible services)
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
-  tools/                35+ tool implementations
+  tools/                38+ tool implementations
   security/             Secrets (ChaCha20), sandbox backends (landlock, firejail, ...)
   cron.zig              Cron scheduler with JSON persistence
   health.zig            Component health registry
