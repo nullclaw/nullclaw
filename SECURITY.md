@@ -1,5 +1,7 @@
 # Security Policy
 
+For NullClaw's security model and hardening guide, see [`docs/en/security.md`](docs/en/security.md) ([中文](docs/zh/security.md)).
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in nullclaw, please report it responsibly:
