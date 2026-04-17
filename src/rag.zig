@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 
 // RAG -- Retrieval-Augmented Generation for hardware datasheets.
 //
@@ -115,7 +116,7 @@ fn parseKeyValue(line: []const u8) ?PinAlias {
 /// Returns null for "generic" or "_generic" paths.
 pub fn inferBoardFromPath(path: []const u8) ?[]const u8 {
     // Get the filename without extension
-    const basename = std.fs.path.basename(path);
+    const basename = std_compat.fs.path.basename(path);
     const stem = if (std.mem.lastIndexOfScalar(u8, basename, '.')) |dot| basename[0..dot] else basename;
 
     if (stem.len == 0) return null;
@@ -123,8 +124,8 @@ pub fn inferBoardFromPath(path: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, stem, "generic_")) return null;
 
     // Check if parent dir is _generic
-    const dir = std.fs.path.dirname(path) orelse "";
-    const dir_base = std.fs.path.basename(dir);
+    const dir = std_compat.fs.path.dirname(path) orelse "";
+    const dir_base = std_compat.fs.path.basename(dir);
     if (std.mem.eql(u8, dir_base, "_generic")) return null;
 
     return stem;

@@ -83,7 +83,7 @@ pub const MessageTool = struct {
             .{ channel, chat_id, content.len },
         ) catch return ToolResult.ok("Message sent");
 
-        return ToolResult.ok(result);
+        return ToolResult{ .success = true, .output = result };
     }
 };
 

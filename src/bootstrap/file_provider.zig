@@ -1,9 +1,11 @@
 // src/bootstrap/file_provider.zig
 const std = @import("std");
+const std_compat = @import("compat");
 const provider = @import("provider.zig");
 const BootstrapProvider = provider.BootstrapProvider;
 const isBootstrapFilename = provider.isBootstrapFilename;
 const memory_root = @import("../memory/root.zig");
+const util = @import("../util.zig");
 
 pub const Error = error{NotBootstrapFile};
 
@@ -45,10 +47,10 @@ pub const FileBootstrapProvider = struct {
         const self = castSelf(ptr);
         if (!isBootstrapFilename(filename)) return Error.NotBootstrapFile;
 
-        const path = try std.fs.path.join(allocator, &.{ self.workspace_dir, filename });
+        const path = try std_compat.fs.path.join(allocator, &.{ self.workspace_dir, filename });
         defer allocator.free(path);
 
-        var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        var file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -61,10 +63,10 @@ pub const FileBootstrapProvider = struct {
         const self = castSelf(ptr);
         if (!isBootstrapFilename(filename)) return Error.NotBootstrapFile;
 
-        const path = try std.fs.path.join(allocator, &.{ self.workspace_dir, filename });
+        const path = try std_compat.fs.path.join(allocator, &.{ self.workspace_dir, filename });
         defer allocator.free(path);
 
-        var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        var file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -77,10 +79,10 @@ pub const FileBootstrapProvider = struct {
         const self = castSelf(ptr);
         if (!isBootstrapFilename(filename)) return Error.NotBootstrapFile;
 
-        const path = try std.fs.path.join(self.allocator, &.{ self.workspace_dir, filename });
+        const path = try std_compat.fs.path.join(self.allocator, &.{ self.workspace_dir, filename });
         defer self.allocator.free(path);
 
-        const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+        const file = try std_compat.fs.createFileAbsolute(path, .{ .truncate = true });
         defer file.close();
 
         try file.writeAll(content);
@@ -90,10 +92,10 @@ pub const FileBootstrapProvider = struct {
         const self = castSelf(ptr);
         if (!isBootstrapFilename(filename)) return Error.NotBootstrapFile;
 
-        const path = try std.fs.path.join(self.allocator, &.{ self.workspace_dir, filename });
+        const path = try std_compat.fs.path.join(self.allocator, &.{ self.workspace_dir, filename });
         defer self.allocator.free(path);
 
-        std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
         };
@@ -104,10 +106,10 @@ pub const FileBootstrapProvider = struct {
         const self = castSelf(ptr);
         if (!isBootstrapFilename(filename)) return false;
 
-        const path = std.fs.path.join(self.allocator, &.{ self.workspace_dir, filename }) catch return false;
+        const path = std_compat.fs.path.join(self.allocator, &.{ self.workspace_dir, filename }) catch return false;
         defer self.allocator.free(path);
 
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        std_compat.fs.accessAbsolute(path, .{}) catch return false;
         return true;
     }
 
@@ -116,10 +118,10 @@ pub const FileBootstrapProvider = struct {
         var result = std.ArrayListUnmanaged([]const u8).empty;
 
         for (memory_root.prompt_bootstrap_docs) |doc| {
-            const path = try std.fs.path.join(allocator, &.{ self.workspace_dir, doc.filename });
+            const path = try std_compat.fs.path.join(allocator, &.{ self.workspace_dir, doc.filename });
             defer allocator.free(path);
 
-            std.fs.accessAbsolute(path, .{}) catch continue;
+            std_compat.fs.accessAbsolute(path, .{}) catch continue;
             try result.append(allocator, try allocator.dupe(u8, doc.filename));
         }
 
@@ -134,10 +136,10 @@ pub const FileBootstrapProvider = struct {
             hasher.update(doc.filename);
             hasher.update("\n");
 
-            const path = try std.fs.path.join(allocator, &.{ self.workspace_dir, doc.filename });
+            const path = try std_compat.fs.path.join(allocator, &.{ self.workspace_dir, doc.filename });
             defer allocator.free(path);
 
-            const file = std.fs.openFileAbsolute(path, .{}) catch {
+            const file = std_compat.fs.openFileAbsolute(path, .{}) catch {
                 hasher.update("missing");
                 continue;
             };
@@ -165,12 +167,13 @@ pub const FileBootstrapProvider = struct {
     }
 };
 
-fn read_file_excerpt(allocator: std.mem.Allocator, file: *std.fs.File, max_bytes: usize) ![]const u8 {
-    const buf = try allocator.alloc(u8, max_bytes);
+fn read_file_excerpt(allocator: std.mem.Allocator, file: *std_compat.fs.File, max_bytes: usize) ![]const u8 {
+    const buf = try allocator.alloc(u8, max_bytes + 1);
     errdefer allocator.free(buf);
 
     const read_len = try file.readAll(buf);
-    return shrink_alloc(allocator, buf, read_len);
+    const safe_len = util.truncateUtf8(buf[0..read_len], max_bytes).len;
+    return shrink_alloc(allocator, buf, safe_len);
 }
 
 fn shrink_alloc(allocator: std.mem.Allocator, slice: []u8, new_len: usize) ![]u8 {
@@ -188,7 +191,7 @@ fn shrink_alloc(allocator: std.mem.Allocator, slice: []u8, new_len: usize) ![]u8
 const testing = std.testing;
 
 fn setupTestProvider(tmp: *std.testing.TmpDir) !struct { provider: FileBootstrapProvider, workspace: []const u8 } {
-    const workspace = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     return .{
         .provider = .{
             .allocator = testing.allocator,
@@ -241,6 +244,23 @@ test "load_excerpt returns prefix for oversized file" {
     defer if (excerpt) |c| testing.allocator.free(c);
 
     try testing.expectEqualStrings("abc", excerpt.?);
+}
+
+test "load_excerpt keeps UTF-8 intact for disk files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var ctx = try setupTestProvider(&tmp);
+    defer testing.allocator.free(ctx.workspace);
+
+    var bp = ctx.provider.provider();
+
+    try bp.store("AGENTS.md", "aaa\xd0\x99tail");
+    const excerpt = try bp.load_excerpt(testing.allocator, "AGENTS.md", 4);
+    defer if (excerpt) |c| testing.allocator.free(c);
+
+    try testing.expectEqualStrings("aaa", excerpt.?);
+    try testing.expect(std.unicode.utf8ValidateSlice(excerpt.?));
 }
 
 test "remove deletes file" {

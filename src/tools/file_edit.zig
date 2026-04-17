@@ -1,12 +1,17 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const file_common = @import("file_common.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const memory_root = @import("../memory/root.zig");
+const bootstrapRootFilename = file_common.bootstrapRootFilename;
+const prepareWorkspacePath = file_common.prepareWorkspacePath;
+const resolveNearestExistingAncestor = file_common.resolveNearestExistingAncestor;
 
 /// Default maximum file size to read for editing (10MB).
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -45,29 +50,23 @@ pub const FileEditTool = struct {
             return ToolResult.fail("Missing 'new_text' parameter");
 
         // Build full path — absolute or relative
-        const full_path = if (std.fs.path.isAbsolute(path)) blk: {
-            if (self.allowed_paths.len == 0)
-                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
-            if (std.mem.indexOfScalar(u8, path, 0) != null)
-                return ToolResult.fail("Path contains null bytes");
-            break :blk try allocator.dupe(u8, path);
-        } else blk: {
-            if (!isPathSafe(path))
-                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        const path_info = prepareWorkspacePath(allocator, self.workspace_dir, path, self.allowed_paths.len > 0) catch |err| switch (err) {
+            error.AbsolutePathsNotAllowed => return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)"),
+            error.PathContainsNullBytes => return ToolResult.fail("Path contains null bytes"),
+            error.UnsafePath => return ToolResult.fail("Path not allowed: contains traversal or absolute path"),
+            else => return err,
         };
-        defer allocator.free(full_path);
+        defer path_info.deinit(allocator);
 
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-        const ws_path = ws_resolved orelse "";
+        const full_path = path_info.full_path;
+        const ws_path = path_info.workspacePath();
         const bootstrap_filename = bootstrapRootFilename(path);
 
         // Intercept bootstrap file edits for non-file backends.
         if (bootstrap_filename) |filename| {
             if (self.bootstrap_provider) |bp| {
                 if (!bootstrap_mod.backendUsesFiles(self.backend_name)) {
-                    const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+                    const parent_to_check = std_compat.fs.path.dirname(full_path) orelse full_path;
                     const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
                         const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
                         return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -101,7 +100,7 @@ pub const FileEditTool = struct {
         }
 
         // Resolve to catch symlink escapes
-        const resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| {
+        const resolved = fs_compat.realpathAllocPath(allocator, full_path) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -113,7 +112,7 @@ pub const FileEditTool = struct {
         }
 
         // Read existing file contents
-        const file_r = std.fs.openFileAbsolute(resolved, .{}) catch |err| {
+        const file_r = std_compat.fs.openFileAbsolute(resolved, .{}) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to open file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -142,7 +141,7 @@ pub const FileEditTool = struct {
         defer allocator.free(new_contents);
 
         // Write back
-        const file_w = std.fs.createFileAbsolute(resolved, .{ .truncate = true }) catch |err| {
+        const file_w = std_compat.fs.createFileAbsolute(resolved, .{ .truncate = true }) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to write file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -157,25 +156,6 @@ pub const FileEditTool = struct {
         return ToolResult{ .success = true, .output = msg };
     }
 };
-
-fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => {
-            const parent = std.fs.path.dirname(path) orelse return err;
-            if (std.mem.eql(u8, parent, path)) return err;
-            return resolveNearestExistingAncestor(allocator, parent);
-        },
-        else => return err,
-    };
-}
-
-fn bootstrapRootFilename(path: []const u8) ?[]const u8 {
-    if (std.fs.path.isAbsolute(path)) return null;
-    const basename = std.fs.path.basename(path);
-    if (!std.mem.eql(u8, basename, path)) return null;
-    if (!bootstrap_mod.isBootstrapFilename(basename)) return null;
-    return basename;
-}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -197,9 +177,9 @@ test "file_edit tool schema has required params" {
 test "file_edit basic replace" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileEditTool{ .workspace_dir = ws_path };
@@ -214,7 +194,7 @@ test "file_edit basic replace" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Replaced") != null);
 
     // Verify file contents
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
 }
@@ -222,9 +202,9 @@ test "file_edit basic replace" {
 test "file_edit old_text not found" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileEditTool{ .workspace_dir = ws_path };
@@ -243,7 +223,7 @@ test "file_edit nonexistent file error includes requested path" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileEditTool{ .workspace_dir = ws_path };
@@ -261,9 +241,9 @@ test "file_edit nonexistent file error includes requested path" {
 test "file_edit empty file returns not found" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "empty.txt", .data = "" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "empty.txt", .data = "" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileEditTool{ .workspace_dir = ws_path };
@@ -281,9 +261,9 @@ test "file_edit empty file returns not found" {
 test "file_edit replaces only first occurrence" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "dup.txt", .data = "aaa bbb aaa" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "dup.txt", .data = "aaa bbb aaa" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileEditTool{ .workspace_dir = ws_path };
@@ -296,7 +276,7 @@ test "file_edit replaces only first occurrence" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "dup.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "dup.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("ccc bbb aaa", actual);
 }
@@ -345,9 +325,9 @@ test "file_edit missing new_text param" {
 test "file_edit empty old_text" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "content" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "content" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileEditTool{ .workspace_dir = ws_path };
@@ -377,11 +357,11 @@ test "file_edit absolute path without allowed_paths is rejected" {
 test "file_edit absolute path with allowed_paths works" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const abs_file = try std.fs.path.join(std.testing.allocator, &.{ ws_path, "test.txt" });
+    const abs_file = try std_compat.fs.path.join(std.testing.allocator, &.{ ws_path, "test.txt" });
     defer std.testing.allocator.free(abs_file);
 
     // JSON-escape backslashes in the path (needed on Windows where paths use \)
@@ -409,7 +389,7 @@ test "file_edit absolute path with allowed_paths works" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
 }
@@ -420,13 +400,13 @@ test "file_edit does not bypass allowed_paths for bootstrap memory edits" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
 
-    try outside_tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "outside-before" });
-    const outside_file = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "AGENTS.md" });
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{ .sub_path = "AGENTS.md", .data = "outside-before" });
+    const outside_file = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "AGENTS.md" });
     defer std.testing.allocator.free(outside_file);
 
     var escaped_buf: [1024]u8 = undefined;
@@ -471,7 +451,7 @@ test "file_edit does not bypass allowed_paths for bootstrap memory edits" {
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("alpha", content);
 
-    const outside_after = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 1024);
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "AGENTS.md", 1024);
     defer std.testing.allocator.free(outside_after);
     try std.testing.expectEqualStrings("outside-before", outside_after);
 }

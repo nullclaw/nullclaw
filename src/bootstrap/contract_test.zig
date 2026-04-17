@@ -70,7 +70,7 @@ fn runContractTests(bp: BootstrapProvider) !void {
 test "contract: FileBootstrapProvider" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir_path);
 
     var impl = FileBootstrapProvider.init(testing.allocator, dir_path);

@@ -34,6 +34,7 @@
 ### 交互式模型路由
 
 - 在 `nullclaw agent` 里，`/model` 会显示当前模型以及已配置的路由/回退状态。
+- `/config reload` 会热重载 `config.json` 中支持的配置项（包括 Agent Profile 的更新）。
 - 如果配置了自动路由，`/model` 还会显示最近一次自动路由决策以及选择原因。
 - 如果某条自动路由命中的提供方暂时被限流或额度耗尽，`/model` 会把这条路线标成 degraded，直到冷却结束。
 - `/model` 还会列出已配置的自动路由及其 `cost_class`、`quota_class` 元数据。
@@ -55,7 +56,7 @@
 | `nullclaw service restart` | 重启后台服务 |
 | `nullclaw service status` | 查看后台服务状态 |
 | `nullclaw service uninstall` | 卸载后台服务 |
-| `nullclaw status` | 查看全局状态总览 |
+| `nullclaw status [--json]` | 查看全局状态总览，或输出 machine-readable runtime snapshot |
 | `nullclaw doctor` | 执行系统诊断 |
 | `nullclaw update --check` | 仅检查是否有更新 |
 | `nullclaw update --yes` | 自动确认并安装更新 |
@@ -75,10 +76,11 @@
 
 | 命令 | 说明 |
 |---|---|
-| `nullclaw channel list` | 列出已知 / 已配置渠道 |
+| `nullclaw channel list [--json]` | 列出已知 / 已配置渠道 |
 | `nullclaw channel start` | 启动默认可用渠道 |
 | `nullclaw channel start telegram` | 启动指定渠道 |
 | `nullclaw channel status` | 查看渠道健康状态 |
+| `nullclaw channel info <type> [--json]` | 查看某类渠道的已配置账号 |
 | `nullclaw channel add <type>` | 提示如何往配置里添加某类渠道 |
 | `nullclaw channel remove <name>` | 提示如何从配置里移除渠道 |
 
@@ -86,9 +88,10 @@
 
 | 命令 | 说明 |
 |---|---|
-| `nullclaw cron list` | 查看所有计划任务 |
+| `nullclaw cron list [--json]` | 查看所有计划任务 |
+| `nullclaw cron status [--json]` | 查看 scheduler 层状态与任务计数 |
 | `nullclaw cron add "0 * * * *" "command"` | 新增周期性 shell 任务 |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--to <id>]` | 新增周期性 agent 任务 |
+| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | 新增周期性 agent 任务 |
 | `nullclaw cron once 10m "command"` | 新增一次性延迟任务 |
 | `nullclaw cron once-agent 10m "prompt" --model <model>` | 新增一次性 agent 延迟任务 |
 | `nullclaw cron run <id>` | 立即执行指定任务 |
@@ -103,8 +106,16 @@
 |---|---|
 | `nullclaw skills list` | 列出已安装 skill |
 | `nullclaw skills install <source>` | 从 GitHub URL 或本地路径安装 skill |
+| `nullclaw skills install --name <query>` | 在 skill registry 中搜索并安装最匹配的 skill |
 | `nullclaw skills remove <name>` | 移除 skill |
 | `nullclaw skills info <name>` | 查看 skill 元信息 |
+
+### History
+
+| 命令 | 说明 |
+|---|---|
+| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出会话记录 |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定会话的消息详情 |
 
 ## 数据、模型与工作区
 
@@ -130,8 +141,11 @@
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | 重置 bundled markdown，并可附带清理 bootstrap / memory 文件 |
 | `nullclaw capabilities` | 输出运行时能力摘要 |
 | `nullclaw capabilities --json` | 输出 JSON manifest |
+| `nullclaw config show [--json]` | 输出完整的磁盘配置 |
+| `nullclaw config get <path> [--json]` | 读取一条 dotted config 值 |
 | `nullclaw models list` | 列出 provider 与默认模型 |
 | `nullclaw models info <model>` | 查看模型说明 |
+| `nullclaw models summary [--json]` | 输出供集成侧使用的 provider/key-safe 管理摘要 |
 | `nullclaw models benchmark` | 运行模型延迟基准 |
 | `nullclaw models refresh` | 刷新模型目录 |
 | `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw |
@@ -141,6 +155,7 @@
 
 - `workspace edit` 只适用于 file-based backend（如 `markdown`、`hybrid`）。
 - 如果当前 memory backend 把 bootstrap 数据放在数据库里，CLI 会提示改用 agent 的 `memory_store` 工具，或切回 file-based backend。
+- 这些带 `--json` 的 read-side 命令主要用于自动化集成，以及 NullHub 对 managed instance 的 admin API 边界。
 
 ## 硬件与自动化集成
 

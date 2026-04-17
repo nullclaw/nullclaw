@@ -53,7 +53,9 @@ pub const LineChannel = struct {
     pub fn replyMessage(self: *LineChannel, reply_token: []const u8, text: []const u8) !void {
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const w = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const w = &body_writer.writer;
 
         try w.writeAll("{\"replyToken\":\"");
         try w.writeAll(reply_token);
@@ -63,9 +65,9 @@ pub const LineChannel = struct {
         const body = body_list.items;
 
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.config.access_token});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{self.config.access_token});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, REPLY_URL, body, &.{auth_header}) catch |err| {
             log.err("replyMessage failed: {}", .{err});
@@ -78,7 +80,9 @@ pub const LineChannel = struct {
     pub fn pushMessage(self: *LineChannel, user_id: []const u8, text: []const u8) !void {
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const w = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const w = &body_writer.writer;
 
         try w.writeAll("{\"to\":\"");
         try w.writeAll(user_id);
@@ -88,9 +92,9 @@ pub const LineChannel = struct {
         const body = body_list.items;
 
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.config.access_token});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{self.config.access_token});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, PUSH_URL, body, &.{auth_header}) catch |err| {
             log.err("pushMessage failed: {}", .{err});
@@ -225,7 +229,7 @@ pub const LineChannel = struct {
         var kept: usize = 0;
         for (events) |*ev| {
             if (ev.user_id) |uid| {
-                if (!root.isAllowed(self.config.allow_from, uid)) {
+                if (!root.isAllowedScoped("line channel", self.config.allow_from, uid)) {
                     ev.deinit(self.allocator);
                     continue;
                 }

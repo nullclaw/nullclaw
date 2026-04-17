@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 
@@ -18,14 +20,14 @@ pub const CliChannel = struct {
 
     pub fn sendMessage(_: *CliChannel, _: []const u8, message: []const u8) !void {
         var out_buf: [4096]u8 = undefined;
-        var bw = std.fs.File.stdout().writer(&out_buf);
+        var bw = std_compat.fs.File.stdout().writer(&out_buf);
         const w = &bw.interface;
         try w.print("{s}\n", .{message});
         try w.flush();
     }
 
     pub fn readLine(_: *CliChannel, buf: []u8) !?[]const u8 {
-        const stdin = std.fs.File.stdin();
+        const stdin = std_compat.fs.File.stdin();
         var pos: usize = 0;
         while (pos < buf.len) {
             const n = stdin.read(buf[pos .. pos + 1]) catch return null;
@@ -100,7 +102,7 @@ const MAX_HISTORY_LINES: usize = 500;
 /// If the file does not exist, returns an empty slice.
 /// Caller owns the returned slice and all strings within it.
 pub fn loadHistory(allocator: std.mem.Allocator, path: []const u8) ![][]const u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    const file = fs_compat.openPath(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return try allocator.alloc([]const u8, 0),
         else => return err,
     };
@@ -175,7 +177,7 @@ pub fn freeHistory(allocator: std.mem.Allocator, history: [][]const u8) void {
 /// Save command history to a file (one command per line).
 /// Writes at most MAX_HISTORY_LINES entries.
 pub fn saveHistory(history: []const []const u8, path: []const u8) !void {
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    const file = try fs_compat.createPath(path, .{ .truncate = true });
     defer file.close();
 
     const start = if (history.len > MAX_HISTORY_LINES) history.len - MAX_HISTORY_LINES else 0;
@@ -190,7 +192,7 @@ pub fn saveHistory(history: []const []const u8, path: []const u8) !void {
 pub fn defaultHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw_history" });
+    return std_compat.fs.path.join(allocator, &.{ home, ".nullclaw_history" });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -215,14 +217,14 @@ test "loadHistory reads file lines" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const tmp_path = try std.fs.path.join(allocator, &.{ base, "history_test" });
+    const tmp_path = try std_compat.fs.path.join(allocator, &.{ base, "history_test" });
     defer allocator.free(tmp_path);
 
     // Write a temporary history file
     {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        const f = try fs_compat.createPath(tmp_path, .{ .truncate = true });
         defer f.close();
         try f.writeAll("hello world\nhow are you\ngoodbye\n");
     }
@@ -242,9 +244,9 @@ test "loadHistory returns empty for missing file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const tmp_path = try std.fs.path.join(allocator, &.{ base, "nonexistent_history_file" });
+    const tmp_path = try std_compat.fs.path.join(allocator, &.{ base, "nonexistent_history_file" });
     defer allocator.free(tmp_path);
 
     const history = try loadHistory(allocator, tmp_path);
@@ -258,9 +260,9 @@ test "saveHistory writes file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const tmp_path = try std.fs.path.join(allocator, &.{ base, "save_history_test" });
+    const tmp_path = try std_compat.fs.path.join(allocator, &.{ base, "save_history_test" });
     defer allocator.free(tmp_path);
 
     const entries = [_][]const u8{ "first", "second", "third" };
@@ -282,9 +284,9 @@ test "saveHistory and loadHistory roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const tmp_path = try std.fs.path.join(allocator, &.{ base, "roundtrip_history_test" });
+    const tmp_path = try std_compat.fs.path.join(allocator, &.{ base, "roundtrip_history_test" });
     defer allocator.free(tmp_path);
 
     // Save
@@ -306,13 +308,13 @@ test "loadHistory trims whitespace from entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const tmp_path = try std.fs.path.join(allocator, &.{ base, "trim_history_test" });
+    const tmp_path = try std_compat.fs.path.join(allocator, &.{ base, "trim_history_test" });
     defer allocator.free(tmp_path);
 
     {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        const f = try fs_compat.createPath(tmp_path, .{ .truncate = true });
         defer f.close();
         try f.writeAll("  hello  \n\t world \t\nfoo\r\n");
     }
@@ -332,13 +334,13 @@ test "loadHistory skips blank lines" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const tmp_path = try std.fs.path.join(allocator, &.{ base, "blank_history_test" });
+    const tmp_path = try std_compat.fs.path.join(allocator, &.{ base, "blank_history_test" });
     defer allocator.free(tmp_path);
 
     {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        const f = try fs_compat.createPath(tmp_path, .{ .truncate = true });
         defer f.close();
         try f.writeAll("first\n\n   \n\nsecond\n  \nthird\n");
     }
@@ -358,13 +360,13 @@ test "loadHistory enforces max entries limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const tmp_path = try std.fs.path.join(allocator, &.{ base, "max_history_test" });
+    const tmp_path = try std_compat.fs.path.join(allocator, &.{ base, "max_history_test" });
     defer allocator.free(tmp_path);
 
     {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        const f = try fs_compat.createPath(tmp_path, .{ .truncate = true });
         defer f.close();
         // Write more than MAX_HISTORY_LINES (500) entries
         for (0..600) |i| {

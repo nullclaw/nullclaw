@@ -52,20 +52,32 @@ fn isApiErrorPayload(allocator: std.mem.Allocator, body: []const u8) bool {
         else => return false,
     };
 
+    const has_message = hasApiErrorMessage(obj);
+
     if (obj.get("code")) |code| {
         if (code == .integer and code.integer >= 400) {
-            if (obj.get("name") != null and obj.get("message") != null) {
+            if (obj.get("name") != null and has_message) {
                 return true;
             }
         }
     }
 
     if (obj.get("status")) |status| {
-        if (status == .integer and status.integer >= 400 and obj.get("message") != null) {
+        if (status == .integer and status.integer >= 400 and has_message) {
             return true;
         }
     }
 
+    return false;
+}
+
+fn hasApiErrorMessage(obj: std.json.ObjectMap) bool {
+    if (obj.get("message")) |message| {
+        if (message == .string) return true;
+    }
+    if (obj.get("msg")) |message| {
+        if (message == .string) return true;
+    }
     return false;
 }
 
@@ -74,6 +86,13 @@ const testing = std.testing;
 test "isApiErrorPayload detects jina auth error JSON" {
     const body =
         \\{"data":null,"code":401,"name":"AuthenticationRequiredError","status":40103,"message":"Authentication is required to use this endpoint. Please provide a valid API key via Authorization header.","readableMessage":"AuthenticationRequiredError: Authentication is required to use this endpoint. Please provide a valid API key via Authorization header."}
+    ;
+    try testing.expect(isApiErrorPayload(testing.allocator, body));
+}
+
+test "isApiErrorPayload detects jina auth error JSON via msg" {
+    const body =
+        \\{"data":null,"code":401,"name":"AuthenticationRequiredError","status":40103,"msg":"Authentication is required to use this endpoint."}
     ;
     try testing.expect(isApiErrorPayload(testing.allocator, body));
 }

@@ -5,6 +5,7 @@
 //! TTL. The cache is optional and disabled by default.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
@@ -119,7 +120,7 @@ pub const ResponseCache = struct {
 
     /// Look up a cached response. Returns null on miss or expired entry.
     pub fn get(self: *Self, allocator: std.mem.Allocator, key_hex: []const u8) !?[]u8 {
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const cutoff_ts = now_ts - self.ttl_minutes * 60;
         const now_str = try timestampStr(allocator, now_ts);
         defer allocator.free(now_str);
@@ -160,7 +161,7 @@ pub const ResponseCache = struct {
 
     /// Store a response in the cache.
     pub fn put(self: *Self, allocator: std.mem.Allocator, key_hex: []const u8, model: []const u8, response: []const u8, token_count: u32) !void {
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const now_str = try timestampStr(allocator, now_ts);
         defer allocator.free(now_str);
 
@@ -252,7 +253,7 @@ pub const ResponseCache = struct {
     }
 
     fn evictExpired(self: *Self, allocator: std.mem.Allocator) !void {
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const cutoff_ts = now_ts - self.ttl_minutes * 60;
         const cutoff_str = try timestampStr(allocator, cutoff_ts);
         defer allocator.free(cutoff_str);

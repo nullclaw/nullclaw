@@ -8,6 +8,8 @@
 //! or message history storage.
 
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("fs_compat.zig");
 const providers = @import("providers/root.zig");
 const ChatMessage = providers.ChatMessage;
 const ContentPart = providers.ContentPart;
@@ -162,11 +164,7 @@ pub const DataUriImage = struct {
 /// Path is validated against `allowed_dirs` to prevent arbitrary file reads.
 pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: MultimodalConfig) !ImageData {
     // Resolve to absolute path (realpathAlloc resolves ".." and symlinks)
-    const resolved = if (std.fs.path.isAbsolute(path))
-        std.fs.realpathAlloc(allocator, path) catch return error.PathNotFound
-    else blk: {
-        break :blk std.fs.cwd().realpathAlloc(allocator, path) catch return error.PathNotFound;
-    };
+    const resolved = fs_compat.realpathAllocPath(allocator, path) catch return error.PathNotFound;
     defer allocator.free(resolved);
 
     // Verify the resolved path is within an allowed directory (skipped in yolo mode).
@@ -174,12 +172,12 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
         if (config.allowed_dirs.len == 0) return error.LocalReadNotAllowed;
         const allowed = blk: {
             for (config.allowed_dirs) |dir| {
-                const trimmed = std.mem.trimRight(u8, dir, "/\\");
+                const trimmed = std_compat.mem.trimRight(u8, dir, "/\\");
                 if (trimmed.len == 0) continue;
                 if (path_security.pathStartsWith(resolved, trimmed)) break :blk true;
 
                 // Compare against canonicalized allowed dir too (/var -> /private/var on macOS).
-                const canonical = std.fs.realpathAlloc(allocator, trimmed) catch continue;
+                const canonical = std_compat.fs.realpathAlloc(allocator, trimmed) catch continue;
                 defer allocator.free(canonical);
                 if (path_security.pathStartsWith(resolved, canonical)) break :blk true;
             }
@@ -188,14 +186,14 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
         if (!allowed) return error.PathNotAllowed;
     }
 
-    const file = std.fs.openFileAbsolute(resolved, .{}) catch return error.PathNotFound;
+    const file = std_compat.fs.openFileAbsolute(resolved, .{}) catch return error.PathNotFound;
     return readFromFile(allocator, file, config.max_image_size_bytes);
 }
 
-fn readFromFile(allocator: std.mem.Allocator, file: std.fs.File, max_size: u64) !ImageData {
+fn readFromFile(allocator: std.mem.Allocator, file: std_compat.fs.File, max_size: u64) !ImageData {
     defer file.close();
 
-    const stat = try file.stat();
+    const stat = try fs_compat.stat(file);
     const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
     const effective_max_size = @min(max_size, max_usize_u64);
     if (stat.size > effective_max_size)
@@ -846,10 +844,10 @@ test "readLocalImage rejects when no allowed_dirs" {
     // Create a real temp file so realpath succeeds, then verify allowed_dirs rejection
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.png", .data = "\x89PNG\x0d\x0a\x1a\x0a" });
-    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.png", .data = "\x89PNG\x0d\x0a\x1a\x0a" });
+    const dir_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "test.png" });
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir_path, "test.png" });
     defer std.testing.allocator.free(file_path);
 
     const err = readLocalImage(std.testing.allocator, file_path, .{});
@@ -862,11 +860,11 @@ test "readLocalImage allows any path when skip_dir_check is set" {
     defer tmp_dir.cleanup();
 
     const png_header = "\x89PNG\x0d\x0a\x1a\x0a";
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.png", .data = png_header });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.png", .data = png_header });
 
-    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "test.png" });
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir_path, "test.png" });
     defer std.testing.allocator.free(file_path);
 
     // With empty allowed_dirs and skip_dir_check=true, read should succeed
@@ -884,14 +882,14 @@ test "prepareMessagesForProvider does not delete nullclaw temp image files" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
         .sub_path = "nullclaw_photo_123.png",
         .data = "\x89PNG\x0d\x0a\x1a\x0a",
     });
 
-    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "nullclaw_photo_123.png" });
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir_path, "nullclaw_photo_123.png" });
     defer std.testing.allocator.free(file_path);
 
     const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -908,7 +906,7 @@ test "prepareMessagesForProvider does not delete nullclaw temp image files" {
         .allowed_dirs = &.{dir_path},
     });
 
-    try std.fs.accessAbsolute(file_path, .{});
+    try std_compat.fs.accessAbsolute(file_path, .{});
 }
 
 test "parseImageMarkers mixed case markers" {

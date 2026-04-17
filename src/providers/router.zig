@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const model_refs = @import("../model_refs.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -104,6 +105,27 @@ pub const RouterProvider = struct {
     ///
     /// If the model starts with "hint:", look up the hint in the route table.
     /// Otherwise, use the default provider with the given model name.
+    fn resolveExplicitProviderRef(self: RouterProvider, model_ref: []const u8) ?struct { usize, []const u8 } {
+        var best_index: ?usize = null;
+        var best_model: []const u8 = undefined;
+        var best_prefix_len: usize = 0;
+
+        for (self.provider_names, 0..) |provider_name, provider_idx| {
+            const split = model_refs.matchExplicitProviderPrefix(model_ref, provider_name) orelse continue;
+            const provider_len = split.provider.?.len;
+            if (provider_len <= best_prefix_len) continue;
+
+            best_prefix_len = provider_len;
+            best_index = provider_idx;
+            best_model = split.model;
+        }
+
+        if (best_index) |provider_idx| {
+            return .{ provider_idx, best_model };
+        }
+        return null;
+    }
+
     pub fn resolve(self: RouterProvider, model: []const u8) struct { usize, []const u8 } {
         if (std.mem.startsWith(u8, model, "hint:")) {
             const hint = model["hint:".len..];
@@ -112,14 +134,8 @@ pub const RouterProvider = struct {
             }
         }
 
-        if (std.mem.indexOfScalar(u8, model, '/')) |slash_idx| {
-            const provider_name = model[0..slash_idx];
-            const provider_model = model[slash_idx + 1 ..];
-            if (provider_model.len > 0) {
-                if (self.provider_indexes.get(provider_name)) |provider_idx| {
-                    return .{ provider_idx, provider_model };
-                }
-            }
+        if (self.resolveExplicitProviderRef(model)) |resolved| {
+            return resolved;
         }
 
         // Not a hint or hint not found — use default
@@ -527,6 +543,25 @@ test "explicit provider ref resolves provider prefix" {
     const openrouter = router.resolve("openrouter/anthropic/claude-sonnet-4");
     try std.testing.expect(openrouter[0] == 0);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", openrouter[1]);
+}
+
+test "explicit provider ref resolves custom url provider prefix" {
+    const provider_names = [_][]const u8{ "openai-codex", "custom:http://127.0.0.1:8000/v1" };
+    var mock_default = MockProvider.init("default", false);
+    var mock_custom = MockProvider.init("custom", false);
+    const providers = [_]Provider{ mock_default.provider(), mock_custom.provider() };
+    var router = try RouterProvider.init(
+        std.testing.allocator,
+        &provider_names,
+        &providers,
+        &.{},
+        "openai-codex/gpt-5.4",
+    );
+    defer router.deinit();
+
+    const resolved = router.resolve("custom:http://127.0.0.1:8000/v1/claude-haiku-4.5");
+    try std.testing.expect(resolved[0] == 1);
+    try std.testing.expectEqualStrings("claude-haiku-4.5", resolved[1]);
 }
 
 test "skips routes with unknown provider" {

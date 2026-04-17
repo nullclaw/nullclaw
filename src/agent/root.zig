@@ -5,6 +5,7 @@
 //! (system prompt), memory_loader.zig (memory enrichment).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
@@ -26,6 +27,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const util = @import("../util.zig");
 const verbose_mod = @import("../verbose.zig");
 
 const cache = memory_mod.cache;
@@ -58,10 +60,13 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
 /// - The keyword appears as a whole word (not as part of another word)
 /// - No negation word precedes the keyword within reasonable distance
 fn matchTriggerKeyword(lower_msg: []const u8, keyword: []const u8) bool {
+    const parsed = parseTriggerKeyword(keyword);
+    const keyword_part = parsed.keyword;
+
     var lower_kw_buf: [256]u8 = undefined;
-    if (keyword.len > lower_kw_buf.len) return false;
-    const lower_kw = lower_kw_buf[0..keyword.len];
-    for (keyword, 0..) |c, i| {
+    if (keyword_part.len > lower_kw_buf.len) return false;
+    const lower_kw = lower_kw_buf[0..keyword_part.len];
+    for (keyword_part, 0..) |c, i| {
         lower_kw[i] = std.ascii.toLower(c);
     }
 
@@ -227,7 +232,8 @@ fn cleanUserInput(
     if (start > 0 or end < result.len) {
         const trimmed_len = end - start;
         if (trimmed_len == 0) {
-            return result[0..0];
+            allocator.free(result);
+            return allocator.alloc(u8, 0);
         }
         const trimmed = try allocator.alloc(u8, trimmed_len);
         @memcpy(trimmed, result[start..end]);
@@ -309,6 +315,11 @@ fn hasNegationBefore(lower_msg: []const u8, pos: usize) bool {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Agent = struct {
+    const TextPreview = struct {
+        slice: []const u8,
+        truncated: bool,
+    };
+
     const VerboseLevel = enum {
         off,
         on,
@@ -495,6 +506,9 @@ pub const Agent = struct {
     default_provider: []const u8 = "openrouter",
     default_provider_owned: bool = false,
     default_model: []const u8 = "anthropic/claude-sonnet-4",
+    profile_name: ?[]const u8 = null,
+    profile_system_prompt: ?[]const u8 = null,
+    profile_system_prompt_owned: bool = false,
     model_routes: []const config_types.ModelRouteConfig = &.{},
     model_pinned_by_user: bool = false,
     last_route_trace: ?[]u8 = null,
@@ -504,6 +518,7 @@ pub const Agent = struct {
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
     temperature: f64,
     workspace_dir: []const u8,
+    workspace_dir_owned: bool = false,
     allowed_paths: []const []const u8 = &.{},
     multimodal_unrestricted: bool = false,
     /// List of models that do not support image/vision input.
@@ -592,10 +607,10 @@ pub const Agent = struct {
     /// Cross-thread interrupt flag used to stop in-flight tool loops.
     interrupt_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Tracks currently running tool and effective interruptions for user-facing reporting.
-    tool_state_mu: std.Thread.Mutex = .{},
+    tool_state_mu: std_compat.sync.Mutex = .{},
     active_tool_name: ?[]u8 = null,
     interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
-    /// Conversation context for the current turn (Signal-specific for now).
+    /// Conversation context for the current turn.
     conversation_context: ?prompt.ConversationContext = null,
 
     /// Conversation history — owned, growable list.
@@ -608,6 +623,8 @@ pub const Agent = struct {
     has_system_prompt: bool = false,
     /// Whether the currently injected system prompt contains conversation context.
     system_prompt_has_conversation_context: bool = false,
+    /// Fingerprint of the conversation context used for the cached system prompt.
+    system_prompt_conversation_context_fingerprint: ?u64 = null,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
     /// Model name used when building the currently cached system prompt.
@@ -633,6 +650,15 @@ pub const Agent = struct {
         }
     };
 
+    /// Append a history message that owns its content.
+    /// On append failure, the message is deinitialized to avoid leaks.
+    fn appendOwnedHistoryMessage(self: *Agent, msg: OwnedMessage) !void {
+        self.history.append(self.allocator, msg) catch |err| {
+            msg.deinit(self.allocator);
+            return err;
+        };
+    }
+
     /// Initialize agent from a loaded Config.
     pub fn fromConfig(
         allocator: std.mem.Allocator,
@@ -642,7 +668,26 @@ pub const Agent = struct {
         mem: ?Memory,
         observer_i: Observer,
     ) !Agent {
-        const default_model = cfg.default_model orelse return error.NoDefaultModel;
+        return fromConfigWithProfile(allocator, cfg, provider_i, tools, mem, observer_i, null);
+    }
+
+    pub fn fromConfigWithProfile(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+        provider_i: Provider,
+        tools: []const Tool,
+        mem: ?Memory,
+        observer_i: Observer,
+        profile: ?config_types.NamedAgentConfig,
+    ) !Agent {
+        const default_model = if (profile) |agent_profile|
+            agent_profile.model
+        else
+            cfg.default_model orelse return error.NoDefaultModel;
+        const default_provider = if (profile) |agent_profile|
+            agent_profile.provider
+        else
+            cfg.default_provider;
         const token_limit_override = if (cfg.agent.token_limit_explicit) cfg.agent.token_limit else null;
         const resolved_token_limit = context_tokens.resolveContextTokens(token_limit_override, default_model);
         const resolved_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, default_model);
@@ -669,10 +714,24 @@ pub const Agent = struct {
             };
         }
 
-        // Load and merge tool customizations from config and external file
-        const merged_tool_customizations = try loadAndMergeToolCustomizations(allocator, cfg.tools.tool_customizations, cfg.tools.tool_customizations_file, cfg.workspace_dir);
+        var effective_workspace_dir = cfg.workspace_dir;
+        var workspace_dir_owned = false;
+        if (profile) |agent_profile| {
+            if (agent_profile.workspace_path) |workspace_path| {
+                effective_workspace_dir = try cfg.resolveAgentWorkspacePath(allocator, workspace_path);
+                workspace_dir_owned = true;
+                errdefer if (workspace_dir_owned) allocator.free(effective_workspace_dir);
+                Config.scaffoldAgentWorkspace(allocator, effective_workspace_dir) catch {};
+            }
+        }
 
-        // Apply tool customizations to tool specs
+        const merged_tool_customizations = try loadAndMergeToolCustomizations(
+            allocator,
+            cfg.tools.tool_customizations,
+            cfg.tools.tool_customizations_file,
+            effective_workspace_dir,
+        );
+
         for (specs, 0..) |*spec, i| {
             const tool_name = spec.name;
             if (merged_tool_customizations.get(tool_name)) |custom| {
@@ -690,7 +749,7 @@ pub const Agent = struct {
             allocator,
             cfg.memory.backend,
             mem,
-            cfg.workspace_dir,
+            effective_workspace_dir,
         ) catch null;
 
         return .{
@@ -702,14 +761,17 @@ pub const Agent = struct {
             .bootstrap = bootstrap_provider,
             .observer = observer_i,
             .model_name = default_model,
-            .default_provider = cfg.default_provider,
+            .default_provider = default_provider,
             .default_model = default_model,
-            .model_routes = cfg.model_routes,
+            .profile_name = if (profile) |agent_profile| agent_profile.name else null,
+            .profile_system_prompt = if (profile) |agent_profile| agent_profile.system_prompt else null,
+            .model_routes = if (profile != null) &.{} else cfg.model_routes,
             .configured_providers = cfg.providers,
             .fallback_providers = cfg.reliability.fallback_providers,
             .model_fallbacks = cfg.reliability.model_fallbacks,
-            .temperature = cfg.default_temperature,
-            .workspace_dir = cfg.workspace_dir,
+            .temperature = if (profile) |agent_profile| agent_profile.temperature orelse cfg.default_temperature else cfg.default_temperature,
+            .workspace_dir = effective_workspace_dir,
+            .workspace_dir_owned = workspace_dir_owned,
             .allowed_paths = cfg.autonomy.allowed_paths,
             .multimodal_unrestricted = cfg.autonomy.level == .yolo,
             .vision_disabled_models = cfg.agent.vision_disabled_models,
@@ -748,6 +810,8 @@ pub const Agent = struct {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.profile_system_prompt_owned and self.profile_system_prompt != null) self.allocator.free(self.profile_system_prompt.?);
+        if (self.workspace_dir_owned) self.allocator.free(self.workspace_dir);
         if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.last_route_trace) |trace| self.allocator.free(trace);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -774,21 +838,11 @@ pub const Agent = struct {
         }
         self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
-        
-        // Free tool customizations - simplified approach
-        // Directly iterate through the hash map and free resources
+
         var iter = self.tool_customizations.iterator();
         while (iter.next()) |entry| {
-            const custom = entry.value_ptr;
-            if (custom.system_prompt) |sp| self.allocator.free(sp);
-            if (custom.triggers.len > 0) {
-                for (custom.triggers) |t| self.allocator.free(t);
-                self.allocator.free(custom.triggers);
-            }
-            if (custom.skip_llm_tpl) |tpl| self.allocator.free(tpl);
+            freeToolCustomization(self.allocator, entry.value_ptr);
         }
-        
-        // Finally, deinit the hash map itself
         self.tool_customizations.deinit(self.allocator);
     }
 
@@ -1046,18 +1100,89 @@ pub const Agent = struct {
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
+        // Specific "let me <action-verb>" and "i'll/i will <action-verb>" phrases.
+        // Kept as explicit verb+phrase pairs to avoid false-positives on conclusory
+        // statements like "I'll note that…", "Let me know if…", or "I will summarize…".
         const ascii_patterns = [_][]const u8{
+            // try / retry / attempt
             "i'll try",
             "i will try",
             "let me try",
-            "i'll check",
-            "i will check",
-            "let me check",
             "i'll retry",
             "i will retry",
             "let me retry",
             "i'll attempt",
             "i will attempt",
+            "let me attempt",
+            // check / look / verify
+            "i'll check",
+            "i will check",
+            "let me check",
+            "i'll look into",
+            "i will look into",
+            "let me look into",
+            "i'll look up",
+            "i will look up",
+            "let me look up",
+            "i'll verify",
+            "i will verify",
+            "let me verify",
+            // fetch / get / retrieve
+            "i'll fetch",
+            "i will fetch",
+            "let me fetch",
+            "i'll get the",
+            "i will get the",
+            "let me get the",
+            "i'll get that",
+            "i will get that",
+            "let me get that",
+            "i'll get this",
+            "i will get this",
+            "let me get this",
+            "i'll get it",
+            "i will get it",
+            "let me get it",
+            "i'll retrieve",
+            "i will retrieve",
+            "let me retrieve",
+            // find / search
+            "i'll find",
+            "i will find",
+            "let me find",
+            "i'll search",
+            "i will search",
+            "let me search",
+            // read / open / load
+            "i'll read",
+            "i will read",
+            "let me read",
+            "i'll open",
+            "i will open",
+            "let me open",
+            "i'll load",
+            "i will load",
+            "let me load",
+            // run / execute
+            "i'll run the",
+            "i will run the",
+            "let me run the",
+            "i'll run that",
+            "i will run that",
+            "let me run that",
+            "i'll run it",
+            "i will run it",
+            "let me run it",
+            "i'll execute the",
+            "i will execute the",
+            "let me execute the",
+            "i'll execute that",
+            "i will execute that",
+            "let me execute that",
+            "i'll execute it",
+            "i will execute it",
+            "let me execute it",
+            // do / do that
             "i'll do that now",
             "i will do that now",
             "doing that now",
@@ -1313,7 +1438,7 @@ pub const Agent = struct {
 
     fn markRouteDegraded(self: *Agent, selection: RouteSelection, err: anyerror) !void {
         if (!self.routeShouldBeDegraded(err)) return;
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
         const reason = try self.routeDegradeReason(err);
         errdefer self.allocator.free(reason);
 
@@ -1370,7 +1495,7 @@ pub const Agent = struct {
 
     fn routeSelectionForTurn(self: *Agent, user_message: []const u8) ?RouteSelection {
         if (self.model_pinned_by_user or self.model_routes.len == 0) return null;
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
 
         if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasUsableModelRouteHint("vision", now_ms)) {
             return self.routeSelectionForHint(
@@ -1548,45 +1673,24 @@ pub const Agent = struct {
         errdefer {
             var iter = customizations.iterator();
             while (iter.next()) |entry| {
-                if (entry.value_ptr.system_prompt) |sp| allocator.free(sp);
-                if (entry.value_ptr.triggers.len > 0) {
-                    for (entry.value_ptr.triggers) |t| allocator.free(t);
-                    allocator.free(entry.value_ptr.triggers);
-                }
-                if (entry.value_ptr.skip_llm_tpl) |tpl| allocator.free(tpl);
+                freeToolCustomization(allocator, entry.value_ptr);
             }
             customizations.deinit(allocator);
         }
 
-        // Add customizations from config
         for (config_customizations) |custom| {
-            const result = try customizations.getOrPut(allocator, custom.name);
-            if (!result.found_existing) {
-                // Copy the customization and duplicate all allocated fields
-                var custom_copy = custom;
-                // Duplicate name to avoid dangling pointer
-                custom_copy.name = try allocator.dupe(u8, custom.name);
-                // Duplicate triggers to avoid dangling pointers
-                if (custom_copy.triggers.len > 0) {
-                    var triggers_copy: std.ArrayListUnmanaged([]const u8) = .empty;
-                    for (custom_copy.triggers) |t| {
-                        try triggers_copy.append(allocator, try allocator.dupe(u8, t));
-                    }
-                    custom_copy.triggers = try triggers_copy.toOwnedSlice(allocator);
-                }
-                // Duplicate system_prompt to avoid dangling pointer
-                if (custom_copy.system_prompt) |sp| {
-                    custom_copy.system_prompt = try allocator.dupe(u8, sp);
-                }
-                // Duplicate skip_llm_tpl to avoid dangling pointer
-                if (custom_copy.skip_llm_tpl) |tpl| {
-                    custom_copy.skip_llm_tpl = try allocator.dupe(u8, tpl);
-                }
+            var custom_copy = try dupeToolCustomization(allocator, custom);
+            errdefer freeToolCustomization(allocator, &custom_copy);
+
+            const result = try customizations.getOrPut(allocator, custom_copy.name);
+            if (result.found_existing) {
+                try mergeToolCustomization(allocator, result.value_ptr, &custom_copy);
+                freeToolCustomization(allocator, &custom_copy);
+            } else {
                 result.value_ptr.* = custom_copy;
             }
         }
 
-        // Load customizations from external file if specified
         if (customizations_file) |file_path| {
             var file_customizations = loadToolCustomizationsFromFile(allocator, file_path, workspace_dir) catch |err| {
                 log.warn("Failed to load tool customizations from file '{s}': {}", .{ file_path, err });
@@ -1595,73 +1699,103 @@ pub const Agent = struct {
             defer {
                 var iter = file_customizations.iterator();
                 while (iter.next()) |entry| {
-                    if (entry.value_ptr.system_prompt) |sp| allocator.free(sp);
-                    if (entry.value_ptr.triggers.len > 0) {
-                        for (entry.value_ptr.triggers) |t| allocator.free(t);
-                        allocator.free(entry.value_ptr.triggers);
-                    }
+                    freeToolCustomization(allocator, entry.value_ptr);
                 }
                 file_customizations.deinit(allocator);
             }
 
-            // Merge file customizations with config customizations
             var iter = file_customizations.iterator();
             while (iter.next()) |entry| {
-                // Duplicate the key to avoid dangling pointer when file_customizations is deinit
-                const key_dupe = try allocator.dupe(u8, entry.key_ptr.*);
-                const result = try customizations.getOrPut(allocator, key_dupe);
-                if (!result.found_existing) {
-                    // Copy the customization and duplicate all allocated fields
-                    var custom_copy = entry.value_ptr.*;
-                    // Duplicate name to avoid dangling pointer
-                    custom_copy.name = key_dupe;
-                    // Duplicate triggers to avoid dangling pointers
-                    if (custom_copy.triggers.len > 0) {
-                        var triggers_copy: std.ArrayListUnmanaged([]const u8) = .empty;
-                        for (custom_copy.triggers) |t| {
-                            try triggers_copy.append(allocator, try allocator.dupe(u8, t));
-                        }
-                        custom_copy.triggers = try triggers_copy.toOwnedSlice(allocator);
-                    }
-                    // Duplicate system_prompt to avoid dangling pointer
-                    if (custom_copy.system_prompt) |sp| {
-                        custom_copy.system_prompt = try allocator.dupe(u8, sp);
-                    }
-                    // Duplicate skip_llm_tpl to avoid dangling pointer
-                    if (custom_copy.skip_llm_tpl) |tpl| {
-                        custom_copy.skip_llm_tpl = try allocator.dupe(u8, tpl);
-                    }
-                    result.value_ptr.* = custom_copy;
+                if (customizations.getPtr(entry.key_ptr.*)) |existing| {
+                    try mergeToolCustomization(allocator, existing, entry.value_ptr);
                 } else {
-                    // Free the duplicated key since we didn't use it
-                    allocator.free(key_dupe);
-                    // Merge triggers if both exist
-                    const existing = result.value_ptr;
-                    if (entry.value_ptr.triggers.len > 0) {
-                        const merged_triggers = try mergeAndDeduplicateStrings(allocator, existing.triggers, entry.value_ptr.triggers);
-                        if (existing.triggers.len > 0) allocator.free(existing.triggers);
-                        existing.triggers = merged_triggers;
-                    }
-                    // Override other fields if provided
-                    if (entry.value_ptr.system_prompt != null) {
-                        if (existing.system_prompt) |sp| allocator.free(sp);
-                        existing.system_prompt = try allocator.dupe(u8, entry.value_ptr.system_prompt.?);
-                    }
-                    if (entry.value_ptr.skip_llm_tpl != null) {
-                        if (existing.skip_llm_tpl) |tpl| allocator.free(tpl);
-                        existing.skip_llm_tpl = try allocator.dupe(u8, entry.value_ptr.skip_llm_tpl.?);
-                    }
-                    if (entry.value_ptr.priority > existing.priority) {
-                        existing.priority = entry.value_ptr.priority;
-                    }
-                    if (!entry.value_ptr.enabled) {
-                        existing.enabled = false;
-                    }
+                    var custom_copy = try dupeToolCustomization(allocator, entry.value_ptr.*);
+                    errdefer freeToolCustomization(allocator, &custom_copy);
+
+                    const result = try customizations.getOrPut(allocator, custom_copy.name);
+                    std.debug.assert(!result.found_existing);
+                    result.value_ptr.* = custom_copy;
                 }
             }
         }
 
         return customizations;
+    }
+
+    fn freeToolCustomization(
+        allocator: std.mem.Allocator,
+        custom: *const config_types.ToolCustomization,
+    ) void {
+        allocator.free(custom.name);
+        if (custom.system_prompt) |sp| allocator.free(sp);
+        if (custom.triggers.len > 0) {
+            for (custom.triggers) |trigger| allocator.free(trigger);
+            allocator.free(custom.triggers);
+        }
+        if (custom.skip_llm_tpl) |tpl| allocator.free(tpl);
+        if (custom.trigger_arguments) |args_json| allocator.free(args_json);
+    }
+
+    fn dupeToolCustomization(
+        allocator: std.mem.Allocator,
+        custom: config_types.ToolCustomization,
+    ) !config_types.ToolCustomization {
+        var triggers_copy: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (triggers_copy.items) |trigger| allocator.free(trigger);
+            triggers_copy.deinit(allocator);
+        }
+        for (custom.triggers) |trigger| {
+            try triggers_copy.append(allocator, try allocator.dupe(u8, trigger));
+        }
+
+        return .{
+            .name = try allocator.dupe(u8, custom.name),
+            .system_prompt = if (custom.system_prompt) |sp| try allocator.dupe(u8, sp) else null,
+            .triggers = try triggers_copy.toOwnedSlice(allocator),
+            .priority = custom.priority,
+            .enabled = custom.enabled,
+            .skip_llm_tpl = if (custom.skip_llm_tpl) |tpl| try allocator.dupe(u8, tpl) else null,
+            .trigger_arguments = if (custom.trigger_arguments) |args_json| try allocator.dupe(u8, args_json) else null,
+        };
+    }
+
+    fn mergeToolCustomization(
+        allocator: std.mem.Allocator,
+        existing: *config_types.ToolCustomization,
+        incoming: *const config_types.ToolCustomization,
+    ) !void {
+        if (incoming.triggers.len > 0) {
+            const merged_triggers = try mergeAndDeduplicateStrings(allocator, existing.triggers, incoming.triggers);
+            if (existing.triggers.len > 0) {
+                for (existing.triggers) |trigger| allocator.free(trigger);
+                allocator.free(existing.triggers);
+            }
+            existing.triggers = merged_triggers;
+        }
+
+        if (incoming.system_prompt) |sp| {
+            if (existing.system_prompt) |old_sp| allocator.free(old_sp);
+            existing.system_prompt = try allocator.dupe(u8, sp);
+        }
+
+        if (incoming.skip_llm_tpl) |tpl| {
+            if (existing.skip_llm_tpl) |old_tpl| allocator.free(old_tpl);
+            existing.skip_llm_tpl = try allocator.dupe(u8, tpl);
+        }
+
+        if (incoming.trigger_arguments) |args_json| {
+            if (existing.trigger_arguments) |old_args| allocator.free(old_args);
+            existing.trigger_arguments = try allocator.dupe(u8, args_json);
+        }
+
+        if (incoming.priority > existing.priority) {
+            existing.priority = incoming.priority;
+        }
+
+        if (!incoming.enabled) {
+            existing.enabled = false;
+        }
     }
 
     /// Load tool customizations from JSON file.
@@ -1677,7 +1811,7 @@ pub const Agent = struct {
             try std.fs.path.join(allocator, &.{ workspace_dir, file_path });
         defer allocator.free(full_path);
 
-        const file = try std.fs.openFileAbsolute(full_path, .{});
+        const file = try std_compat.fs.openFileAbsolute(full_path, .{});
         defer file.close();
 
         const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
@@ -1695,12 +1829,7 @@ pub const Agent = struct {
         errdefer {
             var iter = customizations.iterator();
             while (iter.next()) |entry| {
-                if (entry.value_ptr.system_prompt) |sp| allocator.free(sp);
-                if (entry.value_ptr.triggers.len > 0) {
-                    for (entry.value_ptr.triggers) |t| allocator.free(t);
-                    allocator.free(entry.value_ptr.triggers);
-                }
-                if (entry.value_ptr.skip_llm_tpl) |tpl| allocator.free(tpl);
+                freeToolCustomization(allocator, entry.value_ptr);
             }
             customizations.deinit(allocator);
         }
@@ -1714,8 +1843,7 @@ pub const Agent = struct {
 
             if (tool_obj.get("triggers")) |triggers_val| {
                 if (triggers_val == .array) {
-                    const triggers_array = triggers_val.array;
-                    for (triggers_array.items) |item| {
+                    for (triggers_val.array.items) |item| {
                         if (item == .string) {
                             try triggers_list.append(allocator, try allocator.dupe(u8, item.string));
                         }
@@ -1730,6 +1858,7 @@ pub const Agent = struct {
                 .priority = 0,
                 .enabled = true,
                 .skip_llm_tpl = null,
+                .trigger_arguments = null,
             };
 
             if (tool_obj.get("system_prompt")) |sp_val| {
@@ -1758,7 +1887,7 @@ pub const Agent = struct {
 
             if (tool_obj.get("trigger_arguments")) |tav| {
                 if (tav == .object) {
-                    custom.trigger_arguments = tav;
+                    custom.trigger_arguments = try std.json.Stringify.valueAlloc(allocator, tav, .{});
                 }
             }
 
@@ -1775,25 +1904,31 @@ pub const Agent = struct {
         b: []const []const u8,
     ) ![]const []const u8 {
         var merged: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (merged.items) |item| allocator.free(item);
+            merged.deinit(allocator);
+        }
 
         for (a) |item| {
-            try merged.append(allocator, item);
+            if (!containsString(merged.items, item)) {
+                try merged.append(allocator, try allocator.dupe(u8, item));
+            }
         }
 
         for (b) |item| {
-            var is_duplicate = false;
-            for (a) |existing| {
-                if (std.mem.eql(u8, existing, item)) {
-                    is_duplicate = true;
-                    break;
-                }
-            }
-            if (!is_duplicate) {
-                try merged.append(allocator, item);
+            if (!containsString(merged.items, item)) {
+                try merged.append(allocator, try allocator.dupe(u8, item));
             }
         }
 
         return merged.toOwnedSlice(allocator);
+    }
+
+    fn containsString(items: []const []const u8, needle: []const u8) bool {
+        for (items) |item| {
+            if (std.mem.eql(u8, item, needle)) return true;
+        }
+        return false;
     }
 
     /// Expand variables in default arguments JSON string.
@@ -1831,12 +1966,12 @@ pub const Agent = struct {
                 if (std.mem.eql(u8, var_name, "workspace_dir")) {
                     try result.appendSlice(allocator, workspace_dir);
                 } else if (std.mem.eql(u8, var_name, "timestamp")) {
-                    const ts = std.time.timestamp();
+                    const ts = std_compat.time.timestamp();
                     var buf: [32]u8 = undefined;
                     const str = try std.fmt.bufPrint(&buf, "{d}", .{ts});
                     try result.appendSlice(allocator, str);
                 } else if (std.mem.eql(u8, var_name, "date")) {
-                    const ts = std.time.timestamp();
+                    const ts = std_compat.time.timestamp();
                     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
                     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
                     const month_day = year_day.calculateMonthDay();
@@ -1848,7 +1983,7 @@ pub const Agent = struct {
                     });
                     try result.appendSlice(allocator, str);
                 } else if (std.mem.eql(u8, var_name, "time")) {
-                    const ts = std.time.timestamp();
+                    const ts = std_compat.time.timestamp();
                     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
                     const day = epoch_seconds.getDaySeconds();
                     var buf: [16]u8 = undefined;
@@ -1882,6 +2017,30 @@ pub const Agent = struct {
         return try result.toOwnedSlice(allocator);
     }
 
+    fn buildTriggerArgumentsJson(
+        allocator: std.mem.Allocator,
+        trigger_arguments: ?[]const u8,
+        args_key: ?[]const u8,
+        workspace_dir: []const u8,
+    ) ![]const u8 {
+        const raw_args = trigger_arguments orelse return allocator.dupe(u8, "{}");
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_args, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .object) {
+            return allocator.dupe(u8, "{}");
+        }
+
+        const key_to_use = args_key orelse "default";
+        const args_value = parsed.value.object.get(key_to_use) orelse parsed.value.object.get("default") orelse {
+            return allocator.dupe(u8, "{}");
+        };
+
+        const json_str = try std.json.Stringify.valueAlloc(allocator, args_value, .{});
+        defer allocator.free(json_str);
+        return expandDefaultArguments(allocator, json_str, workspace_dir);
+    }
+
     fn execBlockMessage(self: *Agent, args: std.json.ObjectMap) ?[]const u8 {
         return commands.execBlockMessage(self, args);
     }
@@ -1889,7 +2048,8 @@ pub const Agent = struct {
     pub fn formatModelStatus(self: *const Agent) ![]const u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
 
         try w.print("Current model: {s}\n", .{self.model_name});
         try w.print("Default model: {s}\n", .{self.default_model});
@@ -1991,7 +2151,7 @@ pub const Agent = struct {
             }
         }
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
         if (self.model_routes.len > 0) {
             try w.writeAll("\nAuto routes:");
             for (self.model_routes) |route| {
@@ -2029,6 +2189,7 @@ pub const Agent = struct {
         }
 
         try w.writeAll("\nSwitch: /model <name>");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2149,7 +2310,6 @@ pub const Agent = struct {
         const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
         defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
 
-        // Check for tool trigger keywords and handle exact/priority matching
         var processed_user_message: []const u8 = effective_user_message;
         var processed_user_message_owned = false;
         defer if (processed_user_message_owned) self.allocator.free(processed_user_message);
@@ -2175,36 +2335,31 @@ pub const Agent = struct {
                     if (!custom.enabled or custom.triggers.len == 0) continue;
 
                     for (custom.triggers) |kw| {
-                    const parsed = parseTriggerKeyword(kw);
-                    const keyword_part = parsed.keyword;
-                    if (ci.len == keyword_part.len) {
-                        var is_match = true;
-                        for (ci, 0..) |c, i| {
-                            // For ASCII characters, use case-insensitive comparison
-                            // For non-ASCII (like Chinese), use exact comparison
-                            if (std.ascii.isAscii(c) and std.ascii.isAscii(keyword_part[i])) {
-                                if (std.ascii.toLower(c) != std.ascii.toLower(keyword_part[i])) {
-                                    is_match = false;
-                                    break;
-                                }
-                            } else {
-                                // For non-ASCII characters, use exact byte comparison
-                                if (c != keyword_part[i]) {
+                        const parsed = parseTriggerKeyword(kw);
+                        const keyword_part = parsed.keyword;
+                        if (ci.len == keyword_part.len) {
+                            var is_match = true;
+                            for (ci, 0..) |c, i| {
+                                if (std.ascii.isAscii(c) and std.ascii.isAscii(keyword_part[i])) {
+                                    if (std.ascii.toLower(c) != std.ascii.toLower(keyword_part[i])) {
+                                        is_match = false;
+                                        break;
+                                    }
+                                } else if (c != keyword_part[i]) {
                                     is_match = false;
                                     break;
                                 }
                             }
-                        }
-                        if (is_match) {
-                            if (verbose_mod.isVerbose()) {
-                                log.debug("exact trigger match: tool={s}, keyword='{s}'", .{ custom.name, kw });
+                            if (is_match) {
+                                if (verbose_mod.isVerbose()) {
+                                    log.debug("exact trigger match: tool={s}, keyword='{s}'", .{ custom.name, kw });
+                                }
+                                exact_match_tool = custom.name;
+                                exact_match_args_key = parsed.args_key;
+                                break;
                             }
-                            exact_match_tool = custom.name;
-                            exact_match_args_key = parsed.args_key;
-                            break;
                         }
                     }
-                }
                     if (exact_match_tool != null) break;
                 }
 
@@ -2249,30 +2404,18 @@ pub const Agent = struct {
                     if (find_tool_by_name(self.tools, tn)) |tool| {
                         const custom = self.tool_customizations.get(tn);
 
-                        // Build arguments from trigger_arguments
                         const args_json: []const u8 = if (custom) |c| blk: {
-                            if (c.trigger_arguments) |ta| {
-                                if (ta == .object) {
-                                    // Use args_key from trigger match, or "default" if not specified
-                                    const key_to_use = exact_match_args_key orelse "default";
-                                    if (ta.object.get(key_to_use)) |args_val| {
-                                        const json_str = std.json.Stringify.valueAlloc(self.allocator, args_val, .{}) catch null;
-                                        if (json_str) |js| {
-                                            const expanded = expandDefaultArguments(self.allocator, js, self.workspace_dir) catch null;
-                                            self.allocator.free(js);
-                                            if (expanded) |exp| {
-                                                defer self.allocator.free(exp);
-                                                break :blk try self.allocator.dupe(u8, exp);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            break :blk try self.allocator.dupe(u8, "{}");
+                            break :blk buildTriggerArgumentsJson(
+                                self.allocator,
+                                c.trigger_arguments,
+                                exact_match_args_key,
+                                self.workspace_dir,
+                            ) catch {
+                                return try self.allocator.dupe(u8, "Invalid trigger arguments configuration");
+                            };
                         } else try self.allocator.dupe(u8, "{}");
                         defer self.allocator.free(args_json);
 
-                        // Execute tool
                         var arena = std.heap.ArenaAllocator.init(self.allocator);
                         defer arena.deinit();
                         const tool_arena = arena.allocator();
@@ -2298,14 +2441,12 @@ pub const Agent = struct {
                             return err_msg;
                         };
 
-                        // Copy output from arena to self.allocator since arena will be freed
                         const output = if (result.success) 
                             try self.allocator.dupe(u8, result.output)
                         else 
                             try self.allocator.dupe(u8, result.error_msg orelse result.output);
                         defer self.allocator.free(output);
 
-                        // Apply skip_llm_tpl if configured
                         const final_output: []const u8 = if (custom) |c| blk2: {
                             if (c.skip_llm_tpl) |tpl| {
                                 var output_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -2326,7 +2467,6 @@ pub const Agent = struct {
                             break :blk2 try self.allocator.dupe(u8, output);
                         } else try self.allocator.dupe(u8, output);
 
-                        // Save to history so LLM knows what happened
                         try self.history.append(self.allocator, .{
                             .role = .user,
                             .content = try self.allocator.dupe(u8, effective_user_message),
@@ -2336,21 +2476,18 @@ pub const Agent = struct {
                             .content = try self.allocator.dupe(u8, final_output),
                         });
 
-                        // Auto-save tool result to memory for future context
                         if (self.auto_save) {
                             if (self.mem) |mem| {
-                                const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                                const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_tool_{d}", .{ts}) catch null;
                                 if (save_key) |key| {
                                     defer self.allocator.free(key);
-                                    // Store both the trigger and the tool result
                                     const tool_result_msg = try std.fmt.allocPrint(self.allocator, "Tool '{s}' executed: {s}", .{ tn, final_output });
                                     defer self.allocator.free(tool_result_msg);
-                                    
+
                                     if (mem.store(key, tool_result_msg, .conversation, self.memory_session_id)) |_| {
-                                        // Vector sync after auto-save
                                         if (self.mem_rt) |rt| {
-                                            rt.syncVectorAfterStore(self.allocator, key, tool_result_msg);
+                                            rt.syncVectorAfterStore(self.allocator, key, tool_result_msg, self.memory_session_id);
                                         }
                                     } else |_| {}
                                 }
@@ -2361,10 +2498,9 @@ pub const Agent = struct {
                             log.debug("exact trigger match: tool={s}", .{ tn });
                         }
 
-                        // Print output to console (since cli.zig may skip printing for streaming)
                         if (!builtin.is_test) {
                             var out_buf: [4096]u8 = undefined;
-                            var bw = std.fs.File.stdout().writer(&out_buf);
+                            var bw = std_compat.fs.File.stdout().writer(&out_buf);
                             const w = &bw.interface;
                             w.print("{s}\n", .{final_output}) catch {};
                             w.flush() catch {};
@@ -2373,7 +2509,6 @@ pub const Agent = struct {
                         return final_output;
                     }
                 } else if (priority_tool) |pn| {
-                    // Priority tool: inject hint into message
                     const processed = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
                     processed_user_message = processed;
                     processed_user_message_owned = true;
@@ -2381,8 +2516,17 @@ pub const Agent = struct {
             }
         }
 
+        var cfg_for_prompt_opt: ?Config = Config.load(self.allocator) catch null;
+        defer if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded.deinit();
+        const cfg_for_prompt_ptr: ?*const Config = if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded else null;
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(
+            self.allocator,
+            self.workspace_dir,
+            self.bootstrap,
+            if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+        ) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
         }
@@ -2395,17 +2539,18 @@ pub const Agent = struct {
         }
 
         const turn_has_conversation_context = self.conversation_context != null;
+        const turn_conversation_context_fingerprint = if (self.conversation_context) |ctx|
+            ctx.senderFingerprint()
+        else
+            null;
         const conversation_context_changed = self.has_system_prompt and
-            self.system_prompt_has_conversation_context != turn_has_conversation_context;
+            (self.system_prompt_has_conversation_context != turn_has_conversation_context or
+                self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
 
         if (!self.has_system_prompt or conversation_context_changed) {
-            var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
-            defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
-            const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
-
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
-                cfg_for_caps_ptr,
+                cfg_for_prompt_ptr,
                 self.tools,
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
@@ -2414,10 +2559,28 @@ pub const Agent = struct {
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
                 .tools = self.tools,
+                .timezone = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC",
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
+                .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+                .observer = self.observer,
             });
+            const final_system = if (self.profile_system_prompt) |profile_prompt|
+                if (profile_prompt.len > 0) blk: {
+                    defer self.allocator.free(full_system);
+                    break :blk try std.fmt.allocPrint(
+                        self.allocator,
+                        "## Agent Profile\n\nProfile: {s}\n\n{s}\n\n{s}",
+                        .{
+                            self.profile_name orelse "custom",
+                            profile_prompt,
+                            full_system,
+                        },
+                    );
+                } else full_system
+            else
+                full_system;
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -2425,21 +2588,22 @@ pub const Agent = struct {
                 self.history.items[0].deinit(self.allocator);
                 self.history.items[0] = .{
                     .role = .system,
-                    .content = full_system,
+                    .content = final_system,
                 };
             } else if (self.history.items.len > 0) {
                 try self.history.insert(self.allocator, 0, .{
                     .role = .system,
-                    .content = full_system,
+                    .content = final_system,
                 });
             } else {
                 try self.history.append(self.allocator, .{
                     .role = .system,
-                    .content = full_system,
+                    .content = final_system,
                 });
             }
             self.has_system_prompt = true;
             self.system_prompt_has_conversation_context = turn_has_conversation_context;
+            self.system_prompt_conversation_context_fingerprint = turn_conversation_context_fingerprint;
             self.workspace_prompt_fingerprint = workspace_fp;
             if (self.system_prompt_model_name) |cached_model| self.allocator.free(cached_model);
             self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
@@ -2448,14 +2612,14 @@ pub const Agent = struct {
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
             if (self.mem) |mem| {
-                const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
                     if (mem.store(key, effective_user_message, .conversation, self.memory_session_id)) |_| {
                         // Vector sync after auto-save
                         if (self.mem_rt) |rt| {
-                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message);
+                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message, self.memory_session_id);
                         }
                     } else |_| {}
                 }
@@ -2468,12 +2632,9 @@ pub const Agent = struct {
             try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, processed_user_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, processed_user_message);
-        errdefer self.allocator.free(enriched);
 
-        try self.history.append(self.allocator, .{
-            .role = .user,
-            .content = enriched,
-        });
+        // Keep the user message retained even if provider/tool steps fail.
+        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
 
         // ── Response cache check ──
         if (self.response_cache) |rc| {
@@ -2496,14 +2657,6 @@ pub const Agent = struct {
             }
         }
 
-        // Record agent event
-        const start_event = ObserverEvent{ .llm_request = .{
-            .provider = self.provider.getName(),
-            .model = turn_model_name,
-            .messages_count = self.history.items.len,
-        } };
-        self.observer.recordEvent(&start_event);
-
         const turn_token_limit = context_tokens.resolveContextTokens(self.token_limit_override, turn_model_name);
         const turn_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(self.max_tokens_override, turn_model_name);
         const turn_token_limit_cap: u32 = @intCast(@min(turn_token_limit, @as(u64, std.math.maxInt(u32))));
@@ -2515,6 +2668,9 @@ pub const Agent = struct {
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
+        var empty_response_retry_count: u32 = 0;
+        var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
+        defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
@@ -2526,9 +2682,10 @@ pub const Agent = struct {
             // Build messages slice for provider (arena-owned; freed at end of iteration)
             const messages = try self.buildProviderMessages(arena, turn_model_name);
 
-            const timer_start = std.time.milliTimestamp();
+            const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
             const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
@@ -2542,33 +2699,30 @@ pub const Agent = struct {
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
+            providers.clearLastApiErrorDetail();
             if (is_streaming) {
+                self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
                     self.allocator,
                     .{
                         .messages = messages,
+                        .session_id = self.memory_session_id,
                         .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
                 ) catch |err| retry_stream: {
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-                    const fail_event = ObserverEvent{ .llm_response = .{
-                        .provider = self.provider.getName(),
-                        .model = turn_model_name,
-                        .duration_ms = fail_duration,
-                        .success = false,
-                        .error_message = @errorName(err),
-                    } };
-                    self.observer.recordEvent(&fail_event);
+                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
+                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
@@ -2584,17 +2738,20 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, true);
                         break :retry_stream self.provider.streamChat(
                             self.allocator,
                             .{
                                 .messages = retry_msgs,
+                                .session_id = self.memory_session_id,
                                 .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -2613,36 +2770,33 @@ pub const Agent = struct {
                 };
                 response = ChatResponse{
                     .content = stream_result.content,
+                    .reasoning_content = stream_result.reasoning_content,
                     .tool_calls = &.{},
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                 };
             } else {
+                self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
                 response = self.provider.chat(
                     self.allocator,
                     .{
                         .messages = messages,
+                        .session_id = self.memory_session_id,
                         .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-                    const fail_event = ObserverEvent{ .llm_response = .{
-                        .provider = self.provider.getName(),
-                        .model = turn_model_name,
-                        .duration_ms = fail_duration,
-                        .success = false,
-                        .error_message = @errorName(err),
-                    } };
-                    self.observer.recordEvent(&fail_event);
+                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
+                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
@@ -2658,17 +2812,20 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = retry_msgs,
+                                .session_id = self.memory_session_id,
                                 .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -2694,17 +2851,20 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = recovery_msgs,
+                                .session_id = self.memory_session_id,
                                 .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = recovery_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -2715,20 +2875,29 @@ pub const Agent = struct {
                         };
                     }
 
+                    if (self.routeShouldBeDegraded(err)) {
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
+                        self.emitUsageFailure(turn_model_name);
+                        return err;
+                    }
+
                     // Retry once
-                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    std_compat.thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
+                    self.recordLlmRequestEvent(turn_model_name, messages);
                     self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
                     break :retry_blk self.provider.chat(
                         self.allocator,
                         .{
                             .messages = messages,
+                            .session_id = self.memory_session_id,
                             .model = turn_model_name,
                             .temperature = self.temperature,
                             .max_tokens = request_max_tokens,
                             .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
+                            .include_reasoning = include_reasoning,
                         },
                         turn_model_name,
                         self.temperature,
@@ -2745,17 +2914,20 @@ pub const Agent = struct {
                                 turn_max_tokens,
                             );
                             response_attempt = 3;
+                            self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
                             self.logLlmRequest(iteration + 1, 3, turn_model_name, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
                                     .messages = recovery_msgs,
+                                    .session_id = self.memory_session_id,
                                     .model = turn_model_name,
                                     .temperature = self.temperature,
                                     .max_tokens = recovery_max_tokens,
                                     .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
+                                    .include_reasoning = include_reasoning,
                                 },
                                 turn_model_name,
                                 self.temperature,
@@ -2773,15 +2945,7 @@ pub const Agent = struct {
             }
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
-            const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-            const resp_event = ObserverEvent{ .llm_response = .{
-                .provider = self.provider.getName(),
-                .model = turn_model_name,
-                .duration_ms = duration_ms,
-                .success = true,
-                .error_message = null,
-            } };
-            self.observer.recordEvent(&resp_event);
+            const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
 
             const response_text = response.contentOrEmpty();
 
@@ -2801,6 +2965,11 @@ pub const Agent = struct {
 
             self.total_tokens += normalized_usage.total_tokens;
             self.last_turn_usage = normalized_usage;
+            if (normalized_usage.total_tokens > 0) {
+                const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_usage.total_tokens };
+                self.observer.recordMetric(&usage_metric);
+            }
+            self.recordLlmResponseEvent(turn_model_name, duration_ms, &response);
             self.emitUsageRecord(&response, true);
             const use_native = response.hasToolCalls();
 
@@ -2871,24 +3040,34 @@ pub const Agent = struct {
             const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
 
             if (parsed_calls.len == 0) {
+                const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
+
+                if (trimmed_display_text.len == 0) {
+                    self.freeResponseFields(&response);
+                    if (empty_response_retry_count < 1 and
+                        iteration + 1 < self.max_tool_iterations)
+                    {
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") });
+                        self.trimHistory();
+                        empty_response_retry_count += 1;
+                        continue;
+                    }
+                    return error.NoResponseContent;
+                }
+
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
-                if (!is_streaming and
-                    forced_follow_through_count < 2 and
+                // This applies in both streaming and non-streaming paths: the follow-up
+                // iteration will stream its own chunks independently.
+                if (forced_follow_through_count < 2 and
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
-                    try self.history.append(self.allocator, .{
-                        .role = .assistant,
-                        .content = try self.allocator.dupe(u8, display_text),
-                    });
-                    try self.history.append(self.allocator, .{
-                        .role = .user,
-                        .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
-                            "Do it in this turn by issuing the appropriate tool call(s). " ++
-                            "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt."),
-                    });
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.allocator.dupe(u8, display_text) });
+                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
+                        "Do it in this turn by issuing the appropriate tool call(s). " ++
+                        "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") });
                     self.trimHistory();
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
@@ -2924,14 +3103,14 @@ pub const Agent = struct {
                             while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
                             break :blk base_text[0..end];
                         } else base_text;
-                        const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                        const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                         const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
                         if (save_key) |key| {
                             defer self.allocator.free(key);
                             if (mem.store(key, summary, .conversation, self.memory_session_id)) |_| {
                                 // Vector sync after auto-save
                                 if (self.mem_rt) |rt| {
-                                    rt.syncVectorAfterStore(self.allocator, key, summary);
+                                    rt.syncVectorAfterStore(self.allocator, key, summary, self.memory_session_id);
                                 }
                             } else |_| {}
                         }
@@ -2971,7 +3150,7 @@ pub const Agent = struct {
             // so avoid writing arbitrary text that can corrupt the control channel.
             if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
-                var bw = std.fs.File.stdout().writer(&out_buf);
+                var bw = std_compat.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
                 w.print("{s}", .{display_text}) catch {};
                 w.flush() catch {};
@@ -2985,12 +3164,9 @@ pub const Agent = struct {
                 free_assistant_history = false;
                 break :blk assistant_history_content;
             } else try self.allocator.dupe(u8, assistant_history_content);
-            errdefer self.allocator.free(assistant_content);
 
-            try self.history.append(self.allocator, .{
-                .role = .assistant,
-                .content = assistant_content,
-            });
+            // Once appended, history owns the buffer.
+            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = assistant_content });
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -3019,17 +3195,29 @@ pub const Agent = struct {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
-                const tool_timer = std.time.milliTimestamp();
-                const result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
-                    ToolExecutionResult{
-                        .name = call.name,
-                        .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
-                        .success = true,
-                        .tool_call_id = call.tool_call_id,
+                const tool_timer = std_compat.time.milliTimestamp();
+                const result = blk: {
+                    if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
+                        break :blk ToolExecutionResult{
+                            .name = call.name,
+                            .output = cached_result.output,
+                            .success = cached_result.success,
+                            .tool_call_id = call.tool_call_id,
+                        };
                     }
-                else
-                    self.executeTool(arena, call);
-                const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+                    const executed_result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                        ToolExecutionResult{
+                            .name = call.name,
+                            .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
+                            .success = true,
+                            .tool_call_id = call.tool_call_id,
+                        }
+                    else
+                        self.executeTool(arena, call);
+                    rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
+                    break :blk executed_result;
+                };
+                const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
                     log.info(
@@ -3038,11 +3226,25 @@ pub const Agent = struct {
                     );
                 }
 
+                var tool_args_buf: [1024]u8 = undefined;
+                var tool_detail_buf: [1024]u8 = undefined;
+                const tool_args = if (self.log_llm_io)
+                    toolArgsObserverDetail(&tool_args_buf, call.arguments_json)
+                else
+                    null;
+                const tool_detail = if (self.log_llm_io) blk: {
+                    const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
+                    break :blk toolResultObserverDetail(&tool_detail_buf, scrubbed_output);
+                } else if (!result.success)
+                    result.output
+                else
+                    null;
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
                     .duration_ms = tool_duration,
                     .success = result.success,
-                    .detail = if (result.success) null else result.output,
+                    .args = tool_args,
+                    .detail = tool_detail,
                 } };
                 self.observer.recordEvent(&tool_event);
 
@@ -3095,11 +3297,14 @@ pub const Agent = struct {
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
+        const summary_timer_start = std_compat.time.milliTimestamp();
+        self.recordLlmRequestEvent(self.model_name, summary_messages);
         self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
             .{
                 .messages = summary_messages,
+                .session_id = self.memory_session_id,
                 .model = self.model_name,
                 .temperature = self.temperature,
                 .max_tokens = summary_max_tokens,
@@ -3109,16 +3314,42 @@ pub const Agent = struct {
             },
             self.model_name,
             self.temperature,
-        ) catch {
+        ) catch |err| {
+            const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
+            self.recordLlmFailureEvent(self.model_name, fail_duration, @errorName(err));
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
             return fallback;
         };
         self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
+        const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
+        const summary_text = summary_response.contentOrEmpty();
+        var normalized_summary_usage = summary_response.usage;
+        if (normalized_summary_usage.total_tokens == 0 and
+            (normalized_summary_usage.prompt_tokens > 0 or normalized_summary_usage.completion_tokens > 0))
+        {
+            normalized_summary_usage.total_tokens = normalized_summary_usage.prompt_tokens +| normalized_summary_usage.completion_tokens;
+        }
+        if (normalized_summary_usage.total_tokens == 0 and
+            normalized_summary_usage.prompt_tokens == 0 and
+            normalized_summary_usage.completion_tokens == 0 and
+            summary_text.len > 0)
+        {
+            normalized_summary_usage.completion_tokens = estimate_text_tokens(summary_text);
+            normalized_summary_usage.total_tokens = normalized_summary_usage.completion_tokens;
+        }
+        summary_response.usage = normalized_summary_usage;
+        self.total_tokens += normalized_summary_usage.total_tokens;
+        self.last_turn_usage = normalized_summary_usage;
+        if (normalized_summary_usage.total_tokens > 0) {
+            const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_summary_usage.total_tokens };
+            self.observer.recordMetric(&usage_metric);
+        }
+        self.recordLlmResponseEvent(self.model_name, summary_duration_ms, &summary_response);
+        self.emitUsageRecord(&summary_response, true);
         defer self.freeResponseFields(&summary_response);
 
-        const summary_text = summary_response.contentOrEmpty();
         const prefixed = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
         errdefer self.allocator.free(prefixed);
 
@@ -3148,7 +3379,10 @@ pub const Agent = struct {
     }
 
     fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
-        if (!std.mem.eql(u8, call.name, "file_write") and !std.mem.eql(u8, call.name, "file_edit")) return false;
+        if (!std.mem.eql(u8, call.name, "file_write") and
+            !std.mem.eql(u8, call.name, "file_append") and
+            !std.mem.eql(u8, call.name, "file_edit") and
+            !std.mem.eql(u8, call.name, "file_edit_hashed")) return false;
 
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{}) catch return false;
         defer parsed.deinit();
@@ -3191,6 +3425,76 @@ pub const Agent = struct {
         }
 
         return false;
+    }
+
+    fn toolCallDedupFingerprint(call: ParsedToolCall) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        if (call.tool_call_id) |tool_call_id| {
+            if (tool_call_id.len > 0) {
+                hasher.update("id:");
+                hasher.update(tool_call_id);
+                return hasher.final();
+            }
+        }
+
+        hasher.update("sig:");
+        hasher.update(call.name);
+        hasher.update("\n");
+        hasher.update(call.arguments_json);
+        return hasher.final();
+    }
+
+    const CachedToolCallResult = struct {
+        success: bool,
+        output: []const u8,
+    };
+
+    fn deinitSeenToolCallResults(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+    ) void {
+        var it = seen_tool_call_results.valueIterator();
+        while (it.next()) |cached_result| {
+            if (cached_result.output.len > 0) allocator.free(cached_result.output);
+        }
+        seen_tool_call_results.deinit(allocator);
+    }
+
+    fn cachedToolCallResultInTurn(
+        seen_tool_call_results: *const std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        call: ParsedToolCall,
+    ) ?CachedToolCallResult {
+        return seen_tool_call_results.get(toolCallDedupFingerprint(call));
+    }
+
+    fn rememberToolCallResultInTurn(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        call: ParsedToolCall,
+        result: ToolExecutionResult,
+    ) void {
+        // Only cache successful results, unless it's a native tool call with an ID.
+        // For ID-based calls, we must preserve the result (even if failed) to support
+        // exact replays requested by the provider.
+        // Signature-based calls (XML) that failed are not cached so they can be
+        // re-tried if a subsequent tool in the same turn fixes the environment.
+        const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
+        if (!result.success and !has_id) return;
+
+        const fingerprint = toolCallDedupFingerprint(call);
+        if (seen_tool_call_results.contains(fingerprint)) return;
+
+        const output_copy = if (result.output.len == 0)
+            ""
+        else
+            allocator.dupe(u8, result.output) catch return;
+
+        seen_tool_call_results.put(allocator, fingerprint, .{
+            .success = result.success,
+            .output = output_copy,
+        }) catch {
+            if (output_copy.len > 0) allocator.free(output_copy);
+        };
     }
 
     fn is_tools_markdown_path(path: []const u8) bool {
@@ -3301,6 +3605,8 @@ pub const Agent = struct {
                 defer tools_mod.process_util.setThreadInterruptFlag(null);
                 @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
+                const previous_memory_session_id = tools_mod.setThreadMemorySessionId(self.memory_session_id);
+                defer _ = tools_mod.setThreadMemorySessionId(previous_memory_session_id);
                 const result = t.execute(tool_allocator, args) catch |err| {
                     if (verbose_mod.isVerbose()) {
                         log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
@@ -3319,8 +3625,14 @@ pub const Agent = struct {
                     self.noteInterruptedTool(trimmed_call_name) catch {};
                 }
                 if (verbose_mod.isVerbose()) {
-                    const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
-                    log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
+                    if (result.success) {
+                        const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
+                        log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
+                    } else {
+                        const error_msg = result.error_msg orelse result.output;
+                        const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
+                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
+                    }
                 }
                 return .{
                     .name = call.name,
@@ -3341,11 +3653,161 @@ pub const Agent = struct {
 
     const LLM_LOG_MAX_BYTES: usize = 8192;
 
-    fn llmLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
-        if (text.len <= LLM_LOG_MAX_BYTES) {
-            return .{ .slice = text, .truncated = false };
+    fn previewText(text: []const u8, max_bytes: usize) TextPreview {
+        const preview = util.previewUtf8(text, max_bytes);
+        return .{
+            .slice = preview.slice,
+            .truncated = preview.truncated,
+        };
+    }
+
+    fn llmLogPreview(text: []const u8) TextPreview {
+        return previewText(text, LLM_LOG_MAX_BYTES);
+    }
+
+    test "previewText keeps UTF-8 intact when truncating" {
+        const preview = previewText("aaa\xd0\x99tail", 4);
+        try std.testing.expectEqualStrings("aaa", preview.slice);
+        try std.testing.expect(preview.truncated);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
+    }
+
+    fn llmRequestObserverDetail(buf: []u8, messages: []const ChatMessage) ?[]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        const max_messages = @min(messages.len, 6);
+        for (messages[0..max_messages], 0..) |msg, idx| {
+            const preview = previewText(msg.content, 240);
+            const parts_count: usize = if (msg.content_parts) |parts| parts.len else 0;
+            w.print(
+                "#{d} role={s} bytes={d} parts={d} content={f}{s}",
+                .{
+                    idx + 1,
+                    msg.role.toSlice(),
+                    msg.content.len,
+                    parts_count,
+                    std.json.fmt(preview.slice, .{}),
+                    if (preview.truncated) " [truncated]" else "",
+                },
+            ) catch break;
+            if (idx + 1 < max_messages) {
+                w.writeByte('\n') catch break;
+            }
         }
-        return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
+        if (messages.len > max_messages) {
+            w.print("\n... {d} more messages", .{messages.len - max_messages}) catch {};
+        }
+        const written = w.buffered();
+        if (written.len == 0) return null;
+        return written;
+    }
+
+    fn llmResponseObserverDetail(buf: []u8, response: *const ChatResponse) ?[]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+
+        const content = response.contentOrEmpty();
+        const content_preview = previewText(content, 400);
+        w.print(
+            "content_bytes={d} content={f}{s}",
+            .{
+                content.len,
+                std.json.fmt(content_preview.slice, .{}),
+                if (content_preview.truncated) " [truncated]" else "",
+            },
+        ) catch return null;
+
+        if (response.reasoning_content) |reasoning| {
+            const reasoning_preview = previewText(reasoning, 240);
+            w.print(
+                "\nreasoning_bytes={d} reasoning={f}{s}",
+                .{
+                    reasoning.len,
+                    std.json.fmt(reasoning_preview.slice, .{}),
+                    if (reasoning_preview.truncated) " [truncated]" else "",
+                },
+            ) catch {};
+        }
+
+        const max_tool_calls = @min(response.tool_calls.len, 4);
+        for (response.tool_calls[0..max_tool_calls], 0..) |tc, idx| {
+            const args_preview = previewText(tc.arguments, 200);
+            w.print(
+                "\ntool#{d} id={s} name={s} args={f}{s}",
+                .{
+                    idx + 1,
+                    if (tc.id.len > 0) tc.id else "-",
+                    tc.name,
+                    std.json.fmt(args_preview.slice, .{}),
+                    if (args_preview.truncated) " [truncated]" else "",
+                },
+            ) catch {};
+        }
+        if (response.tool_calls.len > max_tool_calls) {
+            w.print("\n... {d} more tool calls", .{response.tool_calls.len - max_tool_calls}) catch {};
+        }
+
+        const written = w.buffered();
+        if (written.len == 0) return null;
+        return written;
+    }
+
+    fn toolArgsObserverDetail(buf: []u8, arguments_json: []const u8) ?[]const u8 {
+        const preview = previewText(arguments_json, @min(buf.len, 512));
+        if (preview.slice.len == 0) return null;
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{f}{s}", .{
+            std.json.fmt(preview.slice, .{}),
+            if (preview.truncated) " [truncated]" else "",
+        }) catch return null;
+        return w.buffered();
+    }
+
+    fn toolResultObserverDetail(buf: []u8, output: []const u8) ?[]const u8 {
+        const preview = previewText(output, @min(buf.len, 512));
+        if (preview.slice.len == 0) return null;
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{f}{s}", .{
+            std.json.fmt(preview.slice, .{}),
+            if (preview.truncated) " [truncated]" else "",
+        }) catch return null;
+        return w.buffered();
+    }
+
+    fn recordLlmRequestEvent(self: *Agent, model_name: []const u8, messages: []const ChatMessage) void {
+        var detail_buf: [2048]u8 = undefined;
+        const event = ObserverEvent{ .llm_request = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .messages_count = messages.len,
+            .detail = if (self.log_llm_io) llmRequestObserverDetail(&detail_buf, messages) else null,
+        } };
+        self.observer.recordEvent(&event);
+    }
+
+    fn recordLlmResponseEvent(self: *Agent, model_name: []const u8, duration_ms: u64, response: *const ChatResponse) void {
+        var detail_buf: [2048]u8 = undefined;
+        const event = ObserverEvent{ .llm_response = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .duration_ms = duration_ms,
+            .success = true,
+            .error_message = null,
+            .prompt_tokens = response.usage.prompt_tokens,
+            .completion_tokens = response.usage.completion_tokens,
+            .total_tokens = response.usage.total_tokens,
+            .detail = if (self.log_llm_io) llmResponseObserverDetail(&detail_buf, response) else null,
+        } };
+        self.observer.recordEvent(&event);
+    }
+
+    fn recordLlmFailureEvent(self: *Agent, model_name: []const u8, duration_ms: u64, err_name: []const u8) void {
+        const event = ObserverEvent{ .llm_response = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .duration_ms = duration_ms,
+            .success = false,
+            .error_message = err_name,
+        } };
+        self.observer.recordEvent(&event);
     }
 
     fn logLlmRequest(
@@ -3397,8 +3859,10 @@ pub const Agent = struct {
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
+        const reasoning_returned = response.reasoning_content != null and response.reasoning_content.?.len > 0;
+        const reasoning_requested = self.reasoning_mode != .off;
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} reasoning_mode={s} reasoning_effort={s} reasoning_requested={} reasoning_returned={} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
@@ -3407,11 +3871,32 @@ pub const Agent = struct {
                 self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
+                self.reasoning_mode.toSlice(),
+                self.reasoning_effort orelse "off",
+                reasoning_requested,
+                reasoning_returned,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
                 if (preview.truncated) " [log preview truncated]" else "",
             },
         );
+
+        // NOTE: Logging-only path. No direct unit test added because verifying structured
+        // log emission here would require a log sink harness for Agent runtime logging.
+        if (reasoning_requested and !reasoning_returned) {
+            log.info(
+                "llm response reasoning missing session=0x{x} iter={d} attempt={d} provider={s} model={s} reasoning_mode={s} reasoning_effort={s}",
+                .{
+                    session_hash,
+                    iteration,
+                    attempt,
+                    self.effectiveProvider(response),
+                    self.effectiveModel(response),
+                    self.reasoning_mode.toSlice(),
+                    self.reasoning_effort orelse "off",
+                },
+            );
+        }
 
         if (response.reasoning_content) |reasoning| {
             const r_preview = llmLogPreview(reasoning);
@@ -3460,7 +3945,7 @@ pub const Agent = struct {
         const cb = self.usage_record_callback orelse return;
         const ctx = self.usage_record_ctx orelse return;
         cb(ctx, .{
-            .ts = std.time.timestamp(),
+            .ts = std_compat.time.timestamp(),
             .provider = self.effectiveProvider(response),
             .model = self.effectiveModel(response),
             .usage = response.usage,
@@ -3556,7 +4041,7 @@ pub const Agent = struct {
         dirs: *std.ArrayListUnmanaged([]const u8),
         raw_dir: []const u8,
     ) !void {
-        const trimmed = std.mem.trimRight(u8, raw_dir, "/\\");
+        const trimmed = std_compat.mem.trimRight(u8, raw_dir, "/\\");
         if (trimmed.len == 0) return;
 
         if (!containsMultimodalDir(dirs.items, trimmed)) {
@@ -3564,7 +4049,7 @@ pub const Agent = struct {
         }
 
         // Add canonical path variant too (/var <-> /private/var on macOS).
-        const canonical = std.fs.realpathAlloc(arena, trimmed) catch return;
+        const canonical = std_compat.fs.realpathAlloc(arena, trimmed) catch return;
         if (!containsMultimodalDir(dirs.items, canonical)) {
             try dirs.append(arena, canonical);
         }
@@ -3630,6 +4115,7 @@ pub const Agent = struct {
         self.history.items.len = 0;
         self.has_system_prompt = false;
         self.system_prompt_has_conversation_context = false;
+        self.system_prompt_conversation_context_fingerprint = null;
         self.workspace_prompt_fingerprint = null;
     }
 
@@ -4093,6 +4579,10 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
         fn supportsVisionForModel(_: *anyopaque, model: []const u8) bool {
             return std.mem.eql(u8, model, "vision-model");
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -4170,6 +4660,10 @@ test "Agent buildProviderMessages allows workspace image paths" {
         fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
             return true;
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -4178,15 +4672,15 @@ test "Agent buildProviderMessages allows workspace image paths" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
         .sub_path = "screen.png",
         .data = "\x89PNG\x0d\x0a\x1a\x0a",
     });
 
     const allocator = std.testing.allocator;
-    const workspace_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const workspace_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_path);
-    const image_path = try std.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
+    const image_path = try std_compat.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
     defer allocator.free(image_path);
 
     var dummy: u8 = 0;
@@ -4352,6 +4846,10 @@ fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy-test-provider";
         }
@@ -4394,6 +4892,80 @@ fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {
     return null;
 }
 
+const RecordingObserver = struct {
+    const Self = @This();
+
+    llm_request_count: usize = 0,
+    llm_response_count: usize = 0,
+    llm_failure_count: usize = 0,
+    tool_iterations_exhausted_count: usize = 0,
+    turn_complete_count: usize = 0,
+    tokens_used_metric_total: u64 = 0,
+    last_llm_response_total_tokens: ?u32 = null,
+    llm_request_message_counts: [8]usize = [_]usize{0} ** 8,
+    llm_request_message_counts_len: usize = 0,
+
+    const vtable = Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = getName,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
+    };
+
+    fn observer(self: *Self) Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn resolve(ptr: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        switch (event.*) {
+            .llm_request => |e| {
+                self.llm_request_count += 1;
+                if (self.llm_request_message_counts_len < self.llm_request_message_counts.len) {
+                    self.llm_request_message_counts[self.llm_request_message_counts_len] = e.messages_count;
+                    self.llm_request_message_counts_len += 1;
+                }
+            },
+            .llm_response => |e| {
+                self.llm_response_count += 1;
+                if (!e.success) self.llm_failure_count += 1;
+                self.last_llm_response_total_tokens = e.total_tokens;
+            },
+            .tool_iterations_exhausted => {
+                self.tool_iterations_exhausted_count += 1;
+            },
+            .turn_complete => {
+                self.turn_complete_count += 1;
+            },
+            else => {},
+        }
+    }
+
+    fn recordMetric(ptr: *anyopaque, metric: *const observability.ObserverMetric) void {
+        const self = resolve(ptr);
+        switch (metric.*) {
+            .tokens_used => |v| self.tokens_used_metric_total += v,
+            else => {},
+        }
+    }
+
+    fn flush(_: *anyopaque) void {}
+
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+    fn getName(_: *anyopaque) []const u8 {
+        return "recording-test";
+    }
+};
+
 test "Agent.fromConfig resolves token limit from model lookup when unset" {
     const allocator = std.testing.allocator;
     var cfg = Config{
@@ -4432,6 +5004,117 @@ test "Agent.fromConfig keeps explicit token_limit override" {
 
     try std.testing.expectEqual(@as(u64, 64_000), agent.token_limit);
     try std.testing.expectEqual(@as(?u64, 64_000), agent.token_limit_override);
+}
+
+test "Agent.fromConfigWithProfile applies named profile defaults" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_provider = "openrouter",
+        .default_model = "openrouter/default-model",
+        .allocator = allocator,
+        .model_routes = &.{
+            .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
+        },
+    };
+
+    const profile = config_types.NamedAgentConfig{
+        .name = "coder",
+        .provider = "ollama",
+        .model = "qwen2.5-coder:14b",
+        .system_prompt = "You are a coding specialist.",
+        .temperature = 0.2,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, undefined, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", agent.model_name);
+    try std.testing.expectEqualStrings("ollama", agent.default_provider);
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", agent.default_model);
+    try std.testing.expectEqualStrings("coder", agent.profile_name.?);
+    try std.testing.expectEqualStrings("You are a coding specialist.", agent.profile_system_prompt.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), agent.temperature, 0.000001);
+    try std.testing.expectEqual(@as(usize, 0), agent.model_routes.len);
+}
+
+test "turn prepends profile system prompt when profile is active" {
+    const CaptureProvider = struct {
+        captured_system: ?[]const u8 = null,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.messages.len > 0 and request.messages[0].role == .system) {
+                self.captured_system = request.messages[0].content;
+            }
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "capture-profile-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CaptureProvider.chatWithSystem,
+        .chat = CaptureProvider.chat,
+        .supportsNativeTools = CaptureProvider.supportsNativeTools,
+        .getName = CaptureProvider.getName,
+        .deinit = CaptureProvider.deinitFn,
+    };
+    var provider_state = CaptureProvider{};
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_provider = "openrouter",
+        .default_model = "openrouter/default-model",
+        .allocator = allocator,
+    };
+    const profile = config_types.NamedAgentConfig{
+        .name = "coder",
+        .provider = "openrouter",
+        .model = "openrouter/coder-model",
+        .system_prompt = "You are a coding specialist.",
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expect(provider_state.captured_system != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_state.captured_system.?, "You are a coding specialist.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_state.captured_system.?, "Profile: coder") != null);
 }
 
 test "Agent.fromConfig resolves max_tokens from provider lookup when unset" {
@@ -4852,6 +5535,10 @@ test "turn bare /new routes through fresh-session prompt" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "echo-provider";
         }
@@ -4924,6 +5611,10 @@ test "turn /reset with argument stays slash-only command" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "nocall-provider";
         }
@@ -4974,6 +5665,321 @@ test "turn /reset with argument stays slash-only command" {
     try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
 }
 
+test "turn retains user message on provider error" {
+    const FailProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ProviderFailed;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "fail-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = FailProvider.chatWithSystem,
+        .chat = FailProvider.chat,
+        .supportsNativeTools = FailProvider.supportsNativeTools,
+        .getName = FailProvider.getName,
+        .deinit = FailProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrFromInt(1), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    // Seed a system prompt so turn() does not rebuild it (which can load
+    // user config and introduce non-deterministic side effects in tests).
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+
+    try std.testing.expectError(error.ProviderFailed, agent.turn("hello"));
+    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+    try std.testing.expectEqualStrings("hello", agent.history.items[1].content);
+
+    // Should not double-free when clearing history after a failed turn.
+    agent.clearHistory();
+    try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
+}
+
+test "turn does not retry immediately on rate limit" {
+    const RateLimitedProvider = struct {
+        const State = struct {
+            calls: u32 = 0,
+        };
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            return error.RateLimited;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "rate-limited-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RateLimitedProvider.chatWithSystem,
+        .chat = RateLimitedProvider.chat,
+        .supportsNativeTools = RateLimitedProvider.supportsNativeTools,
+        .getName = RateLimitedProvider.getName,
+        .deinit = RateLimitedProvider.deinitFn,
+    };
+    var state = RateLimitedProvider.State{};
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+
+    try std.testing.expectError(error.RateLimited, agent.turn("hello"));
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+}
+
+test "turn still retries non-rate-limited provider failures once" {
+    const RetryProvider = struct {
+        const State = struct {
+            calls: u32 = 0,
+        };
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            return error.ProviderFailed;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "retry-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RetryProvider.chatWithSystem,
+        .chat = RetryProvider.chat,
+        .supportsNativeTools = RetryProvider.supportsNativeTools,
+        .getName = RetryProvider.getName,
+        .deinit = RetryProvider.deinitFn,
+    };
+    var state = RetryProvider.State{};
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    providers.clearLastApiErrorDetail();
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    defer providers.clearLastApiErrorDetail();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+
+    try std.testing.expectError(error.ProviderFailed, agent.turn("hello"));
+    try std.testing.expectEqual(@as(u32, 2), state.calls);
+}
+
+test "turn records llm request for immediate context-compaction retry" {
+    const RecoveryProvider = struct {
+        const State = struct {
+            calls: u32 = 0,
+        };
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            if (state.calls == 1) return error.ContextLengthExceeded;
+            return .{
+                .content = try allocator.dupe(u8, "recovered"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "recovery-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = RecoveryProvider.State{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RecoveryProvider.chatWithSystem,
+        .chat = RecoveryProvider.chat,
+        .supportsNativeTools = RecoveryProvider.supportsNativeTools,
+        .getName = RecoveryProvider.getName,
+        .deinit = RecoveryProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var observer = RecordingObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+    for (0..7) |idx| {
+        const content = try std.fmt.allocPrint(allocator, "m{d}", .{idx});
+        try agent.history.append(allocator, .{
+            .role = if (idx % 2 == 0) .user else .assistant,
+            .content = content,
+        });
+    }
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "[Context compacted]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "recovered") != null);
+    try std.testing.expectEqual(@as(u32, 2), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.llm_failure_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_message_counts_len);
+    try std.testing.expect(observer.llm_request_message_counts[1] < observer.llm_request_message_counts[0]);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+}
+
 test "slash /help returns help text" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -4986,6 +5992,8 @@ test "slash /help returns help text" {
     try std.testing.expect(std.mem.indexOf(u8, response, "/help") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "/status") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "/model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/tasks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/poll") != null);
 }
 
 test "slash /commands aliases to help" {
@@ -5087,6 +6095,7 @@ test "slash /model with telegram bot mention switches model" {
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.default_model);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
 }
 
@@ -5101,7 +6110,31 @@ test "slash /model resolves provider max_tokens fallback" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
+}
+
+test "slash /model preserves custom provider prefix when switching explicit provider model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.max_tokens = 111;
+
+    const response = (try agent.handleSlashCommand(
+        "/model custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+    )).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model") != null);
+    try std.testing.expectEqualStrings(
+        "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+        agent.model_name,
+    );
+    try std.testing.expectEqualStrings(
+        "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+        agent.default_model,
+    );
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/proxy/v1/openai/v2", agent.default_provider);
 }
 
 test "slash /model keeps explicit token_limit override" {
@@ -5338,14 +6371,14 @@ test "auto route selection benchmark stays below visible overhead" {
     };
 
     const iterations: usize = 50_000;
-    var timer = try std.time.Timer.start();
+    const start_ns = std_compat.time.nanoTimestamp();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const hint = agent.selectRouteHintForTurn("show current status");
         try std.testing.expect(hint != null);
         try std.testing.expectEqualStrings("fast", hint.?);
     }
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(std_compat.time.nanoTimestamp() - start_ns);
     const avg_ns = elapsed_ns / iterations;
 
     // Heuristic routing should stay far below human-visible latency.
@@ -5431,6 +6464,94 @@ test "slash /model without name shows current" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
+}
+
+test "slash /model renders interactive choices for telegram sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
+}
+
+test "slash /model provider renders interactive model choices for selected provider" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model provider anthropic")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model with a single configured provider renders models directly" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model renders interactive choices for routed slack sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "agent:slack-ops:main";
+    agent.conversation_context = .{ .channel = "slack" };
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
 }
 
 test "slash /models aliases to /model" {
@@ -5810,6 +6931,10 @@ test "hard stop mock interruption lists exactly interrupted tool" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "one-shot-tool-provider";
         }
@@ -5824,9 +6949,9 @@ test "hard stop mock interruption lists exactly interrupted tool" {
     const InterruptWorker = struct {
         fn run(ctx: *InterruptCtx) void {
             while (!ctx.started.load(.acquire)) {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std_compat.thread.sleep(10 * std.time.ns_per_ms);
             }
-            std.Thread.sleep(80 * std.time.ns_per_ms);
+            std_compat.thread.sleep(80 * std.time.ns_per_ms);
             ctx.agent.requestInterrupt();
         }
     };
@@ -5980,6 +7105,10 @@ test "turn includes reasoning and usage footer when enabled" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6024,7 +7153,7 @@ test "turn includes reasoning and usage footer when enabled" {
     const response = try agent.turn("hello");
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\n> thinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
 }
@@ -6048,6 +7177,10 @@ test "turn estimates token usage when provider omits usage" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6116,6 +7249,10 @@ test "turn refreshes system prompt after workspace markdown change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6128,12 +7265,12 @@ test "turn refreshes system prompt after workspace markdown change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll("SOUL-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6174,7 +7311,7 @@ test "turn refreshes system prompt after workspace markdown change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("SOUL-V2-UPDATED");
     }
@@ -6203,6 +7340,10 @@ test "turn refreshes system prompt after TOOLS.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6215,12 +7356,12 @@ test "turn refreshes system prompt after TOOLS.md change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("TOOLS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("TOOLS.md", .{});
         defer f.close();
         try f.writeAll("TOOLS-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6261,7 +7402,7 @@ test "turn refreshes system prompt after TOOLS.md change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "TOOLS-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("TOOLS.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("TOOLS.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("TOOLS-V2-UPDATED");
     }
@@ -6290,6 +7431,10 @@ test "turn refreshes system prompt after USER.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6302,12 +7447,12 @@ test "turn refreshes system prompt after USER.md change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("- **Name:** USER-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6348,7 +7493,7 @@ test "turn refreshes system prompt after USER.md change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "USER-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("- **Name:** USER-V2-UPDATED");
     }
@@ -6356,6 +7501,102 @@ test "turn refreshes system prompt after USER.md change" {
     const second = try agent.turn("second");
     defer allocator.free(second);
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "USER-V2-UPDATED") != null);
+}
+
+test "turn refreshes system prompt when conversation sender changes" {
+    const ReloadProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "reload-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReloadProvider.chatWithSystem,
+        .chat = ReloadProvider.chat,
+        .supportsNativeTools = ReloadProvider.supportsNativeTools,
+        .getName = ReloadProvider.getName,
+        .deinit = ReloadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace,
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    agent.conversation_context = .{
+        .channel = "discord",
+        .sender_id = "user-1",
+        .sender_username = "alpha",
+        .sender_display_name = "Alpha",
+        .group_id = "guild-1",
+        .is_group = true,
+    };
+    const first = try agent.turn("first");
+    defer allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender Discord ID: user-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender username: alpha") != null);
+
+    agent.conversation_context = .{
+        .channel = "discord",
+        .sender_id = "user-2",
+        .sender_username = "beta",
+        .sender_display_name = "Beta",
+        .group_id = "guild-1",
+        .is_group = true,
+    };
+    const second = try agent.turn("second");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender Discord ID: user-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender username: beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender Discord ID: user-1") == null);
 }
 
 test "exec security deny blocks shell tool execution" {
@@ -6451,7 +7692,9 @@ test "slash additional commands are handled" {
         "/approve",
         "/poll",
         "/subagents",
+        "/config reload",
         "/config get model",
+        "/skill reload",
         "/skill list",
     };
 
@@ -6489,9 +7732,9 @@ test "direct slash skill command resolves hyphenated skill name" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6503,14 +7746,14 @@ test "direct slash skill command resolves hyphenated skill name" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news-digest latest ai news")).?;
@@ -6525,9 +7768,9 @@ test "direct slash skill command resolves two-word alias to hyphenated skill" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6539,14 +7782,14 @@ test "direct slash skill command resolves two-word alias to hyphenated skill" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -6561,9 +7804,9 @@ test "direct slash skill command does not collapse token boundaries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6575,14 +7818,14 @@ test "direct slash skill command does not collapse token boundaries" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = try agent.handleSlashCommand("/newsdigest latest ai news");
@@ -6594,10 +7837,10 @@ test "direct slash skill command reports ambiguous normalized alias" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
-    try tmp.dir.makePath("skills/news_ digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news_ digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6609,12 +7852,12 @@ test "direct slash skill command reports ambiguous normalized alias" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
     {
-        const f = try tmp.dir.createFile("skills/news_ digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news_ digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6626,14 +7869,14 @@ test "direct slash skill command reports ambiguous normalized alias" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news_ digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news_ digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect other news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -6647,9 +7890,9 @@ test "direct slash skill command does not shadow built in doctor" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/doctor");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/doctor");
     {
-        const f = try tmp.dir.createFile("skills/doctor/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/doctor/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6661,14 +7904,14 @@ test "direct slash skill command does not shadow built in doctor" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/doctor/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/doctor/SKILL.md", .{});
         defer f.close();
         try f.writeAll("This should not shadow /doctor.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/doctor")).?;
@@ -6683,10 +7926,10 @@ test "direct slash skill command reports ambiguity between exact and composite m
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news");
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6698,12 +7941,12 @@ test "direct slash skill command reports ambiguity between exact and composite m
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news/SKILL.md", .{});
         defer f.close();
         try f.writeAll("General news skill body.");
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6715,20 +7958,62 @@ test "direct slash skill command reports ambiguity between exact and composite m
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Digest skill body.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "Ambiguous skill name") != null);
+}
+
+test "slash /skill reload invalidates prompt caches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/broken");
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/broken/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{ invalid json");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    agent.has_system_prompt = true;
+    agent.system_prompt_has_conversation_context = true;
+    agent.workspace_prompt_fingerprint = 1234;
+    agent.system_prompt_model_name = try allocator.dupe(u8, "openrouter/gpt-4o");
+
+    const response = (try agent.handleSlashCommand("/skill reload")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Skills reloaded") != null);
+    try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(!agent.system_prompt_has_conversation_context);
+    try std.testing.expect(agent.workspace_prompt_fingerprint == null);
+    try std.testing.expect(agent.system_prompt_model_name == null);
+}
+
+test "slash /config reload returns summary" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/config reload")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Config hot reload complete") != null);
 }
 
 test "Agent streaming fields default to null" {
@@ -6793,6 +8078,10 @@ test "turn passes auto-routed model to provider" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "capture-provider";
         }
@@ -6847,8 +8136,8 @@ test "turn passes auto-routed model to provider" {
 // Simulate by verifying the @max(0, ...) clamping logic.
 test "milliTimestamp negative difference clamps to zero" {
     // Simulate: timer_start is in the future relative to "now" (negative diff)
-    const timer_start = std.time.milliTimestamp() + 10_000;
-    const diff = std.time.milliTimestamp() - timer_start;
+    const timer_start = std_compat.time.milliTimestamp() + 10_000;
+    const diff = std_compat.time.milliTimestamp() - timer_start;
     // diff < 0 here; @max(0, diff) must clamp to 0 without panic
     const clamped = @max(0, diff);
     const duration: u64 = @as(u64, @intCast(clamped));
@@ -6860,9 +8149,14 @@ test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
 
     const calls_match = [_]ParsedToolCall{
         .{ .name = "file_write", .arguments_json = "{\"path\":\"TOOLS.md\",\"content\":\"x\"}" },
-        .{ .name = "file_edit", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"old_text\":\"a\",\"new_text\":\"b\"}" },
+        .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"target\":\"L1:abc\",\"new_text\":\"b\"}" },
     };
     try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
+
+    const calls_append_match = [_]ParsedToolCall{
+        .{ .name = "file_append", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"content\":\"\\nmore guidance\"}" },
+    };
+    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_append_match));
 
     const calls_no_match = [_]ParsedToolCall{
         .{ .name = "file_write", .arguments_json = "{\"path\":\"README.md\",\"content\":\"x\"}" },
@@ -6875,7 +8169,7 @@ test "should_skip_tools_memory_store_duplicate skips only tools-related memory_s
     const allocator = std.testing.allocator;
 
     const calls = [_]ParsedToolCall{
-        .{ .name = "file_edit", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"old_text\":\"old\",\"new_text\":\"new\"}" },
+        .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"target\":\"L4:def\",\"new_text\":\"new\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"pref.tools.file_read_over_cat\",\"content\":\"Always use file_read\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"user.nickname\",\"content\":\"DonPrus\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"session.note\",\"content\":\"Rule is documented in TOOLS.md\"}" },
@@ -6887,6 +8181,232 @@ test "should_skip_tools_memory_store_duplicate skips only tools-related memory_s
     try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[2]));
     try std.testing.expect(Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[3]));
     try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, false, calls[1]));
+}
+
+test "toolCallDedupFingerprint prefers tool_call_id over arguments" {
+    const call_a = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"pwd\"}",
+        .tool_call_id = "call_abc",
+    };
+    const call_b = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"ls\"}",
+        .tool_call_id = "call_abc",
+    };
+    try std.testing.expectEqual(Agent.toolCallDedupFingerprint(call_a), Agent.toolCallDedupFingerprint(call_b));
+}
+
+test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const call_a = ParsedToolCall{
+        .name = "memory_search",
+        .arguments_json = "{\"query\":\"hello\"}",
+        .tool_call_id = null,
+    };
+    const call_b = ParsedToolCall{
+        .name = "memory_search",
+        .arguments_json = "{\"query\":\"hello\"}",
+        .tool_call_id = null,
+    };
+    const call_c = ParsedToolCall{
+        .name = "memory_search",
+        .arguments_json = "{\"query\":\"world\"}",
+        .tool_call_id = null,
+    };
+
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_a) == null);
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, call_a, .{
+        .name = call_a.name,
+        .output = "first result",
+        .success = true,
+        .tool_call_id = null,
+    });
+
+    const cached_b = Agent.cachedToolCallResultInTurn(&seen, call_b).?;
+    try std.testing.expect(cached_b.success);
+    try std.testing.expectEqualStrings("first result", cached_b.output);
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_c) == null);
+}
+
+test "rememberToolCallResultInTurn preserves failed result for replayed tool_call_id" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const original_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"curl https://example.com\"}",
+        .tool_call_id = "call_retry_me",
+    };
+    const replayed_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"curl https://example.com --retry 2\"}",
+        .tool_call_id = "call_retry_me",
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, original_call, .{
+        .name = original_call.name,
+        .output = "Rate limit exceeded",
+        .success = false,
+        .tool_call_id = original_call.tool_call_id,
+    });
+
+    const cached_replay = Agent.cachedToolCallResultInTurn(&seen, replayed_call).?;
+    try std.testing.expect(!cached_replay.success);
+    try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
+}
+
+test "rememberToolCallResultInTurn skips failed signature-only calls" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const failed_call = ParsedToolCall{
+        .name = "file_read",
+        .arguments_json = "{\"path\":\"missing.txt\"}",
+        .tool_call_id = null,
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, .{
+        .name = failed_call.name,
+        .output = "FileNotFound",
+        .success = false,
+        .tool_call_id = null,
+    });
+
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call) == null);
+}
+
+test "Agent turn skips replayed tool_call_id across iterations" {
+    const ProbeTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "probe";
+        pub const tool_description = "probe";
+        pub const tool_params =
+            \\{"type":"object","properties":{"value":{"type":"number"}},"required":["value"]}
+        ;
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "probe ok" };
+        }
+    };
+
+    const ReplayProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count <= 2) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-replay-1"),
+                    .name = try allocator.dupe(u8, "probe"),
+                    .arguments = try allocator.dupe(u8, "{\"value\":1}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "replaying"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "replay-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = ReplayProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReplayProvider.chatWithSystem,
+        .chat = ReplayProvider.chat,
+        .supportsNativeTools = ReplayProvider.supportsNativeTools,
+        .getName = ReplayProvider.getName,
+        .deinit = ReplayProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var probe_count: usize = 0;
+    var probe_tool_impl = ProbeTool{ .count = &probe_count };
+    const tool_list = [_]Tool{probe_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 5,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run probe");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 1), probe_count);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
 }
 
 test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same batch" {
@@ -6974,6 +8494,10 @@ test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same b
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -7040,6 +8564,382 @@ test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same b
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
+test "Agent tool-limit summary preserves provider session_id" {
+    const NoopTool = struct {
+        const Self = @This();
+        pub const tool_name = "noop";
+        pub const tool_description = "noop";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "noop ok"),
+            };
+        }
+    };
+
+    const SessionCaptureProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+        summary_session_id: ?[]const u8 = null,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop"),
+                    .name = try allocator.dupe(u8, "noop"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            self.summary_session_id = request.session_id;
+            return .{
+                .content = try allocator.dupe(u8, "summary"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "session-capture-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = SessionCaptureProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SessionCaptureProvider.chatWithSystem,
+        .chat = SessionCaptureProvider.chat,
+        .supportsNativeTools = SessionCaptureProvider.supportsNativeTools,
+        .getName = SessionCaptureProvider.getName,
+        .deinit = SessionCaptureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop_tool = NoopTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .memory_session_id = "telegram:chat123",
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("trigger summary");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    try std.testing.expectEqualStrings("telegram:chat123", provider_state.summary_session_id.?);
+}
+
+test "Agent tool-limit summary records observer events and token metric" {
+    const NoopTool = struct {
+        const Self = @This();
+        pub const tool_name = "noop";
+        pub const tool_description = "noop";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+
+    const SummaryProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+
+            if (self.calls == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop"),
+                    .name = try allocator.dupe(u8, "noop"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "summary"),
+                .tool_calls = &.{},
+                .usage = .{ .total_tokens = 5 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "summary-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = SummaryProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummaryProvider.chatWithSystem,
+        .chat = SummaryProvider.chat,
+        .supportsNativeTools = SummaryProvider.supportsNativeTools,
+        .getName = SummaryProvider.getName,
+        .deinit = SummaryProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop_tool = NoopTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var observer = RecordingObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("trigger summary");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
+    try std.testing.expectEqual(@as(usize, 0), observer.llm_failure_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), observer.tokens_used_metric_total);
+    try std.testing.expectEqual(@as(?u32, 5), observer.last_llm_response_total_tokens);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), agent.tokensUsed());
+    try std.testing.expectEqual(@as(u32, 5), agent.last_turn_usage.total_tokens);
+}
+
+test "Agent tool-limit summary records llm failure when summary call fails" {
+    const NoopTool = struct {
+        const Self = @This();
+        pub const tool_name = "noop";
+        pub const tool_description = "noop";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+
+    const SummaryFailProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+
+            if (self.calls == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop"),
+                    .name = try allocator.dupe(u8, "noop"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "running tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return error.ProviderFailed;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "summary-fail-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = SummaryFailProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummaryFailProvider.chatWithSystem,
+        .chat = SummaryFailProvider.chat,
+        .supportsNativeTools = SummaryFailProvider.supportsNativeTools,
+        .getName = SummaryFailProvider.getName,
+        .deinit = SummaryFailProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop_tool = NoopTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var observer = RecordingObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("trigger summary failure");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
+    try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.llm_failure_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool")), observer.tokens_used_metric_total);
+}
+
 test "bindMemoryTools wires memory tools to sqlite backend" {
     const allocator = std.testing.allocator;
 
@@ -7071,6 +8971,10 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -7189,6 +9093,10 @@ test "Agent tool loop frees dynamic tool outputs" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -7328,6 +9236,10 @@ test "Agent shell failure with normalized output does not poison next turn" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "shell-failure-provider";
         }
@@ -7441,6 +9353,10 @@ test "Agent strips fabricated tool_result blocks from XML assistant history" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "xml-fabrication-provider";
         }
@@ -7576,6 +9492,10 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
             return error.ShouldNotStream;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "stream-guard";
         }
@@ -7635,6 +9555,26 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll look into that for you"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I will fetch the file now"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me search for that"));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll run the tool now"));
+    // Regression: "let me get/fetch/find" must be caught (was the exact failure mode with vikunja-mcp)
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Found the Workstream Board (project ID 4). Let me get the Kanban columns (buckets) for it."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me fetch the list of projects."));
+    try std.testing.expect(Agent.shouldForceActionFollowThrough("Let me look up the tasks now."));
+}
+
+test "Agent shouldForceActionFollowThrough ignores conclusory english statements" {
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me know if you need anything else."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me show you how this works with a small example."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me list the main tradeoffs before the code."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I will call this helper once during initialization."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I'll use a simple example to explain the flow."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Let me get straight to the point."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I'll note that this is a known limitation."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I will summarize what I found: the directory contains 3 files."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
 }
 
 test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
@@ -7653,6 +9593,17 @@ test "Agent selectDisplayText hides malformed tool markup payload" {
     try std.testing.expectEqualStrings("", selected);
 }
 
+test "Agent selectDisplayText hides orphan closing tool_call tag" {
+    // Model emits </tool_call> without an opener — must not leak to user.
+    const raw = "Here are the results:\n</tool_call>\nSome reply";
+    const selected = Agent.selectDisplayText(raw, "", 0);
+    try std.testing.expectEqualStrings("", selected);
+
+    const bracket_raw = "Here are the results:\n[/tool_call]\nSome reply";
+    const bracket_selected = Agent.selectDisplayText(bracket_raw, "", 0);
+    try std.testing.expectEqualStrings("", bracket_selected);
+}
+
 test "Agent selectDisplayText keeps plain text when no markup exists" {
     const raw = "All good.";
     const selected = Agent.selectDisplayText(raw, "", 0);
@@ -7668,6 +9619,437 @@ test "Agent selectDisplayText hides malformed tool markup present in parsed text
     const parsed_with_markup = "Some text <tool_call>{\"name\":\"shell\"";
     const selected = Agent.selectDisplayText(parsed_with_markup, parsed_with_markup, 0);
     try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent retries empty final response once before succeeding" {
+    const EmptyThenRecoveredProvider = struct {
+        call_count: usize = 0,
+        saw_empty_retry_prompt: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                return .{
+                    .content = try allocator.dupe(u8, ""),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            for (request.messages) |msg| {
+                if (msg.role == .user and std.mem.indexOf(u8, msg.content, "previous reply was empty") != null) {
+                    self.saw_empty_retry_prompt = true;
+                }
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "recovered"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "empty-then-recovered-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = EmptyThenRecoveredProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = EmptyThenRecoveredProvider.chatWithSystem,
+        .chat = EmptyThenRecoveredProvider.chat,
+        .supportsNativeTools = EmptyThenRecoveredProvider.supportsNativeTools,
+        .getName = EmptyThenRecoveredProvider.getName,
+        .deinit = EmptyThenRecoveredProvider.deinitFn,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_empty_retry_prompt);
+}
+
+test "Agent returns NoResponseContent after repeated empty final responses" {
+    const AlwaysEmptyProvider = struct {
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            return .{
+                .content = try allocator.dupe(u8, ""),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "always-empty-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = AlwaysEmptyProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = AlwaysEmptyProvider.chatWithSystem,
+        .chat = AlwaysEmptyProvider.chat,
+        .supportsNativeTools = AlwaysEmptyProvider.supportsNativeTools,
+        .getName = AlwaysEmptyProvider.getName,
+        .deinit = AlwaysEmptyProvider.deinitFn,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("hello"));
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "Agent retries empty streaming response once" {
+    const EmptyThenRecoveredStreamingProvider = struct {
+        const Self = @This();
+
+        call_count: usize = 0,
+        saw_empty_retry_prompt: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldUseStreamChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 2) {
+                for (request.messages) |msg| {
+                    if (msg.role == .user and
+                        std.mem.indexOf(u8, msg.content, "Your previous reply was empty") != null)
+                    {
+                        self.saw_empty_retry_prompt = true;
+                        break;
+                    }
+                }
+                callback(callback_ctx, providers.StreamChunk.textDelta("recovered"));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{
+                    .content = try allocator.dupe(u8, "recovered"),
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = null,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "empty-then-recovered-streaming-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamCollector = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!chunk.is_final and chunk.delta.len > 0) {
+                self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+            }
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.chunks.deinit(allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = EmptyThenRecoveredStreamingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = EmptyThenRecoveredStreamingProvider.chatWithSystem,
+        .chat = EmptyThenRecoveredStreamingProvider.chat,
+        .supportsNativeTools = EmptyThenRecoveredStreamingProvider.supportsNativeTools,
+        .getName = EmptyThenRecoveredStreamingProvider.getName,
+        .deinit = EmptyThenRecoveredStreamingProvider.deinitFn,
+        .supports_streaming = EmptyThenRecoveredStreamingProvider.supportsStreaming,
+        .stream_chat = EmptyThenRecoveredStreamingProvider.streamChat,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    var collector = StreamCollector{};
+    defer collector.deinit(allocator);
+    agent.stream_callback = StreamCollector.callback;
+    agent.stream_ctx = @ptrCast(&collector);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqualStrings("recovered", collector.chunks.items);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_empty_retry_prompt);
+}
+
+test "Agent forces follow-through retry for streaming deferred promise" {
+    const DeferredPromiseStreamingProvider = struct {
+        const Self = @This();
+
+        call_count: usize = 0,
+        saw_follow_through_prompt: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldUseStreamChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 2) {
+                for (request.messages) |msg| {
+                    if (msg.role == .user and
+                        std.mem.indexOf(u8, msg.content, "You just promised to take action now") != null)
+                    {
+                        self.saw_follow_through_prompt = true;
+                        break;
+                    }
+                }
+                callback(callback_ctx, providers.StreamChunk.textDelta("I cannot access that tool in this environment."));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{
+                    .content = try allocator.dupe(u8, "I cannot access that tool in this environment."),
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            // Regression: A2A streaming replies like this must trigger a follow-up iteration.
+            const deferred = "Found the Workstream Board (project ID 4). Let me get the Kanban columns (buckets) for it.";
+            callback(callback_ctx, providers.StreamChunk.textDelta(deferred));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, deferred),
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "deferred-promise-streaming-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamCollector = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!chunk.is_final and chunk.delta.len > 0) {
+                self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+            }
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.chunks.deinit(allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = DeferredPromiseStreamingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = DeferredPromiseStreamingProvider.chatWithSystem,
+        .chat = DeferredPromiseStreamingProvider.chat,
+        .supportsNativeTools = DeferredPromiseStreamingProvider.supportsNativeTools,
+        .getName = DeferredPromiseStreamingProvider.getName,
+        .deinit = DeferredPromiseStreamingProvider.deinitFn,
+        .supports_streaming = DeferredPromiseStreamingProvider.supportsStreaming,
+        .stream_chat = DeferredPromiseStreamingProvider.streamChat,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    var collector = StreamCollector{};
+    defer collector.deinit(allocator);
+    agent.stream_callback = StreamCollector.callback;
+    agent.stream_ctx = @ptrCast(&collector);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("I cannot access that tool in this environment.", response);
+    try std.testing.expect(std.mem.indexOf(u8, collector.chunks.items, "Let me get the Kanban columns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collector.chunks.items, "I cannot access that tool in this environment.") != null);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_follow_through_prompt);
 }
 
 test "Agent.fromConfig sets exec_security=full for full autonomy" {
@@ -7889,6 +10271,14 @@ test "Agent cleanUserInput uses custom punctuation" {
     try std.testing.expectEqualStrings("screenshot.", cleaned3);
 }
 
+test "Agent cleanUserInput can return empty string safely" {
+    const allocator = std.testing.allocator;
+
+    const cleaned = try cleanUserInput("please", allocator, null, null);
+    defer allocator.free(cleaned);
+    try std.testing.expectEqual(@as(usize, 0), cleaned.len);
+}
+
 test "Agent isExactTriggerMatch detects exact matches" {
     // Match without suffix returns null (use default args)
     try std.testing.expect(isExactTriggerMatch("screenshot", "screenshot") == null);
@@ -7928,6 +10318,14 @@ test "Agent isExactTriggerMatch extracts args_key from suffix" {
     try std.testing.expectEqualStrings("exec", args_key3.?);
 }
 
+test "Agent matchTriggerKeyword ignores trigger suffix during priority matching" {
+    var lower_msg: [22]u8 = undefined;
+    const msg = "please list directory";
+    for (msg, 0..) |c, i| lower_msg[i] = std.ascii.toLower(c);
+
+    try std.testing.expect(matchTriggerKeyword(lower_msg[0..msg.len], "list directory::ls"));
+}
+
 test "execBlockMessage allows all commands when exec_security=full" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -7936,19 +10334,19 @@ test "execBlockMessage allows all commands when exec_security=full" {
     agent.exec_ask = .off;
 
     // Even high-risk commands should not be blocked by execBlockMessage
-    var args1 = std.json.ObjectMap.init(allocator);
-    defer args1.deinit();
-    try args1.put("command", .{ .string = "rm -rf /tmp/test" });
+    var args1: std.json.ObjectMap = .empty;
+    defer args1.deinit(allocator);
+    try args1.put(allocator, "command", .{ .string = "rm -rf /tmp/test" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
-    var args2 = std.json.ObjectMap.init(allocator);
-    defer args2.deinit();
-    try args2.put("command", .{ .string = "curl https://example.com" });
+    var args2: std.json.ObjectMap = .empty;
+    defer args2.deinit(allocator);
+    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) == null);
 
-    var args3 = std.json.ObjectMap.init(allocator);
-    defer args3.deinit();
-    try args3.put("command", .{ .string = "ls -la" });
+    var args3: std.json.ObjectMap = .empty;
+    defer args3.deinit(allocator);
+    try args3.put(allocator, "command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args3) == null);
 }
 
@@ -7973,15 +10371,15 @@ test "execBlockMessage checks allowlist when exec_security=allowlist" {
     agent.policy = &policy;
 
     // Allowed command passes
-    var args1 = std.json.ObjectMap.init(allocator);
-    defer args1.deinit();
-    try args1.put("command", .{ .string = "ls -la" });
+    var args1: std.json.ObjectMap = .empty;
+    defer args1.deinit(allocator);
+    try args1.put(allocator, "command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
     // Disallowed command is blocked
-    var args2 = std.json.ObjectMap.init(allocator);
-    defer args2.deinit();
-    try args2.put("command", .{ .string = "curl https://example.com" });
+    var args2: std.json.ObjectMap = .empty;
+    defer args2.deinit(allocator);
+    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) != null);
 }
 
@@ -8019,9 +10417,9 @@ test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
 
     // Command outside default allowlist should pass with wildcard policy.
     agent.policy = &open_policy;
-    var args = std.json.ObjectMap.init(allocator);
-    defer args.deinit();
-    try args.put("command", .{ .string = "python3 script.py" });
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(allocator);
+    try args.put(allocator, "command", .{ .string = "python3 script.py" });
     try std.testing.expect(agent.execBlockMessage(args) == null);
 
     // Same command should be blocked under restrictive allowlist.

@@ -1,12 +1,19 @@
 const std = @import("std");
+const json_util = @import("../json_util.zig");
 
 pub const START_TAG = "<nc_choices>";
 pub const END_TAG = "</nc_choices>";
-pub const MAX_OPTIONS: usize = 6;
+pub const MAX_OPTIONS: usize = 12;
 pub const MIN_OPTIONS: usize = 2;
 pub const MAX_ID_LEN: usize = 24;
 pub const MAX_LABEL_LEN: usize = 64;
 pub const MAX_SUBMIT_TEXT_LEN: usize = 256;
+pub const CALLBACK_PREFIX = "nc1:";
+
+pub const ChoiceCallbackData = struct {
+    token: []const u8,
+    option_id: []const u8,
+};
 
 pub const ChoiceOption = struct {
     id: []const u8,
@@ -39,6 +46,52 @@ pub const ParsedAssistantChoices = struct {
         if (self.choices) |*choices| choices.deinit(allocator);
     }
 };
+
+fn validateRenderableOption(id: []const u8, label: []const u8, submit_text: []const u8) !void {
+    if (!isValidChoiceId(id)) return error.InvalidChoices;
+    if (label.len == 0 or label.len > MAX_LABEL_LEN) return error.InvalidChoices;
+    if (submit_text.len == 0 or submit_text.len > MAX_SUBMIT_TEXT_LEN) return error.InvalidChoices;
+}
+
+pub fn renderAssistantChoices(allocator: std.mem.Allocator, visible_text: []const u8, options_src: anytype) ![]u8 {
+    const options = switch (@typeInfo(@TypeOf(options_src))) {
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => options_src,
+            .one => switch (@typeInfo(ptr.child)) {
+                .array => options_src[0..],
+                else => @compileError("options_src must be a slice or pointer to array"),
+            },
+            else => @compileError("options_src must be a slice or pointer to array"),
+        },
+        else => @compileError("options_src must be a slice or pointer to array"),
+    };
+
+    if (options.len < MIN_OPTIONS or options.len > MAX_OPTIONS) return error.InvalidChoices;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, visible_text);
+    if (visible_text.len > 0 and visible_text[visible_text.len - 1] != '\n') {
+        try out.appendSlice(allocator, "\n\n");
+    }
+    try out.appendSlice(allocator, START_TAG);
+    try out.appendSlice(allocator, "{\"v\":1,\"options\":[");
+    for (options, 0..) |option, idx| {
+        try validateRenderableOption(option.id, option.label, option.submit_text);
+        if (idx > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"id\":");
+        try json_util.appendJsonString(&out, allocator, option.id);
+        try out.appendSlice(allocator, ",\"label\":");
+        try json_util.appendJsonString(&out, allocator, option.label);
+        try out.appendSlice(allocator, ",\"submit_text\":");
+        try json_util.appendJsonString(&out, allocator, option.submit_text);
+        try out.append(allocator, '}');
+    }
+    try out.appendSlice(allocator, "]}");
+    try out.appendSlice(allocator, END_TAG);
+    return try out.toOwnedSlice(allocator);
+}
 
 const ChoicesBlockSpan = struct {
     open_start: usize,
@@ -80,6 +133,66 @@ pub fn parseAssistantChoices(allocator: std.mem.Allocator, text: []const u8) !Pa
     return .{
         .visible_text = visible,
         .choices = choices,
+    };
+}
+
+fn isValidChoiceCallbackToken(token: []const u8) bool {
+    return token.len > 0 and std.mem.indexOfScalar(u8, token, ':') == null;
+}
+
+fn choiceCallbackDataLen(token: []const u8, option_id: []const u8) !usize {
+    if (!isValidChoiceCallbackToken(token)) return error.InvalidCallbackData;
+    if (!isValidChoiceId(option_id)) return error.InvalidCallbackData;
+    return CALLBACK_PREFIX.len + token.len + 1 + option_id.len;
+}
+
+pub fn formatChoiceCallbackData(
+    buf: []u8,
+    token: []const u8,
+    option_id: []const u8,
+    max_len: usize,
+) ![]const u8 {
+    const needed_len = try choiceCallbackDataLen(token, option_id);
+    if (max_len > 0 and needed_len > max_len) return error.CallbackDataTooLong;
+    if (needed_len > buf.len) return error.NoSpaceLeft;
+    return std.fmt.bufPrint(buf, "{s}{s}:{s}", .{
+        CALLBACK_PREFIX,
+        token,
+        option_id,
+    });
+}
+
+pub fn buildChoiceCallbackData(
+    allocator: std.mem.Allocator,
+    token: []const u8,
+    option_id: []const u8,
+    max_len: usize,
+) ![]u8 {
+    const needed_len = try choiceCallbackDataLen(token, option_id);
+    if (max_len > 0 and needed_len > max_len) return error.CallbackDataTooLong;
+
+    const encoded = try allocator.alloc(u8, needed_len);
+    errdefer allocator.free(encoded);
+    _ = try std.fmt.bufPrint(encoded, "{s}{s}:{s}", .{
+        CALLBACK_PREFIX,
+        token,
+        option_id,
+    });
+    return encoded;
+}
+
+pub fn parseChoiceCallbackData(data: []const u8) ?ChoiceCallbackData {
+    if (!std.mem.startsWith(u8, data, CALLBACK_PREFIX)) return null;
+    const rest = data[CALLBACK_PREFIX.len..];
+    const sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    if (sep == 0 or sep + 1 >= rest.len) return null;
+    const token = rest[0..sep];
+    const option_id = rest[sep + 1 ..];
+    if (!isValidChoiceCallbackToken(token)) return null;
+    if (!isValidChoiceId(option_id)) return null;
+    return .{
+        .token = token,
+        .option_id = option_id,
     };
 }
 
@@ -258,7 +371,13 @@ test "choices parse rejects too many options" {
         "{\"id\":\"d\",\"label\":\"D\"}," ++
         "{\"id\":\"e\",\"label\":\"E\"}," ++
         "{\"id\":\"f\",\"label\":\"F\"}," ++
-        "{\"id\":\"g\",\"label\":\"G\"}" ++
+        "{\"id\":\"g\",\"label\":\"G\"}," ++
+        "{\"id\":\"h\",\"label\":\"H\"}," ++
+        "{\"id\":\"i\",\"label\":\"I\"}," ++
+        "{\"id\":\"j\",\"label\":\"J\"}," ++
+        "{\"id\":\"k\",\"label\":\"K\"}," ++
+        "{\"id\":\"l\",\"label\":\"L\"}," ++
+        "{\"id\":\"m\",\"label\":\"M\"}" ++
         "]}</nc_choices>";
     var parsed = try parseAssistantChoices(allocator, text);
     defer parsed.deinit(allocator);
@@ -284,4 +403,67 @@ test "choices parse rejects invalid id chars" {
     );
     defer parsed.deinit(allocator);
     try std.testing.expect(parsed.choices == null);
+}
+
+test "choices render helper round-trips through parser" {
+    const allocator = std.testing.allocator;
+    const options = [_]struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    }{
+        .{ .id = "one", .label = "One", .submit_text = "/model alpha" },
+        .{ .id = "two", .label = "Two", .submit_text = "/model beta" },
+    };
+
+    const rendered = try renderAssistantChoices(allocator, "Pick a model.", &options);
+    defer allocator.free(rendered);
+
+    var parsed = try parseAssistantChoices(allocator, rendered);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.choices != null);
+    try std.testing.expectEqualStrings("Pick a model.\n\n", parsed.visible_text);
+    try std.testing.expectEqual(@as(usize, 2), parsed.choices.?.options.len);
+    try std.testing.expectEqualStrings("/model alpha", parsed.choices.?.options[0].submit_text);
+    try std.testing.expectEqualStrings("/model beta", parsed.choices.?.options[1].submit_text);
+}
+
+test "choices callback data roundtrip" {
+    const allocator = std.testing.allocator;
+    const encoded = try buildChoiceCallbackData(allocator, "tok1", "yes", 64);
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqualStrings("nc1:tok1:yes", encoded);
+
+    const parsed = parseChoiceCallbackData(encoded) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("tok1", parsed.token);
+    try std.testing.expectEqualStrings("yes", parsed.option_id);
+}
+
+test "choices format callback data uses caller buffer" {
+    var buf: [64]u8 = undefined;
+    const encoded = try formatChoiceCallbackData(&buf, "tok1", "yes", 64);
+    try std.testing.expectEqualStrings("nc1:tok1:yes", encoded);
+}
+
+test "choices callback data rejects long payload" {
+    const allocator = std.testing.allocator;
+    const long_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    try std.testing.expectError(error.CallbackDataTooLong, buildChoiceCallbackData(allocator, long_token, "yes", 64));
+}
+
+test "choices callback data rejects token separator" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+
+    try std.testing.expectError(error.InvalidCallbackData, formatChoiceCallbackData(&buf, "tok:1", "yes", 64));
+    try std.testing.expectError(error.InvalidCallbackData, buildChoiceCallbackData(allocator, "tok:1", "yes", 64));
+}
+
+test "choices parse callback data rejects malformed payload" {
+    try std.testing.expect(parseChoiceCallbackData("nc1:tok") == null);
+    try std.testing.expect(parseChoiceCallbackData("bad:tok:yes") == null);
+    try std.testing.expect(parseChoiceCallbackData("nc1:tok:extra:yes") == null);
+    try std.testing.expect(parseChoiceCallbackData("nc1:tok:YES") == null);
 }

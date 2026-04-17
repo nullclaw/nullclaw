@@ -1,6 +1,8 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const http_util = @import("../http_util.zig");
 
 /// WhatsApp channel — uses WhatsApp Business Cloud API.
 /// Operates in webhook mode (push-based); messages received via gateway endpoint.
@@ -57,7 +59,7 @@ pub const WhatsAppChannel = struct {
 
     /// Check if a phone number is allowed (E.164 format: +1234567890).
     pub fn isNumberAllowed(self: *const WhatsAppChannel, phone: []const u8) bool {
-        return root.isAllowed(self.allow_from, phone);
+        return root.isAllowedScoped("whatsapp channel", self.allow_from, phone);
     }
 
     /// Normalize a phone number to E.164 (prepend + if missing).
@@ -133,7 +135,7 @@ pub const WhatsAppChannel = struct {
                             else
                                 self.allow_from;
                             if (effective_allow_from.len == 0) continue;
-                            if (!root.isAllowed(effective_allow_from, normalized)) continue;
+                            if (!root.isAllowedScoped("whatsapp channel", effective_allow_from, normalized)) continue;
                         }
                     }
 
@@ -227,11 +229,10 @@ pub const WhatsAppChannel = struct {
         defer allocator.free(media_resp);
 
         // Step 3: Write to tmp file
-        var rand = std.crypto.random;
         var path_buf: [1024]u8 = undefined;
-        const local_path = std.fmt.bufPrint(&path_buf, "/tmp/whatsapp_{x}.dat", .{rand.int(u64)}) catch return null;
+        const local_path = std.fmt.bufPrint(&path_buf, "/tmp/whatsapp_{x}.dat", .{std_compat.crypto.random.int(u64)}) catch return null;
 
-        if (std.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
+        if (std_compat.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
             file.writeAll(media_resp) catch {
                 file.close();
                 return null;
@@ -260,9 +261,9 @@ pub const WhatsAppChannel = struct {
     pub fn sendMessage(self: *WhatsAppChannel, recipient: []const u8, text: []const u8) !void {
         // Build URL
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("https://graph.facebook.com/{s}/{s}/messages", .{ API_VERSION, self.phone_number_id });
-        const url = url_fbs.getWritten();
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
+        try url_writer.print("https://graph.facebook.com/{s}/{s}/messages", .{ API_VERSION, self.phone_number_id });
+        const url = url_writer.buffered();
 
         // Strip leading '+' from recipient for the API
         const to = if (recipient.len > 0 and recipient[0] == '+') recipient[1..] else recipient;
@@ -270,7 +271,9 @@ pub const WhatsAppChannel = struct {
         // Build JSON body dynamically
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const w = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const w = &body_writer.writer;
         try w.writeAll("{\"messaging_product\":\"whatsapp\",\"recipient_type\":\"individual\",\"to\":\"");
         try w.writeAll(to);
         try w.writeAll("\",\"type\":\"text\",\"text\":{\"preview_url\":false,\"body\":");
@@ -280,14 +283,14 @@ pub const WhatsAppChannel = struct {
 
         // Build auth header
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Bearer {s}", .{self.access_token});
-        const auth_value = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Bearer {s}", .{self.access_token});
+        const auth_value = auth_writer.buffered();
 
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = try http_util.ProxyHttpClient.init(self.allocator);
         defer client.deinit();
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,

@@ -7,7 +7,9 @@
 //!   - Prunes old conversation rows from SQLite
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
+const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
@@ -84,7 +86,7 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
 
     // Mark hygiene as completed
     if (mem) |m| {
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         var buf: [20]u8 = undefined;
         const ts = std.fmt.bufPrint(&buf, "{d}", .{now}) catch return report;
         m.store(LAST_HYGIENE_KEY, ts, .core, null) catch {};
@@ -106,7 +108,7 @@ fn shouldRunNow(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
         // Parse raw timestamps (sqlite-like) and markdown-encoded entries
         // (markdown backend stores as "**key**: value").
         const last_ts = parseLastHygieneTimestamp(e.content) orelse return true;
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         return (now - last_ts) >= HYGIENE_INTERVAL_SECS;
     }
 
@@ -125,18 +127,18 @@ fn parseLastHygieneTimestamp(content: []const u8) ?i64 {
 
 /// Archive old daily memory .md files from memory/ to memory/archive/.
 fn archiveOldFiles(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
-    const memory_dir_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory" });
+    const memory_dir_path = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
 
-    var memory_dir = std.fs.cwd().openDir(memory_dir_path, .{ .iterate = true }) catch return 0;
+    var memory_dir = fs_compat.openDirPath(memory_dir_path, .{ .iterate = true }) catch return 0;
     defer memory_dir.close();
 
-    const archive_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
     defer allocator.free(archive_path);
 
-    std.fs.cwd().makePath(archive_path) catch {};
+    fs_compat.makePath(archive_path) catch {};
 
-    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(config.archive_after_days)) * 24 * 60 * 60;
+    const cutoff_secs = std_compat.time.timestamp() - @as(i64, @intCast(config.archive_after_days)) * 24 * 60 * 60;
     var moved: u64 = 0;
 
     var iter = memory_dir.iterate();
@@ -153,14 +155,14 @@ fn archiveOldFiles(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
         if (mtime_secs >= cutoff_secs) continue;
 
         // Build full source and destination paths, then rename
-        const src_path = std.fs.path.join(allocator, &.{ memory_dir_path, name }) catch continue;
+        const src_path = std_compat.fs.path.join(allocator, &.{ memory_dir_path, name }) catch continue;
         defer allocator.free(src_path);
-        const dst_path = std.fs.path.join(allocator, &.{ archive_path, name }) catch continue;
+        const dst_path = std_compat.fs.path.join(allocator, &.{ archive_path, name }) catch continue;
         defer allocator.free(dst_path);
 
-        std.fs.cwd().rename(src_path, dst_path) catch {
+        fs_compat.renamePath(src_path, dst_path) catch {
             // Fallback: try copy + delete
-            var dest_dir = std.fs.cwd().openDir(archive_path, .{}) catch continue;
+            var dest_dir = fs_compat.openDirPath(archive_path, .{}) catch continue;
             defer dest_dir.close();
             memory_dir.copyFile(name, dest_dir, name, .{}) catch continue;
             memory_dir.deleteFile(name) catch {};
@@ -178,13 +180,13 @@ fn purgeOldArchives(
     mem: ?Memory,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !u64 {
-    const archive_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
     defer allocator.free(archive_path);
 
-    var archive_dir = std.fs.cwd().openDir(archive_path, .{ .iterate = true }) catch return 0;
+    var archive_dir = fs_compat.openDirPath(archive_path, .{ .iterate = true }) catch return 0;
     defer archive_dir.close();
 
-    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(config.purge_after_days)) * 24 * 60 * 60;
+    const cutoff_secs = std_compat.time.timestamp() - @as(i64, @intCast(config.purge_after_days)) * 24 * 60 * 60;
     var removed: u64 = 0;
 
     var iter = archive_dir.iterate();
@@ -211,12 +213,12 @@ fn purgeOldArchives(
 
 fn preserveArchiveFile(
     allocator: std.mem.Allocator,
-    archive_dir: std.fs.Dir,
+    archive_dir: std_compat.fs.Dir,
     file_name: []const u8,
     mem: Memory,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !void {
-    const content = try archive_dir.readFileAlloc(allocator, file_name, ARCHIVE_READ_MAX_BYTES);
+    const content = try fs_compat.readFileAlloc(archive_dir, allocator, file_name, ARCHIVE_READ_MAX_BYTES);
     defer allocator.free(content);
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) return;
 
@@ -280,7 +282,7 @@ fn pruneConversationRowsWithPreserve(
     preserve_before_forget: bool,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !u64 {
-    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
+    const cutoff_secs = std_compat.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
 
     // List conversation-tagged entries directly so prune is independent of
     // message text content.
@@ -393,7 +395,7 @@ test "parseLastHygieneTimestamp supports markdown format" {
 test "runIfDue with markdown backend does not append hygiene marker twice inside interval" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var markdown_memory = try root.MarkdownMemory.init(std.testing.allocator, base);
@@ -482,14 +484,14 @@ test "runIfDue preserves archived markdown chunks before purge" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_dir);
 
-    const archive_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
-    try std.fs.cwd().makePath(archive_path);
+    try fs_compat.makePath(archive_path);
 
-    var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
+    var archive_dir = try fs_compat.openDirPath(archive_path, .{});
     defer archive_dir.close();
 
     var file = try archive_dir.createFile("old-memory.md", .{});
@@ -530,14 +532,14 @@ test "runIfDue deletes old archives when memory is unavailable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_dir);
 
-    const archive_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
-    try std.fs.cwd().makePath(archive_path);
+    try fs_compat.makePath(archive_path);
 
-    var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
+    var archive_dir = try fs_compat.openDirPath(archive_path, .{});
     defer archive_dir.close();
 
     var file = try archive_dir.createFile("old-memory.md", .{});

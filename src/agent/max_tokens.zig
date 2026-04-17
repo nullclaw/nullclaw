@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const config_types = @import("../config_types.zig");
+const model_refs = @import("../model_refs.zig");
+const provider_names = @import("../provider_names.zig");
 
 pub const DEFAULT_MODEL_MAX_TOKENS: u32 = config_types.DEFAULT_MODEL_MAX_TOKENS;
 
@@ -60,6 +62,7 @@ const PROVIDER_MAX_TOKENS = [_]MaxTokensEntry{
     .{ .key = "vllm", .tokens = 8192 },
     .{ .key = "github-copilot", .tokens = 8192 },
     .{ .key = "qianfan", .tokens = 32_768 },
+    .{ .key = "novita", .tokens = 8192 },
     .{ .key = "nvidia", .tokens = 4096 },
     .{ .key = "byteplus", .tokens = 4096 },
     .{ .key = "doubao", .tokens = 4096 },
@@ -113,14 +116,13 @@ fn lookupTable(table: []const MaxTokensEntry, key: []const u8) ?u32 {
     return null;
 }
 
-fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, model: []const u8 } {
-    const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse {
-        return .{ .provider = null, .model = model_ref };
-    };
-    return .{
-        .provider = model_ref[0..slash],
-        .model = model_ref[slash + 1 ..],
-    };
+fn lookupProviderMaxTokens(key: []const u8) ?u32 {
+    if (lookupTable(&PROVIDER_MAX_TOKENS, key)) |n| return n;
+    const canonical = provider_names.canonicalProviderNameIgnoreCase(key);
+    if (!std.ascii.eqlIgnoreCase(canonical, key)) {
+        if (lookupTable(&PROVIDER_MAX_TOKENS, canonical)) |n| return n;
+    }
+    return null;
 }
 
 fn inferFromModelPattern(model_id: []const u8) ?u32 {
@@ -172,8 +174,12 @@ pub fn lookupModelMaxTokens(model_ref_raw: []const u8) ?u32 {
     if (model_ref.len == 0) return null;
 
     if (lookupModelCandidates(model_ref)) |n| return n;
+    if (lookupProviderMaxTokens(model_ref)) |n| return n;
 
-    const split = splitProviderModel(model_ref);
+    const split = model_refs.splitProviderModel(model_ref) orelse model_refs.ProviderModelRef{
+        .provider = null,
+        .model = model_ref,
+    };
     if (lookupModelCandidates(split.model)) |n| return n;
 
     // Support nested refs like openrouter/anthropic/claude-sonnet-4.6.
@@ -181,7 +187,7 @@ pub fn lookupModelMaxTokens(model_ref_raw: []const u8) ?u32 {
         const nested_provider = split.model[0..nested_sep];
         const nested_model = split.model[nested_sep + 1 ..];
         if (lookupModelCandidates(nested_model)) |n| return n;
-        if (lookupTable(&PROVIDER_MAX_TOKENS, nested_provider)) |n| return n;
+        if (lookupProviderMaxTokens(nested_provider)) |n| return n;
     }
     if (std.mem.lastIndexOfScalar(u8, split.model, '/')) |last_sep| {
         const leaf_model = split.model[last_sep + 1 ..];
@@ -189,7 +195,7 @@ pub fn lookupModelMaxTokens(model_ref_raw: []const u8) ?u32 {
     }
 
     if (split.provider) |provider| {
-        if (lookupTable(&PROVIDER_MAX_TOKENS, provider)) |n| return n;
+        if (lookupProviderMaxTokens(provider)) |n| return n;
     }
 
     return null;
@@ -213,6 +219,20 @@ test "lookupModelMaxTokens resolves model and nested provider refs" {
     try std.testing.expectEqual(@as(?u32, 32_768), lookupModelMaxTokens("qianfan/custom-model"));
 }
 
+test "lookupModelMaxTokens handles custom url refs with nested provider budgets" {
+    try std.testing.expectEqual(
+        @as(?u32, 32_768),
+        lookupModelMaxTokens("custom:https://api.example.com/openai/v2/qianfan/custom-model"),
+    );
+}
+
+test "lookupModelMaxTokens handles versionless custom url refs with nested provider budgets" {
+    try std.testing.expectEqual(
+        @as(?u32, 32_768),
+        lookupModelMaxTokens("custom:https://gateway.example.com/qianfan/custom-model"),
+    );
+}
+
 test "lookupModelMaxTokens keeps legacy and turbo gpt-4 variants distinct" {
     try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4-0613"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4-turbo-preview"));
@@ -225,6 +245,11 @@ test "lookupModelMaxTokens strips date suffixes and latest aliases" {
 
 test "lookupModelMaxTokens provider fallback handles lower ceilings" {
     try std.testing.expectEqual(@as(?u32, 4096), lookupModelMaxTokens("nvidia/custom-model"));
+}
+
+test "lookupModelMaxTokens provider fallback honors canonical aliases" {
+    try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("mimo/custom-model"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("xiaomi-mimo"));
 }
 
 test "resolveMaxTokens falls back to global default" {

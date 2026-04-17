@@ -8,8 +8,10 @@
 //!   - Creates backup before import
 
 const std = @import("std");
+const std_compat = @import("compat");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
+const fs_compat = @import("fs_compat.zig");
 const memory_root = @import("memory/root.zig");
 const migrate_mod = @import("memory/lifecycle/migrate.zig");
 
@@ -67,7 +69,7 @@ pub fn migrateOpenclawWithPolicy(
 
     // Verify source exists
     {
-        var dir = std.fs.openDirAbsolute(source, .{}) catch {
+        var dir = std_compat.fs.openDirAbsolute(source, .{}) catch {
             return error.SourceNotFound;
         };
         dir.close();
@@ -194,7 +196,7 @@ fn migrateOpenclawConfig(
     defer if (source_config_path) |p| allocator.free(p);
     const source_config = source_config_path orelse return false;
 
-    const src_file = try std.fs.openFileAbsolute(source_config, .{});
+    const src_file = try std_compat.fs.openFileAbsolute(source_config, .{});
     defer src_file.close();
     const source_content = try src_file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(source_content);
@@ -204,13 +206,13 @@ fn migrateOpenclawConfig(
 
     if (dry_run) return true;
 
-    const dst_dir = std.fs.path.dirname(target_config_path) orelse return error.InvalidConfigPath;
-    std.fs.makeDirAbsolute(dst_dir) catch |err| switch (err) {
+    const dst_dir = std_compat.fs.path.dirname(target_config_path) orelse return error.InvalidConfigPath;
+    std_compat.fs.makeDirAbsolute(dst_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    const dst_file = try std.fs.createFileAbsolute(target_config_path, .{});
+    const dst_file = try std_compat.fs.createFileAbsolute(target_config_path, .{});
     defer dst_file.close();
     try dst_file.writeAll(normalized);
     if (normalized.len == 0 or normalized[normalized.len - 1] != '\n') {
@@ -223,9 +225,9 @@ fn migrateOpenclawConfig(
 /// Resolve OpenClaw config.json location from a workspace path.
 /// Preferred layout is `<workspace parent>/config.json` for `~/.openclaw/workspace`.
 fn resolveOpenclawConfigPath(allocator: std.mem.Allocator, source_workspace: []const u8) !?[]u8 {
-    if (std.fs.path.dirname(source_workspace)) |parent| {
-        const candidate = try std.fs.path.join(allocator, &.{ parent, "config.json" });
-        if (std.fs.openFileAbsolute(candidate, .{})) |f| {
+    if (std_compat.fs.path.dirname(source_workspace)) |parent| {
+        const candidate = try std_compat.fs.path.join(allocator, &.{ parent, "config.json" });
+        if (std_compat.fs.openFileAbsolute(candidate, .{})) |f| {
             f.close();
             return candidate;
         } else |_| {
@@ -233,8 +235,8 @@ fn resolveOpenclawConfigPath(allocator: std.mem.Allocator, source_workspace: []c
         }
     }
 
-    const fallback = try std.fs.path.join(allocator, &.{ source_workspace, "config.json" });
-    if (std.fs.openFileAbsolute(fallback, .{})) |f| {
+    const fallback = try std_compat.fs.path.join(allocator, &.{ source_workspace, "config.json" });
+    if (std_compat.fs.openFileAbsolute(fallback, .{})) |f| {
         f.close();
         return fallback;
     } else |_| {
@@ -273,12 +275,12 @@ fn normalizeJsonValueKeys(allocator: std.mem.Allocator, value: std.json.Value) !
             break :blk .{ .array = out };
         },
         .object => blk: {
-            var out = std.json.ObjectMap.init(allocator);
+            var out: std.json.ObjectMap = .empty;
             var it = value.object.iterator();
             while (it.next()) |entry| {
                 const key = try camelToSnakeKey(allocator, entry.key_ptr.*);
                 const nested = try normalizeJsonValueKeys(allocator, entry.value_ptr.*);
-                try out.put(key, nested);
+                try out.put(allocator, key, nested);
             }
             break :blk .{ .object = out };
         },
@@ -342,12 +344,12 @@ pub fn createBackup(
     allocator: std.mem.Allocator,
     config: *const Config,
 ) ![]u8 {
-    const timestamp = std.time.timestamp();
+    const timestamp = std_compat.time.timestamp();
     const backend = config.memory_backend;
 
     if (std.mem.eql(u8, backend, "sqlite") or std.mem.eql(u8, backend, "lucid")) {
         // SQLite-based backends: backup the memory.db file
-        const db_file = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory.db" });
+        const db_file = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "memory.db" });
         defer allocator.free(db_file);
         const backup_path = try std.fmt.allocPrint(allocator, "{s}.backup-{d}", .{ db_file, timestamp });
         errdefer allocator.free(backup_path);
@@ -355,7 +357,7 @@ pub fn createBackup(
         return backup_path;
     } else if (std.mem.eql(u8, backend, "markdown")) {
         // Markdown backend: backup MEMORY.md
-        const md_file = try std.fs.path.join(allocator, &.{ config.workspace_dir, "MEMORY.md" });
+        const md_file = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "MEMORY.md" });
         defer allocator.free(md_file);
         const backup_path = try std.fmt.allocPrint(allocator, "{s}.backup-{d}", .{ md_file, timestamp });
         errdefer allocator.free(backup_path);
@@ -374,9 +376,9 @@ pub fn restoreBackup(backup_path: []const u8, target_path: []const u8) !void {
 }
 
 fn copyFileAbsolute(src: []const u8, dst: []const u8) !void {
-    const src_file = try std.fs.openFileAbsolute(src, .{});
+    const src_file = try std_compat.fs.openFileAbsolute(src, .{});
     defer src_file.close();
-    const dst_file = try std.fs.createFileAbsolute(dst, .{});
+    const dst_file = try std_compat.fs.createFileAbsolute(dst, .{});
     defer dst_file.close();
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -397,7 +399,7 @@ fn readOpenclawMarkdownEntries(
     const core_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{source});
     defer allocator.free(core_path);
 
-    if (std.fs.cwd().readFileAlloc(allocator, core_path, 1024 * 1024)) |content| {
+    if (fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, core_path, 1024 * 1024)) |content| {
         defer allocator.free(content);
         const count = try parseMarkdownFile(allocator, content, "core", "openclaw_core", entries);
         stats.from_markdown += count;
@@ -407,7 +409,7 @@ fn readOpenclawMarkdownEntries(
     const daily_dir = try std.fmt.allocPrint(allocator, "{s}/memory", .{source});
     defer allocator.free(daily_dir);
 
-    if (std.fs.cwd().openDir(daily_dir, .{ .iterate = true })) |*dir_handle| {
+    if (fs_compat.openDirPath(daily_dir, .{ .iterate = true })) |*dir_handle| {
         var dir = dir_handle.*;
         defer dir.close();
         var iter = dir.iterate();
@@ -415,7 +417,7 @@ fn readOpenclawMarkdownEntries(
             if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
             const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ daily_dir, entry.name });
             defer allocator.free(fpath);
-            if (std.fs.cwd().readFileAlloc(allocator, fpath, 1024 * 1024)) |content| {
+            if (fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, fpath, 1024 * 1024)) |content| {
                 defer allocator.free(content);
                 const stem = entry.name[0 .. entry.name.len - 3];
                 const count = try parseMarkdownFile(allocator, content, "daily", stem, entries);
@@ -492,7 +494,7 @@ fn resolveOpenclawWorkspace(allocator: std.mem.Allocator, source: ?[]const u8) !
     if (source) |src| return allocator.dupe(u8, src);
     const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".openclaw", "workspace" });
+    return std_compat.fs.path.join(allocator, &.{ home, ".openclaw", "workspace" });
 }
 
 /// Check if two paths refer to the same location.
@@ -511,12 +513,12 @@ fn readBrainDbEntries(
     // Try memory/brain.db (common OpenClaw layout)
     const paths = [_][]const u8{ "memory/brain.db", "brain.db" };
     for (&paths) |rel| {
-        const db_path = std.fs.path.joinZ(allocator, &.{ source, rel }) catch continue;
+        const db_path = std_compat.fs.path.joinZ(allocator, &.{ source, rel }) catch continue;
         defer allocator.free(db_path);
 
         // Check file exists before attempting open
         const abs_path = db_path[0..db_path.len];
-        std.fs.cwd().access(abs_path, .{}) catch continue;
+        fs_compat.accessPath(abs_path, .{}) catch continue;
 
         const sqlite_entries = migrate_mod.readBrainDb(allocator, db_path) catch |err| {
             log.warn("brain.db read failed at {s}: {}", .{ abs_path, err });
@@ -668,46 +670,46 @@ test "resolveOpenclawConfigPath finds parent config for workspace layout" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".openclaw/workspace");
-    const cfg_file = try tmp.dir.createFile(".openclaw/config.json", .{});
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath(".openclaw/workspace");
+    const cfg_file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile(".openclaw/config.json", .{});
     cfg_file.close();
 
-    const workspace_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".openclaw/workspace");
+    const workspace_abs = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".openclaw/workspace");
     defer std.testing.allocator.free(workspace_abs);
 
     const resolved = try resolveOpenclawConfigPath(std.testing.allocator, workspace_abs);
     defer if (resolved) |p| std.testing.allocator.free(p);
     try std.testing.expect(resolved != null);
-    try std.testing.expect(std.mem.eql(u8, std.fs.path.basename(resolved.?), "config.json"));
-    const resolved_parent = std.fs.path.dirname(resolved.?) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.eql(u8, std.fs.path.basename(resolved_parent), ".openclaw"));
+    try std.testing.expect(std.mem.eql(u8, std_compat.fs.path.basename(resolved.?), "config.json"));
+    const resolved_parent = std_compat.fs.path.dirname(resolved.?) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.eql(u8, std_compat.fs.path.basename(resolved_parent), ".openclaw"));
 }
 
 test "migrateOpenclawConfig copies and normalizes config json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".openclaw/workspace");
-    try tmp.dir.makePath(".nullclaw");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath(".openclaw/workspace");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath(".nullclaw");
 
     const source_cfg_rel = ".openclaw/config.json";
-    const source_cfg = try tmp.dir.createFile(source_cfg_rel, .{});
+    const source_cfg = try @import("compat").fs.Dir.wrap(tmp.dir).createFile(source_cfg_rel, .{});
     defer source_cfg.close();
     try source_cfg.writeAll(
         \\{"gatewayPort":3000,"httpRequest":{"allowedDomains":["example.com"]},"session":{"idleMinutes":30}}
     );
 
-    const workspace_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".openclaw/workspace");
+    const workspace_abs = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".openclaw/workspace");
     defer std.testing.allocator.free(workspace_abs);
-    const target_cfg_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".nullclaw");
+    const target_cfg_abs = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".nullclaw");
     defer std.testing.allocator.free(target_cfg_abs);
-    const target_cfg_path = try std.fs.path.join(std.testing.allocator, &.{ target_cfg_abs, "config.json" });
+    const target_cfg_path = try std_compat.fs.path.join(std.testing.allocator, &.{ target_cfg_abs, "config.json" });
     defer std.testing.allocator.free(target_cfg_path);
 
     const migrated = try migrateOpenclawConfig(std.testing.allocator, workspace_abs, target_cfg_path, false);
     try std.testing.expect(migrated);
 
-    const migrated_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, target_cfg_path, 64 * 1024);
+    const migrated_bytes = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, target_cfg_path, 64 * 1024);
     defer std.testing.allocator.free(migrated_bytes);
     try std.testing.expect(std.mem.indexOf(u8, migrated_bytes, "\"gateway_port\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, migrated_bytes, "\"http_request\"") != null);
@@ -781,30 +783,30 @@ test "backup and restore roundtrip" {
 
     // Write a "database" file
     const content = "SQLITE_MAGIC_test_data_12345";
-    const src_file = try tmp_dir.dir.createFile("test.db", .{});
+    const src_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile("test.db", .{});
     try src_file.writeAll(content);
     src_file.close();
 
     // Get absolute paths via realpath
-    const src_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.db");
+    const src_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, "test.db");
     defer std.testing.allocator.free(src_path);
 
     const backup_name = "test.db.backup-1234";
-    const backup_file = try tmp_dir.dir.createFile(backup_name, .{});
+    const backup_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile(backup_name, .{});
     backup_file.close();
-    const backup_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, backup_name);
+    const backup_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, backup_name);
     defer std.testing.allocator.free(backup_path);
 
     // Copy source to backup
     try copyFileAbsolute(src_path, backup_path);
 
     // Verify backup content matches
-    const backup_content = try tmp_dir.dir.readFileAlloc(std.testing.allocator, backup_name, 4096);
+    const backup_content = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, backup_name, 4096);
     defer std.testing.allocator.free(backup_content);
     try std.testing.expectEqualStrings(content, backup_content);
 
     // Corrupt the "database" (simulate modification)
-    const mod_file = try tmp_dir.dir.createFile("test.db", .{});
+    const mod_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile("test.db", .{});
     try mod_file.writeAll("CORRUPTED");
     mod_file.close();
 
@@ -812,7 +814,7 @@ test "backup and restore roundtrip" {
     try restoreBackup(backup_path, src_path);
 
     // Verify restored content
-    const restored = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.db", 4096);
+    const restored = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.db", 4096);
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings(content, restored);
 }

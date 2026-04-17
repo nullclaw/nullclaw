@@ -4,6 +4,8 @@ const channel_loop = @import("channel_loop.zig");
 const channels_root = @import("channels/root.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const weixin = @import("channels/weixin.zig");
+const max_mod = @import("channels/max.zig");
 const agent_routing = @import("agent_routing.zig");
 
 pub const PollingSpawnFn = *const fn (
@@ -34,6 +36,11 @@ fn signalPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.C
     return std.fmt.allocPrint(allocator, "{s}|{s}", .{ sg_ptr.http_url, sg_ptr.account }) catch null;
 }
 
+fn weixinPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.Channel) ?[]u8 {
+    const wx_ptr: *const weixin.WeixinChannel = @ptrCast(@alignCast(channel.ptr));
+    return std.fmt.allocPrint(allocator, "{s}|{s}", .{ wx_ptr.config.base_url, wx_ptr.config.token }) catch null;
+}
+
 pub const polling_descriptors = [_]PollingDescriptor{
     .{
         .channel_name = "telegram",
@@ -46,8 +53,17 @@ pub const polling_descriptors = [_]PollingDescriptor{
         .source_key = signalPollingSourceKey,
     },
     .{
+        .channel_name = "weixin",
+        .spawn = channel_loop.spawnWeixinPolling,
+        .source_key = weixinPollingSourceKey,
+    },
+    .{
         .channel_name = "matrix",
         .spawn = channel_loop.spawnMatrixPolling,
+    },
+    .{
+        .channel_name = "max",
+        .spawn = channel_loop.spawnMaxPolling,
     },
 };
 
@@ -63,12 +79,16 @@ pub const InboundMetadata = struct {
     peer_kind: ?agent_routing.ChatType = null,
     peer_id: ?[]const u8 = null,
     message_id: ?[]const u8 = null,
+    replace_message: ?bool = null,
     guild_id: ?[]const u8 = null,
     team_id: ?[]const u8 = null,
     channel_id: ?[]const u8 = null,
     thread_id: ?[]const u8 = null,
+    typing_recipient: ?[]const u8 = null,
     is_dm: ?bool = null,
     is_group: ?bool = null,
+    sender_username: ?[]const u8 = null,
+    sender_display_name: ?[]const u8 = null,
 };
 
 pub const InboundRouteInput = struct {
@@ -219,6 +239,41 @@ fn deriveMaixcamPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routin
     return .{ .kind = .direct, .id = input.chat_id };
 }
 
+fn defaultMaxAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.maxPrimary()) |mc| return mc.account_id;
+    return null;
+}
+
+fn defaultNostrAccount(_: *const Config, _: []const u8) ?[]const u8 {
+    return "default";
+}
+
+fn deriveNostrPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routing.PeerRef {
+    return .{ .kind = .direct, .id = input.sender_id };
+}
+
+fn deriveMaxPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    const is_group = meta.is_group orelse false;
+    return .{
+        .kind = if (is_group) .group else .direct,
+        .id = if (is_group) input.chat_id else input.sender_id,
+    };
+}
+
+fn defaultTeamsAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.teamsPrimary()) |tc| return tc.account_id;
+    return null;
+}
+
+fn deriveTeamsPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    // Teams personal chats are direct; channel/group chats use the conversation id
+    const is_dm = meta.is_dm orelse (meta.peer_kind == null or meta.peer_kind.? == .direct);
+    return .{
+        .kind = if (is_dm) .direct else .channel,
+        .id = if (is_dm) input.sender_id else input.chat_id,
+    };
+}
+
 fn defaultWebAccount(config: *const Config, _: []const u8) ?[]const u8 {
     if (config.channels.webPrimary()) |wc| return wc.account_id;
     return null;
@@ -272,11 +327,37 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .derive_peer = deriveMaixcamPeer,
     },
     .{
+        .channel_name = "teams",
+        .default_account_id = defaultTeamsAccount,
+        .derive_peer = deriveTeamsPeer,
+    },
+    .{
         .channel_name = "web",
         .default_account_id = defaultWebAccount,
         .derive_peer = deriveWebPeer,
     },
+    .{
+        .channel_name = "max",
+        .default_account_id = defaultMaxAccount,
+        .derive_peer = deriveMaxPeer,
+    },
+    .{
+        .channel_name = "nostr",
+        .default_account_id = defaultNostrAccount,
+        .derive_peer = deriveNostrPeer,
+    },
 };
+
+pub fn derivePeerForStaticChannel(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    for (&inbound_route_descriptors) |*desc| {
+        if (desc.channel_name) |name| {
+            if (std.mem.eql(u8, name, input.channel_name)) {
+                return desc.derive_peer(input, meta);
+            }
+        }
+    }
+    return null;
+}
 
 pub fn findInboundRouteDescriptor(config: *const Config, channel_name: []const u8) ?*const InboundRouteDescriptor {
     for (&inbound_route_descriptors) |*desc| {
@@ -292,7 +373,9 @@ pub fn findInboundRouteDescriptor(config: *const Config, channel_name: []const u
 test "findPollingDescriptor returns known polling adapters" {
     try std.testing.expect(findPollingDescriptor("telegram") != null);
     try std.testing.expect(findPollingDescriptor("signal") != null);
+    try std.testing.expect(findPollingDescriptor("weixin") != null);
     try std.testing.expect(findPollingDescriptor("matrix") != null);
+    try std.testing.expect(findPollingDescriptor("max") != null);
     try std.testing.expect(findPollingDescriptor("discord") == null);
 }
 

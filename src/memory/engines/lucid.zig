@@ -10,6 +10,7 @@
 //! Mirrors ZeroClaw's `LucidMemory` (src/memory/lucid.rs).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -85,7 +86,7 @@ pub const LucidMemory = struct {
     // ── Cooldown ─────────────────────────────────────────────────
 
     fn nowMs() i64 {
-        return std.time.milliTimestamp();
+        return std_compat.time.milliTimestamp();
     }
 
     fn inFailureCooldown(self: *const Self) bool {
@@ -147,7 +148,7 @@ pub const LucidMemory = struct {
             argv_buf[i + 1] = arg;
         }
 
-        var child = std.process.Child.init(argv_buf, self.allocator);
+        var child = std_compat.process.Child.init(argv_buf, self.allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
 
@@ -164,7 +165,7 @@ pub const LucidMemory = struct {
         };
 
         switch (term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 self.allocator.free(stdout_raw);
                 return null;
             },
@@ -442,6 +443,11 @@ pub const LucidMemory = struct {
         return self.localMemory().get(allocator, key);
     }
 
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self = castSelf(ptr);
+        return self.localMemory().getScoped(allocator, key, session_id);
+    }
+
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self = castSelf(ptr);
         return self.localMemory().list(allocator, category, session_id);
@@ -450,6 +456,11 @@ pub const LucidMemory = struct {
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self = castSelf(ptr);
         return self.localMemory().forget(key);
+    }
+
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self = castSelf(ptr);
+        return self.localMemory().forgetScoped(self.allocator, key, session_id);
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -479,8 +490,10 @@ pub const LucidMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -525,6 +538,26 @@ pub const LucidMemory = struct {
         return self.local.loadUsage(session_id);
     }
 
+    fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.local.countSessions();
+    }
+
+    fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
+        const self = castSelf(ptr);
+        return self.local.listSessions(allocator, limit, offset);
+    }
+
+    fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.local.countDetailedMessages(session_id);
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
+        const self = castSelf(ptr);
+        return self.local.loadMessagesDetailed(allocator, session_id, limit, offset);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
@@ -532,6 +565,10 @@ pub const LucidMemory = struct {
         .clearAutoSaved = &implSessionClearAutoSaved,
         .saveUsage = &implSessionSaveUsage,
         .loadUsage = &implSessionLoadUsage,
+        .countSessions = &implSessionCountSessions,
+        .listSessions = &implSessionListSessions,
+        .countDetailedMessages = &implSessionCountDetailedMessages,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

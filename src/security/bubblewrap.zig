@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const probe = @import("probe.zig");
 const Sandbox = @import("sandbox.zig").Sandbox;
 
 /// Bubblewrap (bwrap) sandbox backend.
@@ -26,12 +28,22 @@ pub const BubblewrapSandbox = struct {
 
     fn wrapCommand(ptr: *anyopaque, argv: []const []const u8, buf: [][]const u8) anyerror![]const []const u8 {
         const self = resolve(ptr);
-        // bwrap --ro-bind /usr /usr --dev /dev --proc /proc --bind /tmp /tmp --bind WORKSPACE /workspace --unshare-all --die-with-parent <argv...>
+        // Keep the host shell/runtime paths visible so `/bin/sh -c ...` still
+        // works after ShellTool wraps commands with bubblewrap.
         const prefix = [_][]const u8{
             "bwrap",
             "--ro-bind",
             "/usr",
             "/usr",
+            "--ro-bind-try",
+            "/bin",
+            "/bin",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
             "--dev",
             "/dev",
             "--proc",
@@ -41,7 +53,7 @@ pub const BubblewrapSandbox = struct {
             "/tmp",
             "--bind",
             self.workspace_dir,
-            "/workspace",
+            self.workspace_dir,
             "--unshare-all",
             "--die-with-parent",
         };
@@ -58,9 +70,14 @@ pub const BubblewrapSandbox = struct {
         return buf[0 .. prefix_len + argv.len];
     }
 
-    fn isAvailable(_: *anyopaque) bool {
-        const builtin = @import("builtin");
-        return comptime (builtin.os.tag == .linux);
+    fn isAvailable(ptr: *anyopaque) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        const smoke_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
+        var wrapped_argv: [32][]const u8 = undefined;
+        // Probe the same wrapper argv we execute later so auto-detect does not
+        // advertise bubblewrap when the host cannot actually sandbox a command.
+        const argv = wrapCommand(ptr, &smoke_argv, &wrapped_argv) catch return false;
+        return probe.runQuietCommand(argv);
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -103,6 +120,9 @@ test "bubblewrap sandbox wrap command prepends bwrap args" {
     try std.testing.expectEqualStrings("--ro-bind", result[1]);
     try std.testing.expectEqualStrings("/usr", result[2]);
     try std.testing.expectEqualStrings("/usr", result[3]);
+    try std.testing.expectEqualStrings("--ro-bind-try", result[4]);
+    try std.testing.expectEqualStrings("/bin", result[5]);
+    try std.testing.expectEqualStrings("/bin", result[6]);
     // Original command is at the end
     try std.testing.expectEqualStrings("echo", result[result.len - 2]);
     try std.testing.expectEqualStrings("test", result[result.len - 1]);
@@ -136,7 +156,7 @@ test "bubblewrap sandbox wrap empty argv" {
 
     // Just the prefix args, no original command
     try std.testing.expectEqualStrings("bwrap", result[0]);
-    try std.testing.expect(result.len == 16);
+    try std.testing.expect(result.len == 25);
 }
 
 test "bubblewrap buffer too small returns error" {
@@ -147,4 +167,56 @@ test "bubblewrap buffer too small returns error" {
     var buf: [3][]const u8 = undefined;
     const result = sb.wrapCommand(&argv, &buf);
     try std.testing.expectError(error.BufferTooSmall, result);
+}
+
+test "bubblewrap sandbox preserves workspace path for process cwd" {
+    var bw = createBubblewrapSandbox("/tmp/workspace");
+    const sb = bw.sandbox();
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", "printf test" };
+    var buf: [32][]const u8 = undefined;
+    const result = try sb.wrapCommand(&argv, &buf);
+
+    // Regression: ShellTool sets cwd before spawning bwrap, so the workspace
+    // must remain mounted at its original absolute path inside the sandbox.
+    try std.testing.expectEqualStrings("--bind", result[20]);
+    try std.testing.expectEqualStrings("/tmp/workspace", result[21]);
+    try std.testing.expectEqualStrings("/tmp/workspace", result[22]);
+    try std.testing.expectEqualStrings("/bin/sh", result[result.len - 3]);
+}
+
+test "bubblewrap sandbox availability requires executable in PATH" {
+    var bw = createBubblewrapSandbox("/tmp/workspace");
+    const sb = bw.sandbox();
+    if (comptime builtin.os.tag != .linux) {
+        try std.testing.expect(!sb.isAvailable());
+        return;
+    }
+
+    const platform = @import("../platform.zig");
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "PATH");
+    defer std.testing.allocator.free(key_z);
+
+    const old_path = platform.getEnvOrNull(std.testing.allocator, "PATH");
+    defer if (old_path) |path| std.testing.allocator.free(path);
+
+    const old_path_z = if (old_path) |path| try std.testing.allocator.dupeZ(u8, path) else null;
+    defer if (old_path_z) |path| std.testing.allocator.free(path);
+
+    defer {
+        if (old_path_z) |path| {
+            _ = c.setenv(key_z.ptr, path.ptr, 1);
+        } else {
+            _ = c.unsetenv(key_z.ptr);
+        }
+    }
+
+    const empty_z = try std.testing.allocator.dupeZ(u8, "");
+    defer std.testing.allocator.free(empty_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, empty_z.ptr, 1));
+    try std.testing.expect(!sb.isAvailable());
 }

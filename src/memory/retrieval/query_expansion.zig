@@ -808,8 +808,7 @@ const stop_words_es = std.StaticStringMap(void).initComptime(.{
     .{"porque"}, .{"como"},  .{"es"},      .{"son"},           .{"fue"},      .{"fueron"},
     .{"ser"},    .{"estar"}, .{"haber"},   .{"tener"},         .{"hacer"},    .{"ayer"},
     .{"hoy"},    .{"antes"}, .{"ahora"},   .{"recientemente"}, .{"que"},      .{"cuando"},
-    .{"donde"},  .{"favor"},
-    .{"ayuda"},
+    .{"donde"},  .{"favor"}, .{"ayuda"},
     // Accented forms
     .{"ma\xc3\xb1\x61na"}, // mañana
     .{"despu\xc3\xa9s"}, // después
@@ -830,8 +829,7 @@ const stop_words_pt = std.StaticStringMap(void).initComptime(.{
     .{"e"},     .{"ou"},     .{"mas"},   .{"se"},     .{"porque"}, .{"como"},
     .{"foi"},   .{"foram"},  .{"ser"},   .{"estar"},  .{"ter"},    .{"fazer"},
     .{"ontem"}, .{"hoje"},   .{"antes"}, .{"depois"}, .{"agora"},  .{"recentemente"},
-    .{"que"},   .{"quando"}, .{"onde"},  .{"favor"},
-    .{"ajuda"},
+    .{"que"},   .{"quando"}, .{"onde"},  .{"favor"},  .{"ajuda"},
     // Accented forms
     .{"n\xc3\xb3s"}, // nós
     .{"voc\xc3\xaa"}, // você

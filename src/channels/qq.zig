@@ -1,8 +1,10 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
@@ -137,13 +139,13 @@ fn imageExtensionFromContentType(content_type: []const u8) []const u8 {
 fn attachmentCacheDirPath(allocator: std.mem.Allocator) ![]u8 {
     const tmp_dir = try platform.getTempDir(allocator);
     defer allocator.free(tmp_dir);
-    return std.fs.path.join(allocator, &.{ tmp_dir, QQ_ATTACHMENT_CACHE_SUBDIR });
+    return std_compat.fs.path.join(allocator, &.{ tmp_dir, QQ_ATTACHMENT_CACHE_SUBDIR });
 }
 
 fn ensureAttachmentCacheDir(cache_dir: []const u8) !void {
-    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => try std.fs.cwd().makePath(cache_dir),
+        else => try fs_compat.makePath(cache_dir),
     };
 }
 
@@ -173,14 +175,14 @@ fn downloadImageAttachmentToLocal(
     ensureAttachmentCacheDir(cache_dir) catch return null;
 
     const ext = imageExtensionFromContentType(content_type);
-    const ts: u64 = @intCast(@max(std.time.timestamp(), 0));
-    const nonce = std.crypto.random.int(u64);
+    const ts: u64 = @intCast(@max(std_compat.time.timestamp(), 0));
+    const nonce = std_compat.crypto.random.int(u64);
 
     var filename_buf: [96]u8 = undefined;
     const filename = std.fmt.bufPrint(&filename_buf, "qq_{d}_{x}{s}", .{ ts, nonce, ext }) catch return null;
-    const local_path = try std.fs.path.join(allocator, &.{ cache_dir, filename });
+    const local_path = try std_compat.fs.path.join(allocator, &.{ cache_dir, filename });
 
-    const file = std.fs.createFileAbsolute(local_path, .{ .read = false, .truncate = true }) catch {
+    const file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false, .truncate = true }) catch {
         allocator.free(local_path);
         return null;
     };
@@ -301,7 +303,7 @@ pub const DEDUP_CAPACITY: usize = 10_000;
 pub const StringDedupSet = struct {
     seen: std.StringHashMapUnmanaged(void) = .empty,
     order: std.ArrayListUnmanaged([]u8) = .empty,
-    mu: std.Thread.Mutex = .{},
+    mu: std_compat.sync.Mutex = .{},
 
     pub fn deinit(self: *StringDedupSet, allocator: std.mem.Allocator) void {
         self.mu.lock();
@@ -350,87 +352,78 @@ pub const StringDedupSet = struct {
 /// Build the IDENTIFY payload for QQ Gateway WebSocket.
 /// Format: {"op":2,"d":{"token":"QQBot {access_token}","intents":N,"shard":[0,1]}}
 pub fn buildIdentifyPayload(buf: []u8, access_token: []const u8, intents: u32) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{{\"op\":2,\"d\":{{\"token\":\"QQBot {s}\",\"intents\":{d},\"shard\":[0,1]}}}}", .{
         access_token,
         intents,
     });
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build a heartbeat payload.
 /// Format: {"op":1,"d":N} where N is the last sequence number (or null).
 pub fn buildHeartbeatPayload(buf: []u8, sequence: ?i64) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     if (sequence) |seq| {
         try w.print("{{\"op\":1,\"d\":{d}}}", .{seq});
     } else {
         try w.writeAll("{\"op\":1,\"d\":null}");
     }
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build the REST API URL for sending a message to a channel.
 pub fn buildSendUrl(buf: []u8, base: []const u8, channel_id: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}/channels/{s}/messages", .{ base, channel_id });
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build the REST API URL for sending a DM (direct message).
 pub fn buildDmUrl(buf: []u8, base: []const u8, guild_id: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}/dms/{s}/messages", .{ base, guild_id });
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build the REST API URL for sending a group message.
 /// Format: {base}/v2/groups/{group_openid}/messages
 pub fn buildGroupSendUrl(buf: []u8, base: []const u8, group_openid: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}/v2/groups/{s}/messages", .{ base, group_openid });
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build the REST API URL for sending a C2C (private) message.
 /// Format: {base}/v2/users/{user_openid}/messages
 pub fn buildC2cSendUrl(buf: []u8, base: []const u8, user_openid: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}/v2/users/{s}/messages", .{ base, user_openid });
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build the REST API URL for uploading a group media file descriptor.
 /// Format: {base}/v2/groups/{group_openid}/files
 pub fn buildGroupFilesUrl(buf: []u8, base: []const u8, group_openid: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}/v2/groups/{s}/files", .{ base, group_openid });
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build the REST API URL for uploading a C2C media file descriptor.
 /// Format: {base}/v2/users/{user_openid}/files
 pub fn buildC2cFilesUrl(buf: []u8, base: []const u8, user_openid: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}/v2/users/{s}/files", .{ base, user_openid });
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build the REST API URL for resolving gateway endpoint.
 /// Format: {base}/gateway
 pub fn buildGatewayResolveUrl(buf: []u8, base: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}/gateway", .{base});
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Build a message send body.
@@ -452,14 +445,40 @@ pub fn buildSendBody(
         try root.json_util.appendJsonString(&body_list, allocator, mid);
     }
     if (msg_type) |mt| {
-        try body_list.writer(allocator).print(",\"msg_type\":{d}", .{mt});
+        try body_list.print(allocator, ",\"msg_type\":{d}", .{mt});
     }
     if (msg_seq) |seq| {
-        try body_list.writer(allocator).print(",\"msg_seq\":{d}", .{seq});
+        try body_list.print(allocator, ",\"msg_seq\":{d}", .{seq});
     }
     try body_list.appendSlice(allocator, "}");
 
     return body_list.toOwnedSlice(allocator);
+}
+
+fn targetWithoutMessageId(buf: []u8, target: []const u8) ?[]const u8 {
+    const msg_type, const id_str, const msg_id = parseTarget(target);
+    if (msg_id == null) return null;
+
+    if (std.mem.eql(u8, msg_type, "c2c") or std.mem.eql(u8, msg_type, "group")) {
+        return std.fmt.bufPrint(buf, "{s}:{s}", .{ msg_type, id_str }) catch null;
+    }
+    return null;
+}
+
+fn sendWithReplyFallback(
+    target: []const u8,
+    fallback_target: ?[]const u8,
+    log_context: []const u8,
+    sender: anytype,
+) !void {
+    sender.send(target) catch |err| {
+        if (err == error.QQApiError and fallback_target != null) {
+            log.warn("QQ {s} send failed; retrying without msg_id target={s}", .{ log_context, fallback_target.? });
+            try sender.send(fallback_target.?);
+        } else {
+            return err;
+        }
+    };
 }
 
 /// Build a media upload body for QQ /files endpoint.
@@ -494,7 +513,7 @@ pub fn buildMediaSendBody(
         try root.json_util.appendJsonString(&body_list, allocator, mid);
     }
     if (msg_seq) |seq| {
-        try body_list.writer(allocator).print(",\"msg_seq\":{d}", .{seq});
+        try body_list.print(allocator, ",\"msg_seq\":{d}", .{seq});
     }
     try body_list.appendSlice(allocator, "}");
 
@@ -503,10 +522,9 @@ pub fn buildMediaSendBody(
 
 /// Build auth header value: "Authorization: QQBot {access_token}"
 pub fn buildAuthHeader(buf: []u8, access_token: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("Authorization: QQBot {s}", .{access_token});
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 /// Fetch the current gateway URL for this bot/environment.
@@ -622,7 +640,7 @@ fn qqWebhookValidationSignature(
 pub fn isGroupAllowed(config: config_types.QQConfig, group_id: []const u8) bool {
     return switch (config.group_policy) {
         .allow => true,
-        .allowlist => root.isAllowedExact(config.allowed_groups, group_id),
+        .allowlist => root.isAllowedExactScoped("qq channel", config.allowed_groups, group_id),
     };
 }
 
@@ -789,7 +807,7 @@ pub fn parseGatewayPath(wss_url: []const u8) []const u8 {
     return "/websocket";
 }
 
-const invalid_socket: std.posix.socket_t = if (builtin.os.tag == .windows) std.os.windows.ws2_32.INVALID_SOCKET else -1;
+const invalid_socket: std.posix.socket_t = if (builtin.os.tag == .windows) std_compat.net.invalidHandle(std.posix.socket_t) else -1;
 // ════════════════════════════════════════════════════════════════════════════
 // QQChannel
 // ════════════════════════════════════════════════════════════════════════════
@@ -817,7 +835,7 @@ pub const QQChannel = struct {
     heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     force_heartbeat: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ws_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(invalid_socket),
-    token_mu: std.Thread.Mutex = .{},
+    token_mu: std_compat.sync.Mutex = .{},
 
     // ── Access token state ──
     access_token: ?[]u8 = null,
@@ -845,6 +863,9 @@ pub const QQChannel = struct {
     }
 
     pub fn healthCheck(self: *QQChannel) bool {
+        if (self.config.receive_mode == .websocket) {
+            return self.running.load(.acquire) and self.ws_fd.load(.acquire) != invalid_socket;
+        }
         const result = fetchAccessToken(self.allocator, self.config.app_id, self.config.app_secret) catch return false;
         self.allocator.free(result.token);
         return true;
@@ -861,7 +882,7 @@ pub const QQChannel = struct {
         self.token_mu.lock();
         defer self.token_mu.unlock();
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         if (self.access_token) |tok| {
             if (now < self.token_expires_at - TOKEN_REFRESH_MARGIN_SECS) {
                 return self.allocator.dupe(u8, tok);
@@ -1127,7 +1148,7 @@ pub const QQChannel = struct {
         }
 
         // Allowlist check
-        if (!root.isAllowedExact(self.config.allow_from, sender_id)) {
+        if (!root.isAllowedExactScoped("qq channel", self.config.allow_from, sender_id)) {
             log.info("handleMessageCreate: DROPPED — sender '{s}' not in allow_from", .{sender_id});
             return;
         }
@@ -1193,30 +1214,29 @@ pub const QQChannel = struct {
 
         // Build metadata JSON
         var meta_buf: [512]u8 = undefined;
-        var meta_fbs = std.io.fixedBufferStream(&meta_buf);
-        const mw = meta_fbs.writer();
+        var mw: std.Io.Writer = .fixed(&meta_buf);
         mw.writeAll("{\"msg_id\":") catch return;
-        root.appendJsonStringW(mw, msg_id_str) catch return;
+        root.appendJsonStringW(&mw, msg_id_str) catch return;
         mw.print(",\"is_dm\":{s},\"is_group\":{s}", .{
             if (is_dm) "true" else "false",
             if (is_group) "true" else "false",
         }) catch return;
         if (channel_id.len > 0) {
             mw.writeAll(",\"channel_id\":") catch return;
-            root.appendJsonStringW(mw, channel_id) catch return;
+            root.appendJsonStringW(&mw, channel_id) catch return;
         }
         if (group_openid.len > 0) {
             mw.writeAll(",\"group_openid\":") catch return;
-            root.appendJsonStringW(mw, group_openid) catch return;
+            root.appendJsonStringW(&mw, group_openid) catch return;
         }
         if (user_openid.len > 0) {
             mw.writeAll(",\"user_openid\":") catch return;
-            root.appendJsonStringW(mw, user_openid) catch return;
+            root.appendJsonStringW(&mw, user_openid) catch return;
         }
         mw.writeAll(",\"account_id\":") catch return;
-        root.appendJsonStringW(mw, self.config.account_id) catch return;
+        root.appendJsonStringW(&mw, self.config.account_id) catch return;
         mw.writeByte('}') catch return;
-        const metadata = meta_fbs.getWritten();
+        const metadata = mw.buffered();
 
         log.info("QQ inbound: type={s} sender={s} target={s}", .{ event_type, sender_id, reply_target });
 
@@ -1255,10 +1275,31 @@ pub const QQChannel = struct {
     ///   "user:<user_openid>"    — alias for c2c
     ///   "<user_openid>"         — defaults to c2c (zeroclaw parity)
     pub fn sendMessage(self: *QQChannel, target: []const u8, text: []const u8) !void {
+        const ChunkSend = struct {
+            channel: *QQChannel,
+            chunk: []const u8,
+            msg_seq: ?u32,
+
+            fn send(ctx: *@This(), send_target: []const u8) !void {
+                try ctx.channel.sendChunk(send_target, ctx.chunk, ctx.msg_seq);
+            }
+        };
+        const MediaSend = struct {
+            channel: *QQChannel,
+            image_url: []const u8,
+            msg_seq: ?u32,
+
+            fn send(ctx: *@This(), send_target: []const u8) !void {
+                try ctx.channel.sendMedia(send_target, ctx.image_url, ctx.msg_seq);
+            }
+        };
+
         const parsed_target = parseTarget(target);
         const msg_type = parsed_target[0];
         const msg_id = parsed_target[2];
         const supports_media_upload = std.mem.eql(u8, msg_type, "group") or std.mem.eql(u8, msg_type, "c2c");
+        var fallback_target_buf: [256]u8 = undefined;
+        const fallback_target = targetWithoutMessageId(&fallback_target_buf, target);
 
         var msg_seq: u32 = 1;
         if (supports_media_upload) {
@@ -1268,7 +1309,12 @@ pub const QQChannel = struct {
             if (parsed.text.len > 0) {
                 var text_it = root.splitMessage(parsed.text, MAX_MESSAGE_LEN);
                 while (text_it.next()) |chunk| {
-                    try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+                    var chunk_send = ChunkSend{
+                        .channel = self,
+                        .chunk = chunk,
+                        .msg_seq = if (msg_id != null) msg_seq else null,
+                    };
+                    try sendWithReplyFallback(target, fallback_target, "reply", &chunk_send);
                     if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
                         msg_seq += 1;
                     }
@@ -1276,7 +1322,12 @@ pub const QQChannel = struct {
             }
 
             for (parsed.image_urls) |image_url| {
-                try self.sendMedia(target, image_url, if (msg_id != null) msg_seq else null);
+                var media_send = MediaSend{
+                    .channel = self,
+                    .image_url = image_url,
+                    .msg_seq = if (msg_id != null) msg_seq else null,
+                };
+                try sendWithReplyFallback(target, fallback_target, "media reply", &media_send);
                 if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
                     msg_seq += 1;
                 }
@@ -1286,7 +1337,12 @@ pub const QQChannel = struct {
 
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
         while (it.next()) |chunk| {
-            try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+            var chunk_send = ChunkSend{
+                .channel = self,
+                .chunk = chunk,
+                .msg_seq = if (msg_id != null) msg_seq else null,
+            };
+            try sendWithReplyFallback(target, fallback_target, "reply", &chunk_send);
             if (msg_id != null and msg_seq < std.math.maxInt(u32)) msg_seq += 1;
         }
     }
@@ -1487,11 +1543,7 @@ pub const QQChannel = struct {
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.closesocket(fd);
-            } else {
-                std.posix.close(fd);
-            }
+            (std_compat.net.Stream{ .handle = fd }).close();
         }
         if (self.gateway_thread) |t| {
             t.join();
@@ -1562,7 +1614,7 @@ pub const QQChannel = struct {
             // Interruptible backoff
             var slept: u64 = 0;
             while (slept < backoff_ms and self.running.load(.acquire)) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 slept += 100;
             }
         }
@@ -1692,7 +1744,7 @@ pub const QQChannel = struct {
             if (self.force_heartbeat.swap(false, .acq_rel)) {
                 self.sendHeartbeatNow(ws);
             }
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            std_compat.thread.sleep(10 * std.time.ns_per_ms);
         }
         log.info("Heartbeat thread running (interval={d}ms)", .{self.heartbeat_interval_ms.load(.acquire)});
         while (!self.heartbeat_stop.load(.acquire)) {
@@ -1706,7 +1758,7 @@ pub const QQChannel = struct {
                     elapsed = 0;
                     continue;
                 }
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 elapsed += 100;
             }
             if (self.heartbeat_stop.load(.acquire)) return;
@@ -2127,6 +2179,22 @@ test "qq QQChannel init stores config" {
     try std.testing.expect(ch.healthCheck());
     try std.testing.expect(!ch.has_sequence.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), ch.heartbeat_interval_ms.load(.acquire));
+}
+
+test "qq healthCheck websocket requires running socket" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .receive_mode = .websocket });
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    const fake_socket: std.posix.socket_t = if (builtin.os.tag == .windows)
+        @ptrFromInt(1)
+    else
+        42;
+    ch.ws_fd.store(fake_socket, .release);
+    try std.testing.expect(ch.healthCheck());
 }
 
 test "qq QQChannel vtable compiles" {
@@ -2653,6 +2721,59 @@ test "qq parseTarget group with msg_id" {
     try std.testing.expectEqualStrings("group", msg_type);
     try std.testing.expectEqualStrings("openid_abc", id);
     try std.testing.expectEqualStrings("msg_def456", mid.?);
+}
+
+// Regression: QQ delayed replies may need to fall back to a plain target without msg_id.
+test "qq targetWithoutMessageId strips reply msg_id for c2c and group" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("c2c:openid_xyz", targetWithoutMessageId(&buf, "c2c:openid_xyz:msg_abc123").?);
+    try std.testing.expectEqualStrings("group:openid_abc", targetWithoutMessageId(&buf, "group:openid_abc:msg_def456").?);
+    try std.testing.expect(targetWithoutMessageId(&buf, "channel:abc:def") == null);
+    try std.testing.expect(targetWithoutMessageId(&buf, "c2c:openid_xyz") == null);
+}
+
+// Regression: issue #722 must retry delayed QQ replies without msg_id after API failure.
+test "qq sendWithReplyFallback retries QQApiError with plain target" {
+    const Sender = struct {
+        allocator: std.mem.Allocator,
+        calls: std.ArrayListUnmanaged([]const u8) = .empty,
+        fail_first: bool = true,
+
+        fn deinit(self: *@This()) void {
+            self.calls.deinit(self.allocator);
+        }
+
+        fn send(self: *@This(), send_target: []const u8) !void {
+            try self.calls.append(self.allocator, send_target);
+            if (self.fail_first) {
+                self.fail_first = false;
+                return error.QQApiError;
+            }
+        }
+    };
+
+    var sender = Sender{ .allocator = std.testing.allocator };
+    defer sender.deinit();
+
+    try sendWithReplyFallback("group:openid_abc:msg_def456", "group:openid_abc", "reply", &sender);
+    try std.testing.expectEqual(@as(usize, 2), sender.calls.items.len);
+    try std.testing.expectEqualStrings("group:openid_abc:msg_def456", sender.calls.items[0]);
+    try std.testing.expectEqualStrings("group:openid_abc", sender.calls.items[1]);
+}
+
+test "qq sendWithReplyFallback does not retry without plain target" {
+    const Sender = struct {
+        calls: usize = 0,
+
+        fn send(self: *@This(), _: []const u8) !void {
+            self.calls += 1;
+            return error.QQApiError;
+        }
+    };
+
+    var sender = Sender{};
+    try std.testing.expectError(error.QQApiError, sendWithReplyFallback("channel:abc", null, "reply", &sender));
+    try std.testing.expectEqual(@as(usize, 1), sender.calls);
 }
 
 test "qq sendChunk rejects unsupported target type" {

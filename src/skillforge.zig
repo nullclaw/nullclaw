@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const http_util = @import("http_util.zig");
 const json_miniparse = @import("json_miniparse.zig");
 
 // SkillForge -- skill auto-discovery, evaluation, and integration engine.
@@ -65,6 +67,20 @@ pub const SkillCandidate = struct {
     has_root_zig: bool = false,
 };
 
+pub fn freeCandidate(allocator: std.mem.Allocator, candidate: *SkillCandidate) void {
+    allocator.free(candidate.result_name);
+    allocator.free(candidate.repo_url);
+    allocator.free(candidate.description);
+    if (candidate.updated_at) |value| allocator.free(value);
+    if (candidate.language) |value| allocator.free(value);
+    if (!std.mem.eql(u8, candidate.owner, "unknown")) allocator.free(candidate.owner);
+    candidate.* = undefined;
+}
+
+pub fn freeCandidates(allocator: std.mem.Allocator, candidates: []SkillCandidate) void {
+    for (candidates) |*candidate| freeCandidate(allocator, candidate);
+}
+
 // ── Scout ────────────────────────────────────────────────────────
 
 /// Scout: search GitHub for nullclaw-compatible skill repositories.
@@ -85,13 +101,13 @@ pub fn scout(allocator: std.mem.Allocator, query: []const u8) !std.ArrayList(Ski
     defer allocator.free(url);
 
     // Fetch from GitHub API using std.http.Client
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    const result = client.fetch(.{
+    const result = client.client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
         .extra_headers = &.{
@@ -380,7 +396,7 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
     const safe_name = try sanitizePathComponent(candidate.result_name);
 
     // Ensure skills directory exists
-    std.fs.makeDirAbsolute(skills_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(skills_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return IntegrationResult{
             .skill_name = safe_name,
@@ -395,7 +411,7 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
     defer allocator.free(target_path);
 
     // Clone the repository using git
-    var child = std.process.Child.init(
+    var child = std_compat.process.Child.init(
         &.{ "git", "clone", "--depth", "1", candidate.repo_url, target_path },
         allocator,
     );
@@ -420,7 +436,7 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
     };
 
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             return IntegrationResult{
                 .skill_name = safe_name,
                 .install_path = skills_dir,
@@ -443,7 +459,7 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
 
     if (!has_skill_json and !has_build_zig and !has_root_zig) {
         // Remove the cloned directory since it lacks expected structure
-        std.fs.deleteTreeAbsolute(target_path) catch {};
+        std_compat.fs.deleteTreeAbsolute(target_path) catch {};
         return IntegrationResult{
             .skill_name = safe_name,
             .install_path = skills_dir,
@@ -461,9 +477,9 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
 
 /// Check if a file exists in a directory.
 fn hasFile(dir_path: []const u8, filename: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std_compat.fs.max_path_bytes]u8 = undefined;
     const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir_path, filename }) catch return false;
-    std.fs.accessAbsolute(full, .{}) catch return false;
+    std_compat.fs.accessAbsolute(full, .{}) catch return false;
     return true;
 }
 

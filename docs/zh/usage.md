@@ -49,10 +49,17 @@ nullclaw gateway
 | `nullclaw channel start telegram` | 启动指定渠道 |
 | `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw 数据 |
 | `nullclaw migrate openclaw` | 执行迁移 |
+| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出会话记录 |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定会话的消息详情 |
 
 ## 服务化运行建议
 
 建议在长期运行场景使用 service 子命令：
+
+- macOS 走 `launchctl`。
+- Linux 环境会优先使用 `systemd --user`，在检测到 OpenRC 或 SysVinit 运行环境时自动切换到对应实现。
+- Windows 走 Service Control Manager。
+- 如果 Linux 上既没有可用的 `systemd --user`，也缺少必需的 OpenRC / SysVinit 支持，这组子命令会失败；此时应改用前台 `nullclaw gateway` 或其他外部 supervisor。
 
 ```bash
 nullclaw service install
@@ -72,6 +79,7 @@ nullclaw service start
 - 默认网关地址：`127.0.0.1:3000`
 - 推荐保持 `gateway.require_pairing = true`
 - 建议通过 tunnel 暴露外网访问，不直接公网监听网关
+- `/pair` 仅支持 POST，并使用 `X-Pairing-Code`；多次错误尝试会触发限流，且可能进入临时锁定
 
 网关健康检查：
 
@@ -114,8 +122,10 @@ nullclaw onboard --interactive
 重点检查：
 
 - `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
-- `allow_from` 是否误设为空数组。
+- 是否存在渠道级 allowlist / gating 配置不匹配（如 `allow_from`、`group_allow_from`、`require_mention` 等）。空 `allow_from` 不是通用的“拒绝所有”开关。
 - `nullclaw channel status` 是否有 unhealthy 标记。
+- 如果是 DingTalk，进一步看
+  [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)。
 
 ### 4) 网关启动但外部不可访问
 
@@ -124,6 +134,48 @@ nullclaw onboard --interactive
 - 仍绑定在 `127.0.0.1`。
 - 未配置 tunnel 或反向代理。
 - 防火墙未放行端口。
+
+### 5) provider 返回 429 / “rate limit exceeded”
+
+常见原因：
+
+- 额度较低的 coding plan 往往扛不住 tool-heavy 的 agent 回合，即使普通聊天还看起来能用。
+- 当前 provider 计划对重试频率很敏感。
+- 主 provider 被限流后，没有配置可切换的 fallback。
+
+建议排查：
+
+- 前台运行时先用 `nullclaw agent --verbose`。
+- service 模式下查看 `~/.nullclaw/logs/daemon.stdout.log` 与 `~/.nullclaw/logs/daemon.stderr.log`。
+- 跑一次 `nullclaw status`，确认当前实际使用的 provider / model。
+
+如果 plan 本身可用但限流很严，建议保守调整 reliability：
+
+```json
+{
+  "reliability": {
+    "provider_retries": 1,
+    "provider_backoff_ms": 3000,
+    "fallback_providers": ["openrouter"]
+  }
+}
+```
+
+如果同一 provider 有多把 key，可以配置 `reliability.api_keys` 让 NullClaw 在限流时轮转。
+
+### 6) 本地 Ollama 模型提示没有 `scheduler_tool` 权限
+
+这通常意味着：
+
+- NullClaw 里的规范工具名其实是 `schedule`。
+- 某些通过 Ollama 提供的本地模型会输出 `scheduler_tool` 或 `schedule_tool`。
+- 新版 NullClaw 会在分发前把这些 Ollama 别名规范化回 `schedule`。
+
+建议检查：
+
+- 确认当前运行的版本已经包含 Ollama 工具别名规范化修复。
+- 如果仍然看到 scheduler 相关名字触发 `Unknown tool`，用 `nullclaw agent --verbose` 复现一次。
+- 如果还在使用旧二进制，先升级再排查 scheduler 配置；大多数情况下问题是工具名漂移，不是 scheduler 没开。
 
 ## 变更后回归检查清单
 

@@ -57,7 +57,9 @@ pub const CronRunsTool = struct {
         // Format output
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        defer buf = buf_writer.toArrayList();
+        const w = &buf_writer.writer;
 
         // Header with job info
         const last_run_str: []const u8 = if (job.last_run_secs) |lrs| blk: {

@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const probe = @import("probe.zig");
 const Sandbox = @import("sandbox.zig").Sandbox;
 
 /// Maximum supported workspace path length for the mount argument buffer.
@@ -38,16 +40,17 @@ pub const DockerSandbox = struct {
 
     fn wrapCommand(ptr: *anyopaque, argv: []const []const u8, buf: [][]const u8) anyerror![]const []const u8 {
         const self = resolve(ptr);
-        // docker run --rm --memory 512m --cpus 1.0 --network none -v WORKSPACE:WORKSPACE IMAGE <argv...>
+        if (self.workspace_dir.len == 0 or self.mount_arg_len == 0) return error.EmptyWorkspaceDir;
+        // docker run --rm --memory 512m --cpus 1.0 --network none -v WORKSPACE:WORKSPACE -w WORKSPACE IMAGE <argv...>
         const prefix = [_][]const u8{
             "docker",   "run",       "--rm",
             "--memory", "512m",      "--cpus",
             "1.0",      "--network", "none",
             "-v",
         };
-        // We need: prefix (10) + mount_arg (1) + image (1) + argv.len
+        // We need: prefix (10) + mount_arg (1) + -w (1) + workspace (1) + image (1) + argv.len
         const prefix_len = prefix.len;
-        const total = prefix_len + 2 + argv.len;
+        const total = prefix_len + 4 + argv.len;
 
         if (buf.len < total) return error.BufferTooSmall;
 
@@ -55,26 +58,18 @@ pub const DockerSandbox = struct {
             buf[i] = p;
         }
         buf[prefix_len] = self.mount_arg_buf[0..self.mount_arg_len];
-        buf[prefix_len + 1] = self.image;
+        buf[prefix_len + 1] = "-w";
+        buf[prefix_len + 2] = self.workspace_dir;
+        buf[prefix_len + 3] = self.image;
         for (argv, 0..) |arg, i| {
-            buf[prefix_len + 2 + i] = arg;
+            buf[prefix_len + 4 + i] = arg;
         }
         return buf[0..total];
     }
 
-    fn isAvailable(ptr: *anyopaque) bool {
-        const self = resolve(ptr);
-        // Check if docker binary is actually reachable
-        var child = std.process.Child.init(&.{ "docker", "--version" }, self.allocator);
-        child.stderr_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stdin_behavior = .Ignore;
-        child.spawn() catch return false;
-        const term = child.wait() catch return false;
-        return switch (term) {
-            .Exited => |code| code == 0,
-            else => false,
-        };
+    fn isAvailable(_: *anyopaque) bool {
+        // Probe daemon reachability without pulling the configured image.
+        return probe.runQuietCommand(&.{ "docker", "info" });
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -182,7 +177,7 @@ pub fn validateWorkspaceMount(path: []const u8, allowed_roots: ?[]const []const 
     if (path[0] != '/') return .not_absolute;
 
     // 4. Root check — normalize trailing slashes: treat "///" the same as "/"
-    const trimmed = std.mem.trimRight(u8, path, "/");
+    const trimmed = std_compat.mem.trimRight(u8, path, "/");
     if (trimmed.len == 0) return .is_root;
 
     // 5. Traversal check — look for ".." as a path component
@@ -233,7 +228,7 @@ fn isDangerousMount(trimmed: []const u8) bool {
 
 /// Check if `path` is equal to or under `root`.
 fn isUnderRoot(path: []const u8, root: []const u8) bool {
-    const trimmed_root = std.mem.trimRight(u8, root, "/");
+    const trimmed_root = std_compat.mem.trimRight(u8, root, "/");
     if (trimmed_root.len == 0) return false; // don't allow root "/" as an allowed root
     if (std.mem.eql(u8, path, trimmed_root)) return true;
     if (path.len > trimmed_root.len and
@@ -256,7 +251,7 @@ test "docker sandbox name" {
 test "docker sandbox isAvailable returns bool" {
     var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
-    // isAvailable now checks for real docker binary; result depends on environment
+    // isAvailable now checks Docker daemon reachability; result depends on environment.
     _ = sb.isAvailable();
 }
 
@@ -277,12 +272,15 @@ test "docker sandbox wrap command prepends docker run" {
     try std.testing.expectEqualStrings("-v", result[9]);
     // Mount arg: workspace_dir:workspace_dir
     try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", result[10]);
+    try std.testing.expectEqualStrings("-w", result[11]);
+    // Regression: preserve the shell tool's default workspace cwd inside the container.
+    try std.testing.expectEqualStrings("/tmp/workspace", result[12]);
     // Image
-    try std.testing.expectEqualStrings("alpine:latest", result[11]);
+    try std.testing.expectEqualStrings("alpine:latest", result[13]);
     // Original command
-    try std.testing.expectEqualStrings("echo", result[12]);
-    try std.testing.expectEqualStrings("hello", result[13]);
-    try std.testing.expectEqual(@as(usize, 14), result.len);
+    try std.testing.expectEqualStrings("echo", result[14]);
+    try std.testing.expectEqualStrings("hello", result[15]);
+    try std.testing.expectEqual(@as(usize, 16), result.len);
 }
 
 test "docker sandbox wrap with custom image" {
@@ -295,8 +293,10 @@ test "docker sandbox wrap with custom image" {
 
     try std.testing.expectEqualStrings("-v", result[9]);
     try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", result[10]);
-    try std.testing.expectEqualStrings("ubuntu:22.04", result[11]);
-    try std.testing.expectEqualStrings("ls", result[12]);
+    try std.testing.expectEqualStrings("-w", result[11]);
+    try std.testing.expectEqualStrings("/tmp/workspace", result[12]);
+    try std.testing.expectEqualStrings("ubuntu:22.04", result[13]);
+    try std.testing.expectEqualStrings("ls", result[14]);
 }
 
 test "docker sandbox wrap empty argv" {
@@ -307,8 +307,8 @@ test "docker sandbox wrap empty argv" {
     var buf: [32][]const u8 = undefined;
     const result = try sb.wrapCommand(&argv, &buf);
 
-    // prefix (10) + mount_arg (1) + image (1)
-    try std.testing.expectEqual(@as(usize, 12), result.len);
+    // prefix (10) + mount_arg (1) + -w (1) + workspace (1) + image (1)
+    try std.testing.expectEqual(@as(usize, 14), result.len);
 }
 
 test "docker buffer too small returns error" {
@@ -319,6 +319,20 @@ test "docker buffer too small returns error" {
     var buf: [5][]const u8 = undefined;
     const result = sb.wrapCommand(&argv, &buf);
     try std.testing.expectError(error.BufferTooSmall, result);
+}
+
+test "docker wrap rejects empty workspace state" {
+    var dk = DockerSandbox{
+        .allocator = std.testing.allocator,
+        .workspace_dir = "",
+        .image = DockerSandbox.default_image,
+    };
+    const sb = dk.sandbox();
+
+    const argv = [_][]const u8{"echo"};
+    var buf: [16][]const u8 = undefined;
+    const result = sb.wrapCommand(&argv, &buf);
+    try std.testing.expectError(error.EmptyWorkspaceDir, result);
 }
 
 test "docker sandbox workspace is mounted correctly" {

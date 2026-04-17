@@ -4,13 +4,16 @@
 /// interactive wizard (onboard.zig) and channel catalog, ensuring a
 /// single source of truth.
 const std = @import("std");
+const std_compat = @import("compat");
 const onboard = @import("onboard.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const version = @import("version.zig");
 
+const BUILD_FROM_SOURCE_ZIG_VERSION = "0.16.0";
+
 pub fn run() !void {
     var buf: [65536]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writer(&buf);
     const out = &bw.interface;
 
     // ── Top-level fields ─────────────────────────────────────────────
@@ -40,14 +43,14 @@ pub fn run() !void {
     );
 
     // ── Build from source ───────────────────────────────────────────
-    try out.writeAll(
-        \\  "build_from_source": {
-        \\    "zig_version": "0.15.2",
+    try out.print(
+        \\  "build_from_source": {{
+        \\    "zig_version": "{s}",
         \\    "command": "zig build -Doptimize=ReleaseSmall",
         \\    "output": "zig-out/bin/nullclaw"
-        \\  },
+        \\  }},
         \\
-    );
+    , .{BUILD_FROM_SOURCE_ZIG_VERSION});
 
     // ── Launch / health / ports ─────────────────────────────────────
     try out.writeAll(
@@ -107,7 +110,7 @@ pub fn run() !void {
         \\        "description": "Your provider API key",
         \\        "type": "secret",
         \\        "required": true,
-        \\        "condition": { "step": "provider", "not_in": "ollama,lm-studio,claude-cli,codex-cli" }
+        \\        "condition": { "step": "provider", "not_in": "ollama,lm-studio,claude-cli,codex-cli,openai-codex" }
         \\      },
         \\
     );
@@ -260,11 +263,13 @@ pub fn run() !void {
 }
 
 test "export_manifest produces valid structure" {
+    try std.testing.expectEqualStrings("0.16.0", BUILD_FROM_SOURCE_ZIG_VERSION);
+
     // Verify the data sources are accessible and have expected counts
     try std.testing.expect(onboard.known_providers.len >= 29);
     try std.testing.expect(onboard.wizard_memory_backend_order.len == 10);
     try std.testing.expect(onboard.tunnel_options.len == 4);
-    try std.testing.expect(onboard.autonomy_options.len == 3);
+    try std.testing.expect(onboard.autonomy_options.len == 4);
     try std.testing.expect(channel_catalog.known_channels.len >= 20);
 
     // Verify first provider
@@ -272,4 +277,5 @@ test "export_manifest produces valid structure" {
 
     // Verify memory backends start with hybrid
     try std.testing.expectEqualStrings("hybrid", onboard.wizard_memory_backend_order[0]);
+    try std.testing.expectEqualStrings("yolo", onboard.autonomy_options[3]);
 }

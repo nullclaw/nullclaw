@@ -156,9 +156,10 @@ fn isUnsupported(keyword: []const u8, strategy: CleaningStrategy) bool {
 
 /// Extract `$defs` and `definitions` from a root schema value.
 fn extractDefs(allocator: std.mem.Allocator, root: std.json.Value) std.json.ObjectMap {
+    _ = allocator;
     if (root != .object) {
         // Return an empty map — won't be used, just need a valid value.
-        return std.json.ObjectMap.init(allocator);
+        return .empty;
     }
     const obj = root.object;
 
@@ -169,7 +170,7 @@ fn extractDefs(allocator: std.mem.Allocator, root: std.json.Value) std.json.Obje
     if (obj.get("definitions")) |v| {
         if (v == .object) return v.object;
     }
-    return std.json.ObjectMap.init(allocator);
+    return .empty;
 }
 
 const CleanError = std.mem.Allocator.Error;
@@ -225,7 +226,7 @@ fn cleanObject(
     const has_union = obj.contains("anyOf") or obj.contains("oneOf");
 
     // Build cleaned object
-    var cleaned = std.json.ObjectMap.init(allocator);
+    var cleaned: std.json.ObjectMap = .empty;
 
     var it = obj.iterator();
     while (it.next()) |entry| {
@@ -241,26 +242,26 @@ fn cleanObject(
             var enum_arr = std.json.Array.init(allocator);
             try enum_arr.ensureTotalCapacity(1);
             enum_arr.appendAssumeCapacity(value);
-            try cleaned.put("enum", .{ .array = enum_arr });
+            try cleaned.put(allocator, "enum", .{ .array = enum_arr });
         } else if (std.mem.eql(u8, key, "type") and has_union) {
             // Skip type if we have anyOf/oneOf (they define the type)
             continue;
         } else if (std.mem.eql(u8, key, "type") and value == .array) {
             // Handle type arrays (remove null)
-            try cleaned.put(key, cleanTypeArray(value));
+            try cleaned.put(allocator, key, cleanTypeArray(value));
         } else if (std.mem.eql(u8, key, "properties")) {
-            try cleaned.put(key, try cleanProperties(allocator, value, strategy, defs, ref_stack));
+            try cleaned.put(allocator, key, try cleanProperties(allocator, value, strategy, defs, ref_stack));
         } else if (std.mem.eql(u8, key, "items")) {
-            try cleaned.put(key, try cleanValue(allocator, value, strategy, defs, ref_stack));
+            try cleaned.put(allocator, key, try cleanValue(allocator, value, strategy, defs, ref_stack));
         } else if (std.mem.eql(u8, key, "anyOf") or std.mem.eql(u8, key, "oneOf") or std.mem.eql(u8, key, "allOf")) {
-            try cleaned.put(key, try cleanUnion(allocator, value, strategy, defs, ref_stack));
+            try cleaned.put(allocator, key, try cleanUnion(allocator, value, strategy, defs, ref_stack));
         } else {
             // Keep all other keys, cleaning nested objects/arrays recursively
             const cleaned_val = switch (value) {
                 .object, .array => try cleanValue(allocator, value, strategy, defs, ref_stack),
                 else => value,
             };
-            try cleaned.put(key, cleaned_val);
+            try cleaned.put(allocator, key, cleaned_val);
         }
     }
 
@@ -278,7 +279,7 @@ fn resolveRef(
 ) CleanError!std.json.Value {
     // Prevent circular references
     if (ref_stack.contains(ref_value)) {
-        return preserveMeta(allocator, obj, .{ .object = std.json.ObjectMap.init(allocator) });
+        return preserveMeta(allocator, obj, .{ .object = .empty });
     }
 
     // Try to resolve local ref (#/$defs/Name or #/definitions/Name)
@@ -292,7 +293,7 @@ fn resolveRef(
     }
 
     // Can't resolve: return empty object with metadata
-    return preserveMeta(allocator, obj, .{ .object = std.json.ObjectMap.init(allocator) });
+    return preserveMeta(allocator, obj, .{ .object = .empty });
 }
 
 /// Parse a local JSON Pointer ref (#/$defs/Name or #/definitions/Name).
@@ -425,14 +426,14 @@ fn tryFlattenLiteralUnion(allocator: std.mem.Allocator, variants: []const std.js
 
     const ct = common_type orelse return null;
 
-    var result = std.json.ObjectMap.init(allocator);
-    result.put("type", .{ .string = ct }) catch return null;
+    var result: std.json.ObjectMap = .empty;
+    result.put(allocator, "type", .{ .string = ct }) catch return null;
     var enum_arr = std.json.Array.init(allocator);
     enum_arr.ensureTotalCapacity(all_values.items.len) catch return null;
     for (all_values.items) |v| {
         enum_arr.appendAssumeCapacity(v);
     }
-    result.put("enum", .{ .array = enum_arr }) catch return null;
+    result.put(allocator, "enum", .{ .array = enum_arr }) catch return null;
 
     return .{ .object = result };
 }
@@ -465,12 +466,12 @@ fn cleanProperties(
     ref_stack: *std.StringHashMap(void),
 ) CleanError!std.json.Value {
     if (value != .object) return value;
-    var cleaned = std.json.ObjectMap.init(allocator);
+    var cleaned: std.json.ObjectMap = .empty;
     var it = value.object.iterator();
     while (it.next()) |entry| {
         const k = entry.key_ptr.*;
         const v = entry.value_ptr.*;
-        try cleaned.put(k, try cleanValue(allocator, v, strategy, defs, ref_stack));
+        try cleaned.put(allocator, k, try cleanValue(allocator, v, strategy, defs, ref_stack));
     }
     return .{ .object = cleaned };
 }
@@ -500,10 +501,9 @@ fn preserveMeta(allocator: std.mem.Allocator, source: *const std.json.ObjectMap,
     var obj = target.object;
     for (&SCHEMA_META_KEYS) |key| {
         if (source.get(key)) |val| {
-            obj.put(key, val) catch |err| log.err("preserveMeta: failed to put key {s}: {}", .{ key, err });
+            obj.put(allocator, key, val) catch |err| log.err("preserveMeta: failed to put key {s}: {}", .{ key, err });
         }
     }
-    _ = allocator;
     return .{ .object = obj };
 }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const AtomicBool = std.atomic.Value(bool);
 const builtin = @import("builtin");
 
@@ -24,10 +25,24 @@ extern "kernel32" fn WideCharToMultiByte(
 ) callconv(.winapi) i32;
 
 extern "kernel32" fn GetACP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn GetProcessId(process_handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
+extern "kernel32" fn WaitForSingleObject(
+    handle: std.os.windows.HANDLE,
+    milliseconds: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
+extern "kernel32" fn OpenProcess(
+    desired_access: std.os.windows.DWORD,
+    inherit_handle: std.os.windows.BOOL,
+    process_id: std.os.windows.DWORD,
+) callconv(.winapi) ?std.os.windows.HANDLE;
 
 const CP_UTF8: std.os.windows.UINT = 65001;
 const CP_GBK: std.os.windows.UINT = 936;
 const MB_ERR_INVALID_CHARS: std.os.windows.DWORD = 0x00000008;
+const PROCESS_SYNCHRONIZE: std.os.windows.DWORD = 0x00100000;
+const WAIT_OBJECT_0: std.os.windows.DWORD = 0x00000000;
+const WAIT_TIMEOUT: std.os.windows.DWORD = 0x00000102;
 
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 
@@ -42,6 +57,7 @@ pub const RunResult = struct {
     success: bool,
     exit_code: ?u32 = null,
     interrupted: bool = false,
+    timed_out: bool = false,
 
     /// Free both stdout and stderr buffers.
     pub fn deinit(self: *const RunResult, allocator: std.mem.Allocator) void {
@@ -53,29 +69,106 @@ pub const RunResult = struct {
 /// Options for running a child process.
 pub const RunOptions = struct {
     cwd: ?[]const u8 = null,
-    env_map: ?*std.process.EnvMap = null,
+    env_map: ?*std_compat.process.EnvMap = null,
     max_output_bytes: usize = 1_048_576,
     cancel_flag: ?*const AtomicBool = null,
+    timeout_ns: ?u64 = null,
 };
 
-const CancelWatcherCtx = struct {
-    child: *std.process.Child,
-    cancel_flag: *const AtomicBool,
+const ProcessWatcherCtx = struct {
+    child: *std_compat.process.Child,
+    cancel_flag: ?*const AtomicBool,
+    timeout_ns: ?u64,
     done: *AtomicBool,
+    timed_out: *AtomicBool,
 };
 
-fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
-    while (!ctx.done.load(.acquire)) {
-        if (ctx.cancel_flag.load(.acquire)) {
-            if (comptime @import("builtin").os.tag == .windows) {
-                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
-            } else {
-                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
-            }
-            break;
-        }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+fn terminateWindowsProcessTreeByPid(pid: std.os.windows.DWORD) void {
+    if (pid == 0) return;
+
+    var pid_buf: [32]u8 = undefined;
+    if (std.fmt.bufPrint(&pid_buf, "{d}", .{pid})) |pid_arg| {
+        // `TerminateProcess` only reaches the direct child handle; use
+        // `taskkill /T` first so shell wrappers do not strand descendants.
+        var taskkill = std_compat.process.Child.init(&.{ "taskkill", "/T", "/F", "/PID", pid_arg }, std.heap.page_allocator);
+        taskkill.stdin_behavior = .Ignore;
+        taskkill.stdout_behavior = .Ignore;
+        taskkill.stderr_behavior = .Ignore;
+        taskkill.create_no_window = true;
+        _ = taskkill.spawnAndWait() catch null;
+    } else |_| {}
+}
+
+fn terminateChild(child: *std_compat.process.Child) void {
+    if (comptime builtin.os.tag == .windows) {
+        terminateWindowsProcessTreeByPid(GetProcessId(child.id));
+        _ = child.kill() catch {};
+    } else if (comptime builtin.os.tag == .wasi) {
+        return;
+    } else {
+        const process_group_id: std.posix.pid_t = -child.id;
+        std.posix.kill(process_group_id, std.posix.SIG.TERM) catch {
+            std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+            return;
+        };
+
+        std_compat.thread.sleep(100 * std.time.ns_per_ms);
+        std.posix.kill(process_group_id, std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => {},
+        };
     }
+}
+
+fn processWatcherMain(ctx: *ProcessWatcherCtx) void {
+    const poll_ns = 20 * std.time.ns_per_ms;
+    var waited_ns: u64 = 0;
+
+    while (!ctx.done.load(.acquire)) {
+        if (ctx.cancel_flag) |flag| {
+            if (flag.load(.acquire)) {
+                terminateChild(ctx.child);
+                break;
+            }
+        }
+        if (ctx.timeout_ns) |limit| {
+            if (waited_ns >= limit) {
+                ctx.timed_out.store(true, .release);
+                terminateChild(ctx.child);
+                break;
+            }
+        }
+        std_compat.thread.sleep(poll_ns);
+        waited_ns +|= poll_ns;
+    }
+}
+
+fn wasInterrupted(cancel_flag: ?*const AtomicBool) bool {
+    if (cancel_flag) |flag| {
+        return flag.load(.acquire);
+    }
+    return false;
+}
+
+fn processExists(pid: std.posix.pid_t) bool {
+    std.posix.kill(pid, @as(std.posix.SIG, @enumFromInt(0))) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn processExistsWindows(pid: std.os.windows.DWORD) bool {
+    if (pid == 0) return false;
+
+    const handle = OpenProcess(PROCESS_SYNCHRONIZE, .FALSE, pid) orelse return false;
+    defer std.os.windows.CloseHandle(handle);
+
+    return switch (WaitForSingleObject(handle, 0)) {
+        WAIT_TIMEOUT => true,
+        WAIT_OBJECT_0 => false,
+        else => false,
+    };
 }
 
 fn appendUtf8Replacement(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
@@ -158,7 +251,7 @@ fn tryDecodeWindowsCodePageToUtf8(
 }
 
 fn tryDecodeWindowsOutputToUtf8(allocator: std.mem.Allocator, input: []const u8) !?[]u8 {
-    const console_cp = std.os.windows.kernel32.GetConsoleOutputCP();
+    const console_cp = GetConsoleOutputCP();
     if (try tryDecodeWindowsCodePageToUtf8(allocator, input, console_cp)) |decoded| return decoded;
 
     // Prefer GBK before ACP: Western single-byte ACPs like CP1252 will happily
@@ -200,25 +293,40 @@ pub fn run(
     argv: []const []const u8,
     opts: RunOptions,
 ) !RunResult {
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
+    // Captured child processes are non-interactive; inheriting stdin can let
+    // spawned commands stall waiting for input from the parent process.
+    child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        // Isolate the child into its own process group so timeout/cancel signals
+        // can terminate shell wrappers together with any descendants they spawn.
+        child.pgid = 0;
+    }
     if (opts.cwd) |cwd| child.cwd = cwd;
     if (opts.env_map) |env| child.env_map = env;
 
     try child.spawn();
 
     const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
+    const effective_timeout_ns = if (opts.timeout_ns) |limit|
+        if (limit == 0) null else limit
+    else
+        null;
     var cancel_done = AtomicBool.init(false);
+    var timed_out = AtomicBool.init(false);
     var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (effective_cancel_flag) |flag| {
+    var watcher_ctx: ProcessWatcherCtx = undefined;
+    if (effective_cancel_flag != null or effective_timeout_ns != null) {
         watcher_ctx = .{
             .child = &child,
-            .cancel_flag = flag,
+            .cancel_flag = effective_cancel_flag,
+            .timeout_ns = effective_timeout_ns,
             .done = &cancel_done,
+            .timed_out = &timed_out,
         };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+        cancel_watcher = std.Thread.spawn(.{}, processWatcherMain, .{&watcher_ctx}) catch null;
     }
     defer {
         cancel_done.store(true, .release);
@@ -227,7 +335,7 @@ pub fn run(
 
     var stdout = if (child.stdout) |stdout_file| blk: {
         break :blk stdout_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (effective_cancel_flag != null and effective_cancel_flag.?.load(.acquire)) {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
                 break :blk try allocator.dupe(u8, "");
             }
             return err;
@@ -238,7 +346,7 @@ pub fn run(
 
     var stderr = if (child.stderr) |stderr_file| blk: {
         break :blk stderr_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (effective_cancel_flag != null and effective_cancel_flag.?.load(.acquire)) {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
                 break :blk try allocator.dupe(u8, "");
             }
             return err;
@@ -248,15 +356,17 @@ pub fn run(
     stderr = try normalizeCapturedOutputOwned(allocator, stderr);
 
     const term = try child.wait();
-    const interrupted = if (effective_cancel_flag) |flag| flag.load(.acquire) else false;
+    const interrupted = wasInterrupted(effective_cancel_flag);
+    const did_time_out = timed_out.load(.acquire);
 
     return switch (term) {
-        .Exited => |code| .{
+        .exited => |code| .{
             .stdout = stdout,
             .stderr = stderr,
             .success = code == 0,
             .exit_code = code,
             .interrupted = interrupted,
+            .timed_out = did_time_out,
         },
         else => .{
             .stdout = stdout,
@@ -264,6 +374,7 @@ pub fn run(
             .success = false,
             .exit_code = null,
             .interrupted = interrupted,
+            .timed_out = did_time_out,
         },
     };
 }
@@ -332,7 +443,7 @@ test "run honors cancel flag and interrupts child" {
     };
 
     const t = try std.Thread.spawn(.{}, Runner.runThread, .{ allocator, &cancel, &thread_result });
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    std_compat.thread.sleep(100 * std.time.ns_per_ms);
     cancel.store(true, .release);
     t.join();
 
@@ -341,6 +452,160 @@ test "run honors cancel flag and interrupts child" {
     defer result.deinit(allocator);
     try std.testing.expect(!result.success);
     try std.testing.expect(result.interrupted);
+    try std.testing.expect(!result.timed_out);
+}
+
+test "run timeout interrupts child" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const result = try run(allocator, &.{ "sh", "-c", "sleep 5" }, .{
+        .timeout_ns = 100 * std.time.ns_per_ms,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(!result.interrupted);
+    try std.testing.expect(result.timed_out);
+}
+
+test "run zero timeout disables watchdog" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const result = try run(allocator, &.{ "sh", "-c", "sleep 0.1; echo done" }, .{
+        .timeout_ns = 0,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "done") != null);
+}
+
+test "run timeout kills Windows shell descendants" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
+    defer allocator.free(pid_path);
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = "child.ps1",
+        // Regression: invoking PowerShell through `-Command ... -- arg` is not
+        // reliable on GitHub's Windows runner and can let cmd.exe exit before
+        // the timeout watchdog fires. Keep the payload in a script file so the
+        // wrapper deterministically stays alive until the watchdog kills it.
+        .data =
+        \\param([string]$PidPath)
+        \\$PID | Set-Content -NoNewline -LiteralPath $PidPath
+        \\Start-Sleep -Seconds 8
+        \\
+        ,
+    });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = "wrapper.cmd",
+        // Keep cmd.exe in front so the test still exercises descendant cleanup
+        // instead of timing out a direct PowerShell child.
+        .data =
+        \\@echo off
+        \\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0child.ps1" "%~dp0child.pid"
+        \\
+        ,
+    });
+    const script_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "wrapper.cmd" });
+    defer allocator.free(script_path);
+
+    const result = try run(allocator, &.{ "cmd.exe", "/c", script_path }, .{
+        .timeout_ns = 2 * std.time.ns_per_s,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.timed_out);
+
+    var pid_bytes: ?[]u8 = null;
+    var read_attempt: usize = 0;
+    while (read_attempt < 20) : (read_attempt += 1) {
+        pid_bytes = std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                std_compat.thread.sleep(50 * std.time.ns_per_ms);
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (pid_bytes != null) break;
+    }
+    const pid_bytes_owned = pid_bytes orelse return error.FileNotFound;
+    defer allocator.free(pid_bytes_owned);
+    const child_pid = try std.fmt.parseInt(
+        std.os.windows.DWORD,
+        std.mem.trim(u8, pid_bytes_owned, " \t\r\n"),
+        10,
+    );
+    defer if (processExistsWindows(child_pid)) terminateWindowsProcessTreeByPid(child_pid);
+
+    var exited = false;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        if (!processExistsWindows(child_pid)) {
+            exited = true;
+            break;
+        }
+        std_compat.thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(exited);
+}
+
+test "run timeout kills spawned shell descendants" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(allocator, "(sleep 30) & echo $! > \"{s}\"; wait", .{pid_path});
+    defer allocator.free(command);
+
+    // Regression: timing out `sh -c ...` must not leave a background child
+    // running after the wrapper shell exits.
+    const result = try run(allocator, &.{ "sh", "-c", command }, .{
+        .timeout_ns = 200 * std.time.ns_per_ms,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.timed_out);
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const child_pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_bytes, " \t\r\n"),
+        10,
+    );
+    defer if (processExists(child_pid)) {
+        std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+    };
+
+    var exited = false;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        if (!processExists(child_pid)) {
+            exited = true;
+            break;
+        }
+        std_compat.thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(exited);
 }
 
 test "RunResult deinit frees buffers" {

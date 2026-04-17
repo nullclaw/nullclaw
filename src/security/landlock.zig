@@ -36,7 +36,10 @@ pub const LandlockSandbox = struct {
     }
 
     fn isAvailable(_: *anyopaque) bool {
-        return comptime builtin.os.tag == .linux;
+        // Nullclaw does not yet install Landlock rulesets or call
+        // landlock_restrict_self(), so advertising availability would be a
+        // false security signal.
+        return false;
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -45,7 +48,7 @@ pub const LandlockSandbox = struct {
 
     fn getDescription(_: *anyopaque) []const u8 {
         if (comptime builtin.os.tag == .linux) {
-            return "Linux kernel LSM sandboxing (filesystem access control)";
+            return "Linux kernel LSM sandboxing (reserved until ruleset enforcement is implemented)";
         } else {
             return "Linux kernel LSM sandboxing (not available on this platform)";
         }
@@ -64,14 +67,10 @@ test "landlock sandbox name" {
     try std.testing.expectEqualStrings("landlock", sb.name());
 }
 
-test "landlock sandbox availability matches platform" {
+test "landlock sandbox stays unavailable until ruleset enforcement exists" {
     var ll = createLandlockSandbox("/tmp/workspace");
     const sb = ll.sandbox();
-    if (comptime builtin.os.tag == .linux) {
-        try std.testing.expect(sb.isAvailable());
-    } else {
-        try std.testing.expect(!sb.isAvailable());
-    }
+    try std.testing.expect(!sb.isAvailable());
 }
 
 test "landlock sandbox wrap command on non-linux returns error" {

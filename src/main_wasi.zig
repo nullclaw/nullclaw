@@ -1,6 +1,8 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const fs_compat = @import("fs_compat.zig");
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_SEARCH_MATCHES: usize = 5;
@@ -76,14 +78,14 @@ fn parse_command(arg: []const u8) ?Command {
 
 fn print_out(comptime fmt: []const u8, args: anytype) !void {
     var buf: [2048]u8 = undefined;
-    var out = std.fs.File.stdout().writer(&buf);
+    var out = std_compat.fs.File.stdout().writer(&buf);
     try out.interface.print(fmt, args);
     try out.interface.flush();
 }
 
 fn print_err(comptime fmt: []const u8, args: anytype) !void {
     var buf: [2048]u8 = undefined;
-    var out = std.fs.File.stderr().writer(&buf);
+    var out = std_compat.fs.File.stderr().writer(&buf);
     try out.interface.print(fmt, args);
     try out.interface.flush();
 }
@@ -132,13 +134,13 @@ fn parse_workspace_args(allocator: std.mem.Allocator, args: []const []const u8) 
 }
 
 fn join_path(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ a, b });
+    return std_compat.fs.path.join(allocator, &.{ a, b });
 }
 
 fn ensure_parent_dir(path: []const u8) !void {
-    const maybe_parent = std.fs.path.dirname(path);
+    const maybe_parent = std_compat.fs.path.dirname(path);
     if (maybe_parent) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+        fs_compat.makePath(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -146,13 +148,13 @@ fn ensure_parent_dir(path: []const u8) !void {
 }
 
 fn file_exists(path: []const u8) bool {
-    const file = std.fs.cwd().openFile(path, .{}) catch return false;
+    const file = fs_compat.openPath(path, .{}) catch return false;
     file.close();
     return true;
 }
 
 fn read_file_if_present(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    const file = fs_compat.openPath(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -162,7 +164,7 @@ fn read_file_if_present(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
 
 fn write_file_truncate(path: []const u8, content: []const u8) !void {
     try ensure_parent_dir(path);
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    const file = try fs_compat.createPath(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(content);
 }
@@ -170,7 +172,7 @@ fn write_file_truncate(path: []const u8, content: []const u8) !void {
 fn write_if_missing(path: []const u8, content: []const u8) !bool {
     if (file_exists(path)) return false;
     try ensure_parent_dir(path);
-    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    const file = try fs_compat.createPath(path, .{ .exclusive = true });
     defer file.close();
     try file.writeAll(content);
     return true;
@@ -178,10 +180,10 @@ fn write_if_missing(path: []const u8, content: []const u8) !bool {
 
 fn append_line(path: []const u8, line: []const u8, allocator: std.mem.Allocator) !void {
     try ensure_parent_dir(path);
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
+    const file = try fs_compat.createPath(path, .{ .truncate = false, .read = true });
     defer file.close();
 
-    const stat = try file.stat();
+    const stat = try fs_compat.stat(file);
     const size = stat.size;
     try file.seekTo(size);
 
@@ -202,13 +204,13 @@ fn append_line(path: []const u8, line: []const u8, allocator: std.mem.Allocator)
 }
 
 fn scaffold_workspace(allocator: std.mem.Allocator, workspace: []const u8) !usize {
-    std.fs.cwd().makePath(workspace) catch |err| switch (err) {
+    fs_compat.makePath(workspace) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
     const memory_dir = try join_path(allocator, workspace, "memory");
-    std.fs.cwd().makePath(memory_dir) catch |err| switch (err) {
+    fs_compat.makePath(memory_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -310,7 +312,7 @@ fn to_single_line(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 }
 
 fn daily_log_path(allocator: std.mem.Allocator, workspace: []const u8) ![]u8 {
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const epoch_secs: u64 = if (now <= 0) 0 else @intCast(now);
     const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
     const yd = epoch.getEpochDay().calculateYearDay();
@@ -549,10 +551,11 @@ fn run_agent(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try append_line(daily_path, assistant_log, allocator);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    std_compat.initProcess(init);
     const base_allocator = if (builtin.target.os.tag == .wasi) std.heap.wasm_allocator else std.heap.smp_allocator;
-    const args = try std.process.argsAlloc(base_allocator);
-    defer std.process.argsFree(base_allocator, args);
+    const args = try std_compat.process.argsAlloc(base_allocator);
+    defer std_compat.process.argsFree(base_allocator, args);
 
     var arena = std.heap.ArenaAllocator.init(base_allocator);
     defer arena.deinit();
@@ -566,7 +569,7 @@ pub fn main() !void {
     const cmd = parse_command(args[1]) orelse {
         try print_err("Unknown command: {s}\n\n", .{args[1]});
         try print_usage();
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
     const sub_args = args[2..];
@@ -586,6 +589,6 @@ pub fn main() !void {
         } else if (err == error.MissingWorkspacePath) {
             print_err("Missing path value after --workspace.\n", .{}) catch {};
         }
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 }

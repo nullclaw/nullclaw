@@ -4,12 +4,14 @@
 //! process_util.run() for child process spawning.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const retrieval = @import("engine.zig");
 const RetrievalCandidate = retrieval.RetrievalCandidate;
 const RetrievalSourceAdapter = retrieval.RetrievalSourceAdapter;
 const SourceCapabilities = retrieval.SourceCapabilities;
 const config_types = @import("../../config_types.zig");
+const fs_compat = @import("../../fs_compat.zig");
 const process_util = @import("../../tools/process_util.zig");
 const root = @import("../root.zig");
 const log = std.log.scoped(.qmd);
@@ -65,7 +67,7 @@ pub const QmdAdapter = struct {
 
         const argv = &[_][]const u8{ self.config.command, self.config.search_mode, query, "--json", "-n", limit_str };
 
-        var env_map = std.process.EnvMap.init(alloc);
+        var env_map = std_compat.process.EnvMap.init(alloc);
         defer env_map.deinit();
         env_map.put("NO_COLOR", "1") catch {};
 
@@ -139,7 +141,7 @@ pub const QmdAdapter = struct {
         };
         defer parsed.deinit();
 
-        var candidates: std.ArrayListUnmanaged(RetrievalCandidate) = .empty;
+        var candidates = std.ArrayListUnmanaged(RetrievalCandidate).empty;
         errdefer {
             for (candidates.items) |*c| c.deinit(allocator);
             candidates.deinit(allocator);
@@ -227,7 +229,7 @@ pub const QmdAdapter = struct {
             return 0;
 
         // Ensure export directory exists
-        std.fs.cwd().makePath(export_dir) catch |err| {
+        fs_compat.makePath(export_dir) catch |err| {
             log.warn("failed to create session export dir '{s}': {}", .{ export_dir, err });
             return 0;
         };
@@ -252,7 +254,10 @@ pub const QmdAdapter = struct {
             content.appendSlice(allocator, sid) catch continue;
             content.appendSlice(allocator, "\n\n") catch continue;
 
+            var wrote_visible_message = false;
             for (messages) |msg| {
+                if (root.isRuntimeCommandRole(msg.role)) continue;
+                wrote_visible_message = true;
                 const label: []const u8 = if (std.mem.eql(u8, msg.role, "user"))
                     "**User**"
                 else if (std.mem.eql(u8, msg.role, "assistant"))
@@ -264,6 +269,7 @@ pub const QmdAdapter = struct {
                 content.appendSlice(allocator, msg.content) catch continue;
                 content.appendSlice(allocator, "\n\n") catch continue;
             }
+            if (!wrote_visible_message) continue;
 
             // Compute hash of new content
             const new_hash = std.hash.Fnv1a_32.hash(content.items);
@@ -271,19 +277,19 @@ pub const QmdAdapter = struct {
             // Build file path
             const file_name = std.fmt.allocPrint(allocator, "{s}.md", .{sid}) catch continue;
             defer allocator.free(file_name);
-            const file_path = std.fs.path.join(allocator, &.{ export_dir, file_name }) catch continue;
+            const file_path = std_compat.fs.path.join(allocator, &.{ export_dir, file_name }) catch continue;
             defer allocator.free(file_path);
 
             // Check if existing file has same content hash (skip redundant writes)
             const skip = blk: {
-                const existing = std.fs.cwd().readFileAlloc(allocator, file_path, 1024 * 1024) catch break :blk false;
+                const existing = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, file_path, 1024 * 1024) catch break :blk false;
                 defer allocator.free(existing);
                 break :blk std.hash.Fnv1a_32.hash(existing) == new_hash;
             };
             if (skip) continue;
 
             // Write file
-            const file = std.fs.cwd().createFile(file_path, .{}) catch |err| {
+            const file = fs_compat.createPath(file_path, .{}) catch |err| {
                 log.warn("failed to write session export '{s}': {}", .{ file_path, err });
                 continue;
             };
@@ -309,9 +315,9 @@ pub const QmdAdapter = struct {
             return 0;
 
         const retention_ns: i128 = @as(i128, self.config.sessions.retention_days) * 24 * 3600 * std.time.ns_per_s;
-        const now_ns: i128 = std.time.nanoTimestamp();
+        const now_ns: i128 = std_compat.time.nanoTimestamp();
 
-        var dir = std.fs.cwd().openDir(export_dir, .{ .iterate = true }) catch return 0;
+        var dir = fs_compat.openDirPath(export_dir, .{ .iterate = true }) catch return 0;
         defer dir.close();
 
         var deleted: u32 = 0;
@@ -510,9 +516,10 @@ const MockSessionStore = struct {
     fn implLoadMessages(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]root.MessageEntry {
         const self: *MockSessionStore = @ptrCast(@alignCast(ptr));
         self.call_count += 1;
-        var msgs = try allocator.alloc(root.MessageEntry, 2);
+        var msgs = try allocator.alloc(root.MessageEntry, 3);
         msgs[0] = .{ .role = try allocator.dupe(u8, "user"), .content = try allocator.dupe(u8, "Hello") };
-        msgs[1] = .{ .role = try allocator.dupe(u8, "assistant"), .content = try allocator.dupe(u8, "Hi there") };
+        msgs[1] = .{ .role = try allocator.dupe(u8, root.RUNTIME_COMMAND_ROLE), .content = try allocator.dupe(u8, "/usage full") };
+        msgs[2] = .{ .role = try allocator.dupe(u8, "assistant"), .content = try allocator.dupe(u8, "Hi there") };
         return msgs;
     }
     fn implClearMessages(_: *anyopaque, _: []const u8) anyerror!void {}
@@ -536,7 +543,7 @@ test "exportSessions with mock session store writes files" {
     // Create temp dir
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     var mock = MockSessionStore{};
@@ -550,11 +557,12 @@ test "exportSessions with mock session store writes files" {
     try std.testing.expect(mock.call_count >= 1);
 
     // Verify file was created
-    const content = try tmp.dir.readFileAlloc(allocator, "session-1.md", 4096);
+    const content = try fs_compat.readFileAlloc(tmp.dir, allocator, "session-1.md", 4096);
     defer allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "Session: session-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "**User**: Hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "**Assistant**: Hi there") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, root.RUNTIME_COMMAND_ROLE) == null);
 }
 
 test "exportSessions skips unchanged files (hash check)" {
@@ -562,7 +570,7 @@ test "exportSessions skips unchanged files (hash check)" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     var mock = MockSessionStore{};
@@ -610,7 +618,7 @@ test "exportSessions skips unsafe session ids" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     var mock = MockSessionStore{};
@@ -628,12 +636,12 @@ test "pruneExportedSessions deletes old files" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     // Create a test file
     {
-        const f = try tmp.dir.createFile("old-session.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("old-session.md", .{});
         try f.writeAll("old content");
         f.close();
     }
@@ -646,6 +654,6 @@ test "pruneExportedSessions deletes old files" {
     try std.testing.expectEqual(@as(u32, 1), deleted);
 
     // Verify file was deleted
-    const result = tmp.dir.statFile("old-session.md");
+    const result = @import("compat").fs.Dir.wrap(tmp.dir).statFile("old-session.md");
     try std.testing.expectError(error.FileNotFound, result);
 }

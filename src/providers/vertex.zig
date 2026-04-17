@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const log = std.log.scoped(.vertex);
 const root = @import("root.zig");
 const gemini = @import("gemini.zig");
 const config_types = @import("../config_types.zig");
@@ -193,7 +195,7 @@ pub const VertexProvider = struct {
     }
 
     fn loadNonEmptyEnv(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-        if (std.process.getEnvVarOwned(allocator, name)) |value| {
+        if (std_compat.process.getEnvVarOwned(allocator, name)) |value| {
             defer allocator.free(value);
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) {
@@ -235,7 +237,7 @@ pub const VertexProvider = struct {
         allocator: std.mem.Allocator,
         creds: ServiceAccountCredentials,
     ) ![]const u8 {
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         if (self.cached_service_account_token) |token| {
             if (self.cached_service_account_expiry == 0 or
                 now + SERVICE_ACCOUNT_TOKEN_REFRESH_SAFETY_SECONDS < self.cached_service_account_expiry)
@@ -254,7 +256,7 @@ pub const VertexProvider = struct {
 
         self.cached_service_account_token = try self.allocator.dupe(u8, refreshed.access_token);
         const expires_in = if (refreshed.expires_in > 0) refreshed.expires_in else SERVICE_ACCOUNT_JWT_TTL_SECONDS;
-        self.cached_service_account_expiry = std.time.timestamp() + expires_in;
+        self.cached_service_account_expiry = std_compat.time.timestamp() + expires_in;
         return self.cached_service_account_token.?;
     }
 
@@ -370,7 +372,16 @@ pub const VertexProvider = struct {
             request.timeout_secs,
             callback,
             callback_ctx,
-        );
+        ) catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("Vertex streaming failed with {}; falling back to non-streaming response", .{err});
+                var fallback_request = request;
+                fallback_request.timeout_secs = gemini.GeminiProvider.streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+            }
+            return err;
+        };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -518,21 +529,21 @@ fn signRsaSha256WithOpenSsl(
     const temp_dir = try platform.getTempDir(allocator);
     defer allocator.free(temp_dir);
 
-    const filename = try std.fmt.allocPrint(allocator, "nullclaw-vertex-sa-{x}.pem", .{std.crypto.random.int(u64)});
+    const filename = try std.fmt.allocPrint(allocator, "nullclaw-vertex-sa-{x}.pem", .{std_compat.crypto.random.int(u64)});
     defer allocator.free(filename);
 
-    const key_path = try std.fs.path.join(allocator, &.{ temp_dir, filename });
+    const key_path = try std_compat.fs.path.join(allocator, &.{ temp_dir, filename });
     defer allocator.free(key_path);
-    defer std.fs.deleteFileAbsolute(key_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(key_path) catch {};
 
-    var key_file = std.fs.createFileAbsolute(key_path, .{ .mode = 0o600 }) catch return error.VertexApiError;
+    var key_file = std_compat.fs.createFileAbsolute(key_path, .{ .permissions = std_compat.fs.permissionsFromMode(0o600) }) catch return error.VertexApiError;
     key_file.writeAll(private_key_pem) catch {
         key_file.close();
         return error.VertexApiError;
     };
     key_file.close();
 
-    var child = std.process.Child.init(
+    var child = std_compat.process.Child.init(
         &[_][]const u8{ "openssl", "dgst", "-sha256", "-sign", key_path, "-binary" },
         allocator,
     );
@@ -566,7 +577,7 @@ fn signRsaSha256WithOpenSsl(
     const term = child.wait() catch return error.VertexApiError;
     waited = true;
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0 or signature.len == 0) return error.VertexApiError;
         },
         else => return error.VertexApiError,
@@ -577,7 +588,7 @@ fn signRsaSha256WithOpenSsl(
 
 fn buildServiceAccountAssertion(allocator: std.mem.Allocator, creds: ServiceAccountCredentials) ![]u8 {
     const header_json = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
 
     var payload_json: std.ArrayListUnmanaged(u8) = .empty;
     defer payload_json.deinit(allocator);
@@ -688,7 +699,7 @@ fn requestServiceAccountAccessToken(
 }
 
 fn trimTrailingSlash(url: []const u8) []const u8 {
-    return std.mem.trimRight(u8, url, "/");
+    return std_compat.mem.trimRight(u8, url, "/");
 }
 
 fn normalizeModelName(model: []const u8) []const u8 {
@@ -1179,7 +1190,7 @@ test "deinit frees explicit service-account credentials and cached token" {
         } },
         .base = .{ .derived = try alloc.dupe(u8, "https://aiplatform.googleapis.com/v1/projects/proj-x/locations/global/publishers/google/models") },
         .cached_service_account_token = try alloc.dupe(u8, "ya29.cached"),
-        .cached_service_account_expiry = std.time.timestamp() + 1200,
+        .cached_service_account_expiry = std_compat.time.timestamp() + 1200,
         .allocator = alloc,
     };
 

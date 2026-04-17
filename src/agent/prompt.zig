@@ -1,11 +1,18 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
-const platform = @import("../platform.zig");
+const config_paths = @import("../config_paths.zig");
+const config_types = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
+const identity_mod = @import("../identity.zig");
+const memory_root = @import("../memory/root.zig");
 const tools_mod = @import("../tools/root.zig");
 const path_prefix = @import("../path_prefix.zig");
+const util = @import("../util.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
+const observability = @import("../observability.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 const pathStartsWith = path_prefix.pathStartsWith;
 
@@ -15,18 +22,18 @@ const pathStartsWith = path_prefix.pathStartsWith;
 
 /// Maximum characters to include from a single workspace identity file.
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
-/// Read one extra byte via providers so prompt rendering can distinguish
-/// "exactly at cap" from "truncated beyond cap" without loading full files.
-const BOOTSTRAP_PROVIDER_EXCERPT_BYTES: usize = BOOTSTRAP_MAX_CHARS + 1;
+/// Read up to three extra bytes so callers can keep UTF-8 valid while still
+/// distinguishing "exactly at cap" from "truncated beyond cap".
+const BOOTSTRAP_PROVIDER_EXCERPT_BYTES: usize = BOOTSTRAP_MAX_CHARS + 3;
 /// Maximum total characters from injected bootstrap identity files.
 const BOOTSTRAP_TOTAL_MAX_CHARS: usize = 24_000;
 /// Maximum bytes allowed for guarded workspace bootstrap file reads.
 const MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 const GuardedWorkspaceFileOpen = struct {
-    file: std.fs.File,
+    file: std_compat.fs.File,
     canonical_path: []u8,
-    stat: std.fs.File.Stat,
+    stat: std_compat.fs.File.Stat,
 };
 
 fn deinitGuardedWorkspaceFile(allocator: std.mem.Allocator, opened: GuardedWorkspaceFileOpen) void {
@@ -36,15 +43,15 @@ fn deinitGuardedWorkspaceFile(allocator: std.mem.Allocator, opened: GuardedWorks
 
 /// Best-effort device id for fingerprint parity with OpenClaw's
 /// dev+ino+size+mtime identity tuple.
-fn workspaceFileDeviceId(file: *const std.fs.File) ?u64 {
+fn workspaceFileDeviceId(file: *const std_compat.fs.File) ?u64 {
     if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return null;
 
-    const stat = std.posix.fstat(file.handle) catch return null;
-    return @as(u64, @intCast(stat.dev));
+    const stat = file.stat() catch return null;
+    return @as(u64, @intCast(stat.inode));
 }
 
 fn isWorkspaceBootstrapFilenameSafe(filename: []const u8) bool {
-    if (std.fs.path.isAbsolute(filename)) return false;
+    if (std_compat.fs.path.isAbsolute(filename)) return false;
     if (std.mem.indexOfScalar(u8, filename, 0) != null) return false;
     var it = std.mem.splitAny(u8, filename, "/\\");
     while (it.next()) |part| {
@@ -60,13 +67,13 @@ fn openWorkspaceFileWithGuards(
 ) ?GuardedWorkspaceFileOpen {
     if (!isWorkspaceBootstrapFilenameSafe(filename)) return null;
 
-    const workspace_root = std.fs.cwd().realpathAlloc(allocator, workspace_dir) catch return null;
+    const workspace_root = fs_compat.realpathAllocPath(allocator, workspace_dir) catch return null;
     defer allocator.free(workspace_root);
 
-    const candidate = std.fs.path.join(allocator, &.{ workspace_dir, filename }) catch return null;
+    const candidate = std_compat.fs.path.join(allocator, &.{ workspace_dir, filename }) catch return null;
     defer allocator.free(candidate);
 
-    const canonical_path = std.fs.cwd().realpathAlloc(allocator, candidate) catch |err| switch (err) {
+    const canonical_path = fs_compat.realpathAllocPath(allocator, candidate) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return null,
     };
@@ -76,7 +83,7 @@ fn openWorkspaceFileWithGuards(
         return null;
     }
 
-    const file = std.fs.openFileAbsolute(canonical_path, .{}) catch |err| switch (err) {
+    const file = std_compat.fs.openFileAbsolute(canonical_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             allocator.free(canonical_path);
             return null;
@@ -87,7 +94,7 @@ fn openWorkspaceFileWithGuards(
         },
     };
 
-    const stat = file.stat() catch {
+    const stat = fs_compat.stat(file) catch {
         file.close();
         allocator.free(canonical_path);
         return null;
@@ -105,23 +112,106 @@ fn openWorkspaceFileWithGuards(
     };
 }
 
-/// Conversation context for the current turn (Signal-specific for now).
+/// Conversation context for the current turn.
+/// Carries per-message sender metadata so the LLM always knows who is talking.
 pub const ConversationContext = struct {
     channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    // Signal
     sender_number: ?[]const u8 = null,
     sender_uuid: ?[]const u8 = null,
+    sender_name: ?[]const u8 = null,
+    // Discord
+    sender_id: ?[]const u8 = null,
+    sender_username: ?[]const u8 = null,
+    sender_display_name: ?[]const u8 = null,
+    // Shared
+    delivery_chat_id: ?[]const u8 = null,
+    peer_id: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
+
+    /// Compute a hash fingerprint of sender-identifying fields so the system
+    /// prompt can be rebuilt when the *sender* changes, not just when context
+    /// goes from null ↔ non-null.
+    pub fn senderFingerprint(self: ConversationContext) u64 {
+        var h = std.hash.Wyhash.init(0x1234_5678);
+        // Hash each sender-identifying field (or a sentinel null byte).
+        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.peer_id }) |field| {
+            if (field) |v| {
+                h.update(v);
+            } else {
+                h.update(&.{0});
+            }
+            h.update(&.{0xff}); // field separator
+        }
+        return h.final();
+    }
 };
+
+/// Normalize partially-filled inbound metadata into a stable conversation context.
+pub fn buildConversationContext(args: ConversationContext) ?ConversationContext {
+    const channel = normalizeOptionalString(args.channel);
+    const account_id = normalizeOptionalString(args.account_id);
+    const sender_number = normalizeOptionalString(args.sender_number);
+    const sender_uuid = normalizeOptionalString(args.sender_uuid);
+    const sender_name = normalizeOptionalString(args.sender_name);
+    const sender_id = normalizeOptionalString(args.sender_id);
+    const sender_username = normalizeOptionalString(args.sender_username);
+    const sender_display_name = normalizeOptionalString(args.sender_display_name);
+    const delivery_chat_id = normalizeOptionalString(args.delivery_chat_id);
+    const peer_id = normalizeOptionalString(args.peer_id);
+    const is_group = args.is_group;
+    const group_id = if (normalizeOptionalString(args.group_id)) |value|
+        value
+    else if (is_group != null and is_group.? and peer_id != null)
+        peer_id
+    else
+        null;
+
+    const has_sender_identity = sender_id != null or
+        sender_uuid != null or
+        sender_number != null or
+        sender_name != null or
+        sender_username != null or
+        sender_display_name != null;
+    const has_scope = account_id != null or delivery_chat_id != null or peer_id != null or group_id != null or is_group != null;
+    if (channel == null and !has_sender_identity and !has_scope) return null;
+
+    return .{
+        .channel = channel,
+        .account_id = account_id,
+        .sender_number = sender_number,
+        .sender_uuid = sender_uuid,
+        .sender_name = sender_name,
+        .sender_id = sender_id,
+        .sender_username = sender_username,
+        .sender_display_name = sender_display_name,
+        .delivery_chat_id = delivery_chat_id,
+        .peer_id = peer_id,
+        .group_id = group_id,
+        .is_group = is_group,
+    };
+}
+
+fn normalizeOptionalString(value: ?[]const u8) ?[]const u8 {
+    return if (value) |slice|
+        if (slice.len > 0) slice else null
+    else
+        null;
+}
 
 /// Context passed to prompt sections during construction.
 pub const PromptContext = struct {
     workspace_dir: []const u8,
     model_name: []const u8,
     tools: []const Tool,
+    timezone: []const u8 = "UTC",
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
     bootstrap_provider: ?BootstrapProvider = null,
+    identity_config: ?config_types.IdentityConfig = null,
+    observer: ?observability.Observer = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -130,56 +220,63 @@ pub fn workspacePromptFingerprint(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
+    identity_config: ?config_types.IdentityConfig,
 ) !u64 {
-    // When a bootstrap provider is available, delegate fingerprinting to it.
-    if (bootstrap_provider) |bp| {
-        return bp.fingerprint(allocator);
-    }
-
-    // Fallback: file-based fingerprinting.
     var hasher = std.hash.Fnv1a_64.init();
-    const tracked_files = [_][]const u8{
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-        "BOOTSTRAP.md",
-        "MEMORY.md",
-        "memory.md",
-    };
 
-    for (tracked_files) |filename| {
-        hasher.update(filename);
-        hasher.update("\n");
+    // When a bootstrap provider is available, reuse its bootstrap-doc fingerprint.
+    if (bootstrap_provider) |bp| {
+        const provider_fingerprint = try bp.fingerprint(allocator);
+        hasher.update("provider");
+        hasher.update(std.mem.asBytes(&provider_fingerprint));
+    } else {
+        // Fallback: file-based fingerprinting.
+        const tracked_files = [_][]const u8{
+            "AGENTS.md",
+            "SOUL.md",
+            "TOOLS.md",
+            "CONFIG.md",
+            "IDENTITY.md",
+            "USER.md",
+            "HEARTBEAT.md",
+            "BOOTSTRAP.md",
+            "MEMORY.md",
+            "memory.md",
+        };
 
-        const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
-        if (opened == null) {
-            hasher.update("missing");
-            continue;
+        for (tracked_files) |filename| {
+            hasher.update(filename);
+            hasher.update("\n");
+
+            const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
+            if (opened == null) {
+                hasher.update("missing");
+                continue;
+            }
+
+            const guarded = opened.?;
+            defer deinitGuardedWorkspaceFile(allocator, guarded);
+
+            const stat = guarded.stat;
+            hasher.update("present");
+            hasher.update(guarded.canonical_path);
+
+            if (workspaceFileDeviceId(&guarded.file)) |device_id| {
+                hasher.update(std.mem.asBytes(&device_id));
+            } else {
+                hasher.update("nodev");
+            }
+
+            const inode_id = stat.inode;
+            const mtime_ns: i128 = stat.mtime;
+            const size_bytes: u64 = @intCast(stat.size);
+            hasher.update(std.mem.asBytes(&inode_id));
+            hasher.update(std.mem.asBytes(&mtime_ns));
+            hasher.update(std.mem.asBytes(&size_bytes));
         }
-
-        const guarded = opened.?;
-        defer deinitGuardedWorkspaceFile(allocator, guarded);
-
-        const stat = guarded.stat;
-        hasher.update("present");
-        hasher.update(guarded.canonical_path);
-
-        if (workspaceFileDeviceId(&guarded.file)) |device_id| {
-            hasher.update(std.mem.asBytes(&device_id));
-        } else {
-            hasher.update("nodev");
-        }
-
-        const inode_id = stat.inode;
-        const mtime_ns: i128 = stat.mtime;
-        const size_bytes: u64 = @intCast(stat.size);
-        hasher.update(std.mem.asBytes(&inode_id));
-        hasher.update(std.mem.asBytes(&mtime_ns));
-        hasher.update(std.mem.asBytes(&size_bytes));
     }
+
+    try updateAieosIdentityFingerprint(allocator, &hasher, workspace_dir, identity_config);
 
     return hasher.final();
 }
@@ -191,10 +288,11 @@ pub fn buildSystemPrompt(
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     // Identity section — inject workspace MD files
-    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider);
+    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider, ctx.identity_config);
 
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
@@ -203,25 +301,47 @@ pub fn buildSystemPrompt(
     if (ctx.conversation_context) |cc| {
         try w.writeAll("## Conversation Context\n\n");
         if (cc.channel) |ch| {
-            try std.fmt.format(w, "- Channel: {s}\n", .{ch});
+            try w.print("- Channel: {s}\n", .{ch});
         }
         if (cc.is_group) |ig| {
             if (ig) {
                 if (cc.group_id) |gid| {
-                    try std.fmt.format(w, "- Chat type: group\n", .{});
-                    try std.fmt.format(w, "- Group ID: {s}\n", .{gid});
+                    try w.print("- Chat type: group\n", .{});
+                    try w.print("- Group ID: {s}\n", .{gid});
                 } else {
-                    try std.fmt.format(w, "- Chat type: group\n", .{});
+                    try w.print("- Chat type: group\n", .{});
                 }
             } else {
-                try std.fmt.format(w, "- Chat type: direct message\n", .{});
+                try w.print("- Chat type: direct message\n", .{});
             }
         }
         if (cc.sender_number) |num| {
-            try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
+            try w.print("- Sender phone: {s}\n", .{num});
         }
-        if (cc.sender_uuid) |uuid| {
-            try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+        // Show sender identity: "Sender: Name (UUID)" or just "Sender: (UUID)"
+        if (cc.sender_name) |name| {
+            if (cc.sender_uuid) |uuid| {
+                try w.print("- Sender: {s} ({s})\n", .{ name, uuid });
+            } else {
+                try w.print("- Sender: {s}\n", .{name});
+            }
+        } else if (cc.sender_uuid) |uuid| {
+            try w.print("- Sender: ({s})\n", .{uuid});
+        }
+        // Sender identity fields
+        if (cc.sender_id) |sid| {
+            const is_discord = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "discord") else false;
+            if (is_discord) {
+                try w.print("- Sender Discord ID: {s}\n", .{sid});
+            } else {
+                try w.print("- Sender ID: {s}\n", .{sid});
+            }
+        }
+        if (cc.sender_username) |uname| {
+            try w.print("- Sender username: {s}\n", .{uname});
+        }
+        if (cc.sender_display_name) |dname| {
+            try w.print("- Sender display name: {s}\n", .{dname});
         }
         try w.writeAll("\n");
     }
@@ -270,7 +390,7 @@ pub fn buildSystemPrompt(
             try w.writeAll("4. DO NOT use curl, say, or other methods to send messages manually\n");
             try w.writeAll("5. DO NOT add any extra commands - just the basic echo\n\n");
             if (cc.group_id) |gid| {
-                try std.fmt.format(w, "Current group ID: `{s}`\n\n", .{gid});
+                try w.print("Current group ID: `{s}`\n\n", .{gid});
             }
             try w.writeAll("Good example (simple, double quotes):\n");
             try w.writeAll("```\nschedule action=once delay=30m command=\"echo \\\"Time is up!\\\"\"\n```\n\n");
@@ -286,16 +406,16 @@ pub fn buildSystemPrompt(
     try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
 
     // Skills section
-    try appendSkillsSection(allocator, w, ctx.workspace_dir);
+    try appendSkillsSection(allocator, w, ctx.workspace_dir, ctx.observer);
 
     // Workspace section
-    try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
+    try w.print("## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
 
     // DateTime section
-    try appendDateTimeSection(w);
+    try appendDateTimeSection(w, ctx.timezone);
 
     // Runtime section
-    try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
+    try w.print("## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
         @tagName(builtin.os.tag),
         ctx.model_name,
     });
@@ -303,6 +423,7 @@ pub fn buildSystemPrompt(
     // Tool use protocol and available tools
     try writeToolInstructionsSection(w, ctx.tools);
 
+    buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -311,6 +432,7 @@ fn buildIdentitySection(
     w: anytype,
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
+    identity_config: ?config_types.IdentityConfig,
 ) !void {
     var remaining_bootstrap_chars: usize = BOOTSTRAP_TOTAL_MAX_CHARS;
     var hit_total_bootstrap_limit = false;
@@ -320,11 +442,20 @@ fn buildIdentitySection(
     try w.writeAll("If AGENTS.md is present, follow its operational guidance (including startup routines and red-line constraints) unless higher-priority instructions override it.\n\n");
     try w.writeAll("If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.\n\n");
     try w.writeAll("TOOLS.md does not control tool availability; it is user guidance for how to use external tools.\n\n");
+    try injectAieosIdentitySection(
+        allocator,
+        w,
+        workspace_dir,
+        identity_config,
+        &remaining_bootstrap_chars,
+        &hit_total_bootstrap_limit,
+    );
 
     const identity_files = [_][]const u8{
         "AGENTS.md",
         "SOUL.md",
         "TOOLS.md",
+        "CONFIG.md",
         "IDENTITY.md",
         "USER.md",
         "HEARTBEAT.md",
@@ -354,12 +485,109 @@ fn buildIdentitySection(
     );
 
     if (hit_total_bootstrap_limit) {
-        try std.fmt.format(
-            w,
+        try w.print(
             "[... project context truncated at {d} chars total -- use `read` for full files]\n\n",
             .{BOOTSTRAP_TOTAL_MAX_CHARS},
         );
     }
+}
+
+fn injectAieosIdentitySection(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    workspace_dir: []const u8,
+    identity_config: ?config_types.IdentityConfig,
+    remaining_bootstrap_chars: *usize,
+    hit_total_bootstrap_limit: *bool,
+) !void {
+    const cfg = identity_config orelse return;
+    if (!identity_mod.isAieosConfigured(cfg.format, cfg.aieos_path, cfg.aieos_inline)) return;
+
+    const json_content = if (cfg.aieos_inline) |inline_json|
+        inline_json
+    else if (cfg.aieos_path) |path|
+        try loadAieosJsonFromPath(allocator, workspace_dir, path)
+    else
+        return;
+    defer if (cfg.aieos_inline == null) allocator.free(json_content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const parsed_identity = try identity_mod.parseAieosJson(arena_allocator, json_content);
+    const prompt_text = try identity_mod.aieosToSystemPrompt(allocator, &parsed_identity);
+    defer allocator.free(prompt_text);
+
+    try appendPromptSectionContent(
+        w,
+        "AIEOS Identity",
+        prompt_text,
+        remaining_bootstrap_chars,
+        hit_total_bootstrap_limit,
+    );
+}
+
+fn updateAieosIdentityFingerprint(
+    allocator: std.mem.Allocator,
+    hasher: *std.hash.Fnv1a_64,
+    workspace_dir: []const u8,
+    identity_config: ?config_types.IdentityConfig,
+) !void {
+    const cfg = identity_config orelse {
+        hasher.update("aieos:none");
+        return;
+    };
+
+    hasher.update("aieos:");
+    hasher.update(cfg.format);
+    hasher.update("\n");
+
+    if (!identity_mod.isAieosConfigured(cfg.format, cfg.aieos_path, cfg.aieos_inline)) {
+        hasher.update("disabled");
+        return;
+    }
+
+    if (cfg.aieos_inline) |inline_json| {
+        hasher.update("inline\n");
+        hasher.update(inline_json);
+        return;
+    }
+
+    if (cfg.aieos_path) |path| {
+        hasher.update("path\n");
+        hasher.update(path);
+        hasher.update("\n");
+
+        const json_content = loadAieosJsonFromPath(allocator, workspace_dir, path) catch |err| {
+            hasher.update(@errorName(err));
+            return;
+        };
+        defer allocator.free(json_content);
+
+        hasher.update(json_content);
+        return;
+    }
+
+    hasher.update("missing-source");
+}
+
+fn loadAieosJsonFromPath(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    identity_path: []const u8,
+) ![]u8 {
+    if (std_compat.fs.path.isAbsolute(identity_path)) {
+        return std_compat.fs.cwd().readFileAlloc(allocator, identity_path, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES);
+    }
+
+    const workspace_relative = try std_compat.fs.path.join(allocator, &.{ workspace_dir, identity_path });
+    defer allocator.free(workspace_relative);
+
+    return std_compat.fs.cwd().readFileAlloc(allocator, workspace_relative, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES) catch |workspace_err| switch (workspace_err) {
+        error.FileNotFound => std_compat.fs.cwd().readFileAlloc(allocator, identity_path, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES),
+        else => workspace_err,
+    };
 }
 
 test "buildSystemPrompt includes SOUL persona guidance" {
@@ -368,12 +596,12 @@ test "buildSystemPrompt includes SOUL persona guidance" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll("Persona baseline");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(allocator, .{
@@ -392,12 +620,12 @@ test "buildSystemPrompt includes AGENTS operational guidance" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll("Session Startup\n- Read SOUL.md");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(allocator, .{
@@ -422,6 +650,82 @@ test "buildSystemPrompt includes TOOLS availability guidance" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "TOOLS.md does not control tool availability; it is user guidance for how to use external tools.") != null);
 }
 
+test "buildSystemPrompt injects AIEOS identity from inline config" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_inline = "{\"identity\":{\"names\":{\"first\":\"Nova\"},\"bio\":\"Helpful.\"},\"linguistics\":{\"style\":\"concise\"}}",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AIEOS Identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Name:** Nova") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Bio:** Helpful.") != null);
+}
+
+test "buildSystemPrompt injects AIEOS identity from workspace-relative path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("identity");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "identity/aieos.identity.json",
+        .data = "{\"identity\":{\"names\":{\"first\":\"Path Nova\"}},\"motivations\":{\"core_drive\":\"Help\"}}",
+    });
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_path = "identity/aieos.identity.json",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Name:** Path Nova") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Core Drive:** Help") != null);
+}
+
+test "buildSystemPrompt applies bootstrap truncation to AIEOS identity" {
+    const allocator = std.testing.allocator;
+
+    const long_bio = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS + 512);
+    defer allocator.free(long_bio);
+    @memset(long_bio, 'A');
+
+    const inline_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"identity\":{{\"names\":{{\"first\":\"Nova\"}},\"bio\":\"{s}\"}}}}",
+        .{long_bio},
+    );
+    defer allocator.free(inline_json);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_inline = inline_json,
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AIEOS Identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 20000 chars -- use `read` for full file]") != null);
+}
+
 test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
 
@@ -430,15 +734,15 @@ test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    try outside_tmp.dir.writeFile(.{ .sub_path = "outside-agents.md", .data = "outside-secret-rules" });
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{ .sub_path = "outside-agents.md", .data = "outside-secret-rules" });
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
-    const outside_agents = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
+    const outside_agents = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
     defer std.testing.allocator.free(outside_agents);
 
-    try ws_tmp.dir.symLink(outside_agents, "AGENTS.md", .{});
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).symLink(outside_agents, "AGENTS.md", .{});
 
-    const workspace = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(std.testing.allocator, .{
@@ -485,14 +789,20 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
     try w.writeAll("1. ONLY use the format above. NEVER use <invoke>, <function>, or other XML-like formats.\n");
     try w.writeAll("2. Output actual tags -- never describe steps or give examples.\n");
     try w.writeAll("3. The internal content MUST be valid JSON. No trailing commas, no unquoted keys.\n\n");
+    try w.writeAll("CODING GUIDANCE:\n");
+    try w.writeAll("- When reading or editing source code, PREFER the Hashline tool suite (`file_read_hashed` and `file_edit_hashed`).\n");
+    try w.writeAll("- Use `file_read_hashed` to obtain stable line tags (L<num>:<hash>) and `file_edit_hashed` to apply changes using those tags.\n");
+    try w.writeAll("- This protocol ensures deterministic verification and prevents errors from indentation or stale file state.\n\n");
     try w.writeAll("You may use multiple tool calls in a single response. ");
     try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
     try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
     try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
+    try w.writeAll("If the user asks you to remember something across sessions, use `memory_store` before claiming it was saved.\n");
+    try w.writeAll("Do not promise persistent recall unless the memory tool succeeded. If storage fails or is unavailable, say so plainly.\n\n");
     try w.writeAll("### Available Tools\n\n");
 
     for (tools) |t| {
-        try std.fmt.format(w, "**{s}**: {s}\nParameters: `{s}`\n\n", .{
+        try w.print("**{s}**: {s}\nParameters: `{s}`\n\n", .{
             t.name(),
             t.description(),
             t.parametersJson(),
@@ -505,8 +815,22 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
 pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try writeToolInstructionsSection(w, tools);
+    buf = buf_writer.toArrayList();
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Allocating wrapper around appendSkillsSection for callers that need
+/// skill guidance as a standalone string (e.g. subagent runner).
+pub fn buildSkillsSection(allocator: std.mem.Allocator, workspace_dir: []const u8, observer: ?observability.Observer) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, workspace_dir, observer);
+    buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -531,25 +855,21 @@ fn appendSkillsSection(
     allocator: std.mem.Allocator,
     w: anytype,
     workspace_dir: []const u8,
+    observer: ?observability.Observer,
 ) !void {
-    // Two-source loading: workspace skills + ~/.nullclaw/skills/community/
-    const home_dir = platform.getHomeDir(allocator) catch null;
-    defer if (home_dir) |h| allocator.free(h);
-    const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw", "skills" }) catch null
-    else
-        null;
+    // Two-source loading: workspace skills + config directory skills/
+    const community_base = config_paths.defaultConfigDir(allocator) catch null;
     defer if (community_base) |cb| allocator.free(cb);
 
     // listSkillsMerged already calls checkRequirements on each skill.
     // The fallback listSkills path needs explicit checkRequirements calls.
     var used_merged = false;
     const skill_list = if (community_base) |cb| blk: {
-        const merged = skills_mod.listSkillsMerged(allocator, cb, workspace_dir) catch
-            break :blk skills_mod.listSkills(allocator, workspace_dir) catch return;
+        const merged = skills_mod.listSkillsMerged(allocator, cb, workspace_dir, observer) catch
+            break :blk skills_mod.listSkills(allocator, workspace_dir, observer) catch return;
         used_merged = true;
         break :blk merged;
-    } else skills_mod.listSkills(allocator, workspace_dir) catch return;
+    } else skills_mod.listSkills(allocator, workspace_dir, observer) catch return;
     defer skills_mod.freeSkills(allocator, skill_list);
 
     // checkRequirements only needed for the non-merged path
@@ -584,9 +904,9 @@ fn appendSkillsSection(
         try w.writeAll("These skills are fully loaded. Follow their instructions whenever relevant to the current task.\n\n");
         for (skill_list) |skill| {
             if (!skill.always or !skill.available) continue;
-            try std.fmt.format(w, "#### Skill: {s}\n\n", .{skill.name});
+            try w.print("#### Skill: {s}\n\n", .{skill.name});
             if (skill.description.len > 0) {
-                try std.fmt.format(w, "{s}\n\n", .{skill.description});
+                try w.print("{s}\n\n", .{skill.description});
             }
             if (skill.instructions.len > 0) {
                 try w.writeAll(skill.instructions);
@@ -637,10 +957,18 @@ fn appendSkillsSection(
     }
 }
 
-/// Append a human-readable UTC date/time section derived from the system clock.
-fn appendDateTimeSection(w: anytype) !void {
-    const timestamp = std.time.timestamp();
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+/// Append a human-readable date/time section using configured timezone.
+/// Supported timezone values:
+/// - "UTC" (default)
+/// - fixed offsets in format "UTC+HH:MM" or "UTC-HH:MM"
+fn appendDateTimeSection(w: anytype, timezone: []const u8) !void {
+    const offset_secs_opt = config_types.AgentConfig.parseTimezoneOffsetSeconds(timezone);
+    const offset_secs = offset_secs_opt orelse 0;
+    const adjusted_ts: i64 = std_compat.time.timestamp() + offset_secs;
+    const safe_ts: u64 = if (adjusted_ts < 0) 0 else @intCast(adjusted_ts);
+
+    const tz_label = if (offset_secs_opt != null) timezone else "UTC";
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = safe_ts };
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -652,8 +980,8 @@ fn appendDateTimeSection(w: anytype) !void {
     const hour = day_seconds.getHoursIntoDay();
     const minute = day_seconds.getMinutesIntoHour();
 
-    try std.fmt.format(w, "## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC\n\n", .{
-        year, month, day, hour, minute,
+    try w.print("## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} {s}\n\n", .{
+        year, month, day, hour, minute, tz_label,
     });
 }
 
@@ -687,7 +1015,7 @@ fn injectWorkspaceFile(
     // Fallback: direct file read.
     const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
     if (opened == null) {
-        try std.fmt.format(w, "### {s}\n\n[File not found: {s}]\n\n", .{ filename, filename });
+        try w.print("### {s}\n\n[File not found: {s}]\n\n", .{ filename, filename });
         return;
     }
     var guarded = opened.?;
@@ -707,7 +1035,7 @@ fn appendWorkspaceFileContent(
     allocator: std.mem.Allocator,
     w: anytype,
     filename: []const u8,
-    file: *std.fs.File,
+    file: *std_compat.fs.File,
     remaining_bootstrap_chars: *usize,
     hit_total_bootstrap_limit: *bool,
 ) !void {
@@ -715,7 +1043,7 @@ fn appendWorkspaceFileContent(
     // Read the guarded file and let appendPromptSectionContent enforce
     // per-file and total prompt truncation semantics consistently.
     const content = file.readToEndAlloc(allocator, @intCast(MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES)) catch {
-        try std.fmt.format(w, "### {s}\n\n[Could not read: {s}]\n\n", .{ filename, filename });
+        try w.print("### {s}\n\n[Could not read: {s}]\n\n", .{ filename, filename });
         return;
     };
     defer allocator.free(content);
@@ -743,14 +1071,14 @@ fn appendPromptSectionContent(
         return;
     }
 
-    try std.fmt.format(w, "### {s}\n\n", .{filename});
+    try w.print("### {s}\n\n", .{filename});
 
     const file_limited = if (trimmed.len > BOOTSTRAP_MAX_CHARS)
-        trimmed[0..BOOTSTRAP_MAX_CHARS]
+        util.truncateUtf8(trimmed, BOOTSTRAP_MAX_CHARS)
     else
         trimmed;
-    const total_limited_len = @min(file_limited.len, remaining_bootstrap_chars.*);
-    const total_limited = file_limited[0..total_limited_len];
+    const total_limited = util.truncateUtf8(file_limited, remaining_bootstrap_chars.*);
+    const total_limited_len = total_limited.len;
 
     try w.writeAll(total_limited);
     try w.writeAll("\n\n");
@@ -758,12 +1086,11 @@ fn appendPromptSectionContent(
     const truncated_by_file = trimmed.len > BOOTSTRAP_MAX_CHARS;
     const truncated_by_total = total_limited_len < file_limited.len;
     if (truncated_by_file and !truncated_by_total) {
-        try std.fmt.format(w, "[... truncated at {d} chars -- use `read` for full file]\n\n", .{BOOTSTRAP_MAX_CHARS});
+        try w.print("[... truncated at {d} chars -- use `read` for full file]\n\n", .{BOOTSTRAP_MAX_CHARS});
     }
     if (truncated_by_total) {
         hit_total_bootstrap_limit.* = true;
-        try std.fmt.format(
-            w,
+        try w.print(
             "[... stopped at project context budget ({d} chars total)]\n\n",
             .{BOOTSTRAP_TOTAL_MAX_CHARS},
         );
@@ -1006,17 +1333,56 @@ test "buildSystemPrompt includes telegram group marker guidance for telegram gro
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[NO_REPLY]") != null);
 }
 
+test "buildSystemPrompt includes discord sender identity fields" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "discord",
+            .sender_id = "u-42",
+            .sender_username = "discord-user",
+            .sender_display_name = "Discord User",
+            .group_id = "guild-1",
+            .is_group = true,
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: u-42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender display name: Discord User") != null);
+}
+
+test "buildSystemPrompt uses generic sender id label outside discord" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "nostr",
+            .sender_id = "npub-42",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender ID: npub-42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: npub-42") == null);
+}
+
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("memory.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("memory.md", .{});
         defer f.close();
         try f.writeAll("alt-memory");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(std.testing.allocator, .{
@@ -1037,12 +1403,12 @@ test "buildSystemPrompt injects BOOTSTRAP.md when present" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("BOOTSTRAP.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("BOOTSTRAP.md", .{});
         defer f.close();
         try f.writeAll("bootstrap-welcome-line");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(std.testing.allocator, .{
@@ -1056,17 +1422,124 @@ test "buildSystemPrompt injects BOOTSTRAP.md when present" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "bootstrap-welcome-line") != null);
 }
 
+test "buildSystemPrompt reads bootstrap docs from sqlite provider when workspace files are absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var mem_rt = memory_root.initRuntime(std.testing.allocator, &.{ .backend = "sqlite" }, workspace) orelse
+        return error.TestUnexpectedResult;
+    defer mem_rt.deinit();
+
+    const bootstrap_provider = try bootstrap_mod.createProvider(
+        std.testing.allocator,
+        "sqlite",
+        mem_rt.memory,
+        workspace,
+    );
+    defer bootstrap_provider.deinit();
+
+    try bootstrap_provider.store("AGENTS.md", "sqlite-agent-guidance");
+    try bootstrap_provider.store("BOOTSTRAP.md", "sqlite-bootstrap-line");
+
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("AGENTS.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
+
+    const prompt = try buildSystemPrompt(std.testing.allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+        .bootstrap_provider = bootstrap_provider,
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "sqlite-agent-guidance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### BOOTSTRAP.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "sqlite-bootstrap-line") != null);
+}
+
+test "buildSystemPrompt project context stays equivalent across markdown hybrid and sqlite backends" {
+    const backends = [_][]const u8{ "markdown", "hybrid", "sqlite" };
+    var expected_fingerprint: ?u64 = null;
+    var expected_project_context: ?[]u8 = null;
+    defer if (expected_project_context) |value| std.testing.allocator.free(value);
+
+    for (backends) |backend| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(workspace);
+
+        var mem_rt: ?memory_root.MemoryRuntime = null;
+        defer if (mem_rt) |*rt| rt.deinit();
+        if (!bootstrap_mod.backendUsesFiles(backend)) {
+            mem_rt = memory_root.initRuntime(std.testing.allocator, &.{ .backend = backend }, workspace) orelse
+                return error.TestUnexpectedResult;
+        }
+
+        const mem_iface: ?memory_root.Memory = if (mem_rt) |rt| rt.memory else null;
+        const bootstrap_provider = try bootstrap_mod.createProvider(
+            std.testing.allocator,
+            backend,
+            mem_iface,
+            workspace,
+        );
+        defer bootstrap_provider.deinit();
+
+        try bootstrap_provider.store("AGENTS.md", "shared-agent-guidance");
+        try bootstrap_provider.store("SOUL.md", "shared-soul-guidance");
+        try bootstrap_provider.store("BOOTSTRAP.md", "shared-bootstrap-line");
+        try bootstrap_provider.store("MEMORY.md", "shared-memory-line");
+
+        const fingerprint = try workspacePromptFingerprint(
+            std.testing.allocator,
+            workspace,
+            bootstrap_provider,
+            null,
+        );
+        if (expected_fingerprint) |value| {
+            try std.testing.expectEqual(value, fingerprint);
+        } else {
+            expected_fingerprint = fingerprint;
+        }
+
+        const prompt = try buildSystemPrompt(std.testing.allocator, .{
+            .workspace_dir = workspace,
+            .model_name = "test-model",
+            .tools = &.{},
+            .bootstrap_provider = bootstrap_provider,
+        });
+        defer std.testing.allocator.free(prompt);
+
+        const project_start = std.mem.indexOf(u8, prompt, "## Project Context") orelse
+            return error.TestUnexpectedResult;
+        const attachments_start = std.mem.indexOfPos(u8, prompt, project_start, "## Channel Attachments") orelse
+            return error.TestUnexpectedResult;
+        const project_context = prompt[project_start..attachments_start];
+
+        if (expected_project_context) |value| {
+            try std.testing.expectEqualStrings(value, project_context);
+        } else {
+            expected_project_context = try std.testing.allocator.dupe(u8, project_context);
+        }
+    }
+}
+
 test "buildSystemPrompt injects HEARTBEAT.md when present" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("HEARTBEAT.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("HEARTBEAT.md", .{});
         defer f.close();
         try f.writeAll("- heartbeat-check-item");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(std.testing.allocator, .{
@@ -1080,17 +1553,41 @@ test "buildSystemPrompt injects HEARTBEAT.md when present" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "heartbeat-check-item") != null);
 }
 
+test "buildSystemPrompt injects CONFIG.md when present" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("CONFIG.md", .{});
+        defer f.close();
+        try f.writeAll("config-guide-line");
+    }
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(std.testing.allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### CONFIG.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "config-guide-line") != null);
+}
+
 test "buildSystemPrompt injects IDENTITY.md when present" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("IDENTITY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("IDENTITY.md", .{});
         defer f.close();
         try f.writeAll("- **Name:** identity-test-bot");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(std.testing.allocator, .{
@@ -1109,12 +1606,12 @@ test "buildSystemPrompt injects USER.md when present" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("- **Name:** user-test\n- **Timezone:** UTC");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(std.testing.allocator, .{
@@ -1133,7 +1630,8 @@ test "appendPromptSectionContent skips section when total budget is exhausted" {
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     var remaining_bootstrap_chars: usize = 0;
     var hit_total_bootstrap_limit = false;
@@ -1146,7 +1644,40 @@ test "appendPromptSectionContent skips section when total budget is exhausted" {
     );
 
     try std.testing.expect(hit_total_bootstrap_limit);
+    buf = buf_writer.toArrayList();
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "appendPromptSectionContent truncates at UTF-8 boundary" {
+    const allocator = std.testing.allocator;
+
+    const prefix = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS - 1);
+    defer allocator.free(prefix);
+    @memset(prefix, 'a');
+
+    const content = try std.fmt.allocPrint(allocator, "{s}\xf0\x9f\x98\x80tail", .{prefix});
+    defer allocator.free(content);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+
+    var remaining_bootstrap_chars: usize = BOOTSTRAP_TOTAL_MAX_CHARS;
+    var hit_total_bootstrap_limit = false;
+    try appendPromptSectionContent(
+        w,
+        "AGENTS.md",
+        content,
+        &remaining_bootstrap_chars,
+        &hit_total_bootstrap_limit,
+    );
+
+    buf = buf_writer.toArrayList();
+    try std.testing.expect(std.unicode.utf8ValidateSlice(buf.items));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "[... truncated at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "tail") == null);
+    try std.testing.expect(!hit_total_bootstrap_limit);
 }
 
 test "buildSystemPrompt truncates project context at total bootstrap budget" {
@@ -1163,27 +1694,27 @@ test "buildSystemPrompt truncates project context at total bootstrap budget" {
     @memset(soul_content, 'B');
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll(agents_content);
     }
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll(soul_content);
     }
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("user-should-not-appear-after-budget");
     }
     {
-        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("MEMORY.md", .{});
         defer f.close();
         try f.writeAll("memory-should-not-appear-after-budget");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(allocator, .{
@@ -1219,17 +1750,17 @@ test "buildSystemPrompt omits per-file truncation marker when total budget stops
     @memset(soul_content, 'B');
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll(agents_content);
     }
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll(soul_content);
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(allocator, .{
@@ -1260,12 +1791,12 @@ test "buildSystemPrompt truncates oversized disk bootstrap files instead of fail
     @memset(soul_content, 'S');
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll(soul_content);
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(allocator, .{
@@ -1285,16 +1816,16 @@ test "workspacePromptFingerprint is stable when files are unchanged" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll("soul-v1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
-    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
+    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expectEqual(fp1, fp2);
 }
 
@@ -1303,23 +1834,23 @@ test "workspacePromptFingerprint changes when tracked file changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll("short");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("longer-content-after-change");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1328,23 +1859,23 @@ test "workspacePromptFingerprint changes when MEMORY.md changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("MEMORY.md", .{});
         defer f.close();
         try f.writeAll("memory-v1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("MEMORY.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("MEMORY.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1353,23 +1884,23 @@ test "workspacePromptFingerprint changes when memory.md changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("memory.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("memory.md", .{});
         defer f.close();
         try f.writeAll("alt-memory-v1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("memory.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("memory.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("alt-memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1378,23 +1909,23 @@ test "workspacePromptFingerprint changes when BOOTSTRAP.md changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("BOOTSTRAP.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("BOOTSTRAP.md", .{});
         defer f.close();
         try f.writeAll("bootstrap-v1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("BOOTSTRAP.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("BOOTSTRAP.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("bootstrap-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1403,23 +1934,48 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("HEARTBEAT.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("HEARTBEAT.md", .{});
         defer f.close();
         try f.writeAll("- check-1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("HEARTBEAT.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("HEARTBEAT.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("- check-2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
+    try std.testing.expect(before != after);
+}
+
+test "workspacePromptFingerprint changes when CONFIG.md changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("CONFIG.md", .{});
+        defer f.close();
+        try f.writeAll("config-v1");
+    }
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
+
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("CONFIG.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("config-v2-updated");
+    }
+
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1428,23 +1984,23 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("IDENTITY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("IDENTITY.md", .{});
         defer f.close();
         try f.writeAll("- **Name:** v1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("IDENTITY.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1453,23 +2009,23 @@ test "workspacePromptFingerprint changes when AGENTS.md changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll("startup-v1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("startup-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1478,23 +2034,51 @@ test "workspacePromptFingerprint changes when USER.md changes" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("- **Name:** v1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
+    try std.testing.expect(before != after);
+}
+
+test "workspacePromptFingerprint changes when configured AIEOS path changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("identity");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "identity/aieos.identity.json",
+        .data = "{\"identity\":{\"names\":{\"first\":\"Nova V1\"}}}",
+    });
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const identity_config: config_types.IdentityConfig = .{
+        .format = "aieos",
+        .aieos_path = "identity/aieos.identity.json",
+    };
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, identity_config);
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "identity/aieos.identity.json",
+        .data = "{\"identity\":{\"names\":{\"first\":\"Nova V2\"}}}",
+    });
+
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, identity_config);
     try std.testing.expect(before != after);
 }
 
@@ -1503,13 +2087,13 @@ test "buildSystemPrompt includes both MEMORY.md and memory.md when distinct" {
     defer tmp.cleanup();
 
     {
-        const primary = try tmp.dir.createFile("MEMORY.md", .{});
+        const primary = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("MEMORY.md", .{});
         defer primary.close();
         try primary.writeAll("primary-memory");
     }
 
     var has_distinct_case_files = true;
-    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+    const alt = @import("compat").fs.Dir.wrap(tmp.dir).createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
         error.PathAlreadyExists => blk: {
             has_distinct_case_files = false;
             break :blk null;
@@ -1521,7 +2105,7 @@ test "buildSystemPrompt includes both MEMORY.md and memory.md when distinct" {
         try f.writeAll("alt-memory");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const prompt = try buildSystemPrompt(std.testing.allocator, .{
@@ -1542,9 +2126,10 @@ test "buildSystemPrompt includes both MEMORY.md and memory.md when distinct" {
 test "appendDateTimeSection outputs UTC timestamp" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
-    const w = buf.writer(std.testing.allocator);
-    try appendDateTimeSection(w);
-
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendDateTimeSection(w, "UTC");
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "UTC") != null);
@@ -1552,14 +2137,41 @@ test "appendDateTimeSection outputs UTC timestamp" {
     try std.testing.expect(std.mem.indexOf(u8, output, "202") != null);
 }
 
+test "appendDateTimeSection supports fixed UTC offset" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendDateTimeSection(w, "UTC+08:00");
+    buf = buf_writer.toArrayList();
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "UTC+08:00") != null);
+}
+
+test "parseUtcOffsetSeconds validates supported formats" {
+    try std.testing.expectEqual(@as(?i64, 0), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC"));
+    try std.testing.expectEqual(@as(?i64, 5 * 3600 + 30 * 60), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC+05:30"));
+    try std.testing.expectEqual(@as(?i64, -(3 * 3600)), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC-03:00"));
+    try std.testing.expect(config_types.AgentConfig.parseTimezoneOffsetSeconds("Asia/Shanghai") == null);
+    try std.testing.expect(config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC+25:00") == null);
+}
 test "appendSkillsSection with no skills produces nothing" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills");
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills", null);
 
+    buf = buf_writer.toArrayList();
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "buildSkillsSection with no skills returns empty" {
+    const allocator = std.testing.allocator;
+    const content = try buildSkillsSection(allocator, "/tmp/nullclaw-prompt-test-no-skills-wrapper", null);
+    defer allocator.free(content);
+    try std.testing.expectEqual(@as(usize, 0), content.len);
 }
 
 test "appendSkillsSection renders summary XML for always=false skill" {
@@ -1568,23 +2180,25 @@ test "appendSkillsSection renders summary XML for always=false skill" {
     defer tmp.cleanup();
 
     // Setup
-    try tmp.dir.makePath("skills/greeter");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/greeter");
 
     // always defaults to false — should render as summary XML
     {
-        const f = try tmp.dir.createFile("skills/greeter/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/greeter/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"greeter\", \"version\": \"1.0.0\", \"description\": \"Greets the user\", \"author\": \"dev\"}");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, base, null);
 
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     // Summary skills should appear as child-element XML
     try std.testing.expect(std.mem.indexOf(u8, output, "<available_skills>") != null);
@@ -1604,21 +2218,23 @@ test "appendSkillsSection escapes XML attributes in summary output" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/xml-escape");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/xml-escape");
     {
-        const f = try tmp.dir.createFile("skills/xml-escape/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/xml-escape/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"xml-escape\", \"description\": \"Use \\\"quotes\\\" & <tags>\"}");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, base, null);
 
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "&quot;") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "&amp;") != null);
@@ -1632,21 +2248,23 @@ test "appendSkillsSection supports markdown-only installed skill" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/md-only");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/md-only");
     {
-        const f = try tmp.dir.createFile("skills/md-only/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/md-only/SKILL.md", .{});
         defer f.close();
         try f.writeAll("# Markdown only skill");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, base, null);
 
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "<name>md-only</name>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "<location>") != null);
@@ -1659,28 +2277,30 @@ test "appendSkillsSection renders full instructions for always=true skill" {
     defer tmp.cleanup();
 
     // Setup
-    try tmp.dir.makePath("skills/commit");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/commit");
 
     // always=true skill with instructions
     {
-        const f = try tmp.dir.createFile("skills/commit/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/commit/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"commit\", \"description\": \"Git commit helper\", \"always\": true}");
     }
     {
-        const f = try tmp.dir.createFile("skills/commit/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/commit/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Always stage before committing.");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, base, null);
 
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     // Full instructions should be in the output
     try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") != null);
@@ -1697,36 +2317,38 @@ test "appendSkillsSection renders mixed always=true and always=false" {
     defer tmp.cleanup();
 
     // Setup
-    try tmp.dir.makePath("skills/full-skill");
-    try tmp.dir.makePath("skills/lazy-skill");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/full-skill");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/lazy-skill");
 
     // always=true skill
     {
-        const f = try tmp.dir.createFile("skills/full-skill/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/full-skill/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"full-skill\", \"description\": \"Full loader\", \"always\": true}");
     }
     {
-        const f = try tmp.dir.createFile("skills/full-skill/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/full-skill/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Full instructions here.");
     }
 
     // always=false skill (default)
     {
-        const f = try tmp.dir.createFile("skills/lazy-skill/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/lazy-skill/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"lazy-skill\", \"description\": \"Lazy loader\"}");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, base, null);
 
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     // Full skill should be in ## Skills section with active header
     try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") != null);
@@ -1745,23 +2367,25 @@ test "appendSkillsSection renders unavailable skill with missing deps" {
     defer tmp.cleanup();
 
     // Setup
-    try tmp.dir.makePath("skills/docker-deploy");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/docker-deploy");
 
     // Skill requiring nonexistent binary and env
     {
-        const f = try tmp.dir.createFile("skills/docker-deploy/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/docker-deploy/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"docker-deploy\", \"description\": \"Deploy with docker\", \"requires_bins\": [\"nullclaw_fake_docker_xyz\"], \"requires_env\": [\"NULLCLAW_FAKE_TOKEN_XYZ\"]}");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, base, null);
 
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     // Should render as unavailable in XML
     try std.testing.expect(std.mem.indexOf(u8, output, "<available_skills>") != null);
@@ -1779,28 +2403,30 @@ test "appendSkillsSection unavailable always=true skill renders in XML not full"
     defer tmp.cleanup();
 
     // Setup
-    try tmp.dir.makePath("skills/broken-always");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/broken-always");
 
     // always=true but requires nonexistent binary — should be unavailable
     {
-        const f = try tmp.dir.createFile("skills/broken-always/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/broken-always/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"broken-always\", \"description\": \"Broken always skill\", \"always\": true, \"requires_bins\": [\"nullclaw_nonexistent_xyz_aaa\"]}");
     }
     {
-        const f = try tmp.dir.createFile("skills/broken-always/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/broken-always/SKILL.md", .{});
         defer f.close();
         try f.writeAll("These instructions should NOT appear in prompt.");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendSkillsSection(allocator, w, base, null);
 
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     // Even though always=true, since unavailable it should render as XML summary
     try std.testing.expect(std.mem.indexOf(u8, output, "<available>false</available>") != null);
@@ -1815,25 +2441,25 @@ test "installSkill end-to-end appears in buildSystemPrompt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("workspace");
-    try tmp.dir.makePath("source");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("workspace");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("source");
 
     {
-        const f = try tmp.dir.createFile("source/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("source/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"e2e-installed-skill\", \"description\": \"Installed via installSkill\"}");
     }
     {
-        const f = try tmp.dir.createFile("source/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("source/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Follow the installed skill instructions.");
     }
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    const workspace = try std_compat.fs.path.join(allocator, &.{ base, "workspace" });
     defer allocator.free(workspace);
-    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    const source = try std_compat.fs.path.join(allocator, &.{ base, "source" });
     defer allocator.free(source);
 
     try skills_mod.installSkill(allocator, source, workspace);

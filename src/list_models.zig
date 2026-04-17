@@ -3,6 +3,7 @@
 /// Used by nullhub to populate the dynamic model selector during onboarding.
 /// Delegates to onboard.fetchModels which handles caching, fallbacks, and API calls.
 const std = @import("std");
+const std_compat = @import("compat");
 const onboard = @import("onboard.zig");
 
 fn writeModelsJson(out: *std.Io.Writer, models: []const []const u8) !void {
@@ -31,18 +32,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     if (provider == null) {
         std.debug.print("error: --provider is required\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const provider_info = onboard.resolveProviderForQuickSetup(provider.?) orelse {
         std.debug.print("error: unknown provider '{s}'\n", .{provider.?});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
     // Use onboard's fetchModels (handles caching, fallbacks, API calls)
     const models = onboard.fetchModels(allocator, provider_info.key, api_key) catch |err| {
         std.debug.print("error fetching models: {}\n", .{err});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer {
         for (models) |m| allocator.free(m);
@@ -51,7 +52,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Output as JSON array to stdout
     var stdout_buf: [65536]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const out = &bw.interface;
     try writeModelsJson(out, models);
     try bw.interface.flush();

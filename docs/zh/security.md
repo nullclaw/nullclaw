@@ -23,9 +23,18 @@ NullClaw 默认走 secure-by-default：本地绑定、配对鉴权、沙箱隔�
 
 ## Channel allowlist 规则
 
-- `allow_from: []`：拒绝所有入站。
+- `allow_from` 的行为因渠道而异；不要把 `[]` 当成所有 runtime 都适用的默认拒绝开关。
+- 有些渠道（例如 WeChat 和 Discord）会把省略或留空的 `allow_from` 视为“关闭过滤”，想做私有 bot 时要显式填写允许的用户 ID / OpenID。
 - `allow_from: ["*"]`：允许所有来源（高风险，仅显式确认后使用）。
-- 其他：按精确匹配允许列表。
+- 其他情况通常是精确匹配 allowlist，或该渠道自己的 fallback / group-policy 语义。
+
+## Pairing 与 Webhook 鉴权边界
+
+- `/pair` 仅支持 POST，并要求 `X-Pairing-Code`。
+- 多次错误 pairing 尝试会触发限流，并可能进入临时锁定。
+- `/.well-known/agent.json` 与 `/.well-known/agent-card.json` 在启用 A2A 时属于公开发现文档。
+- 保持 `gateway.require_pairing = true` 时，`/webhook` 与 `/a2a` 仍在 bearer 鉴权之后；若关闭 pairing，这两个端点就不再要求 bearer token。
+- 各 channel 专用入站 webhook 继续使用各自的鉴权或签名规则，不应一概写成 gateway bearer 鉴权。
 
 ## Nostr 特殊规则
 
@@ -60,7 +69,16 @@ NullClaw 默认走 secure-by-default：本地绑定、配对鉴权、沙箱隔�
 
 ### 路径验证环境变量
 
-`tools.path_env_vars` 允许指定值为平台路径列表（Unix 用 `:`，Windows 用 `;`）的环境变量。每个路径组件在传递前都会针对沙箱验证（必须在工作区或 `allowed_paths` 内，系统路径始终被拒绝）。
+某些部署场景（如 Kubernetes 中通过 volume mount 注入工具链）需要 `LD_LIBRARY_PATH` 等环境变量来定位共享库，但无条件传递这类变量存在库注入风险。
+
+`tools.path_env_vars` 允许指定值为平台路径列表（Unix 用 `:`，Windows 用 `;`）的环境变量。每个路径组件在传递给子进程前都会经过以下验证：
+
+1. 每个组件必须是绝对路径
+2. 每个组件通过 `realpath` 解析（规范化，跟随符号链接）
+3. 每个组件必须在工作区或 `allowed_paths` 范围内
+4. 系统黑名单路径（`/etc`、`/usr/lib`、`/bin` 等）始终被拒绝
+
+如果任何一个组件验证失败，整个变量会被丢弃。
 
 ```json
 {
@@ -69,11 +87,14 @@ NullClaw 默认走 secure-by-default：本地绑定、配对鉴权、沙箱隔�
 }
 ```
 
+以上述配置为例，当容器环境中 `LD_LIBRARY_PATH=/opt/tools/usr/lib:/opt/tools/lib` 时，shell tool 会验证两个路径组件均在 `/opt/tools`（通过 `allowed_paths`）范围内，然后放行。而攻击者控制的值如 `/tmp/evil:/opt/tools/lib` 会被拒绝，因为 `/tmp/evil` 不在工作区或允许路径内。
+
 ## 高风险配置提醒
 
 以下配置会显著扩大权限边界，应仅用于受控环境：
 
 - `autonomy.level = "full"`
+- `autonomy.level = "yolo"`
 - `allowed_commands = ["*"]`
 - `allowed_paths = ["*"]`
 - `gateway.allow_public_bind = true`

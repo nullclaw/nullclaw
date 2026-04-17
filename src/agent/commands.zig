@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
 const Tool = @import("../tools/root.zig").Tool;
@@ -8,14 +9,19 @@ const subagent_mod = @import("../subagent.zig");
 const memory_mod = @import("../memory/root.zig");
 const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
+const config_paths = @import("../config_paths.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
+const interaction_choices = @import("../interactions/choices.zig");
+const onboard = @import("../onboard.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
+const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
+const util = @import("../util.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -24,6 +30,8 @@ const isSlashName = control_plane.isSlashName;
 
 pub const BARE_SESSION_RESET_PROMPT =
     "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
+
+const MODEL_MENU_PAGE_SIZE: usize = 10;
 
 pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
@@ -87,7 +95,7 @@ const SlashCommandKind = enum {
 fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) return .new_reset;
     if (isSlashName(cmd, "restart")) return .restart;
-    if (isSlashName(cmd, "help") or isSlashName(cmd, "commands")) return .help;
+    if (isSlashName(cmd, "help") or isSlashName(cmd, "commands") or isSlashName(cmd, "menu")) return .help;
     if (isSlashName(cmd, "status")) return .status;
     if (isSlashName(cmd, "whoami") or isSlashName(cmd, "id")) return .whoami;
     if (isSlashName(cmd, "model") or isSlashName(cmd, "models")) return .model;
@@ -105,7 +113,7 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "context")) return .context;
     if (isSlashName(cmd, "export-session") or isSlashName(cmd, "export")) return .export_session;
     if (isSlashName(cmd, "session")) return .session;
-    if (isSlashName(cmd, "subagents")) return .subagents;
+    if (isSlashName(cmd, "subagents") or isSlashName(cmd, "tasks")) return .subagents;
     if (isSlashName(cmd, "agents")) return .agents;
     if (isSlashName(cmd, "focus")) return .focus;
     if (isSlashName(cmd, "unfocus")) return .unfocus;
@@ -158,6 +166,40 @@ pub fn planTurnInput(message: []const u8) TurnInputPlan {
     return .{ .llm_user_message = message };
 }
 
+pub fn persistedRuntimeCommand(message: []const u8) ?[]const u8 {
+    const cmd = parseSlashCommand(message) orelse return null;
+    const kind = classifySlashCommand(cmd);
+    const arg = std.mem.trim(u8, cmd.arg, " \t");
+    const first = firstToken(arg);
+
+    return switch (kind) {
+        .think, .verbose, .reasoning, .usage, .activation, .send, .elevated => blk: {
+            if (first.len == 0 or std.ascii.eqlIgnoreCase(first, "status")) break :blk null;
+            break :blk message;
+        },
+        .exec, .tts => blk: {
+            if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) break :blk null;
+            break :blk message;
+        },
+        .queue => blk: {
+            if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) break :blk null;
+            break :blk message;
+        },
+        .session => blk: {
+            if (!std.ascii.eqlIgnoreCase(first, "ttl")) break :blk null;
+            const tail = splitFirstToken(arg).tail;
+            if (firstToken(tail).len == 0) break :blk null;
+            break :blk message;
+        },
+        .focus, .unfocus, .dock_telegram, .dock_discord, .dock_slack => message,
+        .debug => blk: {
+            if (std.ascii.eqlIgnoreCase(arg, "reset")) break :blk message;
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
 fn firstToken(arg: []const u8) []const u8 {
     var it = std.mem.tokenizeAny(u8, arg, " \t");
     return it.next() orelse "";
@@ -169,6 +211,355 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
     return n;
 }
 
+fn interactiveModelMenuChannel(session_id: ?[]const u8, context_channel: ?[]const u8) ?[]const u8 {
+    if (context_channel) |channel| {
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "telegram")) return "telegram";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "discord")) return "discord";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "slack")) return "slack";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "lark")) return "lark";
+    }
+    const sid = session_id orelse return null;
+
+    if (std.mem.startsWith(u8, sid, "agent:")) {
+        const after_agent = sid["agent:".len..];
+        const agent_sep = std.mem.indexOfScalar(u8, after_agent, ':') orelse return null;
+        const routed = after_agent[agent_sep + 1 ..];
+        if (std.mem.startsWith(u8, routed, "telegram:")) return "telegram";
+        if (std.mem.startsWith(u8, routed, "discord:")) return "discord";
+        if (std.mem.startsWith(u8, routed, "slack:")) return "slack";
+        if (std.mem.startsWith(u8, routed, "lark:")) return "lark";
+    }
+
+    if (std.mem.startsWith(u8, sid, "telegram:")) return "telegram";
+    if (std.mem.startsWith(u8, sid, "discord:")) return "discord";
+    if (std.mem.startsWith(u8, sid, "slack:")) return "slack";
+    if (std.mem.startsWith(u8, sid, "lark:")) return "lark";
+    return null;
+}
+
+fn modelMenuChoiceLabel(allocator: std.mem.Allocator, model_id: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_model_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_model = if (model_id.len <= max_model_len) model_id else model_id[0..max_model_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_model });
+}
+
+fn freeOwnedStringSlice(allocator: std.mem.Allocator, items: [][]const u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn providerMenuChoiceLabel(allocator: std.mem.Allocator, provider_name: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_provider_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_provider = if (provider_name.len <= max_provider_len) provider_name else provider_name[0..max_provider_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_provider });
+}
+
+fn appendUniqueOwnedString(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (items.items) |existing| {
+        if (provider_names.providerNamesMatchIgnoreCase(existing, value)) return;
+    }
+    try items.append(allocator, try allocator.dupe(u8, value));
+}
+
+fn collectInteractiveProviderNames(self: anytype, allocator: std.mem.Allocator) ![][]const u8 {
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer freeOwnedStringSlice(allocator, items.items);
+
+    if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0) {
+        try appendUniqueOwnedString(allocator, &items, self.default_provider);
+    }
+    if (@hasField(@TypeOf(self.*), "configured_providers")) {
+        for (self.configured_providers) |entry| {
+            if (entry.name.len == 0) continue;
+            try appendUniqueOwnedString(allocator, &items, entry.name);
+        }
+    }
+    return try items.toOwnedSlice(allocator);
+}
+
+fn renderInteractiveProviderMenuFromProviders(
+    allocator: std.mem.Allocator,
+    current_provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    providers_list: []const []const u8,
+) !?[]u8 {
+    if (providers_list.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, providers_list.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, providers_list.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (providers_list[start..end], 0..) |provider_name, idx| {
+        const label = try providerMenuChoiceLabel(allocator, provider_name, provider_names.providerNamesMatchIgnoreCase(provider_name, current_provider));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s}", .{provider_name});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "p{d}", .{idx + 1});
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1 and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page - 1});
+        options[option_count] = .{ .id = "prev", .label = "Prev", .submit_text = submit_text };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page + 1});
+        options[option_count] = .{ .id = "next", .label = "Next", .submit_text = submit_text };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a provider (page {d}/{d}).",
+        .{ current_model, current_provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
+}
+fn renderInteractiveModelMenuFromModels(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    models: []const []const u8,
+) !?[]u8 {
+    if (models.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, models.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, models.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (models[start..end], 0..) |model_id, idx| {
+        const label = try modelMenuChoiceLabel(allocator, model_id, std.mem.eql(u8, model_id, current_model));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model {s}", .{model_id});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "m{d}", .{idx + 1});
+
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page - 1 });
+        options[option_count] = .{
+            .id = "prev",
+            .label = "Prev",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page + 1 });
+        options[option_count] = .{
+            .id = "next",
+            .label = "Next",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a model (page {d}/{d}).",
+        .{ current_model, provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
+}
+
+fn renderInteractiveProviderMenu(self: anytype, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    const providers_list = try collectInteractiveProviderNames(self, self.allocator);
+    defer freeOwnedStringSlice(self.allocator, providers_list);
+
+    if (providers_list.len == 1) {
+        return renderInteractiveModelMenu(self, providers_list[0], page_number);
+    }
+
+    return renderInteractiveProviderMenuFromProviders(
+        self.allocator,
+        self.default_provider,
+        self.model_name,
+        page_number,
+        providers_list,
+    );
+}
+
+fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    var cfg_opt: ?config_module.Config = if (builtin.is_test) null else config_module.Config.load(self.allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+
+    const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key) catch return null;
+    defer freeOwnedStringSlice(self.allocator, models);
+
+    return renderInteractiveModelMenuFromModels(
+        self.allocator,
+        provider_name,
+        self.model_name,
+        page_number,
+        models,
+    );
+}
+
+test "interactiveModelMenuChannel enables supported interactive channels" {
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:chat-1", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:main:chat-1", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("discord:dm-1", null).?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("slack:main:C123", null).?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("lark:main:oc_123", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:main:telegram:group:42", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:main:discord:direct:42", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:tg-ops:main", "telegram").?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:discord-ops:main", "discord").?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("agent:slack-ops:main", "slack").?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("agent:lark-ops:main", "lark").?);
+    try std.testing.expect(interactiveModelMenuChannel("cli", null) == null);
+    try std.testing.expect(interactiveModelMenuChannel(null, null) == null);
+}
+
+test "renderInteractiveModelMenuFromModels builds first page with next button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "beta", 1, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, interaction_choices.START_TAG) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 1/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 2\"") != null);
+}
+
+test "renderInteractiveModelMenuFromModels builds later page with prev button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "nu", 2, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 2/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model nu\"") != null);
+}
+
+test "renderInteractiveProviderMenuFromProviders builds provider page with next button" {
+    const allocator = std.testing.allocator;
+    const providers_list = [_][]const u8{
+        "anthropic", "openai",   "openrouter", "moonshot-intl", "groq",
+        "mistral",   "deepseek", "vertex",     "gemini",        "ollama",
+        "qwen",
+    };
+
+    const rendered = (try renderInteractiveProviderMenuFromProviders(allocator, "openrouter", "claude-sonnet-4-6", 1, &providers_list)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Choose a provider (page 1/2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* openrouter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 2\"") != null);
+}
 fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
     return memory_mod.isInternalMemoryEntryKeyOrContent(key, content);
 }
@@ -215,6 +606,37 @@ fn setDefaultProvider(self: anytype, provider_name: []const u8) !void {
     self.default_provider = owned_provider;
 }
 
+fn setProfileSystemPrompt(self: anytype, prompt: ?[]const u8) !void {
+    if (!@hasField(@TypeOf(self.*), "profile_system_prompt")) return;
+
+    const owned_prompt = if (prompt) |value|
+        try self.allocator.dupe(u8, value)
+    else
+        null;
+
+    if (@hasField(@TypeOf(self.*), "profile_system_prompt_owned")) {
+        if (self.profile_system_prompt_owned and self.profile_system_prompt != null) {
+            self.allocator.free(self.profile_system_prompt.?);
+        }
+        self.profile_system_prompt_owned = false;
+    }
+
+    self.profile_system_prompt = owned_prompt;
+    if (@hasField(@TypeOf(self.*), "profile_system_prompt_owned")) {
+        self.profile_system_prompt_owned = owned_prompt != null;
+    }
+}
+
+fn activeRuntimeProviderName(self: anytype) ?[]const u8 {
+    if (@hasField(@TypeOf(self.*), "provider")) {
+        return self.provider.getName();
+    }
+    if (@hasField(@TypeOf(self.*), "default_provider")) {
+        return self.default_provider;
+    }
+    return null;
+}
+
 fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     if (!@hasField(@TypeOf(self.*), "configured_providers")) return false;
     for (self.configured_providers) |entry| {
@@ -223,11 +645,75 @@ fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     return false;
 }
 
-fn hasExplicitProviderPrefix(self: anytype, model: []const u8) bool {
-    const slash = std.mem.indexOfScalar(u8, model, '/') orelse return false;
-    if (slash == 0 or slash + 1 >= model.len) return false;
+const PrimaryModelSelectionRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
 
-    const provider_candidate = model[0..slash];
+fn updateExplicitProviderMatch(
+    model_ref: []const u8,
+    provider_name: []const u8,
+    best_provider: *?[]const u8,
+    best_model: *[]const u8,
+    best_provider_len: *usize,
+) void {
+    const split = model_refs.matchExplicitProviderPrefix(model_ref, provider_name) orelse return;
+    const provider = split.provider orelse return;
+    if (provider.len <= best_provider_len.*) return;
+
+    best_provider.* = provider;
+    best_model.* = split.model;
+    best_provider_len.* = provider.len;
+}
+
+fn splitExplicitProviderModelForSelf(self: anytype, model_ref: []const u8) ?PrimaryModelSelectionRef {
+    var best_provider: ?[]const u8 = null;
+    var best_model: []const u8 = undefined;
+    var best_provider_len: usize = 0;
+
+    if (@hasField(@TypeOf(self.*), "configured_providers")) {
+        for (self.configured_providers) |entry| {
+            updateExplicitProviderMatch(model_ref, entry.name, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (@hasField(@TypeOf(self.*), "model_routes")) {
+        for (self.model_routes) |route| {
+            updateExplicitProviderMatch(model_ref, route.provider, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (@hasField(@TypeOf(self.*), "fallback_providers")) {
+        for (self.fallback_providers) |provider_name| {
+            updateExplicitProviderMatch(model_ref, provider_name, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (best_provider) |provider| {
+        return .{
+            .provider = provider,
+            .model = best_model,
+        };
+    }
+    return null;
+}
+
+fn splitPrimaryModelRefForSelf(self: anytype, primary: []const u8) ?PrimaryModelSelectionRef {
+    if (splitExplicitProviderModelForSelf(self, primary)) |split| return split;
+    if (config_module.splitPrimaryModelRef(primary)) |split| {
+        return .{
+            .provider = split.provider,
+            .model = split.model,
+        };
+    }
+    return null;
+}
+
+fn hasExplicitProviderPrefix(self: anytype, model: []const u8) bool {
+    if (splitExplicitProviderModelForSelf(self, model) != null) return true;
+
+    const split = model_refs.splitProviderModel(model) orelse return false;
+    const provider_candidate = split.provider orelse return false;
     if (providers.classifyProvider(provider_candidate) != .unknown) return true;
 
     var lower_buf: [128]u8 = undefined;
@@ -254,17 +740,54 @@ fn configPrimaryModelForSelection(self: anytype, model: []const u8) ![]u8 {
     return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider, trimmed });
 }
 
+fn primaryModelProviderObjectJson(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    model: []const u8,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var model_obj: std.json.ObjectMap = .empty;
+    try model_obj.put(arena.allocator(), "provider", .{ .string = provider });
+    try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
+}
+
+fn configPrimaryModelMutationValue(self: anytype, model: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, model, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPath;
+
+    if (hasExplicitProviderPrefix(self, trimmed)) {
+        if (splitPrimaryModelRefForSelf(self, trimmed)) |split| {
+            if (config_module.shouldSerializeDefaultModelProviderField(split.provider)) {
+                return try primaryModelProviderObjectJson(self.allocator, split.provider, split.model);
+            }
+        }
+        return try self.allocator.dupe(u8, trimmed);
+    }
+
+    const provider = if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0)
+        self.default_provider
+    else
+        "openrouter";
+    if (config_module.shouldSerializeDefaultModelProviderField(provider)) {
+        return try primaryModelProviderObjectJson(self.allocator, provider, trimmed);
+    }
+    return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider, trimmed });
+}
+
 fn persistSelectedModelToConfig(self: anytype, model: []const u8) !void {
     if (builtin.is_test) return;
 
-    const primary = try configPrimaryModelForSelection(self, model);
-    defer self.allocator.free(primary);
+    const value_raw = try configPrimaryModelMutationValue(self, model);
+    defer self.allocator.free(value_raw);
 
     var result = try config_mutator.mutateDefaultConfig(
         self.allocator,
         .set,
         "agents.defaults.model.primary",
-        primary,
+        value_raw,
         .{ .apply = true },
     );
     defer config_mutator.freeMutationResult(self.allocator, &result);
@@ -276,6 +799,12 @@ fn invalidateSystemPromptCache(self: anytype) void {
     }
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
+    }
+    if (@hasField(@TypeOf(self.*), "workspace_prompt_fingerprint")) {
+        self.workspace_prompt_fingerprint = null;
+    }
+    if (@hasField(@TypeOf(self.*), "system_prompt_conversation_context_fingerprint")) {
+        self.system_prompt_conversation_context_fingerprint = null;
     }
     if (@hasField(@TypeOf(self.*), "system_prompt_model_name")) {
         if (self.system_prompt_model_name) |model_name| self.allocator.free(model_name);
@@ -354,6 +883,81 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
     try std.testing.expectEqualStrings("customgw/model-a", primary);
 }
 
+test "configPrimaryModelForSelection keeps explicit custom url provider ref" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model", primary);
+}
+
+test "configPrimaryModelForSelection keeps versionless custom url provider ref" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://example.com/gpt-4o");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://example.com/gpt-4o", primary);
+}
+
+test "configPrimaryModelMutationValue serializes versionless custom defaults as object" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "custom:https://example.com/api",
+        .configured_providers = &.{},
+    };
+
+    const value_raw = try configPrimaryModelMutationValue(&dummy, "meta-llama/Llama-4-70B-Instruct");
+    defer allocator.free(value_raw);
+
+    try std.testing.expectEqualStrings(
+        "{\"provider\":\"custom:https://example.com/api\",\"primary\":\"meta-llama/Llama-4-70B-Instruct\"}",
+        value_raw,
+    );
+}
+
+test "configPrimaryModelForSelection keeps configured versionless custom url namespace ref" {
+    const allocator = std.testing.allocator;
+    const configured = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://gateway.example.com" },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &configured,
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://gateway.example.com/qianfan/custom-model");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/qianfan/custom-model", primary);
+}
+
 test "bareSessionResetPrompt returns prompt for bare /new" {
     const prompt = bareSessionResetPrompt("/new") orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Execute your Session Startup sequence now") != null);
@@ -389,6 +993,13 @@ test "planTurnInput keeps known slash commands local-only" {
     try std.testing.expect(plan.llm_user_message == null);
 }
 
+test "planTurnInput keeps /menu on local-only path" {
+    const plan = planTurnInput("/menu");
+    try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
+}
+
 test "hotApplyConfigChange updates model primary as provider plus model" {
     const allocator = std.testing.allocator;
     var dummy = struct {
@@ -419,6 +1030,50 @@ test "hotApplyConfigChange updates model primary as provider plus model" {
     try std.testing.expectEqualStrings("inception/mercury", dummy.model_name);
     try std.testing.expectEqualStrings("inception/mercury", dummy.default_model);
     try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+}
+
+test "hotApplyConfigChange handles split custom provider reload payload" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "custom:https://example.com/api",
+        .default_model = "meta-llama/Llama-4-70B-Instruct",
+        .allocator = allocator,
+    };
+
+    const value_json = try hotReloadValueJson(allocator, &cfg, "agents.defaults.model.primary");
+    defer allocator.free(value_json);
+
+    // Regression: hot reload must preserve split custom providers instead of truncating at the first slash.
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        value_json,
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", dummy.model_name);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://example.com/api", dummy.default_provider);
 }
 
 test "hotApplyConfigChange rejects malformed model primary" {
@@ -494,6 +1149,188 @@ test "hotApplyConfigChange model primary refreshes token and max token limits" {
     try std.testing.expectEqual(@as(u32, 8192), dummy.max_tokens);
 }
 
+test "hotApplyConfigChange updates custom url model primary" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://api.example.com/openai/v2/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://api.example.com/openai/v2", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 98_304), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 32_768), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates configured versionless custom url model primary" {
+    const allocator = std.testing.allocator;
+    const configured = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://gateway.example.com" },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .configured_providers = &configured,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://gateway.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 98_304), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 32_768), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates route-only custom url model primary" {
+    // Regression: hot reload must preserve explicit providers that exist only in model_routes.
+    const allocator = std.testing.allocator;
+    const routes = [_]config_types.ModelRouteConfig{
+        .{
+            .hint = "fast",
+            .provider = "custom:https://route.example.com/qianfan",
+            .model = "custom-model",
+        },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        model_routes: []const config_types.ModelRouteConfig,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .model_routes = &routes,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://route.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://route.example.com/qianfan", dummy.default_provider);
+}
+
+test "hotApplyConfigChange updates fallback-only custom url model primary" {
+    // Regression: hot reload must preserve explicit providers that exist only in reliability fallbacks.
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        fallback_providers: []const []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .fallback_providers = &.{"custom:https://fb.example.com/qianfan"},
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://fb.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://fb.example.com/qianfan", dummy.default_provider);
+}
+
 test "hotApplyConfigChange updates agent status_show_emojis" {
     const allocator = std.testing.allocator;
     var dummy = struct {
@@ -524,16 +1361,316 @@ test "hotApplyConfigChange updates agent status_show_emojis" {
     try std.testing.expect(!dummy.status_show_emojis);
 }
 
+test "applyHotReloadConfig restores resolved defaults and invalidates prompt cache" {
+    const allocator = std.testing.allocator;
+
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+        max_tool_iterations: u32,
+        max_history_messages: u32,
+        message_timeout_secs: u64,
+        status_show_emojis: bool,
+        has_system_prompt: bool,
+        system_prompt_has_conversation_context: bool,
+        workspace_prompt_fingerprint: ?u64,
+        system_prompt_model_name: ?[]u8,
+    }{
+        .allocator = allocator,
+        .model_name = "stale-model",
+        .model_name_owned = false,
+        .default_provider = "stale-provider",
+        .default_provider_owned = false,
+        .default_model = "stale-model",
+        .temperature = 1.5,
+        .max_tool_iterations = 1,
+        .max_history_messages = 2,
+        .message_timeout_secs = 3,
+        .status_show_emojis = false,
+        .has_system_prompt = true,
+        .system_prompt_has_conversation_context = true,
+        .workspace_prompt_fingerprint = 1234,
+        .system_prompt_model_name = try allocator.dupe(u8, "stale-model"),
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.system_prompt_model_name) |model_name| allocator.free(model_name);
+
+    var cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 1000;
+    cfg.agent.max_history_messages = 100;
+    cfg.agent.message_timeout_secs = 600;
+    cfg.agent.status_show_emojis = true;
+
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 6), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 6), summary.applied);
+    try std.testing.expectEqual(@as(usize, 0), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("gpt-4o", dummy.model_name);
+    try std.testing.expectEqualStrings("gpt-4o", dummy.default_model);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+    try std.testing.expectEqual(@as(f64, 0.7), dummy.temperature);
+    try std.testing.expectEqual(@as(u32, 1000), dummy.max_tool_iterations);
+    try std.testing.expectEqual(@as(u32, 100), dummy.max_history_messages);
+    try std.testing.expectEqual(@as(u64, 600), dummy.message_timeout_secs);
+    try std.testing.expect(dummy.status_show_emojis);
+    try std.testing.expect(!dummy.has_system_prompt);
+    try std.testing.expect(!dummy.system_prompt_has_conversation_context);
+    try std.testing.expect(dummy.workspace_prompt_fingerprint == null);
+    try std.testing.expect(dummy.system_prompt_model_name == null);
+}
+
+const HotReloadProviderStub = struct {
+    name: []const u8,
+
+    fn provider(self: *@This()) providers.Provider {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        return .{
+            .content = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try allocator.dupe(u8, "test-model"),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(ptr: *anyopaque) []const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.name;
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable = providers.Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+};
+
+test "applyHotReloadConfig updates active profile overrides when runtime provider matches" {
+    const allocator = std.testing.allocator;
+
+    var provider_stub = HotReloadProviderStub{ .name = "ollama" };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        provider: providers.Provider,
+        profile_name: ?[]const u8,
+        profile_system_prompt: ?[]const u8,
+        profile_system_prompt_owned: bool,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+        has_system_prompt: bool,
+        system_prompt_has_conversation_context: bool,
+        workspace_prompt_fingerprint: ?u64,
+        system_prompt_model_name: ?[]u8,
+    }{
+        .allocator = allocator,
+        .provider = provider_stub.provider(),
+        .profile_name = "coder",
+        .profile_system_prompt = "Old profile prompt",
+        .profile_system_prompt_owned = false,
+        .model_name = "qwen2.5-coder:7b",
+        .model_name_owned = false,
+        .default_provider = "ollama",
+        .default_provider_owned = false,
+        .default_model = "qwen2.5-coder:7b",
+        .temperature = 0.2,
+        .has_system_prompt = true,
+        .system_prompt_has_conversation_context = true,
+        .workspace_prompt_fingerprint = 99,
+        .system_prompt_model_name = try allocator.dupe(u8, "old-model"),
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.profile_system_prompt_owned and dummy.profile_system_prompt != null) allocator.free(dummy.profile_system_prompt.?);
+    defer if (dummy.system_prompt_model_name) |model_name| allocator.free(model_name);
+
+    const agents = [_]config_types.NamedAgentConfig{
+        .{
+            .name = "coder",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+            .system_prompt = "New profile prompt",
+            .temperature = 0.4,
+        },
+    };
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .default_temperature = 0.7,
+        .agents = &agents,
+        .allocator = allocator,
+    };
+
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 8), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 4), summary.applied);
+    try std.testing.expectEqual(@as(usize, 5), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", dummy.model_name);
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", dummy.default_model);
+    try std.testing.expectEqualStrings("ollama", dummy.default_provider);
+    try std.testing.expectEqualStrings("New profile prompt", dummy.profile_system_prompt.?);
+    try std.testing.expect(dummy.profile_system_prompt_owned);
+    try std.testing.expectEqual(@as(f64, 0.4), dummy.temperature);
+    try std.testing.expect(!dummy.has_system_prompt);
+    try std.testing.expect(!dummy.system_prompt_has_conversation_context);
+    try std.testing.expect(dummy.workspace_prompt_fingerprint == null);
+    try std.testing.expect(dummy.system_prompt_model_name == null);
+}
+
+test "applyHotReloadConfig clears removed profile overrides and skips provider rebuilds" {
+    const allocator = std.testing.allocator;
+
+    var provider_stub = HotReloadProviderStub{ .name = "ollama" };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        provider: providers.Provider,
+        profile_name: ?[]const u8,
+        profile_system_prompt: ?[]const u8,
+        profile_system_prompt_owned: bool,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+    }{
+        .allocator = allocator,
+        .provider = provider_stub.provider(),
+        .profile_name = "coder",
+        .profile_system_prompt = try allocator.dupe(u8, "Old profile prompt"),
+        .profile_system_prompt_owned = true,
+        .model_name = "qwen2.5-coder:7b",
+        .model_name_owned = false,
+        .default_provider = "ollama",
+        .default_provider_owned = false,
+        .default_model = "qwen2.5-coder:7b",
+        .temperature = 0.2,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.profile_system_prompt_owned and dummy.profile_system_prompt != null) allocator.free(dummy.profile_system_prompt.?);
+
+    const agents = [_]config_types.NamedAgentConfig{
+        .{
+            .name = "coder",
+            .provider = "openai",
+            .model = "gpt-4.1-mini",
+            .system_prompt = null,
+            .temperature = null,
+        },
+    };
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .default_temperature = 0.7,
+        .agents = &agents,
+        .allocator = allocator,
+    };
+
+    // Regression: profile reload must not free borrowed prompt memory or fake a provider switch
+    // when the session would still be bound to the old provider runtime.
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 6), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 2), summary.applied);
+    try std.testing.expectEqual(@as(usize, 7), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", dummy.model_name);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", dummy.default_model);
+    try std.testing.expectEqualStrings("ollama", dummy.default_provider);
+    try std.testing.expect(dummy.profile_system_prompt == null);
+    try std.testing.expect(!dummy.profile_system_prompt_owned);
+    try std.testing.expectEqual(@as(f64, 0.7), dummy.temperature);
+}
+
 test "splitPrimaryModelRef parses provider model format" {
-    const parsed = splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
+    const parsed = config_module.splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("openrouter", parsed.provider);
     try std.testing.expectEqualStrings("inception/mercury", parsed.model);
 }
 
+test "splitPrimaryModelRef parses versioned custom provider model format" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://example.com/v2/meta-llama/Llama-4-70B-Instruct",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/v2", parsed.provider);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", parsed.model);
+}
+
+test "splitPrimaryModelRef parses versionless custom provider model format" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://example.com/api/qianfan/custom-model",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/api", parsed.provider);
+    try std.testing.expectEqualStrings("qianfan/custom-model", parsed.model);
+}
+
+test "splitPrimaryModelRef preserves custom url endpoint suffixes" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://my-api.example.com/api/v2/responses/my-model",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://my-api.example.com/api/v2/responses", parsed.provider);
+    try std.testing.expectEqualStrings("my-model", parsed.model);
+}
+
 test "splitPrimaryModelRef rejects malformed values" {
-    try std.testing.expect(splitPrimaryModelRef("noslash") == null);
-    try std.testing.expect(splitPrimaryModelRef("/model-only") == null);
-    try std.testing.expect(splitPrimaryModelRef("provider/") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("noslash") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("/model-only") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("provider/") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("custom:https://api.example.com/v1/") == null);
 }
 
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
@@ -745,7 +1882,7 @@ fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_in
 }
 
 fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch return null;
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch return null;
     defer skills_mod.freeSkills(self.allocator, skills);
 
     var resolved: ?DirectSkillCommandMatch = null;
@@ -1019,10 +2156,14 @@ fn clearSessionState(self: anytype) void {
 
 fn formatWhoAmI(self: anytype) ![]const u8 {
     const session_id = self.memory_session_id orelse "unknown";
+    const profile_name = if (@hasField(@TypeOf(self.*), "profile_name"))
+        self.profile_name orelse "default"
+    else
+        "default";
     return try std.fmt.allocPrint(
         self.allocator,
-        "Session: {s}\nModel: {s}",
-        .{ session_id, self.model_name },
+        "Session: {s}\nAgent profile: {s}\nModel: {s}",
+        .{ session_id, profile_name, self.model_name },
     );
 }
 
@@ -1182,7 +2323,8 @@ fn resetRuntimeCommandState(self: anytype) void {
 fn formatStatus(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     const show_emojis = if (@hasField(@TypeOf(self.*), "status_show_emojis")) self.status_show_emojis else true;
     const title_prefix = if (show_emojis) "🌊 " else "";
@@ -1200,8 +2342,12 @@ fn formatStatus(self: anytype) ![]const u8 {
     const activation_label = if (show_emojis) "📡 Activation" else "Activation";
     const send_label = if (show_emojis) "📤 Send" else "Send";
     const ttl_label = if (show_emojis) "⏰ Session TTL" else "Session TTL";
+    const tasks_label = if (show_emojis) "🧵 Tasks" else "Tasks";
 
     try w.print("{s}NullClaw {s}\n", .{ title_prefix, version.string });
+    if (@hasField(@TypeOf(self.*), "profile_name")) {
+        try w.print("Agent profile: {s}\n", .{self.profile_name orelse "default"});
+    }
     try w.print("{s}: {s}\n", .{ model_label, self.model_name });
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });
@@ -1228,6 +2374,35 @@ fn formatStatus(self: anytype) ![]const u8 {
     } else {
         try w.print("{s}: off\n", .{ttl_label});
     }
+    if (findSubagentManager(self)) |manager| {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+
+        var running: u32 = 0;
+        var completed: u32 = 0;
+        var failed: u32 = 0;
+        var visible: u32 = 0;
+
+        var it = manager.tasks.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (!taskBelongsToCurrentSession(self, state)) continue;
+            visible += 1;
+            switch (state.status) {
+                .running => running += 1,
+                .completed => completed += 1,
+                .failed => failed += 1,
+            }
+        }
+
+        if (visible > 0) {
+            try w.print(
+                "{s}: running={d} completed={d} failed={d}\n",
+                .{ tasks_label, running, completed, failed },
+            );
+        }
+    }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -1272,7 +2447,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print(
             "Exec: host={s} security={s} ask={s}",
             .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -1280,6 +2456,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
         if (self.exec_node_id) |id| {
             try w.print(" node={s}", .{id});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -1310,7 +2487,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
     try w.print(
         "Exec set: host={s} security={s} ask={s}",
         .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -1318,6 +2496,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.exec_node_id) |id| {
         try w.print(" node={s}", .{id});
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -1490,11 +2669,13 @@ fn handleAllowlistCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.policy) |pol| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.writeAll("Allowlisted commands:\n");
         for (pol.allowed_commands) |cmd| {
             try w.print("  - {s}\n", .{cmd});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
     return try self.allocator.dupe(u8, "No runtime allowlist policy attached.");
@@ -1540,17 +2721,17 @@ fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     const raw_path = firstToken(arg);
     const path = if (raw_path.len == 0)
-        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std.time.timestamp() })
-    else if (std.fs.path.isAbsolute(raw_path))
+        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std_compat.time.timestamp() })
+    else if (std_compat.fs.path.isAbsolute(raw_path))
         try self.allocator.dupe(u8, raw_path)
     else
         try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.workspace_dir, raw_path });
     defer self.allocator.free(path);
 
-    const file = if (std.fs.path.isAbsolute(path))
-        try std.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
+    const file = if (std_compat.fs.path.isAbsolute(path))
+        try std_compat.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
     else
-        try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
+        try std_compat.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
     defer file.close();
     var out_buf: [4096]u8 = undefined;
     var bw = file.writer(&out_buf);
@@ -1722,8 +2903,8 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var args = std.json.ObjectMap.init(arena);
-    try args.put("command", .{ .string = command });
+    var args: std.json.ObjectMap = .empty;
+    try args.put(arena, "command", .{ .string = command });
 
     const result = shell_tool.execute(arena, args) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
@@ -1823,7 +3004,8 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     manager.mutex.lock();
     defer manager.mutex.unlock();
@@ -1854,10 +3036,12 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     if (visible_count == 0) {
         try w.writeAll("No subagents tracked in this session.");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
     try w.print("Totals: running={d}, completed={d}, failed={d}", .{ running, completed, failed });
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2107,7 +3291,8 @@ fn handleTellCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handlePollCommand(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     var wrote_any = false;
     if (self.pending_exec_command) |cmd| {
@@ -2146,6 +3331,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
     if (!wrote_any) {
         return try self.allocator.dupe(u8, "No pending approvals or background tasks.");
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2244,14 +3430,48 @@ fn parseJsonBool(raw: []const u8) ?bool {
     };
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
-    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
-    if (slash == 0 or slash + 1 >= primary.len) return null;
-    return .{
-        .provider = primary[0..slash],
-        .model = primary[slash + 1 ..],
+fn parseHotReloadPrimaryModelRef(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !?config_module.PrimaryModelRef {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    return switch (parsed.value) {
+        .string => |primary| if (splitPrimaryModelRefForSelf(self, primary)) |split|
+            config_module.PrimaryModelRef{
+                .provider = split.provider,
+                .model = split.model,
+            }
+        else
+            null,
+        .object => |obj| blk: {
+            const provider_val = obj.get("provider") orelse break :blk null;
+            const primary_val = obj.get("primary") orelse break :blk null;
+            if (provider_val != .string or primary_val != .string) break :blk null;
+            break :blk .{
+                .provider = provider_val.string,
+                .model = primary_val.string,
+            };
+        },
+        else => null,
     };
 }
+
+const hot_reload_paths = [_][]const u8{
+    "agents.defaults.model.primary",
+    "default_temperature",
+    "agent.max_tool_iterations",
+    "agent.max_history_messages",
+    "agent.message_timeout_secs",
+    "agent.status_show_emojis",
+};
+
+const HotReloadSummary = struct {
+    attempted: usize = 0,
+    applied: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+};
 
 fn hotApplyConfigChange(
     self: anytype,
@@ -2262,9 +3482,9 @@ fn hotApplyConfigChange(
     if (action == .unset) return false;
 
     if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
-        const primary = try parseJsonStringOwned(self.allocator, new_value_json) orelse return false;
-        defer self.allocator.free(primary);
-        const parsed = splitPrimaryModelRef(primary) orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const parsed = try parseHotReloadPrimaryModelRef(self, arena.allocator(), new_value_json) orelse return false;
         try setModelName(self, parsed.model);
         try setDefaultProvider(self, parsed.provider);
         if (@hasField(@TypeOf(self.*), "default_model")) {
@@ -2319,6 +3539,229 @@ fn hotApplyConfigChange(
     }
 
     return false;
+}
+
+fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Config {
+    const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer {
+        arena_ptr.deinit();
+        backing_allocator.destroy(arena_ptr);
+    }
+    const allocator = arena_ptr.allocator();
+
+    const config_path = try config_mutator.defaultConfigPath(allocator);
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse return error.InvalidPath;
+    const default_workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
+
+    var cfg = config_module.Config{
+        .workspace_dir = default_workspace_dir,
+        .config_path = config_path,
+        .allocator = allocator,
+        .arena = arena_ptr,
+    };
+
+    if (std_compat.fs.openFileAbsolute(config_path, .{})) |file| {
+        defer file.close();
+        const content = try file.readToEndAlloc(allocator, 1024 * 64);
+        try cfg.parseJson(content);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    if (cfg.workspace_dir_override != null) {
+        cfg.workspace_dir = cfg.workspace_dir_override.?;
+    }
+
+    if (cfg.channels.nostr) |ns| {
+        ns.config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
+    }
+    {
+        const dir = std_compat.fs.path.dirname(config_path) orelse ".";
+        const teams_mut = @constCast(cfg.channels.teams);
+        for (teams_mut) |*tc| {
+            tc.config_dir = dir;
+        }
+    }
+
+    cfg.applyEnvOverrides();
+    cfg.syncFlatFields();
+    return cfg;
+}
+
+fn hotReloadValueJson(
+    allocator: std.mem.Allocator,
+    cfg: *const config_module.Config,
+    path: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
+        const model = cfg.default_model orelse return allocator.dupe(u8, "null");
+        if (config_module.shouldSerializeDefaultModelProviderField(cfg.default_provider)) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            var model_obj: std.json.ObjectMap = .empty;
+            try model_obj.put(arena.allocator(), "provider", .{ .string = cfg.default_provider });
+            try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+            return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
+        }
+
+        const primary = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.default_provider, model });
+        defer allocator.free(primary);
+        return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = primary }, .{});
+    }
+
+    if (std.mem.eql(u8, path, "default_temperature")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.default_temperature});
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_tool_iterations")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.max_tool_iterations});
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_history_messages")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.max_history_messages});
+    }
+
+    if (std.mem.eql(u8, path, "agent.message_timeout_secs")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.message_timeout_secs});
+    }
+
+    if (std.mem.eql(u8, path, "agent.status_show_emojis")) {
+        return try allocator.dupe(u8, if (cfg.agent.status_show_emojis) "true" else "false");
+    }
+
+    return error.InvalidPath;
+}
+
+fn applyHotReloadConfig(self: anytype, cfg: *const config_module.Config) !HotReloadSummary {
+    var summary = HotReloadSummary{};
+    const has_active_profile = @hasField(@TypeOf(self.*), "profile_name") and self.profile_name != null;
+
+    for (hot_reload_paths) |path| {
+        if (has_active_profile and std.mem.eql(u8, path, "agents.defaults.model.primary")) {
+            summary.skipped += 1;
+            continue;
+        }
+
+        const value_json = hotReloadValueJson(self.allocator, cfg, path) catch {
+            summary.failed += 1;
+            continue;
+        };
+        defer self.allocator.free(value_json);
+
+        if (std.mem.eql(u8, std.mem.trim(u8, value_json, " \t\r\n"), "null")) {
+            summary.skipped += 1;
+            continue;
+        }
+
+        summary.attempted += 1;
+        const hot_applied = hotApplyConfigChange(self, .set, path, value_json) catch {
+            summary.failed += 1;
+            continue;
+        };
+        if (hot_applied) {
+            summary.applied += 1;
+        } else {
+            summary.skipped += 1;
+        }
+    }
+
+    // Profile-aware reload: only hot-apply profile settings that can be reconciled
+    // with the current runtime provider. Provider swaps still require a fresh session.
+    if (@hasField(@TypeOf(self.*), "profile_name")) {
+        if (self.profile_name) |pname| {
+            for (cfg.agents) |*acfg| {
+                if (std.mem.eql(u8, acfg.name, pname)) {
+                    const runtime_provider_name = activeRuntimeProviderName(self) orelse "";
+                    const provider_matches_runtime = provider_names.providerNamesMatchIgnoreCase(
+                        runtime_provider_name,
+                        acfg.provider,
+                    );
+
+                    if (@hasField(@TypeOf(self.*), "default_provider") and
+                        !provider_names.providerNamesMatchIgnoreCase(self.default_provider, acfg.provider))
+                    {
+                        if (provider_matches_runtime) {
+                            summary.attempted += 1;
+                            const provider_updated = blk: {
+                                setDefaultProvider(self, acfg.provider) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile provider metadata update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (provider_updated) summary.applied += 1;
+                        } else {
+                            summary.skipped += 1;
+                            log.warn(
+                                "Hot reload skipped profile provider change for {s}: runtime provider {s} requires a fresh session to switch to {s}",
+                                .{ pname, runtime_provider_name, acfg.provider },
+                            );
+                        }
+                    }
+
+                    if (!std.mem.eql(u8, self.model_name, acfg.model)) {
+                        if (!provider_matches_runtime) {
+                            summary.skipped += 1;
+                            log.warn(
+                                "Hot reload skipped profile model update for {s}: provider switch to {s} was not applied",
+                                .{ pname, acfg.provider },
+                            );
+                        } else {
+                            summary.attempted += 1;
+                            const model_updated = blk: {
+                                setModelName(self, acfg.model) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile model update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (model_updated) {
+                                if (@hasField(@TypeOf(self.*), "default_model")) {
+                                    self.default_model = self.model_name;
+                                }
+                                summary.applied += 1;
+                            }
+                        }
+                    }
+
+                    if (@hasField(@TypeOf(self.*), "profile_system_prompt")) {
+                        const old_prompt = self.profile_system_prompt orelse "";
+                        const new_prompt = acfg.system_prompt orelse "";
+                        if (!std.mem.eql(u8, old_prompt, new_prompt)) {
+                            summary.attempted += 1;
+                            const prompt_updated = blk: {
+                                setProfileSystemPrompt(self, if (new_prompt.len > 0) new_prompt else null) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile system prompt update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (prompt_updated) summary.applied += 1;
+                        }
+                    }
+
+                    const new_temp = acfg.temperature orelse cfg.default_temperature;
+                    if (self.temperature != new_temp) {
+                        summary.attempted += 1;
+                        self.temperature = new_temp;
+                        summary.applied += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if (summary.applied > 0) {
+        invalidateSystemPromptCache(self);
+    }
+
+    return summary;
 }
 
 fn formatConfigMutationResponse(
@@ -2417,6 +3860,40 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Config validation: OK");
     }
 
+    if (std.ascii.eqlIgnoreCase(action, "reload") or std.ascii.eqlIgnoreCase(action, "refresh")) {
+        if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
+            return try self.allocator.dupe(u8, "Usage: /config reload");
+        }
+
+        var validation_failed = false;
+        config_mutator.validateCurrentConfig(self.allocator) catch {
+            validation_failed = true;
+        };
+
+        var summary = HotReloadSummary{};
+        if (validation_failed) {
+            summary.failed = 1;
+        } else {
+            var cfg = loadHotReloadConfig(self.allocator) catch {
+                summary.failed = 1;
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Config hot reload complete: attempted={d} applied={d} skipped={d} failed={d} validation_failed={s}",
+                    .{ summary.attempted, summary.applied, summary.skipped, summary.failed, "false" },
+                );
+            };
+            defer cfg.deinit();
+
+            summary = try applyHotReloadConfig(self, &cfg);
+        }
+
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Config hot reload complete: attempted={d} applied={d} skipped={d} failed={d} validation_failed={s}",
+            .{ summary.attempted, summary.applied, summary.skipped, summary.failed, if (validation_failed) "true" else "false" },
+        );
+    }
+
     if (std.ascii.eqlIgnoreCase(action, "set")) {
         const path_and_value = splitFirstToken(parsed.tail);
         const path = path_and_value.head;
@@ -2502,18 +3979,27 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
             "  /config unset <path>                  (dry-run preview)\n" ++
             "  /config apply set <path> <value>\n" ++
             "  /config apply unset <path>\n" ++
+            "  /config reload                        (hot reload supported keys)\n" ++
             "  /config validate",
     );
 }
 
 fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
+    const parsed = splitFirstToken(arg);
+    const action_or_name = parsed.head;
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "reload") or std.ascii.eqlIgnoreCase(action_or_name, "refresh")) {
+        if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
+            return try self.allocator.dupe(u8, "Usage: /skill reload");
+        }
+        invalidateSystemPromptCache(self);
+        return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
+    }
+
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
     };
     defer skills_mod.freeSkills(self.allocator, skills);
-
-    const parsed = splitFirstToken(arg);
-    const action_or_name = parsed.head;
 
     if (action_or_name.len == 0 or std.ascii.eqlIgnoreCase(action_or_name, "list")) {
         if (skills.len == 0) {
@@ -2521,7 +4007,8 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         }
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.writeAll("Available skills:\n");
         for (skills) |skill| {
             try w.print("  - {s}", .{skill.name});
@@ -2529,6 +4016,7 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
             if (!skill.available) try w.print(" (unavailable: {s})", .{skill.missing_deps});
             try w.writeAll("\n");
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2608,11 +4096,17 @@ pub fn composeFinalReply(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     if (show_reasoning) {
         try w.writeAll("Reasoning:\n");
-        try w.writeAll(reasoning_content.?);
+        var lines = std.mem.splitScalar(u8, reasoning_content.?, '\n');
+        while (lines.next()) |line| {
+            try w.writeAll("> ");
+            try w.writeAll(line);
+            try w.writeAll("\n");
+        }
         try w.writeAll("\n\n");
     }
     try w.writeAll(base_text);
@@ -2630,6 +4124,7 @@ pub fn composeFinalReply(
         ),
     }
 
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2674,10 +4169,43 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .status => return try formatStatus(self),
         .whoami => return try formatWhoAmI(self),
         .model => {
+            const first = firstToken(cmd.arg);
+            if (std.ascii.eqlIgnoreCase(first, "page")) {
+                const page_raw = std.mem.trim(u8, splitFirstToken(cmd.arg).tail, " \t");
+                const page_number = parsePositiveUsize(page_raw) orelse 1;
+                if (try renderInteractiveProviderMenu(self, page_number)) |menu| {
+                    return menu;
+                }
+                return try self.formatModelStatus();
+            }
+            if (std.ascii.eqlIgnoreCase(first, "provider")) {
+                const provider_tail = splitFirstToken(cmd.arg).tail;
+                const provider_name = firstToken(provider_tail);
+                if (provider_name.len == 0) {
+                    if (try renderInteractiveProviderMenu(self, 1)) |menu| {
+                        return menu;
+                    }
+                    return try self.formatModelStatus();
+                }
+
+                const remainder = splitFirstToken(provider_tail).tail;
+                const page_number = if (std.ascii.eqlIgnoreCase(firstToken(remainder), "page"))
+                    parsePositiveUsize(std.mem.trim(u8, splitFirstToken(remainder).tail, " \t")) orelse 1
+                else
+                    1;
+
+                if (try renderInteractiveModelMenu(self, provider_name, page_number)) |menu| {
+                    return menu;
+                }
+                return try std.fmt.allocPrint(self.allocator, "No models available for provider: {s}", .{provider_name});
+            }
             if (cmd.arg.len == 0 or
                 std.ascii.eqlIgnoreCase(cmd.arg, "list") or
                 std.ascii.eqlIgnoreCase(cmd.arg, "status"))
             {
+                if (try renderInteractiveProviderMenu(self, 1)) |menu| {
+                    return menu;
+                }
                 return try self.formatModelStatus();
             }
             if (std.ascii.eqlIgnoreCase(cmd.arg, "auto")) {
@@ -2703,6 +4231,9 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
                     "Automatic model routing enabled. Reverted to the configured default model: {s}",
                     .{self.model_name},
                 );
+            }
+            if (splitPrimaryModelRefForSelf(self, cmd.arg)) |parsed| {
+                try setDefaultProvider(self, parsed.provider);
             }
             try setModelName(self, cmd.arg);
             if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
@@ -2805,7 +4336,8 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const report = mem_rt.diagnose();
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory resolved config:\n", .{});
         try w.print("  backend: {s}\n", .{r.primary_backend});
         try w.print("  retrieval: {s}\n", .{r.retrieval_mode});
@@ -2826,6 +4358,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         } else {
             try w.print("  outbox_pending: n/a\n", .{});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2852,7 +4385,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (std.mem.eql(u8, sub, "get")) {
         const key = std.mem.trim(u8, rest, " \t");
         if (key.len == 0) return try self.allocator.dupe(u8, "Usage: /memory get <key>");
-        const entry = mem_rt.memory.get(self.allocator, key) catch |err| {
+        const entry = mem_rt.memory.getScoped(self.allocator, key, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory get failed: {s}", .{@errorName(err)});
         };
         if (entry) |e| {
@@ -2885,14 +4418,15 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const query = std.mem.trim(u8, query_buf.items, " \t");
         if (query.len == 0) return try self.allocator.dupe(u8, "Usage: /memory search <query> [--limit N]");
 
-        const results = mem_rt.search(self.allocator, query, limit, null) catch |err| {
+        const results = mem_rt.search(self.allocator, query, limit, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory search failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.retrieval.freeCandidates(self.allocator, results);
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Search results: {d}\n", .{results.len});
         for (results, 0..) |c, idx| {
             try w.print("  {d}. {s} [{s}] score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
@@ -2902,10 +4436,10 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
                 try w.print(" vector_score=n/a", .{});
             }
             try w.print(" source={s}\n", .{c.source});
-            const preview_len = @min(@as(usize, 140), c.snippet.len);
-            const preview = c.snippet[0..preview_len];
-            try w.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+            const preview = util.previewUtf8(c.snippet, 140);
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2932,7 +4466,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
         }
 
-        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
+        const entries = mem_rt.memory.list(self.allocator, category_opt, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);
@@ -2950,18 +4484,19 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const shown = @min(limit, filtered_total);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
         var written: usize = 0;
         for (entries) |e| {
             if (!include_internal and isInternalMemoryEntryKeyOrContent(e.key, e.content)) continue;
             if (written >= shown) break;
-            const preview_len = @min(@as(usize, 120), e.content.len);
-            const preview = e.content[0..preview_len];
+            const preview = util.previewUtf8(e.content, 120);
             try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, e.key, e.category.toString(), e.timestamp });
-            try w.print("     {s}{s}\n", .{ preview, if (e.content.len > preview_len) "..." else "" });
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
             written += 1;
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2977,7 +4512,7 @@ fn handleToolCustomizationsCommand(self: anytype, arg: []const u8) ![]const u8 {
         "  /tool-customizations list             - List all available tools\n" ++
         "\n" ++
         "Note: To modify tool customizations, use the CLI command:\n" ++
-        "  nullclaw tools <show|export|import|validate>\n";
+        "  nullclaw tools <show|export|import-preview|validate>\n";
 
     const parsed = splitFirstToken(arg);
     const action = parsed.head;
@@ -2993,7 +4528,8 @@ fn handleToolCustomizationsCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
 
         try w.print("Tool customizations ({d}):\n", .{self.tool_customizations.count()});
 
@@ -3017,6 +4553,7 @@ fn handleToolCustomizationsCommand(self: anytype, arg: []const u8) ![]const u8 {
             try w.print("\n", .{});
         }
 
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -3027,13 +4564,15 @@ fn handleToolCustomizationsCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
 
         try w.print("Available tools ({d}):\n", .{self.tools.len});
         for (self.tools, 0..) |tool, idx| {
             try w.print("  {d}. {s}\n", .{ idx + 1, tool.name() });
         }
 
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 

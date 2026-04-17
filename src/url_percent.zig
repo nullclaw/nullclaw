@@ -5,9 +5,10 @@ pub fn isUnreserved(c: u8) bool {
 }
 
 pub fn appendPercentEncodedWriter(writer: anytype, text: []const u8) !void {
+    var out = writer;
     for (text) |c| {
         if (isUnreserved(c)) {
-            try writer.writeByte(c);
+            try out.writeByte(c);
         } else {
             const upper = "0123456789ABCDEF";
             var esc: [3]u8 = .{
@@ -15,7 +16,7 @@ pub fn appendPercentEncodedWriter(writer: anytype, text: []const u8) !void {
                 upper[(c >> 4) & 0x0F],
                 upper[c & 0x0F],
             };
-            try writer.writeAll(&esc);
+            try out.writeAll(&esc);
         }
     }
 }
@@ -58,7 +59,7 @@ test "url_percent encode percent-encodes reserved bytes" {
 
 test "url_percent appendPercentEncodedWriter percent-encodes bytes" {
     var out: [128]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&out);
-    try appendPercentEncodedWriter(fbs.writer(), "x/y z");
-    try std.testing.expectEqualStrings("x%2Fy%20z", fbs.getWritten());
+    var writer: std.Io.Writer = .fixed(&out);
+    try appendPercentEncodedWriter(&writer, "x/y z");
+    try std.testing.expectEqualStrings("x%2Fy%20z", writer.buffered());
 }

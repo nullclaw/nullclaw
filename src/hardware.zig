@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const thread_stacks = @import("thread_stacks.zig");
@@ -90,7 +91,7 @@ fn parseHexFromLine(line: []const u8, prefix: []const u8) ?u16 {
 
 /// macOS discovery: spawn system_profiler and parse text output.
 fn discoverMacOS(allocator: std.mem.Allocator) ![]DiscoveredDevice {
-    const result = std.process.Child.run(.{
+    const result = std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "system_profiler", "SPUSBDataType" },
     }) catch return &.{};
@@ -145,7 +146,7 @@ fn discoverLinux(allocator: std.mem.Allocator) ![]DiscoveredDevice {
     }
 
     const usb_base = "/sys/bus/usb/devices";
-    var dir = std.fs.openDirAbsolute(usb_base, .{ .iterate = true }) catch return &.{};
+    var dir = std_compat.fs.openDirAbsolute(usb_base, .{ .iterate = true }) catch return &.{};
     defer dir.close();
 
     var iter = dir.iterate();
@@ -168,14 +169,14 @@ fn discoverLinux(allocator: std.mem.Allocator) ![]DiscoveredDevice {
 }
 
 /// Read a 4-digit hex value from a sysfs file like /sys/bus/usb/devices/<dev>/<attr>.
-fn readSysfsHex(dir: std.fs.Dir, dev_name: []const u8, attr: []const u8) ?u16 {
+fn readSysfsHex(dir: std_compat.fs.Dir, dev_name: []const u8, attr: []const u8) ?u16 {
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dev_name, attr }) catch return null;
     var sub_dir = dir.openFile(path, .{}) catch return null;
     defer sub_dir.close();
     var buf: [16]u8 = undefined;
     const n = sub_dir.readAll(&buf) catch return null;
-    const content = std.mem.trimRight(u8, buf[0..n], &.{ '\n', '\r', ' ' });
+    const content = std_compat.mem.trimRight(u8, buf[0..n], &.{ '\n', '\r', ' ' });
     if (content.len == 0) return null;
     return std.fmt.parseInt(u16, content, 16) catch null;
 }
@@ -264,7 +265,7 @@ pub fn introspectDevice(allocator: std.mem.Allocator, path: []const u8) Introspe
 /// macOS introspection: parse system_profiler output to find VID/PID
 /// for the first USB device, then look up in known_boards.
 fn introspectMacOS(allocator: std.mem.Allocator, path: []const u8) IntrospectResult {
-    const result = std.process.Child.run(.{
+    const result = std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "system_profiler", "SPUSBDataType" },
     }) catch return .{
@@ -311,7 +312,7 @@ fn introspectLinux(path: []const u8) IntrospectResult {
     // Try to resolve a /dev/ttyACM* or /dev/ttyUSB* path to its sysfs USB ancestor.
     // Strategy: iterate /sys/bus/usb/devices/ and check each for matching VID/PID.
     const usb_base = "/sys/bus/usb/devices";
-    var dir = std.fs.openDirAbsolute(usb_base, .{ .iterate = true }) catch return .{
+    var dir = std_compat.fs.openDirAbsolute(usb_base, .{ .iterate = true }) catch return .{
         .path = path,
         .memory_map_note = "Cannot access /sys/bus/usb/devices",
     };
@@ -422,7 +423,7 @@ pub fn parseUdevLine(line: []const u8) ?DeviceEvent {
     var subsystem: []const u8 = "unknown";
 
     if (std.mem.lastIndexOf(u8, rest, "(")) |paren_start| {
-        device_path = std.mem.trimRight(u8, rest[0..paren_start], " ");
+        device_path = std_compat.mem.trimRight(u8, rest[0..paren_start], " ");
         const after_paren = rest[paren_start + 1 ..];
         if (std.mem.indexOf(u8, after_paren, ")")) |paren_end| {
             subsystem = after_paren[0..paren_end];
@@ -504,7 +505,7 @@ fn parseTimestampSecs(ts_str: []const u8) i64 {
 /// Linux monitor: spawn `udevadm monitor --udev --subsystem-match=usb --property`
 /// and parse header + property lines from its stdout.
 fn runLinuxMonitor(monitor: *HotplugMonitor) void {
-    var child = std.process.Child.init(
+    var child = std_compat.process.Child.init(
         &.{ "udevadm", "monitor", "--udev", "--subsystem-match=usb", "--property" },
         monitor.allocator,
     );

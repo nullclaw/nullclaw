@@ -1,7 +1,8 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 
-/// Cross-platform wrapper over std.process.getEnvVarOwned that returns
+/// Cross-platform wrapper over std_compat.process.getEnvVarOwned that returns
 /// null instead of error.EnvironmentVariableNotFound.
 /// Caller owns the returned slice and must free it with `allocator.free()`.
 /// Note: OOM is treated as "variable not found" because callers universally
@@ -9,7 +10,7 @@ const builtin = @import("builtin");
 /// propagating OOM would require changing every call-site to handle errors.
 /// In practice, env var allocation (< 4 KB) does not OOM.
 pub fn getEnvOrNull(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch return null;
+    return std_compat.process.getEnvVarOwned(allocator, name) catch return null;
 }
 
 /// Returns the user's home directory. Tries:
@@ -25,7 +26,7 @@ pub fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
         defer allocator.free(path);
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ drive, path });
     } else {
-        return std.process.getEnvVarOwned(allocator, "HOME") catch return error.HomeDirNotFound;
+        return std_compat.process.getEnvVarOwned(allocator, "HOME") catch return error.HomeDirNotFound;
     }
 }
 

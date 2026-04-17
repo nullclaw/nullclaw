@@ -4,6 +4,8 @@
 //! Designed for distributed memory sharing across multiple nullclaw instances.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const std_compat = @import("compat");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -148,7 +150,7 @@ pub const RedisConfig = struct {
 
 pub const RedisMemory = struct {
     allocator: std.mem.Allocator,
-    stream: ?std.net.Stream = null,
+    stream: ?std_compat.net.Stream = null,
     host: []const u8,
     port: u16,
     password: ?[]const u8,
@@ -187,8 +189,8 @@ pub const RedisMemory = struct {
     }
 
     fn connect(self: *Self) anyerror!void {
-        const addr = try std.net.Address.resolveIp(self.host, self.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        const addr = try std_compat.net.Address.resolveIp(self.host, self.port);
+        const stream = try std_compat.net.tcpConnectToAddress(addr);
         self.stream = stream;
 
         // AUTH if password set (stream is already connected, ensureConnected is a no-op)
@@ -290,14 +292,14 @@ pub const RedisMemory = struct {
     // ── Timestamp / ID helpers ─────────────────────────────────────
 
     fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.timestamp();
+        const ts = std_compat.time.timestamp();
         return std.fmt.allocPrint(allocator, "{d}", .{ts});
     }
 
     fn generateId(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.nanoTimestamp();
+        const ts = std_compat.time.nanoTimestamp();
         var rand_buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&rand_buf);
+        std_compat.crypto.random.bytes(&rand_buf);
         const hi = std.mem.readInt(u64, rand_buf[0..8], .little);
         const lo = std.mem.readInt(u64, rand_buf[8..16], .little);
         return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, hi, lo });
@@ -574,6 +576,76 @@ pub const RedisMemory = struct {
         return entries.toOwnedSlice(allocator);
     }
 
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const set_key = if (category) |cat|
+            try self_.prefixedKey("cat", cat.toString())
+        else
+            try self_.prefixedSimple("keys");
+        defer self_.allocator.free(set_key);
+
+        var keys_resp = try self_.sendCommandAlloc(allocator, &.{ "SMEMBERS", set_key });
+        defer keys_resp.deinit(allocator);
+
+        const key_values = switch (keys_resp) {
+            .array => |maybe_arr| maybe_arr orelse return allocator.alloc(MemoryEntry, 0),
+            else => return allocator.alloc(MemoryEntry, 0),
+        };
+
+        var entries: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(allocator);
+            entries.deinit(allocator);
+        }
+
+        var skipped: usize = 0;
+        for (key_values) |kv| {
+            const k = kv.asString() orelse continue;
+
+            const entry_key = try self_.prefixedKey("entry", k);
+            defer self_.allocator.free(entry_key);
+
+            var hash_resp = try self_.sendCommandAlloc(allocator, &.{ "HGETALL", entry_key });
+            defer hash_resp.deinit(allocator);
+
+            const fields = switch (hash_resp) {
+                .array => |maybe_arr| maybe_arr orelse continue,
+                else => continue,
+            };
+            if (fields.len == 0) continue;
+
+            var entry = try parseHashFields(allocator, k, fields);
+            errdefer entry.deinit(allocator);
+
+            if (session_id) |sid| {
+                if (entry.session_id) |e_sid| {
+                    if (!std.mem.eql(u8, e_sid, sid)) {
+                        entry.deinit(allocator);
+                        continue;
+                    }
+                } else {
+                    entry.deinit(allocator);
+                    continue;
+                }
+            }
+
+            if (skipped < offset) {
+                skipped += 1;
+                entry.deinit(allocator);
+                continue;
+            }
+            if (entries.items.len >= limit) {
+                entry.deinit(allocator);
+                break;
+            }
+
+            try entries.append(allocator, entry);
+        }
+
+        return entries.toOwnedSlice(allocator);
+    }
+
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -664,6 +736,7 @@ pub const RedisMemory = struct {
         .recall = &implRecall,
         .get = &implGet,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
@@ -983,8 +1056,13 @@ test "formatCommand roundtrip with parseResp" {
 
 // Integration tests — guarded by Redis availability
 fn canConnectToRedis() bool {
-    const addr = std.net.Address.resolveIp("127.0.0.1", 6379) catch return false;
-    const stream = std.net.tcpConnectToAddress(addr) catch return false;
+    // Windows CI does not provide Redis, and Zig 0.16's AFD connect path can
+    // emit noisy unexpected NTSTATUS traces for a simple connection-refused
+    // probe before the error is caught here.
+    if (builtin.os.tag == .windows) return false;
+
+    const addr = std_compat.net.Address.resolveIp("127.0.0.1", 6379) catch return false;
+    const stream = std_compat.net.tcpConnectToAddress(addr) catch return false;
     stream.close();
     return true;
 }

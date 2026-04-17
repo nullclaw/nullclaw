@@ -1,6 +1,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
+zig-pkg/
 *.db
 *.db-journal
 .DS_Store

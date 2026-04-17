@@ -1,5 +1,7 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
+const util = @import("../util.zig");
 
 const DEFAULT_MAX_API_ERROR_CHARS: usize = 200;
 const MIN_MAX_API_ERROR_CHARS: usize = 200;
@@ -26,7 +28,7 @@ pub fn setApiErrorLimitOverride(limit: ?u32) ApiErrorLimitOverrideError!void {
 }
 
 fn readMaxApiErrorCharsFromEnv() usize {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "NULLCLAW_MAX_ERROR_CHARS")) |env_val| {
+    if (std_compat.process.getEnvVarOwned(std.heap.page_allocator, "NULLCLAW_MAX_ERROR_CHARS")) |env_val| {
         defer std.heap.page_allocator.free(env_val);
         const val = std.fmt.parseInt(usize, env_val, 10) catch DEFAULT_MAX_API_ERROR_CHARS;
         return if (val < MIN_MAX_API_ERROR_CHARS)
@@ -202,11 +204,12 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
 /// Returns an owned slice. Caller must free.
 pub fn scrubToolOutput(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     // First truncate if too long
-    const truncated = if (input.len > MAX_TOOL_OUTPUT_CHARS) blk: {
+    const preview = util.previewUtf8(input, MAX_TOOL_OUTPUT_CHARS);
+    const truncated = if (preview.truncated) blk: {
         const suffix = "\n[output truncated]";
-        var buf = try allocator.alloc(u8, MAX_TOOL_OUTPUT_CHARS + suffix.len);
-        @memcpy(buf[0..MAX_TOOL_OUTPUT_CHARS], input[0..MAX_TOOL_OUTPUT_CHARS]);
-        @memcpy(buf[MAX_TOOL_OUTPUT_CHARS..], suffix);
+        var buf = try allocator.alloc(u8, preview.slice.len + suffix.len);
+        @memcpy(buf[0..preview.slice.len], preview.slice);
+        @memcpy(buf[preview.slice.len..], suffix);
         break :blk buf;
     } else try allocator.dupe(u8, input);
     defer allocator.free(truncated);
@@ -225,9 +228,10 @@ pub fn sanitizeApiError(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     }
 
     // Truncate
-    var truncated = try allocator.alloc(u8, max_chars + 3);
-    @memcpy(truncated[0..max_chars], scrubbed[0..max_chars]);
-    @memcpy(truncated[max_chars..][0..3], "...");
+    const preview = util.previewUtf8(scrubbed, max_chars);
+    var truncated = try allocator.alloc(u8, preview.slice.len + 3);
+    @memcpy(truncated[0..preview.slice.len], preview.slice);
+    @memcpy(truncated[preview.slice.len..][0..3], "...");
     allocator.free(scrubbed);
     return truncated;
 }
@@ -269,6 +273,20 @@ test "sanitizeApiError truncates long errors" {
     defer allocator.free(result);
     try std.testing.expect(result.len <= DEFAULT_MAX_API_ERROR_CHARS + 3);
     try std.testing.expect(std.mem.endsWith(u8, result, "..."));
+}
+
+test "sanitizeApiError keeps UTF-8 intact when truncating" {
+    const allocator = std.testing.allocator;
+    try setApiErrorLimitOverride(200);
+    defer setApiErrorLimitOverride(null) catch unreachable;
+
+    const prefix = "a" ** 199;
+    const result = try sanitizeApiError(allocator, prefix ++ "\xd0\x99tail");
+    defer allocator.free(result);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+    try std.testing.expect(std.mem.endsWith(u8, result, "..."));
+    try std.testing.expect(std.mem.indexOf(u8, result, "\xd0\x99tail") == null);
 }
 
 test "sanitizeApiError no secret no change" {
@@ -393,6 +411,17 @@ test "scrubToolOutput truncates long output" {
     defer allocator.free(result);
     try std.testing.expect(result.len < 110_000);
     try std.testing.expect(std.mem.endsWith(u8, result, "[output truncated]"));
+}
+
+test "scrubToolOutput keeps UTF-8 intact when truncating" {
+    const allocator = std.testing.allocator;
+    const prefix = "x" ** (MAX_TOOL_OUTPUT_CHARS - 1);
+    const result = try scrubToolOutput(allocator, prefix ++ "\xd0\x99tail");
+    defer allocator.free(result);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+    try std.testing.expect(std.mem.endsWith(u8, result, "[output truncated]"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "\xd0\x99tail") == null);
 }
 
 test "scrubToolOutput scrubs secrets and truncates" {

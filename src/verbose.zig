@@ -1,5 +1,5 @@
 //! verbose.zig - Verbose logging control
-//! 
+//!
 //! This module provides thread-safe functions to control and check verbose logging status.
 //! The verbose flag is used to enable detailed debug output across the application.
 
@@ -9,7 +9,7 @@ const std = @import("std");
 var verbose_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// Set the verbose logging status
-/// 
+///
 /// Args:
 ///   enabled: Whether to enable verbose logging
 pub fn setVerbose(enabled: bool) void {
@@ -17,7 +17,7 @@ pub fn setVerbose(enabled: bool) void {
 }
 
 /// Check if verbose logging is enabled
-/// 
+///
 /// Returns:
 ///   bool: True if verbose logging is enabled, false otherwise
 pub fn isVerbose() bool {

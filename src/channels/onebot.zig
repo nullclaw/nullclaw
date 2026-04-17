@@ -1,9 +1,20 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const websocket = @import("../websocket.zig");
+const thread_stacks = @import("../thread_stacks.zig");
+const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.onebot);
+
+const SocketFd = std_compat.net.Stream.Handle;
+const invalid_socket: SocketFd = switch (builtin.os.tag) {
+    .windows => std_compat.net.invalidHandle(SocketFd),
+    else => -1,
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // CQ Code Parsing
@@ -183,7 +194,10 @@ pub const OneBotChannel = struct {
     allocator: std.mem.Allocator,
     event_bus: ?*bus.Bus,
     dedup: DedupRing,
-    running: bool,
+    running: Atomic(bool),
+    connected: Atomic(bool),
+    ws_fd: Atomic(SocketFd),
+    gateway_thread: ?std.Thread,
 
     pub const MAX_MESSAGE_LEN: usize = 4500;
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
@@ -194,7 +208,10 @@ pub const OneBotChannel = struct {
             .allocator = allocator,
             .event_bus = null,
             .dedup = .{},
-            .running = false,
+            .running = Atomic(bool).init(false),
+            .connected = Atomic(bool).init(false),
+            .ws_fd = Atomic(SocketFd).init(invalid_socket),
+            .gateway_thread = null,
         };
     }
 
@@ -207,7 +224,7 @@ pub const OneBotChannel = struct {
     }
 
     pub fn healthCheck(self: *OneBotChannel) bool {
-        return self.running;
+        return self.running.load(.acquire) and self.connected.load(.acquire);
     }
 
     /// Set the event bus for publishing inbound messages.
@@ -250,7 +267,7 @@ pub const OneBotChannel = struct {
         const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{user_id}) catch return;
 
         // Allowlist check
-        if (self.config.allow_from.len > 0 and !root.isAllowed(self.config.allow_from, user_str)) return;
+        if (self.config.allow_from.len > 0 and !root.isAllowedScoped("onebot channel", self.config.allow_from, user_str)) return;
 
         // Extract chat_id (group_id for group messages, user_id for private)
         const chat_id_int = if (is_group) getJsonInt(val, "group_id") orelse return else user_id;
@@ -275,7 +292,7 @@ pub const OneBotChannel = struct {
             if (self.config.group_trigger_prefix) |prefix| {
                 if (std.mem.startsWith(u8, content, prefix)) {
                     // Strip prefix and leading whitespace
-                    content = std.mem.trimLeft(u8, content[prefix.len..], " ");
+                    content = std.mem.trimStart(u8, content[prefix.len..], " ");
                 } else if (!cq.is_mention) {
                     // Not prefixed and not a mention — skip
                     return;
@@ -292,8 +309,8 @@ pub const OneBotChannel = struct {
 
         // Build metadata JSON
         var meta_buf: [256]u8 = undefined;
-        var meta_fbs = std.io.fixedBufferStream(&meta_buf);
-        const mw = meta_fbs.writer();
+        var meta_writer: std.Io.Writer = .fixed(&meta_buf);
+        const mw = &meta_writer;
         mw.print("{{\"message_id\":{d},\"is_group\":{s}", .{
             message_id,
             if (is_group) "true" else "false",
@@ -306,7 +323,7 @@ pub const OneBotChannel = struct {
             mw.writeByte('"') catch return;
         }
         mw.writeByte('}') catch return;
-        const metadata = meta_fbs.getWritten();
+        const metadata = meta_writer.buffered();
 
         const msg = bus.makeInboundFull(
             self.allocator,
@@ -349,15 +366,14 @@ pub const OneBotChannel = struct {
 
         // Build API URL
         var url_buf: [512]u8 = undefined;
-        const api_base = deriveHttpBase(self.config.url);
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/send_msg", .{api_base});
-        const url = url_fbs.getWritten();
+        const url = try buildSendApiUrl(&url_buf, self.config.url);
 
         // Build JSON body dynamically
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const bw = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const bw = &body_writer.writer;
         try bw.writeAll("{\"action\":\"send_msg\",\"params\":{");
         try bw.print("\"message_type\":\"{s}\",", .{msg_type});
         if (std.mem.eql(u8, msg_type, "group")) {
@@ -375,30 +391,58 @@ pub const OneBotChannel = struct {
         var header_storage: [512]u8 = undefined;
         var headers: []const []const u8 = &.{};
         if (self.config.access_token) |token| {
-            var hdr_fbs = std.io.fixedBufferStream(&header_storage);
-            try hdr_fbs.writer().print("Authorization: Bearer {s}", .{token});
-            headers_buf[0] = hdr_fbs.getWritten();
+            var header_writer: std.Io.Writer = .fixed(&header_storage);
+            try header_writer.print("Authorization: Bearer {s}", .{token});
+            headers_buf[0] = header_writer.buffered();
             headers = &headers_buf;
         }
 
-        const resp = root.http_util.curlPost(self.allocator, url, body, headers) catch |err| {
+        const resp = root.http_util.curlPostWithStatus(self.allocator, url, body, headers) catch |err| {
             log.err("OneBot API POST failed: {}", .{err});
             return error.OneBotApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp.body);
+
+        if (resp.status_code < 200 or resp.status_code >= 300) {
+            log.err("OneBot API returned HTTP status {d}", .{resp.status_code});
+            if (resp.status_code == 401 or resp.status_code == 403) return error.OneBotAuthError;
+            return error.OneBotApiError;
+        }
+
+        ensureOneBotApiSuccess(self.allocator, resp.body) catch |err| {
+            log.err("OneBot API returned failure payload: {}", .{err});
+            return err;
+        };
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *OneBotChannel = @ptrCast(@alignCast(ptr));
-        self.running = true;
-        log.info("OneBot channel started (url={s})", .{self.config.url});
+        if (self.running.load(.acquire)) return;
+        self.running.store(true, .release);
+        errdefer self.running.store(false, .release);
+        self.connected.store(false, .release);
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self});
+        log.info("OneBot gateway loop started (url={s})", .{self.config.url});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *OneBotChannel = @ptrCast(@alignCast(ptr));
-        self.running = false;
+        self.running.store(false, .release);
+        self.connected.store(false, .release);
+
+        // Unblock a blocking read without stealing final ownership from WsClient.deinit().
+        const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
+        if (fd != invalid_socket) {
+            (std_compat.net.Stream{ .handle = fd }).shutdown(.recv) catch {};
+        }
+
+        if (self.gateway_thread) |t| {
+            t.join();
+            self.gateway_thread = null;
+        }
+
         log.info("OneBot channel stopped", .{});
     }
 
@@ -428,6 +472,64 @@ pub const OneBotChannel = struct {
     pub fn channel(self: *OneBotChannel) root.Channel {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
+
+    fn gatewayLoop(self: *OneBotChannel) void {
+        while (self.running.load(.acquire)) {
+            self.runGatewayOnce() catch |err| {
+                log.warn("onebot websocket cycle failed: {}", .{err});
+            };
+            if (!self.running.load(.acquire)) break;
+
+            var slept: u64 = 0;
+            while (slept < RECONNECT_DELAY_NS and self.running.load(.acquire)) {
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
+                slept += 100 * std.time.ns_per_ms;
+            }
+        }
+        self.connected.store(false, .release);
+    }
+
+    fn runGatewayOnce(self: *OneBotChannel) !void {
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        var path_buf: [512]u8 = undefined;
+        const parts = try parseWebSocketConnectParts(self.config.url, &host_buf, &path_buf);
+
+        var auth_buf: [512]u8 = undefined;
+        var headers_buf: [1][]const u8 = undefined;
+        const headers: []const []const u8 = if (self.config.access_token) |token| blk: {
+            var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+            try auth_writer.print("Authorization: Bearer {s}", .{token});
+            headers_buf[0] = auth_writer.buffered();
+            break :blk headers_buf[0..1];
+        } else &.{};
+
+        var ws = if (parts.secure)
+            try websocket.WsClient.connect(self.allocator, parts.host, parts.port, parts.path, headers)
+        else
+            try websocket.WsClient.connectPlain(self.allocator, parts.host, parts.port, parts.path, headers);
+        defer {
+            self.connected.store(false, .release);
+            self.ws_fd.store(invalid_socket, .release);
+            ws.deinit();
+        }
+
+        self.ws_fd.store(ws.stream.handle, .release);
+        self.connected.store(true, .release);
+
+        while (self.running.load(.acquire)) {
+            const maybe_message = ws.readMessage() catch |err| switch (err) {
+                error.ConnectionClosed => break,
+                else => return err,
+            };
+            const message = maybe_message orelse break;
+            defer self.allocator.free(message.payload);
+
+            if (message.opcode != .text) continue;
+            self.handleEvent(message.payload) catch |err| {
+                log.warn("failed to handle OneBot websocket event: {}", .{err});
+            };
+        }
+    }
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -445,14 +547,131 @@ fn parseTarget(target: []const u8) struct { []const u8, []const u8 } {
     return .{ "private", target };
 }
 
-/// Derive HTTP API base URL from the WebSocket URL.
-/// "ws://localhost:6700" -> "http://localhost:6700"
-/// "wss://host:6700"     -> "https://host:6700"
-/// If already http(s), return as-is.
-fn deriveHttpBase(ws_url: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, ws_url, "ws://")) return ws_url; // curl handles ws:// -> http://
-    if (std.mem.startsWith(u8, ws_url, "wss://")) return ws_url;
-    return ws_url;
+const OneBotConnectParts = struct {
+    secure: bool,
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+};
+
+fn componentAsSlice(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw => |v| v,
+        .percent_encoded => |v| v,
+    };
+}
+
+fn parseWebSocketConnectParts(
+    ws_url: []const u8,
+    host_buf: *[std.Io.net.HostName.max_len]u8,
+    path_buf: []u8,
+) !OneBotConnectParts {
+    const uri = std.Uri.parse(ws_url) catch return error.InvalidOneBotUrl;
+    const secure = if (std.ascii.eqlIgnoreCase(uri.scheme, "wss"))
+        true
+    else if (std.ascii.eqlIgnoreCase(uri.scheme, "ws"))
+        false
+    else
+        return error.InvalidOneBotUrl;
+
+    const host = (uri.getHost(host_buf) catch return error.InvalidOneBotUrl).bytes;
+    const port: u16 = uri.port orelse if (secure) 443 else 80;
+    const raw_path = componentAsSlice(uri.path);
+    const query = if (uri.query) |q| componentAsSlice(q) else "";
+
+    var w: std.Io.Writer = .fixed(path_buf);
+    if (raw_path.len == 0) {
+        try w.writeByte('/');
+    } else {
+        if (raw_path[0] != '/') try w.writeByte('/');
+        try w.writeAll(raw_path);
+    }
+    if (query.len > 0) {
+        try w.writeByte('?');
+        try w.writeAll(query);
+    }
+
+    return .{
+        .secure = secure,
+        .host = host,
+        .port = port,
+        .path = w.buffered(),
+    };
+}
+
+fn buildSendApiUrl(buf: []u8, ws_url: []const u8) ![]const u8 {
+    const uri = std.Uri.parse(ws_url) catch return error.InvalidOneBotUrl;
+    const secure = if (std.ascii.eqlIgnoreCase(uri.scheme, "wss"))
+        true
+    else if (std.ascii.eqlIgnoreCase(uri.scheme, "ws"))
+        false
+    else if (std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+        true
+    else if (std.ascii.eqlIgnoreCase(uri.scheme, "http"))
+        false
+    else
+        return error.InvalidOneBotUrl;
+
+    var host_storage: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = (uri.getHost(&host_storage) catch return error.InvalidOneBotUrl).bytes;
+    const port: u16 = uri.port orelse if (secure) 443 else 80;
+
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("{s}://{s}", .{ if (secure) "https" else "http", host });
+    if ((secure and port != 443) or (!secure and port != 80)) {
+        try w.print(":{d}", .{port});
+    }
+    try w.writeAll("/send_msg");
+    return w.buffered();
+}
+
+fn messageSuggestsAuthIssue(msg: []const u8) bool {
+    if (msg.len == 0) return false;
+
+    var lower_buf: [256]u8 = undefined;
+    const n = @min(msg.len, lower_buf.len);
+    for (msg[0..n], 0..) |c, i| {
+        lower_buf[i] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..n];
+
+    return std.mem.indexOf(u8, lower, "auth") != null or
+        std.mem.indexOf(u8, lower, "token") != null or
+        std.mem.indexOf(u8, lower, "unauthorized") != null or
+        std.mem.indexOf(u8, lower, "forbidden") != null or
+        std.mem.indexOf(u8, lower, "permission") != null;
+}
+
+/// OneBot typically returns {"status":"ok","retcode":0,...} on success.
+fn ensureOneBotApiSuccess(allocator: std.mem.Allocator, resp_body: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return error.OneBotApiError;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.OneBotApiError;
+
+    const status = if (parsed.value.object.get("status")) |v|
+        (if (v == .string) v.string else "")
+    else
+        "";
+
+    const retcode: i64 = if (parsed.value.object.get("retcode")) |v| switch (v) {
+        .integer => v.integer,
+        .number_string => std.fmt.parseInt(i64, v.number_string, 10) catch -1,
+        else => -1,
+    } else 0;
+
+    if (std.mem.eql(u8, status, "ok") and retcode == 0) return;
+
+    const wording = if (parsed.value.object.get("wording")) |v|
+        (if (v == .string) v.string else "")
+    else
+        "";
+
+    // Common OneBot auth failures appear as 401/403-like retcodes or auth wording.
+    if (retcode == 401 or retcode == 403 or retcode == 1403 or messageSuggestsAuthIssue(wording)) {
+        return error.OneBotAuthError;
+    }
+    return error.OneBotApiError;
 }
 
 /// Get a string field from a JSON object value.
@@ -618,14 +837,44 @@ test "parseTarget no prefix defaults to private" {
     try std.testing.expectEqualStrings("12345", id);
 }
 
-test "deriveHttpBase ws url" {
-    const result = deriveHttpBase("ws://localhost:6700");
-    try std.testing.expectEqualStrings("ws://localhost:6700", result);
+test "parseWebSocketConnectParts supports ws url" {
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    var path_buf: [128]u8 = undefined;
+    const parts = try parseWebSocketConnectParts("ws://localhost:6700", &host_buf, &path_buf);
+    try std.testing.expect(!parts.secure);
+    try std.testing.expectEqualStrings("localhost", parts.host);
+    try std.testing.expectEqual(@as(u16, 6700), parts.port);
+    try std.testing.expectEqualStrings("/", parts.path);
 }
 
-test "deriveHttpBase http url passthrough" {
-    const result = deriveHttpBase("http://localhost:5700");
-    try std.testing.expectEqualStrings("http://localhost:5700", result);
+test "parseWebSocketConnectParts keeps path and query" {
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    var path_buf: [128]u8 = undefined;
+    const parts = try parseWebSocketConnectParts("wss://bot.example.com:9443/ws/onebot?token=abc", &host_buf, &path_buf);
+    try std.testing.expect(parts.secure);
+    try std.testing.expectEqualStrings("bot.example.com", parts.host);
+    try std.testing.expectEqual(@as(u16, 9443), parts.port);
+    try std.testing.expectEqualStrings("/ws/onebot?token=abc", parts.path);
+}
+
+test "buildSendApiUrl converts websocket scheme to http api url" {
+    var buf: [256]u8 = undefined;
+    const result = try buildSendApiUrl(&buf, "ws://localhost:5700/ws");
+    try std.testing.expectEqualStrings("http://localhost:5700/send_msg", result);
+}
+
+test "buildSendApiUrl preserves https default port elision" {
+    var buf: [256]u8 = undefined;
+    const result = try buildSendApiUrl(&buf, "wss://bot.example.com/ws");
+    try std.testing.expectEqualStrings("https://bot.example.com/send_msg", result);
+}
+
+test "ensureOneBotApiSuccess validates success and failure payloads" {
+    const alloc = std.testing.allocator;
+    try ensureOneBotApiSuccess(alloc, "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1}}");
+    try std.testing.expectError(error.OneBotApiError, ensureOneBotApiSuccess(alloc, "not-json"));
+    try std.testing.expectError(error.OneBotApiError, ensureOneBotApiSuccess(alloc, "{\"status\":\"failed\",\"retcode\":1200}"));
+    try std.testing.expectError(error.OneBotAuthError, ensureOneBotApiSuccess(alloc, "{\"status\":\"failed\",\"retcode\":1403,\"wording\":\"token invalid\"}"));
 }
 
 test "config_types.OneBotConfig defaults" {
@@ -647,6 +896,18 @@ test "OneBotChannel init stores config" {
     try std.testing.expectEqualStrings("/bot", ch.config.group_trigger_prefix.?);
     try std.testing.expectEqualStrings("onebot", ch.channelName());
     try std.testing.expect(!ch.healthCheck());
+}
+
+test "OneBotChannel healthCheck requires websocket connection" {
+    const alloc = std.testing.allocator;
+    var ch = OneBotChannel.init(alloc, .{});
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.connected.store(true, .release);
+    try std.testing.expect(ch.healthCheck());
 }
 
 test "OneBotChannel vtable compiles" {
@@ -672,7 +933,7 @@ test "handleEvent private message" {
 
     var ch = OneBotChannel.init(alloc, .{ .account_id = "onebot-main" });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const event_json =
         \\{"post_type":"message","message_type":"private","message_id":1001,
@@ -700,7 +961,7 @@ test "handleEvent group message with prefix" {
         .group_trigger_prefix = "/bot",
     });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     // Message with prefix — should be accepted, prefix stripped
     const event_json =
@@ -725,7 +986,7 @@ test "handleEvent group message without prefix skipped" {
         .group_trigger_prefix = "/bot",
     });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     // Message without prefix and no mention — should be skipped
     const event_json =
@@ -744,7 +1005,7 @@ test "handleEvent deduplication" {
 
     var ch = OneBotChannel.init(alloc, .{});
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const event_json =
         \\{"post_type":"message","message_type":"private","message_id":3001,
@@ -842,7 +1103,7 @@ test "handleEvent allow_from blocks unlisted user" {
         .allow_from = &.{"99999"},
     });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     // user_id=12345 is NOT in allow_from
     const event_json =
@@ -863,7 +1124,7 @@ test "handleEvent allow_from permits listed user" {
         .allow_from = &.{"12345"},
     });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const event_json =
         \\{"post_type":"message","message_type":"private","message_id":6002,
@@ -883,7 +1144,7 @@ test "handleEvent allow_from empty allows all" {
 
     var ch = OneBotChannel.init(alloc, .{});
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const event_json =
         \\{"post_type":"message","message_type":"private","message_id":6003,

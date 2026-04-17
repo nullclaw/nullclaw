@@ -6,7 +6,9 @@
 //!   - should_hydrate: checks if memory is empty but snapshot exists
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
+const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
 const json_util = @import("../../json_util.zig");
 const Memory = root.Memory;
@@ -50,10 +52,10 @@ pub fn exportSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_dir: 
     try json_buf.appendSlice(allocator, "\n]\n");
 
     // Write to file
-    const snapshot_path = try std.fs.path.join(allocator, &.{ workspace_dir, SNAPSHOT_FILENAME });
+    const snapshot_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, SNAPSHOT_FILENAME });
     defer allocator.free(snapshot_path);
 
-    const file = try std.fs.cwd().createFile(snapshot_path, .{});
+    const file = try fs_compat.createPath(snapshot_path, .{});
     defer file.close();
 
     try file.writeAll(json_buf.items);
@@ -73,11 +75,11 @@ const SnapshotEntry = struct {
 /// Restore memory entries from a JSON snapshot file.
 /// Returns the number of entries hydrated.
 pub fn hydrateFromSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_dir: []const u8) !usize {
-    const snapshot_path = try std.fs.path.join(allocator, &.{ workspace_dir, SNAPSHOT_FILENAME });
+    const snapshot_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, SNAPSHOT_FILENAME });
     defer allocator.free(snapshot_path);
 
     // Read snapshot file
-    const content = std.fs.cwd().readFileAlloc(allocator, snapshot_path, 10 * 1024 * 1024) catch return 0;
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, snapshot_path, 10 * 1024 * 1024) catch return 0;
     defer allocator.free(content);
 
     if (content.len == 0) return 0;
@@ -139,10 +141,10 @@ pub fn shouldHydrate(allocator: std.mem.Allocator, mem: ?Memory, workspace_dir: 
     }
 
     // Check if snapshot file exists
-    const snapshot_path = std.fs.path.join(allocator, &.{ workspace_dir, SNAPSHOT_FILENAME }) catch return false;
+    const snapshot_path = std_compat.fs.path.join(allocator, &.{ workspace_dir, SNAPSHOT_FILENAME }) catch return false;
     defer allocator.free(snapshot_path);
 
-    std.fs.cwd().access(snapshot_path, .{}) catch return false;
+    fs_compat.accessPath(snapshot_path, .{}) catch return false;
     return true;
 }
 
@@ -191,7 +193,7 @@ test "R3: snapshot export then import roundtrip preserves all entries" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
     // Source memory: populate with entries
@@ -244,10 +246,10 @@ test "R3: shouldHydrate returns true when memory is empty and snapshot exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const snap_file = try tmp.dir.createFile(SNAPSHOT_FILENAME, .{});
+    const snap_file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile(SNAPSHOT_FILENAME, .{});
     snap_file.close();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
     var mem_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");

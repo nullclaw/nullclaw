@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const platform = @import("platform.zig");
@@ -113,7 +114,7 @@ pub const SerialPeripheral = struct {
     port_path: []const u8,
     baud_rate: u32,
     connected: bool = false,
-    serial_file: ?std.fs.File = null,
+    serial_file: ?std_compat.fs.File = null,
     msg_id: u32 = 0,
 
     const serial_vtable = Peripheral.VTable{
@@ -170,7 +171,7 @@ pub const SerialPeripheral = struct {
         if (!isSerialPathAllowed(self.port_path)) {
             return Peripheral.PeripheralError.PermissionDenied;
         }
-        const file = std.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch {
+        const file = std_compat.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch {
             self.connected = false;
             return Peripheral.PeripheralError.IoError;
         };
@@ -271,7 +272,7 @@ pub const ArduinoPeripheral = struct {
     baud_rate: u32,
     fqbn: []const u8 = "arduino:avr:uno",
     connected: bool = false,
-    serial_file: ?std.fs.File = null,
+    serial_file: ?std_compat.fs.File = null,
     msg_id: u32 = 0,
 
     const arduino_vtable = Peripheral.VTable{
@@ -321,7 +322,7 @@ pub const ArduinoPeripheral = struct {
         const self = resolve(ptr);
         const allocator = self.allocator;
         // Detect Arduino by running arduino-cli board list and checking for the port.
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "arduino-cli", "board", "list" },
             allocator,
         );
@@ -339,7 +340,7 @@ pub const ArduinoPeripheral = struct {
             return Peripheral.PeripheralError.DeviceNotFound;
         };
         const exited_ok = switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
         if (!exited_ok) {
@@ -352,7 +353,7 @@ pub const ArduinoPeripheral = struct {
                 self.connected = true;
                 // Open serial port for read/write communication
                 if (isSerialPathAllowed(self.port_path)) {
-                    const file = std.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch return;
+                    const file = std_compat.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch return;
                     self.serial_file = file;
                 }
                 return;
@@ -364,7 +365,7 @@ pub const ArduinoPeripheral = struct {
 
         // Open serial port for read/write communication
         if (isSerialPathAllowed(self.port_path)) {
-            const file = std.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch {
+            const file = std_compat.fs.openFileAbsolute(self.port_path, .{ .mode = .read_write }) catch {
                 // Board detected but serial port not accessible — still mark connected
                 return;
             };
@@ -424,7 +425,7 @@ pub const ArduinoPeripheral = struct {
         const allocator = self.allocator;
 
         // Step 1: Compile the sketch
-        var compile_child = std.process.Child.init(
+        var compile_child = std_compat.process.Child.init(
             &.{ "arduino-cli", "compile", "--fqbn", self.fqbn, firmware_path },
             allocator,
         );
@@ -437,13 +438,13 @@ pub const ArduinoPeripheral = struct {
         }
         const compile_term = compile_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const compile_ok = switch (compile_term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
         if (!compile_ok) return Peripheral.PeripheralError.FlashFailed;
 
         // Step 2: Upload to the board
-        var upload_child = std.process.Child.init(
+        var upload_child = std_compat.process.Child.init(
             &.{ "arduino-cli", "upload", "-p", self.port_path, "--fqbn", self.fqbn, firmware_path },
             allocator,
         );
@@ -455,7 +456,7 @@ pub const ArduinoPeripheral = struct {
         }
         const upload_term = upload_child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const upload_ok = switch (upload_term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
         if (!upload_ok) return Peripheral.PeripheralError.FlashFailed;
@@ -475,7 +476,7 @@ pub const ArduinoPeripheral = struct {
 
     /// Check if arduino-cli is available on the system.
     pub fn isArduinoCliAvailable(allocator: std.mem.Allocator) bool {
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "arduino-cli", "version" },
             allocator,
         );
@@ -484,7 +485,7 @@ pub const ArduinoPeripheral = struct {
         child.spawn() catch return false;
         const term = child.wait() catch return false;
         return switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
     }
@@ -542,7 +543,7 @@ pub const RpiGpioPeripheral = struct {
             return Peripheral.PeripheralError.UnsupportedOperation;
         }
         // Check that /sys/class/gpio exists (Linux sysfs GPIO interface)
-        var gpio_dir = std.fs.openDirAbsolute("/sys/class/gpio", .{}) catch {
+        var gpio_dir = std_compat.fs.openDirAbsolute("/sys/class/gpio", .{}) catch {
             self.connected = false;
             return Peripheral.PeripheralError.DeviceNotFound;
         };
@@ -604,21 +605,21 @@ pub const RpiGpioPeripheral = struct {
     fn rpiExportPin(pin: u32) void {
         var pin_buf: [8]u8 = undefined;
         const pin_str = std.fmt.bufPrint(&pin_buf, "{d}", .{pin}) catch return;
-        const export_file = std.fs.openFileAbsolute("/sys/class/gpio/export", .{ .mode = .write_only }) catch return;
+        const export_file = std_compat.fs.openFileAbsolute("/sys/class/gpio/export", .{ .mode = .write_only }) catch return;
         defer export_file.close();
         export_file.writeAll(pin_str) catch {};
     }
 
     /// Write a string to a sysfs file.
     fn rpiWriteFile(path: []const u8, value: []const u8) !void {
-        const file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch return error.IoError;
+        const file = std_compat.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch return error.IoError;
         defer file.close();
         file.writeAll(value) catch return error.IoError;
     }
 
     /// Read a GPIO value (0 or 1) from a sysfs value file.
     fn rpiReadFile(path: []const u8) !u8 {
-        const file = std.fs.openFileAbsolute(path, .{}) catch return error.IoError;
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch return error.IoError;
         defer file.close();
         var buf: [4]u8 = undefined;
         const n = file.read(&buf) catch return error.IoError;
@@ -709,7 +710,7 @@ pub const NucleoFlash = struct {
         const self = resolve(ptr);
         const allocator = self.allocator;
         // Verify a debug probe is connected via probe-rs list
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "probe-rs", "list" },
             allocator,
         );
@@ -726,7 +727,7 @@ pub const NucleoFlash = struct {
             return Peripheral.PeripheralError.NotConnected;
         };
         const exited_ok = switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
         if (!exited_ok) {
@@ -758,7 +759,7 @@ pub const NucleoFlash = struct {
             return Peripheral.PeripheralError.IoError;
 
         // Run: probe-rs read b8 <addr> --chip CHIP
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "probe-rs", "read", "b8", addr_hex, "--chip", self.chip },
             allocator,
         );
@@ -769,7 +770,7 @@ pub const NucleoFlash = struct {
         defer if (stdout) |s| allocator.free(s);
         const term = child.wait() catch return Peripheral.PeripheralError.IoError;
         const exited_ok = switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
         if (!exited_ok) return Peripheral.PeripheralError.IoError;
@@ -794,7 +795,7 @@ pub const NucleoFlash = struct {
             return Peripheral.PeripheralError.IoError;
 
         // Run: probe-rs write b8 <addr> <data> --chip CHIP
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "probe-rs", "write", "b8", addr_hex, data_str, "--chip", self.chip },
             self.allocator,
         );
@@ -807,7 +808,7 @@ pub const NucleoFlash = struct {
         }
         const term = child.wait() catch return Peripheral.PeripheralError.IoError;
         const exited_ok = switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
         if (!exited_ok) return Peripheral.PeripheralError.IoError;
@@ -819,7 +820,7 @@ pub const NucleoFlash = struct {
         const allocator = self.allocator;
 
         // Run: probe-rs run --chip CHIP firmware_path
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "probe-rs", "run", "--chip", self.chip, firmware_path },
             allocator,
         );
@@ -835,7 +836,7 @@ pub const NucleoFlash = struct {
         }
         const term = child.wait() catch return Peripheral.PeripheralError.FlashFailed;
         const ok = switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
         if (!ok) return Peripheral.PeripheralError.FlashFailed;
@@ -855,7 +856,7 @@ pub const NucleoFlash = struct {
 
     /// Check if probe-rs is available on the system.
     pub fn isProbeRsAvailable(allocator: std.mem.Allocator) bool {
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "probe-rs", "--version" },
             allocator,
         );
@@ -864,7 +865,7 @@ pub const NucleoFlash = struct {
         child.spawn() catch return false;
         const term = child.wait() catch return false;
         return switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
     }

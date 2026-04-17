@@ -1,5 +1,7 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
+const model_refs = @import("../model_refs.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -265,25 +267,52 @@ pub const ReliableProvider = struct {
         return chain;
     }
 
-    fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, model: []const u8 } {
-        const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse {
-            return .{ .provider = null, .model = model_ref };
-        };
-        if (slash == 0 or slash + 1 >= model_ref.len) {
-            return .{ .provider = null, .model = model_ref };
-        }
-        return .{
-            .provider = model_ref[0..slash],
-            .model = model_ref[slash + 1 ..],
-        };
-    }
-
     fn matchesProvider(provider_name: []const u8, requested: []const u8) bool {
         return std.ascii.eqlIgnoreCase(provider_name, requested);
     }
 
     fn resolveProviderTarget(self: *const ReliableProvider, model_ref: []const u8) ResolvedProviderTarget {
-        const split = splitProviderModel(model_ref);
+        var best_target: ?ResolvedProviderTarget = null;
+        var best_prefix_len: usize = 0;
+
+        if (model_refs.matchExplicitProviderPrefix(model_ref, self.inner.getName())) |split| {
+            best_target = .{
+                .provider = self.inner,
+                .model = split.model,
+                .explicit = true,
+            };
+            best_prefix_len = self.inner.getName().len;
+        }
+
+        for (self.extras) |entry| {
+            if (model_refs.matchExplicitProviderPrefix(model_ref, entry.name)) |split| {
+                if (entry.name.len > best_prefix_len) {
+                    best_target = .{
+                        .provider = entry.provider,
+                        .model = split.model,
+                        .explicit = true,
+                    };
+                    best_prefix_len = entry.name.len;
+                }
+            }
+            const provider_runtime_name = entry.provider.getName();
+            if (model_refs.matchExplicitProviderPrefix(model_ref, provider_runtime_name)) |split| {
+                if (provider_runtime_name.len > best_prefix_len) {
+                    best_target = .{
+                        .provider = entry.provider,
+                        .model = split.model,
+                        .explicit = true,
+                    };
+                    best_prefix_len = provider_runtime_name.len;
+                }
+            }
+        }
+
+        const split = model_refs.splitProviderModel(model_ref) orelse model_refs.ProviderModelRef{
+            .provider = null,
+            .model = model_ref,
+        };
+        if (best_target) |target| return target;
         if (std.mem.eql(u8, self.inner.getName(), "router")) {
             return .{
                 .provider = self.inner,
@@ -362,8 +391,10 @@ pub const ReliableProvider = struct {
 
     fn finalFailureError(self: *const ReliableProvider) anyerror {
         const err_slice = self.lastErrorSlice();
-        if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
+        // Check rate limiting BEFORE context exhaustion — rate limit errors
+        // often contain "token" + "exceed" which false-matches context checks.
         if (isRateLimited(err_slice)) return error.RateLimited;
+        if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
         if (std.mem.eql(u8, err_slice, "ProviderDoesNotSupportVision")) return error.ProviderDoesNotSupportVision;
         return error.AllProvidersFailed;
     }
@@ -420,7 +451,7 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }
@@ -465,7 +496,7 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }
@@ -861,6 +892,7 @@ const MockInnerProvider = struct {
     supports_tools: bool,
     supports_vision: bool = true,
     warmed_up: bool = false,
+    name: []const u8 = "MockProvider",
 
     const vtable_mock = Provider.VTable{
         .chatWithSystem = mockChatWithSystem,
@@ -917,8 +949,9 @@ const MockInnerProvider = struct {
         return self.supports_vision;
     }
 
-    fn mockGetName(_: *anyopaque) []const u8 {
-        return "MockProvider";
+    fn mockGetName(ptr: *anyopaque) []const u8 {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        return self.name;
     }
 
     fn mockDeinit(_: *anyopaque) void {}
@@ -1217,6 +1250,52 @@ test "ReliableProvider vtable delegates getName" {
     var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
     var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50);
     try std.testing.expectEqualStrings("MockProvider", reliable.provider().getName());
+}
+
+test "ReliableProvider resolves explicit custom url provider refs" {
+    var inner = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    var extra = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    const extras = [_]ProviderEntry{
+        .{ .name = "custom:http://127.0.0.1:8000/v1", .provider = extra.toProvider() },
+    };
+
+    var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs };
+    const result = try prov.chat(std.testing.allocator, request, "custom:http://127.0.0.1:8000/v1/claude-haiku-4.5", 0.5);
+    defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
+
+    try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expectEqualStrings("claude-haiku-4.5", result.model);
+    try std.testing.expectEqual(@as(u32, 1), extra.call_count);
+    try std.testing.expectEqual(@as(u32, 0), inner.call_count);
+}
+
+test "ReliableProvider honors explicit fallback refs before router inner" {
+    var inner = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false, .name = "router" };
+    var extra = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false, .name = "fallback-custom" };
+    const extras = [_]ProviderEntry{
+        .{ .name = "custom:https://fb.example.com/v1", .provider = extra.toProvider() },
+    };
+
+    var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs };
+    const result = try prov.chat(std.testing.allocator, request, "custom:https://fb.example.com/v1/model-a", 0.5);
+    defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
+
+    try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expectEqualStrings("model-a", result.model);
+    try std.testing.expectEqual(@as(u32, 1), extra.call_count);
+    try std.testing.expectEqual(@as(u32, 0), inner.call_count);
 }
 
 test "ReliableProvider vtable zero retries fails immediately" {

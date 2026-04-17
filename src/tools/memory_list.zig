@@ -4,6 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
+const util = @import("../util.zig");
 const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
 const MemoryEntry = mem_root.MemoryEntry;
@@ -41,9 +42,9 @@ pub const MemoryListTool = struct {
             null;
 
         const session_id_opt: ?[]const u8 = if (root.getString(args, "session_id")) |sid_raw|
-            if (sid_raw.len > 0) sid_raw else null
+            if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
         else
-            null;
+            root.threadMemorySessionId();
 
         const include_content = root.getBool(args, "include_content") orelse true;
         const include_internal = root.getBool(args, "include_internal") orelse false;
@@ -71,17 +72,16 @@ pub const MemoryListTool = struct {
         const shown = @min(limit, filtered_total);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
-        const w = out.writer(allocator);
-        try w.print("Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
+        try out.print(allocator, "Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
 
         var written: usize = 0;
         for (entries) |entry| {
             if (!include_internal and isInternalEntry(entry)) continue;
             if (written >= shown) break;
-            try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, entry.key, entry.category.toString(), entry.timestamp });
+            try out.print(allocator, "  {d}. {s} [{s}] {s}\n", .{ written + 1, entry.key, entry.category.toString(), entry.timestamp });
             if (include_content) {
-                const preview = truncateUtf8(entry.content, 120);
-                try w.print("     {s}{s}\n", .{ preview, if (entry.content.len > preview.len) "..." else "" });
+                const preview = util.previewUtf8(entry.content, 120);
+                try out.print(allocator, "     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
             }
             written += 1;
         }
@@ -91,13 +91,6 @@ pub const MemoryListTool = struct {
 
     fn isInternalEntry(entry: MemoryEntry) bool {
         return mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content);
-    }
-
-    fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
-        if (s.len <= max_len) return s;
-        var end: usize = max_len;
-        while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
-        return s[0..end];
     }
 };
 
@@ -201,4 +194,30 @@ test "memory_list filters bootstrap internal keys by default" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_topic") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.AGENTS.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-agents") == null);
+}
+
+test "memory_list preview keeps UTF-8 intact at the boundary" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const prefix = try allocator.alloc(u8, 119);
+    defer allocator.free(prefix);
+    @memset(prefix, 'a');
+
+    const content = try std.fmt.allocPrint(allocator, "{s}\xd0\x99tail", .{prefix});
+    defer allocator.free(content);
+    try mem.store("utf8_preview", content, .core, null);
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.output));
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\xd0\x99tail") == null);
 }

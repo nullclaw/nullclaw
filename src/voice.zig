@@ -5,6 +5,7 @@
 //! transcribed text as an owned slice.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
@@ -100,30 +101,30 @@ pub fn transcribeFile(
     const tmp_dir = platform.getTempDir(allocator) catch return error.FileReadFailed;
     defer allocator.free(tmp_dir);
     var tmp_path_buf: [256]u8 = undefined;
-    var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
-    tmp_fbs.writer().print("{s}/nullclaw_voice_{d}.bin", .{ tmp_dir, getPid() }) catch
+    var tmp_writer: std.Io.Writer = .fixed(&tmp_path_buf);
+    tmp_writer.print("{s}/nullclaw_voice_{d}.bin", .{ tmp_dir, getPid() }) catch
         return error.FileReadFailed;
-    const tmp_path_len = tmp_fbs.pos;
+    const tmp_path_len = tmp_writer.buffered().len;
     tmp_path_buf[tmp_path_len] = 0;
     const tmp_path: [:0]const u8 = tmp_path_buf[0..tmp_path_len :0];
 
     // Write multipart body directly to temp file (avoids holding file_data + body in memory)
     writeMultipartToTempFile(tmp_path, file_path, &boundary, opts) catch
         return error.FileReadFailed;
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
 
     // Build headers
     var content_type_buf: [128]u8 = undefined;
-    var ct_fbs = std.io.fixedBufferStream(&content_type_buf);
-    ct_fbs.writer().print("Content-Type: multipart/form-data; boundary={s}", .{&boundary}) catch
+    var ct_writer: std.Io.Writer = .fixed(&content_type_buf);
+    ct_writer.print("Content-Type: multipart/form-data; boundary={s}", .{&boundary}) catch
         return error.BoundaryGenerationFailed;
-    const content_type_hdr = ct_fbs.getWritten();
+    const content_type_hdr = ct_writer.buffered();
 
     var auth_buf: [256]u8 = undefined;
-    var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-    auth_fbs.writer().print("Authorization: Bearer {s}", .{api_key}) catch
+    var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+    auth_writer.print("Authorization: Bearer {s}", .{api_key}) catch
         return error.ApiRequestFailed;
-    const auth_hdr = auth_fbs.getWritten();
+    const auth_hdr = auth_writer.buffered();
 
     // POST via curl using --data-binary @tempfile
     const resp = curlPostFromFile(
@@ -141,7 +142,7 @@ pub fn transcribeFile(
 /// Generate a random 32-character hex boundary string.
 fn generateBoundary() ![32]u8 {
     var random_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std_compat.crypto.random.bytes(&random_bytes);
     var boundary: [32]u8 = undefined;
     const hex = "0123456789abcdef";
     for (random_bytes, 0..) |b, i| {
@@ -201,7 +202,7 @@ fn writeMultipartToTempFile(
     boundary: []const u8,
     opts: TranscribeOptions,
 ) !void {
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
     defer tmp_file.close();
 
     // Write file part header
@@ -211,7 +212,7 @@ fn writeMultipartToTempFile(
 
     // Stream audio file directly (no intermediate buffer)
     {
-        const audio_file = try std.fs.openFileAbsolute(audio_path, .{});
+        const audio_file = try std_compat.fs.openFileAbsolute(audio_path, .{});
         defer audio_file.close();
         var buf: [32768]u8 = undefined;
         while (true) {
@@ -265,9 +266,9 @@ fn curlPostFromFile(
 ) ![]u8 {
     // Build data-binary arg: @/path/to/file
     var data_arg_buf: [300]u8 = undefined;
-    var data_fbs = std.io.fixedBufferStream(&data_arg_buf);
-    try data_fbs.writer().print("@{s}", .{file_path});
-    const data_arg = data_fbs.getWritten();
+    var data_writer: std.Io.Writer = .fixed(&data_arg_buf);
+    try data_writer.print("@{s}", .{file_path});
+    const data_arg = data_writer.buffered();
 
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
@@ -296,7 +297,7 @@ fn curlPostFromFile(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -306,7 +307,7 @@ fn curlPostFromFile(
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             allocator.free(stdout);
             return error.CurlFailed;
         },
@@ -348,7 +349,7 @@ pub fn transcribeTelegramVoice(
     };
     defer {
         // Clean up temp file
-        std.fs.deleteFileAbsolute(local_path) catch {};
+        std_compat.fs.deleteFileAbsolute(local_path) catch {};
         allocator.free(local_path);
     }
 
@@ -364,9 +365,9 @@ pub fn transcribeTelegramVoice(
 /// Call Telegram getFile API and extract the file_path from the response.
 fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8) ![]u8 {
     var url_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&url_buf);
-    try fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token});
-    const url = fbs.getWritten();
+    var writer: std.Io.Writer = .fixed(&url_buf);
+    try writer.print("https://api.telegram.org/bot{s}/getFile", .{bot_token});
+    const url = writer.buffered();
 
     // Build request body
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
@@ -392,9 +393,9 @@ fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []c
 /// Download a file from Telegram and save to temp dir. Returns the local path (owned).
 fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_file_path: []const u8) ![]u8 {
     var url_buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&url_buf);
-    try fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path });
-    const url = fbs.getWritten();
+    var url_writer: std.Io.Writer = .fixed(&url_buf);
+    try url_writer.print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path });
+    const url = url_writer.buffered();
 
     const data = try http_util.curlGet(allocator, url, &.{}, "30");
     defer allocator.free(data);
@@ -404,9 +405,9 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_
     defer allocator.free(tmp_dir);
     const pid = getPid();
     var path_buf: [256]u8 = undefined;
-    var path_fbs = std.io.fixedBufferStream(&path_buf);
-    try path_fbs.writer().print("{s}/nullclaw_tg_voice_{d}.ogg", .{ tmp_dir, pid });
-    const local_path = path_fbs.getWritten();
+    var path_writer: std.Io.Writer = .fixed(&path_buf);
+    try path_writer.print("{s}/nullclaw_tg_voice_{d}.ogg", .{ tmp_dir, pid });
+    const local_path = path_writer.buffered();
 
     var z_buf: [256]u8 = undefined;
     @memcpy(z_buf[0..local_path.len], local_path);
@@ -414,7 +415,7 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_
     const local_path_z: [:0]const u8 = z_buf[0..local_path.len :0];
 
     {
-        const f = try std.fs.createFileAbsolute(local_path_z, .{});
+        const f = try std_compat.fs.createFileAbsolute(local_path_z, .{});
         defer f.close();
         try f.writeAll(data);
     }

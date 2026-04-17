@@ -74,6 +74,7 @@ pub const TagFilter = struct {
         "<tool_result_begin",
         "<|tool_call_begin|",
         "<|tool_result_begin|",
+        "<think",
     };
 
     // Closing tags (fixed match).
@@ -84,6 +85,7 @@ pub const TagFilter = struct {
         "<tool_result_end>",
         "<|tool_call_end|>",
         "<|tool_result_end|>",
+        "</think>",
     };
 
     // Standalone control tokens that should be stripped, but do not wrap body text.
@@ -446,4 +448,16 @@ test "TagFilter strips section wrapper with mixed pipe-delimited close tag" {
     s.emitFinal();
     var buf: [96]u8 = undefined;
     try std.testing.expectEqualStrings("AB", col.joined(&buf));
+}
+
+test "TagFilter strips think blocks split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Before <th");
+    s.emitChunk("ink>private");
+    s.emitChunk("</think> after");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Before  after", col.joined(&buf));
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
@@ -20,12 +21,12 @@ pub const MaixCamChannel = struct {
     event_bus: ?*bus.Bus = null,
     running: bool = false,
     clients: std.ArrayListUnmanaged(Client) = .empty,
-    clients_mu: std.Thread.Mutex = .{},
+    clients_mu: std_compat.sync.Mutex = .{},
     listener_thread: ?std.Thread = null,
     outbound_thread: ?std.Thread = null,
 
     pub const Client = struct {
-        stream: std.net.Stream,
+        stream: std_compat.net.Stream,
         device_id: ?[]const u8 = null,
     };
 
@@ -70,11 +71,20 @@ pub const MaixCamChannel = struct {
     /// If the allowlist is empty, all devices are allowed.
     pub fn isDeviceAllowed(self: *const MaixCamChannel, device_id: []const u8) bool {
         if (self.config.allow_from.len == 0) return true;
+        var matched = false;
+        var wildcard_seen = false;
         for (self.config.allow_from) |allowed| {
-            if (std.mem.eql(u8, allowed, "*")) return true;
-            if (std.mem.eql(u8, allowed, device_id)) return true;
+            if (std.mem.eql(u8, allowed, "*")) {
+                wildcard_seen = true;
+                continue;
+            }
+            if (std.mem.eql(u8, allowed, device_id)) matched = true;
         }
-        return false;
+        if (wildcard_seen) {
+            root.warnWildcardAllowAll("maixcam channel");
+            return true;
+        }
+        return matched;
     }
 
     // ── JSON Message Parsing ──────────────────────────────────────
@@ -165,8 +175,7 @@ pub const MaixCamChannel = struct {
 
     /// Format a device event into a human-readable content string for the bus.
     pub fn formatEventContent(buf: []u8, event: DeviceEvent) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
 
         if (std.mem.eql(u8, event.event_type, "person_detected")) {
             if (event.confidence) |conf| {
@@ -194,19 +203,18 @@ pub const MaixCamChannel = struct {
             try w.print("[MaixCam] {s}", .{event.event_type});
         }
 
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     // ── Outbound JSON ─────────────────────────────────────────────
 
     /// Build an outbound JSON message to send to devices.
     pub fn buildOutboundJson(buf: []u8, content: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll("{\"type\":\"response\",\"text\":");
-        try root.appendJsonStringW(w, content);
+        try root.appendJsonStringW(&w, content);
         try w.writeAll("}\n");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Send a message to all connected clients.
@@ -269,7 +277,7 @@ pub const MaixCamChannel = struct {
 
     // ── Client Connection Handler ─────────────────────────────────
 
-    fn handleClient(self: *MaixCamChannel, stream: std.net.Stream) void {
+    fn handleClient(self: *MaixCamChannel, stream: std_compat.net.Stream) void {
         defer {
             self.removeClient(stream);
             stream.close();
@@ -309,7 +317,7 @@ pub const MaixCamChannel = struct {
         }
     }
 
-    fn processLine(self: *MaixCamChannel, stream: std.net.Stream, line: []const u8) void {
+    fn processLine(self: *MaixCamChannel, stream: std_compat.net.Stream, line: []const u8) void {
         const event = parseDeviceMessage(self.allocator, line) orelse {
             log.debug("failed to parse device message", .{});
             return;
@@ -334,19 +342,19 @@ pub const MaixCamChannel = struct {
 
         // Build session key
         var sk_buf: [256]u8 = undefined;
-        var sk_fbs = std.io.fixedBufferStream(&sk_buf);
-        sk_fbs.writer().print("maixcam:{s}", .{event.device_id}) catch return;
-        const session_key = sk_fbs.getWritten();
+        var sk_writer: std.Io.Writer = .fixed(&sk_buf);
+        sk_writer.print("maixcam:{s}", .{event.device_id}) catch return;
+        const session_key = sk_writer.buffered();
 
         // Publish to bus
         if (self.event_bus) |b| {
             var meta_buf: [128]u8 = undefined;
-            var meta_fbs = std.io.fixedBufferStream(&meta_buf);
-            const mw = meta_fbs.writer();
+            var meta_writer: std.Io.Writer = .fixed(&meta_buf);
+            const mw = &meta_writer;
             mw.writeAll("{\"account_id\":") catch return;
             root.appendJsonStringW(mw, self.config.account_id) catch return;
             mw.writeByte('}') catch return;
-            const metadata = meta_fbs.getWritten();
+            const metadata = meta_writer.buffered();
 
             const msg = bus.makeInboundFull(
                 self.allocator,
@@ -368,7 +376,7 @@ pub const MaixCamChannel = struct {
         }
     }
 
-    fn updateClientDeviceId(self: *MaixCamChannel, stream: std.net.Stream, device_id: []const u8) void {
+    fn updateClientDeviceId(self: *MaixCamChannel, stream: std_compat.net.Stream, device_id: []const u8) void {
         self.clients_mu.lock();
         defer self.clients_mu.unlock();
         for (self.clients.items) |*client| {
@@ -381,7 +389,7 @@ pub const MaixCamChannel = struct {
         }
     }
 
-    fn removeClient(self: *MaixCamChannel, stream: std.net.Stream) void {
+    fn removeClient(self: *MaixCamChannel, stream: std_compat.net.Stream) void {
         self.clients_mu.lock();
         defer self.clients_mu.unlock();
         for (self.clients.items, 0..) |*client, i| {
@@ -393,7 +401,7 @@ pub const MaixCamChannel = struct {
         }
     }
 
-    fn addClient(self: *MaixCamChannel, stream: std.net.Stream) !void {
+    fn addClient(self: *MaixCamChannel, stream: std_compat.net.Stream) !void {
         self.clients_mu.lock();
         defer self.clients_mu.unlock();
         try self.clients.append(self.allocator, .{ .stream = stream });
@@ -510,6 +518,16 @@ test "maixcam allowlist wildcard allows all" {
     const ch = MaixCamChannel.init(std.testing.allocator, .{ .allow_from = &allowlist });
     try std.testing.expect(ch.isDeviceAllowed("anything"));
     try std.testing.expect(ch.isDeviceAllowed("cam-99"));
+}
+
+test "maixcam exact match still triggers wildcard warning" {
+    root.resetWildcardWarningForTest("maixcam channel");
+    defer root.resetWildcardWarningForTest("maixcam channel");
+
+    const allowlist = [_][]const u8{ "cam-01", "*" };
+    const ch = MaixCamChannel.init(std.testing.allocator, .{ .allow_from = &allowlist });
+    try std.testing.expect(ch.isDeviceAllowed("cam-01"));
+    try std.testing.expect(root.wildcardWarningTriggeredForTest("maixcam channel"));
 }
 
 test "maixcam allowlist exact match only" {

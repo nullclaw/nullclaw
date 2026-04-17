@@ -40,13 +40,17 @@ fn hashWithCanonicalLineEndings(bytes: []const u8) [std.crypto.hash.sha2.Sha256.
     return digest;
 }
 
+fn readFileAllocCompat(dir: std.Io.Dir, io: std.Io, allocator: std.mem.Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
+    return try dir.readFileAlloc(io, sub_path, allocator, .limited(max_bytes));
+}
+
 fn verifyVendoredSqliteHashes(b: *std.Build) !void {
     const max_vendor_file_size = 16 * 1024 * 1024;
     for (VENDORED_SQLITE_HASHES) |entry| {
         const file_path = b.pathFromRoot(entry.path);
         defer b.allocator.free(file_path);
 
-        const bytes = std.fs.cwd().readFileAlloc(b.allocator, file_path, max_vendor_file_size) catch |err| {
+        const bytes = readFileAllocCompat(std.Io.Dir.cwd(), b.graph.io, b.allocator, file_path, max_vendor_file_size) catch |err| {
             std.log.err("failed to read {s}: {s}", .{ file_path, @errorName(err) });
             return err;
         };
@@ -72,6 +76,7 @@ const ChannelSelection = struct {
     enable_channel_discord: bool = false,
     enable_channel_slack: bool = false,
     enable_channel_whatsapp: bool = false,
+    enable_channel_teams: bool = false,
     enable_channel_matrix: bool = false,
     enable_channel_mattermost: bool = false,
     enable_channel_irc: bool = false,
@@ -79,6 +84,8 @@ const ChannelSelection = struct {
     enable_channel_email: bool = false,
     enable_channel_lark: bool = false,
     enable_channel_dingtalk: bool = false,
+    enable_channel_wechat: bool = false,
+    enable_channel_wecom: bool = false,
     enable_channel_line: bool = false,
     enable_channel_onebot: bool = false,
     enable_channel_qq: bool = false,
@@ -86,6 +93,7 @@ const ChannelSelection = struct {
     enable_channel_signal: bool = false,
     enable_channel_nostr: bool = false,
     enable_channel_web: bool = false,
+    enable_channel_max: bool = false,
 
     fn enableAll(self: *ChannelSelection) void {
         self.enable_channel_cli = true;
@@ -93,6 +101,7 @@ const ChannelSelection = struct {
         self.enable_channel_discord = true;
         self.enable_channel_slack = true;
         self.enable_channel_whatsapp = true;
+        self.enable_channel_teams = true;
         self.enable_channel_matrix = true;
         self.enable_channel_mattermost = true;
         self.enable_channel_irc = true;
@@ -100,6 +109,8 @@ const ChannelSelection = struct {
         self.enable_channel_email = true;
         self.enable_channel_lark = true;
         self.enable_channel_dingtalk = true;
+        self.enable_channel_wechat = true;
+        self.enable_channel_wecom = true;
         self.enable_channel_line = true;
         self.enable_channel_onebot = true;
         self.enable_channel_qq = true;
@@ -107,6 +118,7 @@ const ChannelSelection = struct {
         self.enable_channel_signal = true;
         self.enable_channel_nostr = true;
         self.enable_channel_web = true;
+        self.enable_channel_max = true;
     }
 };
 
@@ -150,6 +162,8 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_slack = true;
         } else if (std.mem.eql(u8, token, "whatsapp")) {
             selection.enable_channel_whatsapp = true;
+        } else if (std.mem.eql(u8, token, "teams")) {
+            selection.enable_channel_teams = true;
         } else if (std.mem.eql(u8, token, "matrix")) {
             selection.enable_channel_matrix = true;
         } else if (std.mem.eql(u8, token, "mattermost")) {
@@ -164,6 +178,10 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_lark = true;
         } else if (std.mem.eql(u8, token, "dingtalk")) {
             selection.enable_channel_dingtalk = true;
+        } else if (std.mem.eql(u8, token, "wechat") or std.mem.eql(u8, token, "weixin")) {
+            selection.enable_channel_wechat = true;
+        } else if (std.mem.eql(u8, token, "wecom")) {
+            selection.enable_channel_wecom = true;
         } else if (std.mem.eql(u8, token, "line")) {
             selection.enable_channel_line = true;
         } else if (std.mem.eql(u8, token, "onebot")) {
@@ -178,6 +196,8 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_nostr = true;
         } else if (std.mem.eql(u8, token, "web")) {
             selection.enable_channel_web = true;
+        } else if (std.mem.eql(u8, token, "max")) {
+            selection.enable_channel_max = true;
         } else {
             std.log.err("unknown channel '{s}' in -Dchannels list", .{token});
             return error.InvalidChannelsOption;
@@ -210,6 +230,7 @@ const EngineSelection = struct {
     enable_memory_redis: bool = false,
     enable_memory_lancedb: bool = false,
     enable_postgres: bool = false,
+    enable_memory_clickhouse: bool = false,
 
     fn enableBase(self: *EngineSelection) void {
         self.enable_memory_none = true;
@@ -224,6 +245,7 @@ const EngineSelection = struct {
         self.enable_memory_redis = true;
         self.enable_memory_lancedb = true;
         self.enable_postgres = true;
+        self.enable_memory_clickhouse = true;
     }
 
     fn finalize(self: *EngineSelection) void {
@@ -240,7 +262,8 @@ const EngineSelection = struct {
             self.enable_memory_lucid or
             self.enable_memory_redis or
             self.enable_memory_lancedb or
-            self.enable_postgres;
+            self.enable_postgres or
+            self.enable_memory_clickhouse;
     }
 };
 
@@ -291,6 +314,8 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
             selection.enable_memory_lancedb = true;
         } else if (std.mem.eql(u8, token, "postgres")) {
             selection.enable_postgres = true;
+        } else if (std.mem.eql(u8, token, "clickhouse")) {
+            selection.enable_memory_clickhouse = true;
         } else {
             std.log.err("unknown engine '{s}' in -Dengines list", .{token});
             return error.InvalidEnginesOption;
@@ -311,21 +336,19 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
     return selection;
 }
 
-fn envExists(name: []const u8) bool {
-    const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return false;
-    std.heap.page_allocator.free(value);
-    return true;
+fn envExists(b: *std.Build, name: []const u8) bool {
+    return b.graph.environ_map.get(name) != null;
 }
 
 fn ensureAndroidBuildEnvironment(b: *std.Build) void {
-    if (envExists("TERMUX_VERSION")) return;
+    if (envExists(b, "TERMUX_VERSION")) return;
     if (b.libc_file != null) return;
 
     const has_android_sdk_or_ndk =
-        envExists("ANDROID_NDK_HOME") or
-        envExists("ANDROID_NDK_ROOT") or
-        envExists("ANDROID_HOME") or
-        envExists("ANDROID_SDK_ROOT");
+        envExists(b, "ANDROID_NDK_HOME") or
+        envExists(b, "ANDROID_NDK_ROOT") or
+        envExists(b, "ANDROID_HOME") or
+        envExists(b, "ANDROID_SDK_ROOT");
 
     std.log.err("Android cross-builds need a Zig libc/sysroot file passed via --libc (or ZIG_LIBC).", .{});
     if (has_android_sdk_or_ndk) {
@@ -334,8 +357,17 @@ fn ensureAndroidBuildEnvironment(b: *std.Build) void {
         std.log.err("Install the Android NDK, generate a libc/sysroot file for the target, and pass it with --libc.", .{});
     }
     std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
-    std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.15.2.", .{});
+    std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.16.0.", .{});
     std.process.exit(1);
+}
+
+fn addEmbeddedWasm3(module: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const wasm3_dep = b.dependency("wasm3", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addIncludePath(wasm3_dep.path("source"));
+    module.linkLibrary(wasm3_dep.artifact("wasm3"));
 }
 
 pub fn build(b: *std.Build) void {
@@ -343,11 +375,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
+    const enable_embedded_wasm3 = b.option(bool, "embedded_wasm3", "Embed wasm3 runtime into nullclaw binary (default: true; use -Dembedded_wasm3=false to disable)") orelse true;
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "dev";
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|wechat|weixin|wecom|line|onebot|qq|maixcam|signal|nostr|web|max (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -359,7 +392,7 @@ pub fn build(b: *std.Build) void {
     const engines_raw = b.option(
         []const u8,
         "engines",
-        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres (default: base,sqlite)",
+        "Memory engines list. Tokens: base|minimal|all|none|markdown|memory|api|sqlite|lucid|redis|lancedb|postgres|clickhouse (default: base,sqlite)",
     );
     const engines = if (engines_raw) |raw| blk: {
         const parsed = parseEnginesOption(raw) catch {
@@ -378,11 +411,13 @@ pub fn build(b: *std.Build) void {
     const enable_memory_redis = engines.enable_memory_redis;
     const enable_memory_lancedb = engines.enable_memory_lancedb;
     const enable_postgres = engines.enable_postgres;
+    const enable_memory_clickhouse = engines.enable_memory_clickhouse;
     const enable_channel_cli = channels.enable_channel_cli;
     const enable_channel_telegram = channels.enable_channel_telegram;
     const enable_channel_discord = channels.enable_channel_discord;
     const enable_channel_slack = channels.enable_channel_slack;
     const enable_channel_whatsapp = channels.enable_channel_whatsapp;
+    const enable_channel_teams = channels.enable_channel_teams;
     const enable_channel_matrix = channels.enable_channel_matrix;
     const enable_channel_mattermost = channels.enable_channel_mattermost;
     const enable_channel_irc = channels.enable_channel_irc;
@@ -390,6 +425,8 @@ pub fn build(b: *std.Build) void {
     const enable_channel_email = channels.enable_channel_email;
     const enable_channel_lark = channels.enable_channel_lark;
     const enable_channel_dingtalk = channels.enable_channel_dingtalk;
+    const enable_channel_wechat = channels.enable_channel_wechat;
+    const enable_channel_wecom = channels.enable_channel_wecom;
     const enable_channel_line = channels.enable_channel_line;
     const enable_channel_onebot = channels.enable_channel_onebot;
     const enable_channel_qq = channels.enable_channel_qq;
@@ -397,6 +434,7 @@ pub fn build(b: *std.Build) void {
     const enable_channel_signal = channels.enable_channel_signal;
     const enable_channel_nostr = channels.enable_channel_nostr;
     const enable_channel_web = channels.enable_channel_web;
+    const enable_channel_max = channels.enable_channel_max;
 
     if (target.result.abi == .android) {
         ensureAndroidBuildEnvironment(b);
@@ -435,11 +473,13 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_memory_lucid", effective_enable_memory_lucid);
     build_options.addOption(bool, "enable_memory_redis", enable_memory_redis);
     build_options.addOption(bool, "enable_memory_lancedb", effective_enable_memory_lancedb);
+    build_options.addOption(bool, "enable_memory_clickhouse", enable_memory_clickhouse);
     build_options.addOption(bool, "enable_channel_cli", enable_channel_cli);
     build_options.addOption(bool, "enable_channel_telegram", enable_channel_telegram);
     build_options.addOption(bool, "enable_channel_discord", enable_channel_discord);
     build_options.addOption(bool, "enable_channel_slack", enable_channel_slack);
     build_options.addOption(bool, "enable_channel_whatsapp", enable_channel_whatsapp);
+    build_options.addOption(bool, "enable_channel_teams", enable_channel_teams);
     build_options.addOption(bool, "enable_channel_matrix", enable_channel_matrix);
     build_options.addOption(bool, "enable_channel_mattermost", enable_channel_mattermost);
     build_options.addOption(bool, "enable_channel_irc", enable_channel_irc);
@@ -447,6 +487,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_email", enable_channel_email);
     build_options.addOption(bool, "enable_channel_lark", enable_channel_lark);
     build_options.addOption(bool, "enable_channel_dingtalk", enable_channel_dingtalk);
+    build_options.addOption(bool, "enable_channel_wechat", enable_channel_wechat);
+    build_options.addOption(bool, "enable_channel_wecom", enable_channel_wecom);
     build_options.addOption(bool, "enable_channel_line", enable_channel_line);
     build_options.addOption(bool, "enable_channel_onebot", enable_channel_onebot);
     build_options.addOption(bool, "enable_channel_qq", enable_channel_qq);
@@ -454,7 +496,14 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_signal", enable_channel_signal);
     build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
+    build_options.addOption(bool, "enable_channel_max", enable_channel_max);
+    build_options.addOption(bool, "enable_embedded_wasm3", enable_embedded_wasm3);
     const build_options_module = build_options.createModule();
+    const compat_module = b.createModule(.{
+        .root_source_file = b.path("src/compat.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // ---------- library module (importable by consumers) ----------
     const lib_mod: ?*std.Build.Module = if (is_wasi) null else blk: {
@@ -464,6 +513,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         module.addImport("build_options", build_options_module);
+        module.addImport("compat", compat_module);
         if (sqlite3) |lib| {
             module.linkLibrary(lib);
         }
@@ -475,16 +525,23 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             });
+            ws_dep.module("websocket").addImport("compat", compat_module);
             module.addImport("websocket", ws_dep.module("websocket"));
+        }
+        if (enable_embedded_wasm3) {
+            addEmbeddedWasm3(module, b, target, optimize);
         }
         break :blk module;
     };
 
     // ---------- executable ----------
     const exe_imports: []const std.Build.Module.Import = if (is_wasi)
-        &.{}
+        &.{.{ .name = "compat", .module = compat_module }}
     else
-        &.{.{ .name = "nullclaw", .module = lib_mod.? }};
+        &.{
+            .{ .name = "nullclaw", .module = lib_mod.? },
+            .{ .name = "compat", .module = compat_module },
+        };
 
     const exe_root_module = b.createModule(.{
         .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
@@ -508,7 +565,7 @@ pub fn build(b: *std.Build) void {
     // Link SQLite on the compile step (not the module)
     if (!is_wasi) {
         if (sqlite3) |lib| {
-            exe.linkLibrary(lib);
+            exe.root_module.linkLibrary(lib);
         }
         if (enable_postgres) {
             exe.root_module.linkSystemLibrary("pq", .{});
@@ -548,7 +605,7 @@ pub fn build(b: *std.Build) void {
     if (!is_wasi) {
         const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
         if (sqlite3) |lib| {
-            lib_tests.linkLibrary(lib);
+            lib_tests.root_module.linkLibrary(lib);
         }
         if (enable_postgres) {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
@@ -558,4 +615,12 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
+}
+
+test "parse channels option accepts weixin alias" {
+    // Regression: `-Dchannels=weixin` must enable the shared WeChat build flag.
+    const parsed = try parseChannelsOption("weixin");
+
+    try std.testing.expect(parsed.enable_channel_wechat);
+    try std.testing.expect(!parsed.enable_channel_wecom);
 }

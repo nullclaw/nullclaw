@@ -141,67 +141,69 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
 pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("=== Memory Doctor ===\n\n");
 
     // Backend section
     try w.writeAll("Backend\n");
-    try std.fmt.format(w, "  name:    {s}\n", .{report.backend_name});
-    try std.fmt.format(w, "  healthy: {}\n", .{report.backend_healthy});
-    try std.fmt.format(w, "  entries: {d}\n", .{report.entry_count});
+    try w.print("  name:    {s}\n", .{report.backend_name});
+    try w.print("  healthy: {}\n", .{report.backend_healthy});
+    try w.print("  entries: {d}\n", .{report.entry_count});
 
     // Capabilities
     try w.writeAll("\nCapabilities\n");
-    try std.fmt.format(w, "  keyword_rank:    {}\n", .{report.capabilities.supports_keyword_rank});
-    try std.fmt.format(w, "  session_store:   {}\n", .{report.capabilities.supports_session_store});
-    try std.fmt.format(w, "  transactions:    {}\n", .{report.capabilities.supports_transactions});
-    try std.fmt.format(w, "  outbox:          {}\n", .{report.capabilities.supports_outbox});
+    try w.print("  keyword_rank:    {}\n", .{report.capabilities.supports_keyword_rank});
+    try w.print("  session_store:   {}\n", .{report.capabilities.supports_session_store});
+    try w.print("  transactions:    {}\n", .{report.capabilities.supports_transactions});
+    try w.print("  outbox:          {}\n", .{report.capabilities.supports_outbox});
 
     // Vector plane
     try w.writeAll("\nVector Plane\n");
-    try std.fmt.format(w, "  active:  {}\n", .{report.vector_store_active});
+    try w.print("  active:  {}\n", .{report.vector_store_active});
     if (report.vector_entry_count) |vc| {
-        try std.fmt.format(w, "  vectors: {d}\n", .{vc});
+        try w.print("  vectors: {d}\n", .{vc});
     } else {
         try w.writeAll("  vectors: n/a\n");
     }
 
     // Outbox
     try w.writeAll("\nOutbox\n");
-    try std.fmt.format(w, "  active:  {}\n", .{report.outbox_active});
+    try w.print("  active:  {}\n", .{report.outbox_active});
     if (report.outbox_pending) |p| {
-        try std.fmt.format(w, "  pending: {d}\n", .{p});
+        try w.print("  pending: {d}\n", .{p});
     } else {
         try w.writeAll("  pending: n/a\n");
     }
 
     // Cache
     try w.writeAll("\nResponse Cache\n");
-    try std.fmt.format(w, "  active: {}\n", .{report.cache_active});
+    try w.print("  active: {}\n", .{report.cache_active});
     if (report.cache_stats) |cs| {
-        try std.fmt.format(w, "  count:  {d}\n", .{cs.count});
-        try std.fmt.format(w, "  hits:   {d}\n", .{cs.hits});
-        try std.fmt.format(w, "  tokens saved: {d}\n", .{cs.tokens_saved});
+        try w.print("  count:  {d}\n", .{cs.count});
+        try w.print("  hits:   {d}\n", .{cs.hits});
+        try w.print("  tokens saved: {d}\n", .{cs.tokens_saved});
     }
 
     // Retrieval
     try w.writeAll("\nRetrieval\n");
-    try std.fmt.format(w, "  sources: {d}\n", .{report.retrieval_sources});
-    try std.fmt.format(w, "  rollout: {s}\n", .{report.rollout_mode});
+    try w.print("  sources: {d}\n", .{report.retrieval_sources});
+    try w.print("  rollout: {s}\n", .{report.rollout_mode});
 
     // Session store
     try w.writeAll("\nSession Store\n");
-    try std.fmt.format(w, "  active: {}\n", .{report.session_store_active});
+    try w.print("  active: {}\n", .{report.session_store_active});
 
     // Extended pipeline
     try w.writeAll("\nPipeline Stages\n");
-    try std.fmt.format(w, "  query_expansion:  {}\n", .{report.query_expansion_enabled});
-    try std.fmt.format(w, "  adaptive:         {}\n", .{report.adaptive_retrieval_enabled});
-    try std.fmt.format(w, "  llm_reranker:     {}\n", .{report.llm_reranker_enabled});
-    try std.fmt.format(w, "  summarizer:       {}\n", .{report.summarizer_enabled});
-    try std.fmt.format(w, "  semantic_cache:   {}\n", .{report.semantic_cache_active});
+    try w.print("  query_expansion:  {}\n", .{report.query_expansion_enabled});
+    try w.print("  adaptive:         {}\n", .{report.adaptive_retrieval_enabled});
+    try w.print("  llm_reranker:     {}\n", .{report.llm_reranker_enabled});
+    try w.print("  summarizer:       {}\n", .{report.summarizer_enabled});
+    try w.print("  semantic_cache:   {}\n", .{report.semantic_cache_active});
 
+    buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
 

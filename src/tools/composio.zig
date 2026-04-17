@@ -404,8 +404,18 @@ pub fn sanitizeErrorMessage(allocator: std.mem.Allocator, msg: []const u8) ![]co
     }
 }
 
+fn lookupApiErrorMessageField(obj: std.json.ObjectMap) ?[]const u8 {
+    if (obj.get("message")) |msg_val| {
+        if (msg_val == .string) return msg_val.string;
+    }
+    if (obj.get("msg")) |msg_val| {
+        if (msg_val == .string) return msg_val.string;
+    }
+    return null;
+}
+
 /// Extract error message from JSON response body.
-/// Tries {"error":{"message":"..."}} then {"message":"..."}.
+/// Tries {"error":{"message|msg":"..."}} then {"message|msg":"..."}.
 pub fn extractApiErrorMessage(allocator: std.mem.Allocator, body: []const u8) !?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
@@ -415,20 +425,11 @@ pub fn extractApiErrorMessage(allocator: std.mem.Allocator, body: []const u8) !?
     // Try {"error":{"message":"..."}}
     if (root_val.object.get("error")) |err_val| {
         if (err_val == .object) {
-            if (err_val.object.get("message")) |msg_val| {
-                if (msg_val == .string) {
-                    return try allocator.dupe(u8, msg_val.string);
-                }
-            }
+            if (lookupApiErrorMessageField(err_val.object)) |msg| return try allocator.dupe(u8, msg);
         }
     }
 
-    // Try {"message":"..."}
-    if (root_val.object.get("message")) |msg_val| {
-        if (msg_val == .string) {
-            return try allocator.dupe(u8, msg_val.string);
-        }
-    }
+    if (lookupApiErrorMessageField(root_val.object)) |msg| return try allocator.dupe(u8, msg);
 
     return null;
 }
@@ -594,6 +595,22 @@ test "composio extractApiErrorMessage parses message format" {
 test "composio extractApiErrorMessage parses nested error format" {
     const alloc = std.testing.allocator;
     const result = try extractApiErrorMessage(alloc, "{\"error\":{\"message\":\"tool not found\"}}");
+    defer if (result) |r| alloc.free(r);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("tool not found", result.?);
+}
+
+test "composio extractApiErrorMessage parses msg format" {
+    const alloc = std.testing.allocator;
+    const result = try extractApiErrorMessage(alloc, "{\"msg\":\"invalid api key\"}");
+    defer if (result) |r| alloc.free(r);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("invalid api key", result.?);
+}
+
+test "composio extractApiErrorMessage parses nested error msg format" {
+    const alloc = std.testing.allocator;
+    const result = try extractApiErrorMessage(alloc, "{\"error\":{\"msg\":\"tool not found\"}}");
     defer if (result) |r| alloc.free(r);
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("tool not found", result.?);

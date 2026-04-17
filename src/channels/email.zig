@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 
@@ -47,15 +48,20 @@ pub const EmailChannel = struct {
     pub fn isSenderAllowed(self: *const EmailChannel, email_addr: []const u8) bool {
         if (self.config.allow_from.len == 0) return false;
 
+        var matched = false;
+        var wildcard_seen = false;
         for (self.config.allow_from) |allowed| {
-            if (std.mem.eql(u8, allowed, "*")) return true;
+            if (std.mem.eql(u8, allowed, "*")) {
+                wildcard_seen = true;
+                continue;
+            }
 
             if (allowed.len > 0 and allowed[0] == '@') {
                 // Domain match with @ prefix: "@example.com"
-                if (std.ascii.endsWithIgnoreCase(email_addr, allowed)) return true;
+                if (std.ascii.endsWithIgnoreCase(email_addr, allowed)) matched = true;
             } else if (std.mem.indexOf(u8, allowed, "@") != null) {
                 // Full email address match
-                if (std.ascii.eqlIgnoreCase(allowed, email_addr)) return true;
+                if (std.ascii.eqlIgnoreCase(allowed, email_addr)) matched = true;
             } else {
                 // Domain match without @: "example.com" -> match @example.com
                 if (email_addr.len > allowed.len + 1) {
@@ -63,12 +69,16 @@ pub const EmailChannel = struct {
                     if (email_addr[suffix_start] == '@' and
                         std.ascii.eqlIgnoreCase(email_addr[suffix_start + 1 ..], allowed))
                     {
-                        return true;
+                        matched = true;
                     }
                 }
             }
         }
-        return false;
+        if (wildcard_seen) {
+            root.warnWildcardAllowAll("email channel");
+            return true;
+        }
+        return matched;
     }
 
     pub fn healthCheck(_: *EmailChannel) bool {
@@ -89,13 +99,13 @@ pub const EmailChannel = struct {
         if (std.mem.startsWith(u8, message, "Subject: ")) {
             if (std.mem.indexOf(u8, message, "\n")) |nl_pos| {
                 subject = message[9..nl_pos];
-                body = std.mem.trimLeft(u8, message[nl_pos + 1 ..], " \t\r\n");
+                body = std.mem.trimStart(u8, message[nl_pos + 1 ..], " \t\r\n");
             }
         }
 
         // Connect to SMTP server via TCP
-        const addr = std.net.Address.resolveIp(self.config.smtp_host, self.config.smtp_port) catch return error.SmtpConnectError;
-        const stream = std.net.tcpConnectToAddress(addr) catch return error.SmtpConnectError;
+        const addr = std_compat.net.Address.resolveIp(self.config.smtp_host, self.config.smtp_port) catch return error.SmtpConnectError;
+        const stream = std_compat.net.tcpConnectToAddress(addr) catch return error.SmtpConnectError;
         defer stream.close();
 
         // Read greeting
@@ -104,23 +114,23 @@ pub const EmailChannel = struct {
 
         // EHLO
         var ehlo_buf: [256]u8 = undefined;
-        var ehlo_fbs = std.io.fixedBufferStream(&ehlo_buf);
-        try ehlo_fbs.writer().print("EHLO nullclaw\r\n", .{});
-        try stream.writeAll(ehlo_fbs.getWritten());
+        var ehlo_writer: std.Io.Writer = .fixed(&ehlo_buf);
+        try ehlo_writer.print("EHLO nullclaw\r\n", .{});
+        try stream.writeAll(ehlo_writer.buffered());
         _ = stream.read(&greeting_buf) catch return error.SmtpError;
 
         // MAIL FROM
         var from_buf: [512]u8 = undefined;
-        var from_fbs = std.io.fixedBufferStream(&from_buf);
-        try from_fbs.writer().print("MAIL FROM:<{s}>\r\n", .{self.config.from_address});
-        try stream.writeAll(from_fbs.getWritten());
+        var from_writer: std.Io.Writer = .fixed(&from_buf);
+        try from_writer.print("MAIL FROM:<{s}>\r\n", .{self.config.from_address});
+        try stream.writeAll(from_writer.buffered());
         _ = stream.read(&greeting_buf) catch return error.SmtpError;
 
         // RCPT TO
         var rcpt_buf: [512]u8 = undefined;
-        var rcpt_fbs = std.io.fixedBufferStream(&rcpt_buf);
-        try rcpt_fbs.writer().print("RCPT TO:<{s}>\r\n", .{recipient});
-        try stream.writeAll(rcpt_fbs.getWritten());
+        var rcpt_writer: std.Io.Writer = .fixed(&rcpt_buf);
+        try rcpt_writer.print("RCPT TO:<{s}>\r\n", .{recipient});
+        try stream.writeAll(rcpt_writer.buffered());
         _ = stream.read(&greeting_buf) catch return error.SmtpError;
 
         // DATA
@@ -129,8 +139,7 @@ pub const EmailChannel = struct {
 
         // Build email headers + body
         var data_buf: [16384]u8 = undefined;
-        var data_fbs = std.io.fixedBufferStream(&data_buf);
-        const dw = data_fbs.writer();
+        var dw: std.Io.Writer = .fixed(&data_buf);
         try dw.print("From: {s}\r\n", .{self.config.from_address});
         try dw.print("To: {s}\r\n", .{recipient});
         try dw.print("Subject: {s}\r\n", .{subject});
@@ -145,7 +154,7 @@ pub const EmailChannel = struct {
         try dw.writeAll("\r\n");
         try dw.writeAll(body);
         try dw.writeAll("\r\n.\r\n");
-        try stream.writeAll(data_fbs.getWritten());
+        try stream.writeAll(dw.buffered());
         _ = stream.read(&greeting_buf) catch return error.SmtpError;
 
         // QUIT
@@ -155,22 +164,22 @@ pub const EmailChannel = struct {
     /// Send a reply email — applies Re: prefix to subject and includes threading headers.
     pub fn sendReply(self: *EmailChannel, recipient: []const u8, original_subject: []const u8, message: []const u8) !void {
         var buf: [16384]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
+        var writer: std.Io.Writer = .fixed(&buf);
         if (hasReplyPrefix(original_subject)) {
-            try fbs.writer().print("Subject: {s}\n{s}", .{ original_subject, message });
+            try writer.print("Subject: {s}\n{s}", .{ original_subject, message });
         } else {
-            try fbs.writer().print("Subject: Re: {s}\n{s}", .{ original_subject, message });
+            try writer.print("Subject: Re: {s}\n{s}", .{ original_subject, message });
         }
-        try self.sendMessage(recipient, fbs.getWritten());
+        try self.sendMessage(recipient, writer.buffered());
     }
 
     /// Send IMAP UID STORE command to mark a message as \Seen.
-    pub fn markMessageSeen(self: *EmailChannel, stream: std.net.Stream, uid: u32) !void {
+    pub fn markMessageSeen(self: *EmailChannel, stream: std_compat.net.Stream, uid: u32) !void {
         _ = self;
         var cmd_buf: [256]u8 = undefined;
-        var cmd_fbs = std.io.fixedBufferStream(&cmd_buf);
-        try cmd_fbs.writer().print("A003 UID STORE {d} +FLAGS (\\Seen)\r\n", .{uid});
-        try stream.writeAll(cmd_fbs.getWritten());
+        var cmd_writer: std.Io.Writer = .fixed(&cmd_buf);
+        try cmd_writer.print("A003 UID STORE {d} +FLAGS (\\Seen)\r\n", .{uid});
+        try stream.writeAll(cmd_writer.buffered());
         // Read response (discard for now)
         var resp_buf: [1024]u8 = undefined;
         _ = stream.read(&resp_buf) catch return error.ImapError;
@@ -580,6 +589,16 @@ test "email sender wildcard with specific" {
     const senders = [_][]const u8{ "alice@example.com", "*" };
     const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
     try std.testing.expect(ch.isSenderAllowed("anyone@anything.com"));
+}
+
+test "email sender exact match still triggers wildcard warning" {
+    root.resetWildcardWarningForTest("email channel");
+    defer root.resetWildcardWarningForTest("email channel");
+
+    const senders = [_][]const u8{ "alice@example.com", "*" };
+    const ch = EmailChannel.init(std.testing.allocator, .{ .allow_from = &senders });
+    try std.testing.expect(ch.isSenderAllowed("alice@example.com"));
+    try std.testing.expect(root.wildcardWarningTriggeredForTest("email channel"));
 }
 
 test "email sender short address not domain match" {

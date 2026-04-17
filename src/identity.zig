@@ -241,7 +241,8 @@ fn dupeStrArray(allocator: std.mem.Allocator, val: std.json.Value, key: []const 
 pub fn aieosToSystemPrompt(allocator: std.mem.Allocator, identity: *const AieosIdentity) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const writer = &buf_writer.writer;
 
     // Identity section
     if (identity.identity) |id| {
@@ -365,6 +366,7 @@ pub fn aieosToSystemPrompt(allocator: std.mem.Allocator, identity: *const AieosI
     }
 
     // Trim trailing whitespace
+    buf = buf_writer.toArrayList();
     const result = buf.items;
     var end: usize = result.len;
     while (end > 0 and (result[end - 1] == ' ' or result[end - 1] == '\n' or result[end - 1] == '\r' or result[end - 1] == '\t')) {

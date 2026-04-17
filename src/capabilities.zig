@@ -13,6 +13,9 @@ const core_tool_names = [_][]const u8{
     "file_read",
     "file_write",
     "file_edit",
+    "file_append",
+    "file_read_hashed",
+    "file_edit_hashed",
     "git",
     "image_info",
     "memory_store",
@@ -171,10 +174,12 @@ fn collectRuntimeToolNames(
 fn joinNames(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const w = &out_writer.writer;
 
     if (names.len == 0) {
         try w.writeAll("(none)");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -182,6 +187,7 @@ fn joinNames(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
         if (i != 0) try w.writeAll(", ");
         try w.writeAll(name);
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(allocator);
 }
 
@@ -213,7 +219,8 @@ pub fn buildManifestJson(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const w = &out_writer.writer;
 
     try w.writeAll("{\n");
     try w.print("  \"version\": {f},\n", .{std.json.fmt(build_options.version, .{})});
@@ -252,7 +259,11 @@ pub fn buildManifestJson(
     }
     try w.writeAll("\n  ],\n");
 
-    try w.writeAll("  \"tools\": {\n");
+    try w.writeAll("  \"tools\": ");
+    try appendJsonStringArray(w, runtime_loaded_names);
+    try w.writeAll(",\n");
+
+    try w.writeAll("  \"tools_detail\": {\n");
     try w.writeAll("    \"runtime_loaded\": ");
     try appendJsonStringArray(w, runtime_loaded_names);
     try w.writeAll(",\n");
@@ -275,6 +286,7 @@ pub fn buildManifestJson(
     try w.writeAll("\n  }\n");
 
     try w.writeAll("}\n");
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(allocator);
 }
 
@@ -421,7 +433,11 @@ test "buildManifestJson emits core sections" {
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"channels\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"memory_engines\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools\": [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools_detail\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_append\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_read_hashed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_edit_hashed\"") != null);
 }
 
 test "buildManifestJson includes runtime_loaded when runtime tools are unavailable" {

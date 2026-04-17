@@ -4,6 +4,7 @@
 //! No I/O, no allocator, no external dependencies.
 
 const std = @import("std");
+const std_compat = @import("compat");
 
 pub const State = enum { closed, open, half_open };
 
@@ -35,7 +36,7 @@ pub const CircuitBreaker = struct {
         switch (self.state) {
             .closed => return true,
             .open => {
-                const now = std.time.nanoTimestamp();
+                const now = std_compat.time.nanoTimestamp();
                 if (now - self.last_failure_ns >= self.cooldown_ns) {
                     self.state = .half_open;
                     self.half_open_probe_sent = true;
@@ -64,7 +65,7 @@ pub const CircuitBreaker = struct {
     /// Record failed operation. Increments counter, trips to open at threshold.
     pub fn recordFailure(self: *CircuitBreaker) void {
         self.failure_count +|= 1;
-        self.last_failure_ns = std.time.nanoTimestamp();
+        self.last_failure_ns = std_compat.time.nanoTimestamp();
 
         if (self.state == .half_open or (self.state == .closed and self.failure_count >= self.threshold)) {
             self.state = .open;

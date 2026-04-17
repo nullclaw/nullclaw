@@ -5,10 +5,11 @@
 //! Plus/Pro subscriptions can use this without separate API tokens.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
-const platform = @import("../platform.zig");
 const auth = @import("../auth.zig");
+const codex_support = @import("../codex_support.zig");
 const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
@@ -60,7 +61,7 @@ pub const OpenAiCodexProvider = struct {
 
         // Fallback: try Codex CLI token (~/.codex/auth.json) if no stored credential
         if (self.access_token == null) {
-            if (tryLoadCodexCliToken(allocator)) |token| {
+            if (codex_support.loadCodexCliToken(allocator)) |token| {
                 self.access_token = token.access_token;
                 self.refresh_token = token.refresh_token;
                 self.expires_at = token.expires_at;
@@ -186,7 +187,7 @@ pub const OpenAiCodexProvider = struct {
         const token = self.access_token orelse return error.CredentialsNotSet;
 
         // Check if token needs refresh
-        if (self.expires_at != 0 and std.time.timestamp() + 300 >= self.expires_at) {
+        if (self.expires_at != 0 and std_compat.time.timestamp() + 300 >= self.expires_at) {
             const rt = self.refresh_token orelse return error.TokenExpired;
             const new_token = try auth.refreshAccessToken(
                 self.allocator,
@@ -370,7 +371,7 @@ fn codexStreamRequest(
     ctx: *anyopaque,
 ) !StreamChatResult {
     // Build argv on stack
-    var argv_buf: [32][]const u8 = undefined;
+    var argv_buf: [36][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -403,6 +404,10 @@ fn codexStreamRequest(
         argc += 1;
     }
 
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
+
     for (extra_headers) |hdr| {
         argv_buf[argc] = "-H";
         argc += 1;
@@ -417,7 +422,7 @@ fn codexStreamRequest(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -452,6 +457,7 @@ fn codexStreamRequest(
     var saw_text_delta = false;
     var emitted_text_fallback = false;
     var emitted_tool_payload = false;
+    var saw_terminal = false;
 
     outer: while (true) {
         const n = file.read(&read_buf) catch break;
@@ -511,8 +517,14 @@ fn codexStreamRequest(
                             },
                         }
                     },
-                    .done => break :outer,
-                    .error_msg => break :outer,
+                    .done => {
+                        saw_terminal = true;
+                        break :outer;
+                    },
+                    .error_msg => {
+                        saw_terminal = true;
+                        break :outer;
+                    },
                     .skip => {},
                 }
             } else {
@@ -521,29 +533,49 @@ fn codexStreamRequest(
         }
     }
 
-    // Send final chunk
-    callback(ctx, root.StreamChunk.finalChunk());
-
     // Drain remaining stdout
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch {
+        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeCodexStreamResult(allocator, accumulated.items);
+        }
+        return error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .exited => |code| if (code != 0) {
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeCodexStreamResult(allocator, accumulated.items);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeCodexStreamResult(allocator, accumulated.items);
+            }
+            return error.CurlFailed;
+        },
     }
 
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeCodexStreamResult(allocator, accumulated.items);
+}
+
+fn finalizeCodexStreamResult(allocator: std.mem.Allocator, accumulated: []const u8) !StreamChatResult {
+    const content = if (accumulated.len > 0)
+        try allocator.dupe(u8, accumulated)
     else
         null;
 
     return .{
         .content = content,
-        .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
+        .usage = .{ .completion_tokens = @intCast((accumulated.len + 3) / 4) },
         .model = "",
     };
 }
@@ -748,7 +780,7 @@ fn extractCompletedToolCalls(allocator: std.mem.Allocator, root_obj: std.json.Ob
 /// - "response.completed" / "response.done" → done
 /// - "error" / "response.failed" → error
 pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !CodexSseResult {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
 
@@ -757,7 +789,7 @@ pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !Codex
 
     const prefix = "data:";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
-    const data = std.mem.trimLeft(u8, trimmed[prefix.len..], " ");
+    const data = std.mem.trimStart(u8, trimmed[prefix.len..], " ");
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
     // Parse JSON
@@ -960,102 +992,7 @@ pub fn extractAccountIdFromJwt(allocator: std.mem.Allocator, token: []const u8) 
 /// Returns an OAuthToken with access_token, refresh_token, and decoded JWT exp.
 /// Returns null on any error (file not found, parse failure, etc.).
 pub fn tryLoadCodexCliToken(allocator: std.mem.Allocator) ?auth.OAuthToken {
-    const home = platform.getHomeDir(allocator) catch return null;
-    defer allocator.free(home);
-    const path = std.fs.path.join(allocator, &.{ home, ".codex", "auth.json" }) catch return null;
-    defer allocator.free(path);
-
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-
-    const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
-    defer allocator.free(json_bytes);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return null;
-    defer parsed.deinit();
-
-    const root_obj = switch (parsed.value) {
-        .object => |o| o,
-        else => return null,
-    };
-
-    // Codex CLI format: { "tokens": { "access_token": "...", "refresh_token": "..." }, ... }
-    const tokens_val = root_obj.get("tokens") orelse return null;
-    const tokens_obj = switch (tokens_val) {
-        .object => |o| o,
-        else => return null,
-    };
-
-    const access_token_str = switch (tokens_obj.get("access_token") orelse return null) {
-        .string => |s| s,
-        else => return null,
-    };
-    if (access_token_str.len == 0) return null;
-
-    const access_token = allocator.dupe(u8, access_token_str) catch return null;
-    errdefer allocator.free(access_token);
-
-    const refresh_token: ?[]const u8 = if (tokens_obj.get("refresh_token")) |rt_val| blk: {
-        switch (rt_val) {
-            .string => |s| break :blk if (s.len > 0) allocator.dupe(u8, s) catch null else null,
-            else => break :blk null,
-        }
-    } else null;
-
-    // Decode JWT exp
-    const expires_at = decodeJwtExp(allocator, access_token);
-
-    // Check expiration — skip if already expired (past the 300s buffer)
-    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at) {
-        allocator.free(access_token);
-        if (refresh_token) |rt| allocator.free(rt);
-        return null;
-    }
-
-    const token_type = allocator.dupe(u8, "Bearer") catch {
-        allocator.free(access_token);
-        if (refresh_token) |rt| allocator.free(rt);
-        return null;
-    };
-
-    return .{
-        .access_token = access_token,
-        .refresh_token = refresh_token,
-        .expires_at = expires_at,
-        .token_type = token_type,
-    };
-}
-
-/// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
-fn decodeJwtExp(allocator: std.mem.Allocator, token: []const u8) i64 {
-    const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return 0;
-    const rest = token[first_dot + 1 ..];
-    const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse return 0;
-    const payload_b64 = rest[0..second_dot];
-    if (payload_b64.len == 0) return 0;
-
-    const Decoder = std.base64.url_safe_no_pad.Decoder;
-    const decoded_len = Decoder.calcSizeForSlice(payload_b64) catch return 0;
-    const decoded = allocator.alloc(u8, decoded_len) catch return 0;
-    defer allocator.free(decoded);
-    Decoder.decode(decoded, payload_b64) catch return 0;
-
-    const json_parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return 0;
-    defer json_parsed.deinit();
-
-    const obj = switch (json_parsed.value) {
-        .object => |o| o,
-        else => return 0,
-    };
-
-    if (obj.get("exp")) |exp_val| {
-        switch (exp_val) {
-            .integer => |i| return i,
-            .float => |f| return @intFromFloat(f),
-            else => {},
-        }
-    }
-    return 0;
+    return codex_support.loadCodexCliToken(allocator);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

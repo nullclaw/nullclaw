@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -29,23 +31,23 @@ pub const ImageInfoTool = struct {
             return ToolResult.fail("Missing 'path' parameter");
 
         // Open file — try absolute path first, fall back to cwd-relative
-        const file = if (std.fs.path.isAbsolute(path))
-            std.fs.openFileAbsolute(path, .{}) catch |err| {
+        const file = if (std_compat.fs.path.isAbsolute(path))
+            std_compat.fs.openFileAbsolute(path, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "File not found: {s} ({s})", .{ path, @errorName(err) });
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             }
         else
-            std.fs.cwd().openFile(path, .{}) catch |err| {
+            std_compat.fs.cwd().openFile(path, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "File not found: {s} ({s})", .{ path, @errorName(err) });
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
         return executeWithFile(file, allocator, path);
     }
 
-    fn executeWithFile(file: std.fs.File, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
+    fn executeWithFile(file: std_compat.fs.File, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
         defer file.close();
 
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         if (stat.size > MAX_IMAGE_BYTES) {
             const msg = try std.fmt.allocPrint(
                 allocator,

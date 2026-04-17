@@ -32,6 +32,8 @@ const DEFAULT_COUNT: usize = 5;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Upper bound for provider chain size (primary + fallbacks + auto expansions).
 const MAX_PROVIDER_CHAIN: usize = 16;
+const WEB_SEARCH_SETUP_HINT =
+    "web_search is not configured with a reliable provider. Configure http_request.search_base_url for SearXNG or set one of BRAVE_API_KEY, FIRECRAWL_API_KEY, TAVILY_API_KEY, PERPLEXITY_API_KEY, EXA_API_KEY, JINA_API_KEY, or WEB_SEARCH_API_KEY. DuckDuckGo is best-effort only.";
 
 const SearchProvider = enum {
     auto,
@@ -46,6 +48,11 @@ const SearchProvider = enum {
 };
 
 const ProviderSearchError = search_common.ProviderSearchError;
+
+const FailureEntry = struct {
+    provider: SearchProvider,
+    err: ProviderSearchError,
+};
 
 /// Web search tool supporting multiple providers.
 pub const WebSearchTool = struct {
@@ -88,20 +95,25 @@ pub const WebSearchTool = struct {
             else => return err,
         };
 
-        var failures: std.ArrayList(u8) = .empty;
+        var failures: std.ArrayList(FailureEntry) = .empty;
         defer failures.deinit(allocator);
 
         for (chain) |provider| {
-            const result = executeWithProvider(self, allocator, provider, query, count) catch |err| {
-                if (err == error.InvalidSearchBaseUrl) {
-                    return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search] or local http://host[:port][/search]");
-                }
-
-                if (failures.items.len > 0) {
-                    try failures.appendSlice(allocator, " | ");
-                }
-                try std.fmt.format(failures.writer(allocator), "{s}:{s}", .{ providerName(provider), @errorName(err) });
-                continue;
+            const result = executeWithProvider(self, allocator, provider, query, count) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.InvalidSearchBaseUrl => return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search] or local http://host[:port][/search]"),
+                error.InvalidProvider,
+                error.MissingApiKey,
+                error.ProviderUnavailable,
+                error.RequestFailed,
+                error.InvalidResponse,
+                => {
+                    try failures.append(allocator, .{
+                        .provider = provider,
+                        .err = @errorCast(err),
+                    });
+                    continue;
+                },
             };
             return result;
         }
@@ -110,7 +122,7 @@ pub const WebSearchTool = struct {
             return ToolResult.fail("web_search has no providers configured.");
         }
 
-        const msg = try std.fmt.allocPrint(allocator, "All web_search providers failed: {s}", .{failures.items});
+        const msg = try buildSearchFailureMessage(allocator, self, failures.items);
         return ToolResult{ .success = false, .output = "", .error_msg = msg };
     }
 };
@@ -151,6 +163,63 @@ fn appendProviderUnique(chain: []SearchProvider, len: *usize, provider: SearchPr
         chain[len.*] = provider;
         len.* += 1;
     }
+}
+
+fn hasConfiguredSearxngBaseUrl(base_url: ?[]const u8) bool {
+    const trimmed = std.mem.trim(u8, base_url orelse return false, " \t\n\r");
+    return trimmed.len > 0;
+}
+
+fn shouldIncludeSetupHint(self: *WebSearchTool, failures: []const FailureEntry) bool {
+    if (hasConfiguredSearxngBaseUrl(self.searxng_base_url)) return false;
+
+    var saw_reliable_provider_gap = false;
+    for (failures) |failure| {
+        if (failure.err == error.MissingApiKey) {
+            saw_reliable_provider_gap = true;
+            continue;
+        }
+
+        if (failure.provider == .duckduckgo) {
+            saw_reliable_provider_gap = true;
+            continue;
+        }
+
+        if (failure.provider == .searxng and failure.err == error.ProviderUnavailable) {
+            saw_reliable_provider_gap = true;
+            continue;
+        }
+
+        return false;
+    }
+    return saw_reliable_provider_gap;
+}
+
+fn buildSearchFailureSummary(allocator: std.mem.Allocator, failures: []const FailureEntry) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    for (failures, 0..) |failure, i| {
+        if (i > 0) try buf.appendSlice(allocator, " | ");
+        try buf.print(allocator, "{s}:{s}", .{ providerName(failure.provider), @errorName(failure.err) });
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn buildSearchFailureMessage(
+    allocator: std.mem.Allocator,
+    self: *WebSearchTool,
+    failures: []const FailureEntry,
+) ![]u8 {
+    const summary = try buildSearchFailureSummary(allocator, failures);
+    defer allocator.free(summary);
+
+    if (shouldIncludeSetupHint(self, failures)) {
+        return std.fmt.allocPrint(allocator, "{s} Last attempts: {s}", .{ WEB_SEARCH_SETUP_HINT, summary });
+    }
+
+    return std.fmt.allocPrint(allocator, "All web_search providers failed: {s}", .{summary});
 }
 
 fn buildProviderChain(
@@ -323,7 +392,8 @@ test "WebSearchTool without working provider chain returns aggregate error" {
     const result = try wst.execute(testing.allocator, parsed.value.object);
     defer if (result.error_msg) |e| testing.allocator.free(e);
     try testing.expect(!result.success);
-    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "All web_search providers failed") != null);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "web_search is not configured with a reliable provider") != null);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "BRAVE_API_KEY") != null);
 }
 
 test "WebSearchTool invalid searxng URL reports config error" {
@@ -333,6 +403,62 @@ test "WebSearchTool invalid searxng URL reports config error" {
     const result = try wst.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
     try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid http_request.search_base_url") != null);
+}
+
+test "buildSearchFailureMessage keeps aggregate error when searxng is configured" {
+    var wst = WebSearchTool{ .searxng_base_url = "https://searx.example.com" };
+    const failures = [_]FailureEntry{
+        .{ .provider = .searxng, .err = error.RequestFailed },
+        .{ .provider = .brave, .err = error.MissingApiKey },
+    };
+
+    const msg = try buildSearchFailureMessage(testing.allocator, &wst, &failures);
+    defer testing.allocator.free(msg);
+
+    try testing.expect(std.mem.indexOf(u8, msg, "All web_search providers failed") != null);
+}
+
+test "shouldIncludeSetupHint tolerates duckduckgo best-effort failure" {
+    var wst = WebSearchTool{};
+    const failures = [_]FailureEntry{
+        .{ .provider = .brave, .err = error.MissingApiKey },
+        .{ .provider = .duckduckgo, .err = error.RequestFailed },
+    };
+
+    try testing.expect(shouldIncludeSetupHint(&wst, &failures));
+}
+
+test "shouldIncludeSetupHint treats missing searxng base URL as setup gap" {
+    var wst = WebSearchTool{};
+    const failures = [_]FailureEntry{
+        .{ .provider = .searxng, .err = error.ProviderUnavailable },
+    };
+
+    try testing.expect(shouldIncludeSetupHint(&wst, &failures));
+}
+
+test "WebSearchTool explicit searxng without base URL returns setup guidance" {
+    // Regression: issue #812 should point explicit searxng users to search_base_url setup.
+    var wst = WebSearchTool{ .provider = "searxng" };
+    const parsed = try root.parseTestArgs("{\"query\":\"zig\"}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
+
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "http_request.search_base_url") != null);
+}
+
+test "WebSearchTool explicit duckduckgo returns setup guidance when it fails" {
+    // Regression: issue #812 should explain that duckduckgo alone is best-effort only.
+    var wst = WebSearchTool{ .provider = "duckduckgo" };
+    const parsed = try root.parseTestArgs("{\"query\":\"zig\"}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
+
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "DuckDuckGo is best-effort only") != null);
 }
 
 test "parseProvider accepts aliases" {

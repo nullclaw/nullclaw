@@ -61,3 +61,43 @@ fn validated(raw: []const u8) ?[]const u8 {
 
     return trimmed;
 }
+
+test "normalizeEndpoint appends /search when missing" {
+    const allocator = std.testing.allocator;
+    const result = try normalizeEndpoint(allocator, "https://example.com");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("https://example.com/search", result);
+}
+
+test "normalizeEndpoint trims whitespace and trailing slash" {
+    const allocator = std.testing.allocator;
+    const result = try normalizeEndpoint(allocator, " \n\thttps://example.com/search/\r\n");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("https://example.com/search", result);
+}
+
+test "normalizeEndpoint appends /search for private http hosts" {
+    const allocator = std.testing.allocator;
+
+    const lan_result = try normalizeEndpoint(allocator, "http://192.168.1.10:8888/");
+    defer allocator.free(lan_result);
+    try std.testing.expectEqualStrings("http://192.168.1.10:8888/search", lan_result);
+
+    const local_tld_result = try normalizeEndpoint(allocator, "http://searx.local");
+    defer allocator.free(local_tld_result);
+    try std.testing.expectEqualStrings("http://searx.local/search", local_tld_result);
+}
+
+test "normalizeEndpoint preserves canonical local endpoint" {
+    const allocator = std.testing.allocator;
+    const result = try normalizeEndpoint(allocator, "http://[::1]:8888/search");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("http://[::1]:8888/search", result);
+}
+
+test "normalizeEndpoint returns error for invalid URL" {
+    try std.testing.expectError(error.InvalidSearchBaseUrl, normalizeEndpoint(std.testing.allocator, ""));
+    try std.testing.expectError(error.InvalidSearchBaseUrl, normalizeEndpoint(std.testing.allocator, "ftp://bad"));
+    try std.testing.expectError(error.InvalidSearchBaseUrl, normalizeEndpoint(std.testing.allocator, "http://searx.example.com/search"));
+    try std.testing.expectError(error.InvalidSearchBaseUrl, normalizeEndpoint(std.testing.allocator, "https://example.com/custom"));
+}

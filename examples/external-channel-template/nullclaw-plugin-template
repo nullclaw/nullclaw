@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+"""Minimal ExternalChannel JSON-RPC plugin template.
+
+Copy this file into a new repository or rename it for your channel-specific
+plugin. It intentionally contains only the generic lifecycle and protocol glue.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any
+
+
+class JsonRpcError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class ExternalChannelTemplate:
+    def __init__(self) -> None:
+        self.runtime_name = "template_channel"
+        self.account_id = "default"
+        self.state_dir: str | None = None
+        self.running = False
+        self.config: dict[str, Any] = {}
+
+    def run(self) -> None:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            self.handle_line(line)
+
+    def handle_line(self, line: str) -> None:
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            self.log(f"ignoring malformed JSON-RPC line: {exc}")
+            return
+
+        request_id = request.get("id")
+        method = request.get("method")
+        params = request.get("params")
+
+        if not isinstance(method, str):
+            if request_id is not None:
+                self.respond_error(request_id, -32600, "invalid request")
+            return
+
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            if request_id is not None:
+                self.respond_error(request_id, -32602, "params must be an object")
+            return
+
+        try:
+            result = self.dispatch(method, params)
+        except JsonRpcError as exc:
+            if request_id is not None:
+                self.respond_error(request_id, exc.code, exc.message)
+            return
+        except Exception as exc:  # pragma: no cover - defensive runtime path
+            self.log(f"request failed for method={method}: {exc}")
+            if request_id is not None:
+                self.respond_error(request_id, -32000, str(exc))
+            return
+
+        if request_id is not None:
+            self.respond_result(request_id, result)
+
+    def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method == "get_manifest":
+            return {
+                "protocol_version": 2,
+                "capabilities": {
+                    "health": True,
+                    "streaming": False,
+                    "send_rich": False,
+                    "typing": False,
+                    "edit": False,
+                    "delete": False,
+                    "reactions": False,
+                    "read_receipts": False,
+                },
+            }
+        if method == "start":
+            return self.start(params)
+        if method == "stop":
+            return {"stopped": self.stop()}
+        if method == "health":
+            return self.health()
+        if method == "send":
+            return self.send(params)
+        raise JsonRpcError(-32601, f"unknown method: {method}")
+
+    def start(self, params: dict[str, Any]) -> dict[str, Any]:
+        runtime = params.get("runtime")
+        if not isinstance(runtime, dict):
+            raise JsonRpcError(-32602, "runtime must be an object")
+
+        config = params.get("config")
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise JsonRpcError(-32602, "config must be an object")
+
+        runtime_name = str(runtime.get("name") or "").strip()
+        if not runtime_name:
+            raise JsonRpcError(-32602, "runtime.name is required")
+
+        self.runtime_name = runtime_name
+        self.account_id = str(runtime.get("account_id") or "default").strip() or "default"
+        state_dir = runtime.get("state_dir")
+        self.state_dir = str(state_dir).strip() if isinstance(state_dir, str) and state_dir.strip() else None
+        self.config = config
+        self.running = True
+
+        # Start your receiver thread, webhook listener, or bridge connection here.
+        return {"started": True}
+
+    def stop(self) -> bool:
+        self.running = False
+        # Stop background workers or network connections here.
+        return True
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "healthy": self.running,
+            "connected": self.running,
+        }
+
+    def send(self, params: dict[str, Any]) -> dict[str, Any]:
+        runtime = params.get("runtime")
+        if not isinstance(runtime, dict):
+            raise JsonRpcError(-32602, "runtime must be an object")
+        if str(runtime.get("name") or "").strip() != self.runtime_name:
+            raise JsonRpcError(-32602, "runtime.name mismatch")
+        if str(runtime.get("account_id") or "").strip() != self.account_id:
+            raise JsonRpcError(-32602, "runtime.account_id mismatch")
+
+        message = params.get("message")
+        if not isinstance(message, dict):
+            raise JsonRpcError(-32602, "message must be an object")
+
+        target = str(message.get("target") or "").strip()
+        if not target:
+            raise JsonRpcError(-32602, "message.target is required")
+
+        text = str(message.get("text") or "")
+        stage = str(message.get("stage") or "final")
+        self.log(f"send target={target} stage={stage} text={text!r}")
+
+        # Replace this with your real outbound delivery logic.
+        # If you later advertise edit/delete support, also return a stable
+        # message_id here so the host can call edit_message/delete_message.
+        # Example: {"accepted": True, "message_id": "platform-message-id"}
+        return {"accepted": True}
+
+    def emit_inbound_message(
+        self,
+        sender_id: str,
+        chat_id: str,
+        text: str,
+        *,
+        session_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        media: list[str] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "message": {
+                "sender_id": sender_id,
+                "chat_id": chat_id,
+                "text": text,
+            }
+        }
+        if session_key:
+            payload["message"]["session_key"] = session_key
+        if metadata:
+            payload["message"]["metadata"] = metadata
+        if media:
+            payload["message"]["media"] = media
+        self.notify("inbound_message", payload)
+
+    def respond_result(self, request_id: Any, result: Any) -> None:
+        self.write_line({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    def respond_error(self, request_id: Any, code: int, message: str) -> None:
+        self.write_line(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": code,
+                    "message": message,
+                },
+            }
+        )
+
+    def notify(self, method: str, params: dict[str, Any]) -> None:
+        self.write_line({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def write_line(self, payload: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    def log(self, message: str) -> None:
+        print(f"[external-channel-template] {message}", file=sys.stderr, flush=True)
+
+
+def main() -> int:
+    plugin = ExternalChannelTemplate()
+    plugin.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

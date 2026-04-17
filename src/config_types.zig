@@ -1,5 +1,7 @@
 const std = @import("std");
+const net_security = @import("net_security.zig");
 const search_base_url = @import("search_base_url.zig");
+const tunnel_mod = @import("tunnel.zig");
 
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
@@ -36,6 +38,26 @@ pub const SandboxBackend = enum {
 // ── Provider entry (for "providers" config section) ─────────────
 
 pub const ProviderEntry = struct {
+    pub const ApiMode = enum {
+        chat_completions,
+        responses,
+        invalid,
+
+        pub fn parse(raw: []const u8) ApiMode {
+            if (std.mem.eql(u8, raw, "chat_completions")) return .chat_completions;
+            if (std.mem.eql(u8, raw, "responses")) return .responses;
+            return .invalid;
+        }
+
+        pub fn toSlice(self: ApiMode) []const u8 {
+            return switch (self) {
+                .chat_completions => "chat_completions",
+                .responses => "responses",
+                .invalid => "invalid",
+            };
+        }
+    };
+
     name: []const u8,
     /// Provider credential payload.
     /// Usually a string API key/token.
@@ -49,6 +71,44 @@ pub const ProviderEntry = struct {
     /// Optional User-Agent header for HTTP requests to this provider.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Primary OpenAI-compatible protocol to use for this provider.
+    /// Defaults to chat_completions for backward compatibility.
+    api_mode: ApiMode = .chat_completions,
+    /// When true, include `chat_template_kwargs.enable_thinking` in
+    /// OpenAI-compatible chat requests based on `reasoning_effort`.
+    /// Useful for custom vLLM/Qwen endpoints that require chat-template
+    /// toggles instead of standard OpenAI reasoning fields.
+    chat_template_enable_thinking_param: bool = false,
+    /// Maximum estimated request text bytes before the streaming path is
+    /// skipped and a non-streaming POST is used instead.
+    /// null means no limit — streaming is always attempted (recommended for
+    /// modern LLMs with large context windows).
+    /// When set, 0 forces the non-streaming path for every request and any
+    /// positive value applies that byte threshold. Example: 524288 for 512 KiB.
+    max_streaming_prompt_bytes: ?usize = null,
+    /// Optional compact JSON string of additional key-value pairs to merge into
+    /// request bodies for OpenAI-compatible providers. The encoded value must
+    /// be a JSON object.
+    extra_body_params: ?[]const u8 = null,
+
+    /// Provider base URLs must be absolute http(s) URLs with no query/fragment.
+    /// Plain HTTP is accepted only for local/private hosts so intentional
+    /// loopback and LAN providers keep working.
+    pub fn isValidBaseUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n?#") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (uri.query != null or uri.fragment != null) return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host = net_security.extractHost(trimmed) orelse return false;
+        if (is_http and !net_security.isLocalHost(host)) return false;
+        return true;
+    }
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────
@@ -64,9 +124,15 @@ pub const AudioMediaConfig = struct {
 // ── Sub-config structs ──────────────────────────────────────────
 
 pub const DiagnosticsConfig = struct {
+    pub const OtelHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    otel_headers: []const OtelHeaderEntry = &.{},
     /// Optional max length for user-visible provider/API errors after scrubbing.
     /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
     api_error_max_chars: ?u32 = null,
@@ -91,6 +157,64 @@ pub const DiagnosticsConfig = struct {
     token_usage_ledger_max_bytes: u64 = 0,
     /// Maximum number of JSONL rows before reset. 0 disables row-limit reset.
     token_usage_ledger_max_lines: u64 = 0,
+
+    /// OTLP endpoint must be an absolute HTTPS URL, or a local/private HTTP URL
+    /// when exporting to a collector on the same machine, private network, or
+    /// container runtime bridge.
+    pub fn isValidOtelEndpoint(raw: []const u8) bool {
+        var trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
+            trimmed = trimmed[0 .. trimmed.len - 1];
+        }
+        if (trimmed.len == 0) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+        if (host[0] == ':') return false;
+
+        if (is_http and !isPrivateOtelCollectorHost(host)) return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (uri.query != null or uri.fragment != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
+        return true;
+    }
+
+    fn isPrivateOtelCollectorHost(host: []const u8) bool {
+        if (net_security.isLocalHost(host)) return true;
+
+        const bare = if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]"))
+            host[1 .. host.len - 1]
+        else
+            host;
+        if (bare.len == 0) return false;
+
+        // Container networks commonly expose services by a single-label DNS
+        // name such as `otel`. Keep the plaintext OTEL exception scoped to
+        // runtime-local service names rather than broader dotted domains.
+        if (std.mem.indexOfScalar(u8, bare, '.') == null and std.mem.indexOfScalar(u8, bare, ':') == null) {
+            return true;
+        }
+
+        return false;
+    }
 };
 
 pub const AutonomyConfig = struct {
@@ -140,6 +264,14 @@ pub const ReliabilityConfig = struct {
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},
+};
+
+pub const InboundMessagesConfig = struct {
+    debounce_ms: u32 = 3_000,
+};
+
+pub const MessagesConfig = struct {
+    inbound: InboundMessagesConfig = .{},
 };
 
 pub const SchedulerConfig = struct {
@@ -194,6 +326,9 @@ pub const AgentConfig = struct {
     status_show_emojis: bool = true,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 600,
+    /// Timezone label used for prompt date/time section.
+    /// Supported values: "UTC", "UTC+HH:MM", "UTC-HH:MM".
+    timezone: []const u8 = "UTC",
     /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
     /// See ToolFilterGroup for semantics.
     tool_filter_groups: []const ToolFilterGroup = &.{},
@@ -204,6 +339,28 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+
+    pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
+        if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
+        if (raw.len != 9) return null;
+        if (!std.ascii.eqlIgnoreCase(raw[0..3], "UTC")) return null;
+
+        const sign = raw[3];
+        if (sign != '+' and sign != '-') return null;
+        if (raw[6] != ':') return null;
+
+        const hours = std.fmt.parseInt(i64, raw[4..6], 10) catch return null;
+        const minutes = std.fmt.parseInt(i64, raw[7..9], 10) catch return null;
+        if (hours < 0 or hours > 23) return null;
+        if (minutes < 0 or minutes > 59) return null;
+
+        const total = hours * 3600 + minutes * 60;
+        return if (sign == '-') -total else total;
+    }
+
+    pub fn isValidTimezone(raw: []const u8) bool {
+        return parseTimezoneOffsetSeconds(raw) != null;
+    }
 };
 
 pub const ToolsConfig = struct {
@@ -260,11 +417,12 @@ pub const ToolCustomization = struct {
     /// Example: "Screenshot saved: {output}"
     skip_llm_tpl: ?[]const u8 = null,
     /// Trigger-specific arguments mapping for direct tool execution (pre-LLM mode).
+    /// Stored internally as a compact JSON object string to keep ownership explicit.
     /// Key is the argsKey from trigger suffix (e.g., "ls" from "查看目录::ls").
     /// Special key "default" is used when trigger has no suffix or suffix not found.
     /// Format: {"default": {"command": "ls"}, "ps": {"command": "ps aux"}}
     /// Supports variable substitution in values: {workspace_dir}, {timestamp}, {date}, {time}, {home}
-    trigger_arguments: ?std.json.Value = null,
+    trigger_arguments: ?[]const u8 = null,
 };
 
 pub const ModelRouteCostClass = enum {
@@ -309,6 +467,45 @@ pub const TelegramInteractiveConfig = struct {
     remove_on_click: bool = true,
 };
 
+pub const TelegramReactionEmojisConfig = struct {
+    accepted: []const u8 = "👀",
+    running: []const u8 = "⚡",
+    done: []const u8 = "👍",
+    failed: []const u8 = "💔",
+};
+
+pub const TelegramCommandsMenuMode = enum {
+    off,
+    flat,
+    scoped,
+};
+
+pub const MaxListenerMode = enum {
+    polling,
+    webhook,
+};
+
+pub const MaxInteractiveConfig = struct {
+    enabled: bool = false,
+    ttl_secs: u64 = 900,
+    owner_only: bool = true,
+};
+
+pub const MaxConfig = struct {
+    account_id: []const u8 = "default",
+    bot_token: []const u8,
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+    proxy: ?[]const u8 = null,
+    mode: MaxListenerMode = .polling,
+    webhook_url: ?[]const u8 = null,
+    webhook_secret: ?[]const u8 = null,
+    interactive: MaxInteractiveConfig = .{},
+    require_mention: bool = false,
+    streaming: bool = true,
+};
+
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
@@ -322,8 +519,25 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
-    /// Stream partial responses to users via sendMessageDraft before the final message.
+    /// Enable streaming response generation for Telegram. When combined with
+    /// `draft_previews=true`, partial responses are shown via sendMessageDraft.
     streaming: bool = true,
+    /// Show ephemeral sendMessageDraft previews while the reply is still being generated.
+    /// Disabled by default because Telegram drafts can disappear and reappear in a confusing way.
+    draft_previews: bool = false,
+    /// Show task lifecycle on the triggering user message via Telegram reactions.
+    status_reactions: bool = false,
+    /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.
+    reaction_emojis: TelegramReactionEmojisConfig = .{},
+    /// Enable Telegram-specific binding commands such as /bind.
+    binding_commands_enabled: bool = true,
+    /// Enable Telegram-specific topic management commands such as /topic.
+    topic_commands_enabled: bool = true,
+    /// Enable Telegram-specific topic/session map command such as /topics.
+    topic_map_command_enabled: bool = true,
+    /// Publish Telegram slash-command menu:
+    /// off = clear it, flat = one global list, scoped = separate private/group menus.
+    commands_menu_mode: TelegramCommandsMenuMode = .flat,
 };
 
 pub const DiscordConfig = struct {
@@ -363,6 +577,17 @@ pub const SlackConfig = struct {
     reply_to_mode: SlackReplyToMode = .off,
 };
 
+pub const TeamsConfig = struct {
+    account_id: []const u8 = "default",
+    client_id: []const u8,
+    client_secret: []const u8,
+    tenant_id: []const u8,
+    webhook_secret: ?[]const u8 = null,
+    notification_channel_id: ?[]const u8 = null,
+    bot_id: ?[]const u8 = null,
+    config_dir: []const u8 = ".",
+};
+
 pub const WebhookConfig = struct {
     port: u16 = 8080,
     secret: ?[]const u8 = null,
@@ -385,7 +610,9 @@ pub const MatrixConfig = struct {
     user_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
+    dm_policy: []const u8 = "allowlist",
     group_policy: []const u8 = "allowlist",
+    require_mention: bool = false,
 };
 
 pub const MattermostConfig = struct {
@@ -442,12 +669,51 @@ pub const LarkConfig = struct {
     allow_from: []const []const u8 = &.{},
     receive_mode: LarkReceiveMode = .websocket,
     port: ?u16 = null,
+    reaction_emojis: []const []const u8 = &.{},
 };
 
 pub const DingTalkConfig = struct {
     account_id: []const u8 = "default",
     client_id: []const u8,
     client_secret: []const u8,
+    allow_from: []const []const u8 = &.{},
+    ai_card_template_id: ?[]const u8 = null,
+    ai_card_streaming_key: ?[]const u8 = null,
+};
+
+pub const WeChatConfig = struct {
+    account_id: []const u8 = "default",
+    /// Callback verification token used by WeChat signature check.
+    callback_token: []const u8,
+    /// WeChat EncodingAESKey (43 chars base64 sem padding) para callbacks seguros (encrypt_type=aes).
+    encoding_aes_key: ?[]const u8 = null,
+    /// Optional Official Account app id (reserved for outbound API support).
+    app_id: ?[]const u8 = null,
+    /// Optional Official Account app secret (reserved for outbound API support).
+    app_secret: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+};
+
+pub const WeComConfig = struct {
+    account_id: []const u8 = "default",
+    webhook_url: []const u8,
+    /// Callback verification token (used to compute/verify msg_signature).
+    callback_token: ?[]const u8 = null,
+    /// WeCom EncodingAESKey (43 chars base64 without padding) used to decrypt callback payloads.
+    encoding_aes_key: ?[]const u8 = null,
+    /// Expected receiver ID (typically CorpID) for decrypted callback validation.
+    corp_id: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+};
+
+pub const WeixinConfig = struct {
+    account_id: []const u8 = "default",
+    /// Bot token obtained from iLink QR code login flow.
+    token: []const u8 = "",
+    /// iLink API base URL (may be region-specific after login redirect).
+    base_url: []const u8 = "https://ilinkai.weixin.qq.com/",
+    /// Optional HTTP proxy URL for API requests.
+    proxy: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
 };
 
@@ -528,6 +794,7 @@ pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
     pub const DEFAULT_TRANSPORT: []const u8 = "local";
     pub const DEFAULT_MESSAGE_AUTH_MODE: []const u8 = "pairing";
+    pub const DEFAULT_MAX_HANDSHAKE_SIZE: u16 = 8_192;
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
@@ -546,6 +813,9 @@ pub const WebConfig = struct {
     listen: []const u8 = "127.0.0.1",
     path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
+    /// Max bytes allowed for the HTTP upgrade request headers during WS handshake.
+    /// Increase this when running behind reverse proxies that append many headers.
+    max_handshake_size: u16 = DEFAULT_MAX_HANDSHAKE_SIZE,
     /// Optional WebSocket-upgrade auth token for browser/extension clients.
     /// Used for WebSocket-upgrade hardening and for `message_auth_mode="token"`.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
@@ -726,6 +996,50 @@ pub const NostrConfig = struct {
     config_dir: []const u8 = ".",
 };
 
+pub const ExternalChannelConfig = struct {
+    pub const EnvEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub const TransportConfig = struct {
+        command: []const u8 = "",
+        args: []const []const u8 = &.{},
+        env: []const EnvEntry = &.{},
+        timeout_ms: u32 = 10_000,
+    };
+
+    account_id: []const u8 = "default",
+    /// Runtime channel identifier exposed inside nullclaw routing and bindings.
+    /// Example: "whatsapp_web"
+    runtime_name: []const u8 = "",
+    /// Plugin process transport configuration (JSON-RPC over stdio).
+    transport: TransportConfig = .{},
+    /// Raw JSON object forwarded as params.config during the start request.
+    plugin_config_json: []const u8 = "{}",
+    /// Runtime-only host-owned state directory for plugin persistence.
+    /// Backfilled by Config.load(); never serialized.
+    state_dir: []const u8 = ".",
+
+    pub fn isValidRuntimeName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 128) return false;
+        for (trimmed) |ch| {
+            if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') continue;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn hasCommand(raw: []const u8) bool {
+        return std.mem.trim(u8, raw, " \t\r\n").len > 0;
+    }
+
+    pub fn isValidTimeoutMs(timeout_ms: u32) bool {
+        return timeout_ms >= 1 and timeout_ms <= 600_000;
+    }
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
     telegram: []const TelegramConfig = &.{},
@@ -736,9 +1050,13 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
+    teams: []const TeamsConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
+    wechat: []const WeChatConfig = &.{},
+    wecom: []const WeComConfig = &.{},
+    weixin: []const WeixinConfig = &.{},
     signal: []const SignalConfig = &.{},
     email: []const EmailConfig = &.{},
     line: []const LineConfig = &.{},
@@ -746,6 +1064,8 @@ pub const ChannelsConfig = struct {
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
+    max: []const MaxConfig = &.{},
+    external: []const ExternalChannelConfig = &.{},
     nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
@@ -787,6 +1107,9 @@ pub const ChannelsConfig = struct {
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
     }
+    pub fn teamsPrimary(self: *const ChannelsConfig) ?TeamsConfig {
+        return primaryAccount(TeamsConfig, self.teams);
+    }
     pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
         return primaryAccount(IrcConfig, self.irc);
     }
@@ -795,6 +1118,15 @@ pub const ChannelsConfig = struct {
     }
     pub fn dingtalkPrimary(self: *const ChannelsConfig) ?DingTalkConfig {
         return primaryAccount(DingTalkConfig, self.dingtalk);
+    }
+    pub fn wechatPrimary(self: *const ChannelsConfig) ?WeChatConfig {
+        return primaryAccount(WeChatConfig, self.wechat);
+    }
+    pub fn wecomPrimary(self: *const ChannelsConfig) ?WeComConfig {
+        return primaryAccount(WeComConfig, self.wecom);
+    }
+    pub fn weixinPrimary(self: *const ChannelsConfig) ?WeixinConfig {
+        return primaryAccount(WeixinConfig, self.weixin);
     }
     pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
         return primaryAccount(EmailConfig, self.email);
@@ -813,6 +1145,12 @@ pub const ChannelsConfig = struct {
     }
     pub fn webPrimary(self: *const ChannelsConfig) ?WebConfig {
         return primaryAccount(WebConfig, self.web);
+    }
+    pub fn maxPrimary(self: *const ChannelsConfig) ?MaxConfig {
+        return primaryAccount(MaxConfig, self.max);
+    }
+    pub fn externalPrimary(self: *const ChannelsConfig) ?ExternalChannelConfig {
+        return primaryAccount(ExternalChannelConfig, self.external);
     }
 };
 
@@ -866,12 +1204,15 @@ pub const MemoryConfig = struct {
     postgres: MemoryPostgresConfig = .{},
     redis: MemoryRedisConfig = .{},
     api: MemoryApiConfig = .{},
+    clickhouse: MemoryClickHouseConfig = .{},
     retrieval_stages: MemoryRetrievalStagesConfig = .{},
     summarizer: MemorySummarizerConfig = .{},
 
     /// Apply profile defaults. Only sets fields that are still at their default values,
     /// so explicit user overrides always win (profile is applied AFTER parsing).
     pub fn applyProfileDefaults(self: *MemoryConfig) void {
+        const rollout_off = "off";
+        const rollout_on = "on";
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
             .hybrid_keyword => {
@@ -881,7 +1222,10 @@ pub const MemoryConfig = struct {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
             .markdown_only => {
-                // Base default is already markdown.
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "markdown";
+                if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
+                if (!self.search.query.hybrid.temporal_decay.enabled) self.search.query.hybrid.temporal_decay.enabled = true;
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .postgres_keyword => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
@@ -891,14 +1235,14 @@ pub const MemoryConfig = struct {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
-                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .postgres_hybrid => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
                 if (std.mem.eql(u8, self.search.store.kind, "auto")) self.search.store.kind = "pgvector";
-                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .minimal_none => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "none";
@@ -1081,6 +1425,17 @@ pub const MemoryApiConfig = struct {
     namespace: []const u8 = "",
 };
 
+pub const MemoryClickHouseConfig = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 8123,
+    database: []const u8 = "default",
+    table: []const u8 = "memories",
+    user: []const u8 = "",
+    password: []const u8 = "",
+    /// Plain HTTP is accepted only for loopback hosts; remote endpoints must use HTTPS.
+    use_https: bool = false,
+};
+
 pub const MemoryRetrievalStagesConfig = struct {
     query_expansion_enabled: bool = false,
     adaptive_retrieval_enabled: bool = false,
@@ -1100,9 +1455,13 @@ pub const MemorySummarizerConfig = struct {
 
 // ── Tunnel config ───────────────────────────────────────────────
 
-pub const TunnelConfig = struct {
-    provider: []const u8 = "none",
-};
+// Re-export tunnel config types from tunnel.zig so config parsing stays
+// aligned with the runtime tunnel factory shape.
+pub const CloudflareTunnelConfig = tunnel_mod.CloudflareTunnelConfig;
+pub const TailscaleTunnelConfig = tunnel_mod.TailscaleTunnelConfig;
+pub const NgrokTunnelConfig = tunnel_mod.NgrokTunnelConfig;
+pub const CustomTunnelConfig = tunnel_mod.CustomTunnelConfig;
+pub const TunnelConfig = tunnel_mod.TunnelFullConfig;
 
 // ── Gateway config ──────────────────────────────────────────────
 
@@ -1115,6 +1474,27 @@ pub const GatewayConfig = struct {
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
+    /// Maximum HTTP request body size in bytes.
+    /// Default 65536 (64 KB). Raise this when the gateway is configured
+    /// for multi-modal use and needs to accept image payloads.
+    max_body_size_bytes: usize = 65_536,
+    /// Socket read timeout for incoming HTTP requests in seconds.
+    /// Default 30s. Raise this when accepting large payloads (e.g. images)
+    /// over slow or high-latency connections.
+    request_timeout_secs: u64 = 30,
+};
+
+// ── A2A (Agent-to-Agent) protocol config ────────────────────────
+
+pub const A2aConfig = struct {
+    enabled: bool = false,
+    name: []const u8 = "NullClaw",
+    description: []const u8 = "AI assistant",
+    url: []const u8 = "",
+    version: []const u8 = "1.0.0",
+    /// When true, the agent card advertises multi_modal capability,
+    /// signalling that the gateway's model accepts image/file attachments.
+    multi_modal: bool = false,
 };
 
 // ── Composio config ─────────────────────────────────────────────
@@ -1183,8 +1563,9 @@ pub const HttpRequestConfig = struct {
     /// Allowed forms:
     ///   - https://host
     ///   - https://host/search
-    ///   - http://localhost[:port]
-    ///   - http://localhost[:port]/search
+    ///   - http://localhost[:port][/search]
+    ///   - http://192.168.1.10[:port][/search]
+    ///   - http://searx.local[:port][/search]
     pub fn isValidSearchBaseUrl(raw: []const u8) bool {
         return search_base_url.isValid(raw);
     }
@@ -1347,6 +1728,9 @@ pub const NamedAgentConfig = struct {
     provider: []const u8,
     model: []const u8,
     system_prompt: ?[]const u8 = null,
+    /// Runtime-only source path preserved so Config.save() can round-trip file-backed prompts.
+    system_prompt_path: ?[]const u8 = null,
+    workspace_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
@@ -1355,15 +1739,89 @@ pub const NamedAgentConfig = struct {
 // ── MCP Server Config ──────────────────────────────────────────
 
 pub const McpServerConfig = struct {
+    pub const DEFAULT_TRANSPORT = "stdio";
+    pub const HTTP_TRANSPORT = "http";
+
     name: []const u8,
-    command: []const u8,
+    transport: []const u8 = DEFAULT_TRANSPORT,
+    command: []const u8 = "",
+    url: ?[]const u8 = null,
+    /// Per-request wall clock timeout for HTTP transport. 0 = default.
+    timeout_ms: u32 = 10_000,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
+    headers: []const McpHeaderEntry = &.{},
 
     pub const McpEnvEntry = struct {
         key: []const u8,
         value: []const u8,
     };
+
+    pub const McpHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn isValidTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, DEFAULT_TRANSPORT) or std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isHttpTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isValidHttpUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+        if (host[0] == ':') return false;
+
+        // Keep MCP local-http exceptions aligned with shared host safety rules.
+        if (is_http and !net_security.isLocalHost(host)) return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (std.mem.indexOfScalar(u8, trimmed, '#') != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
+        return true;
+    }
+
+    pub fn isValidHeaderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        for (trimmed) |ch| {
+            // RFC 7230 token subset; keep strict to prevent header injection.
+            if (ch <= 0x20 or ch >= 0x7f) return false;
+            if (ch == ':' or ch == '"' or ch == '\\') return false;
+        }
+        return true;
+    }
+
+    pub fn isValidHeaderValue(raw: []const u8) bool {
+        if (std.mem.indexOfAny(u8, raw, "\r\n") != null) return false;
+        return true;
+    }
 };
 
 // ── Model Pricing ──────────────────────────────────────────────
@@ -1396,6 +1854,18 @@ pub const SessionConfig = struct {
     dm_scope: DmScope = .per_channel_peer,
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
+    /// Automatically route direct messages from unknown peers into deterministic
+    /// per-peer agent IDs (agent runtime/workspace/memory isolation).
+    auto_provision_direct_agents: bool = false,
+    /// Optional HMAC secret used to verify `/claim <token>` identity assertions.
+    /// When unset, direct-peer auto-provisioning is not gated by identity claims.
+    claim_secret: ?[]const u8 = null,
+    /// Optional shared secret for manual `/revoke <admin-secret>` operations.
+    claim_admin_secret: ?[]const u8 = null,
+    /// Failed `/claim` attempts allowed before lockout kicks in.
+    claim_max_attempts: u32 = 5,
+    /// Lockout duration in seconds after too many failed claim attempts.
+    claim_lockout_secs: u32 = 300,
     typing_interval_secs: u32 = 5,
     /// Maximum concurrent message processing tasks per channel.
     /// When set to 0 or 1, messages are processed sequentially.
@@ -1411,6 +1881,7 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
+    try std.testing.expectEqual(WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, cfg.max_handshake_size);
     try std.testing.expect(cfg.auth_token == null);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_MESSAGE_AUTH_MODE, cfg.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
@@ -1426,6 +1897,7 @@ test "WebConfig defaults" {
 test "security defaults stay least-privilege" {
     const diagnostics = DiagnosticsConfig{};
     try std.testing.expect(diagnostics.api_error_max_chars == null);
+    try std.testing.expect(diagnostics.otel_endpoint == null);
 
     const autonomy = AutonomyConfig{};
     try std.testing.expectEqual(AutonomyLevel.supervised, autonomy.level);
@@ -1440,6 +1912,69 @@ test "security defaults stay least-privilege" {
     try std.testing.expect(http_request.proxy == null);
     try std.testing.expect(http_request.search_base_url == null);
     try std.testing.expectEqualStrings("auto", http_request.search_provider);
+}
+
+test "McpServerConfig transport validation" {
+    try std.testing.expect(McpServerConfig.isValidTransport("stdio"));
+    try std.testing.expect(McpServerConfig.isValidTransport("http"));
+    try std.testing.expect(!McpServerConfig.isValidTransport("sse"));
+}
+
+test "McpServerConfig http url validation" {
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp#frag"));
+    // Regression: MCP HTTP URLs must stay aligned with shared local-host rules.
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://localhost:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://foo.localhost:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://mcp.local:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://host.docker.internal:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://host.containers.internal:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://127.0.0.1:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://10.0.0.1:8080/rpc"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://192.168.1.1:8080/rpc"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://172.16.0.1:8080/rpc"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://[::1]:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://[fd00::1]:6000/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://example.com:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://100.64.0.1:8931/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://100.120.137.95:8931/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://100.127.255.254:6000/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://100.128.0.1:8080/rpc"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://100.63.0.1:8080/rpc"));
+}
+
+test "DiagnosticsConfig otel endpoint validation" {
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com/collector"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com/"));
+
+    // Regression: OTEL exporters must not allow remote plaintext collectors.
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://localhost:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://127.0.0.1:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://10.0.0.5:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://otel:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://host.docker.internal:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://host.containers.internal:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.com:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.internal:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com?x=1"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com#frag"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("ftp://otel.example.com"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://"));
+}
+
+test "McpServerConfig timeout defaults" {
+    const cfg = McpServerConfig{ .name = "x", .command = "echo" };
+    try std.testing.expectEqual(@as(u32, 10_000), cfg.timeout_ms);
+}
+
+test "McpServerConfig header validation" {
+    try std.testing.expect(McpServerConfig.isValidHeaderName("Authorization"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderName("Bad Header"));
+    try std.testing.expect(McpServerConfig.isValidHeaderValue("Bearer token"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderValue("line1\nline2"));
 }
 
 test "HttpRequestConfig proxy URL validation" {
@@ -1457,11 +1992,32 @@ test "HttpRequestConfig proxy URL validation" {
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com?x=1"));
 }
 
+test "ProviderEntry base URL validation keeps local providers and rejects remote http" {
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("https://api.example.com/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://localhost:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://127.0.0.1:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://192.168.1.10:1234/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("http://api.example.com/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("https://api.example.com/v1?x=1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("ftp://api.example.com/v1"));
+}
+
 test "WebConfig normalizePath trims and normalizes" {
     try std.testing.expectEqualStrings("/ws", WebConfig.normalizePath("/ws/"));
     try std.testing.expectEqualStrings("/relay", WebConfig.normalizePath(" /relay/ "));
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath("relay"));
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath(""));
+}
+
+test "AgentConfig timezone validation accepts UTC and fixed offsets" {
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC"));
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC+05:30"));
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC-03:00"));
+    try std.testing.expect(AgentConfig.isValidTimezone("utc+08:00"));
+
+    try std.testing.expect(!AgentConfig.isValidTimezone("Asia/Shanghai"));
+    try std.testing.expect(!AgentConfig.isValidTimezone("UTC+25:00"));
+    try std.testing.expect(!AgentConfig.isValidTimezone("UTC+08"));
 }
 
 test "WebConfig token validation enforces printable no-whitespace constraints" {
@@ -1542,6 +2098,8 @@ test "HttpRequestConfig search base URL validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/search/"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://192.168.1.10:8888/search"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.local/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://host.docker.internal:8888/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://host.containers.internal:8888/search"));
 
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("ftp://searx.example.com"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));
@@ -1576,4 +2134,49 @@ test "HttpRequestConfig fallback provider validation disallows auto" {
     try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("JINA"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("AUTO"));
+}
+
+test "ProviderEntry.max_streaming_prompt_bytes defaults to null" {
+    // GAP-5: Documents that zero-init ProviderEntry has no streaming limit.
+    const pe = ProviderEntry{ .name = "test" };
+    try std.testing.expectEqual(@as(?usize, null), pe.max_streaming_prompt_bytes);
+}
+
+test "ProviderEntry.api_mode defaults to chat_completions" {
+    const pe = ProviderEntry{ .name = "test" };
+    try std.testing.expectEqual(ProviderEntry.ApiMode.chat_completions, pe.api_mode);
+}
+
+test "markdown_only profile enables markdown retrieval defaults" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+    };
+
+    cfg.applyProfileDefaults();
+
+    try std.testing.expectEqualStrings("markdown", cfg.backend);
+    try std.testing.expect(cfg.search.query.hybrid.enabled);
+    try std.testing.expect(cfg.search.query.hybrid.temporal_decay.enabled);
+    try std.testing.expectEqual(@as(u32, 30), cfg.search.query.hybrid.temporal_decay.half_life_days);
+    try std.testing.expectEqualStrings("on", cfg.reliability.rollout_mode);
+}
+
+test "markdown_only profile preserves explicit half-life override" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+        .search = .{
+            .query = .{
+                .hybrid = .{
+                    .temporal_decay = .{
+                        .half_life_days = 0,
+                    },
+                },
+            },
+        },
+    };
+
+    cfg.applyProfileDefaults();
+
+    // Regression: markdown_only should not clobber an explicit half-life override.
+    try std.testing.expectEqual(@as(u32, 0), cfg.search.query.hybrid.temporal_decay.half_life_days);
 }

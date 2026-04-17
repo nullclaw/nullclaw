@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const net_security = @import("../net_security.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -36,23 +37,12 @@ pub const BrowserOpenTool = struct {
             return ToolResult.fail("Only https:// URLs are allowed");
         }
 
-        // Extract host from URL
-        const rest = url["https://".len..];
-        const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-        const authority = rest[0..host_end];
-
-        if (authority.len == 0) {
+        const host = net_security.extractHost(url) orelse {
             return ToolResult.fail("URL must include a host");
-        }
-
-        // Strip port
-        const host = if (std.mem.indexOf(u8, authority, ":")) |colon|
-            authority[0..colon]
-        else
-            authority;
+        };
 
         // Block localhost and private IPs
-        if (isLocalOrPrivate(host)) {
+        if (net_security.isLocalHost(host)) {
             return ToolResult.fail("Blocked local/private host");
         }
 
@@ -87,21 +77,6 @@ pub const BrowserOpenTool = struct {
         return ToolResult.fail("Browser command failed");
     }
 };
-
-fn isLocalOrPrivate(host: []const u8) bool {
-    if (std.mem.eql(u8, host, "localhost")) return true;
-    if (std.mem.endsWith(u8, host, ".localhost")) return true;
-    if (std.mem.endsWith(u8, host, ".local")) return true;
-    if (std.mem.eql(u8, host, "::1")) return true;
-
-    // Check common private IPv4 ranges
-    if (std.mem.startsWith(u8, host, "10.")) return true;
-    if (std.mem.startsWith(u8, host, "127.")) return true;
-    if (std.mem.startsWith(u8, host, "192.168.")) return true;
-    if (std.mem.startsWith(u8, host, "169.254.")) return true;
-
-    return false;
-}
 
 fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool {
     for (allowed) |domain| {
@@ -202,16 +177,23 @@ test "browser_open rejects private ip" {
     try std.testing.expect(!result.success);
 }
 
-test "isLocalOrPrivate detects localhost" {
-    try std.testing.expect(isLocalOrPrivate("localhost"));
-    try std.testing.expect(isLocalOrPrivate("sub.localhost"));
-    try std.testing.expect(isLocalOrPrivate("host.local"));
-    try std.testing.expect(isLocalOrPrivate("127.0.0.1"));
-    try std.testing.expect(isLocalOrPrivate("10.0.0.1"));
-    try std.testing.expect(isLocalOrPrivate("192.168.1.1"));
-    try std.testing.expect(isLocalOrPrivate("169.254.0.1"));
-    try std.testing.expect(!isLocalOrPrivate("example.com"));
-    try std.testing.expect(!isLocalOrPrivate("google.com"));
+test "browser_open rejects shared and ipv6 local addresses" {
+    const tailscale_domains = [_][]const u8{"100.64.0.1"};
+    var tailscale = BrowserOpenTool{ .allowed_domains = &tailscale_domains };
+    const tailscale_tool = tailscale.tool();
+    const tailscale_args = try root.parseTestArgs("{\"url\": \"https://100.64.0.1\"}");
+    defer tailscale_args.deinit();
+    const tailscale_result = try tailscale_tool.execute(std.testing.allocator, tailscale_args.value.object);
+    try std.testing.expect(!tailscale_result.success);
+
+    // Regression: browser_open must share the same local-host blocking as net_security.
+    const ipv6_domains = [_][]const u8{"[fd00::1]"};
+    var ipv6 = BrowserOpenTool{ .allowed_domains = &ipv6_domains };
+    const ipv6_tool = ipv6.tool();
+    const ipv6_args = try root.parseTestArgs("{\"url\": \"https://[fd00::1]\"}");
+    defer ipv6_args.deinit();
+    const ipv6_result = try ipv6_tool.execute(std.testing.allocator, ipv6_args.value.object);
+    try std.testing.expect(!ipv6_result.success);
 }
 
 test "hostMatchesAllowlist exact and subdomain" {

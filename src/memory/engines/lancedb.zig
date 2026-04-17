@@ -12,6 +12,7 @@
 //! Uses the existing vector/math.zig for cosine similarity and serialization.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -132,7 +133,7 @@ pub const LanceDbMemory = struct {
 
     fn generateUuid(allocator: std.mem.Allocator) ![]u8 {
         var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
+        std_compat.crypto.random.bytes(&buf);
         // Set version 4
         buf[6] = (buf[6] & 0x0f) | 0x40;
         // Set variant bits
@@ -245,7 +246,7 @@ pub const LanceDbMemory = struct {
         const content_z = try self_.allocator.dupeZ(u8, content);
         defer self_.allocator.free(content_z);
 
-        const now = try std.fmt.allocPrint(self_.allocator, "{d}", .{std.time.timestamp()});
+        const now = try std.fmt.allocPrint(self_.allocator, "{d}", .{std_compat.time.timestamp()});
         defer self_.allocator.free(now);
 
         const sql = "INSERT INTO lancedb_memories (id, key, text, embedding, importance, category, created_at, updated_at, session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(key) DO UPDATE SET text=?3, embedding=?4, updated_at=?8";
@@ -577,6 +578,89 @@ pub const LanceDbMemory = struct {
         return try results.toOwnedSlice(allocator);
     }
 
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const db = self_.db orelse return error.NotConnected;
+
+        var results: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+        errdefer {
+            for (results.items) |*e| e.deinit(allocator);
+            results.deinit(allocator);
+        }
+
+        const sql = if (category != null and session_id != null)
+            "SELECT key, text, category, created_at FROM lancedb_memories WHERE category = ?1 AND session_id = ?2 ORDER BY created_at DESC, key DESC LIMIT ?3 OFFSET ?4"
+        else if (category != null)
+            "SELECT key, text, category, created_at FROM lancedb_memories WHERE category = ?1 ORDER BY created_at DESC, key DESC LIMIT ?2 OFFSET ?3"
+        else if (session_id != null)
+            "SELECT key, text, category, created_at FROM lancedb_memories WHERE session_id = ?1 ORDER BY created_at DESC, key DESC LIMIT ?2 OFFSET ?3"
+        else
+            "SELECT key, text, category, created_at FROM lancedb_memories ORDER BY created_at DESC, key DESC LIMIT ?1 OFFSET ?2";
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var cat_z_buf: ?[:0]u8 = null;
+        defer if (cat_z_buf) |cz| allocator.free(cz);
+        var sid_z: ?[:0]u8 = null;
+        defer if (sid_z) |sz| allocator.free(sz);
+
+        if (category != null and session_id != null) {
+            const cat_str = categoryToString(category.?);
+            cat_z_buf = try allocator.dupeZ(u8, cat_str);
+            _ = c.sqlite3_bind_text(stmt, 1, cat_z_buf.?.ptr, @intCast(cat_z_buf.?.len), SQLITE_STATIC);
+            sid_z = try allocator.dupeZ(u8, session_id.?);
+            _ = c.sqlite3_bind_text(stmt, 2, sid_z.?.ptr, @intCast(sid_z.?.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 4, @intCast(offset));
+        } else if (category) |cat| {
+            const cat_str = categoryToString(cat);
+            cat_z_buf = try allocator.dupeZ(u8, cat_str);
+            _ = c.sqlite3_bind_text(stmt, 1, cat_z_buf.?.ptr, @intCast(cat_z_buf.?.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(offset));
+        } else if (session_id) |sid| {
+            sid_z = try allocator.dupeZ(u8, sid);
+            _ = c.sqlite3_bind_text(stmt, 1, sid_z.?.ptr, @intCast(sid_z.?.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(offset));
+        } else {
+            _ = c.sqlite3_bind_int64(stmt, 1, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(offset));
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const key_ptr = c.sqlite3_column_text(stmt, 0);
+            const text_ptr = c.sqlite3_column_text(stmt, 1);
+            const cat_ptr = c.sqlite3_column_text(stmt, 2);
+            const ts_ptr = c.sqlite3_column_text(stmt, 3);
+
+            if (key_ptr == null or text_ptr == null) continue;
+
+            const k = try allocator.dupe(u8, std.mem.span(key_ptr));
+            errdefer allocator.free(k);
+            const content = try allocator.dupe(u8, std.mem.span(text_ptr));
+            errdefer allocator.free(content);
+            const id = try allocator.dupe(u8, k);
+            errdefer allocator.free(id);
+            const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
+            errdefer allocator.free(timestamp);
+            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+
+            try results.append(allocator, .{
+                .id = id,
+                .key = k,
+                .content = content,
+                .category = stringToCategory(cat_str),
+                .timestamp = timestamp,
+                .session_id = if (session_id) |sid| try allocator.dupe(u8, sid) else null,
+            });
+        }
+
+        return try results.toOwnedSlice(allocator);
+    }
+
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         const db = self_.db orelse return error.NotConnected;
@@ -629,6 +713,7 @@ pub const LanceDbMemory = struct {
         .recall = &implRecall,
         .get = &implGet,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .count = &implCount,
         .healthCheck = &implHealthCheck,

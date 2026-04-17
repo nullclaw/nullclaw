@@ -82,3 +82,72 @@ pub const detectAvailable = @import("detect.zig").detectAvailable;
 pub const AvailableBackends = @import("detect.zig").AvailableBackends;
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "NoopSandbox is always available" {
+    var ns = NoopSandbox{};
+    try testing.expect(ns.sandbox().isAvailable());
+}
+
+test "NoopSandbox name is 'none'" {
+    var ns = NoopSandbox{};
+    try testing.expectEqualStrings("none", ns.sandbox().name());
+}
+
+test "NoopSandbox description is non-empty" {
+    var ns = NoopSandbox{};
+    const desc = ns.sandbox().description();
+    try testing.expect(desc.len > 0);
+}
+
+test "NoopSandbox wrapCommand passes argv through unchanged" {
+    var ns = NoopSandbox{};
+    const sandbox = ns.sandbox();
+    const argv = &[_][]const u8{ "echo", "hello" };
+    var buf: [2][]const u8 = undefined;
+    const result = try sandbox.wrapCommand(argv, &buf);
+    try testing.expectEqual(@as(usize, 2), result.len);
+    try testing.expectEqualStrings("echo", result[0]);
+    try testing.expectEqualStrings("hello", result[1]);
+}
+
+test "NoopSandbox wrapCommand with empty argv" {
+    var ns = NoopSandbox{};
+    const sandbox = ns.sandbox();
+    const argv: []const []const u8 = &.{};
+    var buf: [0][]const u8 = undefined;
+    const result = try sandbox.wrapCommand(argv, &buf);
+    try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "Sandbox interface dispatches to NoopSandbox correctly" {
+    var ns = NoopSandbox{};
+    const sb = ns.sandbox();
+    try testing.expect(sb.isAvailable());
+    try testing.expectEqualStrings("none", sb.name());
+    try testing.expect(sb.description().len > 0);
+}
+
+test "createNoopSandbox returns functional sandbox" {
+    var ns = createNoopSandbox();
+    const sb = ns.sandbox();
+    try testing.expect(sb.isAvailable());
+    try testing.expectEqualStrings("none", sb.name());
+}
+
+test "SandboxBackend enum exhaustiveness" {
+    const expected_names = [_][]const u8{
+        "auto",
+        "none",
+        "landlock",
+        "firejail",
+        "bubblewrap",
+        "docker",
+    };
+    const enum_fields = @typeInfo(SandboxBackend).@"enum".fields;
+    try testing.expectEqual(expected_names.len, enum_fields.len);
+    inline for (expected_names, 0..) |expected_name, i| {
+        try testing.expectEqualStrings(expected_name, enum_fields[i].name);
+    }
+}

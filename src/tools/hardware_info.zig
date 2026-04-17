@@ -75,7 +75,7 @@ pub const HardwareBoardInfoTool = struct {
         // Look up static info
         for (&BOARD_DB) |*entry| {
             if (std.mem.eql(u8, entry.id, board)) {
-                var output: std.ArrayList(u8) = .{};
+                var output: std.ArrayList(u8) = .empty;
                 errdefer output.deinit(allocator);
 
                 try output.appendSlice(allocator, "**Board:** ");

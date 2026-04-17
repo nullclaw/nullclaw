@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 pub const RateTracker = @import("tracker.zig").RateTracker;
 
 /// How much autonomy the agent has
@@ -220,25 +221,6 @@ pub const SecurityPolicy = struct {
         var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
         const norm_len = normalizeCommand(command, &normalized);
         const norm = normalized[0..norm_len];
-
-        // First, check if the full command is in allowed_commands (exact match)
-        // This allows full command strings from trigger_arguments to work
-        var full_match = false;
-        for (self.allowed_commands) |raw_allowed| {
-            const allowed = std.mem.trim(u8, raw_allowed, " \t\r\n");
-            if (allowed.len == 0) continue;
-            if (std.mem.eql(u8, allowed, command)) {
-                full_match = true;
-                break;
-            }
-        }
-
-        // If full command matches, allow it without further checks
-        if (full_match) {
-            return true;
-        }
-
-        // Otherwise, fall back to per-segment checking
         var has_cmd = false;
         var iter = std.mem.splitScalar(u8, norm, 0);
         while (iter.next()) |raw_segment| {
@@ -508,7 +490,7 @@ fn skipEnvAssignments(s: []const u8) []const u8 {
 
 /// Extract basename from a path (everything after last separator)
 fn extractBasename(path: []const u8) []const u8 {
-    return std.fs.path.basename(path);
+    return std_compat.fs.path.basename(path);
 }
 
 /// Check if a command basename is in the high-risk set
@@ -585,7 +567,7 @@ fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool 
     if (!self.workspace_only) return true;
 
     // Keep git `-C` scoped to the workspace when workspace_only is enabled.
-    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (std_compat.fs.path.isAbsolute(trimmed)) return false;
     if (hasParentTraversalSegment(trimmed)) return false;
     return true;
 }
@@ -671,7 +653,7 @@ fn isSafeBootstrapDeleteTarget(raw_arg: []const u8) bool {
     if (trimmed.len == 0) return false;
 
     // No absolute paths, traversal, or globs.
-    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (std_compat.fs.path.isAbsolute(trimmed)) return false;
     if (containsStr(trimmed, "..")) return false;
     if (containsStr(trimmed, "*") or containsStr(trimmed, "?") or
         containsStr(trimmed, "[") or containsStr(trimmed, "]"))

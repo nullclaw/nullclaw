@@ -62,7 +62,7 @@ test "backendUsesFiles" {
 test "createProvider returns FileBootstrapProvider for hybrid" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir);
 
     const bp = try createProvider(std.testing.allocator, "hybrid", null, dir);

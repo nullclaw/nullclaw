@@ -1,4 +1,6 @@
-**Official website:** [nullclaw.io](https://nullclaw.io)
+Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
+
+[nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
 
 <p align="center">
   <img src="nullclaw.png" alt="nullclaw" width="200" />
@@ -14,15 +16,16 @@
 <p align="center">
   <a href="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
+  <a href="https://discord.gg/Bfmdua22Ud"><img src="https://img.shields.io/badge/discord-join%20community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
 </p>
 
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
-Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
+Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
 
 ```
-678 KB binary · <2 ms startup · 5,100+ tests · 50+ providers · 19 channels · Pluggable everything
+678 KB binary · <2 ms startup · 5,300+ tests · 50+ providers · 19 channels · Pluggable everything
 ```
 
 ### Features
@@ -31,7 +34,7 @@ Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributi
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 50+ providers, 19 channels, 30+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 50+ providers, 19 channels, 35+ tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
 ### Why nullclaw
 
@@ -49,8 +52,8 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **Language** | TypeScript | Python | Go | Rust | **Zig** |
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
-| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **5,100+** |
+| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **678 KB** |
+| **Tests** | — | — | — | 1,017 | **5,300+** |
 | **Source Files** | ~400+ | — | — | ~120 | **~230** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
@@ -115,9 +118,9 @@ nullclaw --help
 
 ### 2) Build from source
 
-> **Prerequisite:** use **Zig 0.15.2** (exact version).
-> `0.16.0-dev` and other Zig versions are currently unsupported and may fail to build.
-> Verify before building: `zig version` should print `0.15.2`.
+> **Prerequisite:** use **Zig 0.16.0** (exact version).
+> Other Zig versions are currently unsupported and may fail to build.
+> Verify before building: `zig version` should print `0.16.0`.
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
@@ -190,6 +193,7 @@ nullclaw channel start discord
 nullclaw channel start signal
 
 # Manage background service
+# Linux supports systemd user services and OpenRC
 nullclaw service install
 nullclaw service status
 
@@ -214,21 +218,21 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 |-----------|-----------|------------|--------|
 | **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
-| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
-| **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, pushover, and more | Any capability |
+| **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API | Any persistence backend |
+| **Tools** | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, memory_store, memory_recall, memory_forget, memory_list, browser_open, screenshot, composio, http_request, web_fetch, web_search, delegate, schedule, hardware_info, hardware_memory, pushover, message, spawn, git, image, i2c, spi, and more | Any capability |
 | **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
 | **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed), WASM (wasmtime) | Any runtime |
 | **Security** | `Sandbox` | Landlock, Firejail, Bubblewrap, Docker, auto-detect | Any sandbox backend |
 | **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
 | **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
-| **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
+| **Skills** | Loader | TOML/JSON manifests or YAML frontmatter in `SKILL.md` | Community skill packs |
 | **Peripherals** | `Peripheral` | Serial, Arduino, Raspberry Pi GPIO, STM32/Nucleo | Any hardware interface |
 | **Cron** | Scheduler | Cron expressions + one-shot timers with JSON persistence | — |
 
 ### Memory System
 
-All custom, zero external dependencies:
+All custom, zero external dependencies for the core path:
 
 | Layer | Implementation |
 |-------|---------------|
@@ -238,6 +242,7 @@ All custom, zero external dependencies:
 | **Embeddings** | `EmbeddingProvider` vtable — OpenAI, custom URL, or noop |
 | **Hygiene** | Automatic archival + purge of stale memories |
 | **Snapshots** | Export/import full memory state for migration |
+| **Engines** | SQLite (default), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API, None |
 
 ```json
 {
@@ -417,7 +422,19 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   },
 
   "mcp_servers": {
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"] }
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://mcp.example.com/rpc",
+      "timeout_ms": 10000,
+      "headers": {
+        "Authorization": "Bearer example-token"
+      }
+    }
   },
 
   "memory": {
@@ -462,6 +479,128 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   }
 }
 ```
+
+Config values are literal. NullClaw does not expand `${VAR}` inside `config.json`
+strings, including custom header values. If you need environment-based secrets,
+render `config.json` ahead of time with your own deployment tooling.
+
+Telegram forum topics:
+
+- Topic session isolation is automatic. You do not add a `topic_id` field under `channels.telegram`.
+- The easiest operator flow is:
+  1. define named agent profiles under `agents.list`
+  2. open the target Telegram chat or forum topic
+  3. run `/bind <agent>`
+- To bind a specific Telegram forum topic to a specific agent, use `bindings[].match.peer.id` with the canonical thread form `"<chat_id>:thread:<topic_id>"`.
+- To bind the whole Telegram group as a fallback for all other topics, keep a normal group binding with `"<chat_id>"`.
+- `/bind status` shows the current effective route and the available agent ids.
+- `/bind clear` removes only the exact binding for the current account/chat/topic and falls back to the broader route.
+- `/bind` persists an exact `bindings[]` entry for the current Telegram account and peer.
+- `/bind status` distinguishes an exact local override from an inherited broader fallback.
+- Topic-specific bindings win over group fallback by route priority; the order in `bindings[]` does not matter.
+- Telegram menu visibility for `/bind` is controlled by `channels.telegram.accounts.<id>.binding_commands_enabled`.
+
+Example:
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "coder",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "group", "id": "-1001234567890:thread:42" }
+      }
+    },
+    {
+      "agent_id": "orchestrator",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "group", "id": "-1001234567890" }
+      }
+    }
+  ]
+}
+```
+
+In that setup, topic `42` routes to `coder`, while the rest of the forum falls back to `orchestrator`.
+
+Named agent profiles are configured separately from bindings. Bindings only choose which named agent handles a given chat/topic.
+
+If a named agent should run from its own workspace, set `agents.list[].workspace_path`.
+Relative paths are resolved from the directory that contains `config.json`, the workspace is scaffolded on first use, and the agent gets a durable memory namespace `agent:<agent-id>`.
+Setting `workspace_path` does not disable `system_prompt`: when both are configured, the named profile prompt is still applied and the workspace bootstrap files are loaded from that dedicated workspace.
+This applies to `nullclaw agent --agent <id>`, `/subagents spawn --agent <id>`, and routed sessions resolved through `bindings`.
+
+Minimal end-to-end example:
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "orchestrator",
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-4"
+      },
+      {
+        "id": "coder",
+        "provider": "ollama",
+        "model": "qwen2.5-coder:14b",
+        "system_prompt": "You are the coding agent for this topic."
+      }
+    ]
+  },
+  "channels": {
+    "telegram": {
+      "accounts": {
+        "main": {
+          "bot_token": "123456:ABCDEF",
+          "allow_from": ["YOUR_TELEGRAM_USER_ID"],
+          "binding_commands_enabled": true,
+          "topic_commands_enabled": true,
+          "topic_map_command_enabled": true,
+          "commands_menu_mode": "scoped"
+        }
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agent_id": "orchestrator",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "group", "id": "-1001234567890" }
+      }
+    }
+  ]
+}
+```
+
+Operator flow:
+
+- Send `/bind coder` inside the target forum topic.
+- `nullclaw` writes a new exact `bindings[]` entry to `~/.nullclaw/config.json` for that topic and Telegram account.
+- The next message in that topic uses the new routed agent profile.
+- `nullclaw` must have write access to `~/.nullclaw/config.json` for `/bind` to persist changes.
+
+About `account_id`:
+
+- `account_id` identifies the configured Telegram account entry, not a topic and not an agent.
+- In the usual `channels.telegram.accounts` form, the object key becomes the account id. For example, `accounts.main` means `account_id = "main"`, and `accounts.backup` means `account_id = "backup"`.
+- In `bindings`, `match.account_id` limits that binding to one specific Telegram account.
+- If `match.account_id` is omitted, the binding can match any Telegram account for that channel.
+- Use different account ids only when you run multiple Telegram bot accounts/tokens in the same nullclaw instance.
+
+Effect on delivery:
+
+- Incoming Telegram updates are processed by the account that received them.
+- Routing uses that same `account_id`, so `match.account_id = "main"` matches only messages received by `channels.telegram.accounts.main`.
+- Replies go back out through the same Telegram account/runtime that handled the message.
+- Setting one binding to `account_id = "main"` and another to `account_id = "sub"` does not split one chat across two agents automatically; it scopes each binding to a different configured Telegram account.
 
 ### Full Web Search + Shell Access
 
@@ -523,8 +662,10 @@ Use `channels.web` for browser UI events (WebChannel v1):
 - `message_auth_mode` controls inbound `user_message` auth:
   - `"pairing"` (default): send `pairing_request`, receive `pairing_result`, include UI `access_token` in every `user_message`.
   - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
-- `auth_token` is optional hardening for WebSocket upgrade and required when binding non-loopback addresses.
-- Remote host: set `"listen": "0.0.0.0"` and terminate TLS at proxy/CDN (`wss://...`).
+- `auth_token` hardens the WebSocket upgrade and becomes required when binding non-loopback addresses.
+- Unauthenticated WebSocket upgrade is loopback-only. Pairing-first local UX works on `127.0.0.1`, but a public/LAN bind must authenticate the `/ws` upgrade on the first hop with `?token=<auth_token>` or `Authorization: Bearer <auth_token>`.
+- `/ws` is the WebSocket endpoint. `/pair` belongs to the HTTP gateway API and is not part of the web channel handshake.
+- Remote/headless host: if you bind `"listen": "0.0.0.0"`, prefer a stable configured token plus `message_auth_mode: "token"` behind TLS/reverse proxy, or keep loopback bind and expose it through SSH tunnel/proxy.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
 - For orchestration, use local token mode with a stable token from config or env (`NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`).
 - Relay transport (outbound agent socket) is configured via:
@@ -563,8 +704,55 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
+| `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
+| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (canonical methods plus legacy slash aliases) |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
+
+### A2A (Agent-to-Agent Protocol v0.3.0)
+
+NullClaw implements Google's [A2A protocol](https://github.com/google/A2A) v0.3.0, allowing any A2A-compatible agent or client to discover, authenticate, and interact with your instance over JSON-RPC 2.0.
+
+Enable in `~/.nullclaw/config.json`:
+
+```json
+{
+  "a2a": {
+    "enabled": true,
+    "name": "nullclaw",
+    "description": "General-purpose AI assistant",
+    "url": "https://example.com",
+    "version": "1.0.0"
+  }
+}
+```
+
+**Endpoints:**
+
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `GET /.well-known/agent-card.json` | None | Agent Card discovery (public) |
+| `POST /a2a` | Bearer token | JSON-RPC 2.0 dispatch |
+
+**Supported methods:** `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`, `tasks/resubscribe`.
+
+**Quick test:**
+
+```bash
+# 1. Get a bearer token
+TOKEN=$(curl -s -X POST -H "X-Pairing-Code: 123456" http://localhost:3000/pair | jq -r .token)
+
+# 2. Discover the agent
+curl http://localhost:3000/.well-known/agent-card.json
+
+# 3. Send a message
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"kind":"text","text":"Hello"}]}}}' \
+  http://localhost:3000/a2a
+```
+
+See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including streaming, task lifecycle, and configuration details.
 
 ## Commands
 
@@ -576,24 +764,30 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `agent -m "..."` | Single message mode |
 | `agent` | Interactive chat mode |
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
-| `service install\|start\|stop\|status\|uninstall` | Manage background service |
+| `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
 | `doctor` | Diagnose system health |
-| `status` | Show full system status |
-| `channel status` | Show channel health/status |
-| `cron list\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
-| `skills list\|install\|remove\|info` | Manage skill packs |
+| `status [--json]` | Show full system status or emit the machine-readable runtime snapshot |
+| `channel list\|info\|start\|status\|add\|remove` | Manage channels, including JSON account inventory for automation |
+| `cron list\|status\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
+| `skills list\|install\|remove\|info` | Manage skill packs, including `install --name <query>` registry search |
+| `history list\|show` | View session conversation history |
+| `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
-| `models list\|info\|benchmark` | Model catalog |
+| `config show\|get`, `models list\|summary\|info\|benchmark\|refresh` | Read config/model admin state and manage the model catalog |
+| `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |
+| `capabilities [--json]` | Show runtime capabilities manifest |
+| `auth login\|status\|logout` | Manage OAuth authentication |
 | `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
+| `update [--check] [--yes]` | Check for and install updates |
 
 ## Development
 
-Build and tests are pinned to **Zig 0.15.2**.
+Build and tests are pinned to **Zig 0.16.0**.
 
 ```bash
 zig build                          # Dev build
 zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 5,100+ tests
+zig build test --summary all       # 5,300+ tests
 ```
 
 ### Channel Flow Coverage
@@ -609,10 +803,10 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 ### Project Stats
 
 ```
-Language:     Zig 0.15.2
-Source files: ~230
-Lines of code: ~175,000
-Tests:        5,100+
+Language:     Zig 0.16.0
+Source files: ~250
+Lines of code: ~249,000
+Tests:        5,300+
 Binary:       678 KB (ReleaseSmall)
 Peak RSS:     ~1 MB
 Startup:      <2 ms (Apple Silicon)
@@ -632,7 +826,7 @@ src/
   channels/             19 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
   providers/            50+ AI provider integrations
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
-  tools/                33 tool implementations
+  tools/                35+ tool implementations
   security/             Secrets (ChaCha20), sandbox backends (landlock, firejail, ...)
   cron.zig              Cron scheduler with JSON persistence
   health.zig            Component health registry
@@ -668,17 +862,17 @@ Implement a vtable interface, submit a PR:
 - New `Peripheral` -> `src/peripherals.zig`
 - New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
 
-## 中文文档
+## Chinese Docs (中文文档)
 
-- [中文文档总览](docs/zh/README.md)
-- [安装指南](docs/zh/installation.md)
-- [配置指南](docs/zh/configuration.md)
-- [使用与运维](docs/zh/usage.md)
-- [架构总览](docs/zh/architecture.md)
-- [安全机制](docs/zh/security.md)
-- [Gateway API](docs/zh/gateway-api.md)
-- [命令参考](docs/zh/commands.md)
-- [开发指南](docs/zh/development.md)
+- [Chinese docs overview (中文文档总览)](docs/zh/README.md)
+- [Installation guide (安装指南)](docs/zh/installation.md)
+- [Configuration guide (配置指南)](docs/zh/configuration.md)
+- [Usage and operations (使用与运维)](docs/zh/usage.md)
+- [Architecture overview (架构总览)](docs/zh/architecture.md)
+- [Security model (安全机制)](docs/zh/security.md)
+- [Gateway API (中文)](docs/zh/gateway-api.md)
+- [Commands reference (命令参考)](docs/zh/commands.md)
+- [Development guide (开发指南)](docs/zh/development.md)
 
 ## English Docs
 

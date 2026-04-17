@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -51,13 +52,13 @@ pub const SpiTool = struct {
         }
 
         // On Linux: glob /dev/spidev*.*
-        var devices: std.ArrayList(u8) = .{};
+        var devices: std.ArrayList(u8) = .empty;
         errdefer devices.deinit(allocator);
 
         try devices.appendSlice(allocator, "{\"devices\":[");
 
         var count: usize = 0;
-        var dir = std.fs.openDirAbsolute("/dev", .{ .iterate = true }) catch {
+        var dir = std_compat.fs.openDirAbsolute("/dev", .{ .iterate = true }) catch {
             try devices.appendSlice(allocator, "]}");
             return ToolResult{ .success = true, .output = try devices.toOwnedSlice(allocator) };
         };
@@ -124,6 +125,10 @@ pub const SpiTool = struct {
         return spiTransferLinux(allocator, device, tx_buf[0..tx_len], speed_hz, mode, bits_per_word);
     }
 
+    fn openSpiDevice(device: []const u8) !std_compat.fs.File {
+        return try std_compat.fs.openFileAbsolute(device, .{ .mode = .read_write });
+    }
+
     /// Linux-only SPI transfer via ioctl.
     fn spiTransferLinux(
         allocator: std.mem.Allocator,
@@ -145,11 +150,12 @@ pub const SpiTool = struct {
         const SPI_IOC_MESSAGE_1: u32 = 0x40206B00;
 
         // Open SPI device
-        const fd = std.posix.open(device, .{ .ACCMODE = .RDWR }, 0) catch |err| {
+        const file = openSpiDevice(device) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to open SPI device '{s}': {}", .{ device, err });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
-        defer std.posix.close(fd);
+        defer file.close();
+        const fd = file.handle;
 
         // Set SPI mode
         var mode_val: u8 = mode;
@@ -316,6 +322,12 @@ test "spi read on non-linux returns error" {
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "not supported") != null);
+}
+
+test "spi open helper opens absolute file on linux" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const file = try SpiTool.openSpiDevice("/dev/null");
+    file.close();
 }
 
 test "spi missing action" {

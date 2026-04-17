@@ -4,6 +4,8 @@
 //! Extracted from file_edit.zig to eliminate cross-imports between tool files.
 
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
 const path_prefix = @import("../path_prefix.zig");
 
 /// System-critical prefixes (Unix) — always blocked even if they match allowed_paths.
@@ -67,7 +69,7 @@ pub fn isResolvedPathAllowed(
         const ap = std.mem.trim(u8, raw_allowed_path, " \t\r\n");
         if (ap.len == 0) continue;
         if (std.mem.eql(u8, ap, "*")) return true;
-        const ap_resolved = std.fs.cwd().realpathAlloc(allocator, ap) catch continue;
+        const ap_resolved = fs_compat.realpathAllocPath(allocator, ap) catch continue;
         defer allocator.free(ap_resolved);
         if (pathStartsWith(resolved, ap_resolved)) return true;
     }
@@ -76,7 +78,7 @@ pub fn isResolvedPathAllowed(
 
 /// Check if a relative path is safe (no traversal, no absolute path).
 pub fn isPathSafe(path: []const u8) bool {
-    if (std.fs.path.isAbsolute(path)) return false;
+    if (std_compat.fs.path.isAbsolute(path)) return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
     var iter = std.mem.splitAny(u8, path, "/\\");
     while (iter.next()) |component| {
@@ -209,11 +211,11 @@ test "isResolvedPathAllowed blocks system paths" {
 test "isResolvedPathAllowed allows via allowed_paths" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "" });
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "test.txt" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "" });
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "test.txt" });
     defer std.testing.allocator.free(file_path);
 
     try std.testing.expect(isResolvedPathAllowed(
@@ -245,11 +247,11 @@ test "isResolvedPathAllowed wildcard with whitespace allows non-system paths" {
 test "isResolvedPathAllowed trims allowed path entries before resolving" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "" });
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "test.txt" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "" });
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "test.txt" });
     defer std.testing.allocator.free(file_path);
 
     const spaced_allowed = try std.fmt.allocPrint(std.testing.allocator, "  {s}  ", .{tmp_path});

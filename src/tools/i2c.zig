@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -12,6 +13,22 @@ const I2C_FUNCS = 0x0705;
 /// Valid I2C address range (7-bit addressing, excluding reserved).
 const I2C_ADDR_MIN: u7 = 0x03;
 const I2C_ADDR_MAX: u7 = 0x77;
+
+fn writeFd(fd: std.posix.fd_t, bytes: []const u8) error{WriteFailed}!usize {
+    if (bytes.len == 0) return 0;
+    while (true) {
+        const rc = std.posix.system.write(fd, bytes.ptr, bytes.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.WriteFailed,
+        }
+    }
+}
+
+fn openLinuxBusFile(path: []const u8) !std_compat.fs.File {
+    return try std_compat.fs.openFileAbsolute(path, .{ .mode = .read_write });
+}
 
 /// I2C hardware tool — detect buses, scan devices, read/write registers.
 /// On non-Linux platforms, all actions return a platform-not-supported error.
@@ -107,7 +124,7 @@ pub const I2cTool = struct {
 
     fn detectLinux(allocator: std.mem.Allocator) !ToolResult {
         if (comptime builtin.os.tag != .linux) return ToolResult.fail("I2C is only supported on Linux");
-        var output: std.ArrayList(u8) = .{};
+        var output: std.ArrayList(u8) = .empty;
         errdefer output.deinit(allocator);
         try output.appendSlice(allocator, "{\"buses\":[");
 
@@ -116,7 +133,7 @@ pub const I2cTool = struct {
             var path_buf: [32]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buf, "/dev/i2c-{d}", .{i}) catch continue;
             // Check if device node exists
-            if (std.fs.accessAbsolute(path, .{})) {
+            if (std_compat.fs.accessAbsolute(path, .{})) {
                 if (found > 0) try output.appendSlice(allocator, ",");
                 try output.appendSlice(allocator, "\"");
                 try output.appendSlice(allocator, path);
@@ -140,11 +157,12 @@ pub const I2cTool = struct {
         const path = std.fmt.bufPrint(&path_buf, "/dev/i2c-{d}", .{bus}) catch
             return ToolResult.fail("Invalid bus number");
 
-        const fd = std.posix.open(path, .{ .ACCMODE = .RDWR }, 0) catch
+        const file = openLinuxBusFile(path) catch
             return ToolResult.fail("Cannot open I2C bus (permission denied or bus not found)");
-        defer std.posix.close(fd);
+        defer file.close();
+        const fd = file.handle;
 
-        var output: std.ArrayList(u8) = .{};
+        var output: std.ArrayList(u8) = .empty;
         errdefer output.deinit(allocator);
         try output.appendSlice(allocator, "{\"bus\":");
         var bus_str_buf: [8]u8 = undefined;
@@ -161,7 +179,7 @@ pub const I2cTool = struct {
             if (signed_rc < 0) continue;
 
             // Quick write probe (send 0 bytes)
-            const wrc = std.posix.write(fd, &.{}) catch continue;
+            const wrc = writeFd(fd, &.{}) catch continue;
             _ = wrc;
 
             if (found > 0) try output.appendSlice(allocator, ",");
@@ -186,9 +204,10 @@ pub const I2cTool = struct {
         const path = std.fmt.bufPrint(&path_buf, "/dev/i2c-{d}", .{bus}) catch
             return ToolResult.fail("Invalid bus number");
 
-        const fd = std.posix.open(path, .{ .ACCMODE = .RDWR }, 0) catch
+        const file = openLinuxBusFile(path) catch
             return ToolResult.fail("Cannot open I2C bus");
-        defer std.posix.close(fd);
+        defer file.close();
+        const fd = file.handle;
 
         // Set slave address
         const rc = std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, I2C_SLAVE), @as(usize, addr));
@@ -197,7 +216,7 @@ pub const I2cTool = struct {
             return ToolResult.fail("Failed to set I2C slave address");
 
         // Write register address
-        _ = std.posix.write(fd, &.{register}) catch
+        _ = writeFd(fd, &.{register}) catch
             return ToolResult.fail("Failed to write register address");
 
         // Read data
@@ -206,7 +225,7 @@ pub const I2cTool = struct {
             return ToolResult.fail("Failed to read from I2C device");
 
         // Format output
-        var output: std.ArrayList(u8) = .{};
+        var output: std.ArrayList(u8) = .empty;
         errdefer output.deinit(allocator);
         try output.appendSlice(allocator, "{\"bus\":");
         var bus_buf: [8]u8 = undefined;
@@ -241,9 +260,10 @@ pub const I2cTool = struct {
         const path = std.fmt.bufPrint(&path_buf, "/dev/i2c-{d}", .{bus}) catch
             return ToolResult.fail("Invalid bus number");
 
-        const fd = std.posix.open(path, .{ .ACCMODE = .RDWR }, 0) catch
+        const file = openLinuxBusFile(path) catch
             return ToolResult.fail("Cannot open I2C bus");
-        defer std.posix.close(fd);
+        defer file.close();
+        const fd = file.handle;
 
         // Set slave address
         const rc = std.os.linux.syscall3(.ioctl, @as(usize, @intCast(fd)), @as(usize, I2C_SLAVE), @as(usize, addr));
@@ -252,7 +272,7 @@ pub const I2cTool = struct {
             return ToolResult.fail("Failed to set I2C slave address");
 
         // Write register + value
-        _ = std.posix.write(fd, &.{ register, value }) catch
+        _ = writeFd(fd, &.{ register, value }) catch
             return ToolResult.fail("Failed to write to I2C device");
 
         const output = try std.fmt.allocPrint(allocator,
@@ -317,6 +337,12 @@ test "i2c detect on non-linux returns platform error" {
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not supported") != null);
+}
+
+test "i2c open bus helper opens absolute file on linux" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const file = try openLinuxBusFile("/dev/null");
+    file.close();
 }
 
 test "i2c scan on non-linux returns platform error" {

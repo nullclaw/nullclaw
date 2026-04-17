@@ -5,7 +5,9 @@
 //! Default model: "text-embedding-004", 768 dimensions
 
 const std = @import("std");
+const std_compat = @import("compat");
 const EmbeddingProvider = @import("embeddings.zig").EmbeddingProvider;
+const http_util = @import("../../http_util.zig");
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 
 pub const GeminiEmbedding = struct {
@@ -98,13 +100,13 @@ pub const GeminiEmbedding = struct {
         const url = try self_.buildUrl(allocator);
         defer allocator.free(url);
 
-        var client = std.http.Client{ .allocator = allocator };
+        var client = try http_util.ProxyHttpClient.init(allocator);
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,

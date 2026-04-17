@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -47,7 +48,7 @@ pub const CronRunTool = struct {
         };
 
         // Execute the command
-        const result = std.process.Child.run(.{
+        const result = std_compat.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ platform.getShell(), platform.getShellFlag(), command },
             .max_output_bytes = 65536,
@@ -55,7 +56,7 @@ pub const CronRunTool = struct {
             // Update last_status to error
             if (scheduler.getMutableJob(job_id)) |job| {
                 job.last_status = "error";
-                job.last_run_secs = std.time.timestamp();
+                job.last_run_secs = std_compat.time.timestamp();
             }
             cron.saveJobs(&scheduler) catch {};
 
@@ -66,7 +67,7 @@ pub const CronRunTool = struct {
         defer allocator.free(result.stderr);
 
         const exit_code: u8 = switch (result.term) {
-            .Exited => |code| code,
+            .exited => |code| code,
             else => 1,
         };
         const success = exit_code == 0;
@@ -75,7 +76,7 @@ pub const CronRunTool = struct {
         // Update job last_run and last_status
         if (scheduler.getMutableJob(job_id)) |job| {
             job.last_status = status_str;
-            job.last_run_secs = std.time.timestamp();
+            job.last_run_secs = std_compat.time.timestamp();
         }
         cron.saveJobs(&scheduler) catch {};
 

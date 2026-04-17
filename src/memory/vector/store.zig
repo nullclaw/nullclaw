@@ -5,6 +5,7 @@
 //! shares the database handle with SqliteMemory (memory_embeddings table).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const vector = @import("math.zig");
@@ -404,13 +405,13 @@ pub const SqliteSharedVectorStore = struct {
 
     fn implHealthCheck(ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const start = std.time.nanoTimestamp();
+        const start = std_compat.time.nanoTimestamp();
 
         const sql = "SELECT COUNT(*) FROM memory_embeddings";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) {
-            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+            const elapsed: u64 = @intCast(@max(0, std_compat.time.nanoTimestamp() - start));
             return HealthStatus{
                 .ok = false,
                 .latency_ns = elapsed,
@@ -421,7 +422,7 @@ pub const SqliteSharedVectorStore = struct {
         defer _ = c.sqlite3_finalize(stmt);
 
         rc = c.sqlite3_step(stmt);
-        const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+        const elapsed: u64 = @intCast(@max(0, std_compat.time.nanoTimestamp() - start));
 
         if (rc == c.SQLITE_ROW) {
             const n: usize = @intCast(c.sqlite3_column_int64(stmt, 0));
@@ -896,13 +897,13 @@ pub const SqliteAnnVectorStore = struct {
 
     fn implHealthCheck(ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const start = std.time.nanoTimestamp();
+        const start = std_compat.time.nanoTimestamp();
 
         const sql = "SELECT COUNT(*) FROM memory_embeddings";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) {
-            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+            const elapsed: u64 = @intCast(@max(0, std_compat.time.nanoTimestamp() - start));
             return HealthStatus{
                 .ok = false,
                 .latency_ns = elapsed,
@@ -913,7 +914,7 @@ pub const SqliteAnnVectorStore = struct {
         defer _ = c.sqlite3_finalize(stmt);
 
         rc = c.sqlite3_step(stmt);
-        const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+        const elapsed: u64 = @intCast(@max(0, std_compat.time.nanoTimestamp() - start));
 
         if (rc == c.SQLITE_ROW) {
             const n: usize = @intCast(c.sqlite3_column_int64(stmt, 0));

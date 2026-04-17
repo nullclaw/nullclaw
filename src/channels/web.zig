@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
@@ -14,7 +15,6 @@ const log = std.log.scoped(.web);
 pub const WebChannel = struct {
     const MAX_E2E_PAYLOAD_BYTES: usize = 65_536;
     const E2E_ALG: []const u8 = "x25519-chacha20poly1305-v1";
-    const LOCAL_FIXED_PAIRING_CODE: []const u8 = "123456";
 
     const RelayTokenSource = enum {
         config,
@@ -64,6 +64,7 @@ pub const WebChannel = struct {
     listen_address: []const u8,
     ws_path: []const u8,
     max_connections: u16,
+    max_handshake_size: u16,
     account_id: []const u8,
     configured_auth_token: ?[]const u8,
     allowed_origins: []const []const u8,
@@ -92,7 +93,7 @@ pub const WebChannel = struct {
     connections: ConnectionList = .{},
 
     // Relay state
-    relay_client_mu: std.Thread.Mutex = .{},
+    relay_client_mu: std_compat.sync.Mutex = .{},
     relay_client: ?*ws_client.WsClient = null,
     relay_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     relay_socket_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
@@ -100,17 +101,49 @@ pub const WebChannel = struct {
     relay_pairing_issued_at: i64 = 0,
     jwt_signing_key: [32]u8 = [_]u8{0} ** 32,
     jwt_ready: bool = false,
-    relay_security_mu: std.Thread.Mutex = .{},
+    relay_security_mu: std_compat.sync.Mutex = .{},
     session_client_bindings: std.StringHashMapUnmanaged([]const u8) = .empty,
     e2e_sessions: std.StringHashMapUnmanaged(E2eSession) = .empty,
 
-    const SocketFd = std.net.Stream.Handle;
+    const SocketFd = std_compat.net.Stream.Handle;
     const invalid_socket: SocketFd = switch (builtin.os.tag) {
-        .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+        .windows => std_compat.net.invalidHandle(SocketFd),
         else => -1,
     };
 
     const WsServer = websocket.Server(WsHandler);
+
+    fn publicBindTokenRequiredLogMessage(message_auth_mode: MessageAuthMode) []const u8 {
+        return switch (message_auth_mode) {
+            .pairing => "WS connection rejected: token required for non-loopback bind; local pairing_request is loopback-only. Use /ws?token=<auth_token> (or Authorization header), keep listen=127.0.0.1, or use an SSH tunnel/reverse proxy.",
+            .token => "WS connection rejected: token required for non-loopback bind; use /ws?token=<auth_token> (or Authorization header).",
+            .invalid => "WS connection rejected: token required for non-loopback bind.",
+        };
+    }
+
+    fn loopbackTokenRequiredLogMessage() []const u8 {
+        return "WS connection rejected: token required on loopback when message_auth_mode=token; use /ws?token=<auth_token> (or Authorization header).";
+    }
+
+    fn allowsUnauthenticatedLoopbackUpgrade(message_auth_mode: MessageAuthMode) bool {
+        return message_auth_mode == .pairing;
+    }
+
+    fn requiresOriginAllowlistWarning(self: *const WebChannel) bool {
+        if (self.transport != .local) return false;
+        if (self.allowed_origins.len != 0) return false;
+        if (pairing_mod.isPublicBind(self.listen_address)) return true;
+        return self.message_auth_mode == .token;
+    }
+
+    fn warnIfOriginAllowlistBroad(self: *const WebChannel) void {
+        if (!self.requiresOriginAllowlistWarning()) return;
+        if (pairing_mod.isPublicBind(self.listen_address)) {
+            log.warn("Web channel allowed_origins is empty on non-loopback bind; browser origins are unrestricted. Set channels.web.allowed_origins explicitly before exposing this listener.", .{});
+            return;
+        }
+        log.warn("Web channel allowed_origins is empty while message_auth_mode=token; browser origins are unrestricted on loopback. Set channels.web.allowed_origins to limit trusted UI origins.", .{});
+    }
 
     const vtable = root.Channel.VTable{
         .start = wsStart,
@@ -119,6 +152,7 @@ pub const WebChannel = struct {
         .sendEvent = wsSendEvent,
         .name = wsName,
         .healthCheck = wsHealthCheck,
+        .supportsStreamingOutbound = wsSupportsStreamingOutbound,
     };
 
     pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.WebConfig) WebChannel {
@@ -127,6 +161,10 @@ pub const WebChannel = struct {
         else
             cfg.max_connections;
         const normalized_path = config_types.WebConfig.normalizePath(cfg.path);
+        const normalized_max_handshake_size: u16 = if (cfg.max_handshake_size == 0)
+            config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE
+        else
+            cfg.max_handshake_size;
         return .{
             .allocator = allocator,
             .transport = parseTransport(cfg.transport),
@@ -134,6 +172,7 @@ pub const WebChannel = struct {
             .listen_address = cfg.listen,
             .ws_path = normalized_path,
             .max_connections = clamped_max_connections,
+            .max_handshake_size = normalized_max_handshake_size,
             .account_id = cfg.account_id,
             .configured_auth_token = cfg.auth_token,
             .allowed_origins = cfg.allowed_origins,
@@ -178,7 +217,7 @@ pub const WebChannel = struct {
 
     fn loadTokenFromEnvCandidates(self: *WebChannel, env_candidates: []const []const u8) !bool {
         for (env_candidates) |name| {
-            if (std.process.getEnvVarOwned(self.allocator, name)) |raw| {
+            if (std_compat.process.getEnvVarOwned(self.allocator, name)) |raw| {
                 defer self.allocator.free(raw);
                 self.setActiveToken(raw) catch |err| {
                     if (err == error.InvalidAuthToken) {
@@ -203,7 +242,7 @@ pub const WebChannel = struct {
     }
 
     fn loadDedicatedRelayTokenFromEnv(self: *WebChannel) !?[]u8 {
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_RELAY_TOKEN")) |raw| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_RELAY_TOKEN")) |raw| {
             if (!config_types.WebConfig.isValidAuthToken(raw)) {
                 log.warn("Ignoring invalid relay token from env NULLCLAW_RELAY_TOKEN", .{});
                 self.allocator.free(raw);
@@ -286,7 +325,7 @@ pub const WebChannel = struct {
         };
         defer self.allocator.free(encoded);
 
-        const expires_at: i64 = std.time.timestamp() + @as(i64, @intCast(self.relay_ui_token_ttl_secs));
+        const expires_at: i64 = std_compat.time.timestamp() + @as(i64, @intCast(self.relay_ui_token_ttl_secs));
         auth.saveCredential(self.allocator, provider_key, .{
             .access_token = encoded,
             .refresh_token = null,
@@ -318,7 +357,7 @@ pub const WebChannel = struct {
 
     fn generateRelayLifecycleToken(self: *WebChannel) ![]u8 {
         var random_bytes: [32]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        std_compat.crypto.random.bytes(&random_bytes);
         const hex = std.fmt.bytesToHex(random_bytes, .lower);
         return std.fmt.allocPrint(self.allocator, "zcr_{s}", .{hex});
     }
@@ -330,7 +369,7 @@ pub const WebChannel = struct {
         };
         defer self.allocator.free(provider_key);
 
-        const expires_at: i64 = std.time.timestamp() + @as(i64, @intCast(self.relay_token_ttl_secs));
+        const expires_at: i64 = std_compat.time.timestamp() + @as(i64, @intCast(self.relay_token_ttl_secs));
         auth.saveCredential(self.allocator, provider_key, .{
             .access_token = token,
             .refresh_token = null,
@@ -422,7 +461,7 @@ pub const WebChannel = struct {
             if (try self.loadPersistedUiJwtSigningKey()) {
                 log.info("Web UI JWT signing key loaded from persisted store", .{});
             } else {
-                std.crypto.random.bytes(&self.jwt_signing_key);
+                std_compat.crypto.random.bytes(&self.jwt_signing_key);
                 self.persistUiJwtSigningKey();
                 log.info("Web UI JWT signing key generated and persisted", .{});
             }
@@ -432,26 +471,27 @@ pub const WebChannel = struct {
             @memset(self.jwt_signing_key[0..], 0);
         }
         self.relay_pairing_guard = try pairing_mod.PairingGuard.init(self.allocator, pairing_enabled, &.{});
-        self.relay_pairing_issued_at = if (pairing_enabled) std.time.timestamp() else 0;
+        self.relay_pairing_issued_at = if (pairing_enabled) std_compat.time.timestamp() else 0;
 
         if (self.transport == .local) {
-            if (pairing_enabled) {
-                self.rotateRelayPairingCode("fixed-local");
+            if (self.relay_pairing_guard) |*guard| {
+                if (guard.pairingCode()) |code| {
+                    var pairing_log_buf: [160]u8 = undefined;
+                    self.relay_pairing_issued_at = std_compat.time.timestamp();
+                    log.info("{s}", .{localPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, null, code)});
+                }
             }
         } else if (self.relay_pairing_guard) |*guard| {
             if (guard.pairingCode()) |code| {
-                log.info("Web relay pairing code (one-time, {d}s TTL): {s}", .{
-                    self.relay_pairing_code_ttl_secs,
-                    code,
-                });
+                var pairing_log_buf: [160]u8 = undefined;
+                log.info("{s}", .{relayPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, null, code)});
             }
         }
     }
 
     fn relayPairingCodeExpiredLocked(self: *const WebChannel) bool {
-        if (self.transport == .local) return false;
         if (self.relay_pairing_issued_at == 0) return true;
-        const age = std.time.timestamp() - self.relay_pairing_issued_at;
+        const age = std_compat.time.timestamp() - self.relay_pairing_issued_at;
         return age > @as(i64, @intCast(self.relay_pairing_code_ttl_secs));
     }
 
@@ -461,16 +501,39 @@ pub const WebChannel = struct {
         return self.relayPairingCodeExpiredLocked();
     }
 
+    fn relayPairingLogMessage(buf: []u8, ttl_secs: u32, reason: ?[]const u8, code: []const u8) []const u8 {
+        _ = code;
+        if (reason) |why| {
+            return std.fmt.bufPrint(buf, "Web relay pairing code rotated ({s}, one-time, {d}s TTL, value hidden)", .{
+                why,
+                ttl_secs,
+            }) catch "Web relay pairing code rotated (value hidden)";
+        }
+        return std.fmt.bufPrint(buf, "Web relay pairing code generated (one-time, {d}s TTL, value hidden)", .{
+            ttl_secs,
+        }) catch "Web relay pairing code generated (value hidden)";
+    }
+
+    fn localPairingLogMessage(buf: []u8, ttl_secs: u32, reason: ?[]const u8, code: []const u8) []const u8 {
+        _ = code;
+        if (reason) |why| {
+            return std.fmt.bufPrint(buf, "Web local pairing code rotated ({s}, one-time, {d}s TTL, value hidden)", .{
+                why,
+                ttl_secs,
+            }) catch "Web local pairing code rotated (value hidden)";
+        }
+        return std.fmt.bufPrint(buf, "Web local pairing code generated (one-time, {d}s TTL, value hidden)", .{
+            ttl_secs,
+        }) catch "Web local pairing code generated (value hidden)";
+    }
+
     fn rotateRelayPairingCodeLocked(self: *WebChannel, reason: []const u8) void {
         if (self.transport == .local) {
             if (self.relay_pairing_guard) |*guard| {
-                const code = guard.setPairingCode(LOCAL_FIXED_PAIRING_CODE) catch |err| {
-                    log.warn("Web local pairing code override failed: {}", .{err});
-                    return;
-                };
-                self.relay_pairing_issued_at = std.time.timestamp();
-                if (!std.mem.eql(u8, reason, "consumed")) {
-                    log.info("Web local pairing code active (fixed): {s}", .{code});
+                if (guard.regeneratePairingCode()) |code| {
+                    var pairing_log_buf: [160]u8 = undefined;
+                    self.relay_pairing_issued_at = std_compat.time.timestamp();
+                    log.info("{s}", .{localPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, reason, code)});
                 }
             }
             return;
@@ -478,12 +541,9 @@ pub const WebChannel = struct {
 
         if (self.relay_pairing_guard) |*guard| {
             if (guard.regeneratePairingCode()) |code| {
-                self.relay_pairing_issued_at = std.time.timestamp();
-                log.info("Web relay pairing code rotated ({s}, one-time, {d}s TTL): {s}", .{
-                    reason,
-                    self.relay_pairing_code_ttl_secs,
-                    code,
-                });
+                var pairing_log_buf: [160]u8 = undefined;
+                self.relay_pairing_issued_at = std_compat.time.timestamp();
+                log.info("{s}", .{relayPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, reason, code)});
             }
         }
     }
@@ -497,7 +557,7 @@ pub const WebChannel = struct {
     /// Generate a random auth token (64 hex chars from 32 random bytes).
     pub fn generateToken(self: *WebChannel) void {
         var random_bytes: [32]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        std_compat.crypto.random.bytes(&random_bytes);
         const hex = std.fmt.bytesToHex(random_bytes, .lower);
         @memset(self.token[0..], 0);
         @memcpy(self.token[0..hex.len], &hex);
@@ -548,18 +608,20 @@ pub const WebChannel = struct {
         if (!self.jwt_ready) return error.InvalidState;
 
         const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const exp = now + @as(i64, @intCast(self.relay_ui_token_ttl_secs));
 
         var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer payload_buf.deinit(self.allocator);
-        const pw = payload_buf.writer(self.allocator);
+        var payload_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &payload_buf);
+        const pw = &payload_writer.writer;
         try pw.writeAll("{\"sub\":");
         try root.appendJsonStringW(pw, client_sub);
         try pw.writeAll(",\"aid\":");
         try root.appendJsonStringW(pw, self.account_id);
         try pw.print(",\"iat\":{d},\"exp\":{d}", .{ now, exp });
         try pw.writeByte('}');
+        payload_buf = payload_writer.toArrayList();
 
         const header_b64 = try self.base64UrlEncodeAlloc(header_json);
         defer self.allocator.free(header_b64);
@@ -622,7 +684,7 @@ pub const WebChannel = struct {
             .float => |f| @intFromFloat(f),
             else => return null,
         };
-        if (std.time.timestamp() >= exp) return null;
+        if (std_compat.time.timestamp() >= exp) return null;
 
         return .{
             .sub = self.allocator.dupe(u8, sub_val.string) catch return null,
@@ -699,7 +761,7 @@ pub const WebChannel = struct {
         defer self.allocator.free(client_pub_raw);
         if (client_pub_raw.len != std.crypto.dh.X25519.public_length) return error.InvalidClientPublicKey;
 
-        const kp = std.crypto.dh.X25519.KeyPair.generate();
+        const kp = std.crypto.dh.X25519.KeyPair.generate(std_compat.io());
         const client_pub: [std.crypto.dh.X25519.public_length]u8 = client_pub_raw[0..std.crypto.dh.X25519.public_length].*;
         const shared = try std.crypto.dh.X25519.scalarmult(kp.secret_key, client_pub);
 
@@ -717,7 +779,7 @@ pub const WebChannel = struct {
 
     fn encryptE2ePayload(self: *WebChannel, key: [32]u8, plaintext: []const u8) !struct { nonce_b64: []u8, ciphertext_b64: []u8 } {
         var nonce: [12]u8 = undefined;
-        std.crypto.random.bytes(&nonce);
+        std_compat.crypto.random.bytes(&nonce);
 
         const cipher = try self.allocator.alloc(u8, plaintext.len + secret_crypto.TAG_LEN);
         defer self.allocator.free(cipher);
@@ -784,7 +846,8 @@ pub const WebChannel = struct {
     fn sendRelayError(self: *WebChannel, session_id: []const u8, request_id: ?[]const u8, code: []const u8, message: []const u8) void {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
         w.writeAll("{\"v\":1,\"type\":\"error\",\"session_id\":") catch return;
         root.appendJsonStringW(w, session_id) catch return;
         w.writeAll(",\"agent_id\":") catch return;
@@ -798,6 +861,7 @@ pub const WebChannel = struct {
         w.writeAll(",\"message\":") catch return;
         root.appendJsonStringW(w, message) catch return;
         w.writeAll("}}") catch return;
+        buf = buf_writer.toArrayList();
         self.sendOutboundEvent(session_id, buf.items);
     }
 
@@ -949,7 +1013,8 @@ pub const WebChannel = struct {
 
         var response: std.ArrayListUnmanaged(u8) = .empty;
         defer response.deinit(self.allocator);
-        const w = response.writer(self.allocator);
+        var response_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &response);
+        const w = &response_writer.writer;
         w.writeAll("{\"v\":1,\"type\":\"pairing_result\",\"session_id\":") catch return;
         root.appendJsonStringW(w, session_id) catch return;
         w.writeAll(",\"agent_id\":") catch return;
@@ -976,6 +1041,7 @@ pub const WebChannel = struct {
             w.writeByte('}') catch return;
         }
         w.writeAll("}}") catch return;
+        response = response_writer.toArrayList();
         self.sendOutboundEvent(session_id, response.items);
     }
 
@@ -1027,6 +1093,9 @@ pub const WebChannel = struct {
             .port = self.port,
             .address = self.listen_address,
             .max_conn = @intCast(self.max_connections),
+            .handshake = .{
+                .max_size = self.max_handshake_size,
+            },
         }) catch |err| {
             log.err("Failed to init WebSocket server: {}", .{err});
             return err;
@@ -1047,6 +1116,7 @@ pub const WebChannel = struct {
             .ephemeral => log.warn("Web channel one-time optional upgrade token: {s}", .{self.activeToken()}),
             .config, .env => log.info("Web channel optional upgrade auth token active (hidden in logs)", .{}),
         }
+        self.warnIfOriginAllowlistBroad();
         if (self.message_auth_mode == .token) {
             log.info("Web channel user_message auth mode: token", .{});
         }
@@ -1172,7 +1242,7 @@ pub const WebChannel = struct {
                 s._mut.lock();
                 defer s._mut.unlock();
                 for (s._signals) |fd| {
-                    std.posix.close(fd);
+                    std.Io.Threaded.closeFd(fd);
                 }
                 s._cond.wait(&s._mut);
             } else {
@@ -1209,11 +1279,7 @@ pub const WebChannel = struct {
         // Use shutdown (not close) so WsClient.deinit() performs the final close once.
         const fd = self.relay_socket_fd.load(.acquire);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.shutdown(fd, std.os.windows.ws2_32.SD_RECEIVE);
-            } else {
-                std.posix.shutdown(fd, .recv) catch {};
-            }
+            (std_compat.net.Stream{ .handle = fd }).shutdown(.recv) catch {};
             self.relay_socket_fd.store(invalid_socket, .release);
         }
 
@@ -1243,7 +1309,8 @@ pub const WebChannel = struct {
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
 
         const session_e2e = self.e2eSessionByChat(target);
         if (self.transport == .relay and session_e2e == null and self.relay_e2e_required) {
@@ -1266,10 +1333,12 @@ pub const WebChannel = struct {
         if (session_e2e) |session| {
             var plain_payload: std.ArrayListUnmanaged(u8) = .empty;
             defer plain_payload.deinit(self.allocator);
-            const pw = plain_payload.writer(self.allocator);
+            var plain_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &plain_payload);
+            const pw = &plain_writer.writer;
             try pw.writeAll("{\"content\":");
             try root.appendJsonStringW(pw, message);
             try pw.writeByte('}');
+            plain_payload = plain_writer.toArrayList();
 
             const encrypted = try self.encryptE2ePayload(session.key, plain_payload.items);
             defer self.allocator.free(encrypted.nonce_b64);
@@ -1291,6 +1360,7 @@ pub const WebChannel = struct {
         }
 
         try w.writeByte('}');
+        buf = buf_writer.toArrayList();
         self.sendOutboundEvent(target, buf.items);
     }
 
@@ -1320,6 +1390,10 @@ pub const WebChannel = struct {
             .local => self.running.load(.acquire),
             .relay => self.running.load(.acquire) and self.relay_connected.load(.acquire),
         };
+    }
+
+    fn wsSupportsStreamingOutbound(_: *anyopaque) bool {
+        return true;
     }
 
     fn handleInboundEvent(self: *WebChannel, data: []const u8, forced_session_id: ?[]const u8) void {
@@ -1500,7 +1574,8 @@ pub const WebChannel = struct {
 
         var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer metadata_buf.deinit(allocator);
-        const mw = metadata_buf.writer(allocator);
+        var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &metadata_buf);
+        const mw = &metadata_writer.writer;
         mw.writeAll("{\"is_dm\":true,\"account_id\":") catch return;
         root.appendJsonStringW(mw, self.account_id) catch return;
         if (request_id) |rid| {
@@ -1508,6 +1583,7 @@ pub const WebChannel = struct {
             root.appendJsonStringW(mw, rid) catch return;
         }
         mw.writeByte('}') catch return;
+        metadata_buf = metadata_writer.toArrayList();
 
         const msg = bus_mod.makeInboundFull(
             allocator,
@@ -1536,7 +1612,7 @@ pub const WebChannel = struct {
     // ── Connection tracking ──
 
     pub const ConnectionList = struct {
-        mutex: std.Thread.Mutex = .{},
+        mutex: std_compat.sync.Mutex = .{},
         entries: [MAX_TRACKED]?ConnEntry = [_]?ConnEntry{null} ** MAX_TRACKED,
 
         const MAX_TRACKED = 64;
@@ -1641,14 +1717,14 @@ pub const WebChannel = struct {
             } else {
                 // Pairing-first local UX: allow unauthenticated upgrade only on loopback.
                 if (pairing_mod.isPublicBind(web_channel.listen_address)) {
-                    log.warn("WS connection rejected: token required for non-loopback bind", .{});
+                    log.warn("{s}", .{publicBindTokenRequiredLogMessage(web_channel.message_auth_mode)});
                     return error.Forbidden;
                 }
-                if (web_channel.message_auth_mode == .token) {
-                    log.info("WS client connected without upgrade token; waiting for token-authenticated user_message", .{});
-                } else {
-                    log.info("WS client connected without upgrade token; waiting for pairing_request", .{});
+                if (!allowsUnauthenticatedLoopbackUpgrade(web_channel.message_auth_mode)) {
+                    log.warn("{s}", .{loopbackTokenRequiredLogMessage()});
+                    return error.Forbidden;
                 }
+                log.info("WS client connected without upgrade token; waiting for pairing_request", .{});
             }
 
             // Extract session_id from query (optional, default to "default")
@@ -1807,6 +1883,7 @@ test "WebChannel initFromConfig uses defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", ch.listen_address);
     try std.testing.expectEqualStrings(config_types.WebConfig.DEFAULT_PATH, ch.ws_path);
     try std.testing.expectEqual(@as(u16, 10), ch.max_connections);
+    try std.testing.expectEqual(config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, ch.max_handshake_size);
     try std.testing.expectEqualStrings("default", ch.account_id);
     try std.testing.expect(ch.configured_auth_token == null);
     try std.testing.expectEqual(@as(usize, 0), ch.allowed_origins.len);
@@ -1828,6 +1905,7 @@ test "WebChannel initFromConfig uses custom values" {
         .listen = "0.0.0.0",
         .path = "/relay/",
         .max_connections = 5,
+        .max_handshake_size = 12_288,
         .account_id = "web-main",
         .auth_token = "test-token-123456",
         .message_auth_mode = "token",
@@ -1837,6 +1915,7 @@ test "WebChannel initFromConfig uses custom values" {
     try std.testing.expectEqualStrings("0.0.0.0", ch.listen_address);
     try std.testing.expectEqualStrings("/relay", ch.ws_path);
     try std.testing.expectEqual(@as(u16, 5), ch.max_connections);
+    try std.testing.expectEqual(@as(u16, 12_288), ch.max_handshake_size);
     try std.testing.expectEqualStrings("web-main", ch.account_id);
     try std.testing.expectEqualStrings("test-token-123456", ch.configured_auth_token.?);
     try std.testing.expectEqual(WebChannel.MessageAuthMode.token, ch.message_auth_mode);
@@ -1847,6 +1926,35 @@ test "WebChannel parseMessageAuthMode marks unsupported mode as invalid" {
     try std.testing.expectEqual(WebChannel.MessageAuthMode.pairing, WebChannel.parseMessageAuthMode("pairing"));
     try std.testing.expectEqual(WebChannel.MessageAuthMode.token, WebChannel.parseMessageAuthMode("token"));
     try std.testing.expectEqual(WebChannel.MessageAuthMode.invalid, WebChannel.parseMessageAuthMode("jwt"));
+}
+
+test "WebChannel loopback upgrade policy allows pairing mode only" {
+    try std.testing.expect(WebChannel.allowsUnauthenticatedLoopbackUpgrade(.pairing));
+    try std.testing.expect(!WebChannel.allowsUnauthenticatedLoopbackUpgrade(.token));
+    try std.testing.expect(!WebChannel.allowsUnauthenticatedLoopbackUpgrade(.invalid));
+}
+
+test "WebChannel requires origin allowlist warning on public bind with empty allowlist" {
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .listen = "0.0.0.0",
+    });
+    try std.testing.expect(ch.requiresOriginAllowlistWarning());
+}
+
+test "WebChannel requires origin allowlist warning for token mode on loopback" {
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .message_auth_mode = "token",
+    });
+    try std.testing.expect(ch.requiresOriginAllowlistWarning());
+}
+
+test "WebChannel skips origin allowlist warning when allowlist is configured" {
+    const origins = [_][]const u8{"http://localhost:5173"};
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .message_auth_mode = "token",
+        .allowed_origins = &origins,
+    });
+    try std.testing.expect(!ch.requiresOriginAllowlistWarning());
 }
 
 test "WebChannel wsStart fails fast for invalid message auth mode" {
@@ -1891,6 +1999,13 @@ test "WebChannel initFromConfig clamps max_connections to tracked limit" {
         .max_connections = 500,
     });
     try std.testing.expectEqual(@as(u16, 64), ch.max_connections);
+}
+
+test "WebChannel initFromConfig normalizes zero handshake size to default" {
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .max_handshake_size = 0,
+    });
+    try std.testing.expectEqual(config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, ch.max_handshake_size);
 }
 
 test "WebChannel vtable name returns web" {
@@ -2043,10 +2158,12 @@ test "WsHandler clientMessage uses connection session id" {
 
     var event_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer event_buf.deinit(std.testing.allocator);
-    const w = event_buf.writer(std.testing.allocator);
+    var event_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &event_buf);
+    const w = &event_writer.writer;
     try w.writeAll("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"other-session\",\"payload\":{\"access_token\":");
     try root.appendJsonStringW(w, access_token);
     try w.writeAll(",\"content\":\"hello\",\"sender_id\":\"user-1\"}}");
+    event_buf = event_writer.toArrayList();
 
     try handler.clientMessage(event_buf.items);
 
@@ -2072,10 +2189,12 @@ test "WebChannel handleInboundEvent parses v1 envelope payload" {
 
     var event_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer event_buf.deinit(std.testing.allocator);
-    const w = event_buf.writer(std.testing.allocator);
+    var event_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &event_buf);
+    const w = &event_writer.writer;
     try w.writeAll("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-42\",\"request_id\":\"req-7\",\"payload\":{\"access_token\":");
     try root.appendJsonStringW(w, access_token);
     try w.writeAll(",\"content\":\"hello from ui\",\"sender_id\":\"ui-1\"}}");
+    event_buf = event_writer.toArrayList();
 
     const event = event_buf.items;
     ch.handleInboundEvent(event, null);
@@ -2248,18 +2367,20 @@ test "WebChannel relay pairing request rotates one-time code and initializes e2e
     const code_copy = try std.testing.allocator.dupe(u8, code);
     defer std.testing.allocator.free(code_copy);
 
-    const client_kp = std.crypto.dh.X25519.KeyPair.generate();
+    const client_kp = std.crypto.dh.X25519.KeyPair.generate(std_compat.io());
     const client_pub_b64 = try ch.base64UrlEncodeAlloc(&client_kp.public_key);
     defer std.testing.allocator.free(client_pub_b64);
 
     var event_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer event_buf.deinit(std.testing.allocator);
-    const w = event_buf.writer(std.testing.allocator);
+    var event_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &event_buf);
+    const w = &event_writer.writer;
     try w.writeAll("{\"v\":1,\"type\":\"pairing_request\",\"session_id\":\"sess-pair\",\"payload\":{\"pairing_code\":");
     try root.appendJsonStringW(w, code_copy);
     try w.writeAll(",\"client_pub\":");
     try root.appendJsonStringW(w, client_pub_b64);
     try w.writeAll("}}");
+    event_buf = event_writer.toArrayList();
 
     ch.handleInboundEvent(event_buf.items, null);
     try std.testing.expect(ch.relay_pairing_guard.?.isPaired());
@@ -2268,7 +2389,7 @@ test "WebChannel relay pairing request rotates one-time code and initializes e2e
     try std.testing.expectEqual(@as(usize, 1), ch.e2e_sessions.count());
 }
 
-test "WebChannel local pairing code is fixed to 123456 across rotations" {
+test "WebChannel local pairing code is random and rotates" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .transport = "local",
         .account_id = "local-main",
@@ -2277,14 +2398,24 @@ test "WebChannel local pairing code is fixed to 123456 across rotations" {
     try ch.initRelaySecurityState();
 
     const first = ch.relay_pairing_guard.?.pairingCode() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("123456", first);
+    try std.testing.expectEqual(@as(usize, 6), first.len);
+    for (first) |c| {
+        try std.testing.expect(std.ascii.isDigit(c));
+    }
 
+    ch.relay_pairing_guard.?.failed_count = 4;
+    ch.relay_pairing_guard.?.lockout_time = std_compat.time.nanoTimestamp();
     ch.rotateRelayPairingCode("test-rotate");
     const second = ch.relay_pairing_guard.?.pairingCode() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("123456", second);
+    try std.testing.expectEqual(@as(usize, 6), second.len);
+    for (second) |c| {
+        try std.testing.expect(std.ascii.isDigit(c));
+    }
+    try std.testing.expectEqual(@as(u32, 0), ch.relay_pairing_guard.?.failed_count);
+    try std.testing.expect(ch.relay_pairing_guard.?.lockout_time == null);
 }
 
-test "WebChannel local pairing code never expires" {
+test "WebChannel local pairing code expires with ttl" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .transport = "local",
         .account_id = "local-main",
@@ -2292,8 +2423,29 @@ test "WebChannel local pairing code never expires" {
     defer ch.deinitRelaySecurityState();
     try ch.initRelaySecurityState();
 
-    ch.relay_pairing_issued_at = std.time.timestamp() - 86_400;
-    try std.testing.expect(!ch.relayPairingCodeExpired());
+    ch.relay_pairing_issued_at = std_compat.time.timestamp() - 86_400;
+    try std.testing.expect(ch.relayPairingCodeExpired());
+}
+
+test "WebChannel public bind token guidance mentions loopback-only pairing" {
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.pairing), "loopback-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.pairing), "/ws?token=<auth_token>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.token), "Authorization header") != null);
+}
+
+test "WebChannel relay pairing log message hides code" {
+    var buf: [160]u8 = undefined;
+    const msg = WebChannel.relayPairingLogMessage(&buf, 300, "expired", "654321");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "654321") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "expired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "value hidden") != null);
+}
+
+test "WebChannel local pairing log message hides pairing code" {
+    var buf: [160]u8 = undefined;
+    const msg = WebChannel.localPairingLogMessage(&buf, 300, null, "123456");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "123456") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "value hidden") != null);
 }
 
 test "WebChannel relay encrypted user_message is published to bus" {
@@ -2321,7 +2473,8 @@ test "WebChannel relay encrypted user_message is published to bus" {
 
     var event_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer event_buf.deinit(std.testing.allocator);
-    const w = event_buf.writer(std.testing.allocator);
+    var event_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &event_buf);
+    const w = &event_writer.writer;
     try w.writeAll("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-e2e\",\"payload\":{\"access_token\":");
     try root.appendJsonStringW(w, access_token);
     try w.writeAll(",\"e2e\":{\"nonce\":");
@@ -2329,6 +2482,7 @@ test "WebChannel relay encrypted user_message is published to bus" {
     try w.writeAll(",\"ciphertext\":");
     try root.appendJsonStringW(w, encrypted.ciphertext_b64);
     try w.writeAll("}}}");
+    event_buf = event_writer.toArrayList();
 
     ch.handleInboundEvent(event_buf.items, null);
 

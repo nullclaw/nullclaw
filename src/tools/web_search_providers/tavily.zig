@@ -35,22 +35,11 @@ pub fn execute(
     };
     defer allocator.free(body);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
+    var parsed = try common.parseJsonObject(allocator, body);
     defer parsed.deinit();
 
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.InvalidResponse,
-    };
+    if (parsed.object.get("error")) |_| return error.RequestFailed;
 
-    if (root_val.get("error")) |_| return error.RequestFailed;
-
-    const results = root_val.get("results") orelse return error.InvalidResponse;
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return error.InvalidResponse,
-    };
-
-    if (results_arr.items.len == 0) return common.ToolResult.ok("No web results found.");
-    return common.formatResultsArray(allocator, results_arr.items, query, "content", null);
+    const results_arr = try common.requireArrayField(parsed.object, "results");
+    return common.formatResultsArray(allocator, results_arr, query, "content", null);
 }

@@ -4,11 +4,14 @@
 //! passed by the caller; no dependency on the Agent struct.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
 const path_prefix = @import("../path_prefix.zig");
+const util = @import("../util.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -123,7 +126,7 @@ pub fn autoCompactHistory(
 
         // Truncate if too long
         if (merged.len > config.max_summary_chars) {
-            const truncated = try allocator.dupe(u8, merged[0..config.max_summary_chars]);
+            const truncated = try allocator.dupe(u8, util.truncateUtf8(merged, config.max_summary_chars));
             allocator.free(merged);
             break :blk truncated;
         }
@@ -253,7 +256,7 @@ fn buildCompactionTranscript(
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, ": ");
         // Truncate very long messages in transcript
-        const content = if (msg.content.len > 500) msg.content[0..500] else msg.content;
+        const content = if (msg.content.len > 500) util.truncateUtf8(msg.content, 500) else msg.content;
         try buf.appendSlice(allocator, content);
         try buf.append(allocator, '\n');
 
@@ -262,7 +265,7 @@ fn buildCompactionTranscript(
     }
 
     if (buf.items.len > max_source_chars) {
-        buf.items.len = max_source_chars;
+        buf.items.len = util.truncateUtf8(buf.items, max_source_chars).len;
     }
 
     return buf.toOwnedSlice(allocator);
@@ -306,7 +309,7 @@ fn summarizeSlice(
     ) catch {
         // Fallback: use a local truncation of the transcript
         const max_len = @min(transcript.len, config.max_summary_chars);
-        return try allocator.dupe(u8, transcript[0..max_len]);
+        return try allocator.dupe(u8, util.truncateUtf8(transcript, max_len));
     };
     // Free response's heap-allocated fields after extracting what we need
     defer {
@@ -328,7 +331,7 @@ fn summarizeSlice(
 
     const raw_summary = summary_resp.contentOrEmpty();
     const max_len = @min(raw_summary.len, config.max_summary_chars);
-    return try allocator.dupe(u8, raw_summary[0..max_len]);
+    return try allocator.dupe(u8, util.truncateUtf8(raw_summary, max_len));
 }
 
 const HeadingInfo = struct {
@@ -337,7 +340,7 @@ const HeadingInfo = struct {
 };
 
 fn parseHeadingLine(line: []const u8) ?HeadingInfo {
-    const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+    const trimmed_left = std.mem.trimStart(u8, line, " \t");
     if (trimmed_left.len < 4) return null;
 
     var level: u8 = 0;
@@ -384,7 +387,7 @@ fn extractNamedSection(
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
-        const left_trimmed = std.mem.trimLeft(u8, line, " \t");
+        const left_trimmed = std.mem.trimStart(u8, line, " \t");
         if (std.mem.startsWith(u8, left_trimmed, "```")) {
             in_code_block = !in_code_block;
             if (in_section) {
@@ -462,21 +465,21 @@ fn extractSections(
 fn openWorkspaceAgentsFileGuarded(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
-) ?std.fs.File {
-    const workspace_root = std.fs.cwd().realpathAlloc(allocator, workspace_dir) catch return null;
+) ?std_compat.fs.File {
+    const workspace_root = fs_compat.realpathAllocPath(allocator, workspace_dir) catch return null;
     defer allocator.free(workspace_root);
 
-    const agents_candidate = std.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
+    const agents_candidate = std_compat.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
     defer allocator.free(agents_candidate);
 
-    const agents_canonical = std.fs.cwd().realpathAlloc(allocator, agents_candidate) catch |err| switch (err) {
+    const agents_canonical = fs_compat.realpathAllocPath(allocator, agents_candidate) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return null,
     };
     defer allocator.free(agents_canonical);
 
     if (!pathStartsWith(agents_canonical, workspace_root)) return null;
-    return std.fs.openFileAbsolute(agents_canonical, .{}) catch null;
+    return std_compat.fs.openFileAbsolute(agents_canonical, .{}) catch null;
 }
 
 fn readWorkspaceContextForSummary(
@@ -494,7 +497,7 @@ fn readWorkspaceContextForSummary(
             if (sections.len == 0) return try allocator.dupe(u8, "");
 
             const safe_content = if (sections.len > MAX_WORKSPACE_CONTEXT_CHARS)
-                try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{sections[0..MAX_WORKSPACE_CONTEXT_CHARS]})
+                try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{util.truncateUtf8(sections, MAX_WORKSPACE_CONTEXT_CHARS)})
             else
                 try allocator.dupe(u8, sections);
             defer allocator.free(safe_content);
@@ -521,7 +524,7 @@ fn readWorkspaceContextForSummary(
     if (sections.len == 0) return try allocator.dupe(u8, "");
 
     const safe_content = if (sections.len > MAX_WORKSPACE_CONTEXT_CHARS)
-        try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{sections[0..MAX_WORKSPACE_CONTEXT_CHARS]})
+        try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{util.truncateUtf8(sections, MAX_WORKSPACE_CONTEXT_CHARS)})
     else
         try allocator.dupe(u8, sections);
     defer allocator.free(safe_content);
@@ -746,7 +749,7 @@ test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll(
             \\## Session Startup
@@ -758,7 +761,7 @@ test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
         );
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
@@ -773,7 +776,7 @@ test "readWorkspaceContextForSummary returns empty when AGENTS missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
@@ -790,7 +793,7 @@ test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    try outside_tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{
         .sub_path = "outside-agents.md",
         .data =
         \\## Session Startup
@@ -801,18 +804,39 @@ test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
         ,
     });
 
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
-    const outside_agents = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
+    const outside_agents = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
     defer std.testing.allocator.free(outside_agents);
 
-    try ws_tmp.dir.symLink(outside_agents, "AGENTS.md", .{});
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).symLink(outside_agents, "AGENTS.md", .{});
 
-    const workspace = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
     defer std.testing.allocator.free(context);
 
     try std.testing.expectEqual(@as(usize, 0), context.len);
+}
+
+test "buildCompactionTranscript keeps UTF-8 valid when truncating long message content" {
+    const allocator = std.testing.allocator;
+    const prefix = try allocator.alloc(u8, 499);
+    defer allocator.free(prefix);
+    @memset(prefix, 'a');
+
+    // Regression: the 500-byte message cap must not split the emoji below.
+    const content = try std.fmt.allocPrint(allocator, "{s}\xf0\x9f\x98\x80tail", .{prefix});
+    defer allocator.free(content);
+
+    const history = [_]OwnedMessage{
+        .{ .role = .user, .content = content },
+    };
+
+    const transcript = try buildCompactionTranscript(allocator, &history, 0, history.len, 4_096);
+    defer allocator.free(transcript);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(transcript));
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "tail") == null);
 }

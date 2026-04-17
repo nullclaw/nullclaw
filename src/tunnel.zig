@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
 
 // Tunnel -- ngrok/cloudflare/tailscale/custom tunnel management.
 //
@@ -37,7 +39,7 @@ pub const TunnelProvider = enum {
 // ── Tunnel Config (extended) ────────────────────────────────────
 
 pub const CloudflareTunnelConfig = struct {
-    token: []const u8,
+    token: ?[]const u8 = null,
 };
 
 pub const TailscaleTunnelConfig = struct {
@@ -46,12 +48,12 @@ pub const TailscaleTunnelConfig = struct {
 };
 
 pub const NgrokTunnelConfig = struct {
-    auth_token: []const u8,
+    auth_token: ?[]const u8 = null,
     domain: ?[]const u8 = null,
 };
 
 pub const CustomTunnelConfig = struct {
-    start_command: []const u8,
+    start_command: ?[]const u8 = null,
     health_url: ?[]const u8 = null,
     url_pattern: ?[]const u8 = null,
 };
@@ -186,41 +188,47 @@ const URL_READ_TIMEOUT_DEFAULT_NS: u64 = 30 * std.time.ns_per_s;
 const URL_READ_TIMEOUT_CUSTOM_NS: u64 = 90 * std.time.ns_per_s;
 const URL_READ_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
 
-fn tryReadUrlFromPipe(allocator: std.mem.Allocator, pipe: std.fs.File, timeout_ns: u64) ?[]const u8 {
-    var poller = std.Io.poll(allocator, enum { pipe }, .{
-        .pipe = pipe,
-    });
-    defer poller.deinit();
+fn tryReadUrlFromPipe(allocator: std.mem.Allocator, pipe: std_compat.fs.File, timeout_ns: u64) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) return null;
 
-    const pipe_reader = poller.reader(.pipe);
-    // Reader buffer is owned/freed by poller.deinit(); keep it heap-managed.
-    pipe_reader.buffer = &.{};
-    pipe_reader.seek = 0;
-    pipe_reader.end = 0;
+    var output_buf: [URL_READ_BUFFER_BYTES]u8 = undefined;
+    var output_len: usize = 0;
 
-    const started_at_ns = std.time.nanoTimestamp();
+    const started_at_ns = std_compat.time.nanoTimestamp();
     while (true) {
-        const keep_polling = poller.pollTimeout(URL_READ_POLL_STEP_NS) catch return null;
+        const poll_ms: i32 = @intCast(@divTrunc(URL_READ_POLL_STEP_NS, std.time.ns_per_ms));
+        var poll_fds = [_]std.posix.pollfd{
+            .{
+                .fd = pipe.handle,
+                .events = std.posix.POLL.IN | std.posix.POLL.HUP,
+                .revents = 0,
+            },
+        };
+        const ready = std.posix.poll(&poll_fds, poll_ms) catch return null;
+        if (ready > 0 and (poll_fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+            const read_len = pipe.read(output_buf[output_len..]) catch return null;
+            output_len += read_len;
+        }
 
-        const output = pipe_reader.buffer[0..pipe_reader.end];
+        const output = output_buf[0..output_len];
         if (extractUrl(output)) |found_url| {
             return allocator.dupe(u8, found_url) catch null;
         }
 
         if (output.len > URL_READ_BUFFER_BYTES) return null;
-        if (!keep_polling) return null;
+        if (ready > 0 and output_len == output_buf.len) return null;
 
-        const elapsed_ns: i128 = std.time.nanoTimestamp() - started_at_ns;
+        const elapsed_ns: i128 = std_compat.time.nanoTimestamp() - started_at_ns;
         if (elapsed_ns >= @as(i128, timeout_ns)) return null;
     }
 }
 
-fn detachChildArgv(child: *std.process.Child) void {
+fn detachChildArgv(child: *std_compat.process.Child) void {
     // argv backing storage can be stack/local; drop references after successful spawn.
     child.argv = &.{};
 }
 
-fn cleanupFailedStart(child: *?std.process.Child, state: *TunnelState) void {
+fn cleanupFailedStart(child: *?std_compat.process.Child, state: *TunnelState) void {
     if (child.*) |*running_child| {
         _ = running_child.kill() catch {};
     }
@@ -238,7 +246,7 @@ pub const CloudflareTunnel = struct {
     allocator: std.mem.Allocator,
     state: TunnelState = .stopped,
     url: ?[]const u8 = null,
-    child: ?std.process.Child = null,
+    child: ?std_compat.process.Child = null,
 
     const cf_vtable = TunnelAdapter.VTable{
         .start = cfStart,
@@ -272,7 +280,7 @@ pub const CloudflareTunnel = struct {
         const local_url = std.fmt.bufPrint(&url_buf, "http://localhost:{s}", .{port_str}) catch
             return TunnelAdapter.TunnelError.StartFailed;
 
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "cloudflared", "tunnel", "--no-autoupdate", "run", "--token", self.token, "--url", local_url },
             self.allocator,
         );
@@ -333,7 +341,7 @@ pub const NgrokTunnel = struct {
     allocator: std.mem.Allocator,
     state: TunnelState = .stopped,
     url: ?[]const u8 = null,
-    child: ?std.process.Child = null,
+    child: ?std_compat.process.Child = null,
 
     const ngrok_vtable = TunnelAdapter.VTable{
         .start = ngrokStart,
@@ -391,7 +399,7 @@ pub const NgrokTunnel = struct {
         argv_buf[argc] = "logfmt";
         argc += 1;
 
-        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -448,7 +456,7 @@ pub const TailscaleTunnel = struct {
     allocator: std.mem.Allocator,
     state: TunnelState = .stopped,
     url: ?[]const u8 = null,
-    child: ?std.process.Child = null,
+    child: ?std_compat.process.Child = null,
 
     const ts_vtable = TunnelAdapter.VTable{
         .start = tsStart,
@@ -480,7 +488,7 @@ pub const TailscaleTunnel = struct {
 
         const subcmd: []const u8 = if (self.funnel) "funnel" else "serve";
 
-        var child = std.process.Child.init(
+        var child = std_compat.process.Child.init(
             &.{ "tailscale", subcmd, port_str },
             self.allocator,
         );
@@ -525,7 +533,7 @@ pub const TailscaleTunnel = struct {
         const self = resolve(ptr);
         // Reset tailscale serve/funnel before killing process
         const subcmd: []const u8 = if (self.funnel) "funnel" else "serve";
-        var reset_child = std.process.Child.init(
+        var reset_child = std_compat.process.Child.init(
             &.{ "tailscale", subcmd, "reset" },
             self.allocator,
         );
@@ -566,7 +574,7 @@ pub const CustomTunnel = struct {
     allocator: std.mem.Allocator,
     state: TunnelState = .stopped,
     url: ?[]const u8 = null,
-    child: ?std.process.Child = null,
+    child: ?std_compat.process.Child = null,
 
     const custom_vtable = TunnelAdapter.VTable{
         .start = customStart,
@@ -620,7 +628,7 @@ pub const CustomTunnel = struct {
         }
         if (argc == 0) return TunnelAdapter.TunnelError.InvalidCommand;
 
-        var child = std.process.Child.init(argv_list[0..argc], self.allocator);
+        var child = std_compat.process.Child.init(argv_list[0..argc], self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -674,7 +682,7 @@ pub const Tunnel = struct {
     allocator: ?std.mem.Allocator = null,
     public_url: ?[]const u8 = null,
     state: TunnelState = .stopped,
-    child: ?std.process.Child = null,
+    child: ?std_compat.process.Child = null,
 
     // Provider-specific config stored as tagged union
     cloudflare_token: ?[]const u8 = null,
@@ -722,7 +730,7 @@ pub const Tunnel = struct {
                 var url_buf: [64]u8 = undefined;
                 const local_url = try std.fmt.bufPrint(&url_buf, "http://localhost:{s}", .{port_str});
 
-                var child = std.process.Child.init(
+                var child = std_compat.process.Child.init(
                     &.{ "cloudflared", "tunnel", "--no-autoupdate", "run", "--token", token, "--url", local_url },
                     alloc,
                 );
@@ -776,7 +784,7 @@ pub const Tunnel = struct {
                 argv_buf[argc] = "logfmt";
                 argc += 1;
 
-                var child = std.process.Child.init(argv_buf[0..argc], alloc);
+                var child = std_compat.process.Child.init(argv_buf[0..argc], alloc);
                 child.stdin_behavior = .Pipe;
                 child.stdout_behavior = .Pipe;
                 child.stderr_behavior = .Pipe;
@@ -800,7 +808,7 @@ pub const Tunnel = struct {
                 self.state = .starting;
                 const subcmd: []const u8 = if (self.tailscale_funnel) "funnel" else "serve";
 
-                var child = std.process.Child.init(
+                var child = std_compat.process.Child.init(
                     &.{ "tailscale", subcmd, port_str },
                     alloc,
                 );
@@ -843,7 +851,7 @@ pub const Tunnel = struct {
                 }
                 if (argc == 0) return error.NotImplemented;
 
-                var child = std.process.Child.init(argv_list[0..argc], alloc);
+                var child = std_compat.process.Child.init(argv_list[0..argc], alloc);
                 child.stdin_behavior = .Pipe;
                 child.stdout_behavior = .Pipe;
                 child.stderr_behavior = .Pipe;
@@ -897,9 +905,10 @@ pub fn createTunnel(cfg: TunnelFullConfig) CreateTunnelError!?Tunnel {
         .none => null,
         .cloudflare => blk: {
             const cf = cfg.cloudflare orelse return CreateTunnelError.MissingCloudflareConfig;
+            const token = cf.token orelse return CreateTunnelError.MissingCloudflareConfig;
             break :blk Tunnel{
                 .provider = .cloudflare,
-                .cloudflare_token = cf.token,
+                .cloudflare_token = token,
             };
         },
         .tailscale => blk: {
@@ -912,17 +921,19 @@ pub fn createTunnel(cfg: TunnelFullConfig) CreateTunnelError!?Tunnel {
         },
         .ngrok => blk: {
             const ng = cfg.ngrok orelse return CreateTunnelError.MissingNgrokConfig;
+            const auth_token = ng.auth_token orelse return CreateTunnelError.MissingNgrokConfig;
             break :blk Tunnel{
                 .provider = .ngrok,
-                .ngrok_auth_token = ng.auth_token,
+                .ngrok_auth_token = auth_token,
                 .ngrok_domain = ng.domain,
             };
         },
         .custom => blk: {
             const cu = cfg.custom orelse return CreateTunnelError.MissingCustomConfig;
+            const start_command = cu.start_command orelse return CreateTunnelError.MissingCustomConfig;
             break :blk Tunnel{
                 .provider = .custom,
-                .custom_start_command = cu.start_command,
+                .custom_start_command = start_command,
                 .custom_health_url = cu.health_url,
                 .custom_url_pattern = cu.url_pattern,
             };
@@ -1093,12 +1104,12 @@ test "tryReadUrlFromPipe extracts URL from stream" {
 
     const log_name = "tunnel.log";
     {
-        const log_file = try tmp.dir.createFile(log_name, .{});
+        const log_file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile(log_name, .{});
         defer log_file.close();
         try log_file.writeAll("booting\nhttps://abc123.trycloudflare.com connected\n");
     }
 
-    const read_file = try tmp.dir.openFile(log_name, .{});
+    const read_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile(log_name, .{});
     defer read_file.close();
 
     const url = tryReadUrlFromPipe(std.testing.allocator, read_file, std.time.ns_per_s) orelse

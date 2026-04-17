@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
 const config_types = @import("../config_types.zig");
@@ -91,6 +92,50 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
     return allocator.dupe(u8, trimmed);
 }
 
+fn appendReasoningDetailText(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    detail: std.json.Value,
+) !void {
+    if (detail != .object) return;
+    const obj = detail.object;
+
+    if (obj.get("type")) |type_val| {
+        if (type_val == .string and std.mem.eql(u8, type_val.string, "reasoning.encrypted")) return;
+    }
+
+    const text = blk: {
+        if (obj.get("text")) |value| {
+            if (value == .string and value.string.len > 0) break :blk value.string;
+        }
+        if (obj.get("summary")) |value| {
+            if (value == .string and value.string.len > 0) break :blk value.string;
+        }
+        break :blk null;
+    } orelse return;
+
+    if (out.items.len > 0) try out.append(allocator, '\n');
+    try out.appendSlice(allocator, text);
+}
+
+/// Extract plain-text reasoning from OpenRouter/OpenAI-style `reasoning_details`.
+/// Encrypted detail variants are intentionally ignored.
+pub fn extractReasoningTextFromDetails(allocator: std.mem.Allocator, details: std.json.Value) !?[]const u8 {
+    if (details != .array) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (details.array.items) |detail| {
+        try appendReasoningDetailText(&out, allocator, detail);
+    }
+
+    const trimmed = std.mem.trim(u8, out.items, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const owned = try allocator.dupe(u8, trimmed);
+    return owned;
+}
+
 /// Extract api_key from a config-like struct (supports both Config.defaultProviderKey() and plain .api_key field).
 fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
     const T = @TypeOf(cfg);
@@ -115,13 +160,13 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    const result = try client.fetch(.{
+    const result = try client.client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
         .payload = body_str,
@@ -150,13 +195,13 @@ pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_pro
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    const result = try client.fetch(.{
+    const result = try client.client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
         .payload = body_str,
@@ -190,12 +235,11 @@ pub fn providerUrl(provider_name: []const u8) []const u8 {
 pub fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []const u8, temperature: f64, max_tokens: u32) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try w.writeAll("{\"model\":");
+    try buf.appendSlice(allocator, "{\"model\":");
     try json_util.appendJsonString(&buf, allocator, model);
-    try w.writeAll(",\"messages\":[{\"role\":\"user\",\"content\":");
+    try buf.appendSlice(allocator, ",\"messages\":[{\"role\":\"user\",\"content\":");
     try json_util.appendJsonString(&buf, allocator, prompt);
-    try std.fmt.format(w, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
+    try buf.print(allocator, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -203,15 +247,44 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt:
 pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u8, system: []const u8, prompt: []const u8, temperature: f64, max_tokens: u32) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try w.writeAll("{\"model\":\"");
-    try w.writeAll(model);
-    try w.writeAll("\",\"messages\":[{\"role\":\"system\",\"content\":");
+    try buf.appendSlice(allocator, "{\"model\":\"");
+    try buf.appendSlice(allocator, model);
+    try buf.appendSlice(allocator, "\",\"messages\":[{\"role\":\"system\",\"content\":");
     try json_util.appendJsonString(&buf, allocator, system);
-    try w.writeAll("},{\"role\":\"user\",\"content\":");
+    try buf.appendSlice(allocator, "},{\"role\":\"user\",\"content\":");
     try json_util.appendJsonString(&buf, allocator, prompt);
-    try std.fmt.format(w, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
+    try buf.print(allocator, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Append OpenAI-compatible request extras:
+/// - `user` sourced from the upstream session_id
+/// - arbitrary top-level JSON fields from `extra_body_params`
+///
+/// `extra_body_params` is expected to be a compact JSON object string such as
+/// `{"seed":123,"metadata":{"tier":"pro"}}`. Parsing happens at config-load
+/// time; request builders only splice the already-validated object body.
+pub fn appendOpenAiBodyExtraParams(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    session_id: ?[]const u8,
+    extra_body_params: ?[]const u8,
+) !void {
+    if (session_id) |sid| {
+        try buf.appendSlice(allocator, ",\"user\":");
+        try json_util.appendJsonString(buf, allocator, sid);
+    }
+
+    if (extra_body_params) |extra| {
+        const trimmed = std.mem.trim(u8, extra, " \t\r\n");
+        if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return;
+
+        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        if (inner.len == 0) return;
+
+        try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, inner);
+    }
 }
 
 /// Check if a model name indicates an OpenAI reasoning model
@@ -526,19 +599,46 @@ pub fn convertToolsAnthropic(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
     try buf.append(allocator, ']');
 }
 
+/// Serialize tool definitions into a Responses-API-format JSON array, appending directly into `buf`.
+/// Format: [{"type":"function","name":"...","description":"...","parameters":{...}}]
+/// Note: flat format — no nested "function" wrapper (unlike OpenAI format).
+pub fn convertToolsResponses(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, tools: []const ToolSpec) !void {
+    if (tools.len == 0) {
+        try buf.appendSlice(allocator, "[]");
+        return;
+    }
+    try buf.append(allocator, '[');
+    for (tools, 0..) |tool, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
+        try json_util.appendJsonString(buf, allocator, tool.name);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try json_util.appendJsonString(buf, allocator, tool.description);
+        try buf.appendSlice(allocator, ",\"parameters\":");
+        try buf.appendSlice(allocator, tool.parameters_json);
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+}
+
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
 /// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
+    const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
+        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer if (resolve_entry) |entry| allocator.free(entry);
 
     if (timeout_secs > 0) {
         var timeout_buf: [32]u8 = undefined;
         const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch
-            return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, null);
-        return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, timeout_str);
+            return http_util.curlPostWithProxyAndResolve(allocator, url, body, headers, proxy, null, resolve_entry);
+        return http_util.curlPostWithProxyAndResolve(allocator, url, body, headers, proxy, timeout_str, resolve_entry);
     }
-    return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, null);
+    return http_util.curlPostWithProxyAndResolve(allocator, url, body, headers, proxy, null, resolve_entry);
 }
 
 /// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
@@ -546,14 +646,19 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
 pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, timeout_secs: u64) ![]u8 {
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
+    const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
+        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer if (resolve_entry) |entry| allocator.free(entry);
 
     if (timeout_secs > 0) {
         var timeout_buf: [32]u8 = undefined;
         const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch
-            return http_util.curlPostFormWithProxy(allocator, url, body, proxy, null);
-        return http_util.curlPostFormWithProxy(allocator, url, body, proxy, timeout_str);
+            return http_util.curlPostFormWithProxyAndResolve(allocator, url, body, proxy, null, resolve_entry);
+        return http_util.curlPostFormWithProxyAndResolve(allocator, url, body, proxy, timeout_str, resolve_entry);
     }
-    return http_util.curlPostFormWithProxy(allocator, url, body, proxy, null);
+    return http_util.curlPostFormWithProxyAndResolve(allocator, url, body, proxy, null, resolve_entry);
 }
 
 /// Extract text content from a provider JSON response.
@@ -564,7 +669,7 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
 
     // OpenAI/OpenRouter format: choices[0].message.content
     if (root_obj.get("choices")) |choices| {
-        if (choices.array.items.len > 0) {
+        if (choices == .array and choices.array.items.len > 0) {
             if (choices.array.items[0].object.get("message")) |msg| {
                 if (msg.object.get("content")) |content| {
                     if (content == .string) return try allocator.dupe(u8, content.string);
@@ -575,7 +680,7 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
 
     // Anthropic format: content[0].text
     if (root_obj.get("content")) |content| {
-        if (content.array.items.len > 0) {
+        if (content == .array and content.array.items.len > 0) {
             if (content.array.items[0].object.get("text")) |text| {
                 if (text == .string) return try allocator.dupe(u8, text.string);
             }
@@ -666,6 +771,50 @@ test "convertToolsAnthropic empty tools" {
     try std.testing.expectEqualStrings("[]", buf.items);
 }
 
+test "convertToolsResponses produces flat format" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    const tools = &[_]ToolSpec{
+        .{
+            .name = "shell",
+            .description = "Run a shell command",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
+        },
+        .{
+            .name = "file_read",
+            .description = "Read a file",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+        },
+    };
+    try convertToolsResponses(&buf, alloc, tools);
+    const json = buf.items;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+
+    // Verify flat format: "name" at top level, no nested "function" key
+    const t0 = arr.items[0].object;
+    try std.testing.expectEqualStrings("function", t0.get("type").?.string);
+    try std.testing.expect(t0.get("function") == null); // Must NOT have nested "function"
+    try std.testing.expectEqualStrings("shell", t0.get("name").?.string);
+    try std.testing.expectEqualStrings("Run a shell command", t0.get("description").?.string);
+    try std.testing.expect(t0.get("parameters").? == .object);
+
+    const t1 = arr.items[1].object;
+    try std.testing.expectEqualStrings("file_read", t1.get("name").?.string);
+}
+
+test "convertToolsResponses empty tools" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try convertToolsResponses(&buf, alloc, &.{});
+    try std.testing.expectEqualStrings("[]", buf.items);
+}
+
 test "providerUrl returns correct URLs" {
     try std.testing.expectEqualStrings(
         "https://api.anthropic.com/v1/messages",
@@ -703,6 +852,25 @@ test "extractContent parses Anthropic format" {
     const result = try extractContent(allocator, body);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Hello from Claude", result);
+}
+
+test "extractContent skips null choices and parses Anthropic format" {
+    // Regression: some OpenAI-compatible providers return `"choices": null`.
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"choices":null,"content":[{"type":"text","text":"Hello from Claude"}]}
+    ;
+    const result = try extractContent(allocator, body);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from Claude", result);
+}
+
+test "extractContent null content fails cleanly" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"content":null}
+    ;
+    try std.testing.expectError(error.UnexpectedResponse, extractContent(allocator, body));
 }
 
 test "buildRequestBody escapes double quotes in prompt" {

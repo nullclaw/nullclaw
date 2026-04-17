@@ -1,6 +1,9 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const util = @import("util.zig");
+
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) std.os.windows.DWORD;
 
 /// Component health status.
 pub const ComponentHealth = struct {
@@ -13,15 +16,28 @@ pub const ComponentHealth = struct {
     restart_count: u64 = 0,
 };
 
+pub const SnapshotComponent = struct {
+    name: []const u8,
+    health: ComponentHealth,
+};
+
 /// Full health snapshot.
 pub const HealthSnapshot = struct {
-    pid: u32,
+    pid: ?u32,
     uptime_seconds: u64,
-    components: *std.StringHashMapUnmanaged(ComponentHealth),
+    components: []SnapshotComponent,
+
+    pub fn deinit(self: HealthSnapshot, allocator: std.mem.Allocator) void {
+        for (self.components) |entry| {
+            allocator.free(entry.name);
+            if (entry.health.last_error) |msg| allocator.free(msg);
+        }
+        if (self.components.len > 0) allocator.free(self.components);
+    }
 };
 
 /// Global health registry — thread-safe singleton.
-var registry_mutex: std.Thread.Mutex = .{};
+var registry_mutex: std_compat.sync.Mutex = .{};
 var registry_components: std.StringHashMapUnmanaged(ComponentHealth) = .empty;
 var registry_started: bool = false;
 var registry_start_time: i64 = 0;
@@ -29,7 +45,7 @@ var pending_error_msg: ?[]const u8 = null;
 
 fn ensureInit() void {
     if (!registry_started) {
-        registry_start_time = std.time.timestamp();
+        registry_start_time = std_compat.time.timestamp();
         registry_started = true;
     }
 }
@@ -37,6 +53,15 @@ fn ensureInit() void {
 fn nowTimestamp(buf: *[32]u8) usize {
     const ts = util.timestamp(buf);
     return ts.len;
+}
+
+fn currentProcessId() ?u32 {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        .macos => @intCast(std.c.getpid()),
+        .windows => @intCast(GetCurrentProcessId()),
+        else => null,
+    };
 }
 
 fn upsertComponent(component: []const u8, update_fn: *const fn (*ComponentHealth, [32]u8, usize) void) void {
@@ -108,19 +133,64 @@ pub fn bumpComponentRestart(component: []const u8) void {
     upsertComponent(component, &bumpRestartUpdate);
 }
 
-/// Get a snapshot of the current health state.
-pub fn snapshot() HealthSnapshot {
+/// Returns true when every registered component is currently healthy.
+pub fn allComponentsOk() bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     ensureInit();
 
-    const now = std.time.timestamp();
+    var iter = registry_components.iterator();
+    while (iter.next()) |entry| {
+        if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) return false;
+    }
+    return true;
+}
+
+/// Get a snapshot of the current health state.
+pub fn snapshot(allocator: std.mem.Allocator) !HealthSnapshot {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    ensureInit();
+
+    const now = std_compat.time.timestamp();
     const uptime: u64 = if (now > registry_start_time) @intCast(now - registry_start_time) else 0;
+    const count = registry_components.count();
+    if (count == 0) {
+        return .{
+            .pid = currentProcessId(),
+            .uptime_seconds = uptime,
+            .components = @constCast((&[_]SnapshotComponent{})[0..]),
+        };
+    }
+    const components = try allocator.alloc(SnapshotComponent, count);
+    errdefer allocator.free(components);
+
+    var copied: usize = 0;
+    errdefer {
+        for (components[0..copied]) |entry| {
+            allocator.free(entry.name);
+            if (entry.health.last_error) |msg| allocator.free(msg);
+        }
+        allocator.free(components);
+    }
+
+    var iter = registry_components.iterator();
+    while (iter.next()) |entry| {
+        var component_copy = entry.value_ptr.*;
+        if (component_copy.last_error) |msg| {
+            component_copy.last_error = try allocator.dupe(u8, msg);
+        }
+        components[copied] = .{
+            .name = try allocator.dupe(u8, entry.key_ptr.*),
+            .health = component_copy,
+        };
+        copied += 1;
+    }
 
     return .{
-        .pid = if (builtin.os.tag == .linux) @intCast(std.os.linux.getpid()) else if (builtin.os.tag == .macos) @intCast(std.c.getpid()) else 0,
+        .pid = currentProcessId(),
         .uptime_seconds = uptime,
-        .components = &registry_components,
+        .components = components,
     };
 }
 
@@ -172,11 +242,20 @@ pub const ReadinessResult = struct {
     status: ReadinessStatus,
     checks: []const ComponentCheck,
 
+    pub fn deinit(self: ReadinessResult, allocator: std.mem.Allocator) void {
+        for (self.checks) |check| {
+            allocator.free(check.name);
+            if (check.message) |msg| allocator.free(msg);
+        }
+        if (self.checks.len > 0) allocator.free(self.checks);
+    }
+
     /// Serialize the readiness result as JSON. Caller owns the returned memory.
     pub fn formatJson(self: ReadinessResult, allocator: std.mem.Allocator) ![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        const w = &buf_writer.writer;
 
         const status_str = if (self.status == .ready) "ready" else "not_ready";
         try w.print("{{\"status\":\"{s}\",\"checks\":[", .{status_str});
@@ -192,6 +271,7 @@ pub const ReadinessResult = struct {
         }
 
         try w.writeAll("]}");
+        buf = buf_writer.toArrayList();
         return try allocator.dupe(u8, buf.items);
     }
 };
@@ -245,15 +325,22 @@ pub fn checkRegistryReadiness(allocator: std.mem.Allocator) !ReadinessResult {
     const checks = try allocator.alloc(ComponentCheck, count);
     var all_healthy = true;
     var i: usize = 0;
+    errdefer {
+        for (checks[0..i]) |check| {
+            allocator.free(check.name);
+            if (check.message) |msg| allocator.free(msg);
+        }
+        allocator.free(checks);
+    }
 
     var iter = registry_components.iterator();
     while (iter.next()) |entry| {
         const healthy = std.mem.eql(u8, entry.value_ptr.status, "ok");
         if (!healthy) all_healthy = false;
         checks[i] = .{
-            .name = entry.key_ptr.*,
+            .name = try allocator.dupe(u8, entry.key_ptr.*),
             .healthy = healthy,
-            .message = entry.value_ptr.last_error,
+            .message = if (entry.value_ptr.last_error) |msg| try allocator.dupe(u8, msg) else null,
         };
         i += 1;
     }
@@ -304,11 +391,22 @@ test "bumpComponentRestart increments counter" {
 test "snapshot returns valid state" {
     reset();
     markComponentOk("test-snap");
-    const snap = snapshot();
-    try std.testing.expect(snap.components.count() >= 1);
+    var snap = try snapshot(std.testing.allocator);
+    defer snap.deinit(std.testing.allocator);
+    try std.testing.expect(snap.components.len >= 1);
 }
 
-test "health module compiles" {}
+test "snapshot owns copied strings after registry reset" {
+    reset();
+    markComponentError("test-copy", "ephemeral error");
+    var snap = try snapshot(std.testing.allocator);
+    defer snap.deinit(std.testing.allocator);
+
+    reset();
+
+    try std.testing.expectEqualStrings("test-copy", snap.components[0].name);
+    try std.testing.expectEqualStrings("ephemeral error", snap.components[0].health.last_error.?);
+}
 
 // ── Readiness Check tests ────────────────────────────────────────────
 
@@ -434,7 +532,7 @@ test "ReadinessResult formatJson multiple checks" {
 test "checkRegistryReadiness no components returns ready" {
     reset();
     const result = try checkRegistryReadiness(std.testing.allocator);
-    // Empty checks slice from static empty, no need to free
+    defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(ReadinessStatus.ready, result.status);
     try std.testing.expectEqual(@as(usize, 0), result.checks.len);
 }
@@ -444,7 +542,7 @@ test "checkRegistryReadiness all ok returns ready" {
     markComponentOk("gw");
     markComponentOk("db");
     const result = try checkRegistryReadiness(std.testing.allocator);
-    defer std.testing.allocator.free(result.checks);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(ReadinessStatus.ready, result.status);
     try std.testing.expectEqual(@as(usize, 2), result.checks.len);
     for (result.checks) |check| {
@@ -457,7 +555,7 @@ test "checkRegistryReadiness with error returns not_ready" {
     markComponentOk("gw");
     markComponentError("db", "connection refused");
     const result = try checkRegistryReadiness(std.testing.allocator);
-    defer std.testing.allocator.free(result.checks);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(ReadinessStatus.not_ready, result.status);
     try std.testing.expectEqual(@as(usize, 2), result.checks.len);
     var found_unhealthy = false;

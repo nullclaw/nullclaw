@@ -4,6 +4,7 @@
 //! Provides host extraction, localhost detection, and allowlist matching.
 
 const std = @import("std");
+const std_compat = @import("compat");
 
 /// Extract the hostname from an HTTP(S) URL, stripping port, path, query, fragment.
 pub fn extractHost(url: []const u8) ?[]const u8 {
@@ -39,6 +40,8 @@ pub fn extractHost(url: []const u8) ?[]const u8 {
 pub fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool {
     if (allowed.len == 0) return true; // empty allowlist = allow all
     for (allowed) |pattern| {
+        // Global wildcard: "*" matches any host
+        if (std.mem.eql(u8, pattern, "*")) return true;
         // Exact match
         if (std.mem.eql(u8, host, pattern)) return true;
         // Wildcard subdomain: "*.example.com" matches "api.example.com"
@@ -53,22 +56,26 @@ pub fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool 
     return false;
 }
 
+/// Container runtimes commonly expose the host bridge under a fixed DNS alias.
+pub fn isContainerRuntimeHostAlias(host: []const u8) bool {
+    const bare = stripHostBrackets(host);
+    const unscoped = stripIpv6ZoneId(bare);
+
+    return std.ascii.eqlIgnoreCase(unscoped, "host.docker.internal") or
+        std.ascii.eqlIgnoreCase(unscoped, "host.containers.internal");
+}
+
 /// SSRF: check if host is localhost or a private/reserved IP.
 pub fn isLocalHost(host: []const u8) bool {
-    // Strip brackets from IPv6 addresses like [::1]
-    const bare = if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]"))
-        host[1 .. host.len - 1]
-    else
-        host;
-
-    // Drop IPv6 zone id suffix (e.g. "fe80::1%lo0" or "fe80::1%25lo0").
-    const unscoped = if (std.mem.indexOfScalar(u8, bare, '%')) |pct| bare[0..pct] else bare;
+    const bare = stripHostBrackets(host);
+    const unscoped = stripIpv6ZoneId(bare);
     if (unscoped.len == 0) return true;
 
     if (std.mem.eql(u8, unscoped, "localhost")) return true;
     if (std.mem.endsWith(u8, unscoped, ".localhost")) return true;
     // .local TLD
     if (std.mem.endsWith(u8, unscoped, ".local")) return true;
+    if (isContainerRuntimeHostAlias(unscoped)) return true;
 
     // Try to parse as IPv4
     if (parseIpv4(unscoped)) |octets| {
@@ -133,7 +140,7 @@ pub fn resolveConnectHost(
         });
     }
 
-    const addr_list = std.net.getAddressList(allocator, bare, port) catch |err| switch (err) {
+    const addr_list = std_compat.net.getAddressList(allocator, bare, port) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.HostResolutionFailed,
     };
@@ -224,7 +231,7 @@ pub fn hostResolvesToLocal(allocator: std.mem.Allocator, host: []const u8, port:
     if (parseIpv6(unscoped)) |segs| return isNonGlobalV6(segs);
 
     // Fail closed: if we cannot verify DNS resolution safety, treat host as local.
-    const addr_list = std.net.getAddressList(allocator, bare, port) catch return true;
+    const addr_list = std_compat.net.getAddressList(allocator, bare, port) catch return true;
     defer addr_list.deinit();
 
     for (addr_list.addrs) |addr| {
@@ -577,6 +584,11 @@ test "isLocalHost detects 127.x.x.x range" {
 
 test "isLocalHost detects .local TLD" {
     try std.testing.expect(isLocalHost("myhost.local"));
+}
+
+test "isLocalHost detects container runtime host aliases" {
+    try std.testing.expect(isLocalHost("host.docker.internal"));
+    try std.testing.expect(isLocalHost("host.containers.internal"));
 }
 
 test "isNonGlobalV4 blocks 169.254.x.x link-local" {

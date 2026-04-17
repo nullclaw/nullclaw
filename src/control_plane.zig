@@ -1,58 +1,104 @@
 const std = @import("std");
+const interaction_commands = @import("interactions/commands.zig");
 
 pub const SlashCommand = struct {
     name: []const u8,
     arg: []const u8,
 };
 
+pub const TelegramBotCommandScope = enum {
+    default,
+    all_private_chats,
+    all_group_chats,
+};
+
+pub const TelegramBotCommandOptions = struct {
+    scope: TelegramBotCommandScope = .default,
+    include_bind_command: bool = true,
+    include_topic_command: bool = true,
+    include_topics_command: bool = true,
+};
+
 pub const HELP_TEXT =
     \\Available commands:
+    \\
+    \\Session:
+    \\  /menu, /help, /commands
     \\  /new, /reset [model], /restart [model]
-    \\  /help, /commands, /status, /whoami, /id
+    \\  /status, /whoami, /id, /compact
+    \\  /stop, /abort
+    \\
+    \\Model and output:
     \\  /model, /models, /model <name>, /model auto
     \\  /think, /verbose, /reasoning
     \\  /exec, /queue, /usage, /tts, /voice
-    \\  /stop, /abort, /compact
-    \\  /allowlist, /approve, /context
-    \\  /export-session, /export
-    \\  /session ttl <duration|off>
-    \\  /subagents, /agents, /focus, /unfocus, /kill, /steer, /tell
-    \\  /config, /capabilities, /debug
-    \\  /dock-telegram, /dock-discord, /dock-slack
-    \\  /activation, /send, /elevated, /bash, /poll, /skill
+    \\
+    \\Memory and diagnostics:
     \\  /doctor — memory subsystem diagnostics
     \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
     \\  /tool-customizations, /tools — show tool customizations (read-only)
+    \\  /export-session, /export
+    \\  /session ttl <duration|off>
+    \\  /config, /capabilities, /debug
+    \\
+    \\Tasks and agents:
+    \\  /subagents, /tasks, /agents, /poll, /focus, /unfocus, /kill, /steer, /tell
+    \\  /bind <agent|clear|status>
+    \\
+    \\Access and integrations:
+    \\  /allowlist, /approve, /context
+    \\  /dock-telegram, /dock-discord, /dock-slack
+    \\  /activation, /send, /elevated, /bash, /skill
+    \\
+    \\Telegram forums (if enabled):
+    \\  /topic <name>, /topics, /topic-map
+    \\
     \\  exit, quit
 ;
 
-pub const TELEGRAM_BOT_COMMANDS_JSON =
-    \\{"commands":[
-    \\{"command":"start","description":"Start a conversation"},
-    \\{"command":"new","description":"Clear history, start fresh"},
-    \\{"command":"reset","description":"Alias for /new"},
-    \\{"command":"help","description":"Show available commands"},
-    \\{"command":"commands","description":"Alias for /help"},
-    \\{"command":"status","description":"Show model and stats"},
-    \\{"command":"whoami","description":"Show current session id"},
-    \\{"command":"model","description":"Switch model"},
-    \\{"command":"models","description":"Alias for /model"},
-    \\{"command":"think","description":"Set thinking level"},
-    \\{"command":"verbose","description":"Set verbose level"},
-    \\{"command":"reasoning","description":"Set reasoning output"},
-    \\{"command":"exec","description":"Set exec policy"},
-    \\{"command":"queue","description":"Set queue policy"},
-    \\{"command":"usage","description":"Set usage footer mode"},
-    \\{"command":"tts","description":"Set TTS mode"},
-    \\{"command":"memory","description":"Memory tools and diagnostics"},
-    \\{"command":"doctor","description":"Memory diagnostics quick check"},
-    \\{"command":"tool-customizations","description":"Show tool customizations (read-only)"},
-    \\{"command":"tools","description":"Alias for /tool-customizations"},
-    \\{"command":"stop","description":"Stop active background task"},
-    \\{"command":"restart","description":"Restart current session"},
-    \\{"command":"compact","description":"Compact context now"}
-    \\]}
-;
+fn appendTelegramBotCommandScope(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    scope: TelegramBotCommandScope,
+) !void {
+    switch (scope) {
+        .default => try out.appendSlice(allocator, "{\"type\":\"default\"}"),
+        .all_private_chats => try out.appendSlice(allocator, "{\"type\":\"all_private_chats\"}"),
+        .all_group_chats => try out.appendSlice(allocator, "{\"type\":\"all_group_chats\"}"),
+    }
+}
+
+pub fn buildTelegramBotCommandsJson(
+    allocator: std.mem.Allocator,
+    opts: TelegramBotCommandOptions,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"commands\":[");
+    try interaction_commands.appendTelegramCommandCatalogJson(&out, allocator, .{
+        .include_bind_command = opts.include_bind_command,
+        .include_topic_command = opts.scope != .all_private_chats and opts.include_topic_command,
+        .include_topics_command = opts.scope != .all_private_chats and opts.include_topics_command,
+    });
+    try out.appendSlice(allocator, "],\"scope\":");
+    try appendTelegramBotCommandScope(&out, allocator, opts.scope);
+    try out.appendSlice(allocator, "}");
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn buildTelegramDeleteBotCommandsJson(
+    allocator: std.mem.Allocator,
+    scope: TelegramBotCommandScope,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"scope\":");
+    try appendTelegramBotCommandScope(&out, allocator, scope);
+    try out.appendSlice(allocator, "}");
+    return try out.toOwnedSlice(allocator);
+}
 
 pub fn parseSlashCommand(message: []const u8) ?SlashCommand {
     const trimmed = std.mem.trim(u8, message, " \t\r\n");
@@ -131,7 +177,62 @@ test "isStopLikeCommand rejects non-control commands" {
     try std.testing.expect(!isStopLikeCommand(""));
 }
 
-test "telegram bot command payload includes memory and doctor commands" {
-    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"doctor\"") != null);
+test "telegram bot command payload includes grouped menu commands" {
+    const json = try buildTelegramBotCommandsJson(std.testing.allocator, .{});
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"menu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"allowlist\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"skill\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"doctor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"tasks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"bind\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"poll\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topics\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scope\":{\"type\":\"default\"}") != null);
+}
+
+test "buildTelegramBotCommandsJson omits topic commands when disabled" {
+    const json = try buildTelegramBotCommandsJson(std.testing.allocator, .{
+        .include_topic_command = false,
+        .include_topics_command = false,
+    });
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"menu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topic\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topics\"") == null);
+}
+
+test "buildTelegramBotCommandsJson omits bind command when disabled" {
+    const json = try buildTelegramBotCommandsJson(std.testing.allocator, .{
+        .include_bind_command = false,
+    });
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"menu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"bind\"") == null);
+}
+
+test "buildTelegramBotCommandsJson omits topic commands in private scope" {
+    const json = try buildTelegramBotCommandsJson(std.testing.allocator, .{
+        .scope = .all_private_chats,
+        .include_topic_command = true,
+        .include_topics_command = true,
+    });
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scope\":{\"type\":\"all_private_chats\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"menu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topic\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"topics\"") == null);
+}
+
+test "buildTelegramDeleteBotCommandsJson includes scope" {
+    const json = try buildTelegramDeleteBotCommandsJson(std.testing.allocator, .all_group_chats);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expectEqualStrings("{\"scope\":{\"type\":\"all_group_chats\"}}", json);
 }

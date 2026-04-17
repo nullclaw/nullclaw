@@ -5,6 +5,7 @@
 //! Persisted to `~/.nullclaw/state.json` with atomic writes (temp + rename).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const json_util = @import("json_util.zig");
 const Allocator = std.mem.Allocator;
 const thread_stacks = @import("thread_stacks.zig");
@@ -26,7 +27,7 @@ pub const State = struct {
 pub const StateManager = struct {
     allocator: Allocator,
     state_path: []const u8, // owned
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     state: State = .{},
 
     pub fn init(allocator: Allocator, state_path: []const u8) Allocator.Error!StateManager {
@@ -52,7 +53,7 @@ pub const StateManager = struct {
 
         self.state.last_channel = self.allocator.dupe(u8, channel) catch null;
         self.state.last_chat_id = self.allocator.dupe(u8, chat_id) catch null;
-        self.state.updated_at = std.time.timestamp();
+        self.state.updated_at = std_compat.time.timestamp();
     }
 
     /// Get the last active channel. Returns null if not set.
@@ -102,21 +103,23 @@ pub const StateManager = struct {
         } else {
             try buf.appendSlice(self.allocator, "  \"last_chat_id\": null,\n");
         }
-        try std.fmt.format(buf.writer(self.allocator), "  \"updated_at\": {d}\n", .{updated});
-        try buf.appendSlice(self.allocator, "}\n");
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        try buf_writer.writer.print("  \"updated_at\": {d}\n", .{updated});
+        try buf_writer.writer.print("}}\n", .{});
+        buf = buf_writer.toArrayList();
 
         // Atomic write: temp file + rename
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.state_path});
         defer self.allocator.free(tmp_path);
 
-        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+        const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
         try tmp_file.writeAll(buf.items);
         tmp_file.close();
 
-        std.fs.renameAbsolute(tmp_path, self.state_path) catch {
+        std_compat.fs.renameAbsolute(tmp_path, self.state_path) catch {
             // If rename fails (cross-device), fall back to direct write
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
-            const file = try std.fs.createFileAbsolute(self.state_path, .{});
+            std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = try std_compat.fs.createFileAbsolute(self.state_path, .{});
             try file.writeAll(buf.items);
             file.close();
         };
@@ -124,7 +127,7 @@ pub const StateManager = struct {
 
     /// Load state from disk. Overwrites current in-memory state.
     pub fn load(self: *StateManager) !void {
-        const file = std.fs.openFileAbsolute(self.state_path, .{}) catch |err| switch (err) {
+        const file = std_compat.fs.openFileAbsolute(self.state_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return, // No state file — fresh start
             else => return err,
         };
@@ -227,9 +230,9 @@ test "StateManager updated_at is set" {
 test "StateManager save and load roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "state.json" });
+    const path = try std_compat.fs.path.join(testing.allocator, &.{ dir, "state.json" });
     defer testing.allocator.free(path);
 
     // Save
@@ -255,9 +258,9 @@ test "StateManager save and load roundtrip" {
 test "StateManager load missing file is ok" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "nonexistent.json" });
+    const path = try std_compat.fs.path.join(testing.allocator, &.{ dir, "nonexistent.json" });
     defer testing.allocator.free(path);
 
     var mgr = try StateManager.init(testing.allocator, path);
@@ -269,9 +272,9 @@ test "StateManager load missing file is ok" {
 test "StateManager save with null values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "state-null.json" });
+    const path = try std_compat.fs.path.join(testing.allocator, &.{ dir, "state-null.json" });
     defer testing.allocator.free(path);
 
     {
@@ -293,9 +296,9 @@ test "StateManager save with null values" {
 test "StateManager save overwrites previous file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "state-overwrite.json" });
+    const path = try std_compat.fs.path.join(testing.allocator, &.{ dir, "state-overwrite.json" });
     defer testing.allocator.free(path);
 
     var mgr = try StateManager.init(testing.allocator, path);
@@ -317,9 +320,9 @@ test "StateManager save overwrites previous file" {
 test "StateManager handles special chars in values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir);
-    const path = try std.fs.path.join(testing.allocator, &.{ dir, "state-special.json" });
+    const path = try std_compat.fs.path.join(testing.allocator, &.{ dir, "state-special.json" });
     defer testing.allocator.free(path);
 
     {

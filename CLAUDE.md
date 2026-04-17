@@ -9,10 +9,10 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 ## Build & Test Commands
 
 ```bash
-# Requires exactly Zig 0.15.2 (verify: zig version)
+# Requires exactly Zig 0.16.0 (verify: zig version)
 zig build                           # dev build
 zig build -Doptimize=ReleaseSmall   # release build (target: <1 MB binary)
-zig build test --summary all        # run all 3,371+ tests (must pass with 0 leaks)
+zig build test --summary all        # run all 5,300+ tests (must pass with 0 leaks)
 zig fmt src/                        # format all source files
 zig fmt --check src/                # check formatting (used by pre-commit hook)
 ```
@@ -45,7 +45,7 @@ git config core.hooksPath .githooks
 
 ## Project Overview
 
-NullClaw is an autonomous AI assistant runtime written in Zig 0.15.2. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
+NullClaw is an autonomous AI assistant runtime written in Zig 0.16.0. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
 
 ## Architecture
 
@@ -65,7 +65,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 
 ### Key Entry Points
 
-- `src/main.zig` - CLI command routing (`agent`, `gateway`, `onboard`, `doctor`, `status`, `service`, `cron`, `channel`, `memory`, `skills`, `hardware`, `migrate`, `workspace`, `capabilities`, `models`, `auth`, `update`)
+- `src/main.zig` - CLI command routing (`agent`, `gateway`, `onboard`, `doctor`, `status`, `service`, `cron`, `channel`, `memory`, `skills`, `hardware`, `migrate`, `workspace`, `capabilities`, `models`, `auth`, `update`, `history`)
 - `src/root.zig` - Module hierarchy and public API exports (also serves as library root)
 - `src/config.zig` - JSON config loading (~30 sub-config structs from `config_types.zig`, loads from `~/.nullclaw/config.json`)
 - `src/agent.zig` - Agent orchestration (delegates to `src/agent/root.zig`)
@@ -77,9 +77,15 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 - `src/providers/` - AI model providers. 9 core implementations + 41+ OpenAI-compatible services via `compatible.zig`. Factory in `factory.zig`, single source of truth for provider URLs and auth styles.
 - `src/channels/` - Messaging channels. Each implements `Channel.VTable` (`start`, `stop`, `send`, `name`, `healthCheck`). Factory in `root.zig`.
 - `src/tools/` - Tool implementations. Each implements `Tool.VTable` (`execute`, `name`, `description`, `parameters_json`). Tools receive args as `JsonObjectMap` and return `ToolResult`. Factory in `root.zig`.
-- `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
+- `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, ClickHouse, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
 - `src/security/` - Policy enforcement (`policy.zig`), pairing (`pairing.zig`), encrypted secrets (`secrets.zig`), sandbox backends (`landlock.zig`, `firejail.zig`, `bubblewrap.zig`, `docker.zig`, `detect.zig`).
 - `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Config defaults are `max_tool_iterations = 1000` and `max_history_messages = 100` (see `src/config_types.zig`).
+
+### Provider Boundary Notes
+
+- Keep canonical tool names in the runtime and prompt layer. Provider-specific quirks should be normalized at the provider boundary when possible.
+- `src/providers/ollama.zig` already normalizes common local-model tool-name drift such as `tool.shell` -> `shell`, `tools.file_read` -> `file_read`, and `scheduler_tool` / `schedule_tool` -> `schedule`.
+- If a local model invents another wrapper-style tool name, prefer extending the Ollama normalization helper and adding a regression test instead of teaching alternate names to the tool registry or prompt text.
 
 ### Dependency Direction
 
@@ -100,7 +106,7 @@ defer cfg.deinit();
 
 Key config sections: `models.providers` (API keys/endpoints), `agents` (named agent configs), `channels` (per-channel settings), `memory` (backend/search/lifecycle), `gateway` (port/host/pairing), `security` (sandbox/audit/autonomy), `autonomy` (level/limits/allowlists), `runtime` (native/docker/wasm).
 
-## Zig 0.15.2 API Gotchas
+## Zig 0.16.0 API Gotchas
 
 - `std.io.getStdOut()` does NOT exist. Use `std.fs.File.stdout()`.
 - HTTP client: `std.http.Client.fetch()` with `std.Io.Writer.Allocating`.
@@ -109,6 +115,10 @@ Key config sections: `models.providers` (API keys/endpoints), `agents` (named ag
 - `ChaCha20Poly1305.decrypt`: use stack buffer then `allocator.dupe()` (heap buffer segfaults on macOS).
 - `SQLITE_TRANSIENT` in auto-translated C code: use `SQLITE_STATIC` (null) instead.
 - When unsure about API, search `src/` for existing usage rather than guessing.
+
+## Search Zig Source
+
+Run `zig env` to locate Zig source directories. `.std_dir` points to the standard library, `.lib_dir` to the broader lib tree. Read the source directly to verify struct fields, function signatures, and available methods.
 
 ## Testing Conventions
 

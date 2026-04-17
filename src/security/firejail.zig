@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const probe = @import("probe.zig");
 const Sandbox = @import("sandbox.zig").Sandbox;
 
 /// Firejail sandbox backend for Linux.
@@ -44,11 +46,14 @@ pub const FirejailSandbox = struct {
         return buf[0 .. prefix_len + argv.len];
     }
 
-    fn isAvailable(_: *anyopaque) bool {
-        // Check if firejail binary is reachable — cannot actually spawn in comptime,
-        // so we report true only on Linux where firejail is meaningful.
-        const builtin = @import("builtin");
-        return comptime builtin.os.tag == .linux;
+    fn isAvailable(ptr: *anyopaque) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        const smoke_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
+        var wrapped_argv: [8][]const u8 = undefined;
+        // Probe the same wrapper argv we execute later so auto-detect does not
+        // advertise firejail when the host cannot actually sandbox a command.
+        const argv = wrapCommand(ptr, &smoke_argv, &wrapped_argv) catch return false;
+        return probe.runQuietCommand(argv);
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -132,4 +137,40 @@ test "firejail buffer too small returns error" {
     var buf: [3][]const u8 = undefined;
     const result = sb.wrapCommand(&argv, &buf);
     try std.testing.expectError(error.BufferTooSmall, result);
+}
+
+test "firejail sandbox availability requires executable in PATH" {
+    var fj = createFirejailSandbox("/tmp/workspace");
+    const sb = fj.sandbox();
+    if (comptime builtin.os.tag != .linux) {
+        try std.testing.expect(!sb.isAvailable());
+        return;
+    }
+
+    const platform = @import("../platform.zig");
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "PATH");
+    defer std.testing.allocator.free(key_z);
+
+    const old_path = platform.getEnvOrNull(std.testing.allocator, "PATH");
+    defer if (old_path) |path| std.testing.allocator.free(path);
+
+    const old_path_z = if (old_path) |path| try std.testing.allocator.dupeZ(u8, path) else null;
+    defer if (old_path_z) |path| std.testing.allocator.free(path);
+
+    defer {
+        if (old_path_z) |path| {
+            _ = c.setenv(key_z.ptr, path.ptr, 1);
+        } else {
+            _ = c.unsetenv(key_z.ptr);
+        }
+    }
+
+    const empty_z = try std.testing.allocator.dupeZ(u8, "");
+    defer std.testing.allocator.free(empty_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, empty_z.ptr, 1));
+    try std.testing.expect(!sb.isAvailable());
 }

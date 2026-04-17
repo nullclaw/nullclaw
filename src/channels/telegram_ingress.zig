@@ -61,19 +61,30 @@ pub fn pendingTextChainStatsForKey(
     return .{ .latest = latest, .parts = parts, .total_bytes = total_bytes };
 }
 
-pub fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
+pub fn textDebounceSecsForChainWithBase(parts: usize, total_bytes: usize, base_debounce_secs: u64) u64 {
+    if (base_debounce_secs == 0) return 0;
     if (parts >= LARGE_TEXT_CHAIN_MIN_PARTS or total_bytes >= LARGE_TEXT_CHAIN_MIN_BYTES) {
-        return LARGE_TEXT_CHAIN_DEBOUNCE_SECS;
+        return @max(base_debounce_secs, LARGE_TEXT_CHAIN_DEBOUNCE_SECS);
     }
-    return TEXT_MESSAGE_DEBOUNCE_SECS;
+    return base_debounce_secs;
 }
 
-fn chainStillWarm(now: u64, stats: PendingTextChainStats) bool {
-    return now <= stats.latest + textDebounceSecsForChain(stats.parts, stats.total_bytes);
+pub fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
+    return textDebounceSecsForChainWithBase(parts, total_bytes, TEXT_MESSAGE_DEBOUNCE_SECS);
 }
 
-fn chainIsMature(now: u64, stats: PendingTextChainStats) bool {
-    return !chainStillWarm(now, stats);
+fn chainStillWarm(now: u64, stats: PendingTextChainStats, base_debounce_secs: u64) bool {
+    const debounce_secs = textDebounceSecsForChainWithBase(
+        stats.parts,
+        stats.total_bytes,
+        base_debounce_secs,
+    );
+    if (debounce_secs == 0) return false;
+    return now <= stats.latest + debounce_secs;
+}
+
+fn chainIsMature(now: u64, stats: PendingTextChainStats, base_debounce_secs: u64) bool {
+    return !chainStillWarm(now, stats, base_debounce_secs);
 }
 
 pub fn pendingTextBuffersInSync(
@@ -87,6 +98,16 @@ pub fn nextPendingTextDeadline(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
 ) ?u64 {
+    return nextPendingTextDeadlineWithBase(pending_messages, received_at, TEXT_MESSAGE_DEBOUNCE_SECS);
+}
+
+pub fn nextPendingTextDeadlineWithBase(
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+    base_debounce_secs: u64,
+) ?u64 {
+    if (base_debounce_secs == 0) return null;
+
     const n = @min(pending_messages.len, received_at.len);
     var seen = false;
     var next_deadline: u64 = 0;
@@ -97,7 +118,11 @@ pub fn nextPendingTextDeadline(
             pending_messages,
             received_at,
         ) orelse continue;
-        const deadline = stats.latest + textDebounceSecsForChain(stats.parts, stats.total_bytes);
+        const deadline = stats.latest + textDebounceSecsForChainWithBase(
+            stats.parts,
+            stats.total_bytes,
+            base_debounce_secs,
+        );
         if (!seen or deadline < next_deadline) next_deadline = deadline;
         seen = true;
     }
@@ -110,7 +135,25 @@ pub fn shouldDebounceTextMessage(
     received_at: []const u64,
     msg: root.ChannelMessage,
 ) bool {
+    return shouldDebounceTextMessageWithBase(
+        now,
+        pending_messages,
+        received_at,
+        msg,
+        TEXT_MESSAGE_DEBOUNCE_SECS,
+    );
+}
+
+pub fn shouldDebounceTextMessageWithBase(
+    now: u64,
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+    msg: root.ChannelMessage,
+    base_debounce_secs: u64,
+) bool {
+    if (base_debounce_secs == 0) return false;
     if (!hasMessageId(msg)) return false;
+    if (msg.is_interaction) return false;
     if (isSlashCommandMessage(msg.content)) return false;
     if (isLikelySplitTextChunk(msg)) return true;
 
@@ -120,7 +163,7 @@ pub fn shouldDebounceTextMessage(
         pending_messages,
         received_at,
     ) orelse return false;
-    return chainStillWarm(now, stats);
+    return chainStillWarm(now, stats, base_debounce_secs);
 }
 
 pub fn pendingTextChainMatureAtIndex(
@@ -128,6 +171,22 @@ pub fn pendingTextChainMatureAtIndex(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
     index: usize,
+) bool {
+    return pendingTextChainMatureAtIndexWithBase(
+        now,
+        pending_messages,
+        received_at,
+        index,
+        TEXT_MESSAGE_DEBOUNCE_SECS,
+    );
+}
+
+pub fn pendingTextChainMatureAtIndexWithBase(
+    now: u64,
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+    index: usize,
+    base_debounce_secs: u64,
 ) bool {
     if (index >= pending_messages.len or index >= received_at.len) return false;
 
@@ -138,7 +197,7 @@ pub fn pendingTextChainMatureAtIndex(
         pending_messages,
         received_at,
     ) orelse return false;
-    return chainIsMature(now, stats);
+    return chainIsMature(now, stats, base_debounce_secs);
 }
 
 pub fn cancelPendingTextChainForKey(
@@ -171,8 +230,22 @@ fn findNextMergeCandidateIndex(messages: []const root.ChannelMessage, start: usi
         if (!sameSenderAndChat(current, next)) break;
         const next_message_id = next.message_id orelse break;
         if (isSlashCommandMessage(next.content)) break;
+
+        // Never merge synthetic messages from interactions (like button clicks)
+        // or messages with identical IDs (reused bot message IDs).
+        if (current.is_interaction or next.is_interaction or next_message_id == current_message_id) break;
+
         const split_like = isLikelySplitTextChunk(current) or isLikelySplitTextChunk(next);
-        if (next_message_id == current_message_id + 1 or split_like) return idx;
+        // Only merge if consecutive.
+        if (next_message_id == current_message_id + 1) {
+            // Merge if split-like OR just regular text messages (to avoid turn fragmentation).
+            return idx;
+        } else if (split_like) {
+            // Non-consecutive but one is very long? Still risky but kept for
+            // compatibility with very large split chains where some IDs might be
+            // skipped or filtered.
+            return idx;
+        }
         break;
     }
     return null;
@@ -234,6 +307,68 @@ pub fn mergeConsecutiveMessages(
         var extra = messages.orderedRemove(found_idx);
         extra.deinit(allocator);
     }
+}
+
+test "telegram ingress mergeConsecutiveMessages does not merge synthetic interactions" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    // User message (ID 100)
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Do check?", 100);
+    // Synthetic interaction message from button click (reusing assistant's ID 101)
+    // Even though 101 == 100 + 1, it represents a separate interaction and should not be merged.
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "Yes, please"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 101,
+        .is_interaction = true,
+    });
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("Do check?", messages.items[0].content);
+    try std.testing.expectEqualStrings("Yes, please", messages.items[1].content);
+}
+
+test "telegram ingress mergeConsecutiveMessages does not merge identical IDs" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "First", 100);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Second", 100);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+}
+
+test "telegram ingress mergeConsecutiveMessages still merges split text" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    const split_like = try alloc.alloc(u8, TEXT_SPLIT_LIKELY_MIN_LEN);
+    @memset(split_like, 'x');
+
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = split_like,
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 100,
+    });
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "tail", 101);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
 }
 
 fn appendOwnedTestMessage(
@@ -418,6 +553,21 @@ test "telegram ingress shouldDebounceTextMessage does not debounce stale pending
     try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
 }
 
+test "telegram ingress shouldDebounceTextMessage skips interaction messages" {
+    const now = root.nowEpochSecs();
+    const interaction_msg = root.ChannelMessage{
+        .id = "user-a",
+        .sender = "chat-a",
+        .content = "Yes, please",
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 77,
+        .is_interaction = true,
+    };
+
+    try std.testing.expect(!shouldDebounceTextMessage(now, &.{}, &.{}, interaction_msg));
+}
+
 test "telegram ingress shouldDebounceTextMessage catches real-world ~3.4k split chunk" {
     const alloc = std.testing.allocator;
     var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
@@ -438,6 +588,12 @@ test "telegram ingress textDebounceSecsForChain extends window for large chains"
     try std.testing.expectEqual(@as(u64, TEXT_MESSAGE_DEBOUNCE_SECS), textDebounceSecsForChain(1, 900));
     try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(4, 900));
     try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(2, LARGE_TEXT_CHAIN_MIN_BYTES));
+}
+
+test "telegram ingress textDebounceSecsForChainWithBase honors configured debounce" {
+    try std.testing.expectEqual(@as(u64, 5), textDebounceSecsForChainWithBase(1, 900, 5));
+    try std.testing.expectEqual(@as(u64, 8), textDebounceSecsForChainWithBase(4, 900, 5));
+    try std.testing.expectEqual(@as(u64, 0), textDebounceSecsForChainWithBase(1, 900, 0));
 }
 
 test "telegram ingress shouldDebounceTextMessage debounces medium chunk (~900 bytes)" {

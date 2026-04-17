@@ -13,6 +13,7 @@
 //! with the vector/embeddings module.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const vector_math = @import("../vector/math.zig");
@@ -120,7 +121,7 @@ pub const SemanticCache = struct {
     /// Returns the best matching response if cosine similarity > threshold.
     /// Falls back to exact hash match if no semantic match or no embedding provider.
     pub fn get(self: *Self, allocator: std.mem.Allocator, key_hex: []const u8, query_text: ?[]const u8) !?CacheHit {
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const cutoff_ts = now_ts - self.ttl_minutes * 60;
         const cutoff_str = try timestampStr(allocator, cutoff_ts);
         defer allocator.free(cutoff_str);
@@ -158,7 +159,7 @@ pub const SemanticCache = struct {
         token_count: u32,
         query_text: ?[]const u8,
     ) !void {
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const now_str = try timestampStr(allocator, now_ts);
         defer allocator.free(now_str);
 
@@ -390,7 +391,7 @@ pub const SemanticCache = struct {
     }
 
     fn evictExpired(self: *Self, allocator: std.mem.Allocator) !void {
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const cutoff_ts = now_ts - self.ttl_minutes * 60;
         const cutoff_str = try timestampStr(allocator, cutoff_ts);
         defer allocator.free(cutoff_str);

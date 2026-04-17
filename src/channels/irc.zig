@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
@@ -36,18 +37,18 @@ pub const IrcChannel = struct {
     sasl_password: ?[]const u8,
     tls: bool = true,
     use_tls: bool = false,
-    stream: ?std.net.Stream = null,
+    stream: ?std_compat.net.Stream = null,
     tls_state: ?*TlsState = null,
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reader_thread: ?std.Thread = null,
-    write_mu: std.Thread.Mutex = .{},
+    write_mu: std_compat.sync.Mutex = .{},
 
     /// Heap-allocated TLS state that wraps a TCP stream with encryption.
     /// Must be heap-allocated so that pointers remain stable for the TLS client.
     pub const TlsState = struct {
-        stream_reader: std.net.Stream.Reader,
-        stream_writer: std.net.Stream.Writer,
+        stream_reader: std_compat.net.Stream.Reader,
+        stream_writer: std_compat.net.Stream.Writer,
         tls_client: std.crypto.tls.Client,
         /// Backing buffers owned by the allocator.
         read_buf: []u8,
@@ -120,7 +121,7 @@ pub const IrcChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const IrcChannel, nick: []const u8) bool {
-        return root.isAllowed(self.allow_from, nick);
+        return root.isAllowedScoped("irc channel", self.allow_from, nick);
     }
 
     pub fn setBus(self: *IrcChannel, b: *bus_mod.Bus) void {
@@ -202,9 +203,9 @@ pub const IrcChannel = struct {
         if (std.ascii.eqlIgnoreCase(parsed.command, "PING")) {
             if (parsed.params.len == 0) return;
             var pong_buf: [MAX_LINE_LEN]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&pong_buf);
-            try fbs.writer().print("PONG :{s}", .{parsed.params[parsed.params.len - 1]});
-            try self.sendRaw(fbs.getWritten());
+            var writer: std.Io.Writer = .fixed(&pong_buf);
+            try writer.print("PONG :{s}", .{parsed.params[parsed.params.len - 1]});
+            try self.sendRaw(writer.buffered());
             return;
         }
 
@@ -240,7 +241,9 @@ pub const IrcChannel = struct {
 
         var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer metadata_buf.deinit(self.allocator);
-        const mw = metadata_buf.writer(self.allocator);
+        var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &metadata_buf);
+        defer metadata_buf = metadata_writer.toArrayList();
+        const mw = &metadata_writer.writer;
         try mw.writeByte('{');
         try mw.writeAll("\"account_id\":");
         try root.appendJsonStringW(mw, self.account_id);
@@ -327,10 +330,9 @@ pub const IrcChannel = struct {
         for (chunks) |chunk| {
             // Build: "PRIVMSG <target> :<chunk>\r\n"
             var line_buf: [MAX_LINE_LEN]u8 = undefined;
-            var line_fbs = std.io.fixedBufferStream(&line_buf);
-            const lw = line_fbs.writer();
+            var lw: std.Io.Writer = .fixed(&line_buf);
             try lw.print("PRIVMSG {s} :{s}\r\n", .{ target, chunk });
-            const line = line_fbs.getWritten();
+            const line = lw.buffered();
 
             try self.ircWriteAll(line);
         }
@@ -346,8 +348,8 @@ pub const IrcChannel = struct {
     /// When use_tls is true, wraps the TCP stream with std.crypto.tls.Client
     /// for TLS encryption. Otherwise connects via plain TCP.
     pub fn connect(self: *IrcChannel) !void {
-        const addr = try std.net.Address.resolveIp(self.host, self.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        const addr = try std_compat.net.Address.resolveIp(self.host, self.port);
+        const stream = try std_compat.net.tcpConnectToAddress(addr);
         self.stream = stream;
 
         if (self.use_tls) {
@@ -356,7 +358,7 @@ pub const IrcChannel = struct {
     }
 
     /// Initialize TLS over an existing TCP stream.
-    fn initTls(self: *IrcChannel, stream: std.net.Stream) !void {
+    fn initTls(self: *IrcChannel, stream: std_compat.net.Stream) !void {
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
 
         // Allocate buffers for stream and TLS I/O
@@ -379,15 +381,19 @@ pub const IrcChannel = struct {
         tls.tls_write_buf = tls_write_buf;
         tls.stream_reader = stream.reader(read_buf);
         tls.stream_writer = stream.writer(write_buf);
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        std_compat.crypto.random.bytes(&entropy);
 
         tls.tls_client = std.crypto.tls.Client.init(
-            tls.stream_reader.interface(),
+            &tls.stream_reader.interface,
             &tls.stream_writer.interface,
             .{
                 .host = if (self.tls) .{ .explicit = self.host } else .no_verification,
                 .ca = .no_verification,
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
+                .entropy = &entropy,
+                .realtime_now = std.Io.Timestamp.now(std_compat.io(), .real),
                 .allow_truncation_attacks = true,
             },
         ) catch return error.TlsInitializationFailed;
@@ -432,28 +438,28 @@ pub const IrcChannel = struct {
         // Send PASS if configured
         if (self.server_password) |pass| {
             var pass_buf: [MAX_LINE_LEN]u8 = undefined;
-            var pass_fbs = std.io.fixedBufferStream(&pass_buf);
-            try pass_fbs.writer().print("PASS {s}", .{pass});
-            try self.sendRaw(pass_fbs.getWritten());
+            var pass_writer: std.Io.Writer = .fixed(&pass_buf);
+            try pass_writer.print("PASS {s}", .{pass});
+            try self.sendRaw(pass_writer.buffered());
         }
 
         // Send NICK and USER
         var nick_buf: [MAX_LINE_LEN]u8 = undefined;
-        var nick_fbs = std.io.fixedBufferStream(&nick_buf);
-        try nick_fbs.writer().print("NICK {s}", .{self.nick});
-        try self.sendRaw(nick_fbs.getWritten());
+        var nick_writer: std.Io.Writer = .fixed(&nick_buf);
+        try nick_writer.print("NICK {s}", .{self.nick});
+        try self.sendRaw(nick_writer.buffered());
 
         var user_buf: [MAX_LINE_LEN]u8 = undefined;
-        var user_fbs = std.io.fixedBufferStream(&user_buf);
-        try user_fbs.writer().print("USER {s} 0 * :{s}", .{ self.username, self.nick });
-        try self.sendRaw(user_fbs.getWritten());
+        var user_writer: std.Io.Writer = .fixed(&user_buf);
+        try user_writer.print("USER {s} 0 * :{s}", .{ self.username, self.nick });
+        try self.sendRaw(user_writer.buffered());
 
         // Join configured channels
         for (self.channels) |ch| {
             var join_buf: [MAX_LINE_LEN]u8 = undefined;
-            var join_fbs = std.io.fixedBufferStream(&join_buf);
-            try join_fbs.writer().print("JOIN {s}", .{ch});
-            try self.sendRaw(join_fbs.getWritten());
+            var join_writer: std.Io.Writer = .fixed(&join_buf);
+            try join_writer.print("JOIN {s}", .{ch});
+            try self.sendRaw(join_writer.buffered());
         }
 
         self.reader_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE }, readerLoop, .{self});
@@ -592,7 +598,7 @@ pub fn splitIrcMessage(allocator: std.mem.Allocator, message: []const u8, max_by
 
     var line_it = std.mem.splitScalar(u8, message, '\n');
     while (line_it.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std_compat.mem.trimRight(u8, raw_line, "\r");
         if (line.len == 0) continue;
 
         if (line.len <= max_bytes) {

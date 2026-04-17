@@ -2,6 +2,7 @@
 //! Integration tests for the bootstrap provider factory and full lifecycle.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const bootstrap_root = @import("root.zig");
 const memory_root = @import("../memory/root.zig");
 const InMemoryLruMemory = memory_root.InMemoryLruMemory;
@@ -11,7 +12,7 @@ const testing = std.testing;
 test "factory creates working FileBootstrapProvider for hybrid backend" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir_path);
 
     const bp = try bootstrap_root.createProvider(testing.allocator, "hybrid", null, dir_path);
@@ -23,9 +24,9 @@ test "factory creates working FileBootstrapProvider for hybrid backend" {
     try testing.expectEqualStrings("# Test Soul", loaded.?);
 
     // Verify file actually exists on disk.
-    const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "SOUL.md" });
+    const file_path = try std_compat.fs.path.join(testing.allocator, &.{ dir_path, "SOUL.md" });
     defer testing.allocator.free(file_path);
-    const f = try std.fs.openFileAbsolute(file_path, .{});
+    const f = try std_compat.fs.openFileAbsolute(file_path, .{});
     f.close();
 }
 
@@ -50,9 +51,9 @@ test "MemoryBootstrapProvider disk fallback works via factory" {
     defer tmp.cleanup();
 
     // Write a bootstrap file to disk first.
-    tmp.dir.writeFile(.{ .sub_path = "IDENTITY.md", .data = "# Disk Identity" }) catch unreachable;
+    @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{ .sub_path = "IDENTITY.md", .data = "# Disk Identity" }) catch unreachable;
 
-    const workspace = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(workspace);
 
     var lru = InMemoryLruMemory.init(testing.allocator, 100);

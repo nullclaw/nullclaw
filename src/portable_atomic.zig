@@ -8,6 +8,7 @@
 //! (init / load / store / fetchAdd).
 
 const std = @import("std");
+const std_compat = @import("compat");
 
 pub fn Atomic(comptime T: type) type {
     if (@bitSizeOf(T) <= @bitSizeOf(usize)) {
@@ -19,7 +20,7 @@ pub fn Atomic(comptime T: type) type {
 fn MutexAtomic(comptime T: type) type {
     return struct {
         raw: T,
-        _mutex: std.Thread.Mutex = .{},
+        _mutex: std_compat.sync.Mutex = .{},
 
         const Self = @This();
 

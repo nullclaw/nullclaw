@@ -25,7 +25,7 @@ Key extension points:
 - `src/runtime.zig` (`RuntimeAdapter`) — execution environments
 - `src/peripherals.zig` (`Peripheral`) — hardware boards (Arduino, STM32, RPi)
 
-Current scale: **151 source files, ~96K lines of code, 3,371 tests**.
+Current scale: **245 source files, ~204K lines of code, 5,640+ tests**.
 
 Build and test:
 
@@ -53,18 +53,18 @@ These codebase realities should drive every design decision:
    - `src/gateway.zig`, `src/security/`, `src/tools/`, `src/runtime.zig` carry high blast radius.
    - Defaults are secure-by-default (pairing, HTTPS-only, allowlists, AEAD encryption). Keep it that way.
 
-4. **Zig 0.15.2 API is the baseline — no newer features**
+4. **Zig 0.16.0 API is the baseline — no newer features**
    - HTTP client: `std.http.Client.fetch()` with `std.Io.Writer.Allocating` for response body capture.
    - Child processes: `std.process.Child.init(argv, allocator)`, `.Pipe` (capitalized).
    - stdout: `std.fs.File.stdout().writer(&buf)` → use `.interface` for `print`/`flush`.
-   - `std.io.getStdOut()` does NOT exist in 0.15 — use `std.fs.File.stdout()`.
+   - `std.io.getStdOut()` does NOT exist in the current Zig stdlib — use `std.fs.File.stdout()`.
    - SQLite: linked via `/opt/homebrew/opt/sqlite/{lib,include}` on the compile step, not the module.
    - `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
 
-5. **All 3,371+ tests must pass at zero leaks**
+5. **All 5,640+ tests must pass at zero leaks**
    - The test suite uses `std.testing.allocator` (leak-detecting GPA). Every allocation must be freed.
    - `Config.load()` allocates — always wrap in `std.heap.ArenaAllocator` in tests and production.
-   - `ChaCha20Poly1305.decrypt` segfaults on tag failure with heap-allocated output on macOS/Zig 0.15 — use a stack buffer then `allocator.dupe()`.
+   - `ChaCha20Poly1305.decrypt` can segfault on tag failure with heap-allocated output on macOS with older Zig toolchains — use a stack buffer then `allocator.dupe()`.
 
 ## 3) Engineering Principles (Normative)
 
@@ -158,12 +158,15 @@ When uncertain, classify as higher risk.
 
 Apply these naming rules consistently:
 
-- All identifiers: `snake_case` for functions, variables, fields, modules, files.
-- Types, structs, enums, unions: `PascalCase` (e.g., `AnthropicProvider`, `BrowserTool`).
-- Constants and comptime values: `SCREAMING_SNAKE_CASE` or `PascalCase` depending on context.
+- Functions and methods: `camelCase` (e.g., `parseCommand`, `buildSimpleRequestBody`, `healthCheck`). This follows standard Zig convention.
+- Variables, fields, modules, files: `snake_case` (e.g., `workspace_dir`, `bot_user_id`, `config_parse.zig`).
+- Types, structs, enums, unions: `PascalCase` (e.g., `AnthropicProvider`, `BrowserTool`, `CommandRiskLevel`).
+- Value constants (numeric limits, URLs, timeouts): `SCREAMING_SNAKE_CASE` (e.g., `MAX_BODY_SIZE`, `DEFAULT_BASE_URL`, `KEY_LEN`).
+- Comptime array/table constants: `snake_case` (e.g., `high_risk_commands`, `compat_providers`, `default_allowed_commands`).
 - Vtable implementer naming: `<Name>Provider`, `<Name>Channel`, `<Name>Tool`, `<Name>Memory`, `<Name>Sandbox`.
-- Factory registration keys: stable, lowercase, user-facing (e.g., `"openai"`, `"telegram"`, `"shell"`).
-- Tests: named by behavior (`subject_expected_behavior`), fixtures use neutral names.
+- Vtable function-pointer fields: `camelCase` for new vtables (e.g., `chatWithSystem`, `supportsNativeTools`, `getName`). Note: some older vtable fields use `snake_case` (`supports_streaming`, `record_event`); prefer `camelCase` for new additions and consolidate over time.
+- Factory registration keys: stable, lowercase, user-facing (e.g., `"openai"`, `"telegram"`, `"shell"`). Use hyphens for multi-word keys (e.g., `"together-ai"`, `"aws-bedrock"`).
+- Tests: named with space-separated descriptive phrases as the test block string (e.g., `"command risk low for read commands"`, `"pushover execute missing message"`). Prefix with the subject or subsystem when helpful. Fixtures use neutral names.
 
 ### 6.2 Architecture Boundary Contract (Required)
 
@@ -221,6 +224,8 @@ For release changes:
 zig build -Doptimize=ReleaseSmall  # must compile clean
 ```
 
+Before any version bump, release branch, or tag work: read `RELEASING.md` and follow it exactly. Do not tag feature branches.
+
 Additional expectations by change type:
 
 - **Docs/comments only**: no build required, but verify no broken code references.
@@ -229,7 +234,24 @@ Additional expectations by change type:
 
 If full validation is impractical, document what was run and what was skipped.
 
-### 8.1 Git Hooks
+### 8.1 Test Coverage Mandate
+
+**Every code change must be accompanied by tests.** No exceptions.
+
+- **Behavior changes**: add or update tests that directly exercise the changed code path.
+- **Bug fixes**: add a regression test that reproduces the original failure *before* the fix and passes after.
+- **Logging-only or pure error-propagation changes** (e.g., `catch |err|` + `log.err(...)`): unit testing may not be practical. In this case add a comment near the change explaining why formal test coverage is omitted. Example:
+  ```zig
+  // NOTE: No unit test for this log path — would require a mock session manager.
+  // Covered by manual integration testing against a running NullClaw instance.
+  ```
+- **Error path resource cleanup**: when a function allocates resources before returning an error, always free them before the `return error.Foo`. Verify with `zig build test` that the test allocator reports 0 leaks.
+- Tests that were added to cover a specific fix must have a comment citing the bug they guard against, e.g.:
+  ```zig
+  // Regression: GLM-5 returns content=null on context-limit; parseNativeResponse must not silently succeed.
+  ```
+
+### 8.2 Git Hooks
 
 The repository ships with pre-configured hooks in `.githooks/`. Activate once per clone:
 
@@ -257,7 +279,7 @@ To bypass a hook in an emergency: `git commit --no-verify` / `git push --no-veri
 
 - Do not add C dependencies or large Zig packages without strong justification (binary size impact).
 - Do not return vtable interfaces pointing to temporaries — dangling pointer.
-- Do not use `std.io.getStdOut()` — it does not exist in Zig 0.15.
+- Do not use `std.io.getStdOut()` — it does not exist in Zig 0.16.
 - Do not silently weaken security policy or access constraints.
 - Do not add speculative config/feature flags "just in case".
 - Do not skip `defer allocator.free(...)` — every allocation must be freed.
@@ -285,5 +307,5 @@ When working in fast iterative mode:
 - Validate assumptions with code search before implementing.
 - Prefer deterministic behavior over clever shortcuts.
 - Do not "ship and hope" on security-sensitive paths.
-- If uncertain about Zig 0.15 API, check `src/` for existing usage patterns before guessing.
+- If uncertain about Zig 0.16 API, check `src/` for existing usage patterns before guessing.
 - If uncertain about architecture, read the vtable interface definition before implementing.

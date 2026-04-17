@@ -1,9 +1,10 @@
 const std = @import("std");
+const std_compat = @import("compat");
 
 const MAX_PROVIDER_BYTES: usize = 64;
 const MAX_DETAIL_BYTES: usize = 2048;
 
-var mutex: std.Thread.Mutex = .{};
+var mutex: std_compat.sync.Mutex = .{};
 var last_provider_buf: [MAX_PROVIDER_BYTES]u8 = undefined;
 var last_provider_len: usize = 0;
 var last_detail_buf: [MAX_DETAIL_BYTES]u8 = undefined;

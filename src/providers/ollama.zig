@@ -33,41 +33,63 @@ const OllamaChatResponse = struct {
 
 /// Extract actual tool name and arguments from potentially quirky tool call formats.
 ///
-/// Handles 3 patterns local models commonly produce:
+/// Handles local-model tool-name quirks before the agent dispatcher sees them:
 /// 1. Nested wrapper: {"name":"tool_call","arguments":{"name":"shell","arguments":{...}}}
 /// 2. Prefixed names: "tool.shell" -> "shell"
-/// 3. Normal: return as-is
+/// 3. Known alias spellings: "scheduler_tool" -> "schedule"
+/// 4. Normal: return as-is
+fn stripToolPrefixes(name: []const u8) []const u8 {
+    var normalized = name;
+    while (true) {
+        if (std.mem.eql(u8, normalized, "tool.call")) break;
+        if (std.mem.startsWith(u8, normalized, "tools.")) {
+            normalized = normalized["tools.".len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, normalized, "tool.")) {
+            normalized = normalized["tool.".len..];
+            continue;
+        }
+        break;
+    }
+
+    return normalized;
+}
+
+fn normalizeToolName(name: []const u8) []const u8 {
+    const normalized = stripToolPrefixes(name);
+    if (std.mem.eql(u8, normalized, "scheduler_tool") or std.mem.eql(u8, normalized, "schedule_tool")) {
+        return "schedule";
+    }
+
+    return normalized;
+}
+
 fn extractToolNameAndArgs(
     allocator: std.mem.Allocator,
     name: []const u8,
     arguments: std.json.Value,
 ) struct { name: []const u8, args: std.json.Value } {
+    _ = allocator;
+    const stripped_name = stripToolPrefixes(name);
+
     // Pattern 1: Nested tool_call wrapper
-    if (std.mem.eql(u8, name, "tool_call") or
-        std.mem.eql(u8, name, "tool.call") or
-        std.mem.startsWith(u8, name, "tool_call>") or
-        std.mem.startsWith(u8, name, "tool_call<"))
+    if (std.mem.eql(u8, stripped_name, "tool_call") or
+        std.mem.eql(u8, stripped_name, "tool.call") or
+        std.mem.startsWith(u8, stripped_name, "tool_call>") or
+        std.mem.startsWith(u8, stripped_name, "tool_call<"))
     {
         if (arguments == .object) {
             if (arguments.object.get("name")) |nested_name_val| {
                 if (nested_name_val == .string) {
-                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-                    return .{ .name = nested_name_val.string, .args = nested_args };
+                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = .empty };
+                    return .{ .name = normalizeToolName(nested_name_val.string), .args = nested_args };
                 }
             }
         }
     }
 
-    // Pattern 2: Prefixed tool name (tool.shell -> shell, tools.shell -> shell)
-    if (std.mem.startsWith(u8, name, "tools.")) {
-        return .{ .name = name["tools.".len..], .args = arguments };
-    }
-    if (std.mem.startsWith(u8, name, "tool.")) {
-        return .{ .name = name["tool.".len..], .args = arguments };
-    }
-
-    // Pattern 3: Normal
-    return .{ .name = name, .args = arguments };
+    return .{ .name = normalizeToolName(stripped_name), .args = arguments };
 }
 
 /// Convert Ollama native tool calls to the JSON format expected by the agent loop.
@@ -168,22 +190,58 @@ fn appendOllamaImageValue(
     try buf.append(allocator, '"');
 }
 
-/// Ollama local LLM provider.
+fn appendThinkField(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+) !void {
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse {
+        try buf.appendSlice(allocator, ",\"think\":false");
+        return;
+    };
+    if (std.mem.eql(u8, effort, "none")) {
+        try buf.appendSlice(allocator, ",\"think\":false");
+        return;
+    }
+    try buf.appendSlice(allocator, ",\"think\":");
+    if (ollamaUsesThinkLevels(model)) {
+        try root.appendJsonString(buf, allocator, effort);
+        return;
+    }
+    try buf.appendSlice(allocator, "true");
+}
+
+// GPT-OSS is the documented Ollama exception: it requires string levels rather than booleans.
+fn ollamaUsesThinkLevels(model: []const u8) bool {
+    var lower_buf: [160]u8 = undefined;
+    const lower_len = @min(model.len, lower_buf.len);
+    for (model[0..lower_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..lower_len];
+    return std.mem.indexOf(u8, lower, "gpt-oss") != null;
+}
+
+/// Ollama LLM provider.
 ///
 /// Endpoints:
 /// - POST {base_url}/api/chat
-/// - No authentication required (local service)
+/// - Local: no authentication required
+/// - Cloud: optional `Authorization: Bearer <key>` when api_key is set
 pub const OllamaProvider = struct {
     base_url: []const u8,
+    api_key: ?[]const u8,
     allocator: std.mem.Allocator,
     native_tools: bool,
 
     const DEFAULT_BASE_URL = "http://localhost:11434";
 
-    pub fn init(allocator: std.mem.Allocator, base_url: ?[]const u8) OllamaProvider {
+    pub fn init(allocator: std.mem.Allocator, base_url: ?[]const u8, api_key: ?[]const u8) OllamaProvider {
         const url = if (base_url) |u| trimTrailingSlash(u) else DEFAULT_BASE_URL;
         return .{
             .base_url = url,
+            .api_key = api_key,
             .allocator = allocator,
             .native_tools = true,
         };
@@ -201,6 +259,15 @@ pub const OllamaProvider = struct {
         return std.fmt.allocPrint(allocator, "{s}/api/chat", .{self.base_url});
     }
 
+    /// Build the Authorization header slice for HTTP requests.
+    /// Returns an empty slice when no api_key is configured (local Ollama).
+    fn buildAuthHeaders(self: OllamaProvider, headers_buf: *[1][]const u8, auth_hdr_buf: *[512]u8) ![]const []const u8 {
+        const key = self.api_key orelse return &.{};
+        const auth_hdr = try std.fmt.bufPrint(auth_hdr_buf, "Authorization: Bearer {s}", .{key});
+        headers_buf[0] = auth_hdr;
+        return headers_buf[0..1];
+    }
+
     /// Build an Ollama chat request JSON body.
     pub fn buildRequestBody(
         allocator: std.mem.Allocator,
@@ -211,11 +278,11 @@ pub const OllamaProvider = struct {
     ) ![]const u8 {
         if (system_prompt) |sys| {
             return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"system","content":"{s}"}},{{"role":"user","content":"{s}"}}],"stream":false,"options":{{"temperature":{d:.2}}}}}
+                \\{{"model":"{s}","messages":[{{"role":"system","content":"{s}"}},{{"role":"user","content":"{s}"}}],"stream":false,"think":false,"options":{{"temperature":{d:.2}}}}}
             , .{ model, sys, message, temperature });
         } else {
             return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"stream":false,"options":{{"temperature":{d:.2}}}}}
+                \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"stream":false,"think":false,"options":{{"temperature":{d:.2}}}}}
             , .{ model, message, temperature });
         }
     }
@@ -253,7 +320,7 @@ pub const OllamaProvider = struct {
         }
 
         // Empty response
-        return try allocator.dupe(u8, "");
+        return error.NoResponseContent;
     }
 
     /// Create a Provider interface from this OllamaProvider.
@@ -289,7 +356,11 @@ pub const OllamaProvider = struct {
         const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
         defer allocator.free(body);
 
-        const resp_body = root.curlPostTimed(allocator, url, body, &.{}, 0) catch return error.OllamaApiError;
+        var headers_buf: [1][]const u8 = undefined;
+        var auth_hdr_buf: [512]u8 = undefined;
+        const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers, 0) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
         return parseResponse(allocator, resp_body);
@@ -310,7 +381,11 @@ pub const OllamaProvider = struct {
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        const resp_body = root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.OllamaApiError;
+        var headers_buf: [1][]const u8 = undefined;
+        var auth_hdr_buf: [512]u8 = undefined;
+        const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers, request.timeout_secs) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
         const text = try parseResponse(allocator, resp_body);
@@ -381,6 +456,7 @@ fn buildChatRequestBody(
     }
 
     try buf.append(allocator, ']');
+    try appendThinkField(&buf, allocator, model, request.reasoning_effort);
 
     if (request.tools) |tools| {
         if (tools.len > 0) {
@@ -403,17 +479,17 @@ fn buildChatRequestBody(
 // ════════════════════════════════════════════════════════════════════════════
 
 test "default url" {
-    const p = OllamaProvider.init(std.testing.allocator, null);
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
     try std.testing.expectEqualStrings("http://localhost:11434", p.base_url);
 }
 
 test "custom url trailing slash" {
-    const p = OllamaProvider.init(std.testing.allocator, "http://192.168.1.100:11434/");
+    const p = OllamaProvider.init(std.testing.allocator, "http://192.168.1.100:11434/", null);
     try std.testing.expectEqualStrings("http://192.168.1.100:11434", p.base_url);
 }
 
 test "chat url is correct" {
-    const p = OllamaProvider.init(std.testing.allocator, null);
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
     const url = try p.chatUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("http://localhost:11434/api/chat", url);
@@ -424,6 +500,7 @@ test "buildRequestBody with system" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "llama3") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "system") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "temperature") != null);
 }
@@ -444,19 +521,53 @@ test "parseResponse extracts content" {
     try std.testing.expectEqualStrings("Hello from Ollama!", result);
 }
 
-test "parseResponse empty content" {
+test "parseResponse empty content returns NoResponseContent" {
     const body =
         \\{"message":{"role":"assistant","content":""}}
     ;
-    const result = try OllamaProvider.parseResponse(std.testing.allocator, body);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
+    try std.testing.expectError(error.NoResponseContent, OllamaProvider.parseResponse(std.testing.allocator, body));
 }
 
 test "supportsNativeTools returns true" {
-    var p = OllamaProvider.init(std.testing.allocator, null);
+    var p = OllamaProvider.init(std.testing.allocator, null, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "init stores api_key" {
+    const p = OllamaProvider.init(std.testing.allocator, null, "test-key");
+    try std.testing.expectEqualStrings("test-key", p.api_key.?);
+}
+
+test "init without api_key has null" {
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
+    try std.testing.expect(p.api_key == null);
+}
+
+test "buildAuthHeaders with api_key returns authorization header" {
+    const p = OllamaProvider.init(std.testing.allocator, null, "test-key");
+    var headers_buf: [1][]const u8 = undefined;
+    var auth_hdr_buf: [512]u8 = undefined;
+    const headers = try p.buildAuthHeaders(&headers_buf, &auth_hdr_buf);
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqualStrings("Authorization: Bearer test-key", headers[0]);
+}
+
+test "buildAuthHeaders without api_key returns empty" {
+    const p = OllamaProvider.init(std.testing.allocator, null, null);
+    var headers_buf: [1][]const u8 = undefined;
+    var auth_hdr_buf: [512]u8 = undefined;
+    const headers = try p.buildAuthHeaders(&headers_buf, &auth_hdr_buf);
+    try std.testing.expectEqual(@as(usize, 0), headers.len);
+}
+
+test "buildAuthHeaders errors when api_key exceeds header buffer" {
+    // Regression: a too-long cloud key must fail closed instead of dropping auth.
+    const long_key = [_]u8{'a'} ** 600;
+    const p = OllamaProvider.init(std.testing.allocator, null, long_key[0..]);
+    var headers_buf: [1][]const u8 = undefined;
+    var auth_hdr_buf: [512]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, p.buildAuthHeaders(&headers_buf, &auth_hdr_buf));
 }
 
 // ─── Tool Call Tests ─────────────────────────────────────────────────────────
@@ -474,6 +585,21 @@ test "extractToolNameAndArgs with tool. prefix" {
 test "extractToolNameAndArgs with tools. prefix" {
     const result = extractToolNameAndArgs(std.testing.allocator, "tools.file_read", .null);
     try std.testing.expectEqualStrings("file_read", result.name);
+}
+
+test "extractToolNameAndArgs normalizes scheduler_tool alias" {
+    const result = extractToolNameAndArgs(std.testing.allocator, "scheduler_tool", .null);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
+test "extractToolNameAndArgs normalizes schedule_tool alias" {
+    const result = extractToolNameAndArgs(std.testing.allocator, "schedule_tool", .null);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
+test "extractToolNameAndArgs normalizes prefixed schedule alias" {
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.schedule_tool", .null);
+    try std.testing.expectEqualStrings("schedule", result.name);
 }
 
 test "ollama buildChatRequestBody with images" {
@@ -581,6 +707,52 @@ test "ollama buildChatRequestBody includes native tools" {
     try std.testing.expect(function_obj.get("parameters").? == .object);
 }
 
+test "ollama buildChatRequestBody sends think disabled by default" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":false") != null);
+}
+
+test "ollama buildChatRequestBody enables think for standard thinking models" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .model = "qwen3",
+        .reasoning_effort = "high",
+    }, "qwen3", 0.7);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const think = parsed.value.object.get("think").?;
+    try std.testing.expect(think == .bool);
+    try std.testing.expect(think.bool);
+}
+
+test "ollama buildChatRequestBody maps reasoning_effort to think level for gpt-oss" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .model = "gpt-oss:20b",
+        .reasoning_effort = "xhigh",
+    }, "gpt-oss:20b", 0.7);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const think = parsed.value.object.get("think").?;
+    try std.testing.expect(think == .string);
+    try std.testing.expectEqualStrings("high", think.string);
+}
+
 test "extractToolNameAndArgs with nested tool_call wrapper" {
     // Build a JSON object: {"name":"shell","arguments":{"command":"date"}}
     const json_str =
@@ -607,6 +779,30 @@ test "extractToolNameAndArgs with tool.call wrapper" {
 
     const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
     try std.testing.expectEqualStrings("file_read", result.name);
+}
+
+test "extractToolNameAndArgs with tool.call wrapper normalizes scheduler alias" {
+    // Regression: nested wrapper aliases must normalize before dispatch.
+    const json_str =
+        \\{"name":"scheduler_tool","arguments":{"action":"list"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
+test "extractToolNameAndArgs with prefixed tool_call wrapper normalizes scheduler alias" {
+    // Regression: prefix stripping must happen before wrapper detection.
+    const json_str =
+        \\{"name":"scheduler_tool","arguments":{"action":"list"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.tool_call", parsed.value);
+    try std.testing.expectEqualStrings("schedule", result.name);
 }
 
 test "formatToolCallsForLoop with single tool call" {
@@ -721,6 +917,30 @@ test "parseResponse with tool_call nested wrapper unwraps correctly" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
     // And should NOT have "tool_call" as the function name
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"tool_call\"") == null);
+}
+
+test "parseResponse normalizes scheduler_tool alias to schedule" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"scheduler_tool","arguments":{"action":"list"}}}]}}
+    ;
+    const result = try OllamaProvider.parseResponse(alloc, body);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
+}
+
+test "parseResponse normalizes wrapped scheduler_tool alias to schedule" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"scheduler_tool","arguments":{"action":"list"}}}}]}}
+    ;
+    const result = try OllamaProvider.parseResponse(alloc, body);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
 }
 
 test "jsonEscapeString escapes quotes and backslashes" {

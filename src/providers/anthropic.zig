@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const log = std.log.scoped(.anthropic);
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
@@ -117,13 +119,15 @@ pub const AnthropicProvider = struct {
         }
 
         if (root_obj.get("content")) |content_arr| {
-            for (content_arr.array.items) |block| {
-                const obj = block.object;
-                if (obj.get("type")) |kind| {
-                    if (kind == .string and std.mem.eql(u8, kind.string, "text")) {
-                        if (obj.get("text")) |text| {
-                            if (text == .string) {
-                                return try allocator.dupe(u8, text.string);
+            if (content_arr == .array) {
+                for (content_arr.array.items) |block| {
+                    const obj = block.object;
+                    if (obj.get("type")) |kind| {
+                        if (kind == .string and std.mem.eql(u8, kind.string, "text")) {
+                            if (obj.get("text")) |text| {
+                                if (text == .string) {
+                                    return try allocator.dupe(u8, text.string);
+                                }
                             }
                         }
                     }
@@ -159,47 +163,49 @@ pub const AnthropicProvider = struct {
         var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
 
         if (root_obj.get("content")) |content_arr| {
-            for (content_arr.array.items) |block| {
-                const obj = block.object;
-                const kind = if (obj.get("type")) |t| (if (t == .string) t.string else "") else "";
+            if (content_arr == .array) {
+                for (content_arr.array.items) |block| {
+                    const obj = block.object;
+                    const kind = if (obj.get("type")) |t| (if (t == .string) t.string else "") else "";
 
-                if (std.mem.eql(u8, kind, "thinking")) {
-                    if (obj.get("thinking")) |thinking| {
-                        if (thinking == .string and thinking.string.len > 0) {
-                            if (thinking_parts.items.len > 0) {
-                                try thinking_parts.append(allocator, '\n');
-                            }
-                            try thinking_parts.appendSlice(allocator, thinking.string);
-                        }
-                    }
-                } else if (std.mem.eql(u8, kind, "text")) {
-                    if (obj.get("text")) |text| {
-                        if (text == .string) {
-                            const trimmed = std.mem.trim(u8, text.string, " \t\r\n");
-                            if (trimmed.len > 0) {
-                                if (text_parts.items.len > 0) {
-                                    try text_parts.append(allocator, '\n');
+                    if (std.mem.eql(u8, kind, "thinking")) {
+                        if (obj.get("thinking")) |thinking| {
+                            if (thinking == .string and thinking.string.len > 0) {
+                                if (thinking_parts.items.len > 0) {
+                                    try thinking_parts.append(allocator, '\n');
                                 }
-                                try text_parts.appendSlice(allocator, trimmed);
+                                try thinking_parts.appendSlice(allocator, thinking.string);
                             }
                         }
+                    } else if (std.mem.eql(u8, kind, "text")) {
+                        if (obj.get("text")) |text| {
+                            if (text == .string) {
+                                const trimmed = std.mem.trim(u8, text.string, " \t\r\n");
+                                if (trimmed.len > 0) {
+                                    if (text_parts.items.len > 0) {
+                                        try text_parts.append(allocator, '\n');
+                                    }
+                                    try text_parts.appendSlice(allocator, trimmed);
+                                }
+                            }
+                        }
+                    } else if (std.mem.eql(u8, kind, "tool_use")) {
+                        const name = if (obj.get("name")) |n| (if (n == .string) n.string else "") else "";
+                        if (name.len == 0) continue;
+
+                        const id = if (obj.get("id")) |i| (if (i == .string) i.string else "unknown") else "unknown";
+
+                        var arguments: []const u8 = "{}";
+                        if (obj.get("input")) |input| {
+                            arguments = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(input, .{})});
+                        }
+
+                        try tool_calls_list.append(allocator, .{
+                            .id = try allocator.dupe(u8, id),
+                            .name = try allocator.dupe(u8, name),
+                            .arguments = arguments,
+                        });
                     }
-                } else if (std.mem.eql(u8, kind, "tool_use")) {
-                    const name = if (obj.get("name")) |n| (if (n == .string) n.string else "") else "";
-                    if (name.len == 0) continue;
-
-                    const id = if (obj.get("id")) |i| (if (i == .string) i.string else "unknown") else "unknown";
-
-                    var arguments: []const u8 = "{}";
-                    if (obj.get("input")) |input| {
-                        arguments = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(input, .{})});
-                    }
-
-                    try tool_calls_list.append(allocator, .{
-                        .id = try allocator.dupe(u8, id),
-                        .name = try allocator.dupe(u8, name),
-                        .arguments = arguments,
-                    });
                 }
             }
         }
@@ -389,7 +395,14 @@ pub const AnthropicProvider = struct {
             hdr_count += 1;
         }
 
-        return sse.curlStreamAnthropic(allocator, url, body, headers_buf[0..hdr_count], callback, callback_ctx);
+        return sse.curlStreamAnthropic(allocator, url, body, headers_buf[0..hdr_count], callback, callback_ctx) catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("Anthropic streaming failed with {}; falling back to non-streaming response", .{err});
+                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+            }
+            return err;
+        };
     }
 };
 
@@ -590,7 +603,7 @@ fn appendAnthropicThinkingConfig(
 
 /// HTTP POST with OAuth-specific headers (anthropic-beta, user-agent).
 fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8, auth_hdr: []const u8, version_hdr: []const u8) ![]u8 {
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "curl", "-s", "-X", "POST" });
 
@@ -600,6 +613,12 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
         try argv.appendSlice(allocator, &.{ "--proxy", p });
     }
 
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    if (resolve_entry) |entry| {
+        try argv.appendSlice(allocator, &.{ "--resolve", entry });
+    }
+
     try argv.appendSlice(allocator, &.{
         "-H", "Content-Type: application/json",   "-H",            auth_hdr,
         "-H", version_hdr,                        "-H",            "anthropic-beta: oauth-2025-04-20",
@@ -607,7 +626,7 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
         url,
     });
 
-    var child = std.process.Child.init(argv.items, allocator);
+    var child = std_compat.process.Child.init(argv.items, allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -638,7 +657,7 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
+        .exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
     }
 
@@ -759,6 +778,14 @@ test "parseTextResponse empty content fails" {
     try std.testing.expectError(error.NoResponseContent, AnthropicProvider.parseTextResponse(std.testing.allocator, body));
 }
 
+test "parseTextResponse null content fails" {
+    // Regression: provider response parsing must tolerate `"content": null`.
+    const body =
+        \\{"content":null}
+    ;
+    try std.testing.expectError(error.NoResponseContent, AnthropicProvider.parseTextResponse(std.testing.allocator, body));
+}
+
 test "parseTextResponse classifies rate-limit errors" {
     const body =
         \\{"error":{"type":"rate_limit_error","message":"Too many requests","status":429}}
@@ -851,6 +878,22 @@ test "parseNativeResponse empty content array" {
     }
     try std.testing.expect(response.content == null);
     try std.testing.expect(response.tool_calls.len == 0);
+}
+
+test "parseNativeResponse null content does not crash" {
+    // Regression: provider response parsing must tolerate `"content": null`.
+    const body =
+        \\{"content":null,"model":"claude-3"}
+    ;
+    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c_val| std.testing.allocator.free(c_val);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(response.content == null);
+    try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
+    try std.testing.expectEqualStrings("claude-3", response.model);
 }
 
 test "parseNativeResponse skips tool_use with empty name" {

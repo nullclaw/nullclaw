@@ -5,6 +5,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const cron_gateway = @import("cron_gateway.zig");
 
 /// CronAdd tool — creates a new cron job with either a cron expression or a delay.
 pub const CronAddTool = struct {
@@ -43,6 +44,20 @@ pub const CronAddTool = struct {
         if (delay) |d| {
             _ = cron.parseDuration(d) catch
                 return ToolResult.fail("Invalid delay format");
+        }
+
+        const gateway_body = cron_gateway.buildAddBody(allocator, expression, delay, command, null, null, null, null) catch null;
+        if (gateway_body) |json_body| {
+            defer allocator.free(json_body);
+            switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
+                .unavailable => {},
+                .response => |resp| {
+                    if (resp.status_code >= 200 and resp.status_code < 300) {
+                        return ToolResult{ .success = true, .output = resp.body };
+                    }
+                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                },
+            }
         }
 
         var scheduler = loadScheduler(allocator) catch {
@@ -165,4 +180,14 @@ test "cron_add schema has command" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "command") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "expression") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "delay") != null);
+}
+
+test "cron_add gateway request body preserves delay and command" {
+    const body = try cron_gateway.buildAddBody(std.testing.allocator, null, "30m", "echo later", null, null, null, null);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("30m", parsed.value.object.get("delay").?.string);
+    try std.testing.expectEqualStrings("echo later", parsed.value.object.get("command").?.string);
 }

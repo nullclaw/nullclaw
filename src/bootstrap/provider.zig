@@ -71,6 +71,7 @@ test "isBootstrapFilename recognizes known files" {
     try std.testing.expect(isBootstrapFilename("AGENTS.md"));
     try std.testing.expect(isBootstrapFilename("SOUL.md"));
     try std.testing.expect(isBootstrapFilename("TOOLS.md"));
+    try std.testing.expect(isBootstrapFilename("CONFIG.md"));
     try std.testing.expect(isBootstrapFilename("IDENTITY.md"));
     try std.testing.expect(isBootstrapFilename("USER.md"));
     try std.testing.expect(isBootstrapFilename("HEARTBEAT.md"));

@@ -4,9 +4,11 @@
 /// saves, scaffolds the workspace, and prints {"status":"ok"} on success.
 /// Used by nullhub to configure nullclaw without interactive terminal input.
 const std = @import("std");
+const std_compat = @import("compat");
 const onboard = @import("onboard.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const config_mod = @import("config.zig");
+const config_paths = @import("config_paths.zig");
 const Config = config_mod.Config;
 
 const WizardAnswers = struct {
@@ -98,13 +100,13 @@ fn initConfigWithCustomHome(backing_allocator: std.mem.Allocator, home_dir: []co
         .arena = arena_ptr,
     };
 
-    const config_path = try std.fs.path.join(allocator, &.{ home_dir, "config.json" });
-    const workspace_dir = try std.fs.path.join(allocator, &.{ home_dir, "workspace" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ home_dir, "config.json" });
+    const workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, home_dir);
     cfg.config_path = config_path;
     cfg.workspace_dir = workspace_dir;
     cfg.workspace_dir_override = workspace_dir;
 
-    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+    if (std_compat.fs.openFileAbsolute(config_path, .{})) |file| {
         defer file.close();
         const content = try file.readToEndAlloc(allocator, 1024 * 64);
         cfg.parseJson(content) catch |err| switch (err) {
@@ -121,6 +123,7 @@ fn initConfigWithCustomHome(backing_allocator: std.mem.Allocator, home_dir: []co
     cfg.config_path = config_path;
     cfg.workspace_dir = workspace_dir;
     cfg.workspace_dir_override = workspace_dir;
+    try cfg.backfillRuntimeDerivedFields();
     cfg.syncFlatFields();
 
     return cfg;
@@ -131,6 +134,45 @@ fn loadConfigForFromJson(allocator: std.mem.Allocator, custom_home: ?[]const u8)
         return initConfigWithCustomHome(allocator, home_dir);
     }
     return Config.load(allocator) catch try onboard.initFreshConfig(allocator);
+}
+
+fn providerBaseUrlForKey(cfg: *const Config, provider_key: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, provider_key, "custom:")) {
+        return provider_key["custom:".len..];
+    }
+    return cfg.getProviderBaseUrl(provider_key);
+}
+
+fn applyLegacyProviderAnswers(cfg: *Config, answers: WizardAnswers) !void {
+    var provider_overridden = false;
+
+    if (answers.provider) |p| {
+        const provider_info = onboard.resolveProviderForQuickSetup(p) orelse return error.UnknownProvider;
+        cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
+        provider_overridden = true;
+
+        if (answers.api_key) |key| {
+            try onboard.appendOrReplaceProviderEntry(
+                cfg,
+                provider_info.key,
+                key,
+                providerBaseUrlForKey(cfg, provider_info.key),
+            );
+        }
+    } else if (answers.api_key) |key| {
+        try onboard.appendOrReplaceProviderEntry(
+            cfg,
+            cfg.default_provider,
+            key,
+            providerBaseUrlForKey(cfg, cfg.default_provider),
+        );
+    }
+
+    if (answers.model) |m| {
+        cfg.default_model = try cfg.allocator.dupe(u8, m);
+    } else if (provider_overridden) {
+        cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
+    }
 }
 
 /// Apply providers from the wizard's providers array (new multi-provider format).
@@ -159,7 +201,7 @@ fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
         const resolved = onboard.resolveProviderForQuickSetup(name) orelse {
             if (!primary_provider_set) {
                 std.debug.print("error: unknown provider '{s}'\n", .{name});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             }
             continue;
         };
@@ -182,6 +224,10 @@ fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
         try entries_list.append(cfg.allocator, .{
             .name = try cfg.allocator.dupe(u8, resolved.key),
             .api_key = if (api_key) |k| try cfg.allocator.dupe(u8, k) else null,
+            .base_url = if (std.mem.startsWith(u8, resolved.key, "custom:"))
+                try cfg.allocator.dupe(u8, resolved.key["custom:".len..])
+            else
+                null,
         });
     }
 
@@ -267,7 +313,7 @@ fn putValueByDottedKey(
     value: std.json.Value,
 ) anyerror!void {
     if (std.mem.indexOfScalar(u8, dotted_key, '.') == null) {
-        try root_obj.put(dotted_key, value);
+        try root_obj.put(allocator, dotted_key, value);
         return;
     }
 
@@ -280,24 +326,24 @@ fn putValueByDottedKey(
     while (segments.next()) |next_segment| {
         if (current_obj.getPtr(segment)) |existing_ptr| {
             if (existing_ptr.* != .object) {
-                existing_ptr.* = .{ .object = std.json.ObjectMap.init(allocator) };
+                existing_ptr.* = .{ .object = .empty };
             }
         } else {
-            try current_obj.put(segment, .{ .object = std.json.ObjectMap.init(allocator) });
+            try current_obj.put(allocator, segment, .{ .object = .empty });
         }
 
         current_obj = &current_obj.getPtr(segment).?.object;
         segment = next_segment;
     }
 
-    try current_obj.put(segment, value);
+    try current_obj.put(allocator, segment, value);
 }
 
 fn normalizeWizardAccountObject(
     allocator: std.mem.Allocator,
     raw_obj: std.json.ObjectMap,
 ) anyerror!std.json.ObjectMap {
-    var normalized = std.json.ObjectMap.init(allocator);
+    var normalized: std.json.ObjectMap = .empty;
 
     var it = raw_obj.iterator();
     while (it.next()) |entry| {
@@ -322,20 +368,20 @@ fn addAccountsChannelValue(
         break :blk raw_channel_obj;
     };
 
-    var accounts_obj = std.json.ObjectMap.init(allocator);
+    var accounts_obj: std.json.ObjectMap = .empty;
     var acc_it = accounts_source.iterator();
     while (acc_it.next()) |acc_entry| {
         const account_name = acc_entry.key_ptr.*;
         if (acc_entry.value_ptr.* != .object) continue;
         const normalized = try normalizeWizardAccountObject(allocator, acc_entry.value_ptr.*.object);
-        try accounts_obj.put(account_name, .{ .object = normalized });
+        try accounts_obj.put(allocator, account_name, .{ .object = normalized });
     }
 
     if (accounts_obj.count() == 0) return;
 
-    var wrapper = std.json.ObjectMap.init(allocator);
-    try wrapper.put("accounts", .{ .object = accounts_obj });
-    try channels_obj.put(channel_type, .{ .object = wrapper });
+    var wrapper: std.json.ObjectMap = .empty;
+    try wrapper.put(allocator, "accounts", .{ .object = accounts_obj });
+    try channels_obj.put(allocator, channel_type, .{ .object = wrapper });
 }
 
 fn addSingleChannelValue(
@@ -366,11 +412,11 @@ fn addSingleChannelValue(
 
     if (candidate != .object) return;
     const normalized = try normalizeWizardAccountObject(allocator, candidate.object);
-    try channels_obj.put(channel_type, .{ .object = normalized });
+    try channels_obj.put(allocator, channel_type, .{ .object = normalized });
 }
 
 fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void {
-    var channels_obj = std.json.ObjectMap.init(cfg.allocator);
+    var channels_obj: std.json.ObjectMap = .empty;
 
     var ch_it = raw_channels.iterator();
     while (ch_it.next()) |ch_entry| {
@@ -390,12 +436,12 @@ fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void
 
     if (channels_obj.getPtr("webhook")) |webhook_ptr| {
         if (webhook_ptr.* == .object and webhook_ptr.object.get("port") == null) {
-            try webhook_ptr.object.put("port", .{ .integer = @as(i64, @intCast(cfg.gateway.port)) });
+            try webhook_ptr.object.put(cfg.allocator, "port", .{ .integer = @as(i64, @intCast(cfg.gateway.port)) });
         }
     }
 
-    var root_obj = std.json.ObjectMap.init(cfg.allocator);
-    try root_obj.put("channels", .{ .object = channels_obj });
+    var root_obj: std.json.ObjectMap = .empty;
+    try root_obj.put(cfg.allocator, "channels", .{ .object = channels_obj });
     const root_value: std.json.Value = .{ .object = root_obj };
     const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, root_value, .{});
     defer cfg.allocator.free(patch_json);
@@ -406,7 +452,7 @@ fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) {
         std.debug.print("error: --from-json requires a JSON argument\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const json_str = args[0];
@@ -417,7 +463,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
     ) catch {
         std.debug.print("error: invalid JSON\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer parsed.deinit();
     const answers = parsed.value;
@@ -431,7 +477,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     ) catch null;
     defer if (raw_parsed) |rp| rp.deinit();
 
-    const env_home = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch null;
+    const env_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch null;
     defer if (env_home) |v| allocator.free(v);
 
     // Resolve home directory: JSON home > NULLCLAW_HOME env > default (~/.nullclaw/)
@@ -460,37 +506,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const prov_arr = raw_parsed.?.value.object.get("providers").?.array;
         try applyProvidersFromArray(&cfg, prov_arr.items);
     } else {
-        // Legacy flat provider/api_key/model fields
-        if (answers.provider) |p| {
-            const provider_info = onboard.resolveProviderForQuickSetup(p) orelse {
-                std.debug.print("error: unknown provider '{s}'\n", .{p});
-                std.process.exit(1);
-            };
-            cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
-
-            if (answers.api_key) |key| {
-                const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-                entries[0] = .{
-                    .name = try cfg.allocator.dupe(u8, provider_info.key),
-                    .api_key = try cfg.allocator.dupe(u8, key),
-                };
-                cfg.providers = entries;
-            }
-        } else if (answers.api_key) |key| {
-            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-            entries[0] = .{
-                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-                .api_key = try cfg.allocator.dupe(u8, key),
-            };
-            cfg.providers = entries;
-        }
-
-        // Apply model (explicit or derive from provider)
-        if (answers.model) |m| {
-            cfg.default_model = try cfg.allocator.dupe(u8, m);
-        } else if (answers.provider != null) {
-            cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
-        }
+        applyLegacyProviderAnswers(&cfg, answers) catch |err| switch (err) {
+            error.UnknownProvider => {
+                const provider = answers.provider orelse "unknown";
+                std.debug.print("error: unknown provider '{s}'\n", .{provider});
+                std_compat.process.exit(1);
+            },
+            else => return err,
+        };
     }
 
     // Apply memory backend
@@ -498,11 +521,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const backend = onboard.resolveMemoryBackendForQuickSetup(m) catch |err| switch (err) {
             error.UnknownMemoryBackend => {
                 std.debug.print("error: unknown memory backend '{s}'\n", .{m});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
             error.MemoryBackendDisabledInBuild => {
                 std.debug.print("error: memory backend '{s}' is disabled in this build\n", .{m});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
         };
         cfg.memory.backend = backend.name;
@@ -514,7 +537,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (answers.tunnel) |t| {
         if (!isKnownTunnelProvider(t)) {
             std.debug.print("error: invalid tunnel provider '{s}'\n", .{t});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         cfg.tunnel.provider = try cfg.allocator.dupe(u8, t);
     }
@@ -523,7 +546,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (answers.autonomy) |a| {
         applyAutonomySelection(&cfg, a) catch {
             std.debug.print("error: invalid autonomy level '{s}'\n", .{a});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
     }
 
@@ -531,7 +554,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (answers.gateway_port) |port| {
         if (port == 0) {
             std.debug.print("error: gateway_port must be > 0\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         cfg.gateway.port = port;
     }
@@ -548,7 +571,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     .object => |channels_obj| {
                         applyChannelsFromObject(&cfg, channels_obj) catch |err| {
                             std.debug.print("error: invalid channels payload ({s})\n", .{@errorName(err)});
-                            std.process.exit(1);
+                            std_compat.process.exit(1);
                         };
                     },
                     else => {},
@@ -562,34 +585,36 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
     }
 
+    try cfg.backfillRuntimeDerivedFields();
+
     // Sync flat convenience fields
     cfg.syncFlatFields();
     cfg.validate() catch |err| {
         Config.printValidationError(err);
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
     // Ensure parent config directory and workspace directory exist
-    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
     // Scaffold workspace files
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{}, null);
+    try onboard.scaffoldWorkspaceForConfig(allocator, &cfg, &onboard.ProjectContext{});
 
     // Save config
     try cfg.save();
 
     // Output success as JSON to stdout
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     try bw.interface.writeAll("{\"status\":\"ok\"}\n");
     try bw.interface.flush();
 }
@@ -736,4 +761,70 @@ test "applyProvidersFromArray sets model default from primary provider when omit
     try std.testing.expect(cfg.default_model != null);
     try std.testing.expectEqualStrings(onboard.defaultModelForProvider("groq"), cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+}
+
+test "applyProvidersFromArray keeps custom provider base_url for runtime wiring" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+
+    const payload =
+        \\{
+        \\  "providers": [
+        \\    { "provider": "custom:https://chat.example.com/v1", "api_key": "sk-test" }
+        \\  ]
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const providers = parsed.value.object.get("providers").?.array.items;
+    try applyProvidersFromArray(&cfg, providers);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("custom:https://chat.example.com/v1", cfg.default_provider);
+    try std.testing.expectEqualStrings("https://chat.example.com/v1", cfg.providers[0].base_url.?);
+}
+
+test "applyLegacyProviderAnswers preserves existing providers when updating flat provider fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .default_model = "anthropic/claude-sonnet-4.6",
+        .providers = &.{
+            .{
+                .name = "openrouter",
+                .api_key = "sk-or-existing",
+            },
+            .{
+                .name = "google-vertex",
+                .api_key = "vertex-old",
+                .base_url = "https://vertex.example/v1",
+            },
+        },
+    };
+
+    try applyLegacyProviderAnswers(&cfg, .{
+        .provider = "vertex",
+        .api_key = "vertex-new",
+    });
+
+    try std.testing.expectEqualStrings("vertex", cfg.default_provider);
+    try std.testing.expectEqualStrings(onboard.defaultModelForProvider("vertex"), cfg.default_model.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+    try std.testing.expectEqualStrings("sk-or-existing", cfg.getProviderKey("openrouter").?);
+    try std.testing.expectEqualStrings("vertex-new", cfg.getProviderKey("google-vertex").?);
+    try std.testing.expectEqualStrings("https://vertex.example/v1", cfg.getProviderBaseUrl("vertex").?);
 }

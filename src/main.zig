@@ -1,15 +1,18 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const yc = @import("nullclaw");
+const control_plane = yc.control_plane;
+const util = yc.util;
 
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     _ = error_return_trace;
     _ = ret_addr;
-    std.fs.File.stderr().writeAll("panic: ") catch {};
-    std.fs.File.stderr().writeAll(msg) catch {};
-    std.fs.File.stderr().writeAll("\n") catch {};
-    std.process.exit(1);
+    std_compat.fs.File.stderr().writeAll("panic: ") catch {};
+    std_compat.fs.File.stderr().writeAll(msg) catch {};
+    std_compat.fs.File.stderr().writeAll("\n") catch {};
+    std_compat.process.exit(1);
 }
 
 const log = std.log.scoped(.main);
@@ -18,6 +21,7 @@ const Command = enum {
     agent,
     gateway,
     service,
+    config,
     status,
     version,
     onboard,
@@ -28,9 +32,11 @@ const Command = enum {
     hardware,
     migrate,
     memory,
+    history,
     workspace,
     capabilities,
     models,
+    mcp,
     auth,
     update,
     tools,
@@ -38,13 +44,16 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
-const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
+const CONFIG_SUBCOMMANDS = "show|get|set|unset|reload|validate";
+const CRON_SUBCOMMANDS = "list|get|status|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
+const CHANNEL_SUBCOMMANDS = "list|info|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
-const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|store|update|delete|drain-outbox|forget";
+const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
-const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
+const MODELS_SUBCOMMANDS = "list|summary|info|benchmark|refresh";
+const MCP_SUBCOMMANDS = "list|info";
 const AUTH_SUBCOMMANDS = "login|status|logout";
 const TOOLS_SUBCOMMANDS = "show|export|import-preview|validate";
 
@@ -59,6 +68,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  agent        Start the AI agent loop
     \\  gateway      Start the gateway server (HTTP/WebSocket)
     \\  service      Manage OS service lifecycle
+    \\  config       Inspect resolved config values
     \\  status       Show system status
     \\  version      Show CLI version
     \\  doctor       Run diagnostics
@@ -68,9 +78,11 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  hardware     Discover and manage hardware
     \\  migrate      Migrate data from other agent runtimes
     \\  memory       Inspect and maintain memory subsystem
+    \\  history      View session conversation history
     \\  workspace    Maintain workspace markdown/bootstrap files
     \\  capabilities Show runtime capabilities manifest
     \\  models       Manage provider model catalogs
+    \\  mcp          Inspect configured MCP servers
     \\  auth         Manage OAuth authentication (OpenAI Codex)
     \\  tools        Manage tool customizations (system prompts, triggers, priorities)
     \\  update       Check for and install updates
@@ -80,17 +92,21 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
     \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
     \\  gateway [--port PORT] [--host HOST]
+    \\  status [--json]
     \\  version | --version | -V
     \\  service <{s}>
+    \\  config <{s}> [ARGS]
     \\  cron <{s}> [ARGS]
     \\  channel <{s}> [ARGS]
     \\  skills <{s}> [ARGS]
     \\  hardware <{s}> [ARGS]
     \\  migrate openclaw [--dry-run] [--source PATH]
     \\  memory <{s}> [ARGS]
+    \\  history <{s}> [ARGS]
     \\  workspace <{s}> [ARGS]
     \\  capabilities [--json]
     \\  models <{s}> [ARGS]
+    \\  mcp <{s}> [ARGS]
     \\  auth <{s}> <provider> [--import-codex]
     \\  tools <{s}> [ARGS]
     \\  update [--check] [--yes]
@@ -98,13 +114,16 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
 ,
     .{
         SERVICE_SUBCOMMANDS,
+        CONFIG_SUBCOMMANDS,
         CRON_SUBCOMMANDS,
         CHANNEL_SUBCOMMANDS,
         SKILLS_SUBCOMMANDS,
         HARDWARE_SUBCOMMANDS,
         MEMORY_SUBCOMMANDS,
+        HISTORY_SUBCOMMANDS,
         WORKSPACE_SUBCOMMANDS,
         MODELS_SUBCOMMANDS,
+        MCP_SUBCOMMANDS,
         AUTH_SUBCOMMANDS,
         TOOLS_SUBCOMMANDS,
     },
@@ -115,6 +134,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "agent", .agent },
         .{ "gateway", .gateway },
         .{ "service", .service },
+        .{ "config", .config },
         .{ "status", .status },
         .{ "version", .version },
         .{ "--version", .version },
@@ -127,9 +147,11 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "hardware", .hardware },
         .{ "migrate", .migrate },
         .{ "memory", .memory },
+        .{ "history", .history },
         .{ "workspace", .workspace },
         .{ "capabilities", .capabilities },
         .{ "models", .models },
+        .{ "mcp", .mcp },
         .{ "auth", .auth },
         .{ "tools", .tools },
         .{ "update", .update },
@@ -141,23 +163,25 @@ fn parseCommand(arg: []const u8) ?Command {
 }
 
 extern "kernel32" fn SetConsoleCP(wCodePageID: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn SetConsoleOutputCP(wCodePageID: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
 
 fn configureWindowsConsoleUtf8() void {
     if (comptime builtin.os.tag == .windows) {
         // Set both output and input code pages to UTF-8 so interactive
         // terminal sessions preserve non-ASCII user input.
-        _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
+        _ = SetConsoleOutputCP(65001);
         _ = SetConsoleCP(65001);
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    std_compat.initProcess(init);
     configureWindowsConsoleUtf8();
 
     const allocator = std.heap.smp_allocator;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try std_compat.process.argsAlloc(allocator);
+    defer std_compat.process.argsFree(allocator, args);
 
     if (args.len < 2) {
         printUsage();
@@ -185,33 +209,48 @@ pub fn main() !void {
         try yc.from_json.run(allocator, args[2..]);
         return;
     }
+    if (comptime builtin.os.tag == .windows) {
+        if (yc.service.isWindowsServiceGatewayArg(args[1])) {
+            try yc.service.runWindowsServiceGateway(allocator);
+            return;
+        }
+    }
 
     const cmd = parseCommand(args[1]) orelse {
         std.debug.print("Unknown command: {s}\n\n", .{args[1]});
         printUsage();
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
     const sub_args = args[2..];
 
     switch (cmd) {
         .version => printVersion(),
-        .status => try yc.status.run(allocator),
-        .agent => try yc.agent.run(allocator, sub_args),
+        .status => try yc.status.run(allocator, args[2..]),
+        .agent => if (agentAdminRequested(sub_args)) {
+            try runAgentAdmin(allocator, sub_args);
+        } else if (agentHelpRequested(sub_args)) {
+            printAgentUsage();
+        } else {
+            try yc.agent.run(allocator, sub_args);
+        },
         .onboard => try runOnboard(allocator, sub_args),
-        .doctor => try yc.doctor.run(allocator),
+        .doctor => try runDoctorCommand(allocator, sub_args),
         .help => printUsage(),
         .gateway => try runGateway(allocator, sub_args),
         .service => try runService(allocator, sub_args),
+        .config => try runConfig(allocator, sub_args),
         .cron => try runCron(allocator, sub_args),
         .channel => try runChannel(allocator, sub_args),
         .skills => try runSkills(allocator, sub_args),
         .hardware => try runHardware(allocator, sub_args),
         .migrate => try runMigrate(allocator, sub_args),
         .memory => try runMemory(allocator, sub_args),
+        .history => try runHistory(allocator, sub_args),
         .workspace => try runWorkspace(allocator, sub_args),
         .capabilities => try runCapabilities(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
+        .mcp => try runMcp(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
         .tools => try runTools(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
@@ -220,7 +259,7 @@ pub fn main() !void {
 
 fn printVersion() void {
     var buf: [256]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writer(&buf);
     bw.interface.print("nullclaw {s}\n", .{yc.version.string}) catch return;
     bw.interface.flush() catch return;
 }
@@ -230,11 +269,11 @@ const GatewayDaemonOverrideError = error{InvalidPort};
 fn applyRuntimeProviderOverrides(config: *const yc.config.Config) void {
     yc.http_util.setProxyOverride(config.http_request.proxy) catch |err| {
         std.debug.print("Invalid http_request.proxy override: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     yc.providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars) catch |err| {
         std.debug.print("Invalid diagnostics.api_error_max_chars override: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 }
 
@@ -242,6 +281,49 @@ fn hasVerboseFlag(args: []const []const u8) bool {
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             return true;
+        }
+    }
+    return false;
+}
+
+fn agentHelpRequested(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "-m") or
+            std.mem.eql(u8, arg, "--message") or
+            std.mem.eql(u8, arg, "-s") or
+            std.mem.eql(u8, arg, "--session") or
+            std.mem.eql(u8, arg, "--provider") or
+            std.mem.eql(u8, arg, "--model") or
+            std.mem.eql(u8, arg, "--temperature"))
+        {
+            if (i + 1 < args.len) i += 1;
+        }
+    }
+    return false;
+}
+
+fn agentAdminRequested(args: []const []const u8) bool {
+    if (args.len == 0) return false;
+    return std.mem.eql(u8, args[0], "invoke") or std.mem.eql(u8, args[0], "sessions");
+}
+
+fn gatewayHelpRequested(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--port") or
+            std.mem.eql(u8, arg, "-p") or
+            std.mem.eql(u8, arg, "--host"))
+        {
+            if (i + 1 < args.len) i += 1;
         }
     }
     return false;
@@ -268,24 +350,454 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
 
 // ── Gateway ──────────────────────────────────────────────────────
 
+fn printGatewayUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw gateway [options]
+        \\
+        \\Start the gateway server (HTTP/WebSocket).
+        \\
+        \\OPTIONS:
+        \\  --port PORT, -p PORT   Override gateway listen port
+        \\  --host HOST            Override gateway listen host
+        \\  --verbose, -v          Enable verbose logging
+        \\  --help, -h             Show this help
+        \\
+    , .{});
+}
+
+fn printAgentUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw agent [options]
+        \\
+        \\Start the AI agent loop.
+        \\
+        \\OPTIONS:
+        \\  invoke --message MESSAGE [--session SESSION] [--json]
+        \\                               Run one machine-readable agent turn
+        \\  sessions list [--json]       List persisted agent sessions
+        \\  sessions get <session> [--json]
+        \\                               Show persisted session metadata
+        \\  sessions terminate <session> [--json]
+        \\                               Clear persisted session state
+        \\
+        \\INTERACTIVE / SINGLE-TURN MODE:
+        \\  -m, --message MESSAGE        Run a single message (non-interactive)
+        \\  -s, --session SESSION         Resume a specific session
+        \\  --provider PROVIDER           Override default provider
+        \\  --model MODEL                 Override default model
+        \\  --temperature TEMP            Override sampling temperature
+        \\  --verbose, -v                 Enable verbose logging
+        \\  --help, -h                    Show this help
+        \\
+    , .{});
+}
+
+const HistoryStoreContext = struct {
+    cfg: yc.config.Config,
+    mem_rt: yc.memory.MemoryRuntime,
+    session_store: yc.memory.SessionStore,
+
+    fn init(allocator: std.mem.Allocator) !HistoryStoreContext {
+        var cfg = yc.config.Config.load(allocator) catch return error.ConfigNotFound;
+        errdefer cfg.deinit();
+
+        var history_memory_cfg = buildHistoryMemoryConfig(cfg.memory);
+        var mem_rt = yc.memory.initRuntime(allocator, &history_memory_cfg, cfg.workspace_dir) orelse return error.MemoryRuntimeUnavailable;
+        errdefer mem_rt.deinit();
+
+        const session_store = mem_rt.session_store orelse return error.SessionStoreUnavailable;
+        return .{
+            .cfg = cfg,
+            .mem_rt = mem_rt,
+            .session_store = session_store,
+        };
+    }
+
+    fn deinit(self: *HistoryStoreContext) void {
+        self.mem_rt.deinit();
+        self.cfg.deinit();
+        self.* = undefined;
+    }
+};
+
+fn runDoctorCommand(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 0) {
+        try yc.doctor.run(allocator);
+        return;
+    }
+    if (sub_args.len == 1 and std.mem.eql(u8, sub_args[0], "--json")) {
+        yc.doctor.runJson(allocator) catch |err| {
+            writeJsonError("doctor_failed", @errorName(err), null);
+            std_compat.process.exit(1);
+        };
+        return;
+    }
+
+    std.debug.print("Usage: nullclaw doctor [--json]\n", .{});
+    std_compat.process.exit(1);
+}
+
+fn selfCommandResult(allocator: std.mem.Allocator, args: []const []const u8) !std_compat.process.Child.RunResult {
+    const exe_path = try std_compat.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    for (args) |arg| try argv.append(allocator, arg);
+
+    return std_compat.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+    });
+}
+
+fn trimTrailingNewline(text: []const u8) []const u8 {
+    var trimmed = text;
+    while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == '\n' or trimmed[trimmed.len - 1] == '\r')) {
+        trimmed = trimmed[0 .. trimmed.len - 1];
+    }
+    return trimmed;
+}
+
+fn appendAgentSessionListJson(out: anytype, sessions: []const yc.memory.SessionInfo, total: u64) !void {
+    try out.writeAll("{\"sessions\":[");
+    for (sessions, 0..) |session, idx| {
+        if (idx > 0) try out.writeAll(",");
+        try out.writeAll("{\"session_key\":");
+        try writeJsonString(out, session.session_id);
+        try out.writeAll(",\"created_at\":");
+        try writeJsonString(out, session.first_message_at);
+        try out.writeAll(",\"last_active\":");
+        try writeJsonString(out, session.last_message_at);
+        try out.print(",\"turn_count\":{d},\"turn_running\":false}}", .{session.message_count / 2});
+    }
+    try out.print("],\"total\":{d}}}", .{total});
+}
+
+fn writeAgentSessionListJson(sessions: []const yc.memory.SessionInfo, total: u64) !void {
+    writeRenderedJsonLine(appendAgentSessionListJson, .{ sessions, total });
+}
+
+fn appendAgentSessionDetailJson(out: anytype, session: yc.memory.SessionInfo) !void {
+    try out.writeAll("{\"session_key\":");
+    try writeJsonString(out, session.session_id);
+    try out.writeAll(",\"created_at\":");
+    try writeJsonString(out, session.first_message_at);
+    try out.writeAll(",\"last_active\":");
+    try writeJsonString(out, session.last_message_at);
+    try out.print(",\"turn_count\":{d},\"turn_running\":false}}", .{session.message_count / 2});
+}
+
+fn writeAgentSessionDetailJson(session: yc.memory.SessionInfo) void {
+    writeRenderedJsonLine(appendAgentSessionDetailJson, .{session});
+}
+
+fn appendAgentInvokeResponseJson(out: anytype, session_key: []const u8, response: []const u8, turn_count: u64) !void {
+    try out.writeAll("{\"session\":");
+    try writeJsonString(out, session_key);
+    try out.writeAll(",\"response\":");
+    try writeJsonString(out, response);
+    try out.print(",\"turn_count\":{d}}}", .{turn_count});
+}
+
+fn runAgentAdmin(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 0) {
+        printAgentUsage();
+        std_compat.process.exit(1);
+    }
+
+    const subcmd = sub_args[0];
+    if (std.mem.eql(u8, subcmd, "invoke")) {
+        try runAgentInvokeJson(allocator, sub_args[1..]);
+        return;
+    }
+    if (std.mem.eql(u8, subcmd, "sessions")) {
+        try runAgentSessionsAdmin(allocator, sub_args[1..]);
+        return;
+    }
+
+    printAgentUsage();
+    std_compat.process.exit(1);
+}
+
+fn runAgentInvokeJson(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    var message: ?[]const u8 = null;
+    var session: ?[]const u8 = null;
+    var provider: ?[]const u8 = null;
+    var model: ?[]const u8 = null;
+    var temperature: ?[]const u8 = null;
+    var agent_name: ?[]const u8 = null;
+    var json_mode = false;
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--message") or std.mem.eql(u8, arg, "-m")) {
+            if (i + 1 >= sub_args.len) {
+                writeJsonError("bad_request", "Missing value for --message", null);
+                std_compat.process.exit(1);
+            }
+            i += 1;
+            message = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--session") or std.mem.eql(u8, arg, "-s")) {
+            if (i + 1 >= sub_args.len) {
+                writeJsonError("bad_request", "Missing value for --session", null);
+                std_compat.process.exit(1);
+            }
+            i += 1;
+            session = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--provider")) {
+            if (i + 1 >= sub_args.len) {
+                writeJsonError("bad_request", "Missing value for --provider", null);
+                std_compat.process.exit(1);
+            }
+            i += 1;
+            provider = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            if (i + 1 >= sub_args.len) {
+                writeJsonError("bad_request", "Missing value for --model", null);
+                std_compat.process.exit(1);
+            }
+            i += 1;
+            model = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            if (i + 1 >= sub_args.len) {
+                writeJsonError("bad_request", "Missing value for --temperature", null);
+                std_compat.process.exit(1);
+            }
+            i += 1;
+            temperature = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            if (i + 1 >= sub_args.len) {
+                writeJsonError("bad_request", "Missing value for --agent", null);
+                std_compat.process.exit(1);
+            }
+            i += 1;
+            agent_name = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json_mode = true;
+        } else {
+            writeJsonError("bad_request", "Unknown option for agent invoke", null);
+            std_compat.process.exit(1);
+        }
+    }
+
+    if (!json_mode) {
+        writeJsonError("bad_request", "agent invoke requires --json", null);
+        std_compat.process.exit(1);
+    }
+    const message_text = message orelse {
+        writeJsonError("bad_request", "agent invoke requires --message", null);
+        std_compat.process.exit(1);
+    };
+    if (std.mem.trim(u8, message_text, " \t\r\n").len == 0) {
+        writeJsonError("bad_request", "agent invoke message must not be empty", null);
+        std_compat.process.exit(1);
+    }
+
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "agent");
+    try argv.append(allocator, "-m");
+    try argv.append(allocator, message_text);
+
+    const effective_session = session orelse "api:default";
+    try argv.append(allocator, "-s");
+    try argv.append(allocator, effective_session);
+    if (provider) |value| {
+        try argv.append(allocator, "--provider");
+        try argv.append(allocator, value);
+    }
+    if (model) |value| {
+        try argv.append(allocator, "--model");
+        try argv.append(allocator, value);
+    }
+    if (temperature) |value| {
+        try argv.append(allocator, "--temperature");
+        try argv.append(allocator, value);
+    }
+    if (agent_name) |value| {
+        try argv.append(allocator, "--agent");
+        try argv.append(allocator, value);
+    }
+
+    const result = selfCommandResult(allocator, argv.items) catch |err| {
+        writeJsonError("agent_invoke_failed", @errorName(err), null);
+        std_compat.process.exit(1);
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    }) {
+        var ctx = HistoryStoreContext.init(allocator) catch |err| switch (err) {
+            error.ConfigNotFound => {
+                writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+                std_compat.process.exit(1);
+            },
+            error.MemoryRuntimeUnavailable => {
+                writeJsonError("session_store_unavailable", "Failed to initialize session store", null);
+                std_compat.process.exit(1);
+            },
+            error.SessionStoreUnavailable => {
+                writeJsonError("session_store_unavailable", "Session store not available for configured backend", null);
+                std_compat.process.exit(1);
+            },
+        };
+        defer ctx.deinit();
+
+        const total = ctx.session_store.countDetailedMessages(effective_session) catch 0;
+        const turn_count: u64 = total / 2;
+        const response_text = trimTrailingNewline(result.stdout);
+
+        writeRenderedJsonLine(appendAgentInvokeResponseJson, .{ effective_session, response_text, turn_count });
+        return;
+    }
+
+    const stderr_line = trimTrailingNewline(result.stderr);
+    if (stderr_line.len > 0) {
+        writeJsonError("agent_invoke_failed", stderr_line, null);
+    } else {
+        writeJsonError("agent_invoke_failed", "Agent invocation failed", null);
+    }
+    std_compat.process.exit(1);
+}
+
+fn runAgentSessionsAdmin(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 0) {
+        writeJsonError("bad_request", "Usage: nullclaw agent sessions <list|get|terminate> ...", null);
+        std_compat.process.exit(1);
+    }
+
+    const subcmd = sub_args[0];
+    const json_mode = hasJsonFlag(sub_args[1..]);
+
+    var ctx = HistoryStoreContext.init(allocator) catch |err| switch (err) {
+        error.ConfigNotFound => {
+            if (json_mode) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+            std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+            std_compat.process.exit(1);
+        },
+        error.MemoryRuntimeUnavailable, error.SessionStoreUnavailable => {
+            if (json_mode) writeJsonError("session_store_unavailable", "Session store is not available for configured backend", null);
+            std.debug.print("Session store is not available for configured backend\n", .{});
+            std_compat.process.exit(1);
+        },
+    };
+    defer ctx.deinit();
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        if (sub_args.len > 2 or !json_mode) {
+            writeJsonError("bad_request", "Usage: nullclaw agent sessions list --json", null);
+            std_compat.process.exit(1);
+        }
+        const total = ctx.session_store.countSessions() catch |err| {
+            writeJsonError("session_list_failed", @errorName(err), ctx.cfg.memory.backend);
+            std_compat.process.exit(1);
+        };
+        const sessions = ctx.session_store.listSessions(allocator, @intCast(@max(total, 1)), 0) catch |err| {
+            writeJsonError("session_list_failed", @errorName(err), ctx.cfg.memory.backend);
+            std_compat.process.exit(1);
+        };
+        defer yc.memory.freeSessionInfos(allocator, sessions);
+        try writeAgentSessionListJson(sessions, total);
+        return;
+    }
+
+    if (sub_args.len < 2 or !json_mode) {
+        writeJsonError("bad_request", "Usage: nullclaw agent sessions <get|terminate> <session> --json", null);
+        std_compat.process.exit(1);
+    }
+    const session_key = sub_args[1];
+
+    const total = ctx.session_store.countSessions() catch |err| {
+        writeJsonError("session_list_failed", @errorName(err), ctx.cfg.memory.backend);
+        std_compat.process.exit(1);
+    };
+    const sessions = ctx.session_store.listSessions(allocator, @intCast(@max(total, 1)), 0) catch |err| {
+        writeJsonError("session_list_failed", @errorName(err), ctx.cfg.memory.backend);
+        std_compat.process.exit(1);
+    };
+    defer yc.memory.freeSessionInfos(allocator, sessions);
+
+    const session = blk: {
+        for (sessions) |item| {
+            if (std.mem.eql(u8, item.session_id, session_key)) break :blk item;
+        }
+        break :blk null;
+    };
+
+    if (std.mem.eql(u8, subcmd, "get")) {
+        if (session) |value| {
+            writeAgentSessionDetailJson(value);
+            return;
+        }
+        writeJsonError("session_not_found", "No session with that key", ctx.cfg.memory.backend);
+        std_compat.process.exit(1);
+    }
+
+    if (std.mem.eql(u8, subcmd, "terminate")) {
+        if (session == null) {
+            writeJsonError("session_not_found", "No session with that key", ctx.cfg.memory.backend);
+            std_compat.process.exit(1);
+        }
+
+        ctx.session_store.clearMessages(session_key) catch |err| {
+            writeJsonError("session_terminate_failed", @errorName(err), ctx.cfg.memory.backend);
+            std_compat.process.exit(1);
+        };
+        ctx.session_store.clearAutoSaved(session_key) catch {};
+
+        const entries_opt = ctx.mem_rt.memory.list(allocator, null, session_key) catch null;
+        if (entries_opt) |entries| {
+            defer yc.memory.freeEntries(allocator, entries);
+            for (entries) |entry| {
+                _ = ctx.mem_rt.memory.forgetScoped(allocator, entry.key, session_key) catch {};
+            }
+        }
+
+        writeRenderedJsonLine(appendAgentSessionTerminationJson, .{session_key});
+        return;
+    }
+
+    writeJsonError("bad_request", "Unknown agent sessions command", null);
+    std_compat.process.exit(1);
+}
+
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (gatewayHelpRequested(sub_args)) {
+        printGatewayUsage();
+        return;
+    }
+
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer cfg.deinit();
 
     applyGatewayDaemonOverrides(&cfg, sub_args) catch {
         std.debug.print("Invalid port in CLI args.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
+
+    if (!yc.security.isYoloGatewayAllowed(cfg.autonomy.level, cfg.gateway.host, yc.security.isYoloForceEnabled(allocator))) {
+        std.debug.print(
+            "Refusing to start gateway with autonomy.level=yolo on non-local host '{s}'. Use localhost or set NULLCLAW_ALLOW_YOLO=1 to force this insecure mode.\n",
+            .{cfg.gateway.host},
+        );
+        std_compat.process.exit(1);
+    }
 
     // Check both sub_args and global args for --verbose flag
     var verbose = hasVerboseFlag(sub_args);
     if (!verbose) {
         // Also check global args for --verbose flag
-        const args = std.process.argsAlloc(allocator) catch &.{};
-        defer std.process.argsFree(allocator, args);
+        const args = std_compat.process.argsAlloc(allocator) catch &.{};
+        defer std_compat.process.argsFree(allocator, args);
         for (args) |arg| {
             if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
                 verbose = true;
@@ -299,7 +811,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     }
     cfg.validate() catch |err| {
         yc.config.Config.printValidationError(err);
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     applyRuntimeProviderOverrides(&cfg);
 
@@ -311,7 +823,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         std.debug.print(std.fmt.comptimePrint("Usage: nullclaw service <{s}>\n", .{SERVICE_SUBCOMMANDS}), .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const subcmd = sub_args[0];
@@ -329,16 +841,10 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         }
         std.debug.print("Unknown service command: {s}\n", .{subcmd});
         std.debug.print(std.fmt.comptimePrint("Usage: nullclaw service <{s}>\n", .{SERVICE_SUBCOMMANDS}), .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
-    var cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
-    defer cfg.deinit();
-
-    yc.service.handleCommand(allocator, service_cmd, cfg.config_path) catch |err| {
+    yc.service.handleCommand(allocator, service_cmd) catch |err| {
         const any_err: anyerror = err;
         switch (any_err) {
             error.UnsupportedPlatform => {
@@ -347,9 +853,13 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             error.NoHomeDir => {
                 std.debug.print("Could not resolve home directory for service files.\n", .{});
             },
+            error.OpenRcUnavailable => {
+                std.debug.print("OpenRC was detected, but the required OpenRC commands are unavailable.\n", .{});
+                std.debug.print("Verify `rc-service`, `rc-update`, and `openrc-run` are installed.\n", .{});
+            },
             error.SystemctlUnavailable => {
-                std.debug.print("`systemctl` is not available; Linux service commands require systemd user services.\n", .{});
-                std.debug.print("Run `nullclaw gateway` in the foreground or use another supervisor.\n", .{});
+                std.debug.print("`systemctl` is not available and no supported Linux fallback service manager was detected.\n", .{});
+                std.debug.print("Install OpenRC or SysVinit support, or run `nullclaw gateway` in the foreground.\n", .{});
             },
             error.SystemdUserUnavailable => {
                 std.debug.print("systemd user services are unavailable (`systemctl --user`).\n", .{});
@@ -360,11 +870,51 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             },
             else => return any_err,
         }
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 }
 
 // ── Cron ─────────────────────────────────────────────────────────
+
+const CronAddAgentOptions = struct {
+    model: ?[]const u8 = null,
+    session_target: yc.cron.SessionTarget = .isolated,
+    delivery: yc.cron.DeliveryConfig = .{},
+};
+
+fn parseCronSessionTargetArg(raw: []const u8) !yc.cron.SessionTarget {
+    return yc.cron.SessionTarget.parseStrict(raw);
+}
+
+fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !CronAddAgentOptions {
+    var options = CronAddAgentOptions{};
+    var i: usize = start_index;
+    while (i < sub_args.len) : (i += 1) {
+        if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
+            options.model = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--session-target")) {
+            options.session_target = try parseCronSessionTargetArg(sub_args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
+            options.delivery.mode = .always;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
+            options.delivery.channel = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
+            options.delivery.account_id = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
+            options.delivery.to = sub_args[i + 1];
+            i += 1;
+        }
+    }
+    return options;
+}
+
+fn parseCronAddAgentOptions(sub_args: []const []const u8) !CronAddAgentOptions {
+    return parseCronAgentOptions(sub_args, 3);
+}
 
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
@@ -372,9 +922,11 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Usage: nullclaw cron <{s}> [args]
             \\
             \\Commands:
-            \\  list                          List all scheduled tasks
+            \\  list [--json]                 List all scheduled tasks
+            \\  get <id> [--json]             Show one scheduled task
+            \\  status [--json]               Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]
+            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
             \\  once-agent <delay> <prompt> [--model <model>]
@@ -384,103 +936,120 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  resume <id>                   Resume a paused task
             \\  run <id>                      Run a scheduled task immediately
             \\  update <id> [options]         Update a cron job
-            \\  runs <id>                     List recent run history for a job
+            \\  runs <id> [--limit N] [--json]
+            \\                                List recent run history for a job
             \\
         , .{CRON_SUBCOMMANDS}), .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "list")) {
-        try yc.cron.cliListJobs(allocator);
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            std.debug.print("Usage: nullclaw cron list [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+        try yc.cron.cliListJobs(allocator, hasJsonFlag(sub_args[1..]));
+    } else if (std.mem.eql(u8, subcmd, "get")) {
+        if (sub_args.len < 2 or sub_args.len > 3 or (sub_args.len == 3 and !std.mem.eql(u8, sub_args[2], "--json"))) {
+            std.debug.print("Usage: nullclaw cron get <id> [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+
+        var scheduler = yc.cron.CronScheduler.init(allocator, 1024, true);
+        defer scheduler.deinit();
+        try yc.cron.loadJobs(&scheduler);
+
+        const job = scheduler.getJob(sub_args[1]) orelse {
+            if (hasJsonFlag(sub_args[2..])) {
+                printStdoutBytes("null\n");
+            } else {
+                std.debug.print("Cron job '{s}' not found\n", .{sub_args[1]});
+                std_compat.process.exit(1);
+            }
+            return;
+        };
+
+        if (hasJsonFlag(sub_args[2..])) {
+            writeCronJobJson(job);
+        } else {
+            std.debug.print("Cron job: {s}\n", .{job.id});
+            std.debug.print("  Expression:  {s}\n", .{job.expression});
+            std.debug.print("  Command:     {s}\n", .{job.command});
+            std.debug.print("  Type:        {s}\n", .{job.job_type.asStr()});
+            std.debug.print("  Next run:    {d}\n", .{job.next_run_secs});
+        }
+    } else if (std.mem.eql(u8, subcmd, "status")) {
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            std.debug.print("Usage: nullclaw cron status [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+        try yc.cron.cliStatus(allocator, hasJsonFlag(sub_args[1..]));
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add <expression> <command>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
+            std_compat.process.exit(1);
         }
-        var model: ?[]const u8 = null;
-        var delivery_mode: yc.cron.DeliveryMode = .none;
-        var channel: ?[]const u8 = null;
-        var to: ?[]const u8 = null;
-
-        var i: usize = 3;
-        while (i < sub_args.len) : (i += 1) {
-            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
-                model = sub_args[i + 1];
-                i += 1;
-            } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
-                delivery_mode = .always;
-            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
-                channel = sub_args[i + 1];
-                i += 1;
-            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
-                to = sub_args[i + 1];
-                i += 1;
-            }
-        }
-        const delivery = yc.cron.DeliveryConfig{
-            .mode = delivery_mode,
-            .channel = channel,
-            .to = to,
-            .channel_owned = false,
-            .to_owned = false,
+        const options = parseCronAddAgentOptions(sub_args) catch |err| switch (err) {
+            error.InvalidSessionTarget => {
+                std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
+                std_compat.process.exit(1);
+            },
         };
-        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model, delivery);
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "once-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>]\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>]\n", .{});
+            std_compat.process.exit(1);
         }
-        var model: ?[]const u8 = null;
-        var i: usize = 3;
-        while (i < sub_args.len) : (i += 1) {
-            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
-                model = sub_args[i + 1];
-                i += 1;
-            }
-        }
-        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], model);
+        const options = parseCronAgentOptions(sub_args, 3) catch |err| switch (err) {
+            error.InvalidSessionTarget => {
+                std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
+                std_compat.process.exit(1);
+            },
+        };
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         try yc.cron.cliRemoveJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "pause")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron pause <id>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         try yc.cron.cliPauseJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "resume")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron resume <id>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         try yc.cron.cliResumeJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "run")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron run <id>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         try yc.cron.cliRunJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--enable] [--disable]\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--session-target <isolated|main>] [--enable] [--disable]\n", .{});
+            std_compat.process.exit(1);
         }
         const id = sub_args[1];
         var expression: ?[]const u8 = null;
@@ -488,6 +1057,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         var prompt: ?[]const u8 = null;
         var model: ?[]const u8 = null;
         var enabled: ?bool = null;
+        var session_target: ?yc.cron.SessionTarget = null;
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--expression") and i + 1 < sub_args.len) {
@@ -502,22 +1072,80 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, sub_args[i], "--model") and i + 1 < sub_args.len) {
                 i += 1;
                 model = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--session-target") and i + 1 < sub_args.len) {
+                i += 1;
+                session_target = parseCronSessionTargetArg(sub_args[i]) catch |err| switch (err) {
+                    error.InvalidSessionTarget => {
+                        std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
+                        std_compat.process.exit(1);
+                    },
+                };
             } else if (std.mem.eql(u8, sub_args[i], "--enable")) {
                 enabled = true;
             } else if (std.mem.eql(u8, sub_args[i], "--disable")) {
                 enabled = false;
             }
         }
-        try yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled);
+        yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled, session_target) catch |err| switch (err) {
+            error.SessionTargetRequiresAgentJob => {
+                std.debug.print("session_target can only be updated for agent jobs\n", .{});
+                std_compat.process.exit(1);
+            },
+            else => return err,
+        };
     } else if (std.mem.eql(u8, subcmd, "runs")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron runs <id>\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw cron runs <id> [--limit N] [--json]\n", .{});
+            std_compat.process.exit(1);
         }
-        try yc.cron.cliListRuns(allocator, sub_args[1]);
+        var limit: usize = 10;
+        var json_mode = false;
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw cron runs <id> [--limit N] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std_compat.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option for cron runs: {s}\n", .{sub_args[i]});
+                std_compat.process.exit(1);
+            }
+        }
+
+        if (!json_mode and limit == 10 and sub_args.len == 2) {
+            try yc.cron.cliListRuns(allocator, sub_args[1]);
+            return;
+        }
+
+        var scheduler = yc.cron.CronScheduler.init(allocator, 1024, true);
+        defer scheduler.deinit();
+        try yc.cron.loadJobs(&scheduler);
+        const runs = try scheduler.listRuns(allocator, sub_args[1], limit);
+        defer allocator.free(runs);
+
+        if (json_mode) {
+            writeCronRunsJson(runs);
+        } else {
+            if (runs.len == 0) {
+                std.debug.print("No recorded runs for job '{s}'\n", .{sub_args[1]});
+                return;
+            }
+            std.debug.print("Run history for job {s}:\n", .{sub_args[1]});
+            for (runs) |run| {
+                std.debug.print("  #{d} {s} {d}->{d}\n", .{ run.id, run.status, run.started_at_s, run.finished_at_s });
+            }
+        }
     } else {
         std.debug.print("Unknown cron command: {s}\n", .{subcmd});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 }
 
@@ -529,30 +1157,127 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Usage: nullclaw channel <{s}> [args]
             \\
             \\Commands:
-            \\  list                          List configured channels
+            \\  list [--json]                 List configured channels
+            \\  info <type> [--json]          Show details for a channel type
             \\  start [channel]               Start a channel (default: first available)
             \\  status                        Show channel health/status
             \\  add <type> <config_json>      Add a channel
             \\  remove <name>                 Remove a channel
             \\
         , .{CHANNEL_SUBCOMMANDS}), .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const subcmd = sub_args[0];
+    const wants_json = hasJsonFlag(sub_args[1..]);
 
     var cfg = yc.config.Config.load(allocator) catch {
+        if (wants_json) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer cfg.deinit();
 
     if (std.mem.eql(u8, subcmd, "list")) {
-        std.debug.print("Configured channels:\n", .{});
-        for (yc.channel_catalog.known_channels) |meta| {
-            var status_buf: [64]u8 = undefined;
-            const status_text = yc.channel_catalog.statusText(&cfg, meta, &status_buf);
-            std.debug.print("  {s}: {s}\n", .{ meta.label, status_text });
+        if (wants_json) {
+            const items = blk: {
+                if (tryReadGatewayRuntimeStatusJson(allocator)) |runtime_status_json| {
+                    defer allocator.free(runtime_status_json);
+                    if (yc.channel_admin.collectConfiguredChannelsFromRuntimeStatusJson(allocator, &cfg.channels, runtime_status_json)) |live_items| {
+                        break :blk live_items;
+                    } else |_| {}
+                }
+
+                const snapshot = yc.health.snapshot(allocator) catch |err| {
+                    writeJsonError("channel_health_failed", "Failed to read channel health", null);
+                    std.debug.print("Failed to read channel health: {s}\n", .{@errorName(err)});
+                    std_compat.process.exit(1);
+                };
+                defer snapshot.deinit(allocator);
+
+                break :blk yc.channel_admin.collectConfiguredChannels(allocator, &cfg.channels, snapshot) catch |err| {
+                    writeJsonError("channel_list_failed", "Failed to build channel list", null);
+                    std.debug.print("Failed to build channel list: {s}\n", .{@errorName(err)});
+                    std_compat.process.exit(1);
+                };
+            };
+            defer allocator.free(items);
+
+            const rendered = std.json.Stringify.valueAlloc(allocator, items, .{
+                .emit_null_optional_fields = false,
+            }) catch |err| {
+                writeJsonError("channel_list_failed", "Failed to render channel list", null);
+                std.debug.print("Failed to render channel list: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            defer allocator.free(rendered);
+
+            printStdoutBytes(rendered);
+            printStdoutBytes("\n");
+        } else {
+            std.debug.print("Configured channels:\n", .{});
+            for (yc.channel_catalog.known_channels) |meta| {
+                var status_buf: [64]u8 = undefined;
+                const status_text = yc.channel_catalog.statusText(&cfg, meta, &status_buf);
+                std.debug.print("  {s}: {s}\n", .{ meta.label, status_text });
+            }
+        }
+    } else if (std.mem.eql(u8, subcmd, "info")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw channel info <type> [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+
+        var detail = blk: {
+            if (tryReadGatewayRuntimeStatusJson(allocator)) |runtime_status_json| {
+                defer allocator.free(runtime_status_json);
+                if (yc.channel_admin.readChannelTypeDetailFromRuntimeStatusJson(allocator, &cfg.channels, runtime_status_json, sub_args[1])) |live_detail_opt| {
+                    if (live_detail_opt) |live_detail| break :blk live_detail;
+                } else |_| {}
+            }
+
+            const snapshot = yc.health.snapshot(allocator) catch |err| {
+                if (hasJsonFlag(sub_args[2..])) writeJsonError("channel_health_failed", "Failed to read channel health", null);
+                std.debug.print("Failed to read channel health: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            defer snapshot.deinit(allocator);
+
+            break :blk yc.channel_admin.readChannelTypeDetail(allocator, &cfg.channels, snapshot, sub_args[1]) catch |err| {
+                if (hasJsonFlag(sub_args[2..])) writeJsonError("channel_detail_failed", "Failed to read channel detail", null);
+                std.debug.print("Failed to read channel detail: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            } orelse {
+                if (hasJsonFlag(sub_args[2..])) writeJsonError("channel_type_not_found", "Unknown channel type", null);
+                std.debug.print("Unknown channel type: {s}\n", .{sub_args[1]});
+                std_compat.process.exit(1);
+            };
+        };
+        defer detail.deinit(allocator);
+
+        if (hasJsonFlag(sub_args[2..])) {
+            const rendered = std.json.Stringify.valueAlloc(allocator, detail, .{
+                .emit_null_optional_fields = false,
+            }) catch |err| {
+                writeJsonError("channel_detail_failed", "Failed to render channel detail", null);
+                std.debug.print("Failed to render channel detail: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            defer allocator.free(rendered);
+
+            printStdoutBytes(rendered);
+            printStdoutBytes("\n");
+        } else {
+            std.debug.print("Channel: {s}\n", .{detail.type});
+            std.debug.print("  Status: {s}\n", .{detail.status});
+            if (detail.accounts.len == 0) {
+                std.debug.print("  Accounts: (none configured)\n", .{});
+            } else {
+                std.debug.print("  Accounts:\n", .{});
+                for (detail.accounts) |account| {
+                    std.debug.print("    - {s} [{s}]\n", .{ account.account_id, account.status });
+                }
+            }
         }
     } else if (std.mem.eql(u8, subcmd, "start")) {
         try runChannelStart(allocator, sub_args[1..]);
@@ -573,20 +1298,33 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
                 std.debug.print(" {s}", .{meta.key});
             }
             std.debug.print("\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         std.debug.print("To add a '{s}' channel, edit your config file:\n  {s}\n", .{ sub_args[1], cfg.config_path });
         std.debug.print("Add a \"{s}\" object under \"channels\" with the required fields.\n", .{sub_args[1]});
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw channel remove <name>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         std.debug.print("To remove the '{s}' channel, edit your config file:\n  {s}\n", .{ sub_args[1], cfg.config_path });
         std.debug.print("Remove or set the \"{s}\" object to null under \"channels\".\n", .{sub_args[1]});
     } else {
         std.debug.print("Unknown channel command: {s}\n", .{subcmd});
-        std.process.exit(1);
+        std_compat.process.exit(1);
+    }
+}
+
+fn tryReadGatewayRuntimeStatusJson(allocator: std.mem.Allocator) ?[]const u8 {
+    switch (yc.cron.requestGatewayGet(allocator, "/status")) {
+        .unavailable => return null,
+        .response => |resp| {
+            if (resp.status_code >= 200 and resp.status_code < 300) {
+                return resp.body;
+            }
+            allocator.free(resp.body);
+            return null;
+        },
     }
 }
 
@@ -598,99 +1336,170 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Usage: nullclaw skills <{s}> [args]
             \\
             \\Commands:
-            \\  list                          List installed skills
+            \\  list [--json]                 List installed skills
             \\  install <source>              Install from GitHub URL or path
+            \\  install --name <query>        Search registry and install best match
             \\  remove <name>                 Remove a skill
-            \\  info <name>                   Show skill details
+            \\  info <name> [--json]          Show skill details
             \\
         , .{SKILLS_SUBCOMMANDS}), .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer cfg.deinit();
 
     const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "list")) {
-        const skills_list = yc.skills.listSkills(allocator, cfg.workspace_dir) catch |err| {
+        const json_mode = hasJsonFlag(sub_args[1..]);
+        var visible = loadVisibleSkills(allocator, cfg.workspace_dir) catch |err| {
             std.debug.print("Failed to list skills: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
-        defer yc.skills.freeSkills(allocator, skills_list);
+        defer visible.deinit(allocator);
 
-        if (skills_list.len == 0) {
-            std.debug.print("No skills installed.\n", .{});
+        if (json_mode) {
+            writeSkillListJson(cfg.workspace_dir, visible.community_base, visible.skills);
         } else {
-            std.debug.print("Installed skills ({d}):\n", .{skills_list.len});
-            for (skills_list) |skill| {
-                std.debug.print("  {s} v{s}", .{ skill.name, skill.version });
-                if (skill.description.len > 0) {
-                    std.debug.print(" -- {s}", .{skill.description});
+            if (visible.skills.len == 0) {
+                std.debug.print("No skills installed.\n", .{});
+            } else {
+                std.debug.print("Installed skills ({d}):\n", .{visible.skills.len});
+                for (visible.skills) |skill| {
+                    std.debug.print("  {s} v{s}", .{ skill.name, skill.version });
+                    if (skill.description.len > 0) {
+                        std.debug.print(" -- {s}", .{skill.description});
+                    }
+                    const source = skillSource(cfg.workspace_dir, visible.community_base, skill);
+                    if (!std.mem.eql(u8, source, "workspace")) {
+                        std.debug.print(" [{s}]", .{source});
+                    }
+                    if (!skill.available and skill.missing_deps.len > 0) {
+                        std.debug.print(" (missing:{s})", .{skill.missing_deps});
+                    }
+                    std.debug.print("\n", .{});
                 }
-                std.debug.print("\n", .{});
             }
         }
     } else if (std.mem.eql(u8, subcmd, "install")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw skills install <source>\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw skills install <source> | --name <query>\n", .{});
+            std_compat.process.exit(1);
+        }
+        var install_name: ?[]const u8 = null;
+        var direct_source: ?[]const u8 = null;
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            const arg = sub_args[i];
+            if (std.mem.eql(u8, arg, "--name")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw skills install --name <query>\n", .{});
+                    std_compat.process.exit(1);
+                }
+                if (install_name != null or direct_source != null) {
+                    std.debug.print("Provide only one install target.\n", .{});
+                    std_compat.process.exit(1);
+                }
+                install_name = sub_args[i + 1];
+                i += 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--")) {
+                std.debug.print("Unknown skills install option: {s}\n", .{arg});
+                std_compat.process.exit(1);
+            }
+            if (direct_source != null or install_name != null) {
+                std.debug.print("Provide only one install target.\n", .{});
+                std_compat.process.exit(1);
+            }
+            direct_source = arg;
+        }
+        if (install_name == null and direct_source == null) {
+            std.debug.print("Usage: nullclaw skills install <source> | --name <query>\n", .{});
+            std_compat.process.exit(1);
         }
         var install_error_detail: ?[]u8 = null;
         defer if (install_error_detail) |msg| allocator.free(msg);
-        yc.skills.installSkillWithDetail(allocator, sub_args[1], cfg.workspace_dir, &install_error_detail) catch |err| {
+        if (install_name) |query| {
+            yc.skills.installSkillByNameWithDetail(allocator, query, cfg.workspace_dir, &install_error_detail) catch |err| {
+                if (install_error_detail) |msg| {
+                    std.debug.print("{s}\n", .{msg});
+                }
+                std.debug.print("Failed to install skill: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            std.debug.print("Skill installed from registry search: {s}\n", .{query});
+            return;
+        }
+        yc.skills.installSkillWithDetail(allocator, direct_source.?, cfg.workspace_dir, &install_error_detail) catch |err| {
             if (install_error_detail) |msg| {
                 std.debug.print("{s}\n", .{msg});
             }
             std.debug.print("Failed to install skill: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
-        std.debug.print("Skill installed from: {s}\n", .{sub_args[1]});
+        std.debug.print("Skill installed from: {s}\n", .{direct_source.?});
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw skills remove <name>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         yc.skills.removeSkill(allocator, sub_args[1], cfg.workspace_dir) catch |err| {
             std.debug.print("Failed to remove skill '{s}': {s}\n", .{ sub_args[1], @errorName(err) });
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
         std.debug.print("Removed skill: {s}\n", .{sub_args[1]});
     } else if (std.mem.eql(u8, subcmd, "info")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw skills info <name>\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw skills info <name> [--json]\n", .{});
+            std_compat.process.exit(1);
         }
-        const skill_path = std.fmt.allocPrint(allocator, "{s}/skills/{s}", .{ cfg.workspace_dir, sub_args[1] }) catch {
-            std.debug.print("Out of memory\n", .{});
-            std.process.exit(1);
+        const json_mode = hasJsonFlag(sub_args[2..]);
+        var visible = loadVisibleSkills(allocator, cfg.workspace_dir) catch |err| {
+            std.debug.print("Failed to list skills: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
         };
-        defer allocator.free(skill_path);
+        defer visible.deinit(allocator);
 
-        const skill = yc.skills.loadSkill(allocator, skill_path) catch {
-            std.debug.print("Skill '{s}' not found or invalid.\n", .{sub_args[1]});
-            std.process.exit(1);
+        const skill = findSkillByName(visible.skills, sub_args[1]) orelse {
+            if (json_mode) {
+                printStdoutBytes("null\n");
+                return;
+            } else {
+                std.debug.print("Skill '{s}' not found or invalid.\n", .{sub_args[1]});
+            }
+            std_compat.process.exit(1);
         };
-        defer yc.skills.freeSkill(allocator, &skill);
 
-        std.debug.print("Skill: {s}\n", .{skill.name});
-        std.debug.print("  Version:     {s}\n", .{skill.version});
-        if (skill.description.len > 0) {
-            std.debug.print("  Description: {s}\n", .{skill.description});
-        }
-        if (skill.author.len > 0) {
-            std.debug.print("  Author:      {s}\n", .{skill.author});
-        }
-        std.debug.print("  Enabled:     {}\n", .{skill.enabled});
-        if (skill.instructions.len > 0) {
-            std.debug.print("  Instructions: {d} bytes\n", .{skill.instructions.len});
+        if (json_mode) {
+            writeSkillDetailJson(cfg.workspace_dir, visible.community_base, skill.*);
+        } else {
+            std.debug.print("Skill: {s}\n", .{skill.name});
+            std.debug.print("  Version:     {s}\n", .{skill.version});
+            if (skill.description.len > 0) {
+                std.debug.print("  Description: {s}\n", .{skill.description});
+            }
+            if (skill.author.len > 0) {
+                std.debug.print("  Author:      {s}\n", .{skill.author});
+            }
+            std.debug.print("  Enabled:     {}\n", .{skill.enabled});
+            std.debug.print("  Available:   {}\n", .{skill.available});
+            std.debug.print("  Source:      {s}\n", .{skillSource(cfg.workspace_dir, visible.community_base, skill.*)});
+            std.debug.print("  Path:        {s}\n", .{skill.path});
+            if (skill.missing_deps.len > 0) {
+                std.debug.print("  Missing:     {s}\n", .{skill.missing_deps});
+            }
+            if (skill.instructions.len > 0) {
+                std.debug.print("  Instructions: {d} bytes\n", .{skill.instructions.len});
+            }
         }
     } else {
         std.debug.print("Unknown skills command: {s}\n", .{subcmd});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 }
 
@@ -707,7 +1516,7 @@ fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void
             \\  monitor                       Monitor connected devices
             \\
         , .{HARDWARE_SUBCOMMANDS}), .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const subcmd = sub_args[0];
@@ -718,7 +1527,7 @@ fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void
 
         const devices = yc.hardware.discoverHardware(allocator) catch |err| {
             std.debug.print("Discovery failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
         defer yc.hardware.freeDiscoveredDevices(allocator, devices);
 
@@ -740,14 +1549,14 @@ fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void
     } else if (std.mem.eql(u8, subcmd, "flash")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw hardware flash <firmware_file> [--target <board>]\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         std.debug.print("Flash not yet implemented. Firmware file: {s}\n", .{sub_args[1]});
     } else if (std.mem.eql(u8, subcmd, "monitor")) {
         std.debug.print("Monitor not yet implemented. Use `nullclaw hardware scan` to discover devices first.\n", .{});
     } else {
         std.debug.print("Unknown hardware command: {s}\n", .{subcmd});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 }
 
@@ -766,7 +1575,7 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\  --source <path>               Source workspace path
             \\
         , .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     if (std.mem.eql(u8, sub_args[0], "openclaw")) {
@@ -785,13 +1594,13 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
         var cfg = yc.config.Config.load(allocator) catch {
             std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
         defer cfg.deinit();
 
         const stats = yc.migration.migrateOpenclaw(allocator, &cfg, source_path, dry_run) catch |err| {
             std.debug.print("Migration failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
 
         if (dry_run) {
@@ -807,7 +1616,7 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         }
     } else {
         std.debug.print("Unknown migration source: {s}\n", .{sub_args[0]});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 }
 
@@ -818,15 +1627,23 @@ fn printMemoryUsage() void {
         \\Usage: nullclaw memory <{s}> [args]
         \\
         \\Commands:
-        \\  stats                         Show resolved memory config and key counters
+        \\  stats [--json]                Show resolved memory config and key counters
         \\  count                         Show total number of memory entries
         \\  reindex                       Rebuild vector index from primary memory
-        \\  search <query> [--limit N]    Run runtime retrieval (keyword/hybrid)
-        \\  get <key>                     Show a single memory entry by key
-        \\  list [--category C] [--limit N]
+        \\  search <query> [--limit N] [--session ID] [--json]
+        \\                                Run runtime retrieval (keyword/hybrid)
+        \\  get <key> [--session ID] [--json]
+        \\                                Show a single memory entry by key
+        \\  list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]
         \\                                List memory entries (default limit: 20)
-        \\  drain-outbox                  Drain durable vector outbox queue
-        \\  forget <key>                  Delete entry from primary memory (if backend supports)
+        \\  store <key> <content> [--category C] [--session ID] [--json]
+        \\                                Create or overwrite a memory entry
+        \\  update <key> <content> [--category C] [--session ID] [--json]
+        \\                                Update an existing memory entry
+        \\  delete <key> [--session ID] [--json]
+        \\                                Delete an entry from primary memory
+        \\  drain-outbox [--json]         Drain durable vector outbox queue
+        \\  forget <key>                  Legacy alias for delete
         \\
     , .{MEMORY_SUBCOMMANDS}), .{});
 }
@@ -855,6 +1672,571 @@ fn parsePositiveUsize(arg: []const u8) ?usize {
     const n = std.fmt.parseInt(usize, arg, 10) catch return null;
     if (n == 0) return null;
     return n;
+}
+
+fn parseNonNegativeUsize(arg: []const u8) ?usize {
+    return std.fmt.parseInt(usize, arg, 10) catch null;
+}
+
+fn hasJsonFlag(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--json")) return true;
+    }
+    return false;
+}
+
+const VisibleSkills = struct {
+    skills: []yc.skills.Skill,
+    community_base: ?[]u8 = null,
+
+    fn deinit(self: *VisibleSkills, allocator: std.mem.Allocator) void {
+        yc.skills.freeSkills(allocator, self.skills);
+        if (self.community_base) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+fn loadVisibleSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !VisibleSkills {
+    var community_base: ?[]u8 = yc.config_paths.defaultConfigDir(allocator) catch null;
+    errdefer if (community_base) |path| allocator.free(path);
+
+    if (community_base) |base| {
+        if (yc.skills.listSkillsMerged(allocator, base, workspace_dir, null)) |skills| {
+            return .{
+                .skills = skills,
+                .community_base = base,
+            };
+        } else |_| {
+            allocator.free(base);
+            community_base = null;
+        }
+    }
+
+    const skills = try yc.skills.listSkills(allocator, workspace_dir, null);
+    for (skills) |*skill| {
+        yc.skills.checkRequirements(allocator, skill);
+    }
+    return .{
+        .skills = skills,
+        .community_base = null,
+    };
+}
+
+fn skillSource(workspace_dir: []const u8, community_base: ?[]const u8, skill: yc.skills.Skill) []const u8 {
+    if (std.mem.startsWith(u8, skill.path, workspace_dir)) return "workspace";
+    if (community_base) |base| {
+        if (std.mem.startsWith(u8, skill.path, base)) return "community";
+    }
+    return "unknown";
+}
+
+fn findSkillByName(skills: []const yc.skills.Skill, name: []const u8) ?*const yc.skills.Skill {
+    for (skills) |*skill| {
+        if (std.mem.eql(u8, skill.name, name)) return skill;
+    }
+    return null;
+}
+
+fn writeJsonString(out: anytype, s: []const u8) !void {
+    try out.writeByte('"');
+    try writeJsonEscaped(out, s);
+    try out.writeByte('"');
+}
+
+fn writeJsonNullableString(out: anytype, value: ?[]const u8) !void {
+    if (value) |text| {
+        try writeJsonString(out, text);
+    } else {
+        try out.writeAll("null");
+    }
+}
+
+fn writeJsonNullableU32(out: anytype, value: ?u32) !void {
+    if (value) |n| {
+        try out.print("{d}", .{n});
+    } else {
+        try out.writeAll("null");
+    }
+}
+
+fn writeJsonNullableF32(out: anytype, value: ?f32) !void {
+    if (value) |n| {
+        try out.print("{d}", .{n});
+    } else {
+        try out.writeAll("null");
+    }
+}
+
+fn writeJsonNullableI64(out: anytype, value: ?i64) !void {
+    if (value) |n| {
+        try out.print("{d}", .{n});
+    } else {
+        try out.writeAll("null");
+    }
+}
+
+fn writeJsonBool(out: anytype, value: bool) !void {
+    try out.writeAll(if (value) "true" else "false");
+}
+
+fn appendJsonError(out: anytype, code: []const u8, message: []const u8, backend: ?[]const u8) !void {
+    try out.writeAll("{\"error\":");
+    try writeJsonString(out, code);
+    try out.writeAll(",\"message\":");
+    try writeJsonString(out, message);
+    if (backend) |value| {
+        try out.writeAll(",\"backend\":");
+        try writeJsonString(out, value);
+    }
+    try out.writeAll("}");
+}
+
+fn writeJsonError(code: []const u8, message: []const u8, backend: ?[]const u8) void {
+    writeRenderedJsonLine(appendJsonError, .{ code, message, backend });
+}
+
+fn appendConfigMutationJson(
+    out: anytype,
+    action: yc.config_mutator.MutationAction,
+    result: *const yc.config_mutator.MutationResult,
+) !void {
+    try out.writeAll("{\"action\":");
+    try writeJsonString(out, @tagName(action));
+    try out.writeAll(",\"path\":");
+    try writeJsonString(out, result.path);
+    try out.writeAll(",\"changed\":");
+    try writeJsonBool(out, result.changed);
+    try out.writeAll(",\"applied\":");
+    try writeJsonBool(out, result.applied);
+    try out.writeAll(",\"requires_restart\":");
+    try writeJsonBool(out, result.requires_restart);
+    try out.writeAll(",\"old_value\":");
+    try out.writeAll(result.old_value_json);
+    try out.writeAll(",\"new_value\":");
+    try out.writeAll(result.new_value_json);
+    try out.writeAll(",\"backup_path\":");
+    try writeJsonNullableString(out, result.backup_path);
+    try out.writeAll("}");
+}
+
+fn writeConfigMutationJson(
+    action: yc.config_mutator.MutationAction,
+    result: *const yc.config_mutator.MutationResult,
+) void {
+    writeRenderedJsonLine(appendConfigMutationJson, .{ action, result });
+}
+
+fn modelCanonicalProvider(raw_model: []const u8) ?[]const u8 {
+    const slash = std.mem.indexOfScalar(u8, raw_model, '/') orelse return null;
+    if (slash == 0) return null;
+    return yc.onboard.canonicalProviderName(raw_model[0..slash]);
+}
+
+fn appendModelInfoJson(out: anytype, model_name: []const u8) !void {
+    const provider = modelCanonicalProvider(model_name);
+
+    try out.writeAll("{\"name\":");
+    try writeJsonString(out, model_name);
+    try out.writeAll(",\"provider\":");
+    try writeJsonNullableString(out, provider);
+    try out.writeAll(",\"canonical_name\":");
+    if (provider) |canonical_provider| {
+        const slash = std.mem.indexOfScalar(u8, model_name, '/').?;
+        if (slash + 1 < model_name.len) {
+            try out.writeByte('"');
+            try writeJsonEscaped(out, canonical_provider);
+            try out.writeByte('/');
+            try writeJsonEscaped(out, model_name[slash + 1 ..]);
+            try out.writeByte('"');
+        } else {
+            try writeJsonString(out, canonical_provider);
+        }
+    } else {
+        try writeJsonString(out, model_name);
+    }
+    try out.writeAll(",\"context_window\":null}");
+}
+
+fn writeModelInfoJson(model_name: []const u8) void {
+    writeRenderedJsonLine(appendModelInfoJson, .{model_name});
+}
+
+fn appendCronJobJson(out: anytype, job: *const yc.cron.CronJob) !void {
+    try out.writeAll("{\"id\":");
+    try writeJsonString(out, job.id);
+    try out.writeAll(",\"expression\":");
+    try writeJsonString(out, job.expression);
+    try out.writeAll(",\"command\":");
+    try writeJsonString(out, job.command);
+    try out.print(",\"next_run_secs\":{d}", .{job.next_run_secs});
+    try out.writeAll(",\"last_run_secs\":");
+    try writeJsonNullableI64(out, job.last_run_secs);
+    try out.writeAll(",\"last_status\":");
+    try writeJsonNullableString(out, job.last_status);
+    try out.writeAll(",\"paused\":");
+    try writeJsonBool(out, job.paused);
+    try out.writeAll(",\"one_shot\":");
+    try writeJsonBool(out, job.one_shot);
+    try out.writeAll(",\"job_type\":");
+    try writeJsonString(out, job.job_type.asStr());
+    try out.writeAll(",\"session_target\":");
+    try writeJsonString(out, job.session_target.asStr());
+    try out.writeAll(",\"prompt\":");
+    try writeJsonNullableString(out, job.prompt);
+    try out.writeAll(",\"name\":");
+    try writeJsonNullableString(out, job.name);
+    try out.writeAll(",\"model\":");
+    try writeJsonNullableString(out, job.model);
+    try out.writeAll(",\"enabled\":");
+    try writeJsonBool(out, job.enabled);
+    try out.writeAll(",\"delete_after_run\":");
+    try writeJsonBool(out, job.delete_after_run);
+    try out.print(",\"created_at_s\":{d}", .{job.created_at_s});
+    try out.writeAll(",\"last_output\":");
+    try writeJsonNullableString(out, job.last_output);
+    try out.writeAll("}");
+}
+
+fn writeCronJobJson(job: *const yc.cron.CronJob) void {
+    writeRenderedJsonLine(appendCronJobJson, .{job});
+}
+
+fn appendCronRunsJson(out: anytype, runs: []const yc.cron.CronRun) !void {
+    try out.writeAll("{\"runs\":[");
+    for (runs, 0..) |run, idx| {
+        if (idx > 0) try out.writeAll(",");
+        try out.print("{{\"id\":{d},\"job_id\":", .{run.id});
+        try writeJsonString(out, run.job_id);
+        try out.print(",\"started_at_s\":{d},\"finished_at_s\":{d},\"status\":", .{ run.started_at_s, run.finished_at_s });
+        try writeJsonString(out, run.status);
+        try out.writeAll(",\"output\":");
+        try writeJsonNullableString(out, run.output);
+        try out.writeAll(",\"duration_ms\":");
+        try writeJsonNullableI64(out, run.duration_ms);
+        try out.writeAll("}");
+    }
+    try out.print("],\"total\":{d}}}", .{runs.len});
+}
+
+fn writeCronRunsJson(runs: []const yc.cron.CronRun) void {
+    writeRenderedJsonLine(appendCronRunsJson, .{runs});
+}
+
+fn writeSkillJson(
+    out: anytype,
+    workspace_dir: []const u8,
+    community_base: ?[]const u8,
+    skill: yc.skills.Skill,
+) !void {
+    try out.writeAll("{\"name\":");
+    try writeJsonString(out, skill.name);
+    try out.writeAll(",\"version\":");
+    try writeJsonString(out, skill.version);
+    try out.writeAll(",\"description\":");
+    try writeJsonString(out, skill.description);
+    try out.writeAll(",\"author\":");
+    try writeJsonString(out, skill.author);
+    try out.writeAll(",\"enabled\":");
+    try out.writeAll(if (skill.enabled) "true" else "false");
+    try out.writeAll(",\"always\":");
+    try out.writeAll(if (skill.always) "true" else "false");
+    try out.writeAll(",\"available\":");
+    try out.writeAll(if (skill.available) "true" else "false");
+    try out.writeAll(",\"missing_deps\":");
+    try writeJsonString(out, skill.missing_deps);
+    try out.writeAll(",\"path\":");
+    try writeJsonString(out, skill.path);
+    try out.writeAll(",\"source\":");
+    try writeJsonString(out, skillSource(workspace_dir, community_base, skill));
+    try out.print(",\"instructions_bytes\":{d}}}", .{skill.instructions.len});
+}
+
+fn appendSkillListJson(
+    out: anytype,
+    workspace_dir: []const u8,
+    community_base: ?[]const u8,
+    skills: []const yc.skills.Skill,
+) !void {
+    try out.writeAll("[");
+    for (skills, 0..) |skill, idx| {
+        if (idx > 0) try out.writeAll(",");
+        try writeSkillJson(out, workspace_dir, community_base, skill);
+    }
+    try out.writeAll("]");
+}
+
+fn writeSkillListJson(
+    workspace_dir: []const u8,
+    community_base: ?[]const u8,
+    skills: []const yc.skills.Skill,
+) void {
+    writeRenderedJsonLine(appendSkillListJson, .{ workspace_dir, community_base, skills });
+}
+
+fn writeSkillDetailJson(
+    workspace_dir: []const u8,
+    community_base: ?[]const u8,
+    skill: yc.skills.Skill,
+) void {
+    writeRenderedJsonLine(writeSkillJson, .{ workspace_dir, community_base, skill });
+}
+
+fn memoryEntryVisible(include_internal: bool, entry: yc.memory.MemoryEntry) bool {
+    return include_internal or !yc.memory.isInternalMemoryEntryKeyOrContent(entry.key, entry.content);
+}
+
+fn loadMemoryListPage(
+    allocator: std.mem.Allocator,
+    mem: yc.memory.Memory,
+    category: ?yc.memory.MemoryCategory,
+    session_id: ?[]const u8,
+    limit: usize,
+    offset: usize,
+    include_internal: bool,
+) ![]yc.memory.MemoryEntry {
+    if (include_internal) {
+        return mem.listPaged(allocator, category, session_id, limit, offset);
+    }
+
+    if (!mem.hasNativePagedList()) {
+        const entries = try mem.list(allocator, category, session_id);
+        errdefer yc.memory.freeEntries(allocator, entries);
+
+        var visible_seen: usize = 0;
+        var kept: std.ArrayListUnmanaged(yc.memory.MemoryEntry) = .empty;
+        errdefer {
+            for (kept.items) |*entry| entry.deinit(allocator);
+            kept.deinit(allocator);
+        }
+
+        for (entries) |*entry| {
+            if (!memoryEntryVisible(false, entry.*)) {
+                entry.deinit(allocator);
+                continue;
+            }
+            if (visible_seen < offset) {
+                visible_seen += 1;
+                entry.deinit(allocator);
+                continue;
+            }
+            if (kept.items.len < limit) {
+                try kept.append(allocator, entry.*);
+            } else {
+                entry.deinit(allocator);
+            }
+        }
+        allocator.free(entries);
+        return kept.toOwnedSlice(allocator);
+    }
+
+    var kept: std.ArrayListUnmanaged(yc.memory.MemoryEntry) = .empty;
+    errdefer {
+        for (kept.items) |*entry| entry.deinit(allocator);
+        kept.deinit(allocator);
+    }
+
+    const chunk_size = @max(limit, @as(usize, 64));
+    var raw_offset: usize = 0;
+    var visible_seen: usize = 0;
+
+    while (kept.items.len < limit) {
+        const page = try mem.listPaged(allocator, category, session_id, chunk_size, raw_offset);
+        if (page.len == 0) {
+            allocator.free(page);
+            break;
+        }
+
+        for (page) |*entry| {
+            if (!memoryEntryVisible(false, entry.*)) {
+                entry.deinit(allocator);
+                continue;
+            }
+            if (visible_seen < offset) {
+                visible_seen += 1;
+                entry.deinit(allocator);
+                continue;
+            }
+            if (kept.items.len < limit) {
+                try kept.append(allocator, entry.*);
+            } else {
+                entry.deinit(allocator);
+            }
+        }
+
+        raw_offset += page.len;
+        const short_page = page.len < chunk_size;
+        allocator.free(page);
+        if (short_page) break;
+    }
+
+    return kept.toOwnedSlice(allocator);
+}
+
+fn writeMemoryEntryJson(out: anytype, entry: yc.memory.MemoryEntry) !void {
+    try out.writeAll("{\"key\":");
+    try writeJsonString(out, entry.key);
+    try out.writeAll(",\"category\":");
+    try writeJsonString(out, entry.category.toString());
+    try out.writeAll(",\"timestamp\":");
+    try writeJsonString(out, entry.timestamp);
+    try out.writeAll(",\"content\":");
+    try writeJsonString(out, entry.content);
+    try out.writeAll(",\"session_id\":");
+    try writeJsonNullableString(out, entry.session_id);
+    try out.writeAll("}");
+}
+
+const MemoryStatsPayload = struct {
+    backend: []const u8,
+    retrieval: []const u8,
+    vector: []const u8,
+    embedding: []const u8,
+    rollout: []const u8,
+    sync: []const u8,
+    sources: usize,
+    fallback: []const u8,
+    entries: usize,
+    vector_entries: ?usize,
+    outbox_pending: ?usize,
+};
+
+fn appendMemoryStatsJson(out: anytype, payload: MemoryStatsPayload) !void {
+    try out.writeAll("{\"backend\":");
+    try writeJsonString(out, payload.backend);
+    try out.writeAll(",\"retrieval\":");
+    try writeJsonString(out, payload.retrieval);
+    try out.writeAll(",\"vector\":");
+    try writeJsonString(out, payload.vector);
+    try out.writeAll(",\"embedding\":");
+    try writeJsonString(out, payload.embedding);
+    try out.writeAll(",\"rollout\":");
+    try writeJsonString(out, payload.rollout);
+    try out.writeAll(",\"sync\":");
+    try writeJsonString(out, payload.sync);
+    try out.print(",\"sources\":{d},\"fallback\":", .{payload.sources});
+    try writeJsonString(out, payload.fallback);
+    try out.print(",\"entries\":{d},\"vector_entries\":", .{payload.entries});
+    if (payload.vector_entries) |value| {
+        try out.print("{d}", .{value});
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"outbox_pending\":");
+    if (payload.outbox_pending) |value| {
+        try out.print("{d}", .{value});
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll("}");
+}
+
+fn appendMemoryMaintenanceJson(out: anytype, field_name: []const u8, count: usize, skipped: ?bool) !void {
+    try out.writeAll("{\"");
+    try out.writeAll(field_name);
+    try out.print("\":{d}", .{count});
+    if (skipped) |flag| {
+        try out.writeAll(",\"skipped\":");
+        try writeJsonBool(out, flag);
+    }
+    try out.writeAll("}");
+}
+
+fn appendMemoryMutationJson(out: anytype, action: []const u8, entry: yc.memory.MemoryEntry) !void {
+    try out.writeAll("{\"action\":");
+    try writeJsonString(out, action);
+    try out.writeAll(",\"entry\":");
+    try writeMemoryEntryJson(out, entry);
+    try out.writeAll("}");
+}
+
+fn appendMemoryDeleteJson(out: anytype, key: []const u8, session_id: ?[]const u8, deleted: bool) !void {
+    try out.writeAll("{\"key\":");
+    try writeJsonString(out, key);
+    try out.writeAll(",\"session_id\":");
+    try writeJsonNullableString(out, session_id);
+    try out.writeAll(",\"deleted\":");
+    try writeJsonBool(out, deleted);
+    try out.writeAll("}");
+}
+
+fn appendMemorySearchResultsJson(out: anytype, results: []const yc.memory.RetrievalCandidate) !void {
+    try out.writeAll("[");
+    for (results, 0..) |rc, idx| {
+        if (idx > 0) try out.writeAll(",");
+        try out.writeAll("{\"key\":");
+        try writeJsonString(out, rc.key);
+        try out.writeAll(",\"category\":");
+        try writeJsonString(out, rc.category.toString());
+        try out.writeAll(",\"snippet\":");
+        try writeJsonString(out, rc.snippet);
+        try out.writeAll(",\"source\":");
+        try writeJsonString(out, rc.source);
+        try out.writeAll(",\"source_path\":");
+        try writeJsonString(out, rc.source_path);
+        try out.print(",\"final_score\":{d},\"start_line\":{d},\"end_line\":{d},\"created_at\":{d},\"keyword_rank\":", .{
+            rc.final_score,
+            rc.start_line,
+            rc.end_line,
+            rc.created_at,
+        });
+        try writeJsonNullableU32(out, rc.keyword_rank);
+        try out.writeAll(",\"vector_score\":");
+        try writeJsonNullableF32(out, rc.vector_score);
+        try out.writeAll("}");
+    }
+    try out.writeAll("]");
+}
+
+fn appendMemoryListJson(
+    out: anytype,
+    entries: []const yc.memory.MemoryEntry,
+    shown: usize,
+    include_internal: bool,
+) !void {
+    try out.writeAll("[");
+    var written: usize = 0;
+    for (entries) |entry| {
+        if (!memoryEntryVisible(include_internal, entry)) continue;
+        if (written >= shown) break;
+        if (written > 0) try out.writeAll(",");
+        try writeMemoryEntryJson(out, entry);
+        written += 1;
+    }
+    try out.writeAll("]");
+}
+
+fn writeMemoryStatsJson(payload: MemoryStatsPayload) void {
+    writeRenderedJsonLine(appendMemoryStatsJson, .{payload});
+}
+
+fn writeMemoryMaintenanceJsonLine(field_name: []const u8, count: usize, skipped: ?bool) void {
+    writeRenderedJsonLine(appendMemoryMaintenanceJson, .{ field_name, count, skipped });
+}
+
+fn writeMemoryDeleteJsonLine(key: []const u8, session_id: ?[]const u8, deleted: bool) void {
+    writeRenderedJsonLine(appendMemoryDeleteJson, .{ key, session_id, deleted });
+}
+
+fn writeMemoryEntryJsonLine(entry: yc.memory.MemoryEntry) void {
+    writeRenderedJsonLine(writeMemoryEntryJson, .{entry});
+}
+
+fn writeMemoryListJson(entries: []const yc.memory.MemoryEntry, shown: usize, include_internal: bool) void {
+    writeRenderedJsonLine(appendMemoryListJson, .{ entries, shown, include_internal });
+}
+
+fn writeMemorySearchResultsJsonLine(results: []const yc.memory.RetrievalCandidate) void {
+    writeRenderedJsonLine(appendMemorySearchResultsJson, .{results});
+}
+
+fn writeMemoryMutationJsonLine(action: []const u8, entry: yc.memory.MemoryEntry) void {
+    writeRenderedJsonLine(appendMemoryMutationJson, .{ action, entry });
+}
+
+fn appendAgentSessionTerminationJson(out: anytype, session_key: []const u8) !void {
+    try out.writeAll("{\"session_key\":");
+    try writeJsonString(out, session_key);
+    try out.writeAll(",\"terminated\":true}");
 }
 
 fn printMemoryRuntimeInitFailure(allocator: std.mem.Allocator, backend: []const u8) void {
@@ -896,48 +2278,77 @@ fn printRetrievalScoreLine(c: yc.memory.RetrievalCandidate) void {
     }
 }
 
+fn buildHistoryMemoryConfig(base: yc.config.config_types.MemoryConfig) yc.config.config_types.MemoryConfig {
+    var cfg = base;
+    // History is read-only; avoid bootstrapping retrieval/vector paths or maintenance hooks.
+    cfg.search.enabled = false;
+    cfg.qmd.enabled = false;
+    cfg.lifecycle.hygiene_enabled = false;
+    cfg.lifecycle.snapshot_on_hygiene = false;
+    cfg.lifecycle.auto_hydrate = false;
+    cfg.response_cache.enabled = false;
+    return cfg;
+}
+
 fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         printMemoryUsage();
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer cfg.deinit();
 
     var mem_rt = yc.memory.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse {
         printMemoryRuntimeInitFailure(allocator, cfg.memory.backend);
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer mem_rt.deinit();
 
     const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "stats")) {
+        const json_mode = hasJsonFlag(sub_args[1..]);
         const r = mem_rt.resolved;
         const report = mem_rt.diagnose();
-        std.debug.print("Memory stats:\n", .{});
-        std.debug.print("  backend: {s}\n", .{r.primary_backend});
-        std.debug.print("  retrieval: {s}\n", .{r.retrieval_mode});
-        std.debug.print("  vector: {s}\n", .{r.vector_mode});
-        std.debug.print("  embedding: {s}\n", .{r.embedding_provider});
-        std.debug.print("  rollout: {s}\n", .{r.rollout_mode});
-        std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
-        std.debug.print("  sources: {d}\n", .{r.source_count});
-        std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
-        std.debug.print("  entries: {d}\n", .{report.entry_count});
-        if (report.vector_entry_count) |n| {
-            std.debug.print("  vector_entries: {d}\n", .{n});
+        if (json_mode) {
+            writeMemoryStatsJson(.{
+                .backend = r.primary_backend,
+                .retrieval = r.retrieval_mode,
+                .vector = r.vector_mode,
+                .embedding = r.embedding_provider,
+                .rollout = r.rollout_mode,
+                .sync = r.vector_sync_mode,
+                .sources = r.source_count,
+                .fallback = r.fallback_policy,
+                .entries = report.entry_count,
+                .vector_entries = report.vector_entry_count,
+                .outbox_pending = report.outbox_pending,
+            });
         } else {
-            std.debug.print("  vector_entries: n/a\n", .{});
-        }
-        if (report.outbox_pending) |n| {
-            std.debug.print("  outbox_pending: {d}\n", .{n});
-        } else {
-            std.debug.print("  outbox_pending: n/a\n", .{});
+            std.debug.print("Memory stats:\n", .{});
+            std.debug.print("  backend: {s}\n", .{r.primary_backend});
+            std.debug.print("  retrieval: {s}\n", .{r.retrieval_mode});
+            std.debug.print("  vector: {s}\n", .{r.vector_mode});
+            std.debug.print("  embedding: {s}\n", .{r.embedding_provider});
+            std.debug.print("  rollout: {s}\n", .{r.rollout_mode});
+            std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
+            std.debug.print("  sources: {d}\n", .{r.source_count});
+            std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
+            std.debug.print("  entries: {d}\n", .{report.entry_count});
+            if (report.vector_entry_count) |n| {
+                std.debug.print("  vector_entries: {d}\n", .{n});
+            } else {
+                std.debug.print("  vector_entries: n/a\n", .{});
+            }
+            if (report.outbox_pending) |n| {
+                std.debug.print("  outbox_pending: {d}\n", .{n});
+            } else {
+                std.debug.print("  outbox_pending: n/a\n", .{});
+            }
         }
         return;
     }
@@ -945,15 +2356,19 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (std.mem.eql(u8, subcmd, "count")) {
         const count = mem_rt.memory.count() catch |err| {
             std.debug.print("memory count failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
         std.debug.print("{d}\n", .{count});
         return;
     }
 
     if (std.mem.eql(u8, subcmd, "reindex")) {
+        const json_mode = hasJsonFlag(sub_args[1..]);
         const count = mem_rt.reindex(allocator);
-        if (std.mem.eql(u8, mem_rt.resolved.vector_mode, "none")) {
+        const skipped = std.mem.eql(u8, mem_rt.resolved.vector_mode, "none");
+        if (json_mode) {
+            writeMemoryMaintenanceJsonLine("reindexed", count, skipped);
+        } else if (skipped) {
             std.debug.print("Vector plane is disabled; reindex skipped (0 entries).\n", .{});
         } else {
             std.debug.print("Reindex complete: {d} entries reindexed.\n", .{count});
@@ -962,163 +2377,687 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 
     if (std.mem.eql(u8, subcmd, "drain-outbox")) {
+        const json_mode = hasJsonFlag(sub_args[1..]);
         const drained = mem_rt.drainOutbox(allocator);
-        std.debug.print("Outbox drain complete: {d} operation(s) processed.\n", .{drained});
+        if (json_mode) {
+            writeMemoryMaintenanceJsonLine("drained", drained, null);
+        } else {
+            std.debug.print("Outbox drain complete: {d} operation(s) processed.\n", .{drained});
+        }
         return;
     }
 
-    if (std.mem.eql(u8, subcmd, "forget")) {
+    if (std.mem.eql(u8, subcmd, "forget") or std.mem.eql(u8, subcmd, "delete")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory forget <key>\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw memory delete <key> [--session ID] [--json]\n", .{});
+            std_compat.process.exit(1);
         }
         const key = sub_args[1];
-        const deleted = mem_rt.memory.forget(key) catch |err| {
+        var session_id: ?[]const u8 = null;
+        var json_mode = false;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--session")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory delete <key> [--session ID] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option for memory delete: {s}\n", .{sub_args[i]});
+                std_compat.process.exit(1);
+            }
+        }
+
+        var vector_delete_scopes: std.ArrayListUnmanaged(?[]u8) = .empty;
+        defer {
+            for (vector_delete_scopes.items) |sid_opt| {
+                if (sid_opt) |sid| allocator.free(sid);
+            }
+            vector_delete_scopes.deinit(allocator);
+        }
+
+        const existing_entries = mem_rt.memory.list(allocator, null, session_id) catch |err| {
+            std.debug.print("memory list failed before delete: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+        defer yc.memory.freeEntries(allocator, existing_entries);
+
+        var saw_global = false;
+        for (existing_entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) continue;
+            if (entry.session_id) |sid| {
+                var seen = false;
+                for (vector_delete_scopes.items) |existing_sid| {
+                    if (existing_sid) |existing| {
+                        if (std.mem.eql(u8, existing, sid)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                }
+                if (!seen) {
+                    try vector_delete_scopes.append(allocator, try allocator.dupe(u8, sid));
+                }
+            } else if (!saw_global) {
+                saw_global = true;
+                try vector_delete_scopes.append(allocator, null);
+            }
+        }
+
+        const deleted = mem_rt.memory.forgetScoped(allocator, key, session_id) catch |err| {
             std.debug.print("memory forget failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
         if (deleted) {
-            mem_rt.deleteFromVectorStore(key);
-            std.debug.print("Deleted memory entry: {s}\n", .{key});
+            for (vector_delete_scopes.items) |sid_opt| {
+                mem_rt.deleteFromVectorStore(key, sid_opt);
+            }
+            if (json_mode) {
+                writeMemoryDeleteJsonLine(key, session_id, true);
+            } else {
+                std.debug.print("Deleted memory entry: {s}\n", .{key});
+            }
         } else {
-            std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
+            if (json_mode) {
+                writeMemoryDeleteJsonLine(key, session_id, false);
+            } else {
+                std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
+            }
         }
         return;
     }
 
     if (std.mem.eql(u8, subcmd, "get")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory get <key>\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw memory get <key> [--session ID] [--json]\n", .{});
+            std_compat.process.exit(1);
         }
         const key = sub_args[1];
-        const entry = mem_rt.memory.get(allocator, key) catch |err| {
+        var session_id: ?[]const u8 = null;
+        var json_mode = false;
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--session")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory get <key> [--session ID] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option for memory get: {s}\n", .{sub_args[i]});
+                std_compat.process.exit(1);
+            }
+        }
+
+        const entry = mem_rt.memory.getScoped(allocator, key, session_id) catch |err| {
             std.debug.print("memory get failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
         if (entry) |e| {
             defer e.deinit(allocator);
-            std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
-                e.key,
-                e.category.toString(),
-                e.timestamp,
-                e.content,
-            });
+            if (json_mode) {
+                writeMemoryEntryJsonLine(e);
+            } else {
+                std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
+                    e.key,
+                    e.category.toString(),
+                    e.timestamp,
+                    e.content,
+                });
+            }
         } else {
-            std.debug.print("Not found: {s}\n", .{key});
+            if (json_mode) {
+                printStdoutBytes("null\n");
+            } else {
+                std.debug.print("Not found: {s}\n", .{key});
+            }
         }
         return;
     }
 
     if (std.mem.eql(u8, subcmd, "list")) {
         var limit: usize = 20;
+        var offset: usize = 0;
         var category_opt: ?yc.memory.MemoryCategory = null;
+        var session_id: ?[]const u8 = null;
+        var include_internal = false;
+        var json_mode = false;
 
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
-                    std.process.exit(1);
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std_compat.process.exit(1);
                 }
                 i += 1;
                 limit = parsePositiveUsize(sub_args[i]) orelse {
                     std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
-                    std.process.exit(1);
+                    std_compat.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--offset")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                offset = parseNonNegativeUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --offset value: {s}\n", .{sub_args[i]});
+                    std_compat.process.exit(1);
                 };
             } else if (std.mem.eql(u8, sub_args[i], "--category")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
-                    std.process.exit(1);
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std_compat.process.exit(1);
                 }
                 i += 1;
                 category_opt = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--session")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--include-internal")) {
+                include_internal = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
             } else {
                 std.debug.print("Unknown option for memory list: {s}\n", .{sub_args[i]});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             }
         }
 
-        const entries = mem_rt.memory.list(allocator, category_opt, null) catch |err| {
-            std.debug.print("memory list failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+        const entries = loadMemoryListPage(allocator, mem_rt.memory, category_opt, session_id, limit, offset, include_internal) catch |err| {
+            std.debug.print("memory paged list failed: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
         };
         defer yc.memory.freeEntries(allocator, entries);
 
-        const shown = @min(limit, entries.len);
-        std.debug.print("Memory entries: showing {d}/{d}\n", .{ shown, entries.len });
-        for (entries[0..shown], 0..) |e, idx| {
-            const preview_len = @min(@as(usize, 120), e.content.len);
-            const preview = e.content[0..preview_len];
-            std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
-                idx + 1,
-                e.key,
-                e.category.toString(),
-                e.timestamp,
-                preview,
-                if (e.content.len > preview_len) "..." else "",
-            });
+        const shown = entries.len;
+
+        if (json_mode) {
+            writeMemoryListJson(entries, shown, true);
+        } else {
+            std.debug.print("Memory entries: showing {d} from offset {d}\n", .{ shown, offset });
+            var written: usize = 0;
+            for (entries) |e| {
+                const preview = util.previewUtf8(e.content, 120);
+                std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
+                    offset + written + 1,
+                    e.key,
+                    e.category.toString(),
+                    e.timestamp,
+                    preview.slice,
+                    if (preview.truncated) "..." else "",
+                });
+                written += 1;
+            }
         }
         return;
     }
 
     if (std.mem.eql(u8, subcmd, "search")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
-            std.process.exit(1);
+            std.debug.print("Usage: nullclaw memory search <query> [--limit N] [--session ID] [--json]\n", .{});
+            std_compat.process.exit(1);
         }
         const query = sub_args[1];
         var limit: usize = 6;
+        var session_id: ?[]const u8 = null;
+        var json_mode = false;
 
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
-                    std.process.exit(1);
+                    std.debug.print("Usage: nullclaw memory search <query> [--limit N] [--session ID] [--json]\n", .{});
+                    std_compat.process.exit(1);
                 }
                 i += 1;
                 limit = parsePositiveUsize(sub_args[i]) orelse {
                     std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
-                    std.process.exit(1);
+                    std_compat.process.exit(1);
                 };
+            } else if (std.mem.eql(u8, sub_args[i], "--session")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory search <query> [--limit N] [--session ID] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
             } else {
                 std.debug.print("Unknown option for memory search: {s}\n", .{sub_args[i]});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             }
         }
 
-        const results = mem_rt.search(allocator, query, limit, null) catch |err| {
+        const results = mem_rt.search(allocator, query, limit, session_id) catch |err| {
             std.debug.print("memory search failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
         defer yc.memory.retrieval.freeCandidates(allocator, results);
 
-        std.debug.print("Search results: {d}\n", .{results.len});
-        for (results, 0..) |c, idx| {
-            std.debug.print("  {d}. {s} [{s}]\n", .{ idx + 1, c.key, c.category.toString() });
-            printRetrievalScoreLine(c);
-            const preview_len = @min(@as(usize, 140), c.snippet.len);
-            const preview = c.snippet[0..preview_len];
-            std.debug.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+        if (json_mode) {
+            writeMemorySearchResultsJsonLine(results);
+        } else {
+            std.debug.print("Search results: {d}\n", .{results.len});
+            for (results, 0..) |rc, idx| {
+                std.debug.print("  {d}. {s} [{s}]\n", .{ idx + 1, rc.key, rc.category.toString() });
+                printRetrievalScoreLine(rc);
+                const preview = util.previewUtf8(rc.snippet, 140);
+                std.debug.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
+            }
         }
         return;
     }
 
+    if (std.mem.eql(u8, subcmd, "store") or std.mem.eql(u8, subcmd, "update")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw memory {s} <key> <content> [--category C] [--session ID] [--json]\n", .{subcmd});
+            std_compat.process.exit(1);
+        }
+
+        const key = sub_args[1];
+        const content = sub_args[2];
+        var category: yc.memory.MemoryCategory = .conversation;
+        var session_id: ?[]const u8 = null;
+        var json_mode = false;
+
+        var i: usize = 3;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--category")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory {s} <key> <content> [--category C] [--session ID] [--json]\n", .{subcmd});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                category = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--session")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory {s} <key> <content> [--category C] [--session ID] [--json]\n", .{subcmd});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option for memory {s}: {s}\n", .{ subcmd, sub_args[i] });
+                std_compat.process.exit(1);
+            }
+        }
+
+        if (std.mem.eql(u8, subcmd, "update")) {
+            const existing = mem_rt.memory.getScoped(allocator, key, session_id) catch |err| {
+                std.debug.print("memory get failed before update: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            if (existing) |entry| {
+                entry.deinit(allocator);
+            } else {
+                if (json_mode) writeJsonError("memory_not_found", "Memory entry not found", cfg.memory.backend);
+                std.debug.print("Memory entry not found: {s}\n", .{key});
+                std_compat.process.exit(1);
+            }
+        }
+
+        mem_rt.memory.store(key, content, category, session_id) catch |err| {
+            if (json_mode) writeJsonError("memory_store_failed", @errorName(err), cfg.memory.backend);
+            std.debug.print("memory {s} failed: {s}\n", .{ subcmd, @errorName(err) });
+            std_compat.process.exit(1);
+        };
+
+        const stored = mem_rt.memory.getScoped(allocator, key, session_id) catch |err| {
+            if (json_mode) writeJsonError("memory_store_failed", @errorName(err), cfg.memory.backend);
+            std.debug.print("memory reload failed: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+
+        if (stored) |entry| {
+            defer entry.deinit(allocator);
+            if (json_mode) {
+                writeMemoryMutationJsonLine(if (std.mem.eql(u8, subcmd, "update")) "update" else "store", entry);
+            } else {
+                std.debug.print("Stored memory entry: {s}\n", .{key});
+            }
+            return;
+        }
+
+        if (json_mode) writeJsonError("memory_store_failed", "Stored entry could not be re-read", cfg.memory.backend);
+        std.debug.print("Stored entry could not be re-read: {s}\n", .{key});
+        std_compat.process.exit(1);
+    }
+
     std.debug.print("Unknown memory command: {s}\n\n", .{subcmd});
     printMemoryUsage();
-    std.process.exit(1);
+    std_compat.process.exit(1);
+}
+
+// ── History ──────────────────────────────────────────────────────
+
+fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw history <{s}> [args]
+            \\
+            \\Commands:
+            \\  list [--limit N] [--offset N] [--json]
+            \\                                List conversation sessions
+            \\  show <session_id> [--limit N] [--offset N] [--json]
+            \\                                Show messages for a session
+            \\
+        , .{HISTORY_SUBCOMMANDS}), .{});
+        std_compat.process.exit(1);
+    }
+
+    const wants_json = hasJsonFlag(sub_args[1..]);
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        if (wants_json) {
+            writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+        }
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std_compat.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var history_memory_cfg = buildHistoryMemoryConfig(cfg.memory);
+    var mem_rt = yc.memory.initRuntime(allocator, &history_memory_cfg, cfg.workspace_dir) orelse {
+        if (wants_json) {
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Failed to initialize history runtime (backend: {s})", .{cfg.memory.backend}) catch "Failed to initialize history runtime";
+            writeJsonError("memory_runtime_init_failed", msg, cfg.memory.backend);
+        }
+        std.debug.print("Failed to initialize history runtime (backend: {s})\n", .{cfg.memory.backend});
+        std_compat.process.exit(1);
+    };
+    defer mem_rt.deinit();
+
+    const session_store = mem_rt.session_store orelse {
+        if (wants_json) {
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Session store not available for backend: {s}", .{cfg.memory.backend}) catch "Session store not available";
+            writeJsonError("session_store_unavailable", msg, cfg.memory.backend);
+        }
+        std.debug.print("Session store not available for backend: {s}\n", .{cfg.memory.backend});
+        std_compat.process.exit(1);
+    };
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        var limit: usize = 50;
+        var offset: usize = 0;
+        var json_mode = false;
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history list [--limit N] [--offset N] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std_compat.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--offset")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history list [--limit N] [--offset N] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                offset = parseNonNegativeUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --offset value: {s}\n", .{sub_args[i]});
+                    std_compat.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
+                std_compat.process.exit(1);
+            }
+        }
+
+        const total = session_store.countSessions() catch |err| {
+            if (err == error.NotSupported) {
+                if (json_mode) {
+                    var msg_buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "History listing not supported for backend: {s}", .{cfg.memory.backend}) catch "History listing not supported";
+                    writeJsonError("history_not_supported", msg, cfg.memory.backend);
+                }
+                std.debug.print("History listing not supported for backend: {s}\n", .{cfg.memory.backend});
+                std_compat.process.exit(1);
+            }
+            if (json_mode) {
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Failed to count sessions: {s}", .{@errorName(err)}) catch "Failed to count sessions";
+                writeJsonError("history_count_failed", msg, cfg.memory.backend);
+            }
+            std.debug.print("Failed to count sessions: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+
+        const sessions = session_store.listSessions(allocator, limit, offset) catch |err| {
+            if (err == error.NotSupported) {
+                if (json_mode) {
+                    var msg_buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "History listing not supported for backend: {s}", .{cfg.memory.backend}) catch "History listing not supported";
+                    writeJsonError("history_not_supported", msg, cfg.memory.backend);
+                }
+                std.debug.print("History listing not supported for backend: {s}\n", .{cfg.memory.backend});
+                std_compat.process.exit(1);
+            }
+            if (json_mode) {
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Failed to list sessions: {s}", .{@errorName(err)}) catch "Failed to list sessions";
+                writeJsonError("history_list_failed", msg, cfg.memory.backend);
+            }
+            std.debug.print("Failed to list sessions: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+        defer yc.memory.freeSessionInfos(allocator, sessions);
+
+        if (json_mode) {
+            writeHistoryListJson(sessions, total, limit, offset);
+        } else {
+            if (sessions.len == 0) {
+                std.debug.print("No sessions found.\n", .{});
+            } else {
+                const shown_from: u64 = @intCast(offset + 1);
+                const shown_to: u64 = @intCast(offset + sessions.len);
+                std.debug.print("Sessions: showing {d}-{d} of {d}\n", .{ shown_from, shown_to, total });
+                for (sessions, 0..) |s, idx| {
+                    std.debug.print("  {d}. {s}  msgs={d}  first={s}  last={s}\n", .{
+                        offset + idx + 1, s.session_id, s.message_count, s.first_message_at, s.last_message_at,
+                    });
+                }
+            }
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "show")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw history show <session_id> [--limit N] [--offset N] [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+        const session_id = sub_args[1];
+        var limit: usize = 100;
+        var offset: usize = 0;
+        var json_mode = false;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history show <session_id> [--limit N] [--offset N] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std_compat.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--offset")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history show <session_id> [--limit N] [--offset N] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                offset = parseNonNegativeUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --offset value: {s}\n", .{sub_args[i]});
+                    std_compat.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
+                std_compat.process.exit(1);
+            }
+        }
+
+        const total = session_store.countDetailedMessages(session_id) catch |err| {
+            if (err == error.NotSupported) {
+                if (json_mode) {
+                    var msg_buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Detailed history not supported for backend: {s}", .{cfg.memory.backend}) catch "Detailed history not supported";
+                    writeJsonError("history_not_supported", msg, cfg.memory.backend);
+                }
+                std.debug.print("Detailed history not supported for backend: {s}\n", .{cfg.memory.backend});
+                std_compat.process.exit(1);
+            }
+            if (json_mode) {
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Failed to count messages: {s}", .{@errorName(err)}) catch "Failed to count messages";
+                writeJsonError("history_count_failed", msg, cfg.memory.backend);
+            }
+            std.debug.print("Failed to count messages: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+
+        const messages = session_store.loadMessagesDetailed(allocator, session_id, limit, offset) catch |err| {
+            if (err == error.NotSupported) {
+                if (json_mode) {
+                    var msg_buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Detailed history not supported for backend: {s}", .{cfg.memory.backend}) catch "Detailed history not supported";
+                    writeJsonError("history_not_supported", msg, cfg.memory.backend);
+                }
+                std.debug.print("Detailed history not supported for backend: {s}\n", .{cfg.memory.backend});
+                std_compat.process.exit(1);
+            }
+            if (json_mode) {
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Failed to load messages: {s}", .{@errorName(err)}) catch "Failed to load messages";
+                writeJsonError("history_show_failed", msg, cfg.memory.backend);
+            }
+            std.debug.print("Failed to load messages: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+        defer yc.memory.freeDetailedMessages(allocator, messages);
+
+        if (json_mode) {
+            writeHistoryShowJson(session_id, messages, total, limit, offset);
+        } else {
+            if (messages.len == 0) {
+                std.debug.print("No messages for session: {s}\n", .{session_id});
+            } else {
+                const shown_from: u64 = @intCast(offset + 1);
+                const shown_to: u64 = @intCast(offset + messages.len);
+                std.debug.print("Session: {s} (showing {d}-{d} of {d})\n\n", .{ session_id, shown_from, shown_to, total });
+                for (messages) |m| {
+                    std.debug.print("[{s}] {s}:\n{s}\n\n", .{ m.created_at, m.role, m.content });
+                }
+            }
+        }
+        return;
+    }
+
+    std.debug.print("Unknown history command: {s}\n", .{subcmd});
+    std_compat.process.exit(1);
+}
+
+fn appendHistoryListJson(out: anytype, sessions: []const yc.memory.SessionInfo, total: u64, limit: usize, offset: usize) !void {
+    try out.print("{{\"total\":{d},\"limit\":{d},\"offset\":{d},\"sessions\":[", .{ total, limit, offset });
+    for (sessions, 0..) |s, idx| {
+        if (idx > 0) try out.writeAll(",");
+        try out.writeAll("{\"session_id\":");
+        try writeJsonString(out, s.session_id);
+        try out.print(",\"message_count\":{d},\"first_message_at\":", .{s.message_count});
+        try writeJsonString(out, s.first_message_at);
+        try out.writeAll(",\"last_message_at\":");
+        try writeJsonString(out, s.last_message_at);
+        try out.writeAll("}");
+    }
+    try out.writeAll("]}");
+}
+
+fn writeHistoryListJson(sessions: []const yc.memory.SessionInfo, total: u64, limit: usize, offset: usize) void {
+    writeRenderedJsonLine(appendHistoryListJson, .{ sessions, total, limit, offset });
+}
+
+fn appendHistoryShowJson(out: anytype, session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry, total: u64, limit: usize, offset: usize) !void {
+    try out.writeAll("{\"session_id\":");
+    try writeJsonString(out, session_id);
+    try out.print(",\"total\":{d},\"limit\":{d},\"offset\":{d},\"messages\":[", .{ total, limit, offset });
+    for (messages, 0..) |m, idx| {
+        if (idx > 0) try out.writeAll(",");
+        try out.writeAll("{\"role\":");
+        try writeJsonString(out, m.role);
+        try out.writeAll(",\"content\":");
+        try writeJsonString(out, m.content);
+        try out.writeAll(",\"created_at\":");
+        try writeJsonString(out, m.created_at);
+        try out.writeAll("}");
+    }
+    try out.writeAll("]}");
+}
+
+fn writeHistoryShowJson(session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry, total: u64, limit: usize, offset: usize) void {
+    writeRenderedJsonLine(appendHistoryShowJson, .{ session_id, messages, total, limit, offset });
+}
+
+fn writeJsonEscaped(out: anytype, s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.writeAll("\\\""),
+            '\\' => try out.writeAll("\\\\"),
+            '\n' => try out.writeAll("\\n"),
+            '\r' => try out.writeAll("\\r"),
+            '\t' => try out.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try out.print("\\u{x:0>4}", .{ch});
+                } else {
+                    try out.writeByte(ch);
+                }
+            },
+        }
+    }
 }
 
 fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         printWorkspaceUsage();
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer cfg.deinit();
 
@@ -1131,7 +3070,7 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
     if (!std.mem.eql(u8, subcmd, "reset-md")) {
         std.debug.print("Unknown workspace command: {s}\n\n", .{subcmd});
         printWorkspaceUsage();
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     var include_bootstrap = false;
@@ -1150,7 +3089,7 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
         } else {
             std.debug.print("Unknown option for workspace reset-md: {s}\n\n", .{arg});
             printWorkspaceUsage();
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
     }
 
@@ -1182,15 +3121,15 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
 fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg: yc.config.Config) void {
     if (args.len < 1) {
         std.debug.print("Usage: nullclaw workspace edit <filename>\n\n", .{});
-        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
-        std.process.exit(1);
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, CONFIG.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std_compat.process.exit(1);
     }
     const filename = args[0];
 
     if (!yc.bootstrap.isBootstrapFilename(filename)) {
         std.debug.print("Not a bootstrap file: {s}\n", .{filename});
-        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
-        std.process.exit(1);
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, CONFIG.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std_compat.process.exit(1);
     }
 
     // Only file-based backends (markdown, hybrid) support direct editing.
@@ -1201,12 +3140,12 @@ fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg:
                 "or switch to the hybrid backend for file-based editing.\n",
             .{cfg.memory.backend},
         );
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const filepath = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.workspace_dir, filename }) catch {
         std.debug.print("Failed to build file path\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer allocator.free(filepath);
 
@@ -1218,19 +3157,19 @@ fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg:
     defer if (editor_owned) |value| allocator.free(value);
     const editor = if (editor_owned) |value| value else "vi";
 
-    var child = std.process.Child.init(&.{ editor, filepath }, allocator);
+    var child = std_compat.process.Child.init(&.{ editor, filepath }, allocator);
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
 
     _ = child.spawnAndWait() catch |err| {
         std.debug.print("Failed to launch editor '{s}': {s}\n", .{ editor, @errorName(err) });
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 }
 
 fn getEnvVarOwnedOrNull(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+    return std_compat.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => null,
     };
@@ -1243,7 +3182,7 @@ fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !
             as_json = true;
         } else {
             std.debug.print("Usage: nullclaw capabilities [--json]\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
     }
 
@@ -1257,7 +3196,339 @@ fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !
         try yc.capabilities.buildSummaryText(allocator, cfg_ptr, null);
     defer allocator.free(output);
 
-    std.debug.print("{s}", .{output});
+    try yc.admin_output.writeStdoutBytes(output);
+}
+
+// ── Config ───────────────────────────────────────────────────────
+
+const ModelProviderSummary = struct {
+    name: []const u8,
+    has_key: bool,
+};
+
+fn printStdoutBytes(text: []const u8) void {
+    yc.admin_output.writeStdoutBytes(text) catch return;
+}
+
+fn writeRenderedJsonLine(comptime render_fn: anytype, args: anytype) void {
+    const allocator = std.heap.smp_allocator;
+    yc.admin_output.writeRenderedLine(allocator, render_fn, args) catch {
+        std_compat.process.exit(1);
+    };
+}
+
+fn appendJsonEscaped(buf: *std.array_list.Managed(u8), s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice("\\\""),
+            '\\' => try buf.appendSlice("\\\\"),
+            '\n' => try buf.appendSlice("\\n"),
+            '\r' => try buf.appendSlice("\\r"),
+            '\t' => try buf.appendSlice("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    var escape_buf: [6]u8 = undefined;
+                    const escape = try std.fmt.bufPrint(&escape_buf, "\\u{x:0>4}", .{ch});
+                    try buf.appendSlice(escape);
+                } else {
+                    try buf.append(ch);
+                }
+            },
+        }
+    }
+}
+
+fn allocDefaultModelRef(allocator: std.mem.Allocator, cfg: *const yc.config.Config) !?[]u8 {
+    const model = cfg.default_model orelse return null;
+    if (cfg.default_provider.len == 0) return try allocator.dupe(u8, model);
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.default_provider, model });
+}
+
+fn buildModelsSummaryJson(allocator: std.mem.Allocator, cfg: *const yc.config.Config) ![]u8 {
+    var providers = std.ArrayListUnmanaged(ModelProviderSummary).empty;
+    defer providers.deinit(allocator);
+
+    for (cfg.providers) |provider| {
+        const has_key = if (provider.api_key) |key|
+            std.mem.trim(u8, key, " \t\r\n").len > 0
+        else
+            false;
+        try providers.append(allocator, .{
+            .name = provider.name,
+            .has_key = has_key,
+        });
+    }
+
+    std.mem.sort(ModelProviderSummary, providers.items, {}, struct {
+        fn lessThan(_: void, lhs: ModelProviderSummary, rhs: ModelProviderSummary) bool {
+            return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+        }
+    }.lessThan);
+
+    const default_model_ref = try allocDefaultModelRef(allocator, cfg);
+    defer if (default_model_ref) |value| allocator.free(value);
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    try out.appendSlice("{\"default_provider\":");
+    if (cfg.default_provider.len > 0) {
+        try out.append('"');
+        try appendJsonEscaped(&out, cfg.default_provider);
+        try out.append('"');
+    } else {
+        try out.appendSlice("null");
+    }
+
+    try out.appendSlice(",\"default_model\":");
+    if (default_model_ref) |value| {
+        try out.append('"');
+        try appendJsonEscaped(&out, value);
+        try out.append('"');
+    } else {
+        try out.appendSlice("null");
+    }
+
+    try out.appendSlice(",\"providers\":[");
+    for (providers.items, 0..) |provider, idx| {
+        if (idx > 0) try out.append(',');
+        try out.appendSlice("{\"name\":\"");
+        try appendJsonEscaped(&out, provider.name);
+        try out.appendSlice("\",\"has_key\":");
+        try out.appendSlice(if (provider.has_key) "true" else "false");
+        try out.append('}');
+    }
+    try out.appendSlice("]}");
+    return try out.toOwnedSlice();
+}
+
+fn appendConfigValueResult(out: anytype, path: []const u8, value_json: []const u8) !void {
+    try out.writeAll("{\"path\":");
+    try writeJsonString(out, path);
+    try out.writeAll(",\"value\":");
+    try out.writeAll(value_json);
+    try out.writeAll("}");
+}
+
+fn appendConfigReloadJson(out: anytype) !void {
+    try out.writeAll(
+        "{\"reloaded\":true,\"live_applied\":false,\"message\":\"config.json re-read from disk; restart running daemons to apply changes\"}",
+    );
+}
+
+fn appendValidationJson(out: anytype, valid: bool) !void {
+    try out.writeAll("{\"valid\":");
+    try writeJsonBool(out, valid);
+    try out.writeAll("}");
+}
+
+fn writeConfigValueResult(path: []const u8, value_json: []const u8) void {
+    writeRenderedJsonLine(appendConfigValueResult, .{ path, value_json });
+}
+
+fn printConfigUsage() void {
+    std.debug.print(std.fmt.comptimePrint(
+        \\Usage: nullclaw config <{s}> [args]
+        \\
+        \\Commands:
+        \\  show [--json]                  Print config.json as JSON
+        \\  get <path> [--json]            Read a dotted config path
+        \\  set <path> <value> [--json]    Persist a dotted config value
+        \\  unset <path> [--json]          Remove/reset a dotted config value
+        \\  reload [--json]                Re-read config.json from disk
+        \\  validate [json] [--json]       Validate current or proposed config JSON
+        \\
+    , .{CONFIG_SUBCOMMANDS}), .{});
+}
+
+fn runConfig(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        printConfigUsage();
+        std_compat.process.exit(1);
+    }
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "show")) {
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            printConfigUsage();
+            std_compat.process.exit(1);
+        }
+
+        const config_json = yc.config_mutator.getCurrentConfigJson(allocator) catch |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    if (hasJsonFlag(sub_args[1..])) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+                    std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+                },
+                else => {
+                    if (hasJsonFlag(sub_args[1..])) writeJsonError("config_read_failed", "Failed to read config.json", null);
+                    std.debug.print("Failed to read config.json: {s}\n", .{@errorName(err)});
+                },
+            }
+            std_compat.process.exit(1);
+        };
+        defer allocator.free(config_json);
+
+        printStdoutBytes(config_json);
+        if (config_json.len == 0 or config_json[config_json.len - 1] != '\n') {
+            printStdoutBytes("\n");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "get")) {
+        if (sub_args.len < 2 or sub_args.len > 3 or (sub_args.len == 3 and !std.mem.eql(u8, sub_args[2], "--json"))) {
+            printConfigUsage();
+            std_compat.process.exit(1);
+        }
+
+        const path = sub_args[1];
+        const value_json = yc.config_mutator.findPathValueJson(allocator, path) catch |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+                    std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+                },
+                error.InvalidJson => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_invalid_json", "config.json is not valid JSON", null);
+                    std.debug.print("config.json is not valid JSON\n", .{});
+                },
+                error.InvalidPath => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_invalid_path", "Invalid dotted config path", null);
+                    std.debug.print("Invalid dotted config path: {s}\n", .{path});
+                },
+                else => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_get_failed", "Failed to read config path", null);
+                    std.debug.print("Failed to read config path {s}: {s}\n", .{ path, @errorName(err) });
+                },
+            }
+            std_compat.process.exit(1);
+        };
+        if (value_json) |value| {
+            defer allocator.free(value);
+            if (hasJsonFlag(sub_args[2..])) {
+                writeConfigValueResult(path, value);
+            } else {
+                printStdoutBytes(value);
+                printStdoutBytes("\n");
+            }
+            return;
+        }
+
+        if (hasJsonFlag(sub_args[2..])) writeJsonError("config_path_not_found", "Config path not found", null);
+        std.debug.print("Config path not found: {s}\n", .{path});
+        std_compat.process.exit(1);
+    }
+
+    if (std.mem.eql(u8, subcmd, "set")) {
+        if (sub_args.len < 3 or sub_args.len > 4 or (sub_args.len == 4 and !std.mem.eql(u8, sub_args[3], "--json"))) {
+            printConfigUsage();
+            std_compat.process.exit(1);
+        }
+
+        var result = yc.config_mutator.mutateDefaultConfig(allocator, .set, sub_args[1], sub_args[2], .{ .apply = true }) catch |err| {
+            if (hasJsonFlag(sub_args[3..])) writeJsonError("config_set_failed", @errorName(err), null);
+            std.debug.print("Failed to update config path {s}: {s}\n", .{ sub_args[1], @errorName(err) });
+            std_compat.process.exit(1);
+        };
+        defer yc.config_mutator.freeMutationResult(allocator, &result);
+
+        if (hasJsonFlag(sub_args[3..])) {
+            writeConfigMutationJson(.set, &result);
+        } else {
+            std.debug.print("Updated {s}\n", .{result.path});
+            std.debug.print("  changed:          {}\n", .{result.changed});
+            std.debug.print("  applied:          {}\n", .{result.applied});
+            std.debug.print("  requires_restart: {}\n", .{result.requires_restart});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "unset")) {
+        if (sub_args.len < 2 or sub_args.len > 3 or (sub_args.len == 3 and !std.mem.eql(u8, sub_args[2], "--json"))) {
+            printConfigUsage();
+            std_compat.process.exit(1);
+        }
+
+        var result = yc.config_mutator.mutateDefaultConfig(allocator, .unset, sub_args[1], null, .{ .apply = true }) catch |err| {
+            if (hasJsonFlag(sub_args[2..])) writeJsonError("config_unset_failed", @errorName(err), null);
+            std.debug.print("Failed to unset config path {s}: {s}\n", .{ sub_args[1], @errorName(err) });
+            std_compat.process.exit(1);
+        };
+        defer yc.config_mutator.freeMutationResult(allocator, &result);
+
+        if (hasJsonFlag(sub_args[2..])) {
+            writeConfigMutationJson(.unset, &result);
+        } else {
+            std.debug.print("Unset {s}\n", .{result.path});
+            std.debug.print("  changed:          {}\n", .{result.changed});
+            std.debug.print("  applied:          {}\n", .{result.applied});
+            std.debug.print("  requires_restart: {}\n", .{result.requires_restart});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "reload")) {
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            printConfigUsage();
+            std_compat.process.exit(1);
+        }
+
+        yc.config_mutator.validateCurrentConfig(allocator) catch |err| {
+            if (hasJsonFlag(sub_args[1..])) writeJsonError("config_reload_failed", @errorName(err), null);
+            std.debug.print("Config reload validation failed: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+
+        if (hasJsonFlag(sub_args[1..])) {
+            writeRenderedJsonLine(appendConfigReloadJson, .{});
+        } else {
+            std.debug.print("Config re-read from disk. Restart running daemons to apply changes.\n", .{});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "validate")) {
+        var payload: ?[]const u8 = null;
+        var json_mode = false;
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else if (payload == null) {
+                payload = sub_args[i];
+            } else {
+                printConfigUsage();
+                std_compat.process.exit(1);
+            }
+        }
+
+        if (payload) |candidate| {
+            yc.config_mutator.validateProposedConfigJson(allocator, candidate) catch |err| {
+                if (json_mode) writeJsonError("config_invalid", @errorName(err), null);
+                std.debug.print("Proposed config is invalid: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+        } else {
+            yc.config_mutator.validateCurrentConfig(allocator) catch |err| {
+                if (json_mode) writeJsonError("config_invalid", @errorName(err), null);
+                std.debug.print("Current config is invalid: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+        }
+
+        if (json_mode) {
+            writeRenderedJsonLine(appendValidationJson, .{true});
+        } else {
+            std.debug.print("Config validation: OK\n", .{});
+        }
+        return;
+    }
+
+    std.debug.print("Unknown config command: {s}\n\n", .{subcmd});
+    printConfigUsage();
+    std_compat.process.exit(1);
 }
 
 // ── Models ───────────────────────────────────────────────────────
@@ -1269,12 +3540,13 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\
             \\Commands:
             \\  list                          List available models
+            \\  summary [--json]             Show configured provider summary
             \\  info <model>                  Show model details
             \\  benchmark                     Run model latency benchmark
             \\  refresh                       Refresh model catalog
             \\
         , .{MODELS_SUBCOMMANDS}), .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const subcmd = sub_args[0];
@@ -1297,15 +3569,70 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("  {s:<12} {s:<36} {s}\n", .{ p.key, p.default_model, p.label });
         }
         std.debug.print("\nUse `nullclaw models info <model>` for details.\n", .{});
+    } else if (std.mem.eql(u8, subcmd, "summary")) {
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            std.debug.print("Usage: nullclaw models summary [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+
+        var cfg = yc.config.Config.load(allocator) catch {
+            if (hasJsonFlag(sub_args[1..])) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+            std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+            std_compat.process.exit(1);
+        };
+        defer cfg.deinit();
+
+        const summary_json = buildModelsSummaryJson(allocator, &cfg) catch |err| {
+            if (hasJsonFlag(sub_args[1..])) writeJsonError("models_summary_failed", "Failed to build models summary", null);
+            std.debug.print("Failed to build models summary: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+        defer allocator.free(summary_json);
+
+        if (hasJsonFlag(sub_args[1..])) {
+            printStdoutBytes(summary_json);
+            printStdoutBytes("\n");
+        } else {
+            std.debug.print("Configured provider summary:\n", .{});
+            std.debug.print("  Default provider: {s}\n", .{if (cfg.default_provider.len > 0) cfg.default_provider else "(not set)"});
+            if (cfg.default_model) |model| {
+                if (cfg.default_provider.len > 0) {
+                    std.debug.print("  Default model:    {s}/{s}\n", .{ cfg.default_provider, model });
+                } else {
+                    std.debug.print("  Default model:    {s}\n", .{model});
+                }
+            } else {
+                std.debug.print("  Default model:    (not set)\n", .{});
+            }
+            if (cfg.providers.len == 0) {
+                std.debug.print("  Providers:        (none configured)\n", .{});
+            } else {
+                std.debug.print("  Providers:\n", .{});
+                for (cfg.providers) |provider| {
+                    std.debug.print("    - {s} [{s}]\n", .{
+                        provider.name,
+                        if (provider.api_key != null and std.mem.trim(u8, provider.api_key.?, " \t\r\n").len > 0) "has_key" else "no_key",
+                    });
+                }
+            }
+        }
     } else if (std.mem.eql(u8, subcmd, "info")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw models info <model>\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
-        std.debug.print("Model: {s}\n", .{sub_args[1]});
-        std.debug.print("  Default provider: {s}\n", .{yc.onboard.canonicalProviderName(sub_args[1])});
-        std.debug.print("  Context: varies by provider\n", .{});
-        std.debug.print("  Pricing: see provider dashboard\n", .{});
+        if (hasJsonFlag(sub_args[2..])) {
+            writeModelInfoJson(sub_args[1]);
+        } else {
+            std.debug.print("Model: {s}\n", .{sub_args[1]});
+            if (modelCanonicalProvider(sub_args[1])) |provider| {
+                std.debug.print("  Default provider: {s}\n", .{provider});
+            } else {
+                std.debug.print("  Default provider: unknown\n", .{});
+            }
+            std.debug.print("  Context: varies by provider\n", .{});
+            std.debug.print("  Pricing: see provider dashboard\n", .{});
+        }
     } else if (std.mem.eql(u8, subcmd, "benchmark")) {
         std.debug.print("Running model latency benchmark...\n", .{});
         std.debug.print("Configure a provider first (nullclaw onboard).\n", .{});
@@ -1313,8 +3640,88 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.onboard.runModelsRefresh(allocator);
     } else {
         std.debug.print("Unknown models command: {s}\n", .{subcmd});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
+}
+
+fn runMcp(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw mcp <{s}> [args]
+            \\
+            \\Commands:
+            \\  list [--json]                List configured MCP servers
+            \\  info <name> [--json]         Show details for one MCP server
+            \\
+        , .{MCP_SUBCOMMANDS}), .{});
+        std_compat.process.exit(1);
+    }
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        if (hasJsonFlag(sub_args[1..])) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std_compat.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    const subcmd = sub_args[0];
+    if (std.mem.eql(u8, subcmd, "list")) {
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            std.debug.print("Usage: nullclaw mcp list [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+        if (hasJsonFlag(sub_args[1..])) {
+            const body = yc.mcp_admin.buildServersJson(allocator, cfg.mcp_servers) catch |err| {
+                writeJsonError("mcp_list_failed", @errorName(err), null);
+                std_compat.process.exit(1);
+            };
+            defer allocator.free(body);
+            printStdoutBytes(body);
+            printStdoutBytes("\n");
+            return;
+        }
+
+        if (cfg.mcp_servers.len == 0) {
+            std.debug.print("No MCP servers configured.\n", .{});
+            return;
+        }
+
+        std.debug.print("Configured MCP servers:\n", .{});
+        for (cfg.mcp_servers) |server| {
+            std.debug.print("  - {s} [{s}] {s}\n", .{ server.name, server.transport, server.command });
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "info")) {
+        if (sub_args.len < 2 or sub_args.len > 3 or (sub_args.len == 3 and !std.mem.eql(u8, sub_args[2], "--json"))) {
+            std.debug.print("Usage: nullclaw mcp info <name> [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+
+        const server_json = yc.mcp_admin.buildServerJson(allocator, cfg.mcp_servers, sub_args[1]) catch |err| {
+            if (hasJsonFlag(sub_args[2..])) writeJsonError("mcp_info_failed", @errorName(err), null);
+            std.debug.print("Failed to inspect MCP server: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+        if (server_json) |body| {
+            defer allocator.free(body);
+            if (hasJsonFlag(sub_args[2..])) {
+                printStdoutBytes(body);
+                printStdoutBytes("\n");
+            } else {
+                std.debug.print("{s}\n", .{body});
+            }
+            return;
+        }
+
+        if (hasJsonFlag(sub_args[2..])) writeJsonError("mcp_not_found", "MCP server not found", null);
+        std.debug.print("MCP server not found: {s}\n", .{sub_args[1]});
+        std_compat.process.exit(1);
+    }
+
+    std.debug.print("Unknown mcp command: {s}\n", .{subcmd});
+    std_compat.process.exit(1);
 }
 
 // ── Onboard ──────────────────────────────────────────────────────
@@ -1450,42 +3857,58 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         .unknown_option => |opt| {
             std.debug.print("Unknown onboard option: {s}\n\n", .{opt});
             printOnboardUsage();
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
         .missing_value => |opt| {
             std.debug.print("Missing value for onboard option: {s}\n\n", .{opt});
             printOnboardUsage();
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
         .unexpected_argument => |arg| {
             std.debug.print("Unexpected positional argument for onboard: {s}\n\n", .{arg});
             printOnboardUsage();
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
         .invalid_combination => {
             std.debug.print("Invalid onboard option combination.\n", .{});
             std.debug.print("Use either --interactive, --channels-only, or quick-setup flags.\n\n", .{});
             printOnboardUsage();
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
     };
 
     switch (parsed.mode) {
-        .channels_only => try yc.onboard.runChannelsOnly(allocator),
-        .interactive => try yc.onboard.runWizard(allocator),
+        .channels_only => yc.onboard.runChannelsOnly(allocator) catch |err| switch (err) {
+            error.InsecurePlaintextSecrets => {
+                yc.config.Config.printValidationError(error.InsecurePlaintextSecrets);
+                std_compat.process.exit(1);
+            },
+            else => return err,
+        },
+        .interactive => yc.onboard.runWizard(allocator) catch |err| switch (err) {
+            error.InsecurePlaintextSecrets => {
+                yc.config.Config.printValidationError(error.InsecurePlaintextSecrets);
+                std_compat.process.exit(1);
+            },
+            else => return err,
+        },
         .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.model, parsed.memory_backend) catch |err| switch (err) {
+            error.InsecurePlaintextSecrets => {
+                yc.config.Config.printValidationError(error.InsecurePlaintextSecrets);
+                std_compat.process.exit(1);
+            },
             error.UnknownProvider => {
                 const requested = parsed.provider orelse "(missing)";
                 std.debug.print("Unknown provider '{s}' for quick setup.\n", .{requested});
                 printKnownOnboardProviders();
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
             error.UnknownMemoryBackend => {
                 const requested = parsed.memory_backend orelse "(missing)";
                 std.debug.print("Unknown memory backend '{s}' for quick setup.\n", .{requested});
                 std.debug.print("Known memory backends: {s}\n", .{yc.memory.registry.known_backends_csv});
                 printEnabledMemoryBackends(allocator);
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
             error.MemoryBackendDisabledInBuild => {
                 const requested = parsed.memory_backend orelse "(missing)";
@@ -1493,7 +3916,7 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
                 std.debug.print("Memory backend '{s}' is disabled in this build.\n", .{requested});
                 std.debug.print("Rebuild with -Dengines={s} (or include it in -Dengines=... list).\n", .{engine_token});
                 printEnabledMemoryBackends(allocator);
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
             else => return err,
         },
@@ -1514,6 +3937,61 @@ fn canStartFromChannelCommand(channel_id: yc.channel_catalog.ChannelId) bool {
     };
 }
 
+const ResolvedRuntimeChannel = struct {
+    adapter_key: []const u8,
+    start_name: []const u8,
+};
+
+fn resolveConfiguredRuntimeChannel(config: *const yc.config.Config, requested: []const u8) ?ResolvedRuntimeChannel {
+    for (config.channels.external) |external_cfg| {
+        if (std.mem.eql(u8, external_cfg.runtime_name, requested)) {
+            return .{
+                .adapter_key = "external",
+                .start_name = external_cfg.runtime_name,
+            };
+        }
+    }
+
+    for (config.channels.maixcam) |maixcam_cfg| {
+        if (std.mem.eql(u8, maixcam_cfg.name, requested)) {
+            return .{
+                .adapter_key = "maixcam",
+                .start_name = maixcam_cfg.name,
+            };
+        }
+    }
+
+    return null;
+}
+
+fn printConfiguredRuntimeChannelNames(config: *const yc.config.Config) void {
+    var first = true;
+
+    for (config.channels.external) |external_cfg| {
+        if (external_cfg.runtime_name.len == 0) continue;
+        if (first) {
+            std.debug.print("Configured runtime channel names: {s}", .{external_cfg.runtime_name});
+        } else {
+            std.debug.print(", {s}", .{external_cfg.runtime_name});
+        }
+        first = false;
+    }
+
+    for (config.channels.maixcam) |maixcam_cfg| {
+        if (maixcam_cfg.name.len == 0 or std.mem.eql(u8, maixcam_cfg.name, "maixcam")) continue;
+        if (first) {
+            std.debug.print("Configured runtime channel names: {s}", .{maixcam_cfg.name});
+        } else {
+            std.debug.print(", {s}", .{maixcam_cfg.name});
+        }
+        first = false;
+    }
+
+    if (!first) {
+        std.debug.print("\n", .{});
+    }
+}
+
 fn printChannelStartSupported() void {
     std.debug.print("Supported:", .{});
     for (yc.channel_catalog.known_channels) |meta| {
@@ -1532,7 +4010,7 @@ fn dispatchChannelStart(
     if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
         std.debug.print("{s} channel is disabled in this build.\n", .{meta.label});
         std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     switch (meta.id) {
@@ -1541,21 +4019,28 @@ fn dispatchChannelStart(
                 return runTelegramChannel(allocator, args, config.*, tg_config);
             }
             std.debug.print("Telegram channel is not configured.\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
         .signal => {
             if (config.channels.signalPrimary()) |sig_config| {
                 return runSignalChannel(allocator, args, config, sig_config);
             }
             std.debug.print("Signal channel is not configured.\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
         .matrix => {
             if (config.channels.matrixPrimary()) |mx_config| {
                 return runMatrixChannel(allocator, args, config, mx_config);
             }
             std.debug.print("Matrix channel is not configured.\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
+        },
+        .max => {
+            if (config.channels.maxPrimary()) |max_config| {
+                return runMaxChannel(allocator, args, config, max_config);
+            }
+            std.debug.print("Max channel is not configured.\n", .{});
+            std_compat.process.exit(1);
         },
         else => return runGatewayChannel(allocator, config, meta.key),
     }
@@ -1615,22 +4100,33 @@ fn printNoMessagingChannelConfiguredHint() void {
     std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
 }
 
+const ChannelStartBusDrainCtx = struct {
+    allocator: std.mem.Allocator,
+    bus: *yc.bus.Bus,
+};
+
+fn drainChannelStartBus(ctx: *const ChannelStartBusDrainCtx) void {
+    while (ctx.bus.consumeInbound()) |msg| {
+        msg.deinit(ctx.allocator);
+    }
+}
+
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len > 0 and std.mem.eql(u8, args[0], "--all")) {
         std.debug.print("Use `nullclaw gateway` to start all configured channels/accounts.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     // Load config
     var config = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer config.deinit();
 
     config.validate() catch |err| {
         yc.config.Config.printValidationError(err);
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     applyRuntimeProviderOverrides(&config);
 
@@ -1640,41 +4136,60 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         } else {
             printNoMessagingChannelConfiguredHint();
         }
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     // Check if user specified a channel name
     const requested: ?[]const u8 = if (args.len > 0) args[0] else null;
 
     if (requested) |ch_name| {
-        const meta = yc.channel_catalog.findByKey(ch_name) orelse {
-            std.debug.print("Unknown channel: {s}\n", .{ch_name});
-            printChannelStartSupported();
-            std.process.exit(1);
-        };
-        if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
-            const configured = yc.channel_catalog.configuredCount(&config, meta.id);
-            if (configured > 0) {
-                std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
-            } else {
-                std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+        if (yc.channel_catalog.findByKey(ch_name)) |meta| {
+            if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+                const configured = yc.channel_catalog.configuredCount(&config, meta.id);
+                if (configured > 0) {
+                    std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
+                } else {
+                    std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+                }
+                std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+                printChannelStartSupported();
+                std_compat.process.exit(1);
             }
-            std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
-            printChannelStartSupported();
-            std.process.exit(1);
-        }
-        if (!canStartFromChannelCommand(meta.id)) {
-            std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
-            printChannelStartSupported();
-            std.process.exit(1);
-        }
-        if (!yc.channel_catalog.isConfigured(&config, meta.id)) {
-            std.debug.print("{s} channel is not configured.\n", .{meta.label});
-            std.process.exit(1);
+            if (!canStartFromChannelCommand(meta.id)) {
+                std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
+                printChannelStartSupported();
+                std_compat.process.exit(1);
+            }
+            if (!yc.channel_catalog.isConfigured(&config, meta.id)) {
+                std.debug.print("{s} channel is not configured.\n", .{meta.label});
+                std_compat.process.exit(1);
+            }
+
+            const child_args: []const []const u8 = if (args.len > 1) args[1..] else &.{};
+            return dispatchChannelStart(allocator, child_args, &config, meta);
         }
 
-        const child_args: []const []const u8 = if (args.len > 1) args[1..] else &.{};
-        return dispatchChannelStart(allocator, child_args, &config, meta);
+        if (resolveConfiguredRuntimeChannel(&config, ch_name)) |resolved| {
+            const meta = yc.channel_catalog.findByKey(resolved.adapter_key) orelse unreachable;
+            if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
+                std.debug.print("Channel {s} is configured via {s} but disabled in this build.\n", .{ ch_name, meta.key });
+                std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
+                printChannelStartSupported();
+                std_compat.process.exit(1);
+            }
+            if (!canStartFromChannelCommand(meta.id)) {
+                std.debug.print("Channel {s} cannot be started via `channel start`.\n", .{ch_name});
+                printChannelStartSupported();
+                std_compat.process.exit(1);
+            }
+
+            return runGatewayChannel(allocator, &config, resolved.start_name);
+        }
+
+        std.debug.print("Unknown channel: {s}\n", .{ch_name});
+        printChannelStartSupported();
+        printConfiguredRuntimeChannelNames(&config);
+        std_compat.process.exit(1);
     }
 
     // No channel specified -- keep historical preference:
@@ -1703,85 +4218,85 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
     var registry = yc.channels.dispatch.ChannelRegistry.init(allocator);
     defer registry.deinit();
 
+    // Use a drain-only bus so `channel start` can exercise inbound wiring
+    // without leaking or stalling if the user sends test messages.
+    var event_bus = yc.bus.Bus.init();
+    var drain_ctx = ChannelStartBusDrainCtx{
+        .allocator = allocator,
+        .bus = &event_bus,
+    };
+    const drain_thread = try std.Thread.spawn(.{}, drainChannelStartBus, .{&drain_ctx});
+    defer drain_thread.join();
+    defer event_bus.close();
+
     const mgr = try yc.channel_manager.ChannelManager.init(allocator, config, &registry);
     defer mgr.deinit();
+
+    mgr.setEventBus(&event_bus);
 
     try mgr.collectConfiguredChannels();
 
     // Find and start only the requested channel
     var found = false;
+    var started_name = ch_name;
     for (mgr.channelEntries()) |entry| {
-        if (std.mem.eql(u8, entry.name, ch_name)) {
+        if (std.mem.eql(u8, entry.name, ch_name) or std.mem.eql(u8, entry.adapter_key, ch_name)) {
             entry.channel.start() catch |err| {
-                std.debug.print("{s} channel failed to start: {}\n", .{ ch_name, err });
-                std.process.exit(1);
+                std.debug.print("{s} channel failed to start: {}\n", .{ entry.name, err });
+                std_compat.process.exit(1);
             };
             found = true;
+            started_name = entry.name;
             break;
         }
     }
 
     if (!found) {
         std.debug.print("{s} channel is not configured.\n", .{ch_name});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
-    std.debug.print("{s} channel started. Press Ctrl+C to stop.\n", .{ch_name});
+    std.debug.print("{s} channel started. Press Ctrl+C to stop.\n", .{started_name});
 
     // Block until Ctrl+C
     while (!yc.daemon.isShutdownRequested()) {
-        std.Thread.sleep(1 * std.time.ns_per_s);
+        std_compat.thread.sleep(1 * std.time.ns_per_s);
     }
 }
 
 // ── Signal Channel ─────────────────────────────────────────────────
 
-fn hasReliabilityCredentialFallback(allocator: std.mem.Allocator, config: *const yc.config.Config) bool {
-    for (config.reliability.api_keys) |raw_key| {
-        if (std.mem.trim(u8, raw_key, " \t\r\n").len > 0) return true;
+fn ensureChannelStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const yc.config.Config,
+) void {
+    if (yc.channel_loop.hasStartupProviderCredentials(allocator, config)) return;
+
+    if (std.mem.eql(u8, config.default_provider, "openai-codex")) {
+        std.debug.print("No OpenAI Codex credentials configured.\n", .{});
+        std.debug.print("  Run `nullclaw auth login openai-codex` or `nullclaw auth login openai-codex --import-codex`.\n", .{});
+        std_compat.process.exit(1);
     }
 
-    for (config.reliability.fallback_providers) |provider_name| {
-        if (yc.providers.classifyProvider(provider_name) == .openai_codex_provider) return true;
-
-        const resolved = yc.providers.resolveApiKeyFromConfig(
-            allocator,
-            provider_name,
-            config.providers,
-        ) catch null;
-        defer if (resolved) |k| allocator.free(k);
-
-        if (resolved) |key| {
-            if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
-        }
+    if (yc.provider_probe.providerRequiresApiKey(config.default_provider, config.getProviderBaseUrl(config.default_provider))) {
+        std.debug.print("No usable provider credentials configured for {s}. Set env var or add to ~/.nullclaw/config.json:\n", .{config.default_provider});
+        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
+        std_compat.process.exit(1);
     }
 
-    return false;
+    std.debug.print("No usable startup credentials configured for provider {s}.\n", .{config.default_provider});
+    std.debug.print("Authenticate the provider locally or configure a reliability fallback provider.\n", .{});
+    std_compat.process.exit(1);
 }
 
 fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, config: *const yc.config.Config, signal_config: yc.config.SignalConfig) !void {
     _ = args;
     if (!build_options.enable_channel_signal) {
         std.debug.print("Signal channel is disabled in this build.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
-    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
-    const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
-        allocator,
-        config.default_provider,
-        config.providers,
-    ) catch null;
-    defer if (resolved_api_key) |k| allocator.free(k);
-
-    // OAuth providers (openai-codex) don't need an API key
-    const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, config);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
-        std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
-        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
-        std.process.exit(1);
-    }
+    ensureChannelStartupCredentials(allocator, config);
 
     const temperature = config.default_temperature;
 
@@ -1815,9 +4330,9 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
 
     // Env overrides for Signal
-    const env_http_url = std.process.getEnvVarOwned(allocator, "SIGNAL_HTTP_URL") catch null;
+    const env_http_url = std_compat.process.getEnvVarOwned(allocator, "SIGNAL_HTTP_URL") catch null;
     defer if (env_http_url) |v| allocator.free(v);
-    const env_account = std.process.getEnvVarOwned(allocator, "SIGNAL_ACCOUNT") catch null;
+    const env_account = std_compat.process.getEnvVarOwned(allocator, "SIGNAL_ACCOUNT") catch null;
     defer if (env_account) |v| allocator.free(v);
     const effective_http_url = env_http_url orelse signal_config.http_url;
     const effective_account = env_account orelse signal_config.account;
@@ -1838,199 +4353,17 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     if (!sg.healthCheck()) {
         std.debug.print("Signal health check failed. Is signal-cli daemon running?\n", .{});
         std.debug.print("  Run: signal-cli --account {s} daemon --http 127.0.0.1:8080\n", .{signal_config.account});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
-
-    // Initialize MCP tools from config
-    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
-        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-            std.debug.print("  MCP: init failed: {}\n", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
-
-    // Build security policy from config
-    const security = @import("nullclaw").security.policy;
-    var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
-    defer tracker.deinit();
-
-    var sec_policy = security.SecurityPolicy{
-        .autonomy = config.autonomy.level,
-        .workspace_dir = config.workspace_dir,
-        .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
-        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
-        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
-        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
-        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
-        .tracker = &tracker,
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std_compat.process.exit(1);
     };
-
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
-    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    defer subagent_manager.deinit();
-
-    // Create optional memory backend (don't fail if unavailable).
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
-
-    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
-        allocator,
-        config.memory.backend,
-        mem_opt,
-        config.workspace_dir,
-    ) catch null;
-    defer if (bootstrap_provider) |bp| bp.deinit();
-
-    // Create tools (for system prompt and tool calling)
-    const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
-        .http_enabled = config.http_request.enabled,
-        .http_allowed_domains = config.http_request.allowed_domains,
-        .http_max_response_size = config.http_request.max_response_size,
-        .http_timeout_secs = config.http_request.timeout_secs,
-        .web_search_base_url = config.http_request.search_base_url,
-        .web_search_provider = config.http_request.search_provider,
-        .web_search_fallback_providers = config.http_request.search_fallback_providers,
-        .browser_enabled = config.browser.enabled,
-        .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
-        .agents = config.agents,
-        .configured_providers = config.providers,
-        .fallback_api_key = resolved_api_key,
-        .tools_config = config.tools,
-        .allowed_paths = config.autonomy.allowed_paths,
-        .policy = &sec_policy,
-        .subagent_manager = &subagent_manager,
-        .bootstrap_provider = bootstrap_provider,
-        .backend_name = config.memory.backend,
-    }) catch &.{};
-    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
-
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
-
-    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
-    if (mem_rt) |*rt| {
-        yc.tools.bindMemoryRuntime(tools, rt);
-    }
-
-    // Create provider with reliability wrapper (retry + fallback chains).
-    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
-    defer runtime_provider.deinit();
-    const provider_i = runtime_provider.provider();
-
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
-
-    // Initialize session manager
-    var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
-    session_mgr.policy = &sec_policy;
-    if (mem_rt) |*rt| {
-        session_mgr.mem_rt = rt;
-    }
-    defer session_mgr.deinit();
-
-    // Session key buffer
-    var key_buf: [128]u8 = undefined;
-
-    // Message loop: poll → full agent loop (tool calling) → reply
-    while (true) {
-        const messages = sg.pollMessages(allocator) catch |err| {
-            std.debug.print("Signal poll error: {}\n", .{err});
-            std.Thread.sleep(5 * std.time.ns_per_s);
-            continue;
-        };
-
-        for (messages) |msg| {
-            std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
-
-            // Session key — resolve through route engine, fallback to legacy key.
-            const group_peer_id = yc.channels.signal.signalGroupPeerId(msg.reply_target);
-            var routed_session_key: ?[]const u8 = null;
-            defer if (routed_session_key) |key| allocator.free(key);
-            const session_key = blk: {
-                const route = yc.agent_routing.resolveRouteWithSession(
-                    allocator,
-                    .{
-                        .channel = "signal",
-                        .account_id = sg.account_id,
-                        .peer = .{
-                            .kind = if (msg.is_group) .group else .direct,
-                            .id = if (msg.is_group) group_peer_id else msg.sender,
-                        },
-                    },
-                    config.agent_bindings,
-                    config.agents,
-                    config.session,
-                ) catch break :blk if (msg.is_group)
-                    std.fmt.bufPrint(&key_buf, "signal:{s}:group:{s}:{s}", .{
-                        sg.account_id,
-                        group_peer_id,
-                        msg.sender,
-                    }) catch msg.sender
-                else
-                    std.fmt.bufPrint(&key_buf, "signal:{s}:{s}", .{ sg.account_id, msg.sender }) catch msg.sender;
-                allocator.free(route.main_session_key);
-                routed_session_key = route.session_key;
-                break :blk route.session_key;
-            };
-
-            // Build conversation context for Signal (includes sender UUID and group ID)
-            const conversation_context: ?yc.agent.ConversationContext = if (std.mem.eql(u8, msg.channel, "signal")) blk: {
-                break :blk .{
-                    .channel = "signal",
-                    .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
-                    .sender_uuid = msg.sender_uuid,
-                    .group_id = msg.group_id,
-                    .is_group = msg.is_group,
-                };
-            } else null;
-
-            const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                std.debug.print("  Agent error: {}\n", .{err});
-                const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
-                };
-                if (msg.reply_target) |target| {
-                    sg.sendMessage(target, err_msg, &.{}) catch |send_err| std.debug.print("  Send error: {}\n", .{send_err});
-                }
-                continue;
-            };
-            defer allocator.free(reply);
-
-            std.debug.print("  -> {s}\n", .{reply});
-
-            // Reply on Signal; handles split
-            if (msg.reply_target) |target| {
-                sg.sendMessage(target, reply, &.{}) catch |err| {
-                    std.debug.print("  Send error: {}\n", .{err});
-                };
-            }
-        }
-
-        if (messages.len > 0) {
-            // Free message memory
-            for (messages) |msg| {
-                msg.deinit(allocator);
-            }
-            allocator.free(messages);
-        }
-
-        // Small delay between polls
-        std.Thread.sleep(500 * std.time.ns_per_ms);
-    }
+    defer runtime.deinit();
+    var loop_state = yc.channel_loop.SignalLoopState.init();
+    yc.channel_loop.runSignalLoop(allocator, config, runtime, &loop_state, &sg);
 }
 
 // ── Matrix Channel ────────────────────────────────────────────────
@@ -2044,8 +4377,10 @@ fn runMatrixChannel(
     _ = args;
     if (!build_options.enable_channel_matrix) {
         std.debug.print("Matrix channel is disabled in this build.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
+
+    ensureChannelStartupCredentials(allocator, config);
 
     var mx = yc.channels.matrix.MatrixChannel.initFromConfig(allocator, matrix_config);
 
@@ -2069,14 +4404,14 @@ fn runMatrixChannel(
 
     if (!mx.healthCheck()) {
         std.debug.print("Matrix health check failed. Verify homeserver/access_token.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
     const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
         std.debug.print("Runtime init failed: {}\n", .{err});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer runtime.deinit();
 
@@ -2084,12 +4419,69 @@ fn runMatrixChannel(
     yc.channel_loop.runMatrixLoop(allocator, config, runtime, &loop_state, &mx);
 }
 
+// ── Max Channel ───────────────────────────────────────────────────
+
+fn runMaxChannel(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    config: *const yc.config.Config,
+    max_config: yc.config.MaxConfig,
+) !void {
+    _ = args;
+    if (!build_options.enable_channel_max) {
+        std.debug.print("Max channel is disabled in this build.\n", .{});
+        std_compat.process.exit(1);
+    }
+
+    ensureChannelStartupCredentials(allocator, config);
+
+    var mx = yc.channels.max.MaxChannel.initFromConfig(allocator, max_config);
+
+    if (mx.mode == .webhook) {
+        std.debug.print("nullclaw Max channel configured for webhook delivery.\n", .{});
+        return runGatewayChannel(allocator, config, "max");
+    }
+
+    std.debug.print("nullclaw Max bot starting...\n", .{});
+    std.debug.print("  Provider: {s}\n", .{config.default_provider});
+    std.debug.print("  Account ID: {s}\n", .{mx.account_id});
+    std.debug.print("  Mode: {s}\n", .{@tagName(mx.mode)});
+    std.debug.print("  Group policy: {s}\n", .{mx.group_policy});
+    if (mx.allow_from.len == 0) {
+        std.debug.print("  Allowed users: (none — all messages will be denied)\n", .{});
+    } else if (mx.allow_from.len == 1 and std.mem.eql(u8, mx.allow_from[0], "*")) {
+        std.debug.print("  Allowed users: *\n", .{});
+    } else {
+        std.debug.print("  Allowed users:", .{});
+        for (mx.allow_from) |u| {
+            std.debug.print(" {s}", .{u});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    if (!mx.healthCheck()) {
+        std.debug.print("Max health check failed. Verify bot_token.\n", .{});
+        std_compat.process.exit(1);
+    }
+
+    std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
+
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std_compat.process.exit(1);
+    };
+    defer runtime.deinit();
+
+    var loop_state = yc.channel_loop.MaxLoopState.init();
+    yc.channel_loop.runMaxLoop(allocator, config, runtime, &loop_state, &mx);
+}
+
 // ── Telegram Channel ───────────────────────────────────────────────-
 
 fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, config: yc.config.Config, telegram_config: yc.config.TelegramConfig) !void {
     if (!build_options.enable_channel_telegram) {
         std.debug.print("Telegram channel is disabled in this build.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     // Determine allowed users: --user CLI args override config allow_from
@@ -2109,30 +4501,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     else
         telegram_config.allow_from;
 
-    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
-    const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
-        allocator,
-        config.default_provider,
-        config.providers,
-    ) catch null;
-    defer if (resolved_api_key) |k| allocator.free(k);
-
-    // OAuth providers (openai-codex) don't need an API key
-    const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, &config);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
-        std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
-        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
-        std.process.exit(1);
-    }
-
-    const model = config.default_model.?;
-    const temperature = config.default_temperature;
-
+    ensureChannelStartupCredentials(allocator, &config);
     std.debug.print("nullclaw telegram bot starting...\n", .{});
-    std.debug.print("  Provider: {s}\n", .{config.default_provider});
-    std.debug.print("  Model: {s}\n", .{model});
-    std.debug.print("  Temperature: {d:.1}\n", .{temperature});
+    config.printModelConfig();
+    std.debug.print("  Temperature: {d:.1}\n", .{config.default_temperature});
     if (allowed.len == 0) {
         std.debug.print("  Allowed users: (none — all messages will be denied)\n", .{});
     } else if (allowed.len == 1 and std.mem.eql(u8, allowed[0], "*")) {
@@ -2145,239 +4517,23 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         std.debug.print("\n", .{});
     }
 
-    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, telegram_config.group_allow_from, telegram_config.group_policy);
-    tg.proxy = telegram_config.proxy;
-    tg.account_id = telegram_config.account_id;
-    tg.interactive = telegram_config.interactive;
-
-    // Set up transcription — key comes from providers.{audio_media.provider}
-    const trans = config.audio_media;
-    const whisper_ptr: ?*yc.voice.WhisperTranscriber = if (config.getProviderKey(trans.provider)) |key| blk: {
-        const wt = try allocator.create(yc.voice.WhisperTranscriber);
-        wt.* = .{
-            .endpoint = yc.voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
-            .api_key = key,
-            .model = trans.model,
-            .language = trans.language,
-        };
-        break :blk wt;
-    } else null;
-    defer if (whisper_ptr) |wt| allocator.destroy(wt);
-    if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
-
-    // Initialize MCP tools from config
-    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
-        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-            std.debug.print("  MCP: init failed: {}\n", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
-
-    // Build security policy from config
-    const security = @import("nullclaw").security.policy;
-    var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
-    defer tracker.deinit();
-
-    var sec_policy = security.SecurityPolicy{
-        .autonomy = config.autonomy.level,
-        .workspace_dir = config.workspace_dir,
-        .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
-        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
-        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
-        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
-        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
-        .tracker = &tracker,
+    var runtime_telegram_config = telegram_config;
+    runtime_telegram_config.allow_from = allowed;
+    var tg = yc.channels.telegram.TelegramChannel.initFromConfig(allocator, runtime_telegram_config);
+    tg.text_debounce_secs = yc.channels.telegram.TelegramChannel.textDebounceSecsFromMs(
+        config.messages.inbound.debounce_ms,
+    );
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, &config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std_compat.process.exit(1);
     };
-
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
-    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    defer subagent_manager.deinit();
-
-    // Create optional memory backend (don't fail if unavailable).
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
-
-    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
-        allocator,
-        config.memory.backend,
-        mem_opt,
-        config.workspace_dir,
-    ) catch null;
-    defer if (bootstrap_provider) |bp| bp.deinit();
-
-    // Create tools (for system prompt and tool calling)
-    const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
-        .http_enabled = config.http_request.enabled,
-        .http_allowed_domains = config.http_request.allowed_domains,
-        .http_max_response_size = config.http_request.max_response_size,
-        .http_timeout_secs = config.http_request.timeout_secs,
-        .web_search_base_url = config.http_request.search_base_url,
-        .web_search_provider = config.http_request.search_provider,
-        .web_search_fallback_providers = config.http_request.search_fallback_providers,
-        .browser_enabled = config.browser.enabled,
-        .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
-        .agents = config.agents,
-        .configured_providers = config.providers,
-        .fallback_api_key = resolved_api_key,
-        .tools_config = config.tools,
-        .allowed_paths = config.autonomy.allowed_paths,
-        .policy = &sec_policy,
-        .subagent_manager = &subagent_manager,
-        .bootstrap_provider = bootstrap_provider,
-        .backend_name = config.memory.backend,
-    }) catch &.{};
-    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
-
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
-
-    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
-    if (mem_rt) |*rt| {
-        yc.tools.bindMemoryRuntime(tools, rt);
-    }
-
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
-
-    // Create provider with reliability wrapper (retry + fallback chains).
-    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &config);
-    defer runtime_provider.deinit();
-    const provider_i: yc.providers.Provider = runtime_provider.provider();
-
-    std.debug.print("  Tools: {d} loaded\n", .{tools.len});
-    std.debug.print("  Memory: {s}\n", .{if (mem_opt != null) "enabled" else "disabled"});
-
-    if (yc.channel_loop.loadTelegramUpdateOffset(allocator, &config, tg.account_id, tg.bot_token)) |saved_update_id| {
-        tg.last_update_id = saved_update_id;
-    }
-
-    tg.deleteWebhookKeepPending();
-
-    // Register bot commands in Telegram's "/" menu
-    tg.setMyCommands();
-
+    defer runtime.deinit();
+    std.debug.print("  Tools: {d} loaded\n", .{runtime.tools.len});
+    std.debug.print("  Memory: {s}\n", .{if (runtime.mem_rt != null) "enabled" else "disabled"});
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
-    var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
-    session_mgr.policy = &sec_policy;
-    if (mem_rt) |*rt| {
-        session_mgr.mem_rt = rt;
-    }
-    defer session_mgr.deinit();
-
-    var evict_counter: u32 = 0;
-    var persisted_update_id: i64 = tg.last_update_id;
-
-    // Bot loop: poll → full agent loop (tool calling) → reply
-    while (true) {
-        const messages = tg.pollUpdates(allocator) catch |err| {
-            std.debug.print("Poll error: {}\n", .{err});
-            std.Thread.sleep(5 * std.time.ns_per_s);
-            continue;
-        };
-
-        for (messages) |msg| {
-            std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
-
-            // Handle /start command (Telegram-specific greeting, not sent to LLM)
-            const trimmed_content = std.mem.trim(u8, msg.content, " \t\r\n");
-            if (std.mem.eql(u8, trimmed_content, "/start")) {
-                var greeting_buf: [512]u8 = undefined;
-                const name = msg.first_name orelse msg.id;
-                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullClaw.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullClaw. Type /help for commands.";
-                tg.sendMessageWithReply(msg.sender, greeting, msg.message_id) catch |err| log.err("failed to send /start reply: {}", .{err});
-                continue;
-            }
-
-            // Determine reply-to: always in groups, configurable in private chats
-            const use_reply_to = msg.is_group or telegram_config.reply_in_private;
-            const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
-
-            // Session key — resolve through route engine, fallback to legacy key.
-            var key_buf: [128]u8 = undefined;
-            var routed_session_key: ?[]const u8 = null;
-            defer if (routed_session_key) |key| allocator.free(key);
-            const session_key = blk: {
-                const route = yc.agent_routing.resolveRouteWithSession(
-                    allocator,
-                    .{
-                        .channel = "telegram",
-                        .account_id = tg.account_id,
-                        .peer = .{
-                            .kind = if (msg.is_group) .group else .direct,
-                            .id = msg.sender,
-                        },
-                    },
-                    config.agent_bindings,
-                    config.agents,
-                    config.session,
-                ) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}:{s}", .{ tg.account_id, msg.sender }) catch msg.sender;
-                allocator.free(route.main_session_key);
-                routed_session_key = route.session_key;
-                break :blk route.session_key;
-            };
-
-            // Start periodic typing indicator while the model is processing
-            const typing_target = msg.sender;
-            tg.startTyping(typing_target) catch {};
-            defer tg.stopTyping(typing_target) catch {};
-
-            const reply = session_mgr.processMessage(session_key, msg.content, null) catch |err| {
-                std.debug.print("  Agent error: {}\n", .{err});
-                const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
-                };
-                tg.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                continue;
-            };
-            defer allocator.free(reply);
-
-            std.debug.print("  -> {s}\n", .{reply});
-
-            // Reply on telegram; handles [IMAGE:path] markers + split
-            tg.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
-                std.debug.print("  Send error: {}\n", .{err});
-            };
-        }
-
-        if (messages.len > 0) {
-            // Free message memory
-            for (messages) |msg| {
-                msg.deinit(allocator);
-            }
-            allocator.free(messages);
-        }
-
-        if (tg.persistableUpdateOffset()) |persistable_update_id| {
-            yc.channel_loop.persistTelegramUpdateOffsetIfAdvanced(
-                allocator,
-                &config,
-                tg.account_id,
-                tg.bot_token,
-                &persisted_update_id,
-                persistable_update_id,
-            );
-        }
-
-        // Periodically evict sessions idle longer than the configured timeout
-        evict_counter += 1;
-        if (evict_counter >= 100) {
-            evict_counter = 0;
-            _ = session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
-        }
-    }
+    var loop_state = yc.channel_loop.TelegramLoopState.init();
+    yc.channel_loop.runTelegramLoop(allocator, &config, runtime, &loop_state, &tg);
 }
 
 // ── Auth ─────────────────────────────────────────────────────────
@@ -2385,7 +4541,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 2) {
         printAuthUsage();
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const subcmd = sub_args[0];
@@ -2396,11 +4552,17 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     const codex = yc.providers.openai_codex;
     const auth_mod = yc.auth;
 
+    if (std.mem.eql(u8, provider_name, "weixin")) {
+        runAuthWeixin(allocator, subcmd, rest);
+        return;
+    }
+
     if (!std.mem.eql(u8, provider_name, "openai-codex")) {
         std.debug.print("Unknown auth provider: {s}\n\n", .{provider_name});
         std.debug.print("Available providers:\n", .{});
         std.debug.print("  openai-codex    ChatGPT Plus/Pro subscription (OAuth)\n", .{});
-        std.process.exit(1);
+        std.debug.print("  weixin          WeChat personal account (QR code scan)\n", .{});
+        std_compat.process.exit(1);
     }
 
     if (std.mem.eql(u8, subcmd, "login")) {
@@ -2419,7 +4581,7 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             defer token.deinit(allocator);
             std.debug.print("openai-codex: authenticated\n", .{});
             if (token.expires_at != 0) {
-                const remaining = token.expires_at - std.time.timestamp();
+                const remaining = token.expires_at - std_compat.time.timestamp();
                 if (remaining > 0) {
                     std.debug.print("  Token expires in: {d}h {d}m\n", .{
                         @divTrunc(remaining, 3600),
@@ -2437,6 +4599,10 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             if (account_id) |id| {
                 std.debug.print("  Account: {s}\n", .{id});
             }
+        } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
+            std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
+            std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
+            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in auth.json in your nullclaw config directory.\n", .{});
         } else {
             std.debug.print("openai-codex: not authenticated\n", .{});
             std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
@@ -2450,7 +4616,7 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     } else {
         std.debug.print("Unknown auth command: {s}\n\n", .{subcmd});
         printAuthUsage();
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 }
 
@@ -2468,13 +4634,13 @@ fn runUpdate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         } else {
             std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
             std.debug.print("Usage: nullclaw update [--check] [--yes]\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
     }
 
     yc.update.run(allocator, opts) catch |err| {
         std.debug.print("Update failed: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 }
 
@@ -2483,21 +4649,165 @@ fn printAuthUsage() void {
         \\Usage: nullclaw auth <{s}> <provider> [options]
         \\
         \\Commands:
-        \\  login <provider>                    Authenticate via device code flow
+        \\  login <provider>                    Authenticate with provider
         \\  login <provider> --import-codex     Import from Codex CLI (~/.codex/auth.json)
         \\  status <provider>                   Show authentication status
         \\  logout <provider>                   Remove stored credentials
         \\
         \\Providers:
         \\  openai-codex    ChatGPT Plus/Pro subscription (OAuth)
+        \\  weixin          WeChat personal account (QR code scan)
+        \\
+        \\Weixin options:
+        \\  --base-url <url>    iLink API base URL (default: https://ilinkai.weixin.qq.com/)
+        \\  --proxy <url>       HTTP proxy URL (e.g. http://localhost:7890)
+        \\  --timeout <secs>    Login timeout in seconds (default: 300)
         \\
         \\Examples:
         \\  nullclaw auth login openai-codex
         \\  nullclaw auth login openai-codex --import-codex
+        \\  nullclaw auth login weixin
+        \\  nullclaw auth login weixin --proxy http://localhost:7890
         \\  nullclaw auth status openai-codex
+        \\  nullclaw auth status weixin
         \\  nullclaw auth logout openai-codex
         \\
     , .{AUTH_SUBCOMMANDS}), .{});
+}
+
+fn runAuthWeixin(allocator: std.mem.Allocator, subcmd: []const u8, args: []const []const u8) void {
+    const weixin_mod = yc.channels.weixin;
+    const config_mutator = yc.config_mutator;
+
+    if (std.mem.eql(u8, subcmd, "login")) {
+        var opts = weixin_mod.LoginOptions{};
+
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--base-url") and i + 1 < args.len) {
+                i += 1;
+                opts.base_url = args[i];
+            } else if (std.mem.eql(u8, args[i], "--proxy") and i + 1 < args.len) {
+                i += 1;
+                opts.proxy = args[i];
+            } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+                i += 1;
+                const secs = std.fmt.parseInt(u64, args[i], 10) catch {
+                    std.debug.print("Invalid timeout value: {s}\n", .{args[i]});
+                    std.process.exit(1);
+                };
+                opts.timeout_ns = secs * std.time.ns_per_s;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{args[i]});
+                printAuthUsage();
+                std.process.exit(1);
+            }
+        }
+
+        std.debug.print("Starting Weixin (WeChat personal) login...\n\n", .{});
+
+        var result = weixin_mod.performLogin(allocator, opts) catch |err| {
+            std.debug.print("Weixin login failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer result.deinit(allocator);
+
+        std.debug.print("\nLogin successful!\n", .{});
+        std.debug.print("  Account ID: {s}\n", .{result.account_id});
+        if (result.user_id.len > 0) {
+            std.debug.print("  User ID: {s}\n", .{result.user_id});
+        }
+
+        // Persist token to config
+        const token_json = std.fmt.allocPrint(allocator, "\"{s}\"", .{result.bot_token}) catch {
+            std.debug.print("\nCould not format token for config. Add manually:\n", .{});
+            printManualWeixinConfig(result.bot_token, result.base_url);
+            return;
+        };
+        defer allocator.free(token_json);
+
+        _ = config_mutator.mutateDefaultConfig(
+            allocator,
+            .set,
+            "channels.weixin.token",
+            token_json,
+            .{ .apply = true },
+        ) catch {
+            std.debug.print("\nCould not auto-save config. Add manually:\n", .{});
+            printManualWeixinConfig(result.bot_token, result.base_url);
+            return;
+        };
+
+        // Save base_url if it differs from default
+        if (!std.mem.eql(u8, result.base_url, "https://ilinkai.weixin.qq.com/")) {
+            const base_url_json = std.fmt.allocPrint(allocator, "\"{s}\"", .{result.base_url}) catch return;
+            defer allocator.free(base_url_json);
+            _ = config_mutator.mutateDefaultConfig(
+                allocator,
+                .set,
+                "channels.weixin.base_url",
+                base_url_json,
+                .{ .apply = true },
+            ) catch {};
+        }
+
+        std.debug.print("\nConfig updated. Start the gateway with:\n", .{});
+        std.debug.print("  nullclaw gateway\n\n", .{});
+        std.debug.print("To restrict which WeChat users can send messages, add their user IDs\n", .{});
+        std.debug.print("to channels.weixin.allow_from in your config.\n", .{});
+    } else if (std.mem.eql(u8, subcmd, "status")) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cfg = yc.config.Config.load(arena.allocator()) catch {
+            std.debug.print("weixin: could not load config\n", .{});
+            return;
+        };
+        defer cfg.deinit();
+
+        if (cfg.channels.weixinPrimary()) |weixin_cfg| {
+            if (weixin_cfg.token.len > 0) {
+                std.debug.print("weixin: authenticated\n", .{});
+                std.debug.print("  Token: {s}...{s}\n", .{
+                    weixin_cfg.token[0..@min(8, weixin_cfg.token.len)],
+                    if (weixin_cfg.token.len > 8) weixin_cfg.token[weixin_cfg.token.len - 4 ..] else "",
+                });
+                std.debug.print("  Base URL: {s}\n", .{weixin_cfg.base_url});
+            } else {
+                std.debug.print("weixin: not authenticated (token empty)\n", .{});
+                std.debug.print("  Run `nullclaw auth login weixin` to authenticate.\n", .{});
+            }
+        } else {
+            std.debug.print("weixin: not configured\n", .{});
+            std.debug.print("  Run `nullclaw auth login weixin` to authenticate.\n", .{});
+        }
+    } else if (std.mem.eql(u8, subcmd, "logout")) {
+        _ = config_mutator.mutateDefaultConfig(
+            allocator,
+            .unset,
+            "channels.weixin.token",
+            null,
+            .{ .apply = true },
+        ) catch |err| {
+            std.debug.print("Failed to remove weixin credentials: {s}\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("weixin: credentials removed.\n", .{});
+    } else {
+        std.debug.print("Unknown auth command: {s}\n\n", .{subcmd});
+        printAuthUsage();
+        std.process.exit(1);
+    }
+}
+
+fn printManualWeixinConfig(token: []const u8, base_url: []const u8) void {
+    std.debug.print("\nAdd the following to the channels section of your nullclaw config:\n\n", .{});
+    std.debug.print("  \"weixin\": [{{\n", .{});
+    std.debug.print("    \"token\": \"{s}\",\n", .{token});
+    if (!std.mem.eql(u8, base_url, "https://ilinkai.weixin.qq.com/")) {
+        std.debug.print("    \"base_url\": \"{s}\",\n", .{base_url});
+    }
+    std.debug.print("    \"allow_from\": []\n", .{});
+    std.debug.print("  }}]\n", .{});
 }
 
 fn runAuthDeviceCodeLogin(
@@ -2516,7 +4826,7 @@ fn runAuthDeviceCodeLogin(
         std.debug.print("Failed to start device code flow (likely Cloudflare block).\n", .{});
         std.debug.print("Alternative:\n", .{});
         std.debug.print("  nullclaw auth login openai-codex --import-codex   (import from Codex CLI)\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer dc.deinit(allocator);
 
@@ -2537,7 +4847,7 @@ fn runAuthDeviceCodeLogin(
             error.DeviceCodeTimeout => std.debug.print("Authorization timed out.\n", .{}),
             else => std.debug.print("Authorization failed: {}\n", .{err}),
         }
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer token.deinit(allocator);
 
@@ -2551,32 +4861,32 @@ fn runAuthImportCodex(
 ) void {
     const home = yc.platform.getHomeDir(allocator) catch {
         std.debug.print("HOME not set.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer allocator.free(home);
 
-    const path = std.fs.path.join(allocator, &.{ home, ".codex", "auth.json" }) catch {
+    const path = std_compat.fs.path.join(allocator, &.{ home, ".codex", "auth.json" }) catch {
         std.debug.print("Out of memory.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer allocator.free(path);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch {
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch {
         std.debug.print("Could not open {s}\n", .{path});
         std.debug.print("Install and authenticate with Codex CLI first.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer file.close();
 
     const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch {
         std.debug.print("Failed to read {s}\n", .{path});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer allocator.free(json_bytes);
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch {
         std.debug.print("Failed to parse {s}\n", .{path});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer parsed.deinit();
 
@@ -2584,37 +4894,37 @@ fn runAuthImportCodex(
         .object => |o| o,
         else => {
             std.debug.print("Invalid format in {s}\n", .{path});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
     };
 
     // Extract tokens object
     const tokens_val = root_obj.get("tokens") orelse {
         std.debug.print("No \"tokens\" field in {s}\n", .{path});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     const tokens_obj = switch (tokens_val) {
         .object => |o| o,
         else => {
             std.debug.print("Invalid \"tokens\" field in {s}\n", .{path});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
     };
 
     const access_token_str = switch (tokens_obj.get("access_token") orelse {
         std.debug.print("No access_token in Codex CLI credentials.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }) {
         .string => |s| s,
         else => {
             std.debug.print("Invalid access_token in Codex CLI credentials.\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         },
     };
 
     if (access_token_str.len == 0) {
         std.debug.print("Empty access_token in Codex CLI credentials.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const refresh_token_str: ?[]const u8 = if (tokens_obj.get("refresh_token")) |rt_val| switch (rt_val) {
@@ -2634,7 +4944,7 @@ fn runAuthImportCodex(
 
     auth_mod.saveCredential(allocator, codex.CREDENTIAL_KEY, token) catch {
         std.debug.print("Failed to save credential.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
     const account_id = codex.extractAccountIdFromJwt(allocator, access_token_str) catch null;
@@ -2651,7 +4961,7 @@ fn runAuthImportCodex(
         std.debug.print("  Refresh token: absent\n", .{});
     }
     if (expires_at != 0) {
-        const remaining = expires_at - std.time.timestamp();
+        const remaining = expires_at - std_compat.time.timestamp();
         if (remaining > 0) {
             std.debug.print("  Expires in: {d}h {d}m\n", .{
                 @divTrunc(remaining, 3600),
@@ -2661,7 +4971,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -2704,7 +5014,7 @@ fn saveAndPrintResult(
 ) void {
     auth_mod.saveCredential(allocator, codex.CREDENTIAL_KEY, token) catch {
         std.debug.print("Failed to save credential.\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
     const account_id = codex.extractAccountIdFromJwt(allocator, token.access_token) catch null;
@@ -2715,7 +5025,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 fn printUsage() void {
@@ -2724,6 +5034,7 @@ fn printUsage() void {
 
 test "parse known commands" {
     try std.testing.expectEqual(.agent, parseCommand("agent").?);
+    try std.testing.expectEqual(.config, parseCommand("config").?);
     try std.testing.expectEqual(.status, parseCommand("status").?);
     try std.testing.expectEqual(.version, parseCommand("version").?);
     try std.testing.expectEqual(.version, parseCommand("--version").?);
@@ -2731,6 +5042,7 @@ test "parse known commands" {
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.memory, parseCommand("memory").?);
+    try std.testing.expectEqual(.history, parseCommand("history").?);
     try std.testing.expectEqual(.workspace, parseCommand("workspace").?);
     try std.testing.expectEqual(.capabilities, parseCommand("capabilities").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
@@ -2742,14 +5054,63 @@ test "parse known commands" {
 
 test "top level usage stays aligned with current subcommand synopses" {
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "service <" ++ SERVICE_SUBCOMMANDS ++ ">"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "config <" ++ CONFIG_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "cron <" ++ CRON_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "channel <" ++ CHANNEL_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "skills <" ++ SKILLS_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "hardware <" ++ HARDWARE_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "memory <" ++ MEMORY_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "history <" ++ HISTORY_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "workspace <" ++ WORKSPACE_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "models <" ++ MODELS_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "auth <" ++ AUTH_SUBCOMMANDS ++ "> <provider> [--import-codex]"));
+}
+
+test "allocDefaultModelRef reconstructs provider-prefixed model ref" {
+    const allocator = std.testing.allocator;
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = allocator,
+        .default_provider = "custom:https://gateway.example.com/api",
+        .default_model = "qianfan/custom-model",
+    };
+
+    const value = (try allocDefaultModelRef(allocator, &cfg)).?;
+    defer allocator.free(value);
+
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/api/qianfan/custom-model", value);
+}
+
+test "buildModelsSummaryJson emits sorted provider summaries without key contents" {
+    const allocator = std.testing.allocator;
+    const providers = [_]yc.config.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-test" },
+        .{ .name = "ollama", .api_key = null },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .default_model = "anthropic/claude-sonnet-4.6",
+        .providers = &providers,
+    };
+
+    const json = try buildModelsSummaryJson(allocator, &cfg);
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"default_provider\":\"openrouter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"default_model\":\"openrouter/anthropic/claude-sonnet-4.6\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"ollama\",\"has_key\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"openrouter\",\"has_key\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "sk-test") == null);
 }
 
 test "configureWindowsConsoleUtf8 is safe to call" {
@@ -2763,6 +5124,103 @@ test "parsePositiveUsize accepts only positive integers" {
     try std.testing.expect(parsePositiveUsize("0") == null);
     try std.testing.expect(parsePositiveUsize("-1") == null);
     try std.testing.expect(parsePositiveUsize("bad") == null);
+}
+
+test "appendJsonQuoted escapes quotes and newlines" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+
+    try appendJsonQuoted(&buf, std.testing.allocator, "line \"one\"\nline2");
+    try std.testing.expectEqualStrings("\"line \\\"one\\\"\\nline2\"", buf.items);
+}
+
+test "parseNonNegativeUsize accepts zero and positive integers" {
+    try std.testing.expectEqual(@as(?usize, 0), parseNonNegativeUsize("0"));
+    try std.testing.expectEqual(@as(?usize, 1), parseNonNegativeUsize("1"));
+    try std.testing.expectEqual(@as(?usize, 42), parseNonNegativeUsize("42"));
+    try std.testing.expect(parseNonNegativeUsize("-1") == null);
+    try std.testing.expect(parseNonNegativeUsize("bad") == null);
+}
+
+test "buildHistoryMemoryConfig disables side-effectful runtime features" {
+    var cfg = yc.config.config_types.MemoryConfig{};
+    cfg.search.enabled = true;
+    cfg.qmd.enabled = true;
+    cfg.lifecycle.hygiene_enabled = true;
+    cfg.lifecycle.snapshot_on_hygiene = true;
+    cfg.lifecycle.auto_hydrate = true;
+    cfg.response_cache.enabled = true;
+
+    const history_cfg = buildHistoryMemoryConfig(cfg);
+    try std.testing.expect(!history_cfg.search.enabled);
+    try std.testing.expect(!history_cfg.qmd.enabled);
+    try std.testing.expect(!history_cfg.lifecycle.hygiene_enabled);
+    try std.testing.expect(!history_cfg.lifecycle.snapshot_on_hygiene);
+    try std.testing.expect(!history_cfg.lifecycle.auto_hydrate);
+    try std.testing.expect(!history_cfg.response_cache.enabled);
+}
+
+test "hasJsonFlag detects --json" {
+    const with_json = [_][]const u8{ "--limit", "10", "--json" };
+    try std.testing.expect(hasJsonFlag(&with_json));
+
+    const without_json = [_][]const u8{ "--limit", "10" };
+    try std.testing.expect(!hasJsonFlag(&without_json));
+}
+
+test "agentHelpRequested detects standalone help flag" {
+    const args = [_][]const u8{ "--provider", "openrouter", "--help" };
+    try std.testing.expect(agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores message value that matches help flag" {
+    const args = [_][]const u8{ "--message", "--help" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores session value that matches short help flag" {
+    const args = [_][]const u8{ "--session", "-h" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "gatewayHelpRequested detects standalone help flag" {
+    const args = [_][]const u8{ "--port", "8080", "--help" };
+    try std.testing.expect(gatewayHelpRequested(&args));
+}
+
+test "gatewayHelpRequested ignores host value that matches help flag" {
+    const args = [_][]const u8{ "--host", "--help" };
+    try std.testing.expect(!gatewayHelpRequested(&args));
+}
+
+test "writeJsonString wraps and escapes special characters" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try writeJsonString(&aw.writer, "line \"one\"\nline two\\");
+    const written = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expectEqualStrings("\"line \\\"one\\\"\\nline two\\\\\"", written);
+}
+
+test "skillSource distinguishes workspace and community skills" {
+    const workspace_dir = "/tmp/ws";
+    const community_base = "/tmp/home/.nullclaw/skills";
+
+    const workspace_skill = yc.skills.Skill{
+        .name = "local",
+        .version = "1.0.0",
+        .path = "/tmp/ws/skills/local",
+        .instructions = "",
+    };
+    try std.testing.expectEqualStrings("workspace", skillSource(workspace_dir, community_base, workspace_skill));
+
+    const community_skill = yc.skills.Skill{
+        .name = "shared",
+        .version = "1.0.0",
+        .path = "/tmp/home/.nullclaw/skills/shared",
+        .instructions = "",
+    };
+    try std.testing.expectEqualStrings("community", skillSource(workspace_dir, community_base, community_skill));
 }
 
 test "parseOnboardArgs parses quick setup flags" {
@@ -2894,6 +5352,53 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
 }
 
+test "resolveConfiguredRuntimeChannel matches external plugin name" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .external = &[_]yc.config.ExternalChannelConfig{
+                .{
+                    .account_id = "main",
+                    .runtime_name = "whatsapp_web",
+                    .transport = .{
+                        .command = "nullclaw-plugin-whatsapp-web",
+                    },
+                },
+            },
+        },
+    };
+
+    const resolved = resolveConfiguredRuntimeChannel(&cfg, "whatsapp_web") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("external", resolved.adapter_key);
+    try std.testing.expectEqualStrings("whatsapp_web", resolved.start_name);
+}
+
+test "resolveConfiguredRuntimeChannel matches custom maixcam name" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .maixcam = &[_]yc.config.MaixCamConfig{
+                .{
+                    .account_id = "cam-main",
+                    .name = "vision-lab",
+                },
+            },
+        },
+    };
+
+    const resolved = resolveConfiguredRuntimeChannel(&cfg, "vision-lab") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("maixcam", resolved.adapter_key);
+    try std.testing.expectEqualStrings("vision-lab", resolved.start_name);
+}
+
 test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled channel" {
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
@@ -2977,6 +5482,12 @@ fn runTools(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 }
 
+fn appendJsonQuoted(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    const quoted = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(quoted);
+    try buf.appendSlice(allocator, quoted);
+}
+
 fn showBuiltinTools() !void {
     const tools = yc.tools.builtin_tool_meta;
 
@@ -3007,8 +5518,13 @@ fn toolsShow(allocator: std.mem.Allocator, show_builtin: bool) !void {
 
     if (cfg.tools.tool_customizations.len == 0) {
         std.debug.print("No tool customizations configured.\n", .{});
+        if (cfg.tools.tool_customizations_file) |file_path| {
+            std.debug.print("\nExternal file configured:\n  {s}\n", .{file_path});
+            std.debug.print("\nPreview it with:\n  nullclaw tools import-preview {s}\n", .{file_path});
+            return;
+        }
         std.debug.print("\nTo add customizations, edit your config file:\n  {s}\n", .{cfg.config_path});
-        std.debug.print("\nOr import from a JSON file:\n  nullclaw tools import tool_customizations.json\n", .{});
+        std.debug.print("\nOr preview a JSON file before importing:\n  nullclaw tools import-preview tool_customizations.json\n", .{});
         std.debug.print("\nTo see all built-in tools, run:\n  nullclaw tools show --builtin\n", .{});
         return;
     }
@@ -3039,27 +5555,26 @@ fn toolsShow(allocator: std.mem.Allocator, show_builtin: bool) !void {
 fn exportBuiltinTools(allocator: std.mem.Allocator, file_path: []const u8) !void {
     const tools = yc.tools.builtin_tool_meta;
 
-    var out_buffer = std.ArrayList(u8).initCapacity(allocator, 32768) catch |err| {
+    var out_buffer: std.ArrayList(u8) = .empty;
+    out_buffer.ensureTotalCapacity(allocator, 32768) catch |err| {
         std.debug.print("Export failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer out_buffer.deinit(allocator);
-
-    try out_buffer.writer(allocator).print("{{\n", .{});
+    try out_buffer.appendSlice(allocator, "{\n");
 
     for (tools, 0..) |tool, idx| {
-        const is_last = idx == tools.len - 1;
-        const comma = if (is_last) "" else ",";
-        try out_buffer.writer(allocator).print("  \"{s}\": {{\n", .{tool.name});
-        try out_buffer.writer(allocator).print("    \"system_prompt\": \"{s}\",\n", .{tool.description});
-        try out_buffer.writer(allocator).print("    \"triggers\": [],\n", .{});
-        try out_buffer.writer(allocator).print("    \"priority\": 0,\n", .{});
-        try out_buffer.writer(allocator).print("    \"enabled\": true\n  }}{s}\n", .{comma});
+        if (idx > 0) try out_buffer.appendSlice(allocator, ",\n");
+        try out_buffer.appendSlice(allocator, "  ");
+        try appendJsonQuoted(&out_buffer, allocator, tool.name);
+        try out_buffer.appendSlice(allocator, ": {\n    \"system_prompt\": ");
+        try appendJsonQuoted(&out_buffer, allocator, tool.description);
+        try out_buffer.appendSlice(allocator, ",\n    \"triggers\": [],\n    \"priority\": 0,\n    \"enabled\": true\n  }");
     }
 
-    try out_buffer.writer(allocator).print("}}\n", .{});
+    try out_buffer.appendSlice(allocator, "\n}\n");
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
+    const file = try std_compat.fs.cwd().createFile(file_path, .{});
     defer file.close();
     try file.writeAll(out_buffer.items);
 
@@ -3088,43 +5603,69 @@ fn toolsExport(allocator: std.mem.Allocator, file_path: []const u8, export_built
         return;
     }
 
-    var out_buffer = std.ArrayList(u8).initCapacity(allocator, 2048) catch |err| {
+    var out_buffer: std.ArrayList(u8) = .empty;
+    out_buffer.ensureTotalCapacity(allocator, 2048) catch |err| {
         std.debug.print("Export failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer out_buffer.deinit(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out_buffer);
+    const w = &out_writer.writer;
 
-    try out_buffer.writer(allocator).print("{{", .{});
+    try out_buffer.appendSlice(allocator, "{");
 
     var first_tool = true;
     for (cfg.tools.tool_customizations) |custom| {
         if (!first_tool) {
-            try out_buffer.writer(allocator).print(",", .{});
+            try out_buffer.appendSlice(allocator, ",");
         }
         first_tool = false;
 
-        try out_buffer.writer(allocator).print("\"{s}\":{{", .{custom.name});
+        try appendJsonQuoted(&out_buffer, allocator, custom.name);
+        try out_buffer.appendSlice(allocator, ":{");
 
+        var first_field = true;
         if (custom.system_prompt) |sp| {
-            try out_buffer.writer(allocator).print("\"system_prompt\":\"{s}\",", .{sp});
+            if (!first_field) try out_buffer.appendSlice(allocator, ",");
+            first_field = false;
+            try out_buffer.appendSlice(allocator, "\"system_prompt\":");
+            try appendJsonQuoted(&out_buffer, allocator, sp);
         }
 
         if (custom.triggers.len > 0) {
-            try out_buffer.writer(allocator).print("\"triggers\":[", .{});
+            if (!first_field) try out_buffer.appendSlice(allocator, ",");
+            first_field = false;
+            try out_buffer.appendSlice(allocator, "\"triggers\":[");
             for (custom.triggers, 0..) |trigger, idx| {
-                if (idx > 0) try out_buffer.writer(allocator).print(",", .{});
-                try out_buffer.writer(allocator).print("\"{s}\"", .{trigger});
+                if (idx > 0) try out_buffer.appendSlice(allocator, ",");
+                try appendJsonQuoted(&out_buffer, allocator, trigger);
             }
-            try out_buffer.writer(allocator).print("],", .{});
+            try out_buffer.appendSlice(allocator, "]");
         }
 
-        try out_buffer.writer(allocator).print("\"priority\":{d},", .{custom.priority});
-        try out_buffer.writer(allocator).print("\"enabled\":{}}}", .{custom.enabled});
+        if (!first_field) try out_buffer.appendSlice(allocator, ",");
+        first_field = false;
+        try w.print("\"priority\":{d}", .{custom.priority});
+
+        try out_buffer.appendSlice(allocator, ",");
+        try w.print("\"enabled\":{}", .{custom.enabled});
+
+        if (custom.skip_llm_tpl) |tpl| {
+            try out_buffer.appendSlice(allocator, ",\"skip_llm_tpl\":");
+            try appendJsonQuoted(&out_buffer, allocator, tpl);
+        }
+
+        if (custom.trigger_arguments) |args_json| {
+            try out_buffer.appendSlice(allocator, ",\"trigger_arguments\":");
+            try out_buffer.appendSlice(allocator, args_json);
+        }
+
+        try out_buffer.appendSlice(allocator, "}");
     }
 
-    try out_buffer.writer(allocator).print("}}", .{});
+    try out_buffer.appendSlice(allocator, "}");
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
+    const file = try std_compat.fs.cwd().createFile(file_path, .{});
     defer file.close();
     try file.writeAll(out_buffer.items);
 
@@ -3145,10 +5686,10 @@ fn toolsImportPreview(allocator: std.mem.Allocator, file_path: []const u8) !void
     const full_path = if (std.fs.path.isAbsolute(file_path))
         try allocator.dupe(u8, file_path)
     else
-        try std.fs.cwd().realpathAlloc(allocator, file_path);
+        try std_compat.fs.cwd().realpathAlloc(allocator, file_path);
     defer allocator.free(full_path);
 
-    const file = std.fs.openFileAbsolute(full_path, .{}) catch |err| {
+    const file = std_compat.fs.openFileAbsolute(full_path, .{}) catch |err| {
         std.debug.print("Failed to open file '{s}': {s}\n", .{ file_path, @errorName(err) });
         std.process.exit(1);
     };
@@ -3326,10 +5867,10 @@ fn toolsValidate(allocator: std.mem.Allocator, file_path: []const u8) !void {
     const full_path = if (std.fs.path.isAbsolute(file_path))
         try allocator.dupe(u8, file_path)
     else
-        try std.fs.cwd().realpathAlloc(allocator, file_path);
+        try std_compat.fs.cwd().realpathAlloc(allocator, file_path);
     defer allocator.free(full_path);
 
-    const file = std.fs.openFileAbsolute(full_path, .{}) catch |err| {
+    const file = std_compat.fs.openFileAbsolute(full_path, .{}) catch |err| {
         std.debug.print("Failed to open file '{s}': {s}\n", .{ file_path, @errorName(err) });
         std.process.exit(1);
     };
@@ -3419,4 +5960,610 @@ fn toolsValidate(allocator: std.mem.Allocator, file_path: []const u8) !void {
     } else {
         std.debug.print("\nValidation passed. All tool customizations are valid.\n", .{});
     }
+}
+
+test "hasStartupProviderCredentials accepts configured primary key" {
+    const providers_cfg = [_]yc.config.ProviderEntry{
+        .{ .name = "anthropic", .api_key = "sk-test" },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+        .providers = &providers_cfg,
+    };
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials accepts local compatible provider without api key" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "custom:http://127.0.0.1:8080/v1",
+        .default_model = "custom/local-model",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials accepts gemini oauth env token" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
+    defer std.testing.allocator.free(env_name);
+    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
+    defer std.testing.allocator.free(env_value);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
+    defer _ = c.unsetenv(env_name.ptr);
+
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "gemini",
+        .default_model = "gemini/gemini-2.5-pro",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials accepts reliability fallback credentials" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.api_keys = &.{"rotating-key"};
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials rejects blank configured key" {
+    // Regression: blank API keys must not bypass channel startup credential checks.
+    const providers_cfg = [_]yc.config.ProviderEntry{
+        .{ .name = "anthropic", .api_key = "   " },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+        .providers = &providers_cfg,
+    };
+
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials rejects missing provider and fallback credentials" {
+    // Regression: channel startup must still fail fast when neither the primary provider nor fallbacks can authenticate.
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "parseCronAddAgentOptions preserves delivery account flag" {
+    // Regression: cron add-agent ignored --account and dropped delivery account routing.
+    const args = [_][]const u8{
+        "add-agent",
+        "0 7 * * 1,2,4",
+        "Check traffic",
+        "--model",
+        "glm-cn/glm-5-turbo",
+        "--session-target",
+        "main",
+        "--announce",
+        "--channel",
+        "telegram",
+        "--account",
+        "main",
+        "--to",
+        "7972814626",
+    };
+
+    const options = try parseCronAddAgentOptions(&args);
+    try std.testing.expectEqualStrings("glm-cn/glm-5-turbo", options.model.?);
+    try std.testing.expectEqual(yc.cron.SessionTarget.main, options.session_target);
+    try std.testing.expectEqual(yc.cron.DeliveryMode.always, options.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", options.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", options.delivery.account_id.?);
+    try std.testing.expectEqualStrings("7972814626", options.delivery.to.?);
+    try std.testing.expect(!options.delivery.channel_owned);
+    try std.testing.expect(!options.delivery.account_id_owned);
+    try std.testing.expect(!options.delivery.to_owned);
+}
+
+test "appendAgentInvokeResponseJson renders machine-readable turn payload" {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendAgentInvokeResponseJson(&writer, "api:default", "hello", 3);
+    try std.testing.expectEqualStrings(
+        "{\"session\":\"api:default\",\"response\":\"hello\",\"turn_count\":3}",
+        writer.buffered(),
+    );
+}
+
+test "appendAgentSessionListJson renders persisted session metadata" {
+    const sessions = [_]yc.memory.SessionInfo{
+        .{
+            .session_id = "s-1",
+            .message_count = 4,
+            .first_message_at = "2026-04-17T00:00:00Z",
+            .last_message_at = "2026-04-17T00:05:00Z",
+        },
+        .{
+            .session_id = "s-2",
+            .message_count = 2,
+            .first_message_at = "2026-04-17T00:10:00Z",
+            .last_message_at = "2026-04-17T00:11:00Z",
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendAgentSessionListJson(&writer, &sessions, 2);
+    try std.testing.expectEqualStrings(
+        "{\"sessions\":[{\"session_key\":\"s-1\",\"created_at\":\"2026-04-17T00:00:00Z\",\"last_active\":\"2026-04-17T00:05:00Z\",\"turn_count\":2,\"turn_running\":false},{\"session_key\":\"s-2\",\"created_at\":\"2026-04-17T00:10:00Z\",\"last_active\":\"2026-04-17T00:11:00Z\",\"turn_count\":1,\"turn_running\":false}],\"total\":2}",
+        writer.buffered(),
+    );
+}
+
+test "appendAgentSessionDetailJson renders one persisted session" {
+    const session: yc.memory.SessionInfo = .{
+        .session_id = "s-1",
+        .message_count = 6,
+        .first_message_at = "2026-04-17T00:00:00Z",
+        .last_message_at = "2026-04-17T00:12:00Z",
+    };
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendAgentSessionDetailJson(&writer, session);
+    try std.testing.expectEqualStrings(
+        "{\"session_key\":\"s-1\",\"created_at\":\"2026-04-17T00:00:00Z\",\"last_active\":\"2026-04-17T00:12:00Z\",\"turn_count\":3,\"turn_running\":false}",
+        writer.buffered(),
+    );
+}
+
+test "appendHistoryListJson renders paginated session history metadata" {
+    const sessions = [_]yc.memory.SessionInfo{
+        .{
+            .session_id = "s-1",
+            .message_count = 3,
+            .first_message_at = "2026-04-17T00:00:00Z",
+            .last_message_at = "2026-04-17T00:03:00Z",
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendHistoryListJson(&writer, &sessions, 9, 50, 0);
+    try std.testing.expectEqualStrings(
+        "{\"total\":9,\"limit\":50,\"offset\":0,\"sessions\":[{\"session_id\":\"s-1\",\"message_count\":3,\"first_message_at\":\"2026-04-17T00:00:00Z\",\"last_message_at\":\"2026-04-17T00:03:00Z\"}]}",
+        writer.buffered(),
+    );
+}
+
+test "appendHistoryShowJson renders paginated message history" {
+    const messages = [_]yc.memory.DetailedMessageEntry{
+        .{
+            .role = "user",
+            .content = "hi",
+            .created_at = "2026-04-17T00:00:00Z",
+        },
+        .{
+            .role = "assistant",
+            .content = "hello",
+            .created_at = "2026-04-17T00:00:01Z",
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendHistoryShowJson(&writer, "s-1", &messages, 2, 100, 0);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"s-1\",\"total\":2,\"limit\":100,\"offset\":0,\"messages\":[{\"role\":\"user\",\"content\":\"hi\",\"created_at\":\"2026-04-17T00:00:00Z\"},{\"role\":\"assistant\",\"content\":\"hello\",\"created_at\":\"2026-04-17T00:00:01Z\"}]}",
+        writer.buffered(),
+    );
+}
+
+test "admin output renders large history payloads without truncation" {
+    const allocator = std.testing.allocator;
+    const large_content = try allocator.alloc(u8, 80_000);
+    defer allocator.free(large_content);
+    @memset(large_content, 'x');
+
+    const messages = [_]yc.memory.DetailedMessageEntry{
+        .{
+            .role = "assistant",
+            .content = large_content,
+            .created_at = "2026-04-17T00:00:01Z",
+        },
+    };
+
+    const rendered = try yc.admin_output.renderBytes(allocator, appendHistoryShowJson, .{
+        "s-large",
+        &messages,
+        @as(u64, 1),
+        @as(usize, 100),
+        @as(usize, 0),
+    });
+    defer allocator.free(rendered);
+
+    try std.testing.expect(rendered.len > 80_000);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"session_id\":\"s-large\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"role\":\"assistant\"") != null);
+}
+
+test "appendConfigMutationJson renders persisted config mutation result" {
+    const result: yc.config_mutator.MutationResult = .{
+        .path = "gateway.port",
+        .changed = true,
+        .applied = true,
+        .requires_restart = false,
+        .old_value_json = "3000",
+        .new_value_json = "43123",
+        .backup_path = "/tmp/config.json.bak",
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendConfigMutationJson(&writer, .set, &result);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"set\",\"path\":\"gateway.port\",\"changed\":true,\"applied\":true,\"requires_restart\":false,\"old_value\":3000,\"new_value\":43123,\"backup_path\":\"/tmp/config.json.bak\"}",
+        writer.buffered(),
+    );
+}
+
+test "appendConfigValueResult renders dotted path lookup payload" {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendConfigValueResult(&writer, "gateway.port", "43123");
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"gateway.port\",\"value\":43123}",
+        writer.buffered(),
+    );
+}
+
+test "appendConfigReloadJson renders reload acknowledgment payload" {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendConfigReloadJson(&writer);
+    try std.testing.expectEqualStrings(
+        "{\"reloaded\":true,\"live_applied\":false,\"message\":\"config.json re-read from disk; restart running daemons to apply changes\"}",
+        writer.buffered(),
+    );
+}
+
+test "appendValidationJson renders validation result payload" {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendValidationJson(&writer, true);
+    try std.testing.expectEqualStrings("{\"valid\":true}", writer.buffered());
+}
+
+test "appendModelInfoJson canonicalizes provider-prefixed models" {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendModelInfoJson(&writer, "openai/gpt-5");
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"openai/gpt-5\",\"provider\":\"openai\",\"canonical_name\":\"openai/gpt-5\",\"context_window\":null}",
+        writer.buffered(),
+    );
+}
+
+test "appendCronJobJson renders full cron job detail payload" {
+    const job: yc.cron.CronJob = .{
+        .id = "job-1",
+        .expression = "*/5 * * * *",
+        .command = "echo hello",
+        .next_run_secs = 123,
+        .last_run_secs = 100,
+        .last_status = "ok",
+        .paused = false,
+        .one_shot = false,
+        .job_type = .agent,
+        .session_target = .main,
+        .prompt = "Check status",
+        .name = "health-check",
+        .model = "openai/gpt-5",
+        .enabled = true,
+        .delete_after_run = false,
+        .created_at_s = 42,
+        .last_output = "done",
+    };
+    var buf: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendCronJobJson(&writer, &job);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"job_type\":\"agent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"session_target\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"model\":\"openai/gpt-5\"") != null);
+}
+
+test "appendCronRunsJson renders paginated cron run history" {
+    const runs = [_]yc.cron.CronRun{
+        .{
+            .id = 1,
+            .job_id = "job-1",
+            .started_at_s = 100,
+            .finished_at_s = 101,
+            .status = "ok",
+            .output = "done",
+            .duration_ms = 321,
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendCronRunsJson(&writer, &runs);
+    try std.testing.expectEqualStrings(
+        "{\"runs\":[{\"id\":1,\"job_id\":\"job-1\",\"started_at_s\":100,\"finished_at_s\":101,\"status\":\"ok\",\"output\":\"done\",\"duration_ms\":321}],\"total\":1}",
+        writer.buffered(),
+    );
+}
+
+test "writeSkillJson renders public skill detail without leaking extra fields" {
+    const skill: yc.skills.Skill = .{
+        .name = "checks",
+        .version = "1.0.0",
+        .description = "Checks",
+        .author = "nullclaw",
+        .instructions = "Use checks",
+        .always = true,
+        .available = true,
+        .path = "/tmp/workspace/skills/checks",
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try writeSkillJson(&writer, "/tmp/workspace", null, skill);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"name\":\"checks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"source\":\"workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"instructions_bytes\":10") != null);
+}
+
+test "writeMemoryEntryJson renders nullable session ids" {
+    const entry = yc.memory.MemoryEntry{
+        .id = "entry-1",
+        .key = "fact",
+        .category = .conversation,
+        .timestamp = "2026-04-17T00:00:00Z",
+        .content = "hello",
+        .session_id = null,
+    };
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try writeMemoryEntryJson(&writer, entry);
+    try std.testing.expectEqualStrings(
+        "{\"key\":\"fact\",\"category\":\"conversation\",\"timestamp\":\"2026-04-17T00:00:00Z\",\"content\":\"hello\",\"session_id\":null}",
+        writer.buffered(),
+    );
+}
+
+test "loadMemoryListPage skips internal entries before applying visible offset" {
+    const TestMemory = struct {
+        fn makeEntry(allocator: std.mem.Allocator, key: []const u8, content: []const u8) !yc.memory.MemoryEntry {
+            return .{
+                .id = try allocator.dupe(u8, key),
+                .key = try allocator.dupe(u8, key),
+                .category = .core,
+                .timestamp = try allocator.dupe(u8, "2026-04-17T00:00:00Z"),
+                .content = try allocator.dupe(u8, content),
+                .session_id = null,
+            };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "paged";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: yc.memory.MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]yc.memory.MemoryEntry {
+            return allocator.alloc(yc.memory.MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?yc.memory.MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?yc.memory.MemoryCategory, _: ?[]const u8) anyerror![]yc.memory.MemoryEntry {
+            return allocator.alloc(yc.memory.MemoryEntry, 0);
+        }
+
+        fn implListPaged(_: *anyopaque, allocator: std.mem.Allocator, _: ?yc.memory.MemoryCategory, _: ?[]const u8, limit: usize, offset: usize) anyerror![]yc.memory.MemoryEntry {
+            const all = [_][2][]const u8{
+                .{ "__bootstrap.prompt.AGENTS.md", "bootstrap" },
+                .{ "visible-1", "first visible" },
+                .{ "visible-2", "second visible" },
+            };
+            if (offset >= all.len) return allocator.alloc(yc.memory.MemoryEntry, 0);
+            const end = @min(all.len, offset + limit);
+            var entries = try allocator.alloc(yc.memory.MemoryEntry, end - offset);
+            for (all[offset..end], 0..) |pair, idx| {
+                entries[idx] = try makeEntry(allocator, pair[0], pair[1]);
+            }
+            return entries;
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 3;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = yc.memory.Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .listPaged = &implListPaged,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    const mem = yc.memory.Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    const page = try loadMemoryListPage(std.testing.allocator, mem, null, null, 1, 1, false);
+    defer yc.memory.freeEntries(std.testing.allocator, page);
+
+    try std.testing.expectEqual(@as(usize, 1), page.len);
+    try std.testing.expectEqualStrings("visible-2", page[0].key);
+}
+
+test "appendMemoryStatsJson renders runtime memory stats payload" {
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendMemoryStatsJson(&writer, .{
+        .backend = "sqlite",
+        .retrieval = "hybrid",
+        .vector = "sqlite",
+        .embedding = "disabled",
+        .rollout = "primary",
+        .sync = "inline",
+        .sources = 1,
+        .fallback = "none",
+        .entries = 5,
+        .vector_entries = 2,
+        .outbox_pending = 0,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"backend\":\"sqlite\",\"retrieval\":\"hybrid\",\"vector\":\"sqlite\",\"embedding\":\"disabled\",\"rollout\":\"primary\",\"sync\":\"inline\",\"sources\":1,\"fallback\":\"none\",\"entries\":5,\"vector_entries\":2,\"outbox_pending\":0}",
+        writer.buffered(),
+    );
+}
+
+test "appendMemoryMaintenanceJson renders reindex and drain payloads" {
+    var reindex_buf: [128]u8 = undefined;
+    var reindex_writer: std.Io.Writer = .fixed(&reindex_buf);
+    try appendMemoryMaintenanceJson(&reindex_writer, "reindexed", 3, true);
+    try std.testing.expectEqualStrings("{\"reindexed\":3,\"skipped\":true}", reindex_writer.buffered());
+
+    var drain_buf: [128]u8 = undefined;
+    var drain_writer: std.Io.Writer = .fixed(&drain_buf);
+    try appendMemoryMaintenanceJson(&drain_writer, "drained", 7, null);
+    try std.testing.expectEqualStrings("{\"drained\":7}", drain_writer.buffered());
+}
+
+test "appendMemoryMutationJson renders store and update payloads" {
+    const entry = yc.memory.MemoryEntry{
+        .id = "entry-1",
+        .key = "fact",
+        .category = .conversation,
+        .timestamp = "2026-04-17T00:00:00Z",
+        .content = "hello",
+        .session_id = "s-1",
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendMemoryMutationJson(&writer, "store", entry);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"store\",\"entry\":{\"key\":\"fact\",\"category\":\"conversation\",\"timestamp\":\"2026-04-17T00:00:00Z\",\"content\":\"hello\",\"session_id\":\"s-1\"}}",
+        writer.buffered(),
+    );
+}
+
+test "admin output renders large memory entries without truncation" {
+    const allocator = std.testing.allocator;
+    const large_content = try allocator.alloc(u8, 90_000);
+    defer allocator.free(large_content);
+    @memset(large_content, 'm');
+
+    const entry = yc.memory.MemoryEntry{
+        .id = "entry-large",
+        .key = "fact",
+        .category = .conversation,
+        .timestamp = "2026-04-17T00:00:00Z",
+        .content = large_content,
+        .session_id = "s-large",
+    };
+
+    const rendered = try yc.admin_output.renderBytes(allocator, writeMemoryEntryJson, .{entry});
+    defer allocator.free(rendered);
+
+    try std.testing.expect(rendered.len > 90_000);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"key\":\"fact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"session_id\":\"s-large\"") != null);
+}
+
+test "appendMemoryDeleteJson renders delete outcome payload" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendMemoryDeleteJson(&writer, "fact", "s-1", true);
+    try std.testing.expectEqualStrings(
+        "{\"key\":\"fact\",\"session_id\":\"s-1\",\"deleted\":true}",
+        writer.buffered(),
+    );
+}
+
+test "appendMemorySearchResultsJson renders retrieval candidates" {
+    const results = [_]yc.memory.RetrievalCandidate{
+        .{
+            .id = "row-1",
+            .key = "fact",
+            .content = "hello world",
+            .snippet = "hello",
+            .category = .conversation,
+            .keyword_rank = 1,
+            .vector_score = null,
+            .final_score = 0.9,
+            .source = "primary",
+            .source_path = "memory://fact",
+            .start_line = 1,
+            .end_line = 1,
+            .created_at = 42,
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendMemorySearchResultsJson(&writer, &results);
+    try std.testing.expectEqualStrings(
+        "[{\"key\":\"fact\",\"category\":\"conversation\",\"snippet\":\"hello\",\"source\":\"primary\",\"source_path\":\"memory://fact\",\"final_score\":0.9,\"start_line\":1,\"end_line\":1,\"created_at\":42,\"keyword_rank\":1,\"vector_score\":null}]",
+        writer.buffered(),
+    );
+}
+
+test "appendAgentSessionTerminationJson renders terminated session payload" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try appendAgentSessionTerminationJson(&writer, "s-1");
+    try std.testing.expectEqualStrings("{\"session_key\":\"s-1\",\"terminated\":true}", writer.buffered());
 }

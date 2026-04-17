@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("fs_compat.zig");
 
 /// Token usage information from a single API call.
 pub const TokenUsage = struct {
@@ -26,7 +28,7 @@ pub const TokenUsage = struct {
             .output_tokens = output_tokens,
             .total_tokens = total,
             .cost_usd = input_cost + output_cost,
-            .timestamp_secs = std.time.timestamp(),
+            .timestamp_secs = std_compat.time.timestamp(),
         };
     }
 
@@ -91,7 +93,7 @@ pub const CostTracker = struct {
 
     pub fn init(allocator: std.mem.Allocator, workspace_dir: []const u8, enabled: bool, daily_limit: f64, monthly_limit: f64, warn_pct: u32) CostTracker {
         // Build storage path: workspace_dir/state/costs.jsonl
-        const path = std.fs.path.join(allocator, &.{ workspace_dir, "state", "costs.jsonl" }) catch "";
+        const path = std_compat.fs.path.join(allocator, &.{ workspace_dir, "state", "costs.jsonl" }) catch "";
         return .{
             .enabled = enabled,
             .daily_limit_usd = daily_limit,
@@ -170,15 +172,9 @@ pub const CostTracker = struct {
         if (self.storage_path.len == 0) return;
 
         // Ensure parent directory exists
-        if (std.fs.path.dirnamePosix(self.storage_path) orelse std.fs.path.dirnameWindows(self.storage_path)) |dir| {
-            std.fs.cwd().makePath(dir) catch {};
+        if (std_compat.fs.path.dirnamePosix(self.storage_path) orelse std_compat.fs.path.dirnameWindows(self.storage_path)) |dir| {
+            fs_compat.makePath(dir) catch {};
         }
-
-        const file = std.fs.cwd().createFile(self.storage_path, .{ .truncate = false }) catch return;
-        defer file.close();
-
-        // Seek to end for append
-        file.seekFromEnd(0) catch {};
 
         // Write JSON line
         var buf: std.ArrayList(u8) = .empty;
@@ -204,7 +200,7 @@ pub const CostTracker = struct {
         try buf.appendSlice(self.allocator, record.session_id);
         try buf.appendSlice(self.allocator, "\"}\n");
 
-        file.writeAll(buf.items) catch {};
+        fs_compat.appendBytes(self.storage_path, buf.items) catch {};
     }
 
     /// Get total session cost.
@@ -247,7 +243,7 @@ pub const CostTracker = struct {
     fn sumCostsForPeriod(self: *const CostTracker, target_secs: i64, period: Period) f64 {
         if (self.storage_path.len == 0) return self.sessionCost();
 
-        const file = std.fs.cwd().openFile(self.storage_path, .{}) catch return self.sessionCost();
+        const file = fs_compat.openPath(self.storage_path, .{}) catch return self.sessionCost();
         defer file.close();
 
         const target_day = @divFloor(target_secs, 86400);
@@ -305,7 +301,7 @@ pub const CostTracker = struct {
 
     /// Get cost summary including daily/monthly from JSONL.
     pub fn getSummary(self: *const CostTracker) CostSummary {
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         return .{
             .session_cost_usd = self.sessionCost(),
             .daily_cost_usd = self.getDailyCost(now),
@@ -414,4 +410,24 @@ test "CostTracker summary" {
     try std.testing.expectEqual(@as(usize, 2), summary.request_count);
     try std.testing.expect(summary.session_cost_usd > 0.0);
     try std.testing.expect(summary.total_tokens > 0);
+}
+
+test "CostTracker persists JSONL to absolute workspace path" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var tracker = CostTracker.init(std.testing.allocator, workspace, true, 10.0, 100.0, 80);
+    defer tracker.deinit();
+
+    try tracker.recordUsage(TokenUsage.init("test/model", 123, 45, 1.0, 2.0));
+
+    const file = try std_compat.fs.openFileAbsolute(tracker.storage_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"model\":\"test/model\"") != null);
 }

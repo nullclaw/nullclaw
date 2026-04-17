@@ -315,7 +315,7 @@ test "parseSummaryResponse extracts key facts" {
         \\The user discussed Zig programming.
         \\Key fact: Zig is a systems programming language
         \\Some other line.
-        \\- Key fact: The project uses Zig 0.15
+        \\- Key fact: The project uses Zig 0.16
     ;
     var result = try parseSummaryResponse(std.testing.allocator, response, .{ .auto_extract_semantic = true });
     defer result.deinit(std.testing.allocator);
@@ -323,7 +323,7 @@ test "parseSummaryResponse extracts key facts" {
     try std.testing.expectEqual(@as(usize, 2), result.extracted_facts.len);
     try std.testing.expectEqualStrings("Zig is a systems programming language", result.extracted_facts[0].content);
     try std.testing.expect(result.extracted_facts[0].category.eql(.core));
-    try std.testing.expectEqualStrings("The project uses Zig 0.15", result.extracted_facts[1].content);
+    try std.testing.expectEqualStrings("The project uses Zig 0.16", result.extracted_facts[1].content);
     try std.testing.expect(result.extracted_facts[1].category.eql(.core));
 }
 

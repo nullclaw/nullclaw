@@ -451,8 +451,8 @@ test "readBrainDb with corrupt file returns no memories table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "corrupt.db", .data = "not a sqlite database" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "corrupt.db");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{ .sub_path = "corrupt.db", .data = "not a sqlite database" });
+    const path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "corrupt.db");
     defer std.testing.allocator.free(path);
     const pathZ = try std.testing.allocator.dupeZ(u8, path);
     defer std.testing.allocator.free(pathZ);
@@ -469,9 +469,9 @@ test "readBrainDb with empty table returns empty slice" {
     defer tmp.cleanup();
 
     // Create an actual SQLite file on disk with empty table
-    const file = try tmp.dir.createFile("empty.db", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("empty.db", .{});
     file.close();
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "empty.db");
+    const path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "empty.db");
     defer std.testing.allocator.free(path);
 
     // Open it properly and create the table
@@ -499,9 +499,9 @@ test "readBrainDb skips rows with empty content" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("skip_empty.db", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skip_empty.db", .{});
     file.close();
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "skip_empty.db");
+    const path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "skip_empty.db");
     defer std.testing.allocator.free(path);
     const pathZ = try std.testing.allocator.dupeZ(u8, path);
     defer std.testing.allocator.free(pathZ);
@@ -529,9 +529,9 @@ test "readBrainDb full roundtrip with file-based db" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("roundtrip.db", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("roundtrip.db", .{});
     file.close();
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "roundtrip.db");
+    const path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "roundtrip.db");
     defer std.testing.allocator.free(path);
     const pathZ = try std.testing.allocator.dupeZ(u8, path);
     defer std.testing.allocator.free(pathZ);

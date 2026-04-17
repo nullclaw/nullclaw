@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -25,7 +26,7 @@ pub const NostrChannel = struct {
     /// Null before vtableStart is called.
     signing_sec: ?[]u8,
     /// nak req --stream subprocess for listening to relay events.
-    listener: ?std.process.Child,
+    listener: ?std_compat.process.Child,
     /// Event bus for publishing inbound messages to the agent.
     event_bus: ?*bus.Bus,
     /// Reader thread that processes incoming events from the listener subprocess.
@@ -36,7 +37,7 @@ pub const NostrChannel = struct {
     /// Accessed from both reader thread (writes) and outbound dispatcher (reads),
     /// so guard all map access with sender_protocols_mu.
     sender_protocols: std.StringHashMapUnmanaged(DmProtocol),
-    sender_protocols_mu: std.Thread.Mutex,
+    sender_protocols_mu: std_compat.sync.Mutex,
     /// Recently-seen inner rumor IDs (kind:14 event id → arrival unix timestamp).
     /// Suppresses duplicate deliveries when the same rumor arrives via multiple relays.
     seen_rumor_ids: std.StringHashMapUnmanaged(i64),
@@ -326,7 +327,7 @@ pub const NostrChannel = struct {
         const args = filterArgs(N, bounded, &argv_buf);
         if (args.len == 0) return error.NakCommandFailed;
 
-        var child = std.process.Child.init(args, self.allocator);
+        var child = std_compat.process.Child.init(args, self.allocator);
         child.stdin_behavior = if (stdin_data != null) .Pipe else .Inherit;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit; // avoid deadlock from unread pipe buffer
@@ -356,7 +357,7 @@ pub const NostrChannel = struct {
 
         const term = child.wait() catch return error.NakCommandFailed;
         switch (term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code != 0) {
                     output.deinit(self.allocator);
                     return error.NakCommandFailed;
@@ -556,7 +557,7 @@ pub const NostrChannel = struct {
     /// Owner is always allowed regardless of the allowlist.
     pub fn isDmAllowed(self: *const NostrChannel, sender_pubkey: []const u8) bool {
         if (std.mem.eql(u8, sender_pubkey, self.config.owner_pubkey)) return true;
-        return root.isAllowedExact(self.config.dm_allowed_pubkeys, sender_pubkey);
+        return root.isAllowedExactScoped("nostr channel", self.config.dm_allowed_pubkeys, sender_pubkey);
     }
 
     /// Record which DM protocol a sender used, for protocol mirroring.
@@ -595,7 +596,7 @@ pub const NostrChannel = struct {
     /// Best-effort: caller should ignore errors (dedup is non-critical).
     pub fn recordSeenRumor(self: *NostrChannel, rumor_id: []const u8, now: i64) !void {
         // Collect stale keys (can't remove during iteration).
-        var stale: std.ArrayListUnmanaged([]const u8) = .empty;
+        var stale = std.ArrayListUnmanaged([]const u8).empty;
         defer stale.deinit(self.allocator);
 
         var it = self.seen_rumor_ids.iterator();
@@ -774,7 +775,7 @@ pub const NostrChannel = struct {
             return;
         };
         defer self.allocator.free(plaintext_raw);
-        const plaintext = std.mem.trimRight(u8, plaintext_raw, " \t\r\n");
+        const plaintext = std_compat.mem.trimRight(u8, plaintext_raw, " \t\r\n");
 
         self.recordSenderProtocol(sender, .nip04) catch {};
 
@@ -876,7 +877,7 @@ pub const NostrChannel = struct {
         const args = filterArgs(MAX_LISTENER_ARGS, bounded, &argv_buf);
         if (args.len < 15) return error.ListenerStartFailed;
 
-        var child = std.process.Child.init(args, self.allocator);
+        var child = std_compat.process.Child.init(args, self.allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
         try child.spawn();
@@ -965,7 +966,7 @@ pub const NostrChannel = struct {
         const encrypt_args = buildEncryptArgs(self.config.nak_path, sec, target);
         const ciphertext_raw = try self.runNakCommand(MAX_ENCRYPT_ARGS, encrypt_args, message);
         defer self.allocator.free(ciphertext_raw);
-        const ciphertext = std.mem.trimRight(u8, ciphertext_raw, " \t\r\n");
+        const ciphertext = std_compat.mem.trimRight(u8, ciphertext_raw, " \t\r\n");
         var p_buf: [66]u8 = undefined;
         const p_tag = formatPTag(target, &p_buf);
         const event_args = buildNip04EventArgs(self.config.nak_path, sec, ciphertext, p_tag);

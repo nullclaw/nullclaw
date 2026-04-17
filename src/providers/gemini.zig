@@ -1,4 +1,7 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const log = std.log.scoped(.gemini);
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
@@ -10,6 +13,7 @@ const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const OAUTH_REFRESH_TIMEOUT_SECS: u64 = 20;
+const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
 
 fn parseExpiresIn(v: std.json.Value) ?i64 {
     return switch (v) {
@@ -46,6 +50,31 @@ fn normalizeTokenUsage(usage: *root.TokenUsage) void {
     if (usage.completion_tokens == 0 and usage.total_tokens > usage.prompt_tokens) {
         usage.completion_tokens = usage.total_tokens - usage.prompt_tokens;
     }
+}
+
+fn finalizeGeminiStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    stream_usage: root.TokenUsage,
+) !root.StreamChatResult {
+    var usage = stream_usage;
+    const content = if (accumulated.len > 0)
+        try allocator.dupe(u8, accumulated)
+    else
+        null;
+
+    if (usage.prompt_tokens == 0 and usage.completion_tokens == 0 and usage.total_tokens == 0) {
+        usage.completion_tokens = @intCast((accumulated.len + 3) / 4);
+        usage.total_tokens = usage.completion_tokens;
+    } else {
+        normalizeTokenUsage(&usage);
+    }
+
+    return .{
+        .content = content,
+        .usage = usage,
+        .model = "",
+    };
 }
 
 fn parseUsageMetadataValue(v: std.json.Value) ?root.TokenUsage {
@@ -89,7 +118,7 @@ pub fn extractGeminiUsageMetadata(allocator: std.mem.Allocator, json_str: []cons
 }
 
 fn extractGeminiUsageFromSseLine(allocator: std.mem.Allocator, line: []const u8) !?root.TokenUsage {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
     if (trimmed.len == 0 or trimmed[0] == ':') return null;
 
     const prefix = "data: ";
@@ -161,7 +190,7 @@ pub const GeminiCliCredentials = struct {
     /// If expires_at is null, the token is treated as never-expiring.
     pub fn isExpired(self: GeminiCliCredentials) bool {
         const expiry = self.expires_at orelse return false;
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const buffer_seconds: i64 = 5 * 60; // 5-minute safety buffer
         return now >= (expiry - buffer_seconds);
     }
@@ -310,7 +339,7 @@ pub fn writeCredentialsJson(allocator: std.mem.Allocator, creds: GeminiCliCreden
 
     try buf.append(allocator, '}');
 
-    const file = std.fs.createFileAbsolute(path, .{ .mode = 0o600 }) catch return error.FileWriteError;
+    const file = std_compat.fs.createFileAbsolute(path, .{ .permissions = std_compat.fs.permissionsFromMode(0o600) }) catch return error.FileWriteError;
     defer file.close();
     try file.writeAll(buf.items);
 }
@@ -326,10 +355,10 @@ pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials
     const home = platform.getHomeDir(allocator) catch return null;
     defer allocator.free(home);
 
-    const path = std.fs.path.join(allocator, &.{ home, ".gemini", "oauth_creds.json" }) catch return null;
+    const path = std_compat.fs.path.join(allocator, &.{ home, ".gemini", "oauth_creds.json" }) catch return null;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
 
     const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
@@ -343,7 +372,7 @@ pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials
         if (creds.refresh_token) |rt| {
             if (refreshOAuthToken(allocator, rt)) |refreshed_resp| {
                 // Build refreshed credentials
-                const now = std.time.timestamp();
+                const now = std_compat.time.timestamp();
                 const ttl: i64 = if (refreshed_resp.expires_in > 0) refreshed_resp.expires_in else 3600;
                 const new_expires_at = std.math.add(i64, now, ttl) catch std.math.maxInt(i64);
 
@@ -482,7 +511,7 @@ pub const GeminiProvider = struct {
     }
 
     fn loadNonEmptyEnv(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-        if (std.process.getEnvVarOwned(allocator, name)) |value| {
+        if (std_compat.process.getEnvVarOwned(allocator, name)) |value| {
             defer allocator.free(value);
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) {
@@ -621,35 +650,38 @@ pub const GeminiProvider = struct {
         // Extract text and thinking from candidates.
         // Parts with "thought": true are reasoning traces; all others are visible content.
         if (root_obj.get("candidates")) |candidates| {
-            if (candidates.array.items.len > 0) {
+            if (candidates == .array and candidates.array.items.len > 0) {
                 const candidate = candidates.array.items[0].object;
                 if (candidate.get("content")) |content| {
-                    if (content.object.get("parts")) |parts| {
-                        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        defer text_buf.deinit(allocator);
-                        var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        defer thought_buf.deinit(allocator);
+                    if (content == .object) {
+                        if (content.object.get("parts")) |parts| {
+                            if (parts != .array) return error.NoResponseContent;
+                            var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer text_buf.deinit(allocator);
+                            var thought_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer thought_buf.deinit(allocator);
 
-                        for (parts.array.items) |part_val| {
-                            const part = part_val.object;
-                            const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
-                            if (part.get("text")) |text| {
-                                if (text == .string and text.string.len > 0) {
-                                    const buf = if (is_thought) &thought_buf else &text_buf;
-                                    if (buf.items.len > 0) try buf.append(allocator, '\n');
-                                    try buf.appendSlice(allocator, text.string);
+                            for (parts.array.items) |part_val| {
+                                const part = part_val.object;
+                                const is_thought = if (part.get("thought")) |t| (t == .bool and t.bool) else false;
+                                if (part.get("text")) |text| {
+                                    if (text == .string and text.string.len > 0) {
+                                        const buf = if (is_thought) &thought_buf else &text_buf;
+                                        if (buf.items.len > 0) try buf.append(allocator, '\n');
+                                        try buf.appendSlice(allocator, text.string);
+                                    }
                                 }
                             }
+
+                            if (text_buf.items.len == 0 and thought_buf.items.len == 0)
+                                return error.NoResponseContent;
+
+                            return .{
+                                .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
+                                .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
+                                .usage = usage,
+                            };
                         }
-
-                        if (text_buf.items.len == 0 and thought_buf.items.len == 0)
-                            return error.NoResponseContent;
-
-                        return .{
-                            .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
-                            .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
-                            .usage = usage,
-                        };
                     }
                 }
             }
@@ -681,7 +713,7 @@ pub const GeminiProvider = struct {
     /// - Empty lines, comments (`:`) → `.skip`
     /// - No `[DONE]` sentinel - stream ends when connection closes
     pub fn parseGeminiSseLine(allocator: std.mem.Allocator, line: []const u8) !GeminiSseResult {
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
         if (trimmed.len == 0) return .skip;
         if (trimmed[0] == ':') return .skip;
@@ -741,8 +773,8 @@ pub const GeminiProvider = struct {
         callback: root.StreamCallback,
         ctx: *anyopaque,
     ) !root.StreamChatResult {
-        // Build argv on stack (max 32 args)
-        var argv_buf: [32][]const u8 = undefined;
+        // Build argv on stack (max 36 args)
+        var argv_buf: [36][]const u8 = undefined;
         var argc: usize = 0;
 
         argv_buf[argc] = "curl";
@@ -762,6 +794,10 @@ pub const GeminiProvider = struct {
             argv_buf[argc] = timeout_str;
             argc += 1;
         }
+
+        // Match the generic SSE helper: if the stream goes idle for 60 seconds,
+        // let curl fail fast instead of waiting for the full --max-time budget.
+        sse.appendCurlStallDetectionArgs(argv_buf[0..], &argc);
 
         argv_buf[argc] = "-X";
         argc += 1;
@@ -783,6 +819,10 @@ pub const GeminiProvider = struct {
             argc += 1;
         }
 
+        const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+        defer if (resolve_entry) |entry| allocator.free(entry);
+        http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
+
         for (headers) |hdr| {
             argv_buf[argc] = "-H";
             argc += 1;
@@ -797,7 +837,7 @@ pub const GeminiProvider = struct {
         argv_buf[argc] = url;
         argc += 1;
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
@@ -830,8 +870,9 @@ pub const GeminiProvider = struct {
         var stream_usage = root.TokenUsage{};
         const file = child.stdout.?;
         var read_buf: [4096]u8 = undefined;
+        var saw_done = false;
 
-        while (true) {
+        outer: while (true) {
             const n = file.read(&read_buf) catch break;
             if (n == 0) break;
 
@@ -851,7 +892,10 @@ pub const GeminiProvider = struct {
                             try accumulated.appendSlice(allocator, text);
                             callback(ctx, root.StreamChunk.textDelta(text));
                         },
-                        .done => break,
+                        .done => {
+                            saw_done = true;
+                            break :outer;
+                        },
                         .skip => {},
                     }
                 } else {
@@ -861,7 +905,7 @@ pub const GeminiProvider = struct {
         }
 
         // Parse trailing line if stream ended without final newline.
-        if (line_buf.items.len > 0) {
+        if (!saw_done and line_buf.items.len > 0) {
             if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
                 stream_usage = usage;
             }
@@ -886,32 +930,37 @@ pub const GeminiProvider = struct {
             if (n == 0) break;
         }
 
-        const term = child.wait() catch return error.CurlWaitError;
+        const term = child.wait() catch |err| {
+            log.err("curlStreamGemini child.wait failed: {}", .{err});
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                log.warn("curlStreamGemini proceeding despite wait failure after partial stream output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+            }
+            return error.CurlWaitError;
+        };
         switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
+            .exited => |code| if (code != 0) {
+                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                    log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
+                    callback(ctx, root.StreamChunk.finalChunk());
+                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                }
+                return error.CurlFailed;
+            },
+            else => {
+                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                    log.warn("curlStreamGemini abnormal termination after partial stream output; returning accumulated output", .{});
+                    callback(ctx, root.StreamChunk.finalChunk());
+                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                }
+                return error.CurlFailed;
+            },
         }
 
         // Signal completion only after successful process exit.
         callback(ctx, root.StreamChunk.finalChunk());
-
-        const content = if (accumulated.items.len > 0)
-            try allocator.dupe(u8, accumulated.items)
-        else
-            null;
-
-        if (stream_usage.prompt_tokens == 0 and stream_usage.completion_tokens == 0 and stream_usage.total_tokens == 0) {
-            stream_usage.completion_tokens = @intCast((accumulated.items.len + 3) / 4);
-            stream_usage.total_tokens = stream_usage.completion_tokens;
-        } else {
-            normalizeTokenUsage(&stream_usage);
-        }
-
-        return .{
-            .content = content,
-            .usage = stream_usage,
-            .model = "",
-        };
+        return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
     }
 
     /// Create a Provider interface from this GeminiProvider.
@@ -1038,14 +1087,32 @@ pub const GeminiProvider = struct {
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        if (auth.isApiKey()) {
-            return curlStreamGemini(allocator, url, body, &.{}, request.timeout_secs, callback, callback_ctx);
-        } else {
+        const stream_result = if (auth.isApiKey())
+            curlStreamGemini(allocator, url, body, &.{}, request.timeout_secs, callback, callback_ctx)
+        else blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
             const headers = [_][]const u8{auth_hdr};
-            return curlStreamGemini(allocator, url, body, &headers, request.timeout_secs, callback, callback_ctx);
+            break :blk curlStreamGemini(allocator, url, body, &headers, request.timeout_secs, callback, callback_ctx);
+        };
+
+        return stream_result catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("Gemini streaming failed with {}; falling back to non-streaming response", .{err});
+                var fallback_request = request;
+                fallback_request.timeout_secs = streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+            }
+            return err;
+        };
+    }
+
+    pub fn streamingFallbackTimeoutSecs(request_timeout_secs: u64) u64 {
+        if (request_timeout_secs > 0 and request_timeout_secs < STREAMING_FALLBACK_TIMEOUT_SECS) {
+            return request_timeout_secs;
         }
+        return STREAMING_FALLBACK_TIMEOUT_SECS;
     }
 };
 
@@ -1306,6 +1373,14 @@ test "parseResponse empty candidates fails" {
     try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
 }
 
+test "parseResponse null candidates fails" {
+    // Regression: provider response parsing must tolerate `"candidates": null`.
+    const body =
+        \\{"candidates":null}
+    ;
+    try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseResponse(std.testing.allocator, body));
+}
+
 test "parseResponse no text field fails" {
     const body =
         \\{"candidates":[{"content":{"parts":[{}]}}]}
@@ -1352,6 +1427,13 @@ test "parseChatResponse thought only leaves content null" {
     }
     try std.testing.expect(response.content == null);
     try std.testing.expectEqualStrings("only thinking", response.reasoning_content.?);
+}
+
+test "parseChatResponse null parts fails cleanly" {
+    const body =
+        \\{"candidates":[{"content":{"parts":null}}]}
+    ;
+    try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseChatResponse(std.testing.allocator, body));
 }
 
 test "provider rejects whitespace key" {
@@ -1443,6 +1525,14 @@ test "parseGeminiSseLine invalid json returns error" {
     );
 }
 
+test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+    // Regression: Gemini/Vertex must not wait the full message_timeout_secs
+    // twice when both the streaming and fallback paths are slow.
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(0));
+    try std.testing.expectEqual(@as(u64, 45), GeminiProvider.streamingFallbackTimeoutSecs(45));
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(300));
+}
+
 test "streamChatImpl fails without credentials" {
     // Construct directly with auth=null to avoid picking up env vars or CLI tokens
     var p = GeminiProvider{ .auth = null, .allocator = std.testing.allocator };
@@ -1464,7 +1554,7 @@ test "streamChatImpl fails without credentials" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "GeminiCliCredentials isExpired with future timestamp returns false" {
-    const future: i64 = std.time.timestamp() + 3600; // 1 hour from now
+    const future: i64 = std_compat.time.timestamp() + 3600; // 1 hour from now
     const creds = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1474,7 +1564,7 @@ test "GeminiCliCredentials isExpired with future timestamp returns false" {
 }
 
 test "GeminiCliCredentials isExpired with past timestamp returns true" {
-    const past: i64 = std.time.timestamp() - 3600; // 1 hour ago
+    const past: i64 = std_compat.time.timestamp() - 3600; // 1 hour ago
     const creds = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1494,7 +1584,7 @@ test "GeminiCliCredentials isExpired with null expires_at returns false" {
 
 test "GeminiCliCredentials isExpired with 5-min buffer edge case" {
     // Token expires in exactly 4 minutes — within the 5-minute buffer, so should be expired
-    const almost_expired: i64 = std.time.timestamp() + 4 * 60;
+    const almost_expired: i64 = std_compat.time.timestamp() + 4 * 60;
     const creds_soon = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1503,7 +1593,7 @@ test "GeminiCliCredentials isExpired with 5-min buffer edge case" {
     try std.testing.expect(creds_soon.isExpired());
 
     // Token expires in exactly 6 minutes — outside the 5-minute buffer, so should NOT be expired
-    const still_valid: i64 = std.time.timestamp() + 6 * 60;
+    const still_valid: i64 = std_compat.time.timestamp() + 6 * 60;
     const creds_valid = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1812,10 +1902,10 @@ test "writeCredentialsJson produces valid JSON" {
     defer temp_dir.cleanup();
 
     // Create placeholder file so realpathAlloc works
-    const tmp_file = try temp_dir.dir.createFile("creds.json", .{});
+    const tmp_file = try @import("compat").fs.Dir.wrap(temp_dir.dir).createFile("creds.json", .{});
     tmp_file.close();
 
-    const path = try temp_dir.dir.realpathAlloc(alloc, "creds.json");
+    const path = try @import("compat").fs.Dir.wrap(temp_dir.dir).realpathAlloc(alloc, "creds.json");
     defer alloc.free(path);
 
     const creds = GeminiCliCredentials{
@@ -1827,7 +1917,7 @@ test "writeCredentialsJson produces valid JSON" {
     try writeCredentialsJson(alloc, creds, path);
 
     // Read back and verify valid JSON
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
 
     const content = try file.readToEndAlloc(alloc, 4096);
@@ -1842,7 +1932,7 @@ test "writeCredentialsJson produces valid JSON" {
     try std.testing.expect(obj.get("expires_at").?.integer == 1999999999);
 
     if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const mode = stat.mode & 0o777;
         // Respect process umask: require owner rw and forbid executable bits.
         try std.testing.expect((mode & 0o600) == 0o600);
@@ -1855,10 +1945,10 @@ test "writeCredentialsJson without refresh token" {
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    const tmp_file = try temp_dir.dir.createFile("creds2.json", .{});
+    const tmp_file = try @import("compat").fs.Dir.wrap(temp_dir.dir).createFile("creds2.json", .{});
     tmp_file.close();
 
-    const path = try temp_dir.dir.realpathAlloc(alloc, "creds2.json");
+    const path = try @import("compat").fs.Dir.wrap(temp_dir.dir).realpathAlloc(alloc, "creds2.json");
     defer alloc.free(path);
 
     const creds = GeminiCliCredentials{
@@ -1869,7 +1959,7 @@ test "writeCredentialsJson without refresh token" {
 
     try writeCredentialsJson(alloc, creds, path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
 
     const content = try file.readToEndAlloc(alloc, 4096);
@@ -1889,10 +1979,10 @@ test "writeCredentialsJson escapes token strings" {
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    const tmp_file = try temp_dir.dir.createFile("creds-escaped.json", .{});
+    const tmp_file = try @import("compat").fs.Dir.wrap(temp_dir.dir).createFile("creds-escaped.json", .{});
     tmp_file.close();
 
-    const path = try temp_dir.dir.realpathAlloc(alloc, "creds-escaped.json");
+    const path = try @import("compat").fs.Dir.wrap(temp_dir.dir).realpathAlloc(alloc, "creds-escaped.json");
     defer alloc.free(path);
 
     const access_token = "tok\"en\\line\nbreak";
@@ -1905,7 +1995,7 @@ test "writeCredentialsJson escapes token strings" {
 
     try writeCredentialsJson(alloc, creds, path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(alloc, 4096);
     defer alloc.free(content);

@@ -1,31 +1,31 @@
 services:
   agent:
-    build: .
-    image: nullclaw:latest
+    image: ${NULLCLAW_IMAGE:-ghcr.io/nullclaw/nullclaw:latest}
     profiles: ["agent"]
     stdin_open: true
     tty: true
+    command: ["agent"]
     env_file:
       - path: .env
         required: false
     volumes:
-      - nullclaw-data:/root/.nullclaw
+      - nullclaw-data:/nullclaw-data
     restart: unless-stopped
 
   gateway:
-    build: .
-    image: nullclaw:latest
+    image: ${NULLCLAW_IMAGE:-ghcr.io/nullclaw/nullclaw:latest}
     profiles: ["gateway"]
+    command: ["gateway", "--port", "3000", "--host", "::"]
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${NULLCLAW_GATEWAY_PORT:-3000}:3000"
     env_file:
       - path: .env
         required: false
     volumes:
-      - nullclaw-data:/root/.nullclaw
+      - nullclaw-data:/nullclaw-data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 30s
       timeout: 5s
       retries: 3

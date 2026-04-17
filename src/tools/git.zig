@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -127,14 +129,14 @@ pub const GitTool = struct {
 
         // Resolve optional cwd override
         const effective_cwd = if (root.getString(args, "cwd")) |cwd| blk: {
-            if (cwd.len == 0 or !std.fs.path.isAbsolute(cwd))
+            if (cwd.len == 0 or !std_compat.fs.path.isAbsolute(cwd))
                 return ToolResult.fail("cwd must be an absolute path");
-            const resolved_cwd = std.fs.cwd().realpathAlloc(allocator, cwd) catch |err| {
+            const resolved_cwd = fs_compat.realpathAllocPath(allocator, cwd) catch |err| {
                 const err_msg = try std.fmt.allocPrint(allocator, "Failed to resolve cwd: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
             };
             defer allocator.free(resolved_cwd);
-            const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+            const ws_resolved: ?[]const u8 = fs_compat.realpathAllocPath(allocator, self.workspace_dir) catch null;
             defer if (ws_resolved) |wr| allocator.free(wr);
             if (ws_resolved == null and self.allowed_paths.len == 0)
                 return ToolResult.fail("cwd not allowed (workspace unavailable and no allowed_paths configured)");
@@ -444,7 +446,7 @@ test "git rejects unknown operation" {
 test "git cwd inside workspace works without allowed_paths" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"unknown_op\",\"cwd\":{f}}}", .{std.json.fmt(ws_path, .{})});
@@ -463,14 +465,14 @@ test "git cwd inside workspace works without allowed_paths" {
 test "git cwd outside workspace without allowed_paths is rejected" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.makeDir("ws");
-    try tmp_dir.dir.makeDir("other");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("ws");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("other");
 
-    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root_path);
-    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
+    const ws_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
     defer std.testing.allocator.free(ws_path);
-    const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
+    const other_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
     defer std.testing.allocator.free(other_path);
 
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"status\",\"cwd\":{f}}}", .{std.json.fmt(other_path, .{})});

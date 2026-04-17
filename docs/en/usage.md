@@ -63,10 +63,17 @@ nullclaw gateway
 | `nullclaw channel start telegram` | Start a specific channel |
 | `nullclaw migrate openclaw --dry-run` | Dry-run OpenClaw migration |
 | `nullclaw migrate openclaw` | Execute OpenClaw migration |
+| `nullclaw history list [--limit N] [--offset N] [--json]` | List conversation sessions |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | Show messages for a session |
 
 ## Service Mode Recommendations
 
 For long-running deployments:
+
+- macOS uses `launchctl`.
+- Linux uses `systemd --user` when available and falls back to OpenRC or SysVinit when the required runtime is present.
+- Windows uses the Service Control Manager.
+- If Linux has neither working `systemd --user` nor the required OpenRC/SysVinit support, service subcommands fail; use foreground `nullclaw gateway` or another supervisor instead.
 
 ```bash
 nullclaw service install
@@ -86,6 +93,7 @@ nullclaw service start
 - Default gateway: `127.0.0.1:3000`
 - Recommended: keep `gateway.require_pairing = true`
 - For public access, prefer tunnel/reverse proxy over direct public bind
+- `/pair` is POST-only, uses `X-Pairing-Code`, and can be rate-limited or temporarily locked after repeated invalid attempts
 
 Health check:
 
@@ -128,8 +136,10 @@ nullclaw onboard --interactive
 Check:
 
 - `channels.<name>.accounts.*` token/webhook/account settings.
-- `allow_from` accidentally set to empty array.
+- Channel-specific allowlist or gating mismatch (`allow_from`, `group_allow_from`, `require_mention`, and similar settings). Empty `allow_from` is not a universal deny switch.
 - `nullclaw channel status` health output.
+- For DingTalk-specific stream and reply-target checks, open
+  [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md).
 
 ### 4) Gateway starts but is unreachable externally
 
@@ -138,6 +148,48 @@ Common causes:
 - Still bound to `127.0.0.1`.
 - Tunnel/reverse proxy not configured.
 - Firewall port not opened.
+
+### 5) Provider returns 429 / "rate limit exceeded"
+
+Common causes:
+
+- Low-quota coding plans may reject tool-heavy agent turns even when plain chat still works.
+- Retry pressure is too aggressive for the current provider plan.
+- There is no configured fallback when the primary provider hits quota/rate limits.
+
+Checks:
+
+- For foreground runs, start with `nullclaw agent --verbose`.
+- For service mode, inspect `~/.nullclaw/logs/daemon.stdout.log` and `~/.nullclaw/logs/daemon.stderr.log`.
+- Run `nullclaw status` to confirm the current provider/model pair.
+
+If the plan is valid but fragile, tune reliability conservatively:
+
+```json
+{
+  "reliability": {
+    "provider_retries": 1,
+    "provider_backoff_ms": 3000,
+    "fallback_providers": ["openrouter"]
+  }
+}
+```
+
+If you have multiple keys for the same provider, add `reliability.api_keys` so NullClaw can rotate them.
+
+### 6) Local Ollama model says it has no access to `scheduler_tool`
+
+What this usually means:
+
+- The canonical NullClaw tool name is `schedule`.
+- Some local Ollama-served models emit `scheduler_tool` or `schedule_tool` instead.
+- Current NullClaw builds normalize those Ollama aliases back to `schedule` before dispatch.
+
+Checks:
+
+- Confirm you are running a build that includes the Ollama tool-alias normalization fix.
+- Re-run with `nullclaw agent --verbose` if you still see `Unknown tool` for a scheduler-related name.
+- If you are pinned to an older binary, upgrade before changing your scheduler config. The problem is usually tool-name drift, not a disabled scheduler.
 
 ## Post-Change Checklist
 

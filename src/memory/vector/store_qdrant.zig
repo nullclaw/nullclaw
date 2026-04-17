@@ -5,7 +5,9 @@
 //! and healthCheck via the Qdrant REST endpoints.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
+const http_util = @import("../../http_util.zig");
 const store_mod = @import("store.zig");
 const VectorStore = store_mod.VectorStore;
 const VectorResult = store_mod.VectorResult;
@@ -115,7 +117,7 @@ pub const QdrantVectorStore = struct {
         method: std.http.Method,
         payload: ?[]const u8,
     ) !struct { status: std.http.Status, body: []u8 } {
-        var client = std.http.Client{ .allocator = alloc };
+        var client = try http_util.ProxyHttpClient.init(alloc);
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -132,7 +134,7 @@ pub const QdrantVectorStore = struct {
             header_count += 1;
         }
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = method,
             .payload = payload,
@@ -386,24 +388,24 @@ pub const QdrantVectorStore = struct {
 
     fn implHealthCheck(ptr: *anyopaque, alloc: Allocator) anyerror!HealthStatus {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const start = std.time.nanoTimestamp();
+        const start = std_compat.time.nanoTimestamp();
 
         // Hit the Qdrant healthz endpoint (not collection-scoped)
         const url = try std.fmt.allocPrint(alloc, "{s}/healthz", .{self.url});
         defer alloc.free(url);
 
-        var client = std.http.Client{ .allocator = alloc };
+        var client = try http_util.ProxyHttpClient.init(alloc);
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = .GET,
             .response_writer = &aw.writer,
         }) catch {
-            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+            const elapsed: u64 = @intCast(@max(0, std_compat.time.nanoTimestamp() - start));
             return HealthStatus{
                 .ok = false,
                 .latency_ns = elapsed,
@@ -412,7 +414,7 @@ pub const QdrantVectorStore = struct {
             };
         };
 
-        const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
+        const elapsed: u64 = @intCast(@max(0, std_compat.time.nanoTimestamp() - start));
 
         if (result.status != .ok) {
             return HealthStatus{
