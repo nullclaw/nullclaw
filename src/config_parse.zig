@@ -61,6 +61,17 @@ fn parseApiKeyField(cfg: *const Config, value: std.json.Value) !?[]const u8 {
     };
 }
 
+fn extractShellCommandBaseName(command: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (trimmed.len == 0) return "";
+
+    var segment_it = std.mem.tokenizeAny(u8, trimmed, "|;&\n\r");
+    const first_segment = segment_it.next() orelse return "";
+    var word_it = std.mem.tokenizeAny(u8, first_segment, " \t");
+    const first_word = word_it.next() orelse return "";
+    return std.fs.path.basename(first_word);
+}
+
 fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAgentConfig) void {
     allocator.free(agent_cfg.name);
     allocator.free(agent_cfg.provider);
@@ -1191,6 +1202,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("allowed_paths")) |v| {
                 if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
             }
+            if (aut.object.get("disable_commands")) |v| {
+                if (v == .array) self.autonomy.disable_commands = try parseStringArray(self.allocator, v.array);
+            }
         }
     }
 
@@ -1424,6 +1438,148 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("path_env_vars")) |v| {
                 if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
+            }
+            // tools.tool_customizations
+            if (tl.object.get("tool_customizations")) |v| {
+                if (v == .array) {
+                    var custom_list: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
+                    try custom_list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
+                    for (v.array.items) |item| {
+                        if (item == .object) {
+                            var custom = types.ToolCustomization{
+                                .name = "",
+                                .system_prompt = null,
+                                .triggers = &.{},
+                                .priority = 0,
+                                .enabled = true,
+                                .skip_llm_tpl = null,
+                                .trigger_arguments = null,
+                            };
+                            if (item.object.get("name")) |nv| {
+                                if (nv == .string) custom.name = try self.allocator.dupe(u8, nv.string);
+                            }
+                            if (item.object.get("system_prompt")) |spv| {
+                                if (spv == .string) custom.system_prompt = try self.allocator.dupe(u8, spv.string);
+                            }
+                            if (item.object.get("triggers")) |tv| {
+                                if (tv == .array) custom.triggers = try parseStringArray(self.allocator, tv.array);
+                            }
+                            if (item.object.get("priority")) |pv| {
+                                if (pv == .integer) custom.priority = @intCast(pv.integer);
+                            }
+                            if (item.object.get("enabled")) |ev| {
+                                if (ev == .bool) custom.enabled = ev.bool;
+                            }
+                            if (item.object.get("skip_llm_tpl")) |tplv| {
+                                if (tplv == .string) custom.skip_llm_tpl = try self.allocator.dupe(u8, tplv.string);
+                            }
+                            if (item.object.get("trigger_arguments")) |tav| {
+                                if (tav == .object) {
+                                    custom.trigger_arguments = try std.json.Stringify.valueAlloc(self.allocator, tav, .{});
+                                }
+                            }
+                            try custom_list.append(self.allocator, custom);
+                        }
+                    }
+
+                    // Auto-add base shell commands from trigger_arguments to allowed_commands.
+                    // This keeps configured exact triggers usable without broadening the allowlist
+                    // to argument-specific command strings.
+                    var shell_commands: std.ArrayListUnmanaged([]const u8) = .empty;
+                    defer shell_commands.deinit(self.allocator);
+
+                    for (custom_list.items) |custom| {
+                        if (!std.mem.eql(u8, custom.name, "shell")) continue;
+
+                        const trigger_arguments = custom.trigger_arguments orelse continue;
+                        const parsed_trigger_arguments = std.json.parseFromSlice(std.json.Value, self.allocator, trigger_arguments, .{}) catch continue;
+                        defer parsed_trigger_arguments.deinit();
+
+                        if (parsed_trigger_arguments.value != .object) continue;
+
+                        var ta_iter = parsed_trigger_arguments.value.object.iterator();
+                        while (ta_iter.next()) |entry| {
+                            if (entry.value_ptr.* != .object) continue;
+                            if (entry.value_ptr.*.object.get("command")) |cmd_val| {
+                                if (cmd_val != .string) continue;
+
+                                const base_cmd = extractShellCommandBaseName(cmd_val.string);
+                                if (base_cmd.len == 0) continue;
+
+                                var is_disabled = false;
+                                for (self.autonomy.disable_commands) |disabled| {
+                                    if (std.mem.eql(u8, base_cmd, std.mem.trim(u8, disabled, " \t\r\n"))) {
+                                        is_disabled = true;
+                                        break;
+                                    }
+                                }
+                                if (is_disabled) continue;
+
+                                var already_allowed = false;
+                                for (self.autonomy.allowed_commands) |allowed| {
+                                    if (std.mem.eql(u8, base_cmd, std.mem.trim(u8, allowed, " \t\r\n"))) {
+                                        already_allowed = true;
+                                        break;
+                                    }
+                                }
+                                if (!already_allowed) {
+                                    for (shell_commands.items) |allowed| {
+                                        if (std.mem.eql(u8, base_cmd, allowed)) {
+                                            already_allowed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (!already_allowed) {
+                                    try shell_commands.append(self.allocator, try self.allocator.dupe(u8, base_cmd));
+                                }
+                            }
+                        }
+                    }
+
+                    self.tools.tool_customizations = try custom_list.toOwnedSlice(self.allocator);
+
+                    // Merge shell_commands into allowed_commands
+                    if (shell_commands.items.len > 0) {
+                        const total_len = self.autonomy.allowed_commands.len + shell_commands.items.len;
+                        const merged = try self.allocator.alloc([]const u8, total_len);
+                        var idx: usize = 0;
+
+                        for (self.autonomy.allowed_commands) |cmd| {
+                            merged[idx] = cmd;
+                            idx += 1;
+                        }
+
+                        for (shell_commands.items) |cmd| {
+                            merged[idx] = cmd;
+                            idx += 1;
+                        }
+
+                        self.autonomy.allowed_commands = merged;
+                    }
+                }
+            }
+            // tools.tool_customizations_file
+            if (tl.object.get("tool_customizations_file")) |v| {
+                if (v == .string) self.tools.tool_customizations_file = try self.allocator.dupe(u8, v.string);
+            }
+            // tools.trigger_modifiers
+            if (tl.object.get("trigger_modifiers")) |v| {
+                if (v == .array) {
+                    const modifiers_list = v.array.items;
+                    const modifiers_slice = try self.allocator.alloc([]const u8, modifiers_list.len);
+                    for (modifiers_list, 0..) |item, idx| {
+                        if (item == .string) {
+                            modifiers_slice[idx] = try self.allocator.dupe(u8, item.string);
+                        }
+                    }
+                    self.tools.trigger_modifiers = modifiers_slice;
+                }
+            }
+            // tools.trigger_punctuation
+            if (tl.object.get("trigger_punctuation")) |v| {
+                if (v == .string) self.tools.trigger_punctuation = try self.allocator.dupe(u8, v.string);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {

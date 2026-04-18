@@ -36,6 +36,7 @@ pub const HELP_TEXT =
     \\Memory and diagnostics:
     \\  /doctor — memory subsystem diagnostics
     \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
+    \\  /tool-customizations, /tools — show tool customizations (read-only)
     \\  /export-session, /export
     \\  /session ttl <duration|off>
     \\  /config, /capabilities, /debug

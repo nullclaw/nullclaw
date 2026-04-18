@@ -1,0 +1,101 @@
+{
+  "autonomy": {
+    "disable_commands": ["rm", "sudo", "su", "chmod", "chown"]
+  },
+  "screenshot": {
+    "system_prompt": "Capture and return a screenshot of the current screen. This tool is useful when the user asks to see the screen, take a picture, or capture what's displayed on the monitor.",
+    "triggers": [
+      "截屏",
+      "截图",
+      "显示屏幕",
+      "screenshot",
+      "screen capture",
+      "capture screen",
+      "take a picture",
+      "take a photo",
+      "show me the screen",
+      "show screen"
+    ],
+    "priority": 10,
+    "enabled": true,
+    "skip_llm_tpl": "截图已保存: {output}",
+    "trigger_arguments": {
+      "default": {
+        "filename": "screenshot_{timestamp}.png"
+      }
+    }
+  },
+  "file_read": {
+    "system_prompt": "Read the contents of a file at the specified path. Use this when the user asks to read, view, or examine a file.",
+    "triggers": [
+      "读取文件",
+      "查看文件",
+      "read file",
+      "view file",
+      "open file"
+    ],
+    "priority": 5,
+    "enabled": true
+  },
+  "file_write": {
+    "system_prompt": "Write content to a file at the specified path. Use this when the user asks to create or overwrite a file.",
+    "triggers": [
+      "写入文件",
+      "创建文件",
+      "write file",
+      "create file"
+    ],
+    "priority": 5,
+    "enabled": true,
+    "trigger_arguments": {
+      "default": {
+        "path": "output.txt",
+        "content": ""
+      }
+    }
+  },
+  "shell": {
+    "system_prompt": "Execute a shell command and return the output. Use this when the user asks to run commands, execute scripts, or perform system operations.",
+    "triggers": [
+      "执行命令",
+      "运行命令",
+      "run command",
+      "execute command",
+      "shell",
+      "查看目录::ls",
+      "查看进程::ps",
+      "查看磁盘::df"
+    ],
+    "priority": 8,
+    "enabled": true,
+    "trigger_arguments": {
+      "default": {
+        "command": "echo 'No command specified'"
+      },
+      "ls": {
+        "command": "ls -la"
+      },
+      "ps": {
+        "command": "ps aux"
+      },
+      "df": {
+        "command": "df -h"
+      }
+    }
+  },
+  "git": {
+    "system_prompt": "Execute git commands and return the output. Use this when the user asks about git status, log, diff, or other git operations.",
+    "triggers": [
+      "git 状态",
+      "git status",
+      "check git"
+    ],
+    "priority": 6,
+    "enabled": true,
+    "trigger_arguments": {
+      "default": {
+        "command": "status"
+      }
+    }
+  }
+}

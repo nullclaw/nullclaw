@@ -1,0 +1,656 @@
+# 工具定制管理
+
+为内置工具添加自定义系统提示词、触发关键词和优先级，以提高工具调用的准确性和响应速度。
+
+## 核心功能
+
+- **事前无 LLM 模式**：为工具（如 screenshot）配置特定触发词（trigger）可以实现直接调用工具，无需 LLM 参与
+- **事后无 LLM 模式**：为工具（如 screenshot）配置 `skip_llm_tpl` 参数可将工具输出直接模板化后返回给用户，无需 LLM 处理
+- **触发词特定参数映射**：为每个触发词配置不同的参数，实现快捷方式，更且明确且灵活地调用工具
+
+## 快速开始
+
+### 1. 查看内置工具列表
+
+```bash
+nullclaw tools show --builtin
+```
+
+### 2. 查看当前工具定制
+
+```bash
+nullclaw tools show
+```
+
+### 3. 导出内置工具到 JSON 文件
+
+```bash
+nullclaw tools export builtin_tools.json --builtin
+```
+
+### 4. 导出工具定制到 JSON 文件
+
+```bash
+nullclaw tools export tool_customizations.json
+```
+
+### 5. 验证工具定制 JSON 文件
+
+```bash
+nullclaw tools validate tool_customizations.json
+```
+
+### 6. 导入工具定制（查看预览）
+
+```bash
+nullclaw tools import-preview tool_customizations.json
+```
+
+**注意**：`import-preview` 命令只显示预览，不会自动应用配置。要应用配置，需要手动编辑配置文件。
+
+## 配置方式
+
+### 方式一：使用外部 JSON 文件
+
+在 `~/.nullclaw/config.json` 中指定外部文件路径：
+
+```json
+{
+  "tools": {
+    "tool_customizations_file": "/path/to/tool_customizations.json"
+  }
+}
+```
+
+外部文件格式：
+
+```json
+{
+  "screenshot": {
+    "system_prompt": "...",
+    "triggers": ["截屏", "截图", "screenshot"],
+    "priority": 10,
+    "enabled": true
+  },
+  "file_read": {
+    "system_prompt": "...",
+    "triggers": ["读取文件", "read file"],
+    "priority": 5,
+    "enabled": true
+  }
+}
+```
+
+### 方式二：直接编辑配置文件
+
+编辑 `~/.nullclaw/config.json`，在 `tools` 部分添加 `tool_customizations`：
+
+```json
+{
+  "tools": {
+    "shell_timeout_secs": 60,
+    "shell_max_output_bytes": 1048576,
+    "max_file_size_bytes": 10485760,
+    "web_fetch_max_chars": 50000,
+    "tool_customizations": [
+      {
+        "name": "screenshot",
+        "system_prompt": "Capture and return a screenshot of the current screen. This tool is useful when the user asks to see the screen, take a picture, or capture what's displayed on the monitor.",
+        "triggers": [
+          "截屏",
+          "截图",
+          "显示屏幕",
+          "screenshot",
+          "screen capture",
+          "capture screen",
+          "take a picture",
+          "take a photo",
+          "show me the screen",
+          "show screen"
+        ],
+        "priority": 10,
+        "enabled": true
+      }
+    ]
+  }
+}
+```
+
+## 字段说明
+
+### ToolCustomization 结构
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | string | 是 | 工具名称（如 "screenshot", "file_read", "shell"） |
+| `system_prompt` | string | 否 | 自定义系统提示词，覆盖默认工具描述 |
+| `triggers` | string[] | 否 | 触发关键词列表，当用户消息包含这些词时会优先调用该工具，为空则没有触发词相关逻辑 |
+| `priority` | number | 否 | 优先级（默认 0），数值越高优先级越高 |
+| `enabled` | boolean | 否 | 是否启用该工具（默认 true） |
+| `skip_llm_tpl` | string | 否 | 跳过 LLM 模板，当配置此字段时，工具执行完成后会将输出通过此模板格式化后直接返回给用户，无需 LLM 处理。模板支持 `{output}` 占位符，例如："Screenshot saved: {output}" |
+| `trigger_arguments` | object | 否 | 触发词特定参数映射。键为触发词后缀标识（如 `"ls"` 来自 `"查看目录::ls"`），特殊键 `"default"` 用于无后缀或后缀未找到时。格式：`{"default": {"command": "ls"}, "ps": {"command": "ps aux"}}`。支持变量替换：`{workspace_dir}`（工作目录）、`{timestamp}`（时间戳）、`{date}`（日期 YYYY-MM-DD）、`{time}`（时间 HH-MM-SS）、`{home}`（用户主目录） |
+| `trigger_modifiers` | string[] | 否 | 自定义修饰词列表，会从输入头尾移除后再匹配触发词 |
+| `trigger_punctuation` | string | 否 | 自定义标点符号，会从输入中移除后再匹配触发词 |
+
+## 触发关键词匹配规则
+
+触发关键词采用智能匹配算法，支持两种触发模式：
+
+### 1. 精确匹配（直接执行工具）
+
+当用户输入**仅包含**触发词时（去除修饰词和标点后），直接执行工具，不经过 LLM。
+
+**注意**：配置了 `trigger_arguments` 的工具，其触发词默认允许直接执行，无需额外确认。如需禁用，请将 `enabled` 设置为 `false`。
+
+**输入清理** - 从头尾两端移除：
+- 常见修饰词：`please`, `could you`, `can you`, `would you`, `now`, `go`, `start`, `ok`, `begin`, `do`, `execute`, `run`, `take`, `请`, `帮我`, `开始`
+- 全角/半角标点：空格、句号、逗号、感叹号、问号等
+- **以上修饰词和标点符号会被移除，仅保留触发词**
+- **待清理的修饰词和符号可配置扩展，默认包含以上所有**
+
+**匹配示例**：
+
+| 用户输入 | 清理后 | 触发词 | 结果 |
+|----------|--------|--------|------|
+| "screenshot" | "screenshot" | "screenshot" | ✅ 直接执行截图工具 |
+| "screenshot." | "screenshot" | "screenshot" | ✅ 直接执行截图工具 |
+| "please screenshot" | "screenshot" | "screenshot" | ✅ 直接执行截图工具 |
+| "screenshot please" | "screenshot" | "screenshot" | ✅ 直接执行截图工具 |
+| "screenshot now" | "screenshot" | "screenshot" | ✅ 直接执行截图工具 |
+| " screenshot ." | "screenshot" | "screenshot" | ✅ 直接执行截图工具 |
+| " 截屏 。" | "截屏" | "截屏" | ✅ 直接执行截图工具 |
+| "请截屏请" | "截屏" | "截屏" | ✅ 直接执行截图工具 |
+| "some screenshot" | "somescreenshot" | "screenshot" | ❌ 不匹配（多余单词） |
+
+### 2. 优先级提示（发送给 LLM）
+
+当用户输入**包含**触发词但不是精确匹配时，在消息前添加优先级提示：
+
+| 用户输入 | 触发词 | 结果 |
+|----------|--------|------|
+| "请帮我截屏" | "截屏" | 添加优先级提示，发给 LLM |
+| "帮我截个图" | "截屏" | 添加优先级提示，发给 LLM |
+| "don't screenshot" | "screenshot" | ❌ 不触发（有否定词） |
+
+### 词边界匹配
+
+关键词必须作为**完整单词**出现：
+
+| 消息 | 关键词 | 匹配结果 |
+|------|--------|----------|
+| "请截屏" | "截屏" | ✅ 完整单词 |
+| "noscreenshot" | "screenshot" | ❌ 是其他单词的一部分 |
+| "already done" | "read" | ❌ 包含在其他单词中 |
+
+### 否定词检测
+
+如果关键词前有否定词，则不会触发：
+
+| 消息 | 关键词 | 匹配结果 |
+|------|--------|----------|
+| "不要截屏" | "截屏" | ❌ 有否定词"不要" |
+| "don't screenshot" | "screenshot" | ❌ 有否定词"don't" |
+| "no screenshot needed" | "screenshot" | ❌ 有否定词"no" |
+
+### 调试触发匹配
+
+启用 verbose 模式查看匹配日志：
+
+```bash
+nullclaw agent --verbose
+```
+
+日志示例：
+```
+debug: exact trigger match: tool=screenshot, keyword='screenshot'
+debug: executing tool directly due to exact trigger match
+```
+
+### 最佳实践
+
+1. **精确匹配触发**：配置简短明确的触发词，如 "screenshot"、"截屏"
+2. **避免子字符串冲突**：如用 "screen capture" 而非 "screen"
+3. **合理设置优先级**：重要工具设置更高优先级
+
+## CLI 命令
+
+### `nullclaw tools show`
+
+显示当前配置的工具定制。
+
+```bash
+nullclaw tools show              # 显示用户配置的工具定制
+nullclaw tools show --builtin    # 显示所有内置工具及其描述和参数
+```
+
+### `nullclaw tools export`
+
+导出工具定制到 JSON 文件。
+
+```bash
+nullclaw tools export output.json           # 导出用户配置的工具定制
+nullclaw tools export builtin.json --builtin # 导出所有内置工具信息
+```
+
+### `nullclaw tools validate`
+
+验证工具定制 JSON 文件的格式是否正确。
+
+```bash
+nullclaw tools validate tool_customizations.json
+```
+
+### `nullclaw tools import-preview`
+
+预览工具定制（仅显示预览，不自动应用）。
+
+```bash
+nullclaw tools import-preview tool_customizations.json
+```
+
+## Agent 会话命令
+
+在 agent 会话中，可以使用以下命令查看工具定制（只读）：
+
+```
+/tool-customizations show    # 显示当前工具定制
+/tool-customizations list    # 列出所有可用工具
+```
+
+**安全提示**：Agent 会话中的命令是只读的，无法修改工具定制。要修改配置，请使用 CLI 命令或直接编辑配置文件。
+
+## 安全考虑
+
+- **分离读写权限**：CLI 命令可以修改配置，Agent 会话只能查看
+- **防止提示词注入**：用户无法在对话中意外修改系统提示词
+- **需要重启生效**：修改配置后需要重启 agent 才能生效
+
+## 示例配置
+
+### 截图工具（带 skip_llm_tpl）
+
+```json
+{
+  "name": "screenshot",
+  "system_prompt": "Capture and return a screenshot of the current screen. This tool is useful when the user asks to see the screen, take a picture, or capture what's displayed on the monitor.",
+  "triggers": [
+    "截屏",
+    "截图",
+    "显示屏幕",
+    "screenshot",
+    "screen capture",
+    "capture screen",
+    "show me the screen",
+    "show screen"
+  ],
+  "priority": 10,
+  "enabled": true,
+  "skip_llm_tpl": "截图已保存: {output}"
+}
+```
+
+**说明**：当用户输入精确匹配触发词（如 "截图"）时，工具执行完成后会直接返回 "截图已保存: /path/to/screenshot.png"，无需经过 LLM 处理。
+
+### 文件读取工具
+
+```json
+{
+  "name": "file_read",
+  "system_prompt": "Read the contents of a file at the specified path. Use this when the user asks to read, view, or examine a file.",
+  "triggers": [
+    "读取文件",
+    "查看文件",
+    "read file",
+    "view file",
+    "open file"
+  ],
+  "priority": 5,
+  "enabled": true
+}
+```
+
+### Shell 命令工具
+
+```json
+{
+  "name": "shell",
+  "system_prompt": "Execute a shell command and return the output. Use this when the user asks to run commands, execute scripts, or perform system operations.",
+  "triggers": [
+    "执行命令",
+    "运行命令",
+    "run command",
+    "execute command",
+    "shell"
+  ],
+  "priority": 8,
+  "enabled": true
+}
+```
+
+## 触发词后缀标识（高级功能）
+
+支持在触发词后添加 `::argsKey` 后缀，实现**同一个工具的不同触发词对应不同参数配置**。
+
+### 使用场景
+
+例如，shell 工具可以有多个触发词，每个触发词执行不同的命令：
+- `"查看目录"` → 执行 `ls -la`
+- `"查看进程"` → 执行 `ps aux`
+- `"查看磁盘"` → 执行 `df -h`
+
+### 配置格式
+
+```json
+{
+  "name": "shell",
+  "triggers": [
+    "执行命令",
+    "查看目录::ls",
+    "查看进程::ps",
+    "查看磁盘::df"
+  ],
+  "trigger_arguments": {
+    "default": {
+      "command": "echo 'No command specified'"
+    },
+    "ls": {
+      "command": "ls -la"
+    },
+    "ps": {
+      "command": "ps aux"
+    },
+    "df": {
+      "command": "df -h"
+    }
+  }
+}
+```
+
+### 匹配规则
+
+| 用户输入 | 触发词配置 | 匹配关键字 | 使用的参数键 | 执行的命令 |
+|---------|-----------|-----------|-------------|-----------|
+| "查看目录" | `"查看目录::ls"` | "查看目录" | `"ls"` | `ls -la` |
+| "查看进程" | `"查看进程::ps"` | "查看进程" | `"ps"` | `ps aux` |
+| "查看磁盘" | `"查看磁盘::df"` | "查看磁盘" | `"df"` | `df -h` |
+| "执行命令" | `"执行命令"` | "执行命令" | `"default"` | `echo 'No command specified'` |
+
+**说明**：
+- 后缀 `::argsKey` 不参与匹配，仅用于选择参数配置
+- 无后缀的触发词使用 `"default"` 键的参数
+- 如果后缀对应的键不存在，回退到 `"default"` 键
+
+## 各工具 trigger_arguments 参数样例
+
+以下是常用工具的 `trigger_arguments` 参数样例：
+
+### screenshot（截图）
+
+```json
+{
+  "name": "screenshot",
+  "triggers": ["截图", "screenshot"],
+  "trigger_arguments": {
+    "default": {
+      "filename": "screenshot_{timestamp}.png"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `filename` (string): 截图文件名，保存到工作目录
+
+### shell（执行命令）- 带后缀标识示例
+
+```json
+{
+  "name": "shell",
+  "triggers": [
+    "执行命令",
+    "查看目录::ls",
+    "查看进程::ps",
+    "查看磁盘::df"
+  ],
+  "trigger_arguments": {
+    "default": {
+      "command": "echo 'No command specified'"
+    },
+    "ls": {
+      "command": "ls -la"
+    },
+    "ps": {
+      "command": "ps aux"
+    },
+    "df": {
+      "command": "df -h"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `command` (string, 必填): 要执行的 shell 命令
+- `cwd` (string): 工作目录（默认为工作区根目录）
+
+**自动添加到 allowed_commands**：
+- 配置了 `trigger_arguments` 的 shell 工具，其命令会自动添加到 `autonomy.allowed_commands` 中
+- 这提高了可用性，无需手动配置 `allowed_commands` 即可使用触发词
+- 提取命令的基础部分（第一个单词，忽略参数和管道符）
+- 例如：`ls -la` 会提取 `ls`，`ps aux | grep nginx` 会提取 `ps`
+
+**disable_commands 安全控制**：
+- `autonomy.disable_commands` 可配置禁止自动添加的命令列表
+- 防止潜在危险的命令被自动添加到 `allowed_commands`
+- 示例配置：
+  ```json
+  {
+    "autonomy": {
+      "disable_commands": ["rm", "sudo", "su", "chmod", "chown"]
+    }
+  }
+  ```
+- 即使在 `trigger_arguments` 中配置了这些命令，也不会自动添加到 `allowed_commands`
+
+### file_write（写入文件）- 带后缀标识示例
+
+```json
+{
+  "name": "file_write",
+  "triggers": [
+    "写笔记::note",
+    "写配置::config",
+    "写日志::log"
+  ],
+  "trigger_arguments": {
+    "default": {
+      "path": "output.txt",
+      "content": ""
+    },
+    "note": {
+      "path": "notes_{date}.md",
+      "content": "# Notes for {date}\n\n"
+    },
+    "config": {
+      "path": "config.json",
+      "content": "{\n  \"version\": \"1.0.0\"\n}"
+    },
+    "log": {
+      "path": "app_{date}.log",
+      "content": "Log started at {time}\n\n"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+- `content` (string, 必填): 文件内容
+
+### file_read（读取文件）
+
+```json
+{
+  "name": "file_read",
+  "triggers": ["读取文件", "read file"],
+  "trigger_arguments": {
+    "default": {
+      "path": "README.md"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+
+### file_write（写入文件）
+
+```json
+{
+  "name": "file_write",
+  "triggers": ["写入文件", "write file"],
+  "trigger_arguments": {
+    "default": {
+      "path": "notes_{date}.md",
+      "content": "# Notes for {date}\n\n"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+- `content` (string, 必填): 文件内容
+
+### file_edit（编辑文件）
+
+```json
+{
+  "name": "file_edit",
+  "triggers": ["编辑文件", "edit file"],
+  "trigger_arguments": {
+    "default": {
+      "path": "config.txt",
+      "old_string": "old_value",
+      "new_string": "new_value"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `path` (string, 必填): 相对于工作区的文件路径
+- `old_string` (string, 必填): 要替换的旧文本
+- `new_string` (string, 必填): 新文本
+
+### git（Git 操作）
+
+```json
+{
+  "name": "git",
+  "triggers": ["git 状态", "git status"],
+  "trigger_arguments": {
+    "default": {
+      "command": "status"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `command` (string, 必填): Git 命令（如 status, log, diff 等）
+
+### browser_open（打开浏览器）
+
+```json
+{
+  "name": "browser_open",
+  "triggers": ["打开网页", "open url"],
+  "trigger_arguments": {
+    "default": {
+      "url": "https://example.com"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `url` (string, 必填): 要打开的 URL
+
+### web_fetch（获取网页内容）
+
+```json
+{
+  "name": "web_fetch",
+  "triggers": ["获取网页", "fetch page"],
+  "trigger_arguments": {
+    "default": {
+      "url": "https://example.com/article"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `url` (string, 必填): 要获取的网页 URL
+
+### http_request（HTTP 请求）
+
+```json
+{
+  "name": "http_request",
+  "triggers": ["请求 API", "api request"],
+  "trigger_arguments": {
+    "default": {
+      "url": "https://api.example.com/data",
+      "method": "GET"
+    }
+  }
+}
+```
+
+**可用参数**：
+- `url` (string, 必填): 请求 URL
+- `method` (string): HTTP 方法（GET, POST, PUT, DELETE 等，默认 GET）
+
+### 查看所有工具参数
+
+使用以下命令查看所有内置工具的参数定义：
+
+```bash
+nullclaw tools show --builtin
+```
+
+## 故障排除
+
+### 问题：`nullclaw tools show` 显示 "No tool customizations configured"
+
+**解决方案**：
+1. 检查配置文件路径是否正确
+2. 确认 `tool_customizations` 字段存在于 `tools` 对象中
+3. 验证 JSON 格式是否正确
+
+### 问题：配置修改后没有生效
+
+**解决方案**：
+1. 重启 agent 进程
+2. 检查配置文件语法是否正确
+3. 运行 `nullclaw tools validate` 验证配置
+
+### 问题：工具没有被触发
+
+**解决方案**：
+1. 检查 `enabled` 字段是否为 `true`
+2. 确认触发关键词是否正确
+3. 检查优先级设置是否合理
+4. 查看日志了解工具调用情况
+
+## 相关文件
+
+- `src/config_types.zig` - ToolCustomization 结构定义
+- `src/config_parse.zig` - 配置解析逻辑
+- `src/tools/root.zig` - 内置工具元数据注册表（`builtin_tool_meta`）
+- `src/main.zig` - CLI 命令实现
+- `src/agent/commands.zig` - Agent 会话命令实现
+- `src/agent/root.zig` - 工具定制加载和应用逻辑

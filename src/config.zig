@@ -5562,6 +5562,57 @@ test "json parse tools.media.audio section" {
     allocator.free(cfg.audio_media.language.?);
 }
 
+test "json parse tool customizations stores trigger arguments and auto-allows base shell command only" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "autonomy": {
+        \\    "disable_commands": ["rm"]
+        \\  },
+        \\  "tools": {
+        \\    "tool_customizations": [
+        \\      {
+        \\        "name": "shell",
+        \\        "triggers": ["list directory::ls", "dangerous cleanup::rm"],
+        \\        "trigger_arguments": {
+        \\          "ls": {"command": "ls -la"},
+        \\          "rm": {"command": "rm -rf tmp"}
+        \\        }
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    defer {
+        for (cfg.autonomy.disable_commands) |cmd| allocator.free(cmd);
+        allocator.free(cfg.autonomy.disable_commands);
+        for (cfg.autonomy.allowed_commands) |cmd| allocator.free(cmd);
+        allocator.free(cfg.autonomy.allowed_commands);
+        for (cfg.tools.tool_customizations) |custom| {
+            allocator.free(custom.name);
+            for (custom.triggers) |trigger| allocator.free(trigger);
+            allocator.free(custom.triggers);
+            if (custom.trigger_arguments) |args_json| allocator.free(args_json);
+        }
+        allocator.free(cfg.tools.tool_customizations);
+    }
+
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.tools.tool_customizations.len);
+    try std.testing.expect(cfg.tools.tool_customizations[0].trigger_arguments != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.tools.tool_customizations[0].trigger_arguments.?, "\"ls\"") != null);
+
+    var saw_ls = false;
+    for (cfg.autonomy.allowed_commands) |cmd| {
+        if (std.mem.eql(u8, cmd, "ls")) saw_ls = true;
+        try std.testing.expect(!std.mem.eql(u8, cmd, "ls -la"));
+        try std.testing.expect(!std.mem.eql(u8, cmd, "rm"));
+    }
+    try std.testing.expect(saw_ls);
+}
+
 test "getProviderKey returns null for missing provider" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",

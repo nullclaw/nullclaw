@@ -221,7 +221,6 @@ pub const SecurityPolicy = struct {
         var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
         const norm_len = normalizeCommand(command, &normalized);
         const norm = normalized[0..norm_len];
-
         var has_cmd = false;
         var iter = std.mem.splitScalar(u8, norm, 0);
         while (iter.next()) |raw_segment| {

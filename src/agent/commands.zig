@@ -88,6 +88,7 @@ const SlashCommandKind = enum {
     skill,
     doctor,
     memory,
+    tool_customizations,
     unknown,
 };
 
@@ -133,6 +134,7 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills") or isSlashName(cmd, "iskill")) return .skill;
     if (isSlashName(cmd, "doctor")) return .doctor;
     if (isSlashName(cmd, "memory")) return .memory;
+    if (isSlashName(cmd, "tool-customizations") or isSlashName(cmd, "tools")) return .tool_customizations;
     return .unknown;
 }
 
@@ -5355,6 +5357,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .skill => return try handleSkillCommand(self, cmd.name, cmd.arg),
         .doctor => return try handleDoctorCommand(self),
         .memory => return try handleMemoryCommand(self, cmd.arg),
+        .tool_customizations => return try handleToolCustomizationsCommand(self, cmd.arg),
         .unknown => {
             if (try tryHandleDirectSkillCommand(self, cmd)) |response| return response;
             return null;
@@ -5548,6 +5551,82 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
             try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
             written += 1;
         }
+        out = out_writer.toArrayList();
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    return try self.allocator.dupe(u8, usage);
+}
+
+/// Handle tool customizations command: show, list tools.
+/// Usage: /tool-customizations <show|list> [args]
+fn handleToolCustomizationsCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const usage =
+        "Usage: /tool-customizations <show|list> [args]\n" ++
+        "  /tool-customizations show              - Show current tool customizations\n" ++
+        "  /tool-customizations list             - List all available tools\n" ++
+        "\n" ++
+        "Note: To modify tool customizations, use the CLI command:\n" ++
+        "  nullclaw tools <show|export|import-preview|validate>\n";
+
+    const parsed = splitFirstToken(arg);
+    const action = parsed.head;
+
+    if (action.len == 0 or std.ascii.eqlIgnoreCase(action, "show") or std.ascii.eqlIgnoreCase(action, "status")) {
+        if (!@hasField(@TypeOf(self.*), "tool_customizations")) {
+            return try self.allocator.dupe(u8, "Tool customizations not available in this context.");
+        }
+
+        if (self.tool_customizations.count() == 0) {
+            return try self.allocator.dupe(u8, "No tool customizations configured.\n\nTo add customizations, use:\n  nullclaw tools import-preview <file>");
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
+
+        try w.print("Tool customizations ({d}):\n", .{self.tool_customizations.count()});
+
+        var iter = self.tool_customizations.iterator();
+        while (iter.next()) |entry| {
+            const custom = entry.value_ptr.*;
+            try w.print("  Tool: {s}\n", .{custom.name});
+            if (custom.system_prompt) |sp| {
+                try w.print("    System prompt: {s}\n", .{sp});
+            }
+            if (custom.triggers.len > 0) {
+                try w.print("    Triggers ({d}): ", .{custom.triggers.len});
+                for (custom.triggers, 0..) |trigger, idx| {
+                    if (idx > 0) try w.print(", ", .{});
+                    try w.print("\"{s}\"", .{trigger});
+                }
+                try w.print("\n", .{});
+            }
+            try w.print("    Priority: {d}\n", .{custom.priority});
+            try w.print("    Enabled: {}\n", .{custom.enabled});
+            try w.print("\n", .{});
+        }
+
+        out = out_writer.toArrayList();
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    if (std.ascii.eqlIgnoreCase(action, "list")) {
+        if (!@hasField(@TypeOf(self.*), "tools")) {
+            return try self.allocator.dupe(u8, "Tools not available in this context.");
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
+
+        try w.print("Available tools ({d}):\n", .{self.tools.len});
+        for (self.tools, 0..) |tool, idx| {
+            try w.print("  {d}. {s}\n", .{ idx + 1, tool.name() });
+        }
+
         out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }

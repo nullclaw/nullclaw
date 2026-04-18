@@ -230,6 +230,9 @@ pub const AutonomyConfig = struct {
     /// Additional directories (absolute paths) the agent may access beyond workspace_dir.
     /// Resolved via realpath at check time; system-critical paths are always blocked.
     allowed_paths: []const []const u8 = &.{},
+    /// Commands that should NOT be auto-added to allowed_commands from tool trigger_arguments.
+    /// This provides security control to prevent automatic inclusion of potentially dangerous commands.
+    disable_commands: []const []const u8 = &.{},
 };
 
 pub const DockerRuntimeConfig = struct {
@@ -373,6 +376,53 @@ pub const ToolsConfig = struct {
     ///
     /// Example: ["LD_LIBRARY_PATH", "PYTHONHOME", "NODE_PATH"]
     path_env_vars: []const []const u8 = &.{},
+    /// Tool customization configuration.
+    /// Allows customizing system prompts, trigger keywords, and priorities for individual tools.
+    /// Supports loading from external JSON file via tool_customizations_file.
+    /// Format: {"tool_name": {"system_prompt": "...", "triggers": [...], "priority": 1}}
+    tool_customizations: []const ToolCustomization = &.{},
+    /// Optional path to external JSON file containing tool customizations.
+    /// If specified, file will be merged customizations from this with tool_customizations.
+    /// File format: {"screenshot": {...}, "file_read": {...}, ...}
+    tool_customizations_file: ?[]const u8 = null,
+    /// Custom modifiers to remove from user input when checking for exact trigger matches.
+    /// These strings will be stripped from the beginning of user messages before matching.
+    /// Default includes common polite prefixes like "please", "帮我", "开始", etc.
+    trigger_modifiers: []const []const u8 = &.{},
+    /// Custom punctuation characters to remove when checking for exact trigger matches.
+    /// Default includes common punctuation like space, period, comma, etc.
+    trigger_punctuation: []const u8 = "",
+};
+
+/// Tool customization configuration for individual tools.
+pub const ToolCustomization = struct {
+    /// Tool name (e.g., "screenshot", "file_read", "shell")
+    name: []const u8,
+    /// Custom system prompt for this tool.
+    /// If provided, this will override the default tool description.
+    system_prompt: ?[]const u8 = null,
+    /// Trigger keywords for this tool.
+    /// When user message contains any of these keywords,
+    /// the tool will be prioritized and called immediately.
+    triggers: []const []const u8 = &.{},
+    /// Priority level (higher = more important).
+    /// Default is 0. Tools with higher priority will be called first when multiple tools match.
+    priority: u8 = 0,
+    /// Whether this tool is enabled.
+    /// If false, the tool will not be available.
+    enabled: bool = true,
+    /// Skip LLM template: if provided, tool output will be formatted using this template
+    /// and returned directly to the user without LLM processing.
+    /// Template format: supports {output} placeholder for tool output.
+    /// Example: "Screenshot saved: {output}"
+    skip_llm_tpl: ?[]const u8 = null,
+    /// Trigger-specific arguments mapping for direct tool execution (pre-LLM mode).
+    /// Stored internally as a compact JSON object string to keep ownership explicit.
+    /// Key is the argsKey from trigger suffix (e.g., "ls" from "查看目录::ls").
+    /// Special key "default" is used when trigger has no suffix or suffix not found.
+    /// Format: {"default": {"command": "ls"}, "ps": {"command": "ps aux"}}
+    /// Supports variable substitution in values: {workspace_dir}, {timestamp}, {date}, {time}, {home}
+    trigger_arguments: ?[]const u8 = null,
 };
 
 pub const ModelRouteCostClass = enum {
