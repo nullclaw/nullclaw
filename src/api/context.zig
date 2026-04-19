@@ -92,6 +92,13 @@ pub const ApiContext = struct {
 
     /// Convenience: set a JSON error envelope with the given HTTP status code,
     /// machine-readable error code string, and human-readable message.
+    ///
+    /// NOTE: `code` and `message` are interpolated directly into a JSON string
+    /// via `{s}`.  Callers must ensure both contain no JSON-special characters
+    /// (backslash, double-quote, control characters).  All current call sites
+    /// pass string literals or `@errorName(err)` — both are always ASCII-safe.
+    /// Do not pass user-supplied or runtime-constructed strings here without
+    /// escaping them first with `jsonEscapeString` from api.zig.
     pub fn sendError(self: *ApiContext, http_status: []const u8, code: []const u8, message: []const u8) !void {
         const body_str = try std.fmt.allocPrint(
             self.allocator,

@@ -119,6 +119,46 @@ fn isAllowedPath(path: []const u8) bool {
     return false;
 }
 
+/// Paths that are safe to expose via GET /api/config.
+///
+/// Intentionally narrower than the mutation allowlist: prefixes such as
+/// `channels.`, `security.`, `models.providers.`, and `session.` that may
+/// hold API keys, bot tokens, or pairing secrets are deliberately absent.
+const allowed_read_exact_paths = [_][]const u8{
+    "default_provider",
+    "default_temperature",
+    "reasoning_effort",
+    "gateway.host",
+    "gateway.port",
+    "gateway.admin_api",
+    "tunnel.provider",
+    "memory.backend",
+    "memory.profile",
+    "memory.auto_save",
+    primary_model_path,
+};
+
+/// Safe-to-read path prefixes for the REST Admin API.
+/// Only `diagnostics.` and `scheduler.` are here — neither subtree
+/// contains credentials or auth material.
+const allowed_read_prefix_paths = [_][]const u8{
+    "diagnostics.",
+    "scheduler.",
+};
+
+/// Returns true when `path` is safe to return from GET /api/config.
+/// Use this to guard read access; it is separate from isAllowedPath
+/// (mutation guard) because reads have a narrower threat model.
+pub fn isAllowedReadPath(path: []const u8) bool {
+    for (allowed_read_exact_paths) |allowed| {
+        if (std.mem.eql(u8, path, allowed)) return true;
+    }
+    for (allowed_read_prefix_paths) |prefix| {
+        if (std.mem.startsWith(u8, path, prefix)) return true;
+    }
+    return false;
+}
+
 pub fn pathRequiresRestart(path: []const u8) bool {
     if (std.mem.startsWith(u8, path, "channels.")) return true;
     if (std.mem.startsWith(u8, path, "runtime.")) return true;
@@ -512,6 +552,33 @@ test "isAllowedPath accepts channels and memory path" {
     try std.testing.expect(isAllowedPath("channels.telegram.accounts.default.bot_token"));
     try std.testing.expect(isAllowedPath("memory.backend"));
     try std.testing.expect(!isAllowedPath("identity.format"));
+}
+
+test "isAllowedReadPath permits safe non-sensitive paths" {
+    try std.testing.expect(isAllowedReadPath("default_provider"));
+    try std.testing.expect(isAllowedReadPath("default_temperature"));
+    try std.testing.expect(isAllowedReadPath("gateway.port"));
+    try std.testing.expect(isAllowedReadPath("gateway.admin_api"));
+    try std.testing.expect(isAllowedReadPath("tunnel.provider"));
+    try std.testing.expect(isAllowedReadPath("memory.backend"));
+    try std.testing.expect(isAllowedReadPath("memory.profile"));
+    try std.testing.expect(isAllowedReadPath("memory.auto_save"));
+    try std.testing.expect(isAllowedReadPath("scheduler.max_jobs"));
+    try std.testing.expect(isAllowedReadPath("diagnostics.log_level"));
+}
+
+test "isAllowedReadPath blocks credential-bearing paths" {
+    // Regression: these paths must return 403 from GET /api/config.
+    try std.testing.expect(!isAllowedReadPath("models.providers.0.api_key"));
+    try std.testing.expect(!isAllowedReadPath("channels.telegram.accounts.default.bot_token"));
+    try std.testing.expect(!isAllowedReadPath("security.pairing.tokens"));
+    try std.testing.expect(!isAllowedReadPath("session.auth_token"));
+    try std.testing.expect(!isAllowedReadPath("http_request.auth_header"));
+    try std.testing.expect(!isAllowedReadPath("browser.password"));
+    // Paths that have allowed exact entries must not be reachable via
+    // a prefix that is intentionally absent from the read list.
+    try std.testing.expect(!isAllowedReadPath("channels.slack.api_key"));
+    try std.testing.expect(!isAllowedReadPath("runtime.secret"));
 }
 
 test "setAtPath creates nested objects and stores value" {

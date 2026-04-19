@@ -327,6 +327,14 @@ fn handleConfig(ctx: *ApiContext) anyerror!void {
         return;
     };
 
+    // Guard: only non-sensitive paths may be read via the API.
+    // Paths such as models.providers.*.api_key, channels.*.bot_token, and
+    // security.* are intentionally absent from the read allowlist.
+    if (!config_mutator.isAllowedReadPath(path_param)) {
+        try ctx.sendError("403 Forbidden", "PATH_FORBIDDEN", "that config path is not readable via the API");
+        return;
+    }
+
     const value_json = config_mutator.getPathValueJson(ctx.allocator, path_param) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "config read failed: {s}", .{@errorName(err)});
         defer ctx.allocator.free(msg);
@@ -1150,6 +1158,51 @@ test "dispatch GET /api/config missing param returns 400" {
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("400 Bad Request", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_PARAM") != null);
+}
+
+test "dispatch GET /api/config forbidden path returns 403" {
+    // Regression: credential-bearing paths must never be readable via the API.
+    var cfg = makeEnabledCfg();
+    const sensitive_paths = [_][]const u8{
+        "/api/config?path=models.providers.0.api_key",
+        "/api/config?path=channels.telegram.accounts.default.bot_token",
+        "/api/config?path=security.pairing.tokens",
+    };
+    for (sensitive_paths) |target| {
+        const result = dispatch(
+            std.testing.allocator,
+            "GET /api/config HTTP/1.1\r\n\r\n",
+            "GET",
+            target,
+            "/api/config",
+            &cfg,
+            true,
+            null,
+        );
+        defer if (result.allocated) std.testing.allocator.free(result.body);
+        try std.testing.expectEqualStrings("403 Forbidden", result.status);
+        try std.testing.expect(std.mem.indexOf(u8, result.body, "PATH_FORBIDDEN") != null);
+    }
+}
+
+test "dispatch GET /api/config allowed path reaches handler" {
+    // Confirm the allowlist guard passes non-sensitive paths through to the
+    // handler.  getPathValueJson will return an error (no on-disk config in
+    // the test environment), but the important assertion is that we do NOT
+    // get PATH_FORBIDDEN — the allowlist is wired correctly.
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/config HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/config?path=default_temperature",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "PATH_FORBIDDEN") == null);
 }
 
 test "dispatch GET /api/models returns provider list" {

@@ -22,7 +22,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 - [Security](./security.md): come here when a security review needs the concrete HTTP auth and endpoint surface
 - [Configuration](./configuration.md): return here after editing `gateway` settings to validate the API-facing behavior
 
- ## Endpoints
+## Endpoints
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
