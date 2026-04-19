@@ -253,46 +253,44 @@ fn internalError(allocator: std.mem.Allocator, err: anyerror) DispatchResult {
 ///
 /// `status` is `"ok"` when all components report `"ok"`, otherwise `"degraded"`.
 fn handleStatus(ctx: *ApiContext) anyerror!void {
-    const snap = health.snapshot();
+    const snap = try health.snapshot(ctx.allocator);
+    defer snap.deinit(ctx.allocator);
 
     // Determine overall status from component health.
     var all_ok = true;
-    {
-        var iter = snap.components.iterator();
-        while (iter.next()) |entry| {
-            if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) {
-                all_ok = false;
-                break;
-            }
+    for (snap.components) |sc| {
+        if (!std.mem.eql(u8, sc.health.status, "ok")) {
+            all_ok = false;
+            break;
         }
     }
     const overall = if (all_ok) "ok" else "degraded";
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.print(
         "{{\"version\":\"{s}\",\"pid\":{d},\"uptime_seconds\":{d},\"status\":\"{s}\",\"components\":{{",
-        .{ version.string, snap.pid, snap.uptime_seconds, overall },
+        .{ version.string, snap.pid orelse 0, snap.uptime_seconds, overall },
     );
 
-    var iter = snap.components.iterator();
     var first = true;
-    while (iter.next()) |entry| {
+    for (snap.components) |sc| {
         if (!first) try w.writeByte(',');
         first = false;
-        const ch = entry.value_ptr;
         try w.print(
             "\"{s}\":{{\"status\":\"{s}\",\"restart_count\":{d}",
-            .{ entry.key_ptr.*, ch.status, ch.restart_count },
+            .{ sc.name, sc.health.status, sc.health.restart_count },
         );
-        if (ch.last_error) |le| {
+        if (sc.health.last_error) |le| {
             try w.print(",\"last_error\":\"{s}\"", .{le});
         }
         try w.writeByte('}');
     }
     try w.writeAll("}}");
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -384,7 +382,8 @@ fn handleModels(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.print("{{\"default_provider\":\"{s}\"", .{cfg.default_provider});
     if (cfg.default_model) |dm| {
@@ -405,6 +404,7 @@ fn handleModels(ctx: *ApiContext) anyerror!void {
         });
     }
     try w.writeAll("]}");
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -430,15 +430,17 @@ fn handleCronList(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeByte('[');
     const jobs = sched.listJobs();
     for (jobs, 0..) |job, i| {
         if (i > 0) try w.writeByte(',');
-        try appendCronJobJson(&buf, ctx.allocator, job);
+        try appendCronJobJson(w, job);
     }
     try w.writeByte(']');
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -464,7 +466,10 @@ fn handleCronCreate(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    try appendCronJobJson(&buf, ctx.allocator, job_ptr.*);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendCronJobJson(w, job_ptr.*);
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -489,7 +494,10 @@ fn handleCronCreateOnce(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    try appendCronJobJson(&buf, ctx.allocator, job_ptr.*);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendCronJobJson(w, job_ptr.*);
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -861,17 +869,16 @@ fn cronAddError(err: anyerror) []const u8 {
     };
 }
 
-/// Append a JSON object for `job` to `buf`.
-/// Mirrors appendCronJobJson in gateway.zig but uses std.ArrayList.
-fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job: cron_mod.CronJob) !void {
-    const w = buf.writer(allocator);
+/// Append a JSON object for `job` to writer `w`.
+/// Mirrors appendCronJobJson in gateway.zig but writes to an anytype writer.
+fn appendCronJobJson(w: anytype, job: cron_mod.CronJob) !void {
     try w.writeByte('{');
     try w.writeAll("\"id\":");
-    try appendJsonString(buf, allocator, job.id);
+    try appendJsonString(w, job.id);
     try w.writeAll(",\"expression\":");
-    try appendJsonString(buf, allocator, job.expression);
+    try appendJsonString(w, job.expression);
     try w.writeAll(",\"command\":");
-    try appendJsonString(buf, allocator, job.command);
+    try appendJsonString(w, job.command);
     try w.print(",\"next_run_secs\":{d}", .{job.next_run_secs});
     if (job.last_run_secs) |lrs| {
         try w.print(",\"last_run_secs\":{d}", .{lrs});
@@ -880,53 +887,53 @@ fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job:
     }
     if (job.last_status) |ls| {
         try w.writeAll(",\"last_status\":");
-        try appendJsonString(buf, allocator, ls);
+        try appendJsonString(w, ls);
     } else {
         try w.writeAll(",\"last_status\":null");
     }
     try w.print(",\"paused\":{s}", .{if (job.paused) "true" else "false"});
     try w.print(",\"one_shot\":{s}", .{if (job.one_shot) "true" else "false"});
     try w.writeAll(",\"job_type\":");
-    try appendJsonString(buf, allocator, job.job_type.asStr());
+    try appendJsonString(w, job.job_type.asStr());
     try w.writeAll(",\"session_target\":");
-    try appendJsonString(buf, allocator, job.session_target.asStr());
+    try appendJsonString(w, job.session_target.asStr());
     try w.print(",\"enabled\":{s}", .{if (job.enabled) "true" else "false"});
     try w.print(",\"delete_after_run\":{s}", .{if (job.delete_after_run) "true" else "false"});
     if (job.prompt) |p| {
         try w.writeAll(",\"prompt\":");
-        try appendJsonString(buf, allocator, p);
+        try appendJsonString(w, p);
     } else {
         try w.writeAll(",\"prompt\":null");
     }
     if (job.model) |m| {
         try w.writeAll(",\"model\":");
-        try appendJsonString(buf, allocator, m);
+        try appendJsonString(w, m);
     } else {
         try w.writeAll(",\"model\":null");
     }
     try w.writeAll(",\"delivery_mode\":");
-    try appendJsonString(buf, allocator, job.delivery.mode.asStr());
+    try appendJsonString(w, job.delivery.mode.asStr());
     if (job.delivery.channel) |ch| {
         try w.writeAll(",\"delivery_channel\":");
-        try appendJsonString(buf, allocator, ch);
+        try appendJsonString(w, ch);
     } else {
         try w.writeAll(",\"delivery_channel\":null");
     }
     if (job.delivery.account_id) |aid| {
         try w.writeAll(",\"delivery_account_id\":");
-        try appendJsonString(buf, allocator, aid);
+        try appendJsonString(w, aid);
     } else {
         try w.writeAll(",\"delivery_account_id\":null");
     }
     if (job.delivery.to) |to| {
         try w.writeAll(",\"delivery_to\":");
-        try appendJsonString(buf, allocator, to);
+        try appendJsonString(w, to);
     } else {
         try w.writeAll(",\"delivery_to\":null");
     }
     if (job.delivery.peer_kind) |pk| {
         try w.writeAll(",\"delivery_peer_kind\":");
-        try appendJsonString(buf, allocator, switch (pk) {
+        try appendJsonString(w, switch (pk) {
             .direct => "direct",
             .group => "group",
             .channel => "channel",
@@ -936,13 +943,13 @@ fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job:
     }
     if (job.delivery.peer_id) |pi| {
         try w.writeAll(",\"delivery_peer_id\":");
-        try appendJsonString(buf, allocator, pi);
+        try appendJsonString(w, pi);
     } else {
         try w.writeAll(",\"delivery_peer_id\":null");
     }
     if (job.delivery.thread_id) |ti| {
         try w.writeAll(",\"delivery_thread_id\":");
-        try appendJsonString(buf, allocator, ti);
+        try appendJsonString(w, ti);
     } else {
         try w.writeAll(",\"delivery_thread_id\":null");
     }
@@ -951,9 +958,8 @@ fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job:
     try w.writeByte('}');
 }
 
-/// Append a JSON-escaped string literal (with surrounding quotes) to `buf`.
-fn appendJsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    const w = buf.writer(allocator);
+/// Append a JSON-escaped string literal (with surrounding quotes) to writer `w`.
+fn appendJsonString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |c| {
         switch (c) {
@@ -1008,7 +1014,8 @@ fn extractQueryParam(target: []const u8, param: []const u8) ?[]const u8 {
 fn jsonEscapeString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator); // deinit only on error; caller owns on success
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const w = &out_writer.writer;
     for (input) |c| {
         switch (c) {
             '\\' => try w.writeAll("\\\\"),
@@ -1020,6 +1027,7 @@ fn jsonEscapeString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             else => try w.writeByte(c),
         }
     }
+    out = out_writer.toArrayList();
     return out.toOwnedSlice(allocator);
 }
 
