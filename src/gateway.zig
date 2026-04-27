@@ -5294,6 +5294,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 config_opt,
                 api_auth_ok,
                 lockSharedSchedulerForRequest(),
+                null, // session_mgr_opt
             );
             g_shared_scheduler_mutex.unlock();
             // Write the response immediately so we can safely free an allocated body.

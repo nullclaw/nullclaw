@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const std_compat = @import("compat");
 const health = @import("../health.zig");
 const version = @import("../version.zig");
 const config_mutator = @import("../config_mutator.zig");
@@ -311,46 +312,44 @@ fn internalError(allocator: std.mem.Allocator, err: anyerror) DispatchResult {
 ///
 /// `status` is `"ok"` when all components report `"ok"`, otherwise `"degraded"`.
 fn handleStatus(ctx: *ApiContext) anyerror!void {
-    const snap = health.snapshot();
+    const snap = try health.snapshot(ctx.allocator);
+    defer snap.deinit(ctx.allocator);
 
     // Determine overall status from component health.
     var all_ok = true;
-    {
-        var iter = snap.components.iterator();
-        while (iter.next()) |entry| {
-            if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) {
-                all_ok = false;
-                break;
-            }
+    for (snap.components) |sc| {
+        if (!std.mem.eql(u8, sc.health.status, "ok")) {
+            all_ok = false;
+            break;
         }
     }
     const overall = if (all_ok) "ok" else "degraded";
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.print(
         "{{\"version\":\"{s}\",\"pid\":{d},\"uptime_seconds\":{d},\"status\":\"{s}\",\"components\":{{",
-        .{ version.string, snap.pid, snap.uptime_seconds, overall },
+        .{ version.string, snap.pid orelse 0, snap.uptime_seconds, overall },
     );
 
-    var iter = snap.components.iterator();
     var first = true;
-    while (iter.next()) |entry| {
+    for (snap.components) |sc| {
         if (!first) try w.writeByte(',');
         first = false;
-        const ch = entry.value_ptr;
         try w.print(
             "\"{s}\":{{\"status\":\"{s}\",\"restart_count\":{d}",
-            .{ entry.key_ptr.*, ch.status, ch.restart_count },
+            .{ sc.name, sc.health.status, sc.health.restart_count },
         );
-        if (ch.last_error) |le| {
+        if (sc.health.last_error) |le| {
             try w.print(",\"last_error\":\"{s}\"", .{le});
         }
         try w.writeByte('}');
     }
     try w.writeAll("}}");
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -434,7 +433,8 @@ fn handleModels(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.print("{{\"default_provider\":\"{s}\"", .{cfg.default_provider});
     if (cfg.default_model) |dm| {
@@ -456,6 +456,7 @@ fn handleModels(ctx: *ApiContext) anyerror!void {
     }
     try w.writeAll("]}");
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -480,15 +481,17 @@ fn handleCronList(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeByte('[');
     const jobs = sched.listJobs();
     for (jobs, 0..) |job, i| {
         if (i > 0) try w.writeByte(',');
-        try appendCronJobJson(&buf, ctx.allocator, job);
+        try appendCronJobJson(w, job);
     }
     try w.writeByte(']');
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -520,7 +523,10 @@ fn handleCronGet(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    try appendCronJobJson(&buf, ctx.allocator, job_ptr.*);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendCronJobJson(w, job_ptr.*);
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -545,7 +551,10 @@ fn handleCronCreate(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    try appendCronJobJson(&buf, ctx.allocator, job_ptr.*);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendCronJobJson(w, job_ptr.*);
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -570,7 +579,10 @@ fn handleCronCreateOnce(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    try appendCronJobJson(&buf, ctx.allocator, job_ptr.*);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
+    try appendCronJobJson(w, job_ptr.*);
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -942,17 +954,16 @@ fn cronAddError(err: anyerror) []const u8 {
     };
 }
 
-/// Append a JSON object for `job` to `buf`.
-/// Mirrors appendCronJobJson in gateway.zig but uses std.ArrayList.
-fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job: cron_mod.CronJob) !void {
-    const w = buf.writer(allocator);
+/// Append a JSON object for `job` to writer `w`.
+/// Mirrors appendCronJobJson in gateway.zig but writes to an anytype writer.
+fn appendCronJobJson(w: anytype, job: cron_mod.CronJob) !void {
     try w.writeByte('{');
     try w.writeAll("\"id\":");
-    try appendJsonString(buf, allocator, job.id);
+    try appendJsonString(w, job.id);
     try w.writeAll(",\"expression\":");
-    try appendJsonString(buf, allocator, job.expression);
+    try appendJsonString(w, job.expression);
     try w.writeAll(",\"command\":");
-    try appendJsonString(buf, allocator, job.command);
+    try appendJsonString(w, job.command);
     try w.print(",\"next_run_secs\":{d}", .{job.next_run_secs});
     if (job.last_run_secs) |lrs| {
         try w.print(",\"last_run_secs\":{d}", .{lrs});
@@ -961,53 +972,53 @@ fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job:
     }
     if (job.last_status) |ls| {
         try w.writeAll(",\"last_status\":");
-        try appendJsonString(buf, allocator, ls);
+        try appendJsonString(w, ls);
     } else {
         try w.writeAll(",\"last_status\":null");
     }
     try w.print(",\"paused\":{s}", .{if (job.paused) "true" else "false"});
     try w.print(",\"one_shot\":{s}", .{if (job.one_shot) "true" else "false"});
     try w.writeAll(",\"job_type\":");
-    try appendJsonString(buf, allocator, job.job_type.asStr());
+    try appendJsonString(w, job.job_type.asStr());
     try w.writeAll(",\"session_target\":");
-    try appendJsonString(buf, allocator, job.session_target.asStr());
+    try appendJsonString(w, job.session_target.asStr());
     try w.print(",\"enabled\":{s}", .{if (job.enabled) "true" else "false"});
     try w.print(",\"delete_after_run\":{s}", .{if (job.delete_after_run) "true" else "false"});
     if (job.prompt) |p| {
         try w.writeAll(",\"prompt\":");
-        try appendJsonString(buf, allocator, p);
+        try appendJsonString(w, p);
     } else {
         try w.writeAll(",\"prompt\":null");
     }
     if (job.model) |m| {
         try w.writeAll(",\"model\":");
-        try appendJsonString(buf, allocator, m);
+        try appendJsonString(w, m);
     } else {
         try w.writeAll(",\"model\":null");
     }
     try w.writeAll(",\"delivery_mode\":");
-    try appendJsonString(buf, allocator, job.delivery.mode.asStr());
+    try appendJsonString(w, job.delivery.mode.asStr());
     if (job.delivery.channel) |ch| {
         try w.writeAll(",\"delivery_channel\":");
-        try appendJsonString(buf, allocator, ch);
+        try appendJsonString(w, ch);
     } else {
         try w.writeAll(",\"delivery_channel\":null");
     }
     if (job.delivery.account_id) |aid| {
         try w.writeAll(",\"delivery_account_id\":");
-        try appendJsonString(buf, allocator, aid);
+        try appendJsonString(w, aid);
     } else {
         try w.writeAll(",\"delivery_account_id\":null");
     }
     if (job.delivery.to) |to| {
         try w.writeAll(",\"delivery_to\":");
-        try appendJsonString(buf, allocator, to);
+        try appendJsonString(w, to);
     } else {
         try w.writeAll(",\"delivery_to\":null");
     }
     if (job.delivery.peer_kind) |pk| {
         try w.writeAll(",\"delivery_peer_kind\":");
-        try appendJsonString(buf, allocator, switch (pk) {
+        try appendJsonString(w, switch (pk) {
             .direct => "direct",
             .group => "group",
             .channel => "channel",
@@ -1017,13 +1028,13 @@ fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job:
     }
     if (job.delivery.peer_id) |pi| {
         try w.writeAll(",\"delivery_peer_id\":");
-        try appendJsonString(buf, allocator, pi);
+        try appendJsonString(w, pi);
     } else {
         try w.writeAll(",\"delivery_peer_id\":null");
     }
     if (job.delivery.thread_id) |ti| {
         try w.writeAll(",\"delivery_thread_id\":");
-        try appendJsonString(buf, allocator, ti);
+        try appendJsonString(w, ti);
     } else {
         try w.writeAll(",\"delivery_thread_id\":null");
     }
@@ -1032,9 +1043,8 @@ fn appendCronJobJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, job:
     try w.writeByte('}');
 }
 
-/// Append a JSON-escaped string literal (with surrounding quotes) to `buf`.
-fn appendJsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    const w = buf.writer(allocator);
+/// Append a JSON-escaped string literal (with surrounding quotes) to writer `w`.
+fn appendJsonString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |c| {
         switch (c) {
@@ -1089,7 +1099,8 @@ fn extractQueryParam(target: []const u8, param: []const u8) ?[]const u8 {
 fn jsonEscapeString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator); // deinit only on error; caller owns on success
-    const w = out.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const w = &buf_writer.writer;
     for (input) |c| {
         switch (c) {
             '\\' => try w.writeAll("\\\\"),
@@ -1101,6 +1112,7 @@ fn jsonEscapeString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
             else => try w.writeByte(c),
         }
     }
+    out = buf_writer.toArrayList();
     return out.toOwnedSlice(allocator);
 }
 
@@ -1163,11 +1175,13 @@ const channel_types: []const ChannelTypeEntry = &.{
 /// ```
 fn handleChannelList(ctx: *ApiContext) anyerror!void {
     const cfg = ctx.config_opt.?;
-    const snap = health.snapshot();
+    const snap = try health.snapshot(ctx.allocator);
+    defer snap.deinit(ctx.allocator);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeByte('[');
     var first = true;
@@ -1180,15 +1194,16 @@ fn handleChannelList(ctx: *ApiContext) anyerror!void {
             const status = channelHealthStatus(snap, ct.type_name);
             try w.writeByte('{');
             try w.writeAll("\"type\":");
-            try appendJsonString(&buf, ctx.allocator, ct.type_name);
+            try appendJsonString(w, ct.type_name);
             try w.writeAll(",\"account_id\":");
-            try appendJsonString(&buf, ctx.allocator, entry.account_id);
+            try appendJsonString(w, entry.account_id);
             try w.print(",\"configured\":true,\"status\":\"{s}\"", .{status});
             try w.writeByte('}');
         }
     }
 
     try w.writeByte(']');
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -1224,11 +1239,13 @@ fn handleChannelGet(ctx: *ApiContext) anyerror!void {
         try ctx.sendError("400 Bad Request", "MISSING_PARAM", "channel name required in path");
         return;
     };
-    const snap = health.snapshot();
+    const snap = try health.snapshot(ctx.allocator);
+    defer snap.deinit(ctx.allocator);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     var found = false;
     inline for (channel_types) |ct| {
@@ -1242,7 +1259,7 @@ fn handleChannelGet(ctx: *ApiContext) anyerror!void {
             for (slice, 0..) |entry, i| {
                 if (i > 0) try w.writeByte(',');
                 try w.writeAll("{\"account_id\":");
-                try appendJsonString(&buf, ctx.allocator, entry.account_id);
+                try appendJsonString(w, entry.account_id);
                 try w.writeAll(",\"configured\":true}");
             }
             try w.writeAll("]}");
@@ -1254,6 +1271,7 @@ fn handleChannelGet(ctx: *ApiContext) anyerror!void {
         return;
     }
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -1262,8 +1280,10 @@ fn handleChannelGet(ctx: *ApiContext) anyerror!void {
 /// Look up health status for a channel type name in the snapshot.
 /// Returns "ok", "error", or "unknown" if not registered.
 fn channelHealthStatus(snap: health.HealthSnapshot, type_name: []const u8) []const u8 {
-    const comp = snap.components.get(type_name) orelse return "unknown";
-    return comp.status;
+    for (snap.components) |sc| {
+        if (std.mem.eql(u8, sc.name, type_name)) return sc.health.status;
+    }
+    return "unknown";
 }
 
 // ── Phase 4 handlers — skills ─────────────────────────────────────────
@@ -1291,17 +1311,19 @@ fn handleSkillList(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     const escaped_dir = try jsonEscapeString(ctx.allocator, output_dir);
     defer ctx.allocator.free(escaped_dir);
     try w.print("{{\"output_dir\":\"{s}\",\"skills\":[", .{escaped_dir});
 
     if (!builtin.is_test) {
-        var dir = std.fs.cwd().openDir(output_dir, .{ .iterate = true }) catch |err| switch (err) {
+        var dir = std_compat.fs.cwd().openDir(output_dir, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
                 // Directory doesn't exist yet — return empty list.
                 try w.writeAll("]}");
+                buf = buf_writer.toArrayList();
                 const data = try ctx.allocator.dupe(u8, buf.items);
                 defer ctx.allocator.free(data);
                 try ctx.sendSuccess(data);
@@ -1317,11 +1339,12 @@ fn handleSkillList(ctx: *ApiContext) anyerror!void {
             if (entry.kind != .directory) continue;
             if (!first) try w.writeByte(',');
             first = false;
-            try appendJsonString(&buf, ctx.allocator, entry.name);
+            try appendJsonString(w, entry.name);
         }
     }
 
     try w.writeAll("]}");
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -1361,7 +1384,7 @@ fn handleSkillGet(ctx: *ApiContext) anyerror!void {
     defer ctx.allocator.free(skill_path);
 
     const exists = if (builtin.is_test) false else blk: {
-        var d = std.fs.cwd().openDir(skill_path, .{}) catch |err| switch (err) {
+        var d = std_compat.fs.cwd().openDir(skill_path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => break :blk false,
             else => return err,
         };
@@ -1565,12 +1588,12 @@ fn handleSkillDelete(ctx: *ApiContext) anyerror!void {
 
     if (!builtin.is_test) {
         // Check existence before attempting delete.
-        std.fs.cwd().access(skill_path, .{}) catch {
+        std_compat.fs.cwd().access(skill_path, .{}) catch {
             try ctx.sendError("404 Not Found", "SKILL_NOT_FOUND", "skill not found");
             return;
         };
 
-        std.fs.cwd().deleteTree(skill_path) catch |err| {
+        std_compat.fs.cwd().deleteTree(skill_path) catch |err| {
             const msg = try std.fmt.allocPrint(ctx.allocator, "delete failed: {s}", .{@errorName(err)});
             defer ctx.allocator.free(msg);
             try ctx.sendError("500 Internal Server Error", "DELETE_FAILED", msg);
@@ -1927,14 +1950,16 @@ fn handleMcpList(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeByte('[');
     for (servers, 0..) |srv, i| {
         if (i > 0) try w.writeByte(',');
-        try writeMcpServerSummary(&buf, ctx.allocator, srv);
+        try writeMcpServerSummary(w, srv);
     }
     try w.writeByte(']');
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -1965,23 +1990,28 @@ fn handleMcpGet(ctx: *ApiContext) anyerror!void {
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(ctx.allocator);
-        const w = buf.writer(ctx.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+        var w = &buf_writer.writer;
 
         // Write summary object then splice in the `args` array before the
-        // closing brace.  Easiest: build summary, strip trailing '}', append
-        // args, then close.
-        try writeMcpServerSummary(&buf, ctx.allocator, srv);
+        // closing brace.
+        try writeMcpServerSummary(w, srv);
+        buf = buf_writer.toArrayList();
         // Remove the trailing '}'.
         if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '}') {
             buf.items.len -= 1;
         }
+        // Continue writing with fresh state.
+        var buf_writer2: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+        w = &buf_writer2.writer;
         // Append full args array.
         try w.writeAll(",\"args\":[");
         for (srv.args, 0..) |arg, j| {
             if (j > 0) try w.writeByte(',');
-            try appendJsonString(&buf, ctx.allocator, arg);
+            try appendJsonString(w, arg);
         }
         try w.writeAll("]}");
+        buf = buf_writer2.toArrayList();
 
         const data = try ctx.allocator.dupe(u8, buf.items);
         defer ctx.allocator.free(data);
@@ -1995,25 +2025,23 @@ fn handleMcpGet(ctx: *ApiContext) anyerror!void {
 /// Serialise a single McpServerConfig summary into `buf`.
 /// Env values and header values are redacted to avoid leaking credentials.
 fn writeMcpServerSummary(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
+    w: anytype,
     srv: McpServerConfig,
 ) anyerror!void {
-    const w = buf.writer(allocator);
     try w.writeByte('{');
     // name
     try w.writeAll("\"name\":");
-    try appendJsonString(buf, allocator, srv.name);
+    try appendJsonString(w, srv.name);
     // transport
     try w.writeAll(",\"transport\":");
-    try appendJsonString(buf, allocator, srv.transport);
+    try appendJsonString(w, srv.transport);
     // command (empty string when http transport)
     try w.writeAll(",\"command\":");
-    try appendJsonString(buf, allocator, srv.command);
+    try appendJsonString(w, srv.command);
     // url (null when stdio transport)
     if (srv.url) |u| {
         try w.writeAll(",\"url\":");
-        try appendJsonString(buf, allocator, u);
+        try appendJsonString(w, u);
     } else {
         try w.writeAll(",\"url\":null");
     }
@@ -2023,14 +2051,14 @@ fn writeMcpServerSummary(
     try w.writeAll(",\"env_keys\":[");
     for (srv.env, 0..) |entry, k| {
         if (k > 0) try w.writeByte(',');
-        try appendJsonString(buf, allocator, entry.key);
+        try appendJsonString(w, entry.key);
     }
     try w.writeByte(']');
     // header_names — names only, values redacted
     try w.writeAll(",\"header_names\":[");
     for (srv.headers, 0..) |entry, k| {
         if (k > 0) try w.writeByte(',');
-        try appendJsonString(buf, allocator, entry.key);
+        try appendJsonString(w, entry.key);
     }
     try w.writeByte(']');
     // timeout_ms
@@ -2197,7 +2225,8 @@ fn handleAgentSessionList(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     var total: usize = 0;
 
@@ -2227,6 +2256,7 @@ fn handleAgentSessionList(ctx: *ApiContext) anyerror!void {
     }
     try w.print("],\"total\":{d}}}", .{total});
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -2274,7 +2304,8 @@ fn handleAgentSessionGet(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
     try w.print(
         "{{\"session_key\":{f},\"created_at\":{d},\"last_active\":{d},\"turn_count\":{d},\"turn_running\":{}}}",
         .{
@@ -2286,6 +2317,7 @@ fn handleAgentSessionGet(ctx: *ApiContext) anyerror!void {
         },
     );
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -2456,7 +2488,8 @@ fn handleMemoryList(ctx: *ApiContext) anyerror!void {
     // Build JSON response.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"entries\":[");
     var written: usize = 0;
@@ -2475,6 +2508,7 @@ fn handleMemoryList(ctx: *ApiContext) anyerror!void {
         std.json.fmt(backend_name, .{}),
     });
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -2682,40 +2716,38 @@ fn writeMemoryEntryJson(
 /// }
 /// ```
 fn handleDoctor(ctx: *ApiContext) anyerror!void {
-    const snap = health.snapshot();
+    const snap = try health.snapshot(ctx.allocator);
+    defer snap.deinit(ctx.allocator);
 
     // Determine overall readiness.
     var all_ready = true;
-    {
-        var iter = snap.components.iterator();
-        while (iter.next()) |entry| {
-            if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) {
-                all_ready = false;
-                break;
-            }
+    for (snap.components) |sc| {
+        if (!std.mem.eql(u8, sc.health.status, "ok")) {
+            all_ready = false;
+            break;
         }
     }
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.print(
         "{{\"pid\":{d},\"uptime_seconds\":{d},\"ready\":{s},\"components\":{{",
-        .{ snap.pid, snap.uptime_seconds, if (all_ready) "true" else "false" },
+        .{ snap.pid orelse 0, snap.uptime_seconds, if (all_ready) "true" else "false" },
     );
 
-    var iter = snap.components.iterator();
     var first = true;
-    while (iter.next()) |entry| {
+    for (snap.components) |sc| {
         if (!first) try w.writeByte(',');
         first = false;
-        const ch = entry.value_ptr;
+        const ch = sc.health;
         const updated_at_str = ch.updated_at[0..ch.updated_at_len];
         try w.print(
             "\"{s}\":{{\"status\":\"{s}\",\"restart_count\":{d},\"updated_at\":{f}",
             .{
-                entry.key_ptr.*,
+                sc.name,
                 ch.status,
                 ch.restart_count,
                 std.json.fmt(updated_at_str, .{}),
@@ -2735,6 +2767,7 @@ fn handleDoctor(ctx: *ApiContext) anyerror!void {
         try w.writeByte('}');
     }
     try w.writeAll("}}");
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -2890,7 +2923,8 @@ fn handleMemorySearch(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"entries\":[");
     for (entries, 0..) |*entry, i| {
@@ -2902,6 +2936,7 @@ fn handleMemorySearch(ctx: *ApiContext) anyerror!void {
         std.json.fmt(backend_name, .{}),
     });
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -3049,9 +3084,11 @@ fn handleMemoryGet(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
     try writeMemoryEntryJson(ctx.allocator, w, &entry);
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -3121,7 +3158,8 @@ fn handleHistory(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     // Prefer the durable session store when available.
     if (sm.session_store) |store| {
@@ -3154,6 +3192,7 @@ fn handleHistory(ctx: *ApiContext) anyerror!void {
                 );
             }
             try w.print("],\"total\":{d},\"source\":\"session_store\"}}", .{total});
+            buf = buf_writer.toArrayList();
 
             const data = try ctx.allocator.dupe(u8, buf.items);
             defer ctx.allocator.free(data);
@@ -3195,6 +3234,7 @@ fn handleHistory(ctx: *ApiContext) anyerror!void {
         total = sm.sessions.count();
     }
     try w.print("],\"total\":{d},\"source\":\"active_sessions\"}}", .{total});
+    buf = buf_writer.toArrayList();
 
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
@@ -3263,7 +3303,8 @@ fn handleCronRuns(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     const escaped_id = try jsonEscapeString(ctx.allocator, id);
     defer ctx.allocator.free(escaped_id);
@@ -3275,10 +3316,10 @@ fn handleCronRuns(ctx: *ApiContext) anyerror!void {
             "{{\"id\":{d},\"started_at\":{d},\"finished_at\":{d},\"status\":",
             .{ run.id, run.started_at_s, run.finished_at_s },
         );
-        try appendJsonString(&buf, ctx.allocator, run.status);
+        try appendJsonString(w, run.status);
         try w.writeAll(",\"output\":");
         if (run.output) |out| {
-            try appendJsonString(&buf, ctx.allocator, out);
+            try appendJsonString(w, out);
         } else {
             try w.writeAll("null");
         }
@@ -3292,6 +3333,7 @@ fn handleCronRuns(ctx: *ApiContext) anyerror!void {
     }
     try w.print("],\"total\":{d}}}", .{runs.len});
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
@@ -3370,23 +3412,25 @@ fn handleHistorySession(ctx: *ApiContext) anyerror!void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
-    const w = buf.writer(ctx.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(ctx.allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"session_id\":");
-    try appendJsonString(&buf, ctx.allocator, session_id);
+    try appendJsonString(w, session_id);
     try w.writeAll(",\"messages\":[");
     for (messages, 0..) |msg, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"role\":");
-        try appendJsonString(&buf, ctx.allocator, msg.role);
+        try appendJsonString(w, msg.role);
         try w.writeAll(",\"content\":");
-        try appendJsonString(&buf, ctx.allocator, msg.content);
+        try appendJsonString(w, msg.content);
         try w.writeAll(",\"created_at\":");
-        try appendJsonString(&buf, ctx.allocator, msg.created_at);
+        try appendJsonString(w, msg.created_at);
         try w.writeByte('}');
     }
     try w.print("],\"total\":{d},\"limit\":{d},\"offset\":{d}}}", .{ total, limit, offset });
 
+    buf = buf_writer.toArrayList();
     const data = try ctx.allocator.dupe(u8, buf.items);
     defer ctx.allocator.free(data);
     try ctx.sendSuccess(data);
