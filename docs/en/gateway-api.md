@@ -22,7 +22,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 - [Security](./security.md): come here when a security review needs the concrete HTTP auth and endpoint surface
 - [Configuration](./configuration.md): return here after editing `gateway` settings to validate the API-facing behavior
 
-## Endpoints
+ ## Endpoints
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
@@ -336,7 +336,13 @@ All Admin API responses use a consistent JSON envelope:
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/status` | GET | Version, pid, uptime, overall status, and component health |
+| `/api/doctor` | GET | Deep health report: per-component status, timestamps, restart counts, readiness |
+| `/api/spec` | GET | OpenAPI 3.1 spec for all Admin API endpoints |
 | `/api/config?path=<dotted>` | GET | Read a single config value |
+| `/api/config` | PATCH | Mutate a config value (allowlisted paths only) |
+| `/api/config` | DELETE | Unset a config value |
+| `/api/config/reload` | POST | Hot-reload config from disk |
+| `/api/config/validate` | POST | Validate config without applying |
 | `/api/models` | GET | List configured providers (no key values) |
 | `/api/cron` | GET | List all scheduled jobs |
 | `/api/cron` | POST | Create a recurring cron job |
@@ -346,6 +352,23 @@ All Admin API responses use a consistent JSON envelope:
 | `/api/cron/:id/resume` | POST | Resume a paused job |
 | `/api/cron/:id` | PATCH | Update job fields |
 | `/api/cron/:id` | DELETE | Remove a job |
+| `/api/channels` | GET | List configured channels and health status |
+| `/api/channels/:name` | GET | Detail for a single channel type |
+| `/api/skills` | GET | List installed skills |
+| `/api/skills/install` | POST | Install a skill by name or URL |
+| `/api/skills/:name` | DELETE | Uninstall a skill |
+| `/api/mcp` | GET | List configured MCP servers (env/header values redacted) |
+| `/api/mcp/:name` | GET | Detail for a single MCP server |
+| `/api/agent` | POST | One-shot agent invocation (body: `{"message":"...","session":"..."}`) |
+| `/api/agent/stream` | POST | SSE streaming variant — returns 501 until gateway transport supports chunked responses |
+| `/api/agent/sessions` | GET | List active agent sessions |
+| `/api/agent/sessions/:id` | DELETE | Terminate an agent session |
+| `/api/memory` | GET | List memory entries; filter with `?category=`, `?session=`, `?q=` (FTS), `?limit=`, `?include_internal=true` |
+| `/api/memory/stats` | GET | Memory backend name and total entry count |
+| `/api/memory/search` | POST | Full-text memory search (body: `{"query":"...","limit":10}`) |
+| `/api/memory/:key` | GET | Get a single memory entry by key |
+| `/api/memory/:key` | DELETE | Delete a memory entry by key |
+| `/api/history` | GET | List conversation history sessions |
 
 #### `GET /api/status`
 
@@ -368,6 +391,208 @@ Returns version, pid, uptime, overall health status, and per-component detail.
 ```
 
 `status` is `"ok"` when all components report `"ok"`, otherwise `"degraded"`.
+
+#### `GET /api/doctor`
+
+Deep health report. Includes per-component `updated_at`, `last_ok`, `last_error`, `restart_count`, and a top-level `ready` boolean.
+
+```json
+{
+  "success": true,
+  "data": {
+    "pid": 12345,
+    "uptime_seconds": 3600,
+    "ready": true,
+    "components": {
+      "gateway": {
+        "status": "ok",
+        "restart_count": 0,
+        "updated_at": "2026-04-06T12:00:00Z",
+        "last_ok": "2026-04-06T12:00:00Z",
+        "last_error": null
+      }
+    }
+  },
+  "error": null
+}
+```
+
+`ready` is `true` only when every registered component reports `"ok"`.
+
+#### `GET /api/spec`
+
+Returns the full OpenAPI 3.1 JSON document for the REST Admin API, wrapped in the standard success envelope. Useful for generating client SDKs or importing into tools like Postman.
+
+#### `POST /api/agent`
+
+Sends a message to the agent and waits for a response. Useful for single-message fire-and-wait use cases (e.g. menubar apps, iOS shortcuts, CLI dashboards). Not a replacement for A2A, which handles multi-turn delegation.
+
+Request body:
+
+```json
+{ "message": "summarise open issues", "session": "my-session" }
+```
+
+`session` is optional; defaults to `"api:default"`. Session keys containing `:` must be percent-encoded as `%3A` in URL paths.
+
+Response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "response": "Here are the open issues...",
+    "session": "my-session",
+    "turn_count": 1
+  },
+  "error": null
+}
+```
+
+`POST /api/agent/stream` returns `501 Not Implemented` — the gateway HTTP transport is a single-write model and chunked SSE is not yet supported.
+
+#### `GET /api/agent/sessions`
+
+Lists active sessions with key, turn count, and last-active timestamp.
+
+#### `DELETE /api/agent/sessions/:id`
+
+Terminates the named session and frees its resources. Returns `404` if the session does not exist.
+
+#### `GET /api/memory`
+
+Lists memory entries from the configured backend. All query parameters are optional:
+
+| Parameter | Description |
+|-----------|-------------|
+| `?category=<name>` | Filter by category: `core`, `daily`, `conversation`, or a custom name |
+| `?session=<id>` | Filter by session ID |
+| `?q=<text>` | Full-text search via the backend's `recall()` — overrides `category`/`session` filters |
+| `?limit=<n>` | Max entries (default 100 for list, 20 for search) |
+| `?include_internal=true` | Include autosave/bootstrap internal keys (excluded by default) |
+
+Returns `503 MEMORY_UNAVAILABLE` when no memory backend is configured.
+
+```json
+{
+  "success": true,
+  "data": {
+    "entries": [
+      {
+        "id": "1",
+        "key": "greeting",
+        "content": "Hello world",
+        "category": "core",
+        "timestamp": "2026-04-06T00:00:00Z",
+        "session_id": null,
+        "score": null
+      }
+    ],
+    "total": 1,
+    "backend": "sqlite"
+  },
+  "error": null
+}
+```
+
+#### `GET /api/memory/stats`
+
+Returns the backend name and total entry count.
+
+```json
+{ "success": true, "data": { "backend": "sqlite", "count": 42 }, "error": null }
+```
+
+Returns `503 MEMORY_UNAVAILABLE` when no memory backend is configured.
+
+#### `POST /api/memory/search`
+
+Full-text search via the backend's `recall()` method.
+
+Request body:
+
+```json
+{ "query": "project deadlines", "limit": 10, "session": "opt-session-id" }
+```
+
+`limit` defaults to 20. `session` is optional and scopes the search to a specific session.
+
+Response shape matches `GET /api/memory` (same `entries`/`total`/`backend` envelope).
+
+Returns `503 MEMORY_UNAVAILABLE` when no memory backend is configured.
+
+#### `GET /api/memory/:key`
+
+Returns a single memory entry by its key. The key is percent-decoded before lookup (`%2F` → `/`, `%3A` → `:`). Returns `404 NOT_FOUND` if no entry with that key exists.
+
+Returns `503 MEMORY_UNAVAILABLE` when no memory backend is configured.
+
+#### `DELETE /api/memory/:key`
+
+Deletes a memory entry by key. The key is percent-decoded before lookup (e.g. `%2F` → `/`). Returns `404 NOT_FOUND` if no entry with that key exists.
+
+```json
+{ "success": true, "data": { "key": "greeting", "deleted": true }, "error": null }
+```
+
+Returns `503 MEMORY_UNAVAILABLE` when no memory backend is configured.
+
+#### `GET /api/history`
+
+Lists conversation history sessions. When a durable session store is configured (SQLite backend), returns persisted session metadata. Falls back to listing active in-memory sessions when no store is available.
+
+Query parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `?limit=<n>` | Max sessions to return (default 50) |
+| `?offset=<n>` | Pagination offset (default 0) |
+
+Response (session store):
+
+```json
+{
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "session_id": "telegram:chat123",
+        "message_count": 10,
+        "first_message_at": "2026-04-01T00:00:00Z",
+        "last_message_at": "2026-04-06T12:00:00Z"
+      }
+    ],
+    "total": 1,
+    "source": "session_store"
+  },
+  "error": null
+}
+```
+
+Response (active sessions fallback):
+
+```json
+{
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "session_key": "api:default",
+        "created_at": 1712345678,
+        "last_active": 1712349278,
+        "turn_count": 5
+      }
+    ],
+    "total": 1,
+    "source": "active_sessions"
+  },
+  "error": null
+}
+```
+
+`source` is either `"session_store"` or `"active_sessions"` so callers can distinguish the shape.
+
+Returns `503 SESSION_MANAGER_UNAVAILABLE` when no session manager is running.
 
 ## Security Guidance
 

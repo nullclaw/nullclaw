@@ -12,6 +12,7 @@
 const std = @import("std");
 const Config = @import("../config.zig").Config;
 const cron_mod = @import("../cron.zig");
+const session_mod = @import("../session.zig");
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -42,6 +43,10 @@ pub const ApiContext = struct {
     /// Live CronScheduler pointer, already mutex-locked by the dispatch caller.
     /// Null when the scheduler is not running.  Handlers must not unlock it.
     scheduler_opt: ?*cron_mod.CronScheduler = null,
+    /// Live SessionManager pointer, shared with the gateway worker loop.
+    /// Null when the gateway was started without an agent session manager.
+    /// Handlers that invoke agent.turn() must lock session.mutex themselves.
+    session_mgr: ?*session_mod.SessionManager = null,
     /// Dynamic path segment extracted by the router (e.g. the ":id" portion
     /// of "/api/v1/cron/:id/run").  Set by dispatch() before calling the handler.
     path_param: ?[]const u8 = null,
@@ -92,13 +97,6 @@ pub const ApiContext = struct {
 
     /// Convenience: set a JSON error envelope with the given HTTP status code,
     /// machine-readable error code string, and human-readable message.
-    ///
-    /// NOTE: `code` and `message` are interpolated directly into a JSON string
-    /// via `{s}`.  Callers must ensure both contain no JSON-special characters
-    /// (backslash, double-quote, control characters).  All current call sites
-    /// pass string literals or `@errorName(err)` — both are always ASCII-safe.
-    /// Do not pass user-supplied or runtime-constructed strings here without
-    /// escaping them first with `jsonEscapeString` from api.zig.
     pub fn sendError(self: *ApiContext, http_status: []const u8, code: []const u8, message: []const u8) !void {
         const body_str = try std.fmt.allocPrint(
             self.allocator,
