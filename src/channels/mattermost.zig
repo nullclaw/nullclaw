@@ -12,6 +12,71 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.mattermost);
 
+fn buildTypingRequestBody(
+    allocator: std.mem.Allocator,
+    channel_id: []const u8,
+    thread_id: ?[]const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    const bw = &body_writer.writer;
+    try bw.writeAll("{\"channel_id\":");
+    try root.appendJsonStringW(bw, channel_id);
+    if (thread_id) |tid| {
+        if (tid.len > 0) {
+            try bw.writeAll(",\"parent_id\":");
+            try root.appendJsonStringW(bw, tid);
+        }
+    }
+    try bw.writeByte('}');
+    body = body_writer.toArrayList();
+    return try body.toOwnedSlice(allocator);
+}
+
+fn buildPostRequestBody(
+    allocator: std.mem.Allocator,
+    channel_id: []const u8,
+    text: []const u8,
+    thread_id: ?[]const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    const bw = &body_writer.writer;
+    try bw.writeAll("{\"channel_id\":");
+    try root.appendJsonStringW(bw, channel_id);
+    try bw.writeAll(",\"message\":");
+    try root.appendJsonStringW(bw, text);
+    if (thread_id) |tid| {
+        if (tid.len > 0) {
+            try bw.writeAll(",\"root_id\":");
+            try root.appendJsonStringW(bw, tid);
+        }
+    }
+    try bw.writeByte('}');
+    body = body_writer.toArrayList();
+    return try body.toOwnedSlice(allocator);
+}
+
+fn buildDirectChannelRequestBody(
+    allocator: std.mem.Allocator,
+    bot_id: []const u8,
+    user_id: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    const bw = &body_writer.writer;
+    try bw.writeByte('[');
+    try root.appendJsonStringW(bw, bot_id);
+    try bw.writeByte(',');
+    try root.appendJsonStringW(bw, user_id);
+    try bw.writeByte(']');
+    body = body_writer.toArrayList();
+    return try body.toOwnedSlice(allocator);
+}
+
 const SocketFd = std_compat.net.Stream.Handle;
 const invalid_socket: SocketFd = switch (builtin.os.tag) {
     .windows => std_compat.net.invalidHandle(SocketFd),
@@ -188,26 +253,14 @@ pub const MattermostChannel = struct {
         const url = std.fmt.allocPrint(self.allocator, "{s}/api/v4/users/me/typing", .{self.base_url}) catch return;
         defer self.allocator.free(url);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body);
-        defer body = body_writer.toArrayList();
-        const bw = &body_writer.writer;
-        bw.writeAll("{\"channel_id\":") catch return;
-        root.appendJsonStringW(bw, channel_id) catch return;
-        if (parsed_target.thread_id) |tid| {
-            if (tid.len > 0) {
-                bw.writeAll(",\"parent_id\":") catch return;
-                root.appendJsonStringW(bw, tid) catch return;
-            }
-        }
-        bw.writeByte('}') catch return;
+        const body = buildTypingRequestBody(self.allocator, channel_id, parsed_target.thread_id) catch return;
+        defer self.allocator.free(body);
 
         const auth_header = std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token}) catch return;
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &headers) catch return;
+        const resp = root.http_util.curlPost(self.allocator, url, body, &headers) catch return;
         self.allocator.free(resp);
     }
 
@@ -222,28 +275,14 @@ pub const MattermostChannel = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/api/v4/posts", .{self.base_url});
         defer self.allocator.free(url);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body);
-        defer body = body_writer.toArrayList();
-        const bw = &body_writer.writer;
-        try bw.writeAll("{\"channel_id\":");
-        try root.appendJsonStringW(bw, channel_id);
-        try bw.writeAll(",\"message\":");
-        try root.appendJsonStringW(bw, text);
-        if (thread_id) |tid| {
-            if (tid.len > 0) {
-                try bw.writeAll(",\"root_id\":");
-                try root.appendJsonStringW(bw, tid);
-            }
-        }
-        try bw.writeByte('}');
+        const body = try buildPostRequestBody(self.allocator, channel_id, text, thread_id);
+        defer self.allocator.free(body);
 
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &headers) catch return error.MattermostApiError;
+        const resp = root.http_util.curlPost(self.allocator, url, body, &headers) catch return error.MattermostApiError;
         defer self.allocator.free(resp);
 
         if (std.mem.indexOf(u8, resp, "\"id\"") == null) {
@@ -279,22 +318,14 @@ pub const MattermostChannel = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/api/v4/channels/direct", .{self.base_url});
         defer self.allocator.free(url);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body);
-        defer body = body_writer.toArrayList();
-        const bw = &body_writer.writer;
-        try bw.writeByte('[');
-        try root.appendJsonStringW(bw, bot_id);
-        try bw.writeByte(',');
-        try root.appendJsonStringW(bw, user_id);
-        try bw.writeByte(']');
+        const body = try buildDirectChannelRequestBody(self.allocator, bot_id, user_id);
+        defer self.allocator.free(body);
 
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &headers) catch return error.MattermostApiError;
+        const resp = root.http_util.curlPost(self.allocator, url, body, &headers) catch return error.MattermostApiError;
         defer self.allocator.free(resp);
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.MattermostApiError;
@@ -949,6 +980,28 @@ test "mattermost parseTarget supports prefixes and thread suffix" {
     const f = try parseTarget("#town-square");
     try std.testing.expect(f.kind == .channel);
     try std.testing.expectEqualStrings("town-square", f.value);
+}
+
+test "mattermost buildTypingRequestBody includes channel and thread" {
+    const alloc = std.testing.allocator;
+    const body = try buildTypingRequestBody(alloc, "town", "root-9");
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"channel_id\":\"town\",\"parent_id\":\"root-9\"}", body);
+}
+
+test "mattermost buildPostRequestBody includes non-empty message body" {
+    const alloc = std.testing.allocator;
+    // Regression: Zig 0.16 allocating writer migration must finalize before POST, or Mattermost receives EOF.
+    const body = try buildPostRequestBody(alloc, "town", "hello", null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"channel_id\":\"town\",\"message\":\"hello\"}", body);
+}
+
+test "mattermost buildDirectChannelRequestBody includes both user ids" {
+    const alloc = std.testing.allocator;
+    const body = try buildDirectChannelRequestBody(alloc, "bot-1", "user-2");
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("[\"bot-1\",\"user-2\"]", body);
 }
 
 test "mattermost sendTypingIndicator is no-op in tests" {
