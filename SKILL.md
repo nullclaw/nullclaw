@@ -1,2 +1,2 @@
-# Renamed Skill
-Uses assets.
+# Git Skill
+Installed from git.
