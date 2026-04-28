@@ -5221,6 +5221,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 std_compat.thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
                 continue;
             },
+            // In non-debug builds, std.Io.Threaded's netAcceptPosix maps EAGAIN
+            // from a non-blocking accept4() to error.Unexpected via errnoBug()
+            // instead of error.WouldBlock. Treat it identically: sleep and retry.
+            error.Unexpected => {
+                std_compat.thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
+                continue;
+            },
             else => continue,
         };
         var close_conn = true;

@@ -230,7 +230,12 @@ pub const time = struct {
 
 pub const thread = struct {
     pub fn sleep(nanoseconds: u64) void {
-        std.Io.sleep(io(), .fromNanoseconds(@intCast(nanoseconds)), .awake) catch {};
+        if (nanoseconds == 0) return;
+        const rqtp = std.c.timespec{
+            .sec = @intCast(nanoseconds / std.time.ns_per_s),
+            .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+        };
+        _ = std.c.nanosleep(&rqtp, null);
     }
 };
 
