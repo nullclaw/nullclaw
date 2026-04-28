@@ -137,7 +137,7 @@ test "buildServersJson redacts env values and preserves names" {
             .name = "context7",
             .transport = "stdio",
             .command = "npx",
-            .args = &.{"-y", "@upstash/context7-mcp"},
+            .args = &.{ "-y", "@upstash/context7-mcp" },
             .env = &env,
             .headers = &headers,
             .timeout_ms = 12_000,
@@ -160,7 +160,7 @@ test "buildServerJson includes full args for one server" {
             .name = "context7",
             .transport = "stdio",
             .command = "npx",
-            .args = &.{"-y", "@upstash/context7-mcp"},
+            .args = &.{ "-y", "@upstash/context7-mcp" },
         },
     };
 
@@ -176,7 +176,7 @@ test "appendServerSummary serializes tool_count when known" {
         .name = "context7",
         .transport = "stdio",
         .command = "npx",
-        .args = &.{"-y", "@upstash/context7-mcp"},
+        .args = &.{ "-y", "@upstash/context7-mcp" },
     };
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
