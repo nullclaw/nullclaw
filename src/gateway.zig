@@ -8096,6 +8096,45 @@ test "readHttpRequestFromReader maps Timeout to RequestTimeout" {
     try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
 }
 
+test "readHttpRequestFromReader dispatches GET when headers arrive in one read without second call" {
+    // Regression: Stream.read() used readSliceShort() which looped until the 2048-byte
+    // chunk buffer was full.  HTTP/1.1 keep-alive clients (e.g. curl) never send FIN
+    // after their request headers, so the second readv() call blocked for SO_RCVTIMEO
+    // (30 s) before returning EAGAIN → error.Unexpected → no response sent.
+    // readHttpRequestFromReader must return successfully after the first read() call
+    // when the complete request (headers + empty body for GET) is already available.
+    const KeepAliveReader = struct {
+        data: []const u8,
+        read_count: usize = 0,
+
+        const ReadError = error{WouldBlock};
+
+        fn read(self: *@This(), out: []u8) ReadError!usize {
+            if (self.read_count == 0) {
+                // First call: return the complete GET request in one shot.
+                self.read_count += 1;
+                const n = @min(out.len, self.data.len);
+                std.mem.copyForwards(u8, out[0..n], self.data[0..n]);
+                return n;
+            }
+            // Any second call would mean the reader loop did not exit after the complete
+            // request was buffered — the original bug.
+            return error.WouldBlock;
+        }
+    };
+
+    const request = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    var reader = KeepAliveReader{ .data = request };
+
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE);
+    defer std.testing.allocator.free(raw);
+
+    try std.testing.expectEqualStrings(request, raw);
+    // Exactly one read call must have been made — the loop must not call read() again
+    // after the complete request (header_end == request.len, no body) is buffered.
+    try std.testing.expectEqual(@as(usize, 1), reader.read_count);
+}
+
 test "maybeProbeA2aVision skips probe when a2a is disabled" {
     const ProbeSpy = struct {
         calls: usize = 0,

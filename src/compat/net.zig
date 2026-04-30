@@ -72,8 +72,17 @@ pub const Stream = struct {
     }
 
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
+        // Use a single readVec call (one readv() syscall) instead of readSliceShort.
+        // readSliceShort loops until the buffer is completely filled or EndOfStream,
+        // which blocks HTTP/1.1 keep-alive clients (e.g. curl) that never send FIN:
+        // the second readv() call blocks until SO_RCVTIMEO fires (30 s), then hits
+        // errnoBug(.AGAIN) → error.Unexpected and the gateway sends no response.
+        // nc works only because it sends FIN which triggers EndOfStream and breaks
+        // the loop early.  A single-syscall read returns whatever is available now.
         var stream_reader = self.toInner().reader(shared.io(), &[_]u8{});
-        return stream_reader.interface.readSliceShort(buffer) catch |err| switch (err) {
+        var data: [1][]u8 = .{buffer};
+        return stream_reader.interface.readVec(&data) catch |err| switch (err) {
+            error.EndOfStream => return 0,
             error.ReadFailed => return stream_reader.err orelse error.Unexpected,
         };
     }
@@ -442,6 +451,46 @@ test "compat net normalizes listener and stream blocking mode" {
     defer conn.stream.close();
 
     try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
+}
+
+test "compat net stream read returns partial data without blocking for more" {
+    // Regression: Stream.read() must return as soon as data is available,
+    // not loop until the entire output buffer is full or the connection closes.
+    // The previous readSliceShort() implementation blocked HTTP/1.1 keep-alive
+    // clients (e.g. curl) that do not send FIN after their request headers.
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = server.accept() catch |err| switch (err) {
+        error.WouldBlock => blk: {
+            std.time.sleep(10 * std.time.ns_per_ms);
+            break :blk try server.accept();
+        },
+        else => return err,
+    };
+    defer conn.stream.close();
+
+    // Send a small message without closing the write side — simulates an
+    // HTTP/1.1 keep-alive client that sends headers but keeps the connection open.
+    const msg = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    _ = try client.write(msg);
+
+    // Give the loopback stack a moment to deliver the segment.
+    std.time.sleep(5 * std.time.ns_per_ms);
+
+    // Stream.read() must return immediately with the available bytes.
+    // With the old readSliceShort() it would block here trying to fill
+    // a 2048-byte chunk buffer, timing out only after SO_RCVTIMEO (30 s).
+    var buf: [2048]u8 = undefined;
+    const n = try conn.stream.read(&buf);
+    try std.testing.expectEqual(msg.len, n);
+    try std.testing.expectEqualStrings(msg, buf[0..n]);
 }
 
 fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
