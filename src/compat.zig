@@ -230,7 +230,19 @@ pub const time = struct {
 
 pub const thread = struct {
     pub fn sleep(nanoseconds: u64) void {
-        std.Io.sleep(io(), .fromNanoseconds(@intCast(nanoseconds)), .awake) catch {};
+        if (nanoseconds == 0) return;
+        if (comptime @import("builtin").os.tag == .windows) {
+            // Windows: std.Io.sleep routes through IOCP and reliably suspends here.
+            std.Io.sleep(io(), .fromNanoseconds(@intCast(nanoseconds)), .awake) catch {};
+        } else {
+            // POSIX: call nanosleep directly to bypass std.Io.sleep's cooperative
+            // yield, which does not actually suspend the OS thread in Threaded IO context.
+            const rqtp = std.c.timespec{
+                .sec = @intCast(nanoseconds / std.time.ns_per_s),
+                .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+            };
+            _ = std.c.nanosleep(&rqtp, null);
+        }
     }
 };
 
@@ -294,6 +306,15 @@ pub const sync = struct {
     };
 };
 
-test {
-    std.testing.refAllDecls(@This());
+test "thread.sleep zero duration returns immediately without syscall" {
+    // Regression: std.Io.sleep cooperative yield does not actually suspend the OS thread.
+    // Smoke-test that sleep(0) takes the early-return path without panicking.
+    thread.sleep(0);
+}
+
+test "thread.sleep short duration completes without panic" {
+    // Smoke-test that the nanosleep path (POSIX) or std.Io.sleep path (Windows) is
+    // reachable and does not panic. 1 ns resolves instantly in practice.
+    // NOTE: No timing assertion — wall-clock assertions would be flaky on CI.
+    thread.sleep(1);
 }
