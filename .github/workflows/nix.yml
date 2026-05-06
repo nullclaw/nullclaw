@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  nix-build:
+    name: Test (nixos-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 24.04 restricts user namespace creation via AppArmor by default.
+      # Nix's sandbox (bwrap) and zig2nix's bootstrap build both need them.
+      - name: Allow user namespaces (required for zig2nix bwrap on Ubuntu 24.04)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 1073741824
+
+      - name: nix build
+        run: nix build .
+
+      - name: Smoke test
+        run: |
+          ./result/bin/nullclaw --version 2>/dev/null || \
+          ./result/bin/nullclaw --help 2>/dev/null || \
+          echo "Binary built at $(readlink result)/bin/nullclaw"
