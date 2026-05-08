@@ -27,4 +27,4 @@ jobs:
     with:
       binary_name: nullclaw
       artifact_prefix: nullclaw
-      force: ${{ inputs.force || false }}
+      force: ${{ github.event_name == 'schedule' || inputs.force || false }}
