@@ -5372,6 +5372,7 @@ pub fn run(
                 tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
                     .http_enabled = cfg.http_request.enabled,
                     .http_allowed_domains = cfg.http_request.allowed_domains,
+                    .http_allowed_insecure_domains = cfg.http_request.allowed_insecure_domains,
                     .http_max_response_size = cfg.http_request.max_response_size,
                     .http_timeout_secs = cfg.http_request.timeout_secs,
                     .web_search_base_url = cfg.http_request.search_base_url,

@@ -15,6 +15,7 @@ const log = std.log.scoped(.http_request);
 /// domain allowlisting, SSRF protection, and header redaction.
 pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
+    allowed_insecure_domains: []const []const u8 = &.{},
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 60,
 
@@ -46,20 +47,26 @@ pub const HttpRequestTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
 
+        // Extract host first so we can check if it's allowed to use HTTP
+        const host = net_security.extractHost(url) orelse
+            return ToolResult.fail("Invalid URL: cannot extract host");
+
+        // Check if host is allowed to use insecure HTTP (http://) scheme
+        const is_unsecure_allowed = net_security.hostMatchesAllowlist(host, self.allowed_insecure_domains);
+
         // Validate URL scheme - HTTPS only for security (AGENTS.md policy)
-        net_security.validateOutboundUrl(url) catch {
-            return ToolResult.fail("Only HTTPS URLs are allowed for security");
-        };
+        // Allow http:// only for hosts explicitly listed in allowed_insecure_domains
+        if (!is_unsecure_allowed) {
+            net_security.validateOutboundUrl(url) catch {
+                return ToolResult.fail("Only HTTPS URLs are allowed for security. Use allowed_insecure_domains to permit http:// for specific hosts.");
+            };
+        }
 
         // Build URI
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
 
-        const resolved_port: u16 = uri.port orelse 443;
-
-        // Extract host
-        const host = net_security.extractHost(url) orelse
-            return ToolResult.fail("Invalid URL: cannot extract host");
+        const resolved_port: u16 = uri.port orelse if (is_unsecure_allowed) 80 else 443;
 
         // Check domain allowlist BEFORE any DNS resolution.
         // This prevents DNS exfiltration and avoids unnecessary network calls.
@@ -84,8 +91,8 @@ pub const HttpRequestTool = struct {
         //   This is acceptable because the operator explicitly trusts these domains
         //   (e.g., internal services like searxng on private IPs).
         // - DNS rebinding protection is intentionally traded for operational flexibility.
-        const connect_host: []const u8 = if (is_allowlisted)
-            // Allowlisted: trust the operator, skip SSRF check and DNS pinning.
+        const connect_host: []const u8 = if (is_allowlisted or is_unsecure_allowed)
+            // Allowlisted or unsecure-allowed: trust the operator, skip SSRF check and DNS pinning.
             // curl will resolve the hostname itself (no --resolve pinning).
             try allocator.dupe(u8, host)
         else

@@ -1598,6 +1598,10 @@ pub const HttpRequestConfig = struct {
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
     allowed_domains: []const []const u8 = &.{},
+    /// Domains permitted to use HTTP (instead of HTTPS only).
+    /// These domains are allowed to use http:// URLs, which are insecure.
+    /// Should only contain trusted internal/private service hostnames.
+    allowed_insecure_domains: []const []const u8 = &.{},
     /// Optional outbound proxy URL used for provider/network curl requests.
     /// Supported schemes: http://, https://, socks5://
     proxy: ?[]const u8 = null,

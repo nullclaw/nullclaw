@@ -1338,6 +1338,7 @@ pub const ChannelRuntime = struct {
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
             .http_allowed_domains = config.http_request.allowed_domains,
+            .http_allowed_insecure_domains = config.http_request.allowed_insecure_domains,
             .http_max_response_size = config.http_request.max_response_size,
             .http_timeout_secs = config.http_request.timeout_secs,
             .web_search_base_url = config.http_request.search_base_url,

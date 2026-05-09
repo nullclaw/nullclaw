@@ -1251,6 +1251,7 @@ pub const SessionManager = struct {
         const runtime_tools = tools_mod.allTools(self.allocator, workspace_dir, .{
             .http_enabled = self.config.http_request.enabled,
             .http_allowed_domains = self.config.http_request.allowed_domains,
+            .http_allowed_insecure_domains = self.config.http_request.allowed_insecure_domains,
             .http_max_response_size = self.config.http_request.max_response_size,
             .http_timeout_secs = self.config.http_request.timeout_secs,
             .web_search_base_url = self.config.http_request.search_base_url,

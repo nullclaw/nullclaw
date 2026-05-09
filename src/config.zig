@@ -1389,6 +1389,7 @@ pub const Config = struct {
             .max_response_size = self.http_request.max_response_size,
             .timeout_secs = self.http_request.timeout_secs,
             .allowed_domains = self.http_request.allowed_domains,
+            .allowed_insecure_domains = self.http_request.allowed_insecure_domains,
             .proxy = self.http_request.proxy,
             .search_base_url = self.http_request.search_base_url,
             .search_provider = self.http_request.search_provider,
@@ -2674,6 +2675,8 @@ test "save roundtrip preserves extended config sections" {
     cfg.http_request.enabled = true;
     cfg.http_request.max_response_size = 12345;
     cfg.http_request.timeout_secs = 8;
+    cfg.http_request.allowed_domains = &.{"example.com", "*.internal.example.com"};
+    cfg.http_request.allowed_insecure_domains = &.{"container-1.internal", "container-2.local"};
     cfg.http_request.proxy = "socks5://127.0.0.1:1080";
     cfg.http_request.search_base_url = "https://searx.example.com";
     cfg.http_request.search_provider = "brave";
