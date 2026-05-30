@@ -6,7 +6,7 @@
 //!   - Body size limits (configurable, default 64KB)
 //!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /status, /doctor, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /status, /doctor, /pair, /logout, /webhook, /media/transcribe, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -39,11 +39,14 @@ const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const isPublicBindHost = @import("security/pairing.zig").isPublicBind;
 const channels = @import("channels/root.zig");
+const telegram_update_ingress = @import("channels/telegram_update_ingress.zig");
 const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const cron_mod = @import("cron.zig");
+const platform = @import("platform.zig");
+const voice = @import("voice.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const log = std.log.scoped(.gateway);
@@ -57,6 +60,7 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 const ACCEPT_POLL_INTERVAL_MS: u64 = 100;
 const ACCEPT_ERROR_BACKOFF_MAX_MS: u64 = 1_000;
 const ACCEPT_ERROR_LOG_INTERVAL: u32 = 20;
+const MEDIA_TRANSCRIBE_MAX_AUDIO_BYTES: usize = 24 * 1024 * 1024;
 
 /// Sliding window for rate limiting (60s).
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -493,6 +497,7 @@ pub const GatewayState = struct {
     whatsapp_account_id: []const u8 = "default",
     telegram_bot_token: []const u8,
     telegram_account_id: []const u8 = "default",
+    telegram_webhook_secret: ?[]const u8 = null,
     telegram_allow_from: []const []const u8 = &.{},
     whatsapp_allow_from: []const []const u8 = &.{},
     whatsapp_group_allow_from: []const []const u8 = &.{},
@@ -718,7 +723,8 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
     return guard.isAuthenticated(token);
 }
 
-/// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a) should
+/// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a,
+/// /media/transcribe) should
 /// be accepted for the current bind exposure and bearer token. Public binds
 /// always require a valid stored bearer token, even when interactive pairing is
 /// disabled, so generic endpoints cannot silently become anonymous Internet
@@ -971,6 +977,278 @@ fn buildWebhookSuccessResponse(
     try w.writeByte('}');
     buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
+}
+
+const MediaTranscribeResult = struct {
+    status: []const u8,
+    body: []const u8,
+};
+
+const MediaTranscribeRequest = struct {
+    audio_base64: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    source: ?[]const u8 = null,
+    language: ?[]const u8 = null,
+};
+
+fn mediaExtensionForMime(mime_type: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, mime_type, "wav") != null) return "wav";
+    if (std.mem.indexOf(u8, mime_type, "mpeg") != null or std.mem.indexOf(u8, mime_type, "mp3") != null) return "mp3";
+    if (std.mem.indexOf(u8, mime_type, "webm") != null) return "webm";
+    if (std.mem.indexOf(u8, mime_type, "mp4") != null or std.mem.indexOf(u8, mime_type, "m4a") != null) return "m4a";
+    if (std.mem.indexOf(u8, mime_type, "ogg") != null or std.mem.indexOf(u8, mime_type, "opus") != null) return "ogg";
+    return "bin";
+}
+
+fn isSafeMediaMimeType(mime_type: []const u8) bool {
+    if (mime_type.len == 0 or mime_type.len > 128) return false;
+    if (!std.mem.startsWith(u8, mime_type, "audio/")) return false;
+    for (mime_type) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return false;
+    }
+    return true;
+}
+
+fn decodeBase64Alloc(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    if (data.len == 0) return error.InvalidBase64;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data) catch return error.InvalidBase64;
+    if (decoded_len > MEDIA_TRANSCRIBE_MAX_AUDIO_BYTES) return error.AudioTooLarge;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, data) catch return error.InvalidBase64;
+    return decoded;
+}
+
+fn writeTempAudioFile(
+    allocator: std.mem.Allocator,
+    audio: []const u8,
+    mime_type: []const u8,
+) ![]u8 {
+    const tmp_dir = try platform.getTempDir(allocator);
+    defer allocator.free(tmp_dir);
+    const ext = mediaExtensionForMime(mime_type);
+    var attempts: usize = 0;
+    while (attempts < 16) : (attempts += 1) {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}{c}nullclaw_media_{x}.{s}",
+            .{ tmp_dir, std.fs.path.sep, std_compat.crypto.random.int(u64), ext },
+        );
+        const file = std_compat.fs.createFileAbsolute(path, .{
+            .read = false,
+            .truncate = false,
+            .exclusive = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => {
+                allocator.free(path);
+                return err;
+            },
+        };
+        errdefer {
+            std_compat.fs.deleteFileAbsolute(path) catch {};
+            allocator.free(path);
+        }
+        defer file.close();
+        try file.writeAll(audio);
+        return path;
+    }
+    return error.TempFileUnavailable;
+}
+
+fn appendOptionalMediaMetadata(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: ?[]const u8,
+) !void {
+    if (value) |v| {
+        try buf.append(allocator, ',');
+        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, key);
+        try buf.appendSlice(allocator, "\":");
+        try root_mod.json_util.appendJsonString(buf, allocator, v);
+    }
+}
+
+fn buildMediaTranscribeJson(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    source: ?[]const u8,
+    language: ?[]const u8,
+    mime_type: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"text\":");
+    try root_mod.json_util.appendJsonString(&buf, allocator, text);
+    try appendOptionalMediaMetadata(&buf, allocator, "source", source);
+    try appendOptionalMediaMetadata(&buf, allocator, "language", language);
+    try appendOptionalMediaMetadata(&buf, allocator, "mime_type", mime_type);
+    try buf.append(allocator, '}');
+    return buf.toOwnedSlice(allocator);
+}
+
+const MediaTranscriptionAccess = struct {
+    provider: []const u8,
+    api_key: []const u8,
+    endpoint: []const u8,
+    model: []const u8,
+
+    fn deinit(self: *const MediaTranscriptionAccess, allocator: std.mem.Allocator) void {
+        allocator.free(self.endpoint);
+    }
+};
+
+fn supportsAudioTranscriptionProvider(provider: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(provider, "openai") or
+        std.ascii.eqlIgnoreCase(provider, "groq") or
+        std.ascii.eqlIgnoreCase(provider, "telnyx");
+}
+
+fn defaultAudioTranscriptionModel(provider: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "whisper-1";
+    if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "distil-whisper/distil-large-v2";
+    return "whisper-large-v3";
+}
+
+fn customProviderBaseUrl(provider: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, provider, "custom:")) return provider["custom:".len..];
+    return null;
+}
+
+fn resolveMediaTranscriptionEndpoint(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    provider: []const u8,
+    explicit_audio_endpoint: ?[]const u8,
+) !?[]u8 {
+    if (explicit_audio_endpoint) |endpoint| return try allocator.dupe(u8, endpoint);
+    if (cfg.getProviderBaseUrl(provider)) |base_url| {
+        return try voice.transcriptionEndpointFromBaseUrl(allocator, base_url);
+    }
+    if (customProviderBaseUrl(provider)) |base_url| {
+        return try voice.transcriptionEndpointFromBaseUrl(allocator, base_url);
+    }
+    if (supportsAudioTranscriptionProvider(provider)) {
+        return try allocator.dupe(u8, voice.resolveTranscriptionEndpoint(provider, null));
+    }
+    return null;
+}
+
+fn resolveMediaAccessForProvider(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    provider: []const u8,
+    model: []const u8,
+    explicit_audio_endpoint: ?[]const u8,
+) !?MediaTranscriptionAccess {
+    const api_key = cfg.getProviderKey(provider) orelse return null;
+    const endpoint = (try resolveMediaTranscriptionEndpoint(allocator, cfg, provider, explicit_audio_endpoint)) orelse return null;
+    errdefer allocator.free(endpoint);
+    return .{
+        .provider = provider,
+        .api_key = api_key,
+        .endpoint = endpoint,
+        .model = model,
+    };
+}
+
+fn mediaProviderAlreadyTried(provider: []const u8, tried: []const []const u8) bool {
+    for (tried) |candidate| {
+        if (std.ascii.eqlIgnoreCase(provider, candidate)) return true;
+    }
+    return false;
+}
+
+fn resolveMediaTranscriptionAccess(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+) !?MediaTranscriptionAccess {
+    const configured_provider = cfg.audio_media.provider;
+    if (try resolveMediaAccessForProvider(allocator, cfg, configured_provider, cfg.audio_media.model, cfg.audio_media.base_url)) |access| {
+        return access;
+    }
+
+    const primary_candidates = [_][]const u8{ cfg.default_provider, "openai", "groq", "telnyx" };
+    for (primary_candidates) |provider| {
+        if (std.ascii.eqlIgnoreCase(provider, configured_provider)) continue;
+        const model = if (supportsAudioTranscriptionProvider(provider))
+            defaultAudioTranscriptionModel(provider)
+        else
+            cfg.audio_media.model;
+        if (try resolveMediaAccessForProvider(allocator, cfg, provider, model, null)) |access| {
+            return access;
+        }
+    }
+
+    for (cfg.providers) |entry| {
+        if (entry.base_url == null and customProviderBaseUrl(entry.name) == null) continue;
+        if (mediaProviderAlreadyTried(entry.name, primary_candidates[0..]) or std.ascii.eqlIgnoreCase(entry.name, configured_provider)) continue;
+        if (try resolveMediaAccessForProvider(allocator, cfg, entry.name, cfg.audio_media.model, null)) |access| {
+            return access;
+        }
+    }
+    return null;
+}
+
+fn handleMediaTranscribe(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    cfg: *const Config,
+) MediaTranscribeResult {
+    if (!cfg.audio_media.enabled) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"audio transcription disabled\"}" };
+    }
+
+    var parsed = std.json.parseFromSlice(MediaTranscribeRequest, allocator, body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid JSON body\"}" };
+    defer parsed.deinit();
+
+    const audio_b64 = parsed.value.audio_base64 orelse
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"audio_base64 is required\"}" };
+    const mime_type = parsed.value.mime_type orelse "audio/ogg";
+    if (!isSafeMediaMimeType(mime_type)) {
+        return .{ .status = "415 Unsupported Media Type", .body = "{\"error\":\"unsupported audio mime_type\"}" };
+    }
+    const audio = decodeBase64Alloc(allocator, audio_b64) catch |err| switch (err) {
+        error.AudioTooLarge => return .{ .status = "413 Payload Too Large", .body = "{\"error\":\"audio payload too large\"}" },
+        else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid audio_base64\"}" },
+    };
+    defer allocator.free(audio);
+
+    const access = (resolveMediaTranscriptionAccess(allocator, cfg) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"audio provider resolution failed\"}" }) orelse
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"audio provider key not configured\"}" };
+    defer access.deinit(allocator);
+    const language = parsed.value.language orelse cfg.audio_media.language;
+
+    const temp_path = writeTempAudioFile(allocator, audio, mime_type) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to stage audio\"}" };
+    defer {
+        std_compat.fs.deleteFileAbsolute(temp_path) catch {};
+        allocator.free(temp_path);
+    }
+
+    const ext = mediaExtensionForMime(mime_type);
+    var filename_buf: [64]u8 = undefined;
+    const filename = std.fmt.bufPrint(&filename_buf, "audio.{s}", .{ext}) catch "audio.bin";
+    const text = voice.transcribeFile(allocator, access.api_key, access.endpoint, temp_path, .{
+        .model = access.model,
+        .language = language,
+        .mime_type = mime_type,
+        .filename = filename,
+    }) catch return .{ .status = "502 Bad Gateway", .body = "{\"error\":\"audio transcription failed\"}" };
+    defer allocator.free(text);
+
+    const response = buildMediaTranscribeJson(allocator, text, parsed.value.source, language, parsed.value.mime_type) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to render response\"}" };
+    return .{ .status = "200 OK", .body = response };
 }
 
 /// Build a JSON challenge response: `{"challenge":"<escaped>"}`.
@@ -1917,7 +2195,7 @@ fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
 }
 
 fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []const u8, body: []const u8) bool {
-    if (allow_from.len == 0) return true;
+    if (allow_from.len == 0) return false;
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
@@ -1943,6 +2221,19 @@ fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []con
     }
 
     return false;
+}
+
+fn telegramWebhookSecretMatches(raw_request: []const u8, configured_secret: ?[]const u8) bool {
+    const secret = configured_secret orelse return false;
+    if (secret.len == 0) return false;
+    const header = extractHeader(raw_request, "X-Telegram-Bot-Api-Secret-Token") orelse return false;
+    const trimmed = std.mem.trim(u8, header, " \t\r\n");
+    return constantTimeEq(trimmed, secret);
+}
+
+fn lineSenderAllowed(allow_from: []const []const u8, evt: channels.line.LineEvent) bool {
+    const user_id = evt.user_id orelse return false;
+    return channels.isAllowed(allow_from, user_id);
 }
 
 fn telegramSessionKeyRouted(
@@ -1994,6 +2285,28 @@ const TelegramWebhookTarget = struct {
 fn telegramMessageValue(root: std.json.Value) ?std.json.Value {
     if (root != .object) return null;
     return root.object.get("message") orelse root.object.get("edited_message");
+}
+
+fn telegramMessageContentAlloc(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        if (jsonStringField(body, "text")) |text| {
+            return allocator.dupe(u8, text) catch null;
+        }
+        return null;
+    };
+    defer parsed.deinit();
+
+    const message = telegramMessageValue(parsed.value) orelse return null;
+    const base_content = telegram_update_ingress.textOrCaption(allocator, message) orelse return null;
+    const reply_text = telegram_update_ingress.replyToText(message) orelse return base_content;
+
+    const enriched = telegram_update_ingress.contentWithReplyContext(
+        allocator,
+        base_content,
+        reply_text,
+    ) catch return base_content;
+    allocator.free(base_content);
+    return enriched;
 }
 
 fn telegramMessageThreadId(message: std.json.Value) ?i64 {
@@ -2631,48 +2944,45 @@ pub fn sendTelegramReply(
     message_thread_id: ?i64,
     text: []const u8,
 ) !void {
-    // Build the curl command to call the Telegram API
+    const body = try buildTelegramReplyBody(allocator, chat_id, message_thread_id, text);
+    defer allocator.free(body);
+
+    // Tests cover the JSON construction above; skip the real Telegram side effect.
+    if (comptime builtin.is_test) return;
+
     const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
     defer allocator.free(url);
 
-    // JSON-escape the text for the body
-    var body_buf: std.ArrayList(u8) = .empty;
-    defer body_buf.deinit(allocator);
-    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_buf);
-    const w = &body_writer.writer;
-    try w.print("{{\"chat_id\":{d},\"text\":\"", .{chat_id});
-    for (text) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeAll("\"");
+    const resp = http_util.httpRequest(allocator, .POST, url, body, &.{}, "application/json", null) catch return;
+    allocator.free(resp);
+}
+
+fn buildTelegramReplyBody(
+    allocator: std.mem.Allocator,
+    chat_id: i64,
+    message_thread_id: ?i64,
+    text: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    var int_buf: [32]u8 = undefined;
+    try body.appendSlice(allocator, "{\"chat_id\":");
+    try body.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{chat_id}) catch "0");
+    try body.appendSlice(allocator, ",\"text\":");
+    try appendJsonStringBuf(&body, allocator, text);
     if (message_thread_id) |thread_id| {
-        try w.print(",\"message_thread_id\":{d}", .{thread_id});
+        try body.appendSlice(allocator, ",\"message_thread_id\":");
+        try body.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{thread_id}) catch "0");
     }
-    try w.writeAll("}");
-    body_buf = body_writer.toArrayList();
+    try body.appendSlice(allocator, "}");
+    return body.toOwnedSlice(allocator);
+}
 
-    const body = body_buf.items;
-
-    var curl_child = std_compat.process.Child.init(
-        &[_][]const u8{
-            "curl", "-s",                             "-X", "POST",
-            "-H",   "Content-Type: application/json", "-d", body,
-            url,
-        },
-        allocator,
-    );
-    curl_child.stdout_behavior = .Pipe;
-    curl_child.stderr_behavior = .Pipe;
-
-    curl_child.spawn() catch return;
-    _ = curl_child.wait() catch {};
+test "telegram reply body escapes text and includes thread" {
+    const body = try buildTelegramReplyBody(std.testing.allocator, 42, 7, "hello \"there\"\nnext");
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("{\"chat_id\":42,\"text\":\"hello \\\"there\\\"\\nnext\",\"message_thread_id\":7}", body);
 }
 
 fn userFacingAgentError(err: anyerror) []const u8 {
@@ -3323,13 +3633,22 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         var tg_bot_token = ctx.state.telegram_bot_token;
         var tg_allow_from = ctx.state.telegram_allow_from;
         var tg_account_id = ctx.state.telegram_account_id;
+        var tg_webhook_secret = ctx.state.telegram_webhook_secret;
         if (selectTelegramConfig(ctx.config_opt, ctx.target)) |tg_cfg| {
             tg_bot_token = tg_cfg.bot_token;
             tg_allow_from = tg_cfg.allow_from;
             tg_account_id = tg_cfg.account_id;
+            tg_webhook_secret = tg_cfg.webhook_secret;
         }
 
-        const msg_text = jsonStringField(b, "text");
+        if (!telegramWebhookSecretMatches(ctx.raw_request, tg_webhook_secret)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"unauthorized\"}";
+            return;
+        }
+
+        const msg_text = telegramMessageContentAlloc(ctx.req_allocator, b);
+        defer if (msg_text) |owned| ctx.req_allocator.free(owned);
         const telegram_target = telegramWebhookTarget(ctx.req_allocator, b);
         const chat_id = if (telegram_target) |target| target.chat_id else telegramChatId(ctx.req_allocator, b);
         const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
@@ -4062,17 +4381,18 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
             return;
         };
         for (events) |evt| {
-            if (line_allow_from.len > 0) {
-                if (evt.user_id) |uid| {
-                    if (!channels.isAllowed(line_allow_from, uid)) continue;
-                } else continue;
-            }
+            if (!lineSenderAllowed(line_allow_from, evt)) continue;
             if (evt.message_text) |text| {
                 var kb: [128]u8 = undefined;
                 const line_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = lineSessionKeyRouted(ctx.req_allocator, &kb, evt, line_cfg_opt, line_account_id);
                 const uid = evt.user_id orelse "unknown";
                 const line_target = lineReplyTarget(evt);
+                if (evt.reply_token) |rt| {
+                    if (!std.mem.eql(u8, line_target, "unknown")) {
+                        channels.line.cacheReplyToken(line_target, rt);
+                    }
+                }
                 var peer_buf: [160]u8 = undefined;
                 const line_peer = linePeerMetadata(evt, &peer_buf);
 
@@ -5344,6 +5664,52 @@ fn spawnA2aStreamingWorker(
     thread.detach();
 }
 
+const MediaTranscribeWorker = struct {
+    allocator: std.mem.Allocator,
+    body: []u8,
+    stream: std_compat.net.Stream,
+    config: *const Config,
+
+    fn run(self: *@This()) void {
+        defer self.stream.close();
+        defer self.allocator.free(self.body);
+        defer self.allocator.destroy(self);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req_allocator = arena.allocator();
+        const resp = handleMediaTranscribe(req_allocator, self.body, self.config);
+        writeHttpResponse(&self.stream, resp.status, CONTENT_TYPE_JSON, resp.body);
+    }
+};
+
+fn spawnMediaTranscribeWorker(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    stream: std_compat.net.Stream,
+    config: *const Config,
+) !void {
+    const worker = try allocator.create(MediaTranscribeWorker);
+    errdefer allocator.destroy(worker);
+
+    const owned_body = try allocator.dupe(u8, body);
+    errdefer allocator.free(owned_body);
+
+    worker.* = .{
+        .allocator = allocator,
+        .body = owned_body,
+        .stream = stream,
+        .config = config,
+    };
+
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE },
+        MediaTranscribeWorker.run,
+        .{worker},
+    );
+    thread.detach();
+}
+
 // ── Shared scheduler state for cross-thread access ───────────────
 
 var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
@@ -5375,8 +5741,23 @@ fn nextAcceptSleepMs(previous_sleep_ms: u64, err: anyerror) u64 {
     return @min(base * 2, ACCEPT_ERROR_BACKOFF_MAX_MS);
 }
 
+fn probeGatewayAddressAvailable(addr: std_compat.net.Address) !void {
+    if (comptime builtin.os.tag == .windows) {
+        var probe_server: ?std_compat.net.Server = addr.listen(.{ .reuse_address = false }) catch |err| switch (err) {
+            error.AddressInUse => return error.AddressInUse,
+            else => null,
+        };
+        if (probe_server) |*server| server.deinit();
+        return;
+    }
+
+    const probe_conn = std_compat.net.tcpConnectToAddress(addr) catch return;
+    probe_conn.close();
+    return error.AddressInUse;
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, POST /media/transcribe, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 /// `tunnel_url_opt` should contain the daemon's active external tunnel URL when
 /// one is available; a non-null value allows non-loopback binds without setting
@@ -5450,6 +5831,7 @@ pub fn run(
             state.telegram_bot_token = tg_cfg.bot_token;
             state.telegram_allow_from = tg_cfg.allow_from;
             state.telegram_account_id = tg_cfg.account_id;
+            state.telegram_webhook_secret = tg_cfg.webhook_secret;
         }
         if (cfg.channels.whatsappPrimary()) |wa_cfg| {
             state.whatsapp_verify_token = wa_cfg.verify_token;
@@ -5520,11 +5902,7 @@ pub fn run(
     // Best-effort probe to detect if the port is already in use.
     // A TOCTOU gap exists between probe and listen(), but listen() will still
     // fail with AddressInUse if another process binds the port in that window.
-    const probe_conn = std_compat.net.tcpConnectToAddress(addr) catch null;
-    if (probe_conn) |conn| {
-        conn.close();
-        return error.AddressInUse;
-    }
+    try probeGatewayAddressAvailable(addr);
 
     var server = try addr.listen(.{
         .reuse_address = true,
@@ -5764,6 +6142,38 @@ pub fn run(
                     }
                 }
             }
+        } else if (std.mem.eql(u8, base_path, "/media/transcribe")) {
+            // Local media transcription endpoint for gateway clients.
+            if (!is_post) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (config_opt == null) {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"not configured\"}";
+            } else {
+                const auth_header = extractHeader(raw, "Authorization");
+                const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                if (!isGenericGatewayEndpointAuthorized(pairing_guard, bearer, public_bind)) {
+                    response_status = "401 Unauthorized";
+                    response_body = "{\"error\":\"unauthorized\"}";
+                } else if (!allowScopedWebhook(&state, "media/transcribe", client_identifier)) {
+                    response_status = "429 Too Many Requests";
+                    response_body = "{\"error\":\"rate limited\"}";
+                } else if (extractBody(raw)) |b| {
+                    if (spawnMediaTranscribeWorker(allocator, b, conn.stream, config_opt.?)) {
+                        close_conn = false;
+                        response_status = "";
+                        response_body = "";
+                    } else |_| {
+                        response_status = "503 Service Unavailable";
+                        response_body = "{\"error\":\"transcription worker unavailable\"}";
+                    }
+                } else {
+                    response_status = "400 Bad Request";
+                    response_body = "{\"error\":\"empty body\"}";
+                }
+            }
         } else if (control_route_map.get(base_path)) |route| switch (route) {
             .health => {
                 response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
@@ -5972,6 +6382,141 @@ test "cron auth matrix: no pairing guard allows all" {
     // When pairing is not configured, admin routes stay open.
     try std.testing.expect(isWebhookAuthorized(null, null) == false); // webhook still fails
     try std.testing.expect(isAdminRouteAuthorized(null, null));
+}
+
+test "media transcription helpers decode base64 and render json" {
+    const decoded = try decodeBase64Alloc(std.testing.allocator, "aGVsbG8=");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
+
+    const body = try buildMediaTranscribeJson(std.testing.allocator, "hello", "mic", "en", "audio/wav");
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("{\"text\":\"hello\",\"source\":\"mic\",\"language\":\"en\",\"mime_type\":\"audio/wav\"}", body);
+}
+
+test "media transcription rejects unsafe mime before provider lookup" {
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.enabled = true;
+
+    const resp = handleMediaTranscribe(
+        std.testing.allocator,
+        "{\"audio_base64\":\"aGVsbG8=\",\"mime_type\":\"text/plain\"}",
+        &cfg,
+    );
+    try std.testing.expectEqualStrings("415 Unsupported Media Type", resp.status);
+    try std.testing.expectEqualStrings("{\"error\":\"unsupported audio mime_type\"}", resp.body);
+}
+
+test "media transcription rejects control characters in mime type" {
+    try std.testing.expect(isSafeMediaMimeType("audio/wav"));
+    try std.testing.expect(isSafeMediaMimeType("audio/webm;codecs=opus"));
+    try std.testing.expect(!isSafeMediaMimeType("text/plain"));
+    try std.testing.expect(!isSafeMediaMimeType("audio/wav\r\nX-Test: injected"));
+}
+
+test "media transcription falls back to keyed provider" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.default_provider = "openai";
+    cfg.audio_media.provider = "groq";
+    cfg.audio_media.model = "whisper-large-v3";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("whisper-1", access.model);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription ignores unsupported configured provider without explicit endpoint" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic", .api_key = "anthropic-test" },
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.default_provider = "openai";
+    cfg.audio_media.provider = "anthropic";
+    cfg.audio_media.model = "whisper-large-v3";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription allows custom configured provider with explicit endpoint" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "local-stt", .api_key = "local-key" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "local-stt";
+    cfg.audio_media.model = "whisper-custom";
+    cfg.audio_media.base_url = "http://127.0.0.1:8080/transcribe";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("local-stt", access.provider);
+    try std.testing.expectEqualStrings("local-key", access.api_key);
+    try std.testing.expectEqualStrings("whisper-custom", access.model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/transcribe", access.endpoint);
+}
+
+test "media transcription derives endpoint from provider base url" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "sk-test", .base_url = "https://proxy.example/v1" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "openai";
+    cfg.audio_media.model = "whisper-1";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("whisper-1", access.model);
+    try std.testing.expectEqualStrings("https://proxy.example/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription derives endpoint from custom provider base url" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://stt.example/openai/v1", .api_key = "custom-key" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "custom:https://stt.example/openai/v1";
+    cfg.audio_media.model = "whisper-custom";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("custom:https://stt.example/openai/v1", access.provider);
+    try std.testing.expectEqualStrings("custom-key", access.api_key);
+    try std.testing.expectEqualStrings("whisper-custom", access.model);
+    try std.testing.expectEqualStrings("https://stt.example/openai/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription stages temp file with safe extension" {
+    const path = try writeTempAudioFile(std.testing.allocator, "hello", "audio/wav");
+    defer {
+        std_compat.fs.deleteFileAbsolute(path) catch {};
+        std.testing.allocator.free(path);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, path, "nullclaw_media_") != null);
+    try std.testing.expect(std.mem.endsWith(u8, path, ".wav"));
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("hello", content);
 }
 
 test "cron auth matrix: pairing disabled allows all" {
@@ -7821,12 +8366,108 @@ test "whatsappSessionKey builds group key when group id exists" {
     try std.testing.expectEqualStrings("whatsapp:group:1203630@g.us:15550001111", key);
 }
 
-test "telegramSenderAllowed permits when allow_from is empty" {
+test "telegramSenderAllowed denies when allow_from is empty" {
     const allocator = std.testing.allocator;
     const body =
         \\{"message":{"from":{"id":12345,"username":"alice"}}}
     ;
-    try std.testing.expect(telegramSenderAllowed(allocator, &.{}, body));
+    try std.testing.expect(!telegramSenderAllowed(allocator, &.{}, body));
+}
+
+test "telegramSenderAllowed wildcard explicitly permits all senders" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"from":{"id":12345,"username":"alice"}}}
+    ;
+    const allow_from = [_][]const u8{"*"};
+    try std.testing.expect(telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramWebhookSecretMatches requires configured secret header" {
+    const raw =
+        "POST /telegram HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Telegram-Bot-Api-Secret-Token: test-secret\r\n" ++
+        "\r\n{}";
+    try std.testing.expect(telegramWebhookSecretMatches(raw, "test-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, "wrong-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, null));
+}
+
+test "lineSenderAllowed denies empty allow_from and permits wildcard" {
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U123",
+    };
+    try std.testing.expect(!lineSenderAllowed(&.{}, evt));
+    try std.testing.expect(lineSenderAllowed(&.{"*"}, evt));
+    try std.testing.expect(lineSenderAllowed(&.{"U123"}, evt));
+    try std.testing.expect(!lineSenderAllowed(&.{"U999"}, evt));
+}
+
+test "line webhook caches reply token only after sender allowlist passes" {
+    if (!build_options.enable_channel_line) return error.SkipZigTest;
+
+    channels.line.resetReplyTokenCacheForTest();
+    defer channels.line.resetReplyTokenCacheForTest();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const allowed_id = "U" ++ ("1" ** 32);
+    const blocked_id = "U" ++ ("2" ** 32);
+    const allow_from = [_][]const u8{allowed_id};
+    state.line_allow_from = &allow_from;
+    state.line_access_token = "test-token";
+
+    const blocked_body =
+        \\{"events":[{"type":"message","replyToken":"blocked_reply_token","source":{"type":"user","userId":"
+    ++ blocked_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"blocked"}}]}
+    ;
+    const blocked_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ blocked_body;
+    var blocked_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = blocked_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "blocked-line-test",
+    };
+    handleLineWebhookRoute(&blocked_ctx);
+
+    var token_buf: [512]u8 = undefined;
+    try std.testing.expect(channels.line.takeReplyToken(blocked_id, &token_buf) == null);
+
+    const allowed_body =
+        \\{"events":[{"type":"message","replyToken":"allowed_reply_token","source":{"type":"user","userId":"
+    ++ allowed_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m2","type":"text","text":"allowed"}}]}
+    ;
+    const allowed_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ allowed_body;
+    var allowed_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = allowed_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "allowed-line-test",
+    };
+    handleLineWebhookRoute(&allowed_ctx);
+
+    const cached = channels.line.takeReplyToken(allowed_id, &token_buf) orelse return error.TestExpectedEqual;
+    // Regression: disallowed LINE events must not populate the async reply-token cache.
+    try std.testing.expectEqualStrings("allowed_reply_token", cached);
 }
 
 test "telegramChatId extracts nested message.chat.id" {
@@ -7861,6 +8502,41 @@ test "telegramWebhookTarget falls back to reply message id for topic replies" {
     ;
     const target = telegramWebhookTarget(allocator, body) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(?i64, 88), target.message_thread_id);
+}
+
+test "telegramMessageContentAlloc includes reply context" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"reply_to_message":{"message_id":88,"text":"Here are the results"},"text":"show me more"}}
+    ;
+    const content = telegramMessageContentAlloc(allocator, body) orelse return error.TestExpectedEqual;
+    defer allocator.free(content);
+
+    // Regression: webhook Telegram ingress should preserve reply context just like polling ingress.
+    try std.testing.expectEqualStrings("[Replying to \"Here are the results\"] show me more", content);
+}
+
+test "telegramMessageContentAlloc uses current message text before replied text" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"reply_to_message":{"message_id":88,"text":"old text"},"text":"new text"}}
+    ;
+    const content = telegramMessageContentAlloc(allocator, body) orelse return error.TestExpectedEqual;
+    defer allocator.free(content);
+
+    // Regression: the old ad-hoc field scan could read reply_to_message.text first.
+    try std.testing.expectEqualStrings("[Replying to \"old text\"] new text", content);
+}
+
+test "telegramMessageContentAlloc falls back to caption" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"caption":"caption-only fallback"}}
+    ;
+    const content = telegramMessageContentAlloc(allocator, body) orelse return error.TestExpectedEqual;
+    defer allocator.free(content);
+
+    try std.testing.expectEqualStrings("caption-only fallback", content);
 }
 
 test "telegramSenderAllowed matches numeric sender id from nested from object" {
@@ -9937,10 +10613,29 @@ test "jsonWrapChallenge escapes malicious challenge value" {
 
 // ── Port conflict detection tests ─────────────────────────────────────
 
+test "probeGatewayAddressAvailable returns AddressInUse when port is bound" {
+    // Windows Zig 0.16 socket reuse/exclusive-bind behavior can permit another
+    // listener instead of reporting AddressInUse; keep this runtime conflict
+    // regression on platforms where the bind semantics are deterministic.
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var listener = try test_addr.listen(.{ .reuse_address = false });
+    defer listener.deinit();
+
+    // Regression: the gateway probe must not silently treat an active listener
+    // as available before the final listen call.
+    try std.testing.expectError(error.AddressInUse, probeGatewayAddressAvailable(listener.listen_address));
+}
+
 test "run returns AddressInUse when port is already bound" {
+    // Avoid calling run() for this conflict case on Windows: if the OS accepts
+    // the second bind, run() owns the gateway accept loop and the test hangs.
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
     // Find an available port by binding to port 0
     const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var listener = try test_addr.listen(.{ .reuse_address = true });
+    var listener = try test_addr.listen(.{ .reuse_address = false });
     defer listener.deinit();
 
     // Get the actual port that was assigned

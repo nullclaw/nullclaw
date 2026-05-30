@@ -196,10 +196,6 @@ pub const PushoverTool = struct {
     }
 };
 
-const env_c = @cImport({
-    @cInclude("stdlib.h");
-});
-
 const PushoverEnvGuard = struct {
     allocator: std.mem.Allocator,
     token: ?[]const u8,
@@ -214,14 +210,14 @@ const PushoverEnvGuard = struct {
         errdefer guard.deinit();
         errdefer guard.restore() catch {};
 
-        try setProcessEnv(allocator, "PUSHOVER_TOKEN", null);
-        try setProcessEnv(allocator, "PUSHOVER_USER_KEY", null);
+        try platform.setProcessEnv(allocator, "PUSHOVER_TOKEN", null);
+        try platform.setProcessEnv(allocator, "PUSHOVER_USER_KEY", null);
         return guard;
     }
 
     fn restore(self: *const PushoverEnvGuard) !void {
-        try setProcessEnv(self.allocator, "PUSHOVER_TOKEN", self.token);
-        try setProcessEnv(self.allocator, "PUSHOVER_USER_KEY", self.user_key);
+        try platform.setProcessEnv(self.allocator, "PUSHOVER_TOKEN", self.token);
+        try platform.setProcessEnv(self.allocator, "PUSHOVER_USER_KEY", self.user_key);
     }
 
     fn deinit(self: *PushoverEnvGuard) void {
@@ -229,25 +225,6 @@ const PushoverEnvGuard = struct {
         if (self.user_key) |value| self.allocator.free(value);
     }
 };
-
-fn setProcessEnv(allocator: std.mem.Allocator, name: []const u8, value: ?[]const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
-    defer allocator.free(name_z);
-
-    const rc: c_int = if (value) |env_value| blk: {
-        const value_z = try allocator.dupeZ(u8, env_value);
-        defer allocator.free(value_z);
-        break :blk if (comptime builtin.os.tag == .windows)
-            env_c._putenv_s(name_z.ptr, value_z.ptr)
-        else
-            env_c.setenv(name_z.ptr, value_z.ptr, 1);
-    } else if (comptime builtin.os.tag == .windows)
-        env_c._putenv_s(name_z.ptr, "")
-    else
-        env_c.unsetenv(name_z.ptr);
-
-    if (rc != 0) return error.EnvMutationFailed;
-}
 
 fn restorePushoverEnvOrPanic(guard: *const PushoverEnvGuard) void {
     guard.restore() catch @panic("failed to restore Pushover environment");
@@ -482,8 +459,8 @@ test "getCredentials prefers process environment over .env file" {
     defer env_guard.deinit();
     defer restorePushoverEnvOrPanic(&env_guard);
 
-    try setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
-    try setProcessEnv(std.testing.allocator, "PUSHOVER_USER_KEY", "env-user-key");
+    try platform.setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
+    try platform.setProcessEnv(std.testing.allocator, "PUSHOVER_USER_KEY", "env-user-key");
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -509,7 +486,7 @@ test "getCredentials fills missing environment value from .env file" {
     defer env_guard.deinit();
     defer restorePushoverEnvOrPanic(&env_guard);
 
-    try setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
+    try platform.setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();

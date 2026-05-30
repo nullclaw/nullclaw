@@ -8,6 +8,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
+const http_util = @import("../../http_util.zig");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -135,13 +136,27 @@ pub const ApiMemory = struct {
         method: std.http.Method,
         payload: ?[]const u8,
     ) !HttpResponse {
-        // Use curl subprocess so `timeout_ms` is guaranteed to apply.
+        // Keep curl for deterministic --max-time behavior, but keep headers out
+        // of argv and send request bodies over stdin.
         const timeout_secs: u32 = @max(@as(u32, 1), (self.timeout_ms + 999) / 1000);
         var timeout_buf: [16]u8 = undefined;
         const timeout_secs_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
 
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |h| alloc.free(h);
+
+        var headers_buf: [2][]const u8 = undefined;
+        var header_count: usize = 0;
+        headers_buf[header_count] = "Content-Type: application/json";
+        header_count += 1;
+        if (self.api_key) |key| {
+            auth_header = try std.fmt.allocPrint(alloc, "Authorization: Bearer {s}", .{key});
+            headers_buf[header_count] = auth_header.?;
+            header_count += 1;
+        }
+
+        var prepared_headers = try http_util.prepareCurlHeaderArg(alloc, headers_buf[0..header_count]);
+        defer prepared_headers.deinit(alloc);
 
         var argv_buf: [24][]const u8 = undefined;
         var argc: usize = 0;
@@ -160,23 +175,18 @@ pub const ApiMemory = struct {
         argc += 1;
         argv_buf[argc] = @tagName(method);
         argc += 1;
-        argv_buf[argc] = "--header";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
 
-        if (self.api_key) |key| {
-            auth_header = try std.fmt.allocPrint(alloc, "Authorization: Bearer {s}", .{key});
+        if (prepared_headers.arg) |headers_arg| {
             argv_buf[argc] = "--header";
             argc += 1;
-            argv_buf[argc] = auth_header.?;
+            argv_buf[argc] = headers_arg;
             argc += 1;
         }
 
-        if (payload) |body| {
-            argv_buf[argc] = "--data";
+        if (payload != null) {
+            argv_buf[argc] = "--data-binary";
             argc += 1;
-            argv_buf[argc] = body;
+            argv_buf[argc] = "@-";
             argc += 1;
         }
 
@@ -188,13 +198,35 @@ pub const ApiMemory = struct {
         argc += 1;
 
         var child = std_compat.process.Child.init(argv_buf[0..argc], alloc);
-        child.stdin_behavior = .Ignore;
+        child.stdin_behavior = if (payload != null) .Pipe else .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
 
         child.spawn() catch return error.ApiConnectionError;
 
-        const raw_out = child.stdout.?.readToEndAlloc(alloc, 16 * 1024 * 1024) catch return error.ApiConnectionError;
+        if (payload) |body| {
+            if (child.stdin) |stdin_file| {
+                stdin_file.writeAll(body) catch {
+                    stdin_file.close();
+                    child.stdin = null;
+                    _ = child.kill() catch {};
+                    _ = child.wait() catch {};
+                    return error.ApiConnectionError;
+                };
+                stdin_file.close();
+                child.stdin = null;
+            } else {
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.ApiConnectionError;
+            }
+        }
+
+        const raw_out = child.stdout.?.readToEndAlloc(alloc, 16 * 1024 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.ApiConnectionError;
+        };
         defer alloc.free(raw_out);
 
         const term = child.wait() catch return error.ApiConnectionError;

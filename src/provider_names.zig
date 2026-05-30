@@ -9,6 +9,7 @@ pub fn canonicalProviderName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "azure-openai") or std.mem.eql(u8, name, "azure_openai")) return "azure";
     if (std.mem.eql(u8, name, "novita-ai")) return "novita";
     if (std.mem.eql(u8, name, "xiaomi-mimo") or std.mem.eql(u8, name, "mimo")) return "xiaomi";
+    if (std.mem.eql(u8, name, "atlas") or std.mem.eql(u8, name, "atlascloud")) return "atlas-cloud";
     return name;
 }
 
@@ -21,6 +22,7 @@ pub fn canonicalProviderNameIgnoreCase(name: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(name, "azure-openai") or std.ascii.eqlIgnoreCase(name, "azure_openai")) return "azure";
     if (std.ascii.eqlIgnoreCase(name, "novita-ai")) return "novita";
     if (std.ascii.eqlIgnoreCase(name, "xiaomi-mimo") or std.ascii.eqlIgnoreCase(name, "mimo")) return "xiaomi";
+    if (std.ascii.eqlIgnoreCase(name, "atlas") or std.ascii.eqlIgnoreCase(name, "atlascloud")) return "atlas-cloud";
     return name;
 }
 
@@ -45,17 +47,21 @@ test "canonicalProviderName handles supported aliases" {
     try std.testing.expectEqualStrings("novita", canonicalProviderName("novita-ai"));
     try std.testing.expectEqualStrings("xiaomi", canonicalProviderName("xiaomi-mimo"));
     try std.testing.expectEqualStrings("xiaomi", canonicalProviderName("mimo"));
+    try std.testing.expectEqualStrings("atlas-cloud", canonicalProviderName("atlas"));
+    try std.testing.expectEqualStrings("atlas-cloud", canonicalProviderName("atlascloud"));
 }
 
 test "providerNamesMatch handles aliases without broadening custom providers" {
     try std.testing.expect(providerNamesMatch("azure", "azure-openai"));
     try std.testing.expect(providerNamesMatch("gemini", "google"));
     try std.testing.expect(providerNamesMatch("xiaomi", "mimo"));
+    try std.testing.expect(providerNamesMatch("atlas-cloud", "atlascloud"));
     try std.testing.expect(!providerNamesMatch("custom:https://Example.com/v1", "custom:https://example.com/v1"));
 }
 
 test "providerNamesMatchIgnoreCase preserves case-insensitive matching" {
     try std.testing.expect(providerNamesMatchIgnoreCase("azure", "AZURE-OPENAI"));
     try std.testing.expect(providerNamesMatchIgnoreCase("xiaomi", "MIMO"));
+    try std.testing.expect(providerNamesMatchIgnoreCase("Atlas-Cloud", "ATLAS"));
     try std.testing.expect(providerNamesMatchIgnoreCase("CustomGW", "customgw"));
 }

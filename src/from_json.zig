@@ -15,7 +15,7 @@ const WizardAnswers = struct {
     provider: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     model: ?[]const u8 = null,
-    memory: ?[]const u8 = null,
+    memory: ?std.json.Value = null,
     tunnel: ?[]const u8 = null,
     autonomy: ?[]const u8 = null,
     gateway_port: ?u16 = null,
@@ -86,6 +86,24 @@ fn applyChannelsFromString(cfg: *Config, channels_csv: []const u8) void {
     }
 
     cfg.channels.webhook = if (webhook_selected) .{ .port = cfg.gateway.port } else null;
+}
+
+fn applyConfigPatchFields(cfg: *Config, raw_parsed: ?std.json.Parsed(std.json.Value)) !void {
+    const rp = raw_parsed orelse return;
+    if (rp.value != .object) return;
+
+    var root_obj: std.json.ObjectMap = .empty;
+    defer root_obj.deinit(cfg.allocator);
+    const patch_fields = [_][]const u8{ "gateway", "a2a", "tools", "memory" };
+    for (patch_fields) |field| {
+        const value = rp.value.object.get(field) orelse continue;
+        if (value == .object) try root_obj.put(cfg.allocator, field, value);
+    }
+    if (root_obj.count() == 0) return;
+
+    const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, std.json.Value{ .object = root_obj }, .{});
+    defer cfg.allocator.free(patch_json);
+    try cfg.parseJson(patch_json);
 }
 
 fn initConfigWithCustomHome(backing_allocator: std.mem.Allocator, home_dir: []const u8) !Config {
@@ -521,20 +539,25 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Apply memory backend
-    if (answers.memory) |m| {
-        const backend = onboard.resolveMemoryBackendForQuickSetup(m) catch |err| switch (err) {
-            error.UnknownMemoryBackend => {
-                std.debug.print("error: unknown memory backend '{s}'\n", .{m});
-                std_compat.process.exit(1);
-            },
-            error.MemoryBackendDisabledInBuild => {
-                std.debug.print("error: memory backend '{s}' is disabled in this build\n", .{m});
-                std_compat.process.exit(1);
-            },
-        };
-        cfg.memory.backend = backend.name;
-        cfg.memory.profile = onboard.memoryProfileForBackend(backend.name);
-        cfg.memory.auto_save = backend.auto_save_default;
+    if (answers.memory) |memory_value| {
+        if (memory_value != .string) {
+            // Object-form memory config is applied below via applyMemoryFields.
+        } else {
+            const m = memory_value.string;
+            const backend = onboard.resolveMemoryBackendForQuickSetup(m) catch |err| switch (err) {
+                error.UnknownMemoryBackend => {
+                    std.debug.print("error: unknown memory backend '{s}'\n", .{m});
+                    std_compat.process.exit(1);
+                },
+                error.MemoryBackendDisabledInBuild => {
+                    std.debug.print("error: memory backend '{s}' is disabled in this build\n", .{m});
+                    std_compat.process.exit(1);
+                },
+            };
+            cfg.memory.backend = backend.name;
+            cfg.memory.profile = onboard.memoryProfileForBackend(backend.name);
+            cfg.memory.auto_save = backend.auto_save_default;
+        }
     }
 
     // Apply tunnel provider
@@ -562,6 +585,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
         cfg.gateway.port = port;
     }
+
+    try applyConfigPatchFields(&cfg, raw_parsed);
 
     // Apply channels from raw JSON payload.
     // Supports:
@@ -750,6 +775,78 @@ test "applyChannelsFromObject maps single-account webhook channel" {
     try std.testing.expect(cfg.channels.webhook != null);
     try std.testing.expectEqual(@as(u16, 4321), cfg.channels.webhook.?.port);
     try std.testing.expectEqualStrings("sec", cfg.channels.webhook.?.secret.?);
+}
+
+test "applyConfigPatchFields maps generic wizard config fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+
+    const payload =
+        \\{
+        \\  "gateway": {
+        \\    "require_pairing": true,
+        \\    "max_body_size_bytes": 67108864,
+        \\    "request_timeout_secs": 120,
+        \\    "webhook_rate_limit_per_minute": 600,
+        \\    "idempotency_ttl_secs": 30,
+        \\    "paired_tokens": ["nullhub-local-test"]
+        \\  },
+        \\  "a2a": {
+        \\    "enabled": true,
+        \\    "multi_modal": true,
+        \\    "name": "Desktop Overlay"
+        \\  },
+        \\  "tools": {
+        \\    "media": {
+        \\      "audio": {
+        \\        "enabled": true,
+        \\        "language": "en",
+        \\        "models": [
+        \\          {
+        \\            "provider": "openai",
+        \\            "model": "whisper-1",
+        \\            "base_url": "https://api.openai.com/v1/audio/transcriptions"
+        \\          }
+        \\        ]
+        \\      }
+        \\    }
+        \\  },
+        \\  "memory": {
+        \\    "profile": "minimal_none",
+        \\    "backend": "none",
+        \\    "auto_save": false
+        \\  }
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    try applyConfigPatchFields(&cfg, parsed);
+    try std.testing.expect(cfg.gateway.require_pairing);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
+    try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
+    try std.testing.expectEqual(@as(u32, 600), cfg.gateway.webhook_rate_limit_per_minute);
+    try std.testing.expectEqual(@as(u64, 30), cfg.gateway.idempotency_ttl_secs);
+    try std.testing.expectEqual(@as(usize, 1), cfg.gateway.paired_tokens.len);
+    try std.testing.expectEqualStrings("nullhub-local-test", cfg.gateway.paired_tokens[0]);
+    try std.testing.expect(cfg.a2a.enabled);
+    try std.testing.expect(cfg.a2a.multi_modal);
+    try std.testing.expectEqualStrings("Desktop Overlay", cfg.a2a.name);
+    try std.testing.expect(cfg.audio_media.enabled);
+    try std.testing.expectEqualStrings("openai", cfg.audio_media.provider);
+    try std.testing.expectEqualStrings("whisper-1", cfg.audio_media.model);
+    try std.testing.expectEqualStrings("en", cfg.audio_media.language.?);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", cfg.audio_media.base_url.?);
+    try std.testing.expectEqualStrings("minimal_none", cfg.memory.profile);
+    try std.testing.expectEqualStrings("none", cfg.memory.backend);
+    try std.testing.expect(!cfg.memory.auto_save);
 }
 
 test "applyProvidersFromArray sets model default from primary provider when omitted" {

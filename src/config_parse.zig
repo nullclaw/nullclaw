@@ -734,9 +734,147 @@ fn getAllAccountsSorted(allocator: std.mem.Allocator, channel_obj: std.json.Obje
 }
 
 fn parseTypedValue(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value) ?T {
-    return std.json.parseFromValueLeaky(T, allocator, value, .{
+    // `parseFromValueLeaky` allocates as it walks the value tree and does *not*
+    // free its partial allocations on error. To keep `allocator` clean when the
+    // parse fails, we probe inside a throwaway arena first. If the probe
+    // succeeds we re-parse with the caller's allocator (deterministic, same
+    // input). If the probe fails we apply a numeric-coercion retry (see below)
+    // — still inside the arena — before logging and giving up. Nothing leaks
+    // into `allocator` on any failure path.
+    //
+    // The coercion handles a common authoring mistake: integer items inside
+    // string-list fields (e.g. Telegram user IDs as numbers,
+    // `"allow_from": [123456789]`, instead of quoted strings). Without it the
+    // reflector errors out, the surrounding `parseMultiAccountChannel` loop
+    // silently drops the whole account via `orelse continue`, and the channel
+    // ends up "not configured" with no diagnostic. See #869 / #901.
+    var probe_arena = std.heap.ArenaAllocator.init(allocator);
+    defer probe_arena.deinit();
+    const probe_allocator = probe_arena.allocator();
+
+    if (std.json.parseFromValueLeaky(T, probe_allocator, value, .{
         .ignore_unknown_fields = true,
-    }) catch null;
+    })) |_| {
+        // Probe succeeded → re-parse for real.
+        return std.json.parseFromValueLeaky(T, allocator, value, .{
+            .ignore_unknown_fields = true,
+        }) catch null;
+    } else |first_err| {
+        // Probe failed — try once more with integer items in string-list fields
+        // stringified, so one allow-list authoring mistake does not nuke the
+        // account. Clone first; std.json.Value arrays/objects are reference
+        // containers, and mutating a shallow copy would poison the parsed tree.
+        var coerced = cloneJsonValue(probe_allocator, value) catch {
+            log.warn(
+                "channel account config failed to parse as {s}: {s}",
+                .{ @typeName(T), @errorName(first_err) },
+            );
+            return null;
+        };
+        const did_coerce = coerceIntegerStringListFields(T, probe_allocator, &coerced) catch {
+            log.warn(
+                "channel account config failed to parse as {s}: {s}",
+                .{ @typeName(T), @errorName(first_err) },
+            );
+            return null;
+        };
+        if (!did_coerce) {
+            log.warn(
+                "channel account config failed to parse as {s}: {s}",
+                .{ @typeName(T), @errorName(first_err) },
+            );
+            return null;
+        }
+
+        if (std.json.parseFromValueLeaky(T, probe_allocator, coerced, .{
+            .ignore_unknown_fields = true,
+        })) |_| {
+            return std.json.parseFromValueLeaky(T, allocator, coerced, .{
+                .ignore_unknown_fields = true,
+            }) catch null;
+        } else |retry_err| {
+            log.warn(
+                "channel account config failed to parse as {s}: {s} (retry after numeric coercion: {s})",
+                .{ @typeName(T), @errorName(first_err), @errorName(retry_err) },
+            );
+            return null;
+        }
+    }
+}
+
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .array => |arr| blk: {
+            var cloned = std.json.Array.init(allocator);
+            try cloned.ensureTotalCapacity(arr.items.len);
+            for (arr.items) |item| {
+                try cloned.append(try cloneJsonValue(allocator, item));
+            }
+            break :blk .{ .array = cloned };
+        },
+        .object => |obj| blk: {
+            var cloned: std.json.ObjectMap = .empty;
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const gop = try cloned.getOrPut(allocator, entry.key_ptr.*);
+                gop.value_ptr.* = try cloneJsonValue(allocator, entry.value_ptr.*);
+            }
+            break :blk .{ .object = cloned };
+        },
+        else => value,
+    };
+}
+
+fn isStringSlice(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |ptr| ptr.size == .slice and ptr.child == u8,
+        else => false,
+    };
+}
+
+fn isStringList(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |ptr| ptr.size == .slice and isStringSlice(ptr.child),
+        else => false,
+    };
+}
+
+/// Coerce integer JSON array items only for struct fields declared as
+/// `[]const []const u8`. This keeps channel string allow-lists permissive while
+/// leaving numeric scalar fields and non-string arrays strict.
+fn coerceIntegerStringListFields(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    value: *std.json.Value,
+) !bool {
+    if (value.* != .object) return false;
+
+    var changed = false;
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime isStringList(field.type)) {
+            if (value.object.getPtr(field.name)) |field_value| {
+                changed = (try coerceIntegerArrayItemsToStrings(allocator, field_value)) or changed;
+            }
+        }
+    }
+    return changed;
+}
+
+fn coerceIntegerArrayItemsToStrings(allocator: std.mem.Allocator, value: *std.json.Value) !bool {
+    if (value.* != .array) return false;
+
+    var changed = false;
+    for (value.array.items) |*item| {
+        switch (item.*) {
+            .integer => |n| {
+                const buf = try std.fmt.allocPrint(allocator, "{d}", .{n});
+                item.* = .{ .string = buf };
+                changed = true;
+            },
+            else => {},
+        }
+    }
+    return changed;
 }
 
 fn maybeSetAccountId(comptime T: type, allocator: std.mem.Allocator, parsed: *T, account_id: []const u8) !void {

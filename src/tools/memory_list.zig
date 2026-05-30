@@ -15,7 +15,7 @@ pub const MemoryListTool = struct {
     pub const tool_name = "memory_list";
     pub const tool_description = "List memory entries in recency order. Use for requests like 'show first N memory records' without shell/sqlite access.";
     pub const tool_params =
-        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"session_id":{"type":"string","description":"Optional session filter"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
+        \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"session_id":{"type":"string","description":"Optional session filter. Omit to list all sessions and global memory; pass an empty string to list only the current thread session."},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys (default: false)"}}}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -41,10 +41,16 @@ pub const MemoryListTool = struct {
         else
             null;
 
-        const session_id_opt: ?[]const u8 = if (root.getString(args, "session_id")) |sid_raw|
-            if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
+        // Omitted session_id lists across all sessions, including globals
+        // with session_id = NULL. An explicit empty string keeps the existing
+        // memory tool convention of selecting the current thread session.
+        const session_id_opt: ?[]const u8 = if (args.get("session_id") != null)
+            if (root.getString(args, "session_id")) |sid_raw|
+                if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
+            else
+                root.threadMemorySessionId()
         else
-            root.threadMemorySessionId();
+            null;
 
         const include_content = root.getBool(args, "include_content") orelse true;
         const include_internal = root.getBool(args, "include_internal") orelse false;
@@ -194,6 +200,89 @@ test "memory_list filters bootstrap internal keys by default" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_topic") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.AGENTS.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-agents") == null);
+}
+
+test "memory_list returns global entries when thread session is set (regression #917)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Global entries — stored with session_id = NULL.
+    try mem.store("user_language", "ru", .core, null);
+    try mem.store("user_topic", "shipping", .core, null);
+    // Session-scoped entry.
+    try mem.store("recent_message", "hi", .conversation, "session:42");
+
+    // Simulate the production code path: a running agent has its
+    // thread session id set. Before the fix, this caused memory_list
+    // to inject "session:42" as the filter, hiding the two globals.
+    const previous = root.setThreadMemorySessionId("session:42");
+    defer _ = root.setThreadMemorySessionId(previous);
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_topic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_message") != null);
+}
+
+test "memory_list explicit session_id still filters out unrelated entries" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_language", "ru", .core, null); // global
+    try mem.store("recent_a", "hi from A", .conversation, "session:A");
+    try mem.store("recent_b", "hi from B", .conversation, "session:B");
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"session_id\":\"session:A\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_a") != null);
+    // The other session's entry and the global must be excluded when
+    // an explicit session_id is passed — the fix must not turn the
+    // session filter into a no-op.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") == null);
+}
+
+test "memory_list empty session_id uses current thread session" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_language", "ru", .core, null);
+    try mem.store("recent_a", "hi from A", .conversation, "session:A");
+    try mem.store("recent_b", "hi from B", .conversation, "session:B");
+
+    const previous = root.setThreadMemorySessionId("session:A");
+    defer _ = root.setThreadMemorySessionId(previous);
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"session_id\":\"\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") == null);
 }
 
 test "memory_list preview keeps UTF-8 intact at the boundary" {

@@ -433,3 +433,23 @@ test "classifyProbeError maps probe timeout" {
     try std.testing.expectEqualStrings("probe_timeout", classified.reason);
     try std.testing.expectEqual(@as(?u16, 504), classified.status_code);
 }
+
+test "classifyProbeError maps curl transport errors" {
+    // Regression: provider chat implementations preserve these raw curl errors
+    // so health probes can distinguish transport failures from API rejections.
+    inline for (.{
+        error.CurlDnsError,
+        error.CurlConnectError,
+        error.CurlTimeout,
+        error.CurlTlsError,
+        error.CurlReadError,
+        error.CurlWriteError,
+        error.CurlWaitError,
+        error.CurlFailed,
+        error.CurlInterrupted,
+    }) |err| {
+        const classified = classifyProbeError(err);
+        try std.testing.expectEqualStrings("network_error", classified.reason);
+        try std.testing.expectEqual(@as(?u16, null), classified.status_code);
+    }
+}

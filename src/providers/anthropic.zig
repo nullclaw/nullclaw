@@ -1,11 +1,9 @@
 const std = @import("std");
-const std_compat = @import("compat");
 const log = std.log.scoped(.anthropic);
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
-const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -286,11 +284,20 @@ pub const AnthropicProvider = struct {
         var version_hdr_buf: [64]u8 = undefined;
         const version_hdr = std.fmt.bufPrint(&version_hdr_buf, "anthropic-version: {s}", .{API_VERSION}) catch return error.AnthropicApiError;
 
-        // OAuth tokens require extra beta and user-agent headers
-        const resp_body = if (is_oauth)
-            curlPostOAuth(allocator, url, body, auth_hdr, version_hdr) catch return error.AnthropicApiError
-        else
-            root.curlPostTimed(allocator, url, body, &.{ auth_hdr, version_hdr }, 0) catch return error.AnthropicApiError;
+        var headers_buf: [4][]const u8 = undefined;
+        var hdr_count: usize = 0;
+        headers_buf[hdr_count] = auth_hdr;
+        hdr_count += 1;
+        headers_buf[hdr_count] = version_hdr;
+        hdr_count += 1;
+        if (is_oauth) {
+            headers_buf[hdr_count] = "anthropic-beta: oauth-2025-04-20";
+            hdr_count += 1;
+            headers_buf[hdr_count] = "User-Agent: claude-cli/2.1.2 (external, cli)";
+            hdr_count += 1;
+        }
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..hdr_count], 0) catch |err| return root.preserveCurlTransportError(err, error.AnthropicApiError);
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body);
@@ -327,10 +334,20 @@ pub const AnthropicProvider = struct {
         var version_hdr_buf: [64]u8 = undefined;
         const version_hdr = std.fmt.bufPrint(&version_hdr_buf, "anthropic-version: {s}", .{API_VERSION}) catch return error.AnthropicApiError;
 
-        const resp_body = if (is_oauth)
-            curlPostOAuth(allocator, url, body, auth_hdr, version_hdr) catch return error.AnthropicApiError
-        else
-            root.curlPostTimed(allocator, url, body, &.{ auth_hdr, version_hdr }, request.timeout_secs) catch return error.AnthropicApiError;
+        var headers_buf: [4][]const u8 = undefined;
+        var hdr_count: usize = 0;
+        headers_buf[hdr_count] = auth_hdr;
+        hdr_count += 1;
+        headers_buf[hdr_count] = version_hdr;
+        hdr_count += 1;
+        if (is_oauth) {
+            headers_buf[hdr_count] = "anthropic-beta: oauth-2025-04-20";
+            hdr_count += 1;
+            headers_buf[hdr_count] = "User-Agent: claude-cli/2.1.2 (external, cli)";
+            hdr_count += 1;
+        }
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..hdr_count], request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.AnthropicApiError);
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body);
@@ -599,69 +616,6 @@ fn appendAnthropicThinkingConfig(
     const budget_str = std.fmt.bufPrint(&budget_buf, "{d}", .{budget}) catch return error.AnthropicApiError;
     try buf.appendSlice(allocator, budget_str);
     try buf.append(allocator, '}');
-}
-
-/// HTTP POST with OAuth-specific headers (anthropic-beta, user-agent).
-fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8, auth_hdr: []const u8, version_hdr: []const u8) ![]u8 {
-    var argv = std.ArrayListUnmanaged([]const u8).empty;
-    defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ "curl", "-s", "-X", "POST" });
-
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-    if (proxy) |p| {
-        try argv.appendSlice(allocator, &.{ "--proxy", p });
-    }
-
-    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
-    defer if (resolve_entry) |entry| allocator.free(entry);
-    if (resolve_entry) |entry| {
-        try argv.appendSlice(allocator, &.{ "--resolve", entry });
-    }
-
-    try argv.appendSlice(allocator, &.{
-        "-H", "Content-Type: application/json",   "-H",            auth_hdr,
-        "-H", version_hdr,                        "-H",            "anthropic-beta: oauth-2025-04-20",
-        "-A", "claude-cli/2.1.2 (external, cli)", "--data-binary", "@-",
-        url,
-    });
-
-    var child = std_compat.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlWriteError;
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlReadError;
-    };
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
-    }
-
-    return stdout;
 }
 
 pub const AuthHeader = struct {

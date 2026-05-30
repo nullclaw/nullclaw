@@ -300,7 +300,7 @@ pub const OpenAiProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, headers_buf[0..header_count], 0) catch return error.OpenAiApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, headers_buf[0..header_count], 0) catch |err| return root.preserveCurlTransportError(err, error.OpenAiApiError);
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body);
@@ -341,7 +341,7 @@ pub const OpenAiProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, headers_buf[0..header_count], request.timeout_secs) catch return error.OpenAiApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, headers_buf[0..header_count], request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.OpenAiApiError);
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body);

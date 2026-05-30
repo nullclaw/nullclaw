@@ -6,6 +6,7 @@ const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
 const model_refs = @import("model_refs.zig");
 const provider_names = @import("provider_names.zig");
+const pairing = @import("security/pairing.zig");
 const secrets = @import("security/secrets.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
@@ -542,6 +543,29 @@ pub const Config = struct {
     fn secretStore(self: *const Config) secrets.SecretStore {
         const config_dir = std_compat.fs.path.dirname(self.config_path) orelse ".";
         return secrets.SecretStore.init(config_dir, self.secrets.encrypt);
+    }
+
+    fn hashGatewayTokensForStorage(allocator: std.mem.Allocator, tokens: []const []const u8) ![]const []const u8 {
+        if (tokens.len == 0) return &.{};
+        const hashed = try allocator.alloc([]const u8, tokens.len);
+        errdefer allocator.free(hashed);
+        var count: usize = 0;
+        errdefer {
+            for (hashed[0..count]) |token| allocator.free(token);
+        }
+        for (tokens) |token| {
+            hashed[count] = if (pairing.isTokenHash(token))
+                try allocator.dupe(u8, token)
+            else
+                try pairing.hashTokenAlloc(allocator, token);
+            count += 1;
+        }
+        return hashed;
+    }
+
+    fn freeGatewayTokensForStorage(allocator: std.mem.Allocator, tokens: []const []const u8) void {
+        for (tokens) |token| allocator.free(token);
+        if (tokens.len > 0) allocator.free(tokens);
     }
 
     fn encryptConfigSecret(
@@ -1359,7 +1383,10 @@ pub const Config = struct {
             self.allocator.free(serialized_memory.api.api_key);
         };
         try writePrettyField(self.allocator, w, "  ", "memory", serialized_memory, ",\n");
-        try writePrettyField(self.allocator, w, "  ", "gateway", self.gateway, ",\n");
+        var serialized_gateway = self.gateway;
+        serialized_gateway.paired_tokens = try hashGatewayTokensForStorage(self.allocator, self.gateway.paired_tokens);
+        defer freeGatewayTokensForStorage(self.allocator, serialized_gateway.paired_tokens);
+        try writePrettyField(self.allocator, w, "  ", "gateway", serialized_gateway, ",\n");
         try writePrettyField(self.allocator, w, "  ", "a2a", self.a2a, ",\n");
         var serialized_tunnel = self.tunnel;
         if (serialized_tunnel.cloudflare) |*cloudflare| {
@@ -1475,11 +1502,16 @@ pub const Config = struct {
                 try w.print(",\n    \"media\": {{\n      \"audio\": {{\n", .{});
                 try w.print("        \"enabled\": {s}", .{if (am.enabled) "true" else "false"});
                 if (am.language) |lang| {
-                    try w.print(",\n        \"language\": \"{s}\"", .{lang});
+                    try w.print(",\n        \"language\": ", .{});
+                    try writeJsonStr(w, lang);
                 }
-                try w.print(",\n        \"models\": [{{\"provider\": \"{s}\", \"model\": \"{s}\"", .{ am.provider, am.model });
+                try w.print(",\n        \"models\": [{{\"provider\": ", .{});
+                try writeJsonStr(w, am.provider);
+                try w.print(", \"model\": ", .{});
+                try writeJsonStr(w, am.model);
                 if (am.base_url) |bu| {
-                    try w.print(", \"base_url\": \"{s}\"", .{bu});
+                    try w.print(", \"base_url\": ", .{});
+                    try writeJsonStr(w, bu);
                 }
                 try w.print("}}]\n      }}\n    }}", .{});
             }
@@ -1514,6 +1546,7 @@ pub const Config = struct {
         InvalidHttpSearchFallbackProvider,
         InvalidProviderApiMode,
         InvalidProviderBaseUrl,
+        InvalidAudioMediaBaseUrl,
         InvalidMcpTransport,
         MissingMcpCommand,
         MissingMcpHttpUrl,
@@ -1528,6 +1561,7 @@ pub const Config = struct {
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
+        InvalidTelegramWebhookSecret,
         InvalidTeamsWebhookSecret,
         InvalidWebMessageAuthMode,
         InvalidWebMessageAuthTransport,
@@ -1644,6 +1678,11 @@ pub const Config = struct {
                 }
             }
         }
+        if (self.audio_media.base_url) |base_url| {
+            if (!config_types.AudioMediaConfig.isValidBaseUrl(base_url)) {
+                return ValidationError.InvalidAudioMediaBaseUrl;
+            }
+        }
         for (self.http_request.search_fallback_providers) |provider| {
             if (!config_types.HttpRequestConfig.isValidSearchFallbackProviderName(provider)) {
                 return ValidationError.InvalidHttpSearchFallbackProvider;
@@ -1740,6 +1779,13 @@ pub const Config = struct {
                 }
             }
         }
+        for (self.channels.telegram) |telegram_cfg| {
+            if (telegram_cfg.webhook_secret) |webhook_secret| {
+                if (!config_types.TelegramConfig.isValidWebhookSecret(webhook_secret)) {
+                    return ValidationError.InvalidTelegramWebhookSecret;
+                }
+            }
+        }
         for (self.channels.teams) |teams_cfg| {
             if (teams_cfg.webhook_secret) |webhook_secret| {
                 if (!config_types.TeamsConfig.isValidWebhookSecret(webhook_secret)) {
@@ -1783,6 +1829,7 @@ pub const Config = struct {
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
             ValidationError.InvalidProviderApiMode => std.debug.print("Config error: models.providers.<name>.api_mode must be 'chat_completions' or 'responses'.\n", .{}),
             ValidationError.InvalidProviderBaseUrl => std.debug.print("Config error: models.providers.<name>.base_url and custom: provider URLs must be absolute http(s) URLs with no query/fragment; plain HTTP is allowed only for localhost/private hosts.\n", .{}),
+            ValidationError.InvalidAudioMediaBaseUrl => std.debug.print("Config error: tools.media.audio.models[0].base_url must be an absolute http(s) URL with no query/fragment; plain HTTP is allowed only for localhost/private hosts.\n", .{}),
             ValidationError.InvalidMcpTransport => std.debug.print("Config error: mcp_servers.<name>.transport must be 'stdio' or 'http'.\n", .{}),
             ValidationError.MissingMcpCommand => std.debug.print("Config error: mcp_servers.<name>.command is required when transport='stdio'.\n", .{}),
             ValidationError.MissingMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url is required when transport='http'.\n", .{}),
@@ -1797,6 +1844,7 @@ pub const Config = struct {
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
+            ValidationError.InvalidTelegramWebhookSecret => std.debug.print("Config error: channels.telegram.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidTeamsWebhookSecret => std.debug.print("Config error: channels.teams.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidWebMessageAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode must be 'pairing' or 'token'.\n", .{}),
             ValidationError.InvalidWebMessageAuthTransport => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode='token' is supported only when transport='local'.\n", .{}),
@@ -2752,6 +2800,8 @@ test "save roundtrip preserves extended config sections" {
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 256 * 1024);
     defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "tok-1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "tok-2") == null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2822,6 +2872,9 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
     try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.gateway.paired_tokens.len);
+    try std.testing.expect(pairing.isTokenHash(loaded.gateway.paired_tokens[0]));
+    try std.testing.expect(!std.mem.eql(u8, "tok-1", loaded.gateway.paired_tokens[0]));
 }
 
 test "save escapes mcp_servers strings safely" {
@@ -2992,8 +3045,10 @@ test "save escapes string arrays safely" {
     try std.testing.expectEqualStrings("provider\"one", loaded.reliability.fallback_providers[0]);
     try std.testing.expectEqualStrings("path\\two", loaded.reliability.fallback_providers[1]);
     try std.testing.expectEqual(@as(u32, 2), loaded.gateway.paired_tokens.len);
-    try std.testing.expectEqualStrings("tok\"one", loaded.gateway.paired_tokens[0]);
-    try std.testing.expectEqualStrings("tok\\two", loaded.gateway.paired_tokens[1]);
+    try std.testing.expect(pairing.isTokenHash(loaded.gateway.paired_tokens[0]));
+    try std.testing.expect(pairing.isTokenHash(loaded.gateway.paired_tokens[1]));
+    try std.testing.expect(!std.mem.eql(u8, "tok\"one", loaded.gateway.paired_tokens[0]));
+    try std.testing.expect(!std.mem.eql(u8, "tok\\two", loaded.gateway.paired_tokens[1]));
 }
 
 test "syncFlatFields propagates nested values" {
@@ -3177,6 +3232,33 @@ test "validation rejects remote http_request search base URL over plain http" {
     try std.testing.expectError(Config.ValidationError.InvalidHttpSearchBaseUrl, cfg.validate());
 }
 
+test "validation accepts local tools media audio base URL over plain http" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.audio_media.base_url = "http://localhost:9090/v1/audio/transcriptions";
+    try cfg.validate();
+}
+
+test "validation rejects unsafe tools media audio base URL" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    // Regression: STT requests include Authorization headers, so remote
+    // plaintext endpoints and token-in-query endpoints must fail validation.
+    cfg.audio_media.base_url = "http://stt.example.com/v1/audio/transcriptions";
+    try std.testing.expectError(Config.ValidationError.InvalidAudioMediaBaseUrl, cfg.validate());
+
+    cfg.audio_media.base_url = "https://stt.example.com/v1/audio/transcriptions?access_token=test";
+    try std.testing.expectError(Config.ValidationError.InvalidAudioMediaBaseUrl, cfg.validate());
+}
+
 test "validation accepts local diagnostics otel endpoint over plain http" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
@@ -3303,6 +3385,46 @@ test "validation rejects malformed web auth token" {
         },
     };
     try std.testing.expectError(Config.ValidationError.InvalidWebAuthToken, cfg.validate());
+}
+
+test "validation rejects malformed telegram webhook secret" {
+    const telegram_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "default",
+            .bot_token = "123:ABC",
+            .webhook_secret = "short",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &telegram_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidTelegramWebhookSecret, cfg.validate());
+}
+
+test "validation accepts telegram config with valid webhook secret" {
+    const telegram_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "default",
+            .bot_token = "123:ABC",
+            .webhook_secret = "telegram-webhook-secret-012345",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &telegram_accounts,
+        },
+    };
+    try cfg.validate();
 }
 
 test "validation accepts teams config without webhook secret" {
@@ -4450,11 +4572,11 @@ test "json parse gateway paired tokens" {
 test "json parse gateway configurable limits" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"gateway": {"max_body_size_bytes": 20971520, "request_timeout_secs": 120}}
+        \\{"gateway": {"max_body_size_bytes": 67108864, "request_timeout_secs": 120}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(@as(usize, 20 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
     try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
 }
 
@@ -5734,6 +5856,49 @@ test "save escapes provider string fields" {
     try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
 }
 
+test "save escapes tools media audio string fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.secrets.encrypt = false;
+    cfg.audio_media.provider = "local-\"stt";
+    cfg.audio_media.model = "whisper-\"custom";
+    cfg.audio_media.base_url = "https://api.example.com/v1/\"audio";
+    cfg.audio_media.language = "en-\"US";
+
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("tools").?.object;
+    const media = tools.get("media").?.object;
+    const audio = media.get("audio").?.object;
+    const models = audio.get("models").?.array;
+    const model = models.items[0].object;
+
+    try std.testing.expectEqualStrings("en-\"US", audio.get("language").?.string);
+    try std.testing.expectEqualStrings("local-\"stt", model.get("provider").?.string);
+    try std.testing.expectEqualStrings("whisper-\"custom", model.get("model").?.string);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/\"audio", model.get("base_url").?.string);
+}
+
 test "parseJson reads max_streaming_prompt_bytes from provider config" {
     // GAP-1/2: Regression — field was missing from config_parse.zig so setting
     // max_streaming_prompt_bytes in config.json had no effect.
@@ -6595,7 +6760,7 @@ test "tools.media.audio disabled" {
 test "parse telegram accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "status_reactions": true, "binding_commands_enabled": false, "topic_commands_enabled": false, "topic_map_command_enabled": false, "commands_menu_mode": "scoped", "reaction_emojis": {"accepted": "🟡", "running": "🔵", "done": "🟢", "failed": "🔴"}, "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "webhook_secret": "telegram-webhook-secret-012345", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "status_reactions": true, "binding_commands_enabled": false, "topic_commands_enabled": false, "topic_map_command_enabled": false, "commands_menu_mode": "scoped", "reaction_emojis": {"accepted": "🟡", "running": "🔵", "done": "🟢", "failed": "🔴"}, "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -6603,6 +6768,7 @@ test "parse telegram accounts" {
     const tg = cfg.channels.telegram[0];
     try std.testing.expectEqualStrings("main", tg.account_id);
     try std.testing.expectEqualStrings("123:ABC", tg.bot_token);
+    try std.testing.expectEqualStrings("telegram-webhook-secret-012345", tg.webhook_secret.?);
     try std.testing.expectEqual(@as(usize, 1), tg.allow_from.len);
     try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
     try std.testing.expect(!tg.reply_in_private);
@@ -6622,6 +6788,7 @@ test "parse telegram accounts" {
     try std.testing.expect(!tg.interactive.remove_on_click);
     allocator.free(tg.account_id);
     allocator.free(tg.bot_token);
+    allocator.free(tg.webhook_secret.?);
     for (tg.allow_from) |u| allocator.free(u);
     allocator.free(tg.allow_from);
     allocator.free(tg.proxy.?);
@@ -6690,6 +6857,77 @@ test "parse telegram accounts keeps single custom account id" {
     allocator.free(tg.account_id);
     allocator.free(tg.bot_token);
     allocator.free(cfg.channels.telegram);
+}
+
+// Regression test for #869 and #901: when `allow_from` carries Telegram numeric
+// user IDs (the way Telegram itself returns them), the whole channel account was
+// silently dropped — `parseTypedValue` got `error.UnexpectedToken` from the JSON
+// reflector, the surrounding `parseMultiAccountChannel` loop swallowed it via
+// `orelse continue`, the resulting `telegram` slice stayed empty, and the runtime
+// reported "Telegram: not configured" despite the JSON being present.
+//
+// Fix: accept integer items in `[]const []const u8` allow-lists and stringify
+// them. Two real configs from the issue reports:
+//   1) `"allow_from": [123456789]`           — single numeric id
+//   2) `"allow_from": ["alice", 123456789]`  — mixed string + int
+test "parse telegram accounts accepts numeric allow_from (regression #869, #901)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "TOKEN", "allow_from": [123456789]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    // Pre-fix behaviour: telegram.len == 0 (whole account silently dropped).
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
+    const tg = cfg.channels.telegram[0];
+    try std.testing.expectEqualStrings("main", tg.account_id);
+    try std.testing.expectEqualStrings("TOKEN", tg.bot_token);
+    try std.testing.expectEqual(@as(usize, 1), tg.allow_from.len);
+    try std.testing.expectEqualStrings("123456789", tg.allow_from[0]);
+
+    for (tg.allow_from) |u| allocator.free(u);
+    allocator.free(tg.allow_from);
+    allocator.free(tg.account_id);
+    allocator.free(tg.bot_token);
+    allocator.free(cfg.channels.telegram);
+}
+
+test "parse telegram accounts accepts mixed string + integer allow_from" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "TOKEN", "allow_from": ["alice", 12345]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
+    const tg = cfg.channels.telegram[0];
+    try std.testing.expectEqual(@as(usize, 2), tg.allow_from.len);
+    try std.testing.expectEqualStrings("alice", tg.allow_from[0]);
+    try std.testing.expectEqualStrings("12345", tg.allow_from[1]);
+
+    for (tg.allow_from) |u| allocator.free(u);
+    allocator.free(tg.allow_from);
+    allocator.free(tg.account_id);
+    allocator.free(tg.bot_token);
+    allocator.free(cfg.channels.telegram);
+}
+
+test "parse telegram accounts accepts numeric group_allow_from" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "TOKEN", "group_allow_from": [123456789]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
+    const tg = cfg.channels.telegram[0];
+    try std.testing.expectEqual(@as(usize, 1), tg.group_allow_from.len);
+    try std.testing.expectEqualStrings("123456789", tg.group_allow_from[0]);
 }
 
 test "parse discord accounts" {
@@ -7030,6 +7268,22 @@ test "parse onebot multi-account sorted alphabetically" {
     try std.testing.expectEqualStrings("ws://east.local:6700", cfg.channels.onebot[0].url);
     try std.testing.expectEqualStrings("/bot", cfg.channels.onebot[0].group_trigger_prefix.?);
     try std.testing.expectEqualStrings("west", cfg.channels.onebot[1].account_id);
+}
+
+test "parse onebot accounts accepts numeric allow_from" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"onebot": {"accounts": {"main": {"allow_from": [123456789]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.onebot.len);
+    try std.testing.expectEqualStrings("main", cfg.channels.onebot[0].account_id);
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.onebot[0].allow_from.len);
+    try std.testing.expectEqualStrings("123456789", cfg.channels.onebot[0].allow_from[0]);
 }
 
 test "parse onebot account_id in payload is overridden by account key" {

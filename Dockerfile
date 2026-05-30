@@ -6,7 +6,7 @@ FROM --platform=$BUILDPLATFORM alpine:3.23 AS builder
 
 ARG ZIG_VERSION=0.16.0
 
-RUN apk add --no-cache bash curl musl-dev python3
+RUN apk add --no-cache bash curl git musl-dev python3
 
 WORKDIR /app
 COPY .github/scripts/install-zig.sh .github/scripts/install-zig.sh
@@ -18,7 +18,7 @@ RUN set -eu; \
     mkdir -p /tmp/zig-path; \
     GITHUB_PATH=/tmp/zig-path/path RUNNER_TEMP=/opt bash .github/scripts/install-zig.sh "${ZIG_VERSION}"; \
     ln -sf "$(cat /tmp/zig-path/path)/zig" /usr/local/bin/zig; \
-    zig version
+    test "$(zig version)" = "0.16.0"
 
 ARG TARGETARCH
 ARG VERSION=dev
@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall -Dversion="${VERSION}"
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
-FROM busybox:1.37 AS config
+FROM busybox:1.38 AS config
 
 # Keep config.json at the volume root so existing compose volumes remain readable.
 RUN mkdir -p /nullclaw-data/workspace
@@ -77,7 +77,7 @@ FROM alpine:3.23 AS release-base
 
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
-RUN apk add --no-cache ca-certificates curl tzdata
+RUN apk add --no-cache ca-certificates curl git tzdata
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
@@ -85,6 +85,7 @@ COPY --from=config /nullclaw-data /nullclaw-data
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV NULLCLAW_HOME=/nullclaw-data
 ENV HOME=/nullclaw-data
+ENV SHELL=/bin/sh
 ENV NULLCLAW_GATEWAY_PORT=3000
 
 WORKDIR /nullclaw-data
@@ -93,7 +94,7 @@ ENTRYPOINT ["nullclaw"]
 CMD ["gateway", "--port", "3000", "--host", "::"]
 
 # Optional autonomous mode (explicit opt-in):
-#   docker build --target release-root -t nullclaw:root .
+#   make build DOCKER_TARGET=release-root IMAGE=nullclaw:root
 FROM release-base AS release-root
 USER 0:0
 

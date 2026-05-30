@@ -72,6 +72,7 @@ pub const appendOpenAiBodyExtraParams = helpers.appendOpenAiBodyExtraParams;
 // Direct re-exports from utility modules
 pub const appendJsonString = json_util.appendJsonString;
 pub const curlPost = http_util.curlPost;
+pub const preserveCurlTransportError = http_util.preserveCurlTransportError;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Core Types

@@ -117,7 +117,7 @@ Example:
 ### `models.providers`
 
 - Defines LLM provider connection parameters and API keys.
-- Common providers: `openrouter`, `openai`, `anthropic`, `groq`.
+- Common providers: `openrouter`, `openai`, `anthropic`, `groq`, `nearai`, `atlas-cloud`.
 
 Example:
 
@@ -126,6 +126,8 @@ Example:
   "models": {
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
+      "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
+      "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
       "anthropic": { "api_key": "sk-ant-..." },
       "openai": { "api_key": "sk-..." }
     }
@@ -486,6 +488,7 @@ Telegram example:
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"]
         }
       }
@@ -594,6 +597,7 @@ Minimal end-to-end example:
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false,
           "binding_commands_enabled": true,
@@ -710,8 +714,9 @@ Effect on delivery:
 
 Rules:
 
-- Empty `allow_from` behavior is channel-specific. Some channels, including WeChat and Discord, treat an omitted or empty list as "no filtering" rather than "deny all", so set explicit IDs/OpenIDs for a private bot.
+- Empty `allow_from` denies inbound messages on allowlist-based channels. Set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
+- Telegram webhooks require `channels.telegram.accounts.<id>.webhook_secret` and Telegram's `X-Telegram-Bot-Api-Secret-Token` header to match.
 - Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams[].webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
@@ -772,7 +777,7 @@ Discord example:
 }
 ```
 
-Set `allow_from` explicitly unless you intentionally want an open bot. In the current Discord runtime, an omitted or empty `allow_from` list disables filtering instead of denying all inbound messages.
+Set `allow_from` explicitly. An omitted or empty `allow_from` list denies inbound messages; use `["*"]` only when you intentionally want an open bot.
 
 Enable MESSAGE CONTENT INTENT in the Discord Developer Portal if you want the bot to process ordinary guild messages. Without it, Discord omits message content for most guild traffic; direct messages and messages that mention the bot still include content.
 
@@ -849,7 +854,7 @@ Parameters:
 - `token` (required) - Bot token from Discord Developer Portal
 - `intents` (default: 37377) - Gateway intents bitmask
 - `allow_bots` (default: false) - Allow messages from other bots
-- `allow_from` (default: []) - Optional allowlist of user IDs; for Discord, an omitted or empty list disables filtering, so set explicit IDs for a private bot. `["*"]` also matches all users
+- `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages. `["*"]` explicitly allows all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond
 - `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
 
@@ -885,7 +890,7 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
-On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, and `/a2a` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
+On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, `/a2a`, and `/media/transcribe` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
 On non-loopback binds, `/pair` only accepts loopback clients; do the initial pairing locally or preconfigure `paired_tokens` before exposing the gateway.
 
 | Field | Default | Description |
@@ -895,9 +900,9 @@ On non-loopback binds, `/pair` only accepts loopback clients; do the initial pai
 | `require_pairing` | `true` | Require bearer token on all API requests |
 | `allow_public_bind` | `false` | Allow binding to non-loopback addresses |
 | `pair_rate_limit_per_minute` | `10` | Max `/pair` requests per minute per IP |
-| `webhook_rate_limit_per_minute` | `60` | Max webhook requests per minute per IP |
+| `webhook_rate_limit_per_minute` | `60` | Max webhook-like authenticated requests per minute. Raise this for live `/media/transcribe` audio chunks. |
 | `idempotency_ttl_secs` | `300` | Duration to cache idempotent request results |
-| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image or file payloads (e.g. `20971520` for 20 MB). |
+| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image, audio, or file payloads (e.g. `67108864` for 64 MiB). |
 | `request_timeout_secs` | `30` | Socket read timeout for incoming HTTP requests in seconds. Raise this when accepting large payloads over slow connections. |
 
 ### `tunnel`

@@ -2,6 +2,10 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 
+const env_c = @cImport({
+    @cInclude("stdlib.h");
+});
+
 /// Cross-platform wrapper over std_compat.process.getEnvVarOwned that returns
 /// null instead of error.EnvironmentVariableNotFound.
 /// Caller owns the returned slice and must free it with `allocator.free()`.
@@ -11,6 +15,27 @@ const builtin = @import("builtin");
 /// In practice, env var allocation (< 4 KB) does not OOM.
 pub fn getEnvOrNull(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std_compat.process.getEnvVarOwned(allocator, name) catch return null;
+}
+
+/// Sets or unsets a process environment variable.
+/// Passing null removes the variable on POSIX and clears it on Windows.
+pub fn setProcessEnv(allocator: std.mem.Allocator, name: []const u8, value: ?[]const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+
+    const rc: c_int = if (value) |env_value| blk: {
+        const value_z = try allocator.dupeZ(u8, env_value);
+        defer allocator.free(value_z);
+        break :blk if (comptime builtin.os.tag == .windows)
+            env_c._putenv_s(name_z.ptr, value_z.ptr)
+        else
+            env_c.setenv(name_z.ptr, value_z.ptr, 1);
+    } else if (comptime builtin.os.tag == .windows)
+        env_c._putenv_s(name_z.ptr, "")
+    else
+        env_c.unsetenv(name_z.ptr);
+
+    if (rc != 0) return error.EnvMutationFailed;
 }
 
 /// Returns the user's home directory. Tries:
@@ -59,6 +84,24 @@ pub fn getShellFlag() []const u8 {
 
 test "getEnvOrNull returns null for missing var" {
     try std.testing.expect(getEnvOrNull(std.testing.allocator, "NULLCLAW_NONEXISTENT_VAR_12345") == null);
+}
+
+test "setProcessEnv updates and clears process env var" {
+    const allocator = std.testing.allocator;
+    const name = "NULLCLAW_PLATFORM_TEST_ENV";
+    const previous = getEnvOrNull(allocator, name);
+    defer if (previous) |value| allocator.free(value);
+    defer setProcessEnv(allocator, name, previous) catch @panic("failed to restore platform test env");
+
+    try setProcessEnv(allocator, name, "value");
+    const current = getEnvOrNull(allocator, name) orelse return error.TestUnexpectedResult;
+    defer allocator.free(current);
+    try std.testing.expectEqualStrings("value", current);
+
+    try setProcessEnv(allocator, name, null);
+    const cleared = getEnvOrNull(allocator, name);
+    defer if (cleared) |value| allocator.free(value);
+    try std.testing.expect(cleared == null);
 }
 
 test "getHomeDir returns a non-empty string" {

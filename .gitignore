@@ -1,6 +1,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
+.zig-global-cache/
 zig-pkg/
 *.db
 *.db-journal
@@ -14,11 +15,13 @@ zig-pkg/
 *.bak
 *.a
 reference/
+workspace/
 
 result
 .direnv/
 .worktrees
 config.signal.json
+config.json
 
 # IDE configurations
 .idea/

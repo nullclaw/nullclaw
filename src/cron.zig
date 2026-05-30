@@ -12,8 +12,13 @@ const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
 const Config = @import("config.zig").Config;
+const process_util = @import("tools/process_util.zig");
+const security_policy = @import("security/policy.zig");
 
 const log = std.log.scoped(.cron);
+const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
+const DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
+const safe_env_vars = [_][]const u8{ "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR" };
 
 pub const JobType = enum {
     shell,
@@ -475,6 +480,9 @@ pub const CronScheduler = struct {
     allocator: std.mem.Allocator,
     shell_cwd: ?[]const u8 = null,
     agent_timeout_secs: u64 = 0,
+    shell_timeout_ns: u64 = DEFAULT_CRON_SHELL_TIMEOUT_NS,
+    shell_max_output_bytes: usize = DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES,
+    shell_policy: security_policy.SecurityPolicy = .{},
     observer: ?observability.Observer = null,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
@@ -485,6 +493,9 @@ pub const CronScheduler = struct {
             .allocator = allocator,
             .shell_cwd = null,
             .agent_timeout_secs = 0,
+            .shell_timeout_ns = DEFAULT_CRON_SHELL_TIMEOUT_NS,
+            .shell_max_output_bytes = DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES,
+            .shell_policy = .{},
         };
     }
 
@@ -494,6 +505,19 @@ pub const CronScheduler = struct {
 
     pub fn setAgentTimeoutSecs(self: *CronScheduler, timeout_secs: u64) void {
         self.agent_timeout_secs = timeout_secs;
+    }
+
+    pub fn setShellPolicy(self: *CronScheduler, policy: security_policy.SecurityPolicy) void {
+        self.shell_policy = policy;
+    }
+
+    pub fn setShellLimits(self: *CronScheduler, timeout_ns: u64, max_output_bytes: usize) void {
+        self.shell_timeout_ns = timeout_ns;
+        self.shell_max_output_bytes = max_output_bytes;
+    }
+
+    fn validateShellCommand(self: *const CronScheduler, command: []const u8) !void {
+        _ = try self.shell_policy.validateCommandExecution(command, false);
     }
 
     fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
@@ -554,6 +578,7 @@ pub const CronScheduler = struct {
     /// Add a recurring cron job.
     pub fn addJob(self: *CronScheduler, expression: []const u8, command: []const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+        try self.validateShellCommand(command);
 
         // Validate expression
         _ = try normalizeExpression(expression);
@@ -576,6 +601,7 @@ pub const CronScheduler = struct {
     /// Add a one-shot delayed task.
     pub fn addOnce(self: *CronScheduler, delay: []const u8, command: []const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+        try self.validateShellCommand(command);
 
         const delay_secs = try parseDuration(delay);
         const now = std_compat.time.timestamp();
@@ -710,6 +736,7 @@ pub const CronScheduler = struct {
             job.next_run_secs = next_run_secs;
         }
         if (patch.command) |cmd| {
+            if (job.job_type == .shell) self.validateShellCommand(cmd) catch return false;
             const new_cmd = allocator.dupe(u8, cmd) catch return false;
             allocator.free(job.command);
             job.command = new_cmd;
@@ -889,12 +916,25 @@ pub const CronScheduler = struct {
 
             switch (job.job_type) {
                 .shell => {
-                    // Execute shell command via child process
-                    const result = std_compat.process.Child.run(.{
-                        .allocator = self.allocator,
-                        .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
-                        .cwd = self.shell_cwd,
-                    }) catch |err| {
+                    self.validateShellCommand(job.command) catch |err| {
+                        log.warn("cron shell job '{s}' blocked by security policy: {s}", .{ job.id, @errorName(err) });
+                        job.last_status = "error";
+                        job.last_run_secs = now;
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = self.allocator.dupe(u8, "cron shell command blocked by security policy") catch null;
+                        if (out_bus) |b| {
+                            _ = deliverResult(self.allocator, job.delivery, "cron shell command blocked by security policy", false, b) catch {};
+                        }
+                        continue;
+                    };
+
+                    const result = runShellJob(
+                        self.allocator,
+                        self.shell_cwd,
+                        job.command,
+                        self.shell_timeout_ns,
+                        self.shell_max_output_bytes,
+                    ) catch |err| {
                         log.err("cron job '{s}' failed to start: {}", .{ job.id, err });
                         job.last_status = "error";
                         job.last_run_secs = now;
@@ -907,12 +947,9 @@ pub const CronScheduler = struct {
                     };
                     defer self.allocator.free(result.stderr);
 
-                    const success = switch (result.term) {
-                        .exited => |code| code == 0,
-                        else => false,
-                    };
+                    const success = result.success;
                     job.last_run_secs = now;
-                    job.last_status = if (success) "ok" else "error";
+                    job.last_status = if (success) "ok" else if (result.timed_out) "timeout" else "error";
 
                     // Store and deliver stdout
                     if (job.last_output) |old| self.allocator.free(old);
@@ -1006,6 +1043,42 @@ pub const CronScheduler = struct {
 
 const agent_runner = @import("agent_runner.zig");
 const AgentRunResult = agent_runner.AgentRunResult;
+
+fn buildSafeShellEnv(allocator: std.mem.Allocator) !std_compat.process.EnvMap {
+    var env = std_compat.process.EnvMap.init(allocator);
+    errdefer env.deinit();
+
+    for (safe_env_vars) |key| {
+        if (platform.getEnvOrNull(allocator, key)) |val| {
+            defer allocator.free(val);
+            try env.put(key, val);
+        }
+    }
+
+    return env;
+}
+
+fn runShellJob(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    command: []const u8,
+    timeout_ns: u64,
+    max_output_bytes: usize,
+) !process_util.RunResult {
+    var env = try buildSafeShellEnv(allocator);
+    defer env.deinit();
+
+    return process_util.run(
+        allocator,
+        &.{ platform.getShell(), platform.getShellFlag(), command },
+        .{
+            .cwd = resolveRunnableCwd(cwd),
+            .env_map = &env,
+            .timeout_ns = timeout_ns,
+            .max_output_bytes = max_output_bytes,
+        },
+    );
+}
 
 fn runAgentJob(
     allocator: std.mem.Allocator,
@@ -2314,28 +2387,37 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
         const run_at = std_compat.time.timestamp();
         switch (job.job_type) {
             .shell => {
-                const result = std_compat.process.Child.run(.{
-                    .allocator = allocator,
-                    .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
-                    .cwd = run_cwd,
-                }) catch |err| {
+                scheduler.validateShellCommand(job.command) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
+                    log.err("Job '{s}' blocked by security policy: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+
+                const result = runShellJob(
+                    allocator,
+                    run_cwd,
+                    job.command,
+                    scheduler.shell_timeout_ns,
+                    scheduler.shell_max_output_bytes,
+                ) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
                     try saveJobs(&scheduler);
                     log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
-                defer allocator.free(result.stdout);
-                defer allocator.free(result.stderr);
+                defer result.deinit(allocator);
                 if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
-                const exit_code: u8 = switch (result.term) {
-                    .exited => |code| code,
-                    else => 1,
-                };
                 job.last_run_secs = run_at;
-                job.last_status = if (exit_code == 0) "ok" else "error";
+                job.last_status = if (result.success) "ok" else if (result.timed_out) "timeout" else "error";
                 try saveJobs(&scheduler);
-                log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
+                if (result.success) {
+                    log.info("Job '{s}' completed.", .{id});
+                } else {
+                    log.err("Job '{s}' failed.", .{id});
+                }
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
@@ -2922,6 +3004,7 @@ test "save and load roundtrip with JSON-sensitive command characters" {
 
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
 
     const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
     _ = try scheduler.addJob("*/5 * * * *", cmd);
@@ -3047,6 +3130,49 @@ test "updateJob modifies job fields" {
     try std.testing.expect(!updated.enabled);
     try std.testing.expect(updated.paused);
     try std.testing.expectEqual(SessionTarget.main, updated.session_target);
+}
+
+test "cron shell add rejects command blocked by security policy" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    try std.testing.expectError(error.CommandNotAllowed, scheduler.addJob("* * * * *", "echo blocked"));
+}
+
+test "cron shell update rejects command blocked by security policy" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo original");
+    const id = scheduler.listJobs()[0].id;
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    try std.testing.expect(!scheduler.updateJob(allocator, id, .{ .command = "echo blocked" }));
+    try std.testing.expectEqualStrings("echo original", scheduler.getJob(id).?.command);
+}
+
+test "cron shell tick blocks previously stored command when policy changes" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo stored");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
+
+    try std.testing.expectEqualStrings("error", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expectEqualStrings("cron shell command blocked by security policy", scheduler.jobs.items[0].last_output.?);
 }
 
 test "updateJob keeps agent command and prompt in sync" {
@@ -3405,6 +3531,7 @@ test "shell job uses configured cwd for relative output paths" {
 
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     scheduler.setShellCwd(workspace);
+    scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
     defer scheduler.deinit();
 
     _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");

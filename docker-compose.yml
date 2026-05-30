@@ -1,7 +1,39 @@
+x-nullclaw-build: &nullclaw-build
+  context: .
+  dockerfile: Dockerfile
+  target: ${NULLCLAW_DOCKER_TARGET:-release}
+  args:
+    ZIG_VERSION: "0.16.0"
+    VERSION: ${NULLCLAW_VERSION:-dev}
+
 services:
+  init-data:
+    image: alpine:3.23
+    profiles: ["agent", "gateway"]
+    environment:
+      NULLCLAW_UID: "${NULLCLAW_UID:-65534}"
+      NULLCLAW_GID: "${NULLCLAW_GID:-65534}"
+    command:
+      - sh
+      - -ec
+      - |
+        case "$$NULLCLAW_UID" in (""|*[!0-9]*) echo "invalid NULLCLAW_UID" >&2; exit 1;; esac
+        case "$$NULLCLAW_GID" in (""|*[!0-9]*) echo "invalid NULLCLAW_GID" >&2; exit 1;; esac
+        mkdir -p /nullclaw-data/workspace
+        chown -R "$$NULLCLAW_UID:$$NULLCLAW_GID" /nullclaw-data
+    volumes:
+      - nullclaw-data:/nullclaw-data
+      - ./workspace:/nullclaw-data/workspace
+    restart: "no"
+
   agent:
-    image: ${NULLCLAW_IMAGE:-ghcr.io/nullclaw/nullclaw:latest}
+    image: ${NULLCLAW_IMAGE:-nullclaw:local}
+    build: *nullclaw-build
     profiles: ["agent"]
+    user: "${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534}"
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
     stdin_open: true
     tty: true
     command: ["agent"]
@@ -10,22 +42,29 @@ services:
         required: false
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./workspace:/nullclaw-data/workspace
     restart: unless-stopped
 
   gateway:
-    image: ${NULLCLAW_IMAGE:-ghcr.io/nullclaw/nullclaw:latest}
+    image: ${NULLCLAW_IMAGE:-nullclaw:local}
+    build: *nullclaw-build
     profiles: ["gateway"]
-    command: ["gateway", "--port", "3000", "--host", "::"]
+    user: "${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534}"
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    command: ["gateway", "--port", "${NULLCLAW_PORT:-3210}", "--host", "0.0.0.0"]
     ports:
-      - "127.0.0.1:${NULLCLAW_GATEWAY_PORT:-3000}:3000"
+      - "${NULLCLAW_BIND:-127.0.0.1}:${NULLCLAW_PORT:-3210}:${NULLCLAW_PORT:-3210}"
     env_file:
       - path: .env
         required: false
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./workspace:/nullclaw-data/workspace
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${NULLCLAW_PORT:-3210}/health"]
       interval: 30s
       timeout: 5s
       retries: 3

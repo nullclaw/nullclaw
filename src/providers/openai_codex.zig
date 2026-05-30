@@ -392,14 +392,6 @@ fn codexStreamRequest(
     argc += 1;
     argv_buf[argc] = "POST";
     argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = auth_header;
-    argc += 1;
 
     // Add proxy from environment if set
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
@@ -434,10 +426,24 @@ fn codexStreamRequest(
     defer if (resolve_entry) |entry| allocator.free(entry);
     http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
+    var header_buf: [16][]const u8 = undefined;
+    var header_count: usize = 0;
+    header_buf[header_count] = "Content-Type: application/json";
+    header_count += 1;
+    header_buf[header_count] = auth_header;
+    header_count += 1;
     for (extra_headers) |hdr| {
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = hdr;
+        header_count += 1;
+    }
+
+    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_buf[0..header_count]);
+    defer prepared_headers.deinit(allocator);
+    if (prepared_headers.arg) |headers_arg| {
         argv_buf[argc] = "-H";
         argc += 1;
-        argv_buf[argc] = hdr;
+        argv_buf[argc] = headers_arg;
         argc += 1;
     }
 

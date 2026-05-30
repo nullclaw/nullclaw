@@ -22,7 +22,6 @@ const DEFAULT_LARK_PING_INTERVAL_MS: u32 = 120 * std.time.ms_per_s;
 const EVENT_CACHE_TTL_MS: i64 = 10_000;
 const LARK_WS_METHOD_CONTROL: i32 = 0;
 const LARK_WS_METHOD_DATA: i32 = 1;
-const LARK_API_MAX_BYTES: usize = 256 * 1024;
 const LARK_TYPING_PLACEHOLDER = "...";
 
 const LarkWsConnectConfig = struct {
@@ -887,61 +886,7 @@ pub const LarkChannel = struct {
         url: []const u8,
         headers: []const []const u8,
     ) !http_util.HttpResponse {
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = "DELETE";
-        argc += 1;
-
-        for (headers) |header| {
-            if (argc + 2 > argv_buf.len) break;
-            argv_buf[argc] = "-H";
-            argc += 1;
-            argv_buf[argc] = header;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "-w";
-        argc += 1;
-        argv_buf[argc] = "\n%{http_code}";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        child.spawn() catch return error.LarkApiError;
-
-        const stdout = child.stdout.?.readToEndAlloc(allocator, LARK_API_MAX_BYTES) catch {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.LarkApiError;
-        };
-        errdefer allocator.free(stdout);
-
-        const term = child.wait() catch return error.LarkApiError;
-        switch (term) {
-            .exited => |code| if (code != 0) return error.LarkApiError,
-            else => return error.LarkApiError,
-        }
-
-        const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.LarkApiError;
-        const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-        if (status_raw.len != 3) return error.LarkApiError;
-        const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.LarkApiError;
-        const body = try allocator.dupe(u8, stdout[0..status_sep]);
-        allocator.free(stdout);
-
-        return .{
-            .status_code = status_code,
-            .body = body,
-        };
+        return http_util.httpRequestWithStatus(allocator, .DELETE, url, null, headers, null, null);
     }
 
     fn buildRichCardContent(buf: []u8, payload: root.Channel.OutboundPayload) ![]const u8 {

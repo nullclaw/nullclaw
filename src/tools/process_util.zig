@@ -99,6 +99,64 @@ fn terminateWindowsProcessTreeByPid(pid: std.os.windows.DWORD) void {
     } else |_| {}
 }
 
+fn linuxProcessParentPid(allocator: std.mem.Allocator, pid: std.posix.pid_t) ?std.posix.pid_t {
+    if (builtin.os.tag != .linux) return null;
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid}) catch return null;
+    defer allocator.free(path);
+
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 4096) catch return null;
+    defer allocator.free(content);
+
+    const close_idx = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
+    if (close_idx + 2 >= content.len) return null;
+    const fields = std_compat.mem.trimLeft(u8, content[close_idx + 1 ..], ") ");
+    const state_end = std.mem.indexOfScalar(u8, fields, ' ') orelse return null;
+    const after_state = std_compat.mem.trimLeft(u8, fields[state_end..], " ");
+    const ppid_end = std.mem.indexOfScalar(u8, after_state, ' ') orelse after_state.len;
+    return std.fmt.parseInt(std.posix.pid_t, after_state[0..ppid_end], 10) catch null;
+}
+
+fn terminateLinuxChildProcessesFromChildrenFile(parent_pid: std.posix.pid_t, signal: std.posix.SIG) void {
+    if (builtin.os.tag != .linux) return;
+
+    const allocator = std.heap.page_allocator;
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/task/{d}/children", .{ parent_pid, parent_pid }) catch return;
+    defer allocator.free(path);
+
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 8192) catch return;
+    defer allocator.free(content);
+
+    var it = std.mem.tokenizeAny(u8, content, " \t\r\n");
+    while (it.next()) |pid_bytes| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, pid_bytes, 10) catch continue;
+        terminateLinuxChildProcessesFromChildrenFile(pid, signal);
+        std.posix.kill(pid, signal) catch {};
+    }
+}
+
+fn terminateLinuxChildProcesses(parent_pid: std.posix.pid_t, signal: std.posix.SIG) void {
+    if (builtin.os.tag != .linux) return;
+    terminateLinuxChildProcessesFromChildrenFile(parent_pid, signal);
+
+    var proc_dir = std_compat.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return;
+    defer proc_dir.close();
+
+    var iter = proc_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        if (linuxProcessParentPid(std.heap.page_allocator, pid)) |ppid| {
+            if (ppid == parent_pid) {
+                terminateLinuxChildProcesses(pid, signal);
+                std.posix.kill(pid, signal) catch {};
+            }
+        }
+    }
+}
+
 fn terminateChild(child: *std_compat.process.Child) void {
     if (comptime builtin.os.tag == .windows) {
         terminateWindowsProcessTreeByPid(GetProcessId(child.id));
@@ -109,12 +167,17 @@ fn terminateChild(child: *std_compat.process.Child) void {
         const process_group_id: std.posix.pid_t = -child.id;
         std.posix.kill(process_group_id, std.posix.SIG.TERM) catch {
             std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
-            return;
         };
+        if (comptime builtin.os.tag == .linux) {
+            terminateLinuxChildProcesses(child.id, std.posix.SIG.TERM);
+        }
 
         std_compat.thread.sleep(100 * std.time.ns_per_ms);
+        if (comptime builtin.os.tag == .linux) {
+            terminateLinuxChildProcesses(child.id, std.posix.SIG.KILL);
+        }
         std.posix.kill(process_group_id, std.posix.SIG.KILL) catch |err| switch (err) {
-            error.ProcessNotFound => {},
+            error.ProcessNotFound => std.posix.kill(child.id, std.posix.SIG.KILL) catch {},
             else => {},
         };
     }
@@ -156,6 +219,21 @@ fn processExists(pid: std.posix.pid_t) bool {
         else => return true,
     };
     return true;
+}
+
+fn processIsZombie(allocator: std.mem.Allocator, pid: std.posix.pid_t) bool {
+    if (builtin.os.tag != .linux) return false;
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid}) catch return false;
+    defer allocator.free(path);
+
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 4096) catch return false;
+    defer allocator.free(content);
+
+    const close_idx = std.mem.lastIndexOfScalar(u8, content, ')') orelse return false;
+    if (close_idx + 2 >= content.len) return false;
+    return content[close_idx + 2] == 'Z';
 }
 
 fn processExistsWindows(pid: std.os.windows.DWORD) bool {
@@ -598,7 +676,7 @@ test "run timeout kills spawned shell descendants" {
     var exited = false;
     var i: usize = 0;
     while (i < 20) : (i += 1) {
-        if (!processExists(child_pid)) {
+        if (!processExists(child_pid) or processIsZombie(allocator, child_pid)) {
             exited = true;
             break;
         }

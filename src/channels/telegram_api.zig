@@ -254,9 +254,10 @@ pub const Client = struct {
     }
 
     pub fn downloadFile(self: Client, allocator: std.mem.Allocator, file_path: []const u8, timeout: []const u8) ![]u8 {
+        _ = timeout;
         var url_buf: [1024]u8 = undefined;
         const url = try self.fileUrl(&url_buf, file_path);
-        return root.http_util.curlGetWithProxy(allocator, url, &.{}, timeout, self.proxy);
+        return root.http_util.httpGetWithProxy(allocator, url, &.{}, self.proxy);
     }
 
     pub fn postMultipart(
@@ -272,90 +273,47 @@ pub const Client = struct {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
 
-        var file_arg_buf: [1024]u8 = undefined;
-        var file_writer: std.Io.Writer = .fixed(&file_arg_buf);
-        if (std.mem.startsWith(u8, media_path, "http://") or
-            std.mem.startsWith(u8, media_path, "https://"))
-        {
-            try file_writer.print("{s}={s}", .{ field_name, media_path });
-        } else {
-            try file_writer.print("{s}=@{s}", .{ field_name, media_path });
-        }
-        const file_arg = file_writer.buffered();
-
         var chatid_arg_buf: [128]u8 = undefined;
         var chatid_writer: std.Io.Writer = .fixed(&chatid_arg_buf);
         try chatid_writer.print("chat_id={s}", .{chat_id});
         const chatid_arg = chatid_writer.buffered();
 
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "120";
-        argc += 1;
-
-        if (self.proxy) |p| {
-            argv_buf[argc] = "-x";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = chatid_arg;
-        argc += 1;
-
-        var thread_arg_buf: [128]u8 = undefined;
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(allocator);
+        const boundary = "nullclaw-telegram-boundary";
+        try appendMultipartField(&body, allocator, boundary, "chat_id", chatid_arg["chat_id=".len..]);
         if (message_thread_id) |thread_id| {
-            var thread_writer: std.Io.Writer = .fixed(&thread_arg_buf);
-            try thread_writer.print("message_thread_id={d}", .{thread_id});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = thread_writer.buffered();
-            argc += 1;
+            var thread_buf: [32]u8 = undefined;
+            const thread_str = try std.fmt.bufPrint(&thread_buf, "{d}", .{thread_id});
+            try appendMultipartField(&body, allocator, boundary, "message_thread_id", thread_str);
         }
-
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = file_arg;
-        argc += 1;
-
-        var caption_arg_buf: [1024]u8 = undefined;
         if (caption) |cap| {
-            var caption_writer: std.Io.Writer = .fixed(&caption_arg_buf);
-            try caption_writer.print("caption={s}", .{cap});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = caption_writer.buffered();
-            argc += 1;
+            try appendMultipartField(&body, allocator, boundary, "caption", cap);
         }
-
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-
-        _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
+        if (std.mem.startsWith(u8, media_path, "http://") or
+            std.mem.startsWith(u8, media_path, "https://"))
+        {
+            try appendMultipartField(&body, allocator, boundary, field_name, media_path);
+        } else {
+            const file = try std_compat.fs.cwd().openFile(media_path, .{});
+            defer file.close();
+            const data = try file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+            defer allocator.free(data);
+            try appendMultipartFile(&body, allocator, boundary, field_name, media_path, data);
         }
+        try body.appendSlice(allocator, "--" ++ boundary ++ "--\r\n");
+
+        const content_type = "multipart/form-data; boundary=" ++ boundary;
+        const resp = try root.http_util.httpRequest(allocator, .POST, url, body.items, &.{}, content_type, self.proxy);
+        defer allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
     }
 
     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
+        _ = timeout;
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
-        return root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, timeout);
+        return root.http_util.httpPostJsonWithProxy(allocator, url, body, &.{}, self.proxy);
     }
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
@@ -364,6 +322,41 @@ pub const Client = struct {
         return w.buffered();
     }
 };
+
+fn appendMultipartField(
+    body: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    boundary: []const u8,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    try body.appendSlice(allocator, "--");
+    try body.appendSlice(allocator, boundary);
+    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"");
+    try body.appendSlice(allocator, name);
+    try body.appendSlice(allocator, "\"\r\n\r\n");
+    try body.appendSlice(allocator, value);
+    try body.appendSlice(allocator, "\r\n");
+}
+
+fn appendMultipartFile(
+    body: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    boundary: []const u8,
+    name: []const u8,
+    filename: []const u8,
+    data: []const u8,
+) !void {
+    try body.appendSlice(allocator, "--");
+    try body.appendSlice(allocator, boundary);
+    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"");
+    try body.appendSlice(allocator, name);
+    try body.appendSlice(allocator, "\"; filename=\"");
+    try body.appendSlice(allocator, filename);
+    try body.appendSlice(allocator, "\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+    try body.appendSlice(allocator, data);
+    try body.appendSlice(allocator, "\r\n");
+}
 
 pub fn appendReplyTo(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, reply_to: ?i64) !void {
     if (reply_to) |rid| {

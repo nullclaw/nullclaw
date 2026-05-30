@@ -22,6 +22,8 @@ pub const MAX_MESSAGE_LEN: usize = 4000;
 
 // Update types requested via long-polling.
 const UPDATE_TYPES = "message_created,message_callback,message_edited,message_removed,bot_added,bot_removed,bot_started,bot_stopped";
+const MAX_UPLOAD_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UPLOAD_BOUNDARY = "nullclaw-max-upload-boundary";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Types
@@ -441,53 +443,8 @@ pub const Client = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []const u8, proxy: ?[]const u8) !void {
-    var argv_buf: [14][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "DELETE";
-    argc += 1;
-    argv_buf[argc] = "-m";
-    argc += 1;
-    argv_buf[argc] = "10";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = auth_header;
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "-x";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 256 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlReadError;
-    };
-    defer allocator.free(stdout);
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
-    }
+    const resp = try root.http_util.httpRequestWithStatus(allocator, .DELETE, url, null, &.{auth_header}, null, proxy);
+    allocator.free(resp.body);
 }
 
 fn curlMultipartUpload(
@@ -497,61 +454,39 @@ fn curlMultipartUpload(
     proxy: ?[]const u8,
     file_path: []const u8,
 ) ![]u8 {
-    var file_arg_buf: [1024]u8 = undefined;
-    var file_writer: std.Io.Writer = .fixed(&file_arg_buf);
-    try file_writer.print("data=@{s}", .{file_path});
-    const file_arg = file_writer.buffered();
+    const file = try std_compat.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    const data = try file.readToEndAlloc(allocator, MAX_UPLOAD_FILE_BYTES);
+    defer allocator.free(data);
 
-    var argv_buf: [18][]const u8 = undefined;
-    var argc: usize = 0;
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-m";
-    argc += 1;
-    argv_buf[argc] = "120";
-    argc += 1;
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    const filename = std.fs.path.basename(file_path);
+    try appendMaxMultipartFile(&body, allocator, MAX_UPLOAD_BOUNDARY, "data", filename, data);
+    try body.appendSlice(allocator, "--" ++ MAX_UPLOAD_BOUNDARY ++ "--\r\n");
 
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    const content_type = "multipart/form-data; boundary=" ++ MAX_UPLOAD_BOUNDARY;
+    const resp = try root.http_util.httpRequestWithStatus(allocator, .POST, url, body.items, &.{auth_header}, content_type, proxy);
+    return resp.body;
+}
 
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = auth_header;
-    argc += 1;
-    argv_buf[argc] = "-F";
-    argc += 1;
-    argv_buf[argc] = file_arg;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-    const term = child.wait() catch {
-        allocator.free(stdout);
-        return error.CurlWaitError;
-    };
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-    }
-    return stdout;
+fn appendMaxMultipartFile(
+    body: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    boundary: []const u8,
+    name: []const u8,
+    filename: []const u8,
+    data: []const u8,
+) !void {
+    try body.appendSlice(allocator, "--");
+    try body.appendSlice(allocator, boundary);
+    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"");
+    try body.appendSlice(allocator, name);
+    try body.appendSlice(allocator, "\"; filename=\"");
+    try body.appendSlice(allocator, filename);
+    try body.appendSlice(allocator, "\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+    try body.appendSlice(allocator, data);
+    try body.appendSlice(allocator, "\r\n");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -780,6 +715,20 @@ test "parseUploadDescriptor allows upload url without token" {
 test "parseUploadToken returns null on missing token" {
     const allocator = std.testing.allocator;
     try std.testing.expect(Client.parseUploadToken(allocator, "{\"other\":1}") == null);
+}
+
+test "max multipart upload body uses data file field" {
+    const allocator = std.testing.allocator;
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+
+    // Regression: Max uploads must not need curl argv for auth or upload URLs.
+    try appendMaxMultipartFile(&body, allocator, "boundary-test", "data", "sample.txt", "abc");
+    try body.appendSlice(allocator, "--boundary-test--\r\n");
+
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "Content-Disposition: form-data; name=\"data\"; filename=\"sample.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\r\n\r\nabc\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, body.items, "--boundary-test--\r\n"));
 }
 
 test "buildTextMessageBody without format" {

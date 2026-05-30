@@ -364,7 +364,7 @@ pub const DiscordChannel = struct {
         auth_writer.print("Authorization: Bot {s}", .{self.token}) catch return;
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, "{}", &.{auth_header}) catch return;
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, "{}", &.{auth_header}, null) catch return;
         self.allocator.free(resp);
     }
 
@@ -462,7 +462,7 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, body_list.items, &.{auth_header}, null) catch |err| {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -470,69 +470,12 @@ pub const DiscordChannel = struct {
     }
 
     fn sendJsonMethod(self: *DiscordChannel, method: []const u8, url: []const u8, body: []const u8) !void {
-        var argv_buf: [16][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = method;
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
-
         var auth_buf: [512]u8 = undefined;
         var auth_writer: std.Io.Writer = .fixed(&auth_buf);
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth_writer.buffered();
-        argc += 1;
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-        argv_buf[argc] = "@-";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = std_compat.process.Child.init(argv_buf[0..argc], self.allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-
-        if (child.stdin) |stdin_file| {
-            stdin_file.writeAll(body) catch {
-                stdin_file.close();
-                child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-                return error.CurlWriteError;
-            };
-            stdin_file.close();
-            child.stdin = null;
-        } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        }
-
-        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlReadError;
-        };
-        defer self.allocator.free(stdout);
-
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .exited => |code| if (code != 0) return error.DiscordApiError,
-            else => return error.DiscordApiError,
-        }
+        const http_method: std.http.Method = if (std.mem.eql(u8, method, "PATCH")) .PATCH else .POST;
+        const resp = root.http_util.httpRequest(self.allocator, http_method, url, body, &.{auth_writer.buffered()}, "application/json", null) catch return error.DiscordApiError;
+        self.allocator.free(resp);
     }
 
     fn nextInteractionToken(self: *DiscordChannel) ![]u8 {
@@ -743,7 +686,7 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, body.items, &.{auth_header}, null) catch |err| {
             log.err("Discord API rich POST failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -798,7 +741,7 @@ pub const DiscordChannel = struct {
         const owned_body = body catch return;
         defer self.allocator.free(owned_body);
 
-        const resp = root.http_util.curlPost(self.allocator, url, owned_body, &.{}) catch return;
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, owned_body, &.{}, null) catch return;
         self.allocator.free(resp);
     }
 
@@ -1369,10 +1312,8 @@ pub const DiscordChannel = struct {
         }
 
         // Filter 3: allow_from allowlist
-        if (self.allow_from.len > 0) {
-            if (!root.isAllowedScoped("discord channel", self.allow_from, author_id)) {
-                return;
-            }
+        if (!root.isAllowedScoped("discord channel", self.allow_from, author_id)) {
+            return;
         }
 
         // Process attachments (if any)
@@ -1567,7 +1508,7 @@ pub const DiscordChannel = struct {
             else => null,
         } else null;
 
-        if (self.allow_from.len > 0 and !root.isAllowedScoped("discord channel", self.allow_from, user_id)) {
+        if (!root.isAllowedScoped("discord channel", self.allow_from, user_id)) {
             self.answerInteraction(interaction_id, interaction_token, "You are not allowed to use this button");
             return;
         }
@@ -1879,6 +1820,7 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     var ch = DiscordChannel.initFromConfig(alloc, .{
         .account_id = "dc-main",
         .token = "token",
+        .allow_from = &.{"u-1"},
     });
     ch.setBus(&event_bus);
 
@@ -1914,6 +1856,51 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expectEqualStrings("Discord User", meta.value.object.get("sender_display_name").?.string);
 }
 
+test "discord handleMessageCreate empty allow_from denies inbound message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate wildcard allow_from permits inbound message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_from = &.{"*"},
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), event_bus.inboundDepth());
+    var msg = event_bus.consumeInbound().?;
+    defer msg.deinit(alloc);
+}
+
 test "discord handleInteractionCreate publishes synthetic inbound command" {
     const alloc = std.testing.allocator;
     var event_bus = bus_mod.Bus.init();
@@ -1922,6 +1909,7 @@ test "discord handleInteractionCreate publishes synthetic inbound command" {
     var ch = DiscordChannel.initFromConfig(alloc, .{
         .account_id = "dc-main",
         .token = "token",
+        .allow_from = &.{"u-9"},
     });
     ch.setBus(&event_bus);
     defer ch.deinitPendingInteractions();
@@ -1961,6 +1949,7 @@ test "discord handleMessageCreate sets is_dm metadata for direct messages" {
     var ch = DiscordChannel.initFromConfig(alloc, .{
         .account_id = "dc-main",
         .token = "token",
+        .allow_from = &.{"u-7"},
     });
     ch.setBus(&event_bus);
 
@@ -1994,6 +1983,7 @@ test "discord handleMessageCreate require_mention blocks unmentioned guild messa
         .account_id = "dc-main",
         .token = "token",
         .require_mention = true,
+        .allow_from = &.{"u-2"},
     });
     ch.setBus(&event_bus);
     ch.bot_user_id = try alloc.dupe(u8, "bot-1");
@@ -2018,6 +2008,7 @@ test "discord handleMessageCreate require_mention accepts reply to bot message" 
         .account_id = "dc-main",
         .token = "token",
         .require_mention = true,
+        .allow_from = &.{"u-2"},
     });
     ch.setBus(&event_bus);
     ch.bot_user_id = try alloc.dupe(u8, "bot-1");

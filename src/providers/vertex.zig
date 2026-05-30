@@ -309,7 +309,7 @@ pub const VertexProvider = struct {
         const auth_hdr = try self.buildAuthHeader(allocator);
         defer allocator.free(auth_hdr);
 
-        const resp_body = root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch return error.VertexApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch |err| return root.preserveCurlTransportError(err, error.VertexApiError);
         defer allocator.free(resp_body);
 
         return gemini.GeminiProvider.parseResponse(allocator, resp_body);
@@ -335,7 +335,7 @@ pub const VertexProvider = struct {
         const auth_hdr = try self.buildAuthHeader(allocator);
         defer allocator.free(auth_hdr);
 
-        const resp_body = root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch return error.VertexApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.VertexApiError);
         defer allocator.free(resp_body);
 
         return try gemini.GeminiProvider.parseChatResponse(allocator, resp_body);

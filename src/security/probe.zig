@@ -2,22 +2,23 @@ const std = @import("std");
 const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const builtin = @import("builtin");
+const process_util = @import("../tools/process_util.zig");
+
+const DEFAULT_PROBE_TIMEOUT_NS: u64 = 2 * std.time.ns_per_s;
+const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Run a probe command with stdio suppressed and treat exit code 0 as success.
 pub fn runQuietCommand(argv: []const []const u8) bool {
     if (argv.len == 0) return false;
     if (!canResolveExecutable(argv[0])) return false;
 
-    var child = std_compat.process.Child.init(argv, std.heap.page_allocator);
-    child.stderr_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    child.spawn() catch return false;
-    const term = child.wait() catch return false;
-    return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
+    const result = process_util.run(std.heap.page_allocator, argv, .{
+        .max_output_bytes = MAX_PROBE_OUTPUT_BYTES,
+        .timeout_ns = DEFAULT_PROBE_TIMEOUT_NS,
+    }) catch return false;
+    defer result.deinit(std.heap.page_allocator);
+
+    return result.success and !result.timed_out;
 }
 
 /// Check whether an executable name can be found -- either as an absolute or
@@ -162,4 +163,13 @@ test "canResolveExecutable rejects directory on PATH" {
 test "canResolveExecutable rejects empty and nonexistent" {
     try std.testing.expect(!canResolveExecutable(""));
     try std.testing.expect(!canResolveExecutable("__nonexistent_binary_nullclaw_test__"));
+}
+
+test "runQuietCommand times out stalled child" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const platform = @import("../platform.zig");
+    const start_ns = std_compat.time.nanoTimestamp();
+    try std.testing.expect(!runQuietCommand(&.{ platform.getShell(), platform.getShellFlag(), "sleep 30" }));
+    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+    try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
 }

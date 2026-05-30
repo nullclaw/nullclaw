@@ -8,6 +8,8 @@ const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const path_prefix = @import("../path_prefix.zig");
 
+const MACOS_PRIVATE_VAR_FOLDERS_PREFIX = "/private/var/folders";
+
 /// System-critical prefixes (Unix) — always blocked even if they match allowed_paths.
 const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
     "/System",
@@ -58,6 +60,30 @@ pub fn isResolvedPathAllowed(
     ws_resolved: []const u8,
     allowed_paths: []const []const u8,
 ) bool {
+    // macOS tmp dirs canonically live under /private/var/folders. Allow the
+    // active workspace (or explicit allowed paths) there before the broader
+    // /private/var blocklist check.
+    if (comptime @import("builtin").os.tag == .macos) {
+        if (pathStartsWith(ws_resolved, MACOS_PRIVATE_VAR_FOLDERS_PREFIX) and
+            pathStartsWith(resolved, ws_resolved))
+        {
+            return true;
+        }
+
+        for (allowed_paths) |raw_allowed_path| {
+            const ap = std.mem.trim(u8, raw_allowed_path, " \t\r\n");
+            if (ap.len == 0 or std.mem.eql(u8, ap, "*")) continue;
+            const ap_resolved = fs_compat.realpathAllocPath(allocator, ap) catch continue;
+            defer allocator.free(ap_resolved);
+
+            if (pathStartsWith(ap_resolved, MACOS_PRIVATE_VAR_FOLDERS_PREFIX) and
+                pathStartsWith(resolved, ap_resolved))
+            {
+                return true;
+            }
+        }
+    }
+
     // 1. System blocklist
     for (SYSTEM_BLOCKED_PREFIXES) |prefix| {
         if (pathStartsWith(resolved, prefix)) return false;
@@ -150,6 +176,28 @@ test "isResolvedPathAllowed allows exact workspace" {
         std.testing.allocator,
         "/home/user/workspace",
         "/home/user/workspace",
+        &.{},
+    ));
+}
+
+test "isResolvedPathAllowed allows workspace under private var folders" {
+    if (comptime @import("builtin").os.tag != .macos) return;
+
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/private/var/folders/x/T/workspace/file.txt",
+        "/private/var/folders/x/T/workspace",
+        &.{},
+    ));
+}
+
+test "isResolvedPathAllowed does not allow non-workspace private var paths" {
+    if (comptime @import("builtin").os.tag != .macos) return;
+
+    try std.testing.expect(!isResolvedPathAllowed(
+        std.testing.allocator,
+        "/private/var/tmp/evil/file.txt",
+        "/private/var/folders/x/T/workspace",
         &.{},
     ));
 }

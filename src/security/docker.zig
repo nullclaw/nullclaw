@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const probe = @import("probe.zig");
 const Sandbox = @import("sandbox.zig").Sandbox;
@@ -68,6 +69,10 @@ pub const DockerSandbox = struct {
     }
 
     fn isAvailable(_: *anyopaque) bool {
+        // Unit tests must not spawn Docker or depend on a local daemon. Runtime
+        // availability probing still uses `docker info` outside test builds.
+        if (builtin.is_test) return false;
+
         // Probe daemon reachability without pulling the configured image.
         return probe.runQuietCommand(&.{ "docker", "info" });
     }
@@ -248,11 +253,12 @@ test "docker sandbox name" {
     try std.testing.expectEqualStrings("docker", sb.name());
 }
 
-test "docker sandbox isAvailable returns bool" {
+test "docker sandbox isAvailable is disabled in tests" {
     var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
-    // isAvailable now checks Docker daemon reachability; result depends on environment.
-    _ = sb.isAvailable();
+    // Regression: pre-push runs the full test suite and must not hang on a
+    // host-specific Docker CLI plugin while probing `docker info`.
+    try std.testing.expect(!sb.isAvailable());
 }
 
 test "docker sandbox wrap command prepends docker run" {

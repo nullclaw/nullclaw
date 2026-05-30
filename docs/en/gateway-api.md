@@ -29,12 +29,14 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/health` | GET | None | Health check |
 | `/pair` | POST | `X-Pairing-Code` | Exchange one-time pairing code for bearer token (loopback-only when gateway is publicly bound) |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message payload: `{"message":"..."}` |
+| `/media/transcribe` | POST | `Authorization: Bearer <token>` | Transcribe base64 audio payloads through configured STT provider |
 | `/cron` | GET | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | List live scheduler jobs from the running daemon |
 | `/cron/add` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Add or schedule a live cron job |
 | `/cron/remove` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Remove a live cron job by `id` |
 | `/cron/pause` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Pause a live cron job by `id` |
 | `/cron/resume` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Resume a live cron job by `id` |
 | `/cron/update` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Partially update a live cron job |
+| `/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` matching `channels.telegram.accounts.<id>.webhook_secret` | Telegram inbound webhook |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
 | `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
@@ -125,6 +127,40 @@ Teams webhook notes:
 - Teams `channelId` endorsements are enforced from the published Bot Framework key metadata.
 - If `channels.teams[].webhook_secret` is configured, `X-Webhook-Secret` must also match exactly.
 
+## Media Transcription
+
+`POST /media/transcribe` is intended for local orchestrators. It requires the same bearer-token auth as `/webhook` and `/a2a`, and uses the configured `tools.media.audio` STT model.
+
+Request:
+
+```json
+{
+  "audio_base64": "BASE64_AUDIO_BYTES",
+  "mime_type": "audio/webm;codecs=opus",
+  "source": "mic",
+  "language": "en"
+}
+```
+
+Response:
+
+```json
+{
+  "text": "transcribed speech",
+  "source": "mic",
+  "language": "en",
+  "mime_type": "audio/webm;codecs=opus"
+}
+```
+
+Notes:
+
+- `audio_base64` is required; `mime_type` defaults to `audio/ogg`.
+- Only `audio/*` MIME types are accepted.
+- Raise `gateway.max_body_size_bytes`, `gateway.request_timeout_secs`, and `gateway.webhook_rate_limit_per_minute` for live desktop audio chunking.
+- `tools.media.audio.models[0]` selects the STT provider/model/endpoint. If that provider has no key, NullClaw falls back to a keyed OpenAI/Groq/Telnyx provider when available.
+- Custom STT endpoints must be HTTPS for remote hosts; plain HTTP is accepted only for local/private endpoints and URLs with query or fragment parts are rejected.
+
 ## A2A (Agent-to-Agent Protocol)
 
 NullClaw implements [Google's A2A protocol v0.3.0](https://github.com/google/A2A) over JSON-RPC 2.0, enabling interoperability with any A2A-compatible agent or client.
@@ -163,7 +199,7 @@ To accept large image payloads, raise the gateway's HTTP body limit and socket r
 ```json
 {
   "gateway": {
-    "max_body_size_bytes": 20971520,
+    "max_body_size_bytes": 67108864,
     "request_timeout_secs": 120
   }
 }
@@ -306,7 +342,7 @@ Include `contextId` in the message to group tasks into a conversation. All messa
 
 1. Keep `gateway.require_pairing = true`.
 2. Keep gateway on loopback (`127.0.0.1`) and expose externally through tunnel/proxy.
-3. If you intentionally use a non-loopback bind, generic endpoints (`/webhook`, `/cron/*`, `/a2a`) still require a stored bearer token even when interactive pairing is disabled; preconfigure `gateway.paired_tokens` if you are not using `/pair`.
+3. If you intentionally use a non-loopback bind, generic endpoints (`/webhook`, `/cron/*`, `/a2a`, `/media/transcribe`) still require a stored bearer token even when interactive pairing is disabled; preconfigure `gateway.paired_tokens` if you are not using `/pair`.
 4. On non-loopback binds, `/pair` only accepts loopback clients. Do initial pairing locally or preconfigure `gateway.paired_tokens` before exposing the port.
 5. Treat bearer tokens as secrets; do not commit or log them.
 6. Treat Max webhook secrets the same way: randomize them per account and do not reuse one secret across multiple bots.

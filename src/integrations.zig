@@ -102,6 +102,8 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "Hugging Face", .description = "Open-source models", .category = .ai_model, .status = .coming_soon },
     .{ .name = "LM Studio", .description = "Local model server", .category = .ai_model, .status = .coming_soon },
     .{ .name = "Venice", .description = "Privacy-first inference", .category = .ai_model, .status = .available },
+    .{ .name = "NEAR AI Cloud", .description = "OpenAI-compatible inference gateway", .category = .ai_model, .status = .available },
+    .{ .name = "Atlas Cloud", .description = "OpenAI-compatible inference gateway", .category = .ai_model, .status = .available },
     .{ .name = "Vercel AI", .description = "Vercel AI Gateway", .category = .ai_model, .status = .available },
     .{ .name = "Cloudflare AI", .description = "Cloudflare AI Gateway", .category = .ai_model, .status = .available },
     .{ .name = "Moonshot", .description = "Kimi & Kimi Coding", .category = .ai_model, .status = .available },

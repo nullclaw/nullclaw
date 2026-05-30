@@ -6,6 +6,12 @@
       "openrouter": {
         "api_key": "YOUR_OPENROUTER_API_KEY"
       },
+      "nearai": {
+        "api_key": "YOUR_NEARAI_API_KEY"
+      },
+      "atlas-cloud": {
+        "api_key": "YOUR_ATLASCLOUD_API_KEY"
+      },
       "azure": {
         "api_key": "YOUR_AZURE_OPENAI_API_KEY",
         "base_url": "https://your-resource.openai.azure.com"
@@ -36,6 +42,7 @@
       "accounts": {
         "main": {
           "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false
         }

@@ -1,17 +1,10 @@
 const std = @import("std");
 const std_compat = @import("compat");
-const builtin = @import("builtin");
 const root = @import("root.zig");
-const fs_compat = @import("../fs_compat.zig");
 const http_util = @import("../http_util.zig");
-const platform = @import("../platform.zig");
 const error_classify = @import("error_classify.zig");
 const verbose = @import("../verbose.zig");
 const log = std.log.scoped(.provider_sse);
-
-// Keep large request bodies out of argv. On Linux, a single oversized `-d`
-// argument can hit execve limits long before the total ARG_MAX budget.
-const MAX_INLINE_CURL_BODY_BYTES: usize = 64 * 1024;
 
 var curl_fail_fast_arg_mutex: std_compat.sync.Mutex = .{};
 var curl_fail_with_body_supported_cache: ?bool = null;
@@ -114,80 +107,6 @@ pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
         argv_buf[argc.*] = arg;
         argc.* += 1;
     }
-}
-
-const CurlBodyArg = struct {
-    arg: []const u8,
-    temp_path_buf: [std_compat.fs.max_path_bytes]u8 = undefined,
-    temp_path_len: usize = 0,
-    uses_temp_file: bool = false,
-
-    fn deinit(self: *const CurlBodyArg, allocator: std.mem.Allocator) void {
-        if (!self.uses_temp_file) return;
-        std_compat.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
-        allocator.free(self.arg);
-    }
-};
-
-fn prepareCurlBodyArg(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-    log_enabled: bool,
-) !CurlBodyArg {
-    const should_use_temp_file = builtin.os.tag == .windows or body.len > MAX_INLINE_CURL_BODY_BYTES;
-    if (!should_use_temp_file) {
-        return .{ .arg = body };
-    }
-
-    const debug_log = std.log.scoped(.sse);
-    var prepared: CurlBodyArg = .{ .arg = body };
-
-    const tmp_dir_path = platform.getTempDir(allocator) catch
-        return error.TempDirNotFound;
-    defer allocator.free(tmp_dir_path);
-
-    var tmp_dir = std_compat.fs.openDirAbsolute(tmp_dir_path, .{}) catch
-        return error.TempDirNotFound;
-    defer tmp_dir.close();
-
-    const body_path = std.fmt.bufPrint(
-        &prepared.temp_path_buf,
-        "{s}{s}sse_body_{d}.tmp",
-        .{ tmp_dir_path, std_compat.fs.path.sep_str, std_compat.time.timestamp() },
-    ) catch return error.PathTooLong;
-    prepared.temp_path_len = body_path.len;
-    errdefer std_compat.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
-
-    var tmp_file = tmp_dir.createFile(
-        body_path[tmp_dir_path.len + 1 ..],
-        .{ .truncate = true, .exclusive = false },
-    ) catch return error.TempFileCreateFailed;
-
-    tmp_file.writeAll(body) catch {
-        tmp_file.close();
-        return error.TempFileWriteFailed;
-    };
-    tmp_file.close();
-
-    if (log_enabled) {
-        debug_log.info("Using temp file for curl body: {s}, body_len={d}", .{ body_path, body.len });
-    }
-
-    const verify_file = std_compat.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
-    defer verify_file.close();
-    const verify_stat = fs_compat.stat(verify_file) catch return error.TempFileCreateFailed;
-    if (log_enabled) {
-        debug_log.info("Temp body file size: {d} bytes", .{verify_stat.size});
-    }
-
-    for (prepared.temp_path_buf[0..prepared.temp_path_len]) |*c| {
-        if (c.* == '\\') c.* = '/';
-    }
-
-    prepared.arg = try std.fmt.allocPrint(allocator, "@{s}", .{prepared.temp_path_buf[0..prepared.temp_path_len]});
-    errdefer allocator.free(prepared.arg);
-    prepared.uses_temp_file = true;
-    return prepared;
 }
 
 /// Content delta from an SSE chunk.
@@ -354,11 +273,14 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
 /// Returns owned DeltaContent or null if no content found.
 pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?DeltaContent {
     if (verbose.isVerbose()) {
-        log.debug("SSE JSON: {s}", .{json_str});
+        // NOTE: No unit test for this log path; it depends on global verbose
+        // logging state. Keep payload bytes out of logs because SSE chunks can
+        // contain user prompts, tool results, or model output.
+        log.debug("SSE JSON payload received: len={d}", .{json_str.len});
     }
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
-        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON: {s} | Error: {s}", .{ json_str, @errorName(err) });
+        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON payload: len={d} error={s}", .{ json_str.len, @errorName(err) });
         return error.InvalidSseJson;
     };
     defer parsed.deinit();
@@ -449,10 +371,6 @@ pub fn curlStream(
     argc += 1;
     argv_buf[argc] = "POST";
     argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
 
     // Add proxy from environment if set
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
@@ -469,60 +387,44 @@ pub fn curlStream(
     defer if (resolve_entry) |entry| allocator.free(entry);
     http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
+    var header_buf: [16][]const u8 = undefined;
+    var header_count: usize = 0;
+    header_buf[header_count] = "Content-Type: application/json";
+    header_count += 1;
     if (auth_header) |auth| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth;
-        argc += 1;
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = auth;
+        header_count += 1;
     }
 
     for (extra_headers) |hdr| {
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = hdr;
+        header_count += 1;
+    }
+
+    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_buf[0..header_count]);
+    defer prepared_headers.deinit(allocator);
+    if (prepared_headers.arg) |headers_arg| {
         argv_buf[argc] = "-H";
         argc += 1;
-        argv_buf[argc] = hdr;
+        argv_buf[argc] = headers_arg;
         argc += 1;
     }
 
-    // On Windows, command line length is limited to ~32767 chars.
-    // Use a temp file there to avoid NameTooLong; keep other platforms in-memory.
-    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
-    defer prepared_body.deinit(allocator);
-
-    if (prepared_body.uses_temp_file) {
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-    } else {
-        argv_buf[argc] = "-d";
-        argc += 1;
-    }
-    argv_buf[argc] = prepared_body.arg;
+    argv_buf[argc] = "--data-binary";
+    argc += 1;
+    argv_buf[argc] = "@-";
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
 
-    // Debug: log the curl command
     if (log_enabled) {
-        debug_log.info("curl argc={d}, body_len={d}, used_temp_file={}, body_arg={s}", .{ argc, body.len, prepared_body.uses_temp_file, prepared_body.arg });
-    }
-
-    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer cmd_buf.deinit(allocator);
-    for (argv_buf[0..argc], 0..) |arg, i| {
-        if (i > 0) cmd_buf.append(allocator, ' ') catch {};
-        // Quote arguments that contain spaces or special chars for easy copy-paste
-        if (std.mem.indexOfAny(u8, arg, " \t\"'") != null or std.mem.startsWith(u8, arg, "@")) {
-            cmd_buf.append(allocator, '"') catch {};
-            cmd_buf.appendSlice(allocator, arg) catch {};
-            cmd_buf.append(allocator, '"') catch {};
-        } else {
-            cmd_buf.appendSlice(allocator, arg) catch {};
-        }
-    }
-    if (log_enabled) {
-        debug_log.info("curl command: {s}", .{cmd_buf.items});
+        debug_log.info("curl argc={d}, body_len={d}, header_file={}", .{ argc, body.len, prepared_headers.uses_temp_file });
     }
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -533,6 +435,22 @@ pub fn curlStream(
     if (log_enabled) {
         const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
         debug_log.info("curl process spawned, pid={d}", .{pid});
+    }
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlWriteError;
     }
 
     // Read stdout line by line, parse SSE events
@@ -565,7 +483,7 @@ pub fn curlStream(
         total_stdout += n;
 
         if (log_enabled) {
-            debug_log.info("stdout read {d} bytes: {s}", .{ n, read_buf[0..n] });
+            debug_log.info("stdout read {d} bytes", .{n});
         }
 
         // Check if this is JSON (starts with '{')
@@ -589,14 +507,14 @@ pub fn curlStream(
 
             // Return a meaningful error
             _ = child.wait() catch {};
-            debug_log.err("Server returned JSON error: {s}", .{json_response});
+            debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
             return error.ServerError;
         }
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
                 if (log_enabled) {
-                    debug_log.info("parsing SSE line: {s}", .{line_buf.items});
+                    debug_log.info("parsing SSE line: len={d}", .{line_buf.items.len});
                 }
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
@@ -827,10 +745,6 @@ pub fn curlStreamAnthropic(
     argc += 1;
     argv_buf[argc] = "POST";
     argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
 
     // Add proxy from environment if set
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
@@ -847,33 +761,54 @@ pub fn curlStreamAnthropic(
     defer if (resolve_entry) |entry| allocator.free(entry);
     http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
+    var header_buf: [16][]const u8 = undefined;
+    var header_count: usize = 0;
+    header_buf[header_count] = "Content-Type: application/json";
+    header_count += 1;
     for (headers) |hdr| {
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = hdr;
+        header_count += 1;
+    }
+
+    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_buf[0..header_count]);
+    defer prepared_headers.deinit(allocator);
+    if (prepared_headers.arg) |headers_arg| {
         argv_buf[argc] = "-H";
         argc += 1;
-        argv_buf[argc] = hdr;
+        argv_buf[argc] = headers_arg;
         argc += 1;
     }
 
-    const log_enabled = verbose.isVerbose();
-    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
-    defer prepared_body.deinit(allocator);
-
-    if (prepared_body.uses_temp_file) {
-        argv_buf[argc] = "--data-binary";
-    } else {
-        argv_buf[argc] = "-d";
-    }
+    argv_buf[argc] = "--data-binary";
     argc += 1;
-    argv_buf[argc] = prepared_body.arg;
+    argv_buf[argc] = "@-";
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlWriteError;
+    }
 
     // Read stdout line by line, parse Anthropic SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
@@ -992,31 +927,6 @@ test "parseSseLine valid delta without optional space" {
         },
         else => return error.TestUnexpectedResult,
     }
-}
-
-test "prepareCurlBodyArg keeps small bodies inline except on Windows" {
-    const allocator = std.testing.allocator;
-    const body = [_]u8{'x'} ** 4096;
-    var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
-    defer prepared.deinit(allocator);
-
-    if (builtin.os.tag == .windows) {
-        try std.testing.expect(prepared.uses_temp_file);
-        try std.testing.expect(std.mem.startsWith(u8, prepared.arg, "@"));
-    } else {
-        try std.testing.expect(!prepared.uses_temp_file);
-        try std.testing.expectEqualStrings(body[0..], prepared.arg);
-    }
-}
-
-test "prepareCurlBodyArg spills large bodies to temp file" {
-    const allocator = std.testing.allocator;
-    const body = [_]u8{'x'} ** (MAX_INLINE_CURL_BODY_BYTES + 1);
-    var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
-    defer prepared.deinit(allocator);
-
-    try std.testing.expect(prepared.uses_temp_file);
-    try std.testing.expect(std.mem.startsWith(u8, prepared.arg, "@"));
 }
 
 test "appendCurlStallDetectionArgs appends curl speed flags in order" {

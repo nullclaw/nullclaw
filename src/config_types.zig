@@ -119,6 +119,13 @@ pub const AudioMediaConfig = struct {
     model: []const u8 = "whisper-large-v3",
     base_url: ?[]const u8 = null,
     language: ?[]const u8 = null,
+
+    /// Audio transcription endpoints carry provider credentials. Keep the same
+    /// URL boundary as provider base URLs: HTTPS for remote hosts, plain HTTP
+    /// only for explicit local/private endpoints, and no query/fragment.
+    pub fn isValidBaseUrl(raw: []const u8) bool {
+        return ProviderEntry.isValidBaseUrl(raw);
+    }
 };
 
 // ── Sub-config structs ──────────────────────────────────────────
@@ -560,6 +567,8 @@ pub const MaxConfig = struct {
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
+    /// Secret required in Telegram's X-Telegram-Bot-Api-Secret-Token header for webhook delivery.
+    webhook_secret: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
     group_policy: []const u8 = "allowlist",
@@ -589,6 +598,10 @@ pub const TelegramConfig = struct {
     /// Publish Telegram slash-command menu:
     /// off = clear it, flat = one global list, scoped = separate private/group menus.
     commands_menu_mode: TelegramCommandsMenuMode = .flat,
+
+    pub fn isValidWebhookSecret(raw: []const u8) bool {
+        return WebConfig.isValidAuthToken(raw);
+    }
 };
 
 pub const DiscordConfig = struct {

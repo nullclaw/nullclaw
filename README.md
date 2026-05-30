@@ -161,7 +161,53 @@ Then:
 nullclaw --help
 ```
 
-### 3) Common commands
+### 3) Run with Docker Compose
+
+The repository includes a Makefile wrapper around Docker Compose for local
+containerized runs.
+
+```bash
+make build
+make config
+make up
+```
+
+`make config` runs `nullclaw onboard --interactive` inside the agent container.
+Pass only non-secret flags through `CONFIG_ARGS`:
+
+```bash
+make config CONFIG_ARGS="--provider openrouter"
+```
+
+Avoid putting API keys or bot tokens in `CONFIG_ARGS`; command-line arguments
+can be exposed through shell history and process listings.
+
+The compose gateway defaults to `NULLCLAW_PORT=3210`, binds inside the
+container on `0.0.0.0`, and publishes to localhost on the host:
+
+```bash
+curl http://127.0.0.1:3210/health
+```
+
+Override the port or host bind address when needed:
+
+```bash
+make up NULLCLAW_PORT=8080
+make up NULLCLAW_BIND=0.0.0.0
+```
+
+Operational shortcuts:
+
+```bash
+make logs
+make down
+make shell
+```
+
+Only set `NULLCLAW_BIND=0.0.0.0` on trusted networks with pairing, webhook
+secrets, allowlists, and host firewall rules configured.
+
+### 4) Common commands
 
 ```bash
 
@@ -223,7 +269,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
-| **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, NEAR AI Cloud, Atlas Cloud, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, memory_store, memory_recall, memory_forget, memory_list, browser_open, screenshot, composio, http_request, web_fetch, web_search, delegate, schedule, hardware_info, hardware_memory, pushover, message, spawn, git, image, i2c, spi, and more | Any capability |
@@ -331,6 +377,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   "models": {
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
+      "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
+      "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
       "groq": { "api_key": "gsk_..." },
       "vertex": {
         "api_key": {
@@ -714,6 +762,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
+| `/media/transcribe` | POST | `Authorization: Bearer <token>` | Transcribe `audio_base64` payloads through configured STT |
 | `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (canonical methods plus legacy slash aliases) |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
@@ -764,6 +813,10 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including streaming, task lifecycle, and configuration details.
+
+### Media transcription
+
+`POST /media/transcribe` accepts JSON with `audio_base64`, `mime_type`, `source`, and optional `language`, then returns `{"text":"..."}` plus metadata. Configure STT under `tools.media.audio`; remote custom STT endpoints must use HTTPS. Raise `gateway.max_body_size_bytes`, `gateway.request_timeout_secs`, and `gateway.webhook_rate_limit_per_minute` for live desktop audio chunking.
 
 ## Commands
 

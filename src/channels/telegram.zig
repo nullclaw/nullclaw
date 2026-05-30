@@ -2198,10 +2198,25 @@ pub const TelegramChannel = struct {
     }
 
     fn resolveMessageContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
-        return self.resolveVoiceOrAudioContent(allocator, message) orelse
+        const base = self.resolveVoiceOrAudioContent(allocator, message) orelse
             self.resolvePhotoContent(allocator, message) orelse
             self.resolveDocumentContent(allocator, message) orelse
             telegram_update_ingress.textOrCaption(allocator, message);
+
+        const base_content = base orelse return null;
+
+        // Telegram replies arrive with the original message in `reply_to_message`.
+        // Prepending it to the inbound payload gives the agent the conversational
+        // context the user clearly expected to be visible (issue #916).
+        const reply_text = telegram_update_ingress.replyToText(message) orelse return base_content;
+
+        const enriched = telegram_update_ingress.contentWithReplyContext(
+            allocator,
+            base_content,
+            reply_text,
+        ) catch return base_content;
+        allocator.free(base_content);
+        return enriched;
     }
 
     fn appendIncomingMessage(
@@ -5008,6 +5023,49 @@ test "telegram processUpdate falls back to caption when text is absent" {
 
     try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     try std.testing.expectEqualStrings("caption-only fallback", messages.items[0].content);
+}
+
+test "telegram processUpdate includes reply context in message content" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{
+        \\  "update_id": 1,
+        \\  "message": {
+        \\    "message_id": 42,
+        \\    "from": {"id": 1001, "username": "tester", "first_name": "Test"},
+        \\    "chat": {"id": 2002, "type": "private"},
+        \\    "reply_to_message": {"message_id": 41, "text": "Here are the results"},
+        \\    "text": "show me more"
+        \\  }
+        \\}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+    var media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (media_group_ids.items) |mg| if (mg) |s| alloc.free(s);
+        media_group_ids.deinit(alloc);
+    }
+
+    ch.processUpdate(alloc, parsed.value, &messages, &media_group_ids);
+
+    // Regression: Telegram replies must carry the replied-to text into the agent input.
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("[Replying to \"Here are the results\"] show me more", messages.items[0].content);
 }
 
 test "telegram nextPendingMediaDeadline returns earliest group deadline" {

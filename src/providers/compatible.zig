@@ -26,6 +26,11 @@ fn logCompatibleApiError(
     url: []const u8,
     resp_body: []const u8,
 ) void {
+    // NOTE: No unit test for this log-only behavior change.
+    // Tests assert error propagation on these paths; suppress stderr side
+    // effects under zig test so unrelated suites do not fail on expected errors.
+    if (builtin.is_test) return;
+
     const sanitized = root.sanitizeApiError(allocator, resp_body) catch null;
     defer if (sanitized) |body| allocator.free(body);
 
@@ -41,11 +46,7 @@ fn returnLoggedCompatibleApiError(
     url: []const u8,
     resp_body: []const u8,
 ) anyerror!T {
-    // Tests assert error propagation on this path; skip log side effects there
-    // because Zig's test runner treats unexpected stderr logs as failures.
-    if (!builtin.is_test) {
-        logCompatibleApiError(allocator, provider_name, err, url, resp_body);
-    }
+    logCompatibleApiError(allocator, provider_name, err, url, resp_body);
     return err;
 }
 
@@ -308,14 +309,19 @@ pub const OpenAiCompatibleProvider = struct {
 
     /// Backward-compatible model aliases for provider-specific API model ids.
     fn normalizeProviderModel(self: OpenAiCompatibleProvider, model: []const u8) []const u8 {
+        const provider_model = if (model.len > self.name.len + 1 and
+            std.mem.startsWith(u8, model, self.name) and
+            model[self.name.len] == '/')
+            model[self.name.len + 1 ..]
+        else
+            model;
+
         if (std.mem.eql(u8, self.name, "deepseek")) {
-            if (std.mem.eql(u8, model, "deepseek-v3.2") or
-                std.mem.eql(u8, model, "deepseek/deepseek-v3.2"))
-            {
+            if (std.mem.eql(u8, provider_model, "deepseek-v3.2")) {
                 return "deepseek-chat";
             }
         }
-        return model;
+        return provider_model;
     }
 
     fn capNonStreamingMaxTokens(self: OpenAiCompatibleProvider, request: ChatRequest) ChatRequest {
@@ -836,7 +842,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
 
         return parseResponsesResponse(allocator, resp_body) catch |err| {
@@ -1384,7 +1390,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body) catch |err| {
@@ -1476,7 +1482,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body) catch |err| {
@@ -2206,6 +2212,14 @@ test "normalizeProviderModel maps DeepSeek v3.2 aliases to deepseek-chat" {
     try std.testing.expectEqualStrings("deepseek-chat", deepseek.normalizeProviderModel("deepseek-v3.2"));
     try std.testing.expectEqualStrings("deepseek-chat", deepseek.normalizeProviderModel("deepseek/deepseek-v3.2"));
     try std.testing.expectEqualStrings("deepseek-reasoner", deepseek.normalizeProviderModel("deepseek-reasoner"));
+}
+
+test "normalizeProviderModel strips own compatible provider prefix" {
+    const atlas = OpenAiCompatibleProvider.init(std.testing.allocator, "atlas-cloud", "https://api.atlascloud.ai/v1", null, .bearer, null);
+    // Regression: interactive model choices submit provider-qualified refs so
+    // namespaced model IDs like qwen/... keep routing through Atlas Cloud.
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", atlas.normalizeProviderModel("atlas-cloud/qwen/qwen3-32b"));
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", atlas.normalizeProviderModel("qwen/qwen3-32b"));
 }
 
 test "normalizeProviderModel leaves other providers unchanged" {

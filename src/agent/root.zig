@@ -6216,7 +6216,7 @@ test "slash /model provider renders interactive model choices for selected provi
 
     try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model anthropic/claude-sonnet-4-6") != null);
 }
 
 test "slash /model with a single configured provider renders models directly" {
@@ -6237,7 +6237,7 @@ test "slash /model with a single configured provider renders models directly" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model anthropic/claude-sonnet-4-6") != null);
 }
 
 test "slash /model renders interactive choices for routed slack sessions" {
@@ -6290,11 +6290,14 @@ test "slash /memory list hides internal autosave and hygiene entries by default"
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
+    agent.memory_session_id = "chat-123";
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
     const mem = sqlite_mem.memory();
 
+    // Regression: #917 also affected slash `/memory list` when an agent
+    // session was active; global memories must still be visible.
     try mem.store("autosave_user_1", "hello", .conversation, null);
     try mem.store("last_hygiene_at", "1772051598", .core, null);
     try mem.store("MEMORY:99", "**last_hygiene_at**: 1772051691", .core, null);

@@ -323,7 +323,7 @@ fn hashToken(token: []const u8, buf: *[64]u8) []const u8 {
 }
 
 /// SHA-256 hash a token, returning an allocated hex string
-fn hashTokenAlloc(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+pub fn hashTokenAlloc(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(token, &hash, .{});
     const result = try allocator.alloc(u8, 64);
@@ -343,7 +343,7 @@ fn isTokenRecordActive(record: PairingGuard.TokenRecord, now: i64) bool {
 }
 
 /// Check if a stored value looks like a SHA-256 hash (64 hex chars)
-fn isTokenHash(value: []const u8) bool {
+pub fn isTokenHash(value: []const u8) bool {
     if (value.len != 64) return false;
     for (value) |c| {
         if (!std.ascii.isHex(c)) return false;

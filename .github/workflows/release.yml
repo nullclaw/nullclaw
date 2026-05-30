@@ -6,7 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  packages: write
 
 jobs:
   release:
@@ -18,4 +19,10 @@ jobs:
     with:
       binary_name: nullclaw
       artifact_prefix: nullclaw
+      source_archive: true
+      source_archive_name: nullclaw-source-${{ github.ref_name }}.tar.gz
+      source_archive_excludes: |
+        .git
+        .zig-cache
+        zig-out
       publish_docker: true

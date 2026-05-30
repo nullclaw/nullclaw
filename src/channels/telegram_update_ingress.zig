@@ -1,4 +1,5 @@
 const std = @import("std");
+const util = @import("../util.zig");
 
 pub const IdentityScratch = struct {
     user_id_buf: [32]u8 = undefined,
@@ -163,6 +164,35 @@ pub fn textOrCaption(allocator: std.mem.Allocator, message: std.json.Value) ?[]u
     return null;
 }
 
+/// Returns the textual content of `reply_to_message` (text first, then caption)
+/// as a non-owned slice into the JSON value. Returns null when there is no
+/// `reply_to_message` or the replied message carries no text/caption — e.g.
+/// a reply to a sticker, location, or other non-textual media.
+pub fn replyToText(message: std.json.Value) ?[]const u8 {
+    const reply = objectField(message, "reply_to_message") orelse return null;
+    return stringField(reply, "text") orelse stringField(reply, "caption");
+}
+
+/// Build an enriched inbound payload that prepends the replied-to message
+/// text to `user_content`, so the agent sees the conversational context.
+/// Replied-to text is UTF-8-truncated to `REPLY_PREVIEW_MAX_BYTES` with
+/// `...` appended if it was clipped. Caller owns the returned slice.
+pub fn contentWithReplyContext(
+    allocator: std.mem.Allocator,
+    user_content: []const u8,
+    reply_text: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    const preview = util.previewUtf8(reply_text, REPLY_PREVIEW_MAX_BYTES);
+    const ellipsis: []const u8 = if (preview.truncated) "..." else "";
+    return std.fmt.allocPrint(allocator, "[Replying to \"{s}{s}\"] {s}", .{
+        preview.slice,
+        ellipsis,
+        user_content,
+    });
+}
+
+pub const REPLY_PREVIEW_MAX_BYTES: usize = 200;
+
 fn mediaFileId(message: std.json.Value, key: []const u8) ?[]const u8 {
     const media = objectField(message, key) orelse return null;
     return stringField(media, "file_id");
@@ -309,6 +339,77 @@ test "telegram update ingress falls back from text to caption" {
     const content = textOrCaption(allocator, parsed.value) orelse return error.TestExpectedEqual;
     defer allocator.free(content);
     try std.testing.expectEqualStrings("caption-only fallback", content);
+}
+
+test "replyToText returns text of replied-to message (regression #916)" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"text":"show me more","reply_to_message":{"message_id":12,"text":"Here are the results"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const reply = replyToText(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Here are the results", reply);
+}
+
+test "replyToText falls back to caption when replied message has no text" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"text":"nice","reply_to_message":{"message_id":12,"caption":"photo caption"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const reply = replyToText(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("photo caption", reply);
+}
+
+test "replyToText returns null when reply has neither text nor caption" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"text":"sticker reaction","reply_to_message":{"message_id":12,"sticker":{"file_id":"sticker_1"}}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expect(replyToText(parsed.value) == null);
+}
+
+test "replyToText returns null when there is no reply_to_message" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"text":"plain message"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expect(replyToText(parsed.value) == null);
+}
+
+test "contentWithReplyContext prepends quoted reply to user content" {
+    const allocator = std.testing.allocator;
+    const result = try contentWithReplyContext(allocator, "show me more", "Here are the results");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("[Replying to \"Here are the results\"] show me more", result);
+}
+
+test "contentWithReplyContext truncates long reply with ellipsis" {
+    const allocator = std.testing.allocator;
+    const long_reply = "a" ** (REPLY_PREVIEW_MAX_BYTES + 50);
+    const result = try contentWithReplyContext(allocator, "ok", long_reply);
+    defer allocator.free(result);
+
+    const expected_prefix = "[Replying to \"" ++ "a" ** REPLY_PREVIEW_MAX_BYTES ++ "...\"] ok";
+    try std.testing.expectEqualStrings(expected_prefix, result);
 }
 
 test "telegram update ingress parses document metadata" {

@@ -414,7 +414,7 @@ fn renderInteractiveModelMenuFromModels(
     for (models[start..end], 0..) |model_id, idx| {
         const label = try modelMenuChoiceLabel(allocator, model_id, std.mem.eql(u8, model_id, current_model));
         labels_to_free[option_count] = label;
-        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model {s}", .{model_id});
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model {s}/{s}", .{ provider, model_id });
         const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "m{d}", .{idx + 1});
 
         options[option_count] = .{
@@ -572,7 +572,22 @@ test "renderInteractiveModelMenuFromModels builds later page with prev button" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "page 2/2") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model nu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model anthropic/nu\"") != null);
+}
+
+test "renderInteractiveModelMenuFromModels prefixes provider for namespaced model ids" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "qwen/qwen3-32b",
+        "zai-org/GLM-5.1-FP8",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "atlas-cloud", "qwen/qwen3-32b", 1, &models)).?;
+    defer allocator.free(rendered);
+
+    // Regression: Atlas Cloud model IDs can start with another provider namespace
+    // such as qwen/. The interactive action must keep Atlas Cloud as provider.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model atlas-cloud/qwen/qwen3-32b\"") != null);
 }
 
 test "renderInteractiveProviderMenuFromProviders builds provider page with next button" {
@@ -5736,7 +5751,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
         }
 
-        const entries = mem_rt.memory.list(self.allocator, category_opt, self.memory_session_id) catch |err| {
+        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);

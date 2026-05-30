@@ -527,6 +527,9 @@ pub fn build(b: *std.Build) void {
         if (enable_postgres) {
             module.linkSystemLibrary("pq", .{});
         }
+        if (target.result.os.tag == .windows) {
+            module.linkSystemLibrary("ws2_32", .{});
+        }
         if (enable_channel_web) {
             const ws_dep = b.dependency("websocket", .{
                 .target = target,
@@ -576,6 +579,9 @@ pub fn build(b: *std.Build) void {
         }
         if (enable_postgres) {
             exe.root_module.linkSystemLibrary("pq", .{});
+        }
+        if (target.result.os.tag == .windows) {
+            exe.root_module.linkSystemLibrary("ws2_32", .{});
         }
     }
     exe.dead_strip_dylibs = true;

@@ -23,6 +23,7 @@ fn setSocketNonblocking(handle: IoNet.Socket.Handle, nonblocking: bool) !void {
     const rc = posix.system.fcntl(handle, posix.F.GETFL, @as(usize, 0));
     const current_flags = switch (posix.errno(rc)) {
         .SUCCESS => @as(usize, @intCast(rc)),
+        .AGAIN => return error.WouldBlock,
         else => |err| return posix.unexpectedErrno(err),
     };
     const nonblocking_flag = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
@@ -34,6 +35,7 @@ fn setSocketNonblocking(handle: IoNet.Socket.Handle, nonblocking: bool) !void {
 
     switch (posix.errno(posix.system.fcntl(handle, posix.F.SETFL, next_flags))) {
         .SUCCESS => {},
+        .AGAIN => return error.WouldBlock,
         .INVAL => |err| return posix.unexpectedErrno(err),
         else => |err| return posix.unexpectedErrno(err),
     }
@@ -395,7 +397,25 @@ pub fn tcpConnectToHost(allocator: Allocator, host: []const u8, port: u16) !Stre
 }
 
 fn shouldUseWindowsLocalhostFallback(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "localhost");
+    if (std.ascii.eqlIgnoreCase(name, "localhost")) return true;
+
+    const localhost_suffix = ".localhost";
+    return name.len > localhost_suffix.len and std.ascii.endsWithIgnoreCase(name, localhost_suffix);
+}
+
+fn mapWindowsLookupError(err: anyerror) GetAddressListError {
+    return switch (err) {
+        error.UnknownHostName, error.NoAddressReturned => error.UnknownHostName,
+        error.NameServerFailure,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.DetectingNetworkConfigurationFailed,
+        => error.NameServerFailure,
+        error.SystemResources => error.SystemResources,
+        else => error.Unexpected,
+    };
 }
 
 fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddressListError!*AddressList {
@@ -447,18 +467,7 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
     } else |err| switch (err) {
         error.Canceled, error.Closed => {
             // Queue closed or cancelled; lookup is done. Propagate any lookup-level error.
-            _ = lookup_future.await(io) catch |lookup_err| switch (lookup_err) {
-                error.UnknownHostName, error.NoAddressReturned => return error.UnknownHostName,
-                error.NameServerFailure,
-                error.ResolvConfParseFailed,
-                error.InvalidDnsARecord,
-                error.InvalidDnsAAAARecord,
-                error.InvalidDnsCnameRecord,
-                error.DetectingNetworkConfigurationFailed,
-                => return error.NameServerFailure,
-                error.SystemResources => return error.SystemResources,
-                else => return error.Unexpected,
-            };
+            _ = lookup_future.await(io) catch |lookup_err| return mapWindowsLookupError(lookup_err);
         },
     }
 
@@ -577,10 +586,27 @@ test "compat net oversized hostname fails fast" {
 test "compat net windows localhost fallback helper is scoped" {
     // Regression: Windows getAddressList used to return UnknownHostName for
     // every non-localhost hostname because this fallback short-circuited DNS.
+    // Keep the reserved .localhost zone local, but do not bypass DNS for
+    // unrelated hostnames.
     try std.testing.expect(shouldUseWindowsLocalhostFallback("localhost"));
     try std.testing.expect(shouldUseWindowsLocalhostFallback("LOCALHOST"));
-    try std.testing.expect(!shouldUseWindowsLocalhostFallback("foo.localhost"));
+    try std.testing.expect(shouldUseWindowsLocalhostFallback("foo.localhost"));
+    try std.testing.expect(shouldUseWindowsLocalhostFallback("FOO.LOCALHOST"));
     try std.testing.expect(!shouldUseWindowsLocalhostFallback("example.invalid"));
+    try std.testing.expect(!shouldUseWindowsLocalhostFallback("localhost.example"));
+}
+
+test "compat net windows lookup errors map to address list errors" {
+    try std.testing.expect(mapWindowsLookupError(error.UnknownHostName) == error.UnknownHostName);
+    try std.testing.expect(mapWindowsLookupError(error.NoAddressReturned) == error.UnknownHostName);
+    try std.testing.expect(mapWindowsLookupError(error.NameServerFailure) == error.NameServerFailure);
+    try std.testing.expect(mapWindowsLookupError(error.ResolvConfParseFailed) == error.NameServerFailure);
+    try std.testing.expect(mapWindowsLookupError(error.InvalidDnsARecord) == error.NameServerFailure);
+    try std.testing.expect(mapWindowsLookupError(error.InvalidDnsAAAARecord) == error.NameServerFailure);
+    try std.testing.expect(mapWindowsLookupError(error.InvalidDnsCnameRecord) == error.NameServerFailure);
+    try std.testing.expect(mapWindowsLookupError(error.DetectingNetworkConfigurationFailed) == error.NameServerFailure);
+    try std.testing.expect(mapWindowsLookupError(error.SystemResources) == error.SystemResources);
+    try std.testing.expect(mapWindowsLookupError(error.Canceled) == error.Unexpected);
 }
 
 test "compat net normalizes listener and stream blocking mode" {
@@ -755,4 +781,34 @@ fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
     const flags: usize = @intCast(rc);
     const nonblocking_flag = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
     return (flags & nonblocking_flag) != 0;
+}
+
+// Regression: nullclaw/nullclaw#890 -- Windows getAddressList was a localhost-only
+// stub returning error.UnknownHostName for any name other than exact localhost.
+// The .localhost suffix is reserved for loopback names, so resolve it locally
+// instead of relying on runner-specific Windows DNS behavior.
+test "compat net getAddressList resolves localhost subdomain on windows" {
+    if (builtin.os.tag != .windows) return;
+    const list = try getAddressList(std.testing.allocator, "foo.localhost", 443);
+    defer list.deinit();
+    try std.testing.expect(list.addrs.len > 0);
+    try std.testing.expect(list.addrs[0].any.family == posix.AF.INET);
+}
+
+// Regression: nullclaw/nullclaw#890 -- Windows getAddressList was a localhost-only stub.
+// This test guards the localhost string fast-path.
+test "compat net getAddressList localhost fast-path on windows" {
+    if (builtin.os.tag != .windows) return;
+    const list = try getAddressList(std.testing.allocator, "localhost", 80);
+    defer list.deinit();
+    try std.testing.expect(list.addrs.len == 1);
+    try std.testing.expect(list.addrs[0].any.family == posix.AF.INET);
+}
+
+// Regression: nullclaw/nullclaw#890 -- invalid hostnames must map to
+// error.UnknownHostName, not surface as Unexpected or a silent success.
+test "compat net getAddressList returns UnknownHostName for invalid hostname on windows" {
+    if (builtin.os.tag != .windows) return;
+    const result = getAddressList(std.testing.allocator, "bad host", 80);
+    try std.testing.expectError(error.UnknownHostName, result);
 }
