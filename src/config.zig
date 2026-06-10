@@ -6671,6 +6671,28 @@ test "parse agents.defaults.heartbeat dispatch settings" {
     try std.testing.expect(!cfg.heartbeat.delivery_best_effort);
 }
 
+test "parse agent.default_queue_mode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agent":{"default_queue_mode":"latest"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.QueueMode.latest, cfg.agent.default_queue_mode);
+}
+
+test "agent.default_queue_mode defaults to off" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json = "{}";
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.QueueMode.off, cfg.agent.default_queue_mode);
+}
+
 test "save roundtrip preserves heartbeat dispatch settings" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

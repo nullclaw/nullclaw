@@ -374,12 +374,42 @@ pub const ToolFilterGroup = struct {
     keywords: []const []const u8 = &.{},
 };
 
+pub const QueueMode = enum {
+    off,
+    serial,
+    latest,
+    debounce,
+
+    pub fn toSlice(self: QueueMode) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .serial => "serial",
+            .latest => "latest",
+            .debounce => "debounce",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?QueueMode {
+        return if (std.mem.eql(u8, s, "off"))
+            .off
+        else if (std.mem.eql(u8, s, "serial"))
+            .serial
+        else if (std.mem.eql(u8, s, "latest"))
+            .latest
+        else if (std.mem.eql(u8, s, "debounce"))
+            .debounce
+        else
+            null;
+    }
+};
+
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 1000,
     max_history_messages: u32 = 100,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
+    default_queue_mode: QueueMode = .off,
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.
     /// Not serialized; used to distinguish override vs default fallback chain.
