@@ -179,21 +179,7 @@ pub const Agent = struct {
         }
     };
 
-    pub const QueueMode = enum {
-        off,
-        serial,
-        latest,
-        debounce,
-
-        pub fn toSlice(self: QueueMode) []const u8 {
-            return switch (self) {
-                .off => "off",
-                .serial => "serial",
-                .latest => "latest",
-                .debounce => "debounce",
-            };
-        }
-    };
+    pub const QueueMode = config_types.QueueMode;
 
     const QueueDrop = enum {
         summarize,
@@ -639,6 +625,7 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .queue_mode = cfg.agent.default_queue_mode,
             .tools_config = cfg.tools,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .default_exec_security = resolved_exec_security,
