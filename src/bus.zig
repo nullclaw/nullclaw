@@ -38,7 +38,7 @@ pub const InboundMessage = struct {
 };
 
 pub const OutboundMessage = struct {
-    channel: []const u8, // target channel
+    channel: []const u8, // target channel (owned — duped by factory)
     account_id: ?[]const u8 = null, // target account (multi-account channels)
     chat_id: []const u8, // target chat
     content: []const u8, // response text
@@ -52,7 +52,7 @@ pub const OutboundMessage = struct {
         if (self.media.len > 0) allocator.free(self.media);
         for (self.choices) |choice| choice.deinit(allocator);
         if (self.choices.len > 0) allocator.free(self.choices);
-        // channel is a string literal or long-lived config pointer — not owned, don't free
+        allocator.free(self.channel);
         if (self.account_id) |aid| allocator.free(aid);
         allocator.free(self.chat_id);
         allocator.free(self.content);
@@ -169,13 +169,14 @@ fn makeOutboundWithStage(
     content: []const u8,
     stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .stage = stage,
@@ -210,6 +211,8 @@ fn makeOutboundWithAccountStage(
     content: []const u8,
     stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -217,7 +220,7 @@ fn makeOutboundWithAccountStage(
     const aid = try allocator.dupe(u8, account_id);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
@@ -291,6 +294,8 @@ pub fn makeOutboundWithChoices(
     content: []const u8,
     choices_src: anytype,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -302,7 +307,7 @@ pub fn makeOutboundWithChoices(
     };
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .choices = choices,
@@ -317,6 +322,8 @@ pub fn makeOutboundWithAccountChoices(
     content: []const u8,
     choices_src: anytype,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -330,7 +337,7 @@ pub fn makeOutboundWithAccountChoices(
     };
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
@@ -346,7 +353,8 @@ fn makeOutboundWithMedia(
     content: []const u8,
     media_src: []const []const u8,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -366,7 +374,7 @@ fn makeOutboundWithMedia(
     } else &[_][]const u8{};
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .media = media,
