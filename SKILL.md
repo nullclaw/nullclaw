@@ -1,2 +1,2 @@
-# Git Skill
-Installed from git.
+# Root skill
+Installed from root markdown.
