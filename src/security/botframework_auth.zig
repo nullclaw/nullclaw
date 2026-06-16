@@ -636,6 +636,27 @@ test "parseJwtClaims rejects floating numeric dates" {
     );
 }
 
+test "parseJwtClaims accepts lowercase serviceurl claim" {
+    // Bot Framework connector tokens emit the service URL as the lowercase
+    // claim "serviceurl" (AuthenticationConstants.ServiceUrlClaim), not camelCase.
+    var claims = try parseJwtClaims(
+        std.testing.allocator,
+        "{\"iss\":\"https://api.botframework.com\",\"aud\":\"test-app-id\",\"serviceurl\":\"https://smba.trafficmanager.net/amer/\",\"nbf\":1700000000,\"exp\":1900000000}",
+    );
+    defer claims.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://smba.trafficmanager.net/amer/", claims.service_url);
+}
+
+test "parseJwtClaims still accepts camelCase serviceUrl claim" {
+    // Backward compatibility: the camelCase spelling continues to parse.
+    var claims = try parseJwtClaims(
+        std.testing.allocator,
+        "{\"iss\":\"https://api.botframework.com\",\"aud\":\"test-app-id\",\"serviceUrl\":\"https://smba.trafficmanager.net/amer/\",\"nbf\":1700000000,\"exp\":1900000000}",
+    );
+    defer claims.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://smba.trafficmanager.net/amer/", claims.service_url);
+}
+
 fn seedTestKey(cache: *KeyCache, allocator: Allocator) !void {
     try cache.seedFixtureForTest(allocator);
 }
