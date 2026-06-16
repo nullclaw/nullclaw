@@ -14,7 +14,7 @@ pub const CACHE_TTL_SECS: i64 = 24 * 60 * 60;
 pub const CLOCK_SKEW_SECS: i64 = 5 * 60;
 const FETCH_TIMEOUT_SECS = "10";
 const MAX_OPENID_BYTES: usize = 64 * 1024;
-const MAX_KEYS_BYTES: usize = 512 * 1024;
+const MAX_KEYS_BYTES: usize = 2 * 512 * 1024;
 
 pub const VerifyError = error{
     MissingKeyId,
