@@ -423,7 +423,7 @@ fn parseJwtClaims(allocator: Allocator, json_bytes: []const u8) VerifyError!JwtC
     };
 
     const iss = jsonObjectString(obj, "iss") orelse return error.MissingRequiredClaim;
-    const service_url = jsonObjectString(obj, "serviceUrl") orelse return error.MissingRequiredClaim;
+    const service_url = jsonObjectString(obj, "serviceUrl") orelse jsonObjectString(obj, "serviceurl") orelse return error.MissingRequiredClaim;
     const nbf = jsonObjectInt(obj, "nbf") orelse return error.MissingRequiredClaim;
     const exp = jsonObjectInt(obj, "exp") orelse return error.MissingRequiredClaim;
     const aud_value = obj.get("aud") orelse return error.MissingRequiredClaim;
