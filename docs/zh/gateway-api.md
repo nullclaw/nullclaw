@@ -13,7 +13,7 @@
 | Endpoint | Method | 鉴权 | 说明 |
 |---|---|---|---|
 | `/health` | GET | 无 | 健康检查 |
-| `/pair` | POST | `X-Pairing-Code` | 用一次性配对码换取 bearer token（网关公开绑定时仅允许 loopback 客户端） |
+| `/pair` | POST | `X-Pairing-Code` | 用一次性配对码换取 bearer token（网关公开绑定时仅允许 loopback 客户端）。签发的 token 还会持久化（`secrets.encrypt = true` 时静态加密）到配置目录下的 `paired_token`，供 schedule/cron 工具向 `/cron` 认证 |
 | `/webhook` | POST | `Authorization: Bearer <token>` | 发送消息：`{"message":"..."}` |
 | `/media/transcribe` | POST | `Authorization: Bearer <token>` | 通过已配置的 STT provider 转写 base64 音频负载 |
 | `/cron` | GET | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 查看运行中 daemon 的实时 scheduler 任务 |
@@ -322,6 +322,7 @@ curl -X POST \
 4. 如果是非 loopback 绑定，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `gateway.paired_tokens`。
 5. token 视为密钥，不写入公开仓库或日志。
 6. Max webhook secret 同理：每个账号使用独立随机值，不跨 bot 复用。
+7. `/pair` 会把签发的 bearer token 持久化到配置目录下的 `paired_token`（`secrets.encrypt = true` 时用共享 `SecretStore` 加密，权限 `0600`），以便 schedule/cron 工具读取后调用 `/cron/*`。`/logout` 在撤销 token 时会删除该文件。这是 `require_pairing = true` 下调度器正常工作的必要条件；否则 cron 工具无法获取 token，`/cron` 会返回 `401`。
 
 ## 下一步
 

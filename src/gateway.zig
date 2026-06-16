@@ -6316,6 +6316,18 @@ pub fn run(
                                     response_status = "500 Internal Server Error";
                                     response_body = "{\"error\":\"pairing response failed\"}";
                                 }
+                                // Persist the freshly-paired token (encrypted at rest via
+                                // the shared SecretStore when secrets.encrypt=true) so the
+                                // schedule/cron tool running in the agent process can
+                                // authenticate to /cron. Without this, /pair only stored
+                                // the token in this gateway's in-memory PairingGuard and
+                                // the cron tool had no way to obtain it — see issue #839.
+                                if (config_opt) |cfg| {
+                                    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse "";
+                                    cron_mod.persistPairedToken(allocator, config_dir, cfg.secrets.encrypt, token) catch |err| {
+                                        log.err("failed to persist paired token for cron tool: {s}", .{@errorName(err)});
+                                    };
+                                }
                             },
                             .missing_code => {
                                 response_status = "400 Bad Request";
@@ -6361,6 +6373,13 @@ pub fn run(
                         response_body = "{\"error\":\"unauthorized\"}";
                     } else {
                         response_body = "{\"status\":\"revoked\"}";
+                        // Drop the persisted paired_token so a revoked credential
+                        // cannot be reused by the cron tool. Best-effort: a
+                        // failed delete must not mask the successful revocation.
+                        if (config_opt) |cfg| {
+                            const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse "";
+                            cron_mod.clearPairedToken(allocator, config_dir);
+                        }
                     }
                 }
             },
@@ -7053,6 +7072,45 @@ test "idempotency store rejects duplicate key" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-1"));
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-1"));
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
+}
+
+// Regression for issue #839: on a successful /pair, the freshly-issued bearer
+// token must be persisted (encrypted at rest) to <config_dir>/paired_token so
+// the schedule/cron tool can authenticate to /cron. This mirrors the exact
+// call sequence the .pair handler runs: attemptPair -> .paired => |token| ->
+// cron_mod.persistPairedToken, then cron_mod.readPairedTokenFromDir recovers it.
+test "pair handler persists issued token for cron tool access" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    // Same guard construction the gateway uses (require_pairing=true, no preset tokens).
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    _ = try guard.setPairingCode("123456");
+
+    // Mirror the .paired handler arm exactly.
+    const runtime_token = switch (guard.attemptPair("123456")) {
+        .paired => |token| token,
+        else => return error.TestUnexpectedResult,
+    };
+    defer std.testing.allocator.free(runtime_token);
+
+    // The handler then calls persistPairedToken with the live token + config dir.
+    try cron_mod.persistPairedToken(std.testing.allocator, tmp_path, true, runtime_token);
+
+    // The cron tool (separate process) reads it back and gets the plaintext token.
+    const recovered = cron_mod.readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRecovered;
+    defer std.testing.allocator.free(recovered);
+    try std.testing.expectEqualStrings(runtime_token, recovered);
+
+    // And the token must authenticate against the gateway's own guard.
+    try std.testing.expect(guard.isAuthenticated(recovered));
+
+    // /logout cleanup: clearing the file removes the credential.
+    cron_mod.clearPairedToken(std.testing.allocator, tmp_path);
+    try std.testing.expect(cron_mod.readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
 }
 
 test "idempotency store allows different keys" {

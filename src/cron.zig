@@ -14,6 +14,7 @@ const signal = @import("channels/signal.zig");
 const Config = @import("config.zig").Config;
 const process_util = @import("tools/process_util.zig");
 const security_policy = @import("security/policy.zig");
+const secrets = @import("security/secrets.zig");
 
 const log = std.log.scoped(.cron);
 const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -1782,13 +1783,84 @@ fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
 }
 
 /// Read the paired bearer token from paired_token in the config directory (if present).
+/// Resolves the config dir from NULLCLAW_HOME / $HOME/.nullclaw, then delegates to
+/// readPairedTokenFromDir which transparently decrypts enc2: blobs.
 fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
     const dir = config_paths.defaultConfigDir(allocator) catch return null;
     defer allocator.free(dir);
-    const token_path = config_paths.pathFromConfigDir(allocator, dir, "paired_token") catch return null;
+    return readPairedTokenFromDir(allocator, dir);
+}
+
+/// Read + decrypt the paired token from <config_dir>/paired_token.
+///
+/// Returns null when the file is absent or empty/whitespace. Legacy plaintext
+/// tokens (no `enc2:` prefix) pass through unchanged for backward compatibility.
+/// A tampered or undecryptable blob also returns null (graceful degradation)
+/// rather than propagating the crypto error to the cron caller — the gateway
+/// will simply reject the unauthenticated request as before.
+pub fn readPairedTokenFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ?[]const u8 {
+    const token_path = config_paths.pathFromConfigDir(allocator, config_dir, "paired_token") catch return null;
     defer allocator.free(token_path);
-    const raw = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096) catch return null;
-    return trimOwnedRight(allocator, raw);
+    const raw = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 8192) catch return null;
+    const trimmed = trimOwnedRight(allocator, raw) orelse return null;
+    // decryptSecret always returns a freshly-allocated buffer: it dupes
+    // plaintext values and dupes the decrypted plaintext for enc2: blobs.
+    const decrypted = secrets.SecretStore.init(config_dir, true)
+        .decryptSecret(allocator, trimmed) catch {
+        allocator.free(trimmed);
+        return null;
+    };
+    allocator.free(trimmed);
+    if (decrypted.len == 0) {
+        allocator.free(decrypted);
+        return null;
+    }
+    return decrypted;
+}
+
+/// Atomically write the paired_token file (mode 0600 on POSIX). `contents`
+/// is stored verbatim — callers are responsible for any encryption envelope.
+fn writePairedTokenFileAtomic(allocator: std.mem.Allocator, file_path: []const u8, contents: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{file_path});
+    defer allocator.free(tmp_path);
+    const tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{}) catch return error.PairedTokenWriteFailed;
+    var wrote_ok = true;
+    tmp_file.writeAll(contents) catch {
+        wrote_ok = false;
+    };
+    if (builtin.os.tag != .windows) tmp_file.chmod(0o600) catch {};
+    tmp_file.close();
+    if (!wrote_ok) return error.PairedTokenWriteFailed;
+    std_compat.fs.renameAbsolute(tmp_path, file_path) catch return error.PairedTokenWriteFailed;
+}
+
+/// Persist the freshly-paired bearer token to <config_dir>/paired_token so the
+/// cron/schedule tool (running in the agent process) can authenticate to the
+/// gateway /cron endpoint. When `encrypt` is true the token is sealed with the
+/// shared SecretStore (ChaCha20-Poly1305, `enc2:` envelope); when false it is
+/// written as plaintext for parity with the disabled-secrets path.
+pub fn persistPairedToken(
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    encrypt: bool,
+    token: []const u8,
+) !void {
+    const store = secrets.SecretStore.init(config_dir, encrypt);
+    const blob = try store.encryptSecret(allocator, token);
+    defer allocator.free(blob);
+
+    const token_path = try config_paths.pathFromConfigDir(allocator, config_dir, "paired_token");
+    defer allocator.free(token_path);
+    try writePairedTokenFileAtomic(allocator, token_path, blob);
+    log.info("Persisted paired bearer token for cron tool access (encrypt={})", .{encrypt});
+}
+
+/// Remove the paired_token file. Best-effort: missing file and delete errors
+/// are swallowed so a failing cleanup can never break /logout.
+pub fn clearPairedToken(allocator: std.mem.Allocator, config_dir: []const u8) void {
+    const token_path = config_paths.pathFromConfigDir(allocator, config_dir, "paired_token") catch return;
+    defer allocator.free(token_path);
+    std_compat.fs.deleteFileAbsolute(token_path) catch {};
 }
 
 /// Build Authorization header slice (caller owns via arena/allocator).
@@ -3946,4 +4018,143 @@ test "cron rejects obviously malformed expressions" {
         const result = nextRunForCronExpression(input, 0);
         try std.testing.expect(std.meta.isError(result));
     }
+}
+
+// ── paired_token persistence tests (issue #839) ────────────────────
+//
+// Regression: the schedule/cron tool authenticates to the gateway /cron
+// endpoint with a bearer token read from <config_dir>/paired_token, but
+// nothing ever wrote that file — so /cron always returned 401 on loopback
+// with require_pairing=true. These tests cover the encrypted at-rest
+// persistence added so /pair populates paired_token.
+
+test "persistPairedToken writes encrypted blob and readPairedTokenFromDir round-trips" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const token = "zc_deadbeefcafebabe0000000000000000000000000000000000000000000000ff";
+
+    // persistPairedToken with encrypt=true must write an enc2: blob, not plaintext.
+    try persistPairedToken(std.testing.allocator, tmp_path, true, token);
+
+    // The file on disk must NOT contain the plaintext token.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    const on_disk = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, token_path, 8192);
+    defer std.testing.allocator.free(on_disk);
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, on_disk, " \t\r\n"), "enc2:"));
+    try std.testing.expect(std.mem.indexOf(u8, on_disk, token) == null);
+
+    // Reading via the config-dir-aware reader must recover the plaintext token.
+    const read_back = readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRead;
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings(token, read_back);
+}
+
+test "readPairedTokenFromDir returns null when paired_token absent" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir returns null for empty file" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    // Seed an empty (whitespace-only) paired_token — the legacy "nothing here" state.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    try writePairedTokenFileAtomic(std.testing.allocator, token_path, "   ");
+
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir passes legacy plaintext through unchanged" {
+    // Backward compatibility: a pre-existing plaintext paired_token (written by
+    // an older tool or operator) must still be readable without decryption.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const legacy_token = "zc_legacy_plaintext_token_no_enc2_prefix";
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    try writePairedTokenFileAtomic(std.testing.allocator, token_path, legacy_token);
+
+    const read_back = readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRead;
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings(legacy_token, read_back);
+}
+
+test "persistPairedToken with encrypt=false writes plaintext" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const token = "zc_no_encryption_mode_token_0123456789abcdef0123456789abcdef";
+    try persistPairedToken(std.testing.allocator, tmp_path, false, token);
+
+    const read_back = readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRead;
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings(token, read_back);
+}
+
+test "readPairedTokenFromDir detects tampered encrypted blob" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try persistPairedToken(std.testing.allocator, tmp_path, true, "zc_tamper_test_token_0123456789abcdef0123456789abcdef");
+
+    // Flip a byte in the middle of the enc2: blob.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    const original = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, token_path, 8192);
+    defer std.testing.allocator.free(original);
+    var tampered = try std.testing.allocator.dupe(u8, original);
+    defer std.testing.allocator.free(tampered);
+    const flip_at = std.mem.indexOf(u8, tampered, ":").? + 4; // inside hex payload
+    tampered[flip_at] = if (tampered[flip_at] == '0') '1' else '0';
+    try writePairedTokenFileAtomic(std.testing.allocator, token_path, tampered);
+
+    // Tampered AEAD must fail decryption → reader returns null (graceful, not a crash).
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "clearPairedToken removes the file" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try persistPairedToken(std.testing.allocator, tmp_path, true, "zc_clearable_token_00112233445566778899aabbccddeeff");
+    if (readPairedTokenFromDir(std.testing.allocator, tmp_path)) |present| {
+        defer std.testing.allocator.free(present);
+    } else return error.TokenNotPersisted;
+
+    clearPairedToken(std.testing.allocator, tmp_path);
+
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "clearPairedToken is a no-op when file absent" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    // Must not error / leak even though there is nothing to delete.
+    clearPairedToken(std.testing.allocator, tmp_path);
+    clearPairedToken(std.testing.allocator, tmp_path);
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
 }

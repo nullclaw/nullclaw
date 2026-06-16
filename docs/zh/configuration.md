@@ -704,6 +704,7 @@ Max 说明：
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
 - 如果绑定到非 loopback 地址，像 `/webhook`、`/cron/*`、`/a2a`、`/media/transcribe` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求已存储的 bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。
 - 如果绑定到非 loopback 地址，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `paired_tokens`。
+- `/pair` 会把签发的 bearer token 持久化到配置目录下的 `paired_token`（`secrets.encrypt = true` 时用共享 `SecretStore` 静态加密，权限 `0600`），以便运行在 agent 进程中的 schedule/cron 工具读取后向 `/cron/*` 认证。`/logout` 在撤销 token 时会删除该文件。正是这一持久化让调度器在 `require_pairing = true` 下也能工作；否则 cron 工具拿不到 token，`/cron` 返回 `401`。
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|

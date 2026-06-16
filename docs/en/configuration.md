@@ -894,6 +894,8 @@ Avoid direct public exposure. Use tunnel when external access is required.
 On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, `/a2a`, and `/media/transcribe` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
 On non-loopback binds, `/pair` only accepts loopback clients; do the initial pairing locally or preconfigure `paired_tokens` before exposing the gateway.
 
+`/pair` persists the issued bearer token to `paired_token` in the config directory (encrypted at rest with the shared `SecretStore` when `secrets.encrypt = true`, written mode `0600`) so the schedule/cron tool — which runs in the agent process — can read and use it to authenticate to `/cron/*`. `/logout` removes this file when the token is revoked. This persistence is what lets the scheduler work with `require_pairing = true`; without it the cron tool cannot obtain a token and `/cron` returns `401`.
+
 | Field | Default | Description |
 |-------|---------|-------------|
 | `host` | `"127.0.0.1"` | Listen address |
