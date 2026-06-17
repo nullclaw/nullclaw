@@ -22,6 +22,8 @@ const streaming = @import("../streaming.zig");
 const outbound = @import("../outbound.zig");
 const log = std.log.scoped(.channels);
 
+pub const cli_line_editor = @import("cli_line_editor.zig");
+
 fn wildcardWarningState(comptime scope: []const u8) *std.atomic.Value(bool) {
     const WarningState = struct {
         var warned = std.atomic.Value(bool).init(false);
