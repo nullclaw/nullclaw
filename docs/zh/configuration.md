@@ -467,6 +467,53 @@ WeChat 说明：
 - `allow_from` 应显式列出可信 OpenID，不要依赖空 allowlist 来实现隐私隔离。
 - 如果当前二进制未编译 WeChat channel，请使用 `-Dchannels=wechat`（或 `-Dchannels=all`）重新构建。
 
+#### Weixin — 个人微信账号（扫码登录）
+
+`weixin` channel 通过 iLink bot API 连接**个人微信账号**，使用 QR 扫码认证。
+这与上方的 `wechat` Official Account channel 不同——`weixin` 用于个人账号，而非
+企业/公众号。
+
+首先，扫码登录获取 token：
+
+```bash
+nullclaw auth login weixin
+```
+
+此命令会在终端渲染 QR 码。用微信 App 扫码并在手机上确认登录后，生成的 `token`
+和 `base_url` 会自动保存到配置文件中。
+
+登录后，添加 `weixin` channel 条目：
+
+```json
+{
+  "channels": {
+    "weixin": [
+      {
+        "token": "<扫码登录获取的 bot token>",
+        "base_url": "https://ilinkai.weixin.qq.com/",
+        "allow_from": ["<你的微信用户 ID>"]
+      }
+    ]
+  }
+}
+```
+
+Weixin channel 字段：
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `token` | `""` | 从 `nullclaw auth login weixin` 获取的 bot token（必填） |
+| `base_url` | `https://ilinkai.weixin.qq.com/` | iLink API 基础 URL（地区重定向后可能变化） |
+| `proxy` | `null` | 可选的 HTTP 代理 URL |
+| `allow_from` | `[]` | 允许向 bot 发消息的微信用户 ID 列表 |
+
+说明：
+
+- 使用 `nullclaw auth status weixin` 查看当前登录状态。
+- 如果在代理后方，使用 `nullclaw auth login weixin --proxy http://localhost:7890`。
+- 如果二进制未编译 weixin channel，请使用 `-Dchannels=weixin`（或 `-Dchannels=all`）重新构建。
+- 启动时，nullclaw 会自动为每个已配置的 weixin 账号启动轮询线程。
+
 规则说明：
 
 - 对基于 allowlist 的渠道，空 `allow_from` 会拒绝入站消息；如果要做私有机器人，请显式填写 ID/OpenID。

@@ -527,6 +527,53 @@ WeChat notes:
 - `allow_from` should list trusted OpenIDs. Keep it explicit; do not rely on an empty allowlist for privacy.
 - Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
 
+#### Weixin — Personal WeChat Account (QR Code Login)
+
+The `weixin` channel connects to a **personal WeChat account** via the iLink bot API
+using QR code authentication. This is separate from the `wechat` Official Account channel
+above — `weixin` is for personal accounts, not business/public accounts.
+
+First, log in and obtain a token:
+
+```bash
+nullclaw auth login weixin
+```
+
+This renders a QR code in the terminal. Scan it with your WeChat app, confirm login
+on your phone, and the resulting `token` and `base_url` are saved to your config.
+
+After login, add a `weixin` channel entry:
+
+```json
+{
+  "channels": {
+    "weixin": [
+      {
+        "token": "<bot-token-from-qr-login>",
+        "base_url": "https://ilinkai.weixin.qq.com/",
+        "allow_from": ["<your-wechat-user-id>"]
+      }
+    ]
+  }
+}
+```
+
+Weixin channel fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `token` | `""` | Bot token from `nullclaw auth login weixin` (required) |
+| `base_url` | `https://ilinkai.weixin.qq.com/` | iLink API base URL (may change after region redirect) |
+| `proxy` | `null` | Optional HTTP proxy URL for API requests |
+| `allow_from` | `[]` | WeChat user IDs allowed to message the bot |
+
+Notes:
+
+- Use `nullclaw auth status weixin` to check whether you are logged in.
+- Use `nullclaw auth login weixin --proxy http://localhost:7890` if behind a proxy.
+- Build with `-Dchannels=weixin` (or `-Dchannels=all`) if your binary was compiled without it.
+- On boot, nullclaw starts the `weixin` polling thread automatically for each configured account.
+
 Telegram forum topics:
 
 - Topic session isolation is automatic; there is no separate `topic_id` field under `channels.telegram`.
