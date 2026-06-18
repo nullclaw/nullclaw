@@ -821,7 +821,10 @@ test "applyConfigPatchFields maps generic wizard config fields" {
         \\  "memory": {
         \\    "profile": "minimal_none",
         \\    "backend": "none",
-        \\    "auto_save": false
+        \\    "auto_save": false,
+        \\    "auto_recall": false,
+        \\    "recall_limit": 7,
+        \\    "max_context_bytes": 8000
         \\  }
         \\}
     ;
@@ -847,6 +850,9 @@ test "applyConfigPatchFields maps generic wizard config fields" {
     try std.testing.expectEqualStrings("minimal_none", cfg.memory.profile);
     try std.testing.expectEqualStrings("none", cfg.memory.backend);
     try std.testing.expect(!cfg.memory.auto_save);
+    try std.testing.expect(!cfg.memory.auto_recall);
+    try std.testing.expectEqual(@as(u32, 7), cfg.memory.recall_limit);
+    try std.testing.expectEqual(@as(u32, 8000), cfg.memory.max_context_bytes);
 }
 
 test "applyProvidersFromArray sets model default from primary provider when omitted" {
