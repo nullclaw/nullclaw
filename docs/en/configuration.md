@@ -145,6 +145,43 @@ Common per-provider fields:
 - `max_streaming_prompt_bytes`: skip streaming above this estimated prompt size.
 - `chat_template_enable_thinking_param`: for custom OpenAI-compatible vLLM/Qwen endpoints, map `reasoning_effort` to `chat_template_kwargs.enable_thinking`.
 
+#### Native Anthropic Provider
+
+NullClaw has a dedicated Anthropic provider that connects directly to the Anthropic API
+— no OpenRouter or proxy needed. It supports:
+
+- **Standard API keys** via the `x-api-key` header (keys starting with `sk-ant-api...`).
+- **OAuth / Pro-Plan tokens** via Bearer auth (keys starting with `sk-ant-oat01-`).
+  OAuth tokens are detected automatically — no extra config required.
+- **Custom base URLs** for proxies or self-hosted endpoints (set `base_url`).
+- **Streaming, native tool use, vision (multimodal images), and extended thinking.**
+
+Example (direct Anthropic API key):
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": { "api_key": "sk-ant-api03-..." }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-sonnet-4-20250514" }
+    }
+  }
+}
+```
+
+Notes:
+
+- Use the **Anthropic model ID** (e.g. `claude-sonnet-4-20250514`) with the
+  `anthropic/` provider prefix. List available models with
+  `nullclaw --list-models --provider anthropic`.
+- The `base_url` field is optional and defaults to `https://api.anthropic.com`.
+- OAuth setup tokens (`sk-ant-oat01-...`) work automatically; NullClaw detects
+  them and switches to Bearer token authentication.
+
 ### `agents.defaults.model.primary`
 
 - Sets default model route, typically `provider/vendor/model`.

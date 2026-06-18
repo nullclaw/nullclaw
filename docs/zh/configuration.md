@@ -130,6 +130,42 @@ nullclaw onboard --interactive
 - `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
 - `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
 
+#### 原生 Anthropic Provider
+
+NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API，无需经过 OpenRouter 或代理。支持：
+
+- **标准 API Key** 通过 `x-api-key` header（以 `sk-ant-api...` 开头的密钥）。
+- **OAuth / Pro-Plan 令牌** 通过 Bearer auth（以 `sk-ant-oat01-` 开头的密钥）。
+  OAuth 令牌会被自动检测，无需额外配置。
+- **自定义 base_url** 用于代理或自托管端点（设置 `base_url`）。
+- **流式输出、原生工具调用、视觉（多模态图片）与 extended thinking。**
+
+示例（直接使用 Anthropic API Key）：
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": { "api_key": "sk-ant-api03-..." }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-sonnet-4-20250514" }
+    }
+  }
+}
+```
+
+说明：
+
+- 使用 **Anthropic 模型 ID**（例如 `claude-sonnet-4-20250514`）并加上
+  `anthropic/` provider 前缀。通过 `nullclaw --list-models --provider anthropic`
+  查看可用模型列表。
+- `base_url` 字段是可选的，默认值为 `https://api.anthropic.com`。
+- OAuth 设置令牌（`sk-ant-oat01-...`）自动生效；NullClaw 会检测它们并自动切换为
+  Bearer 令牌认证。
+
 ### `agents.defaults.model.primary`
 
 - 设置默认模型路由，通常是 `provider/vendor/model`。
