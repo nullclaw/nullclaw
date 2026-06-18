@@ -2021,8 +2021,7 @@ pub const Agent = struct {
             var prompt_tools_arena = std.heap.ArenaAllocator.init(self.allocator);
             defer prompt_tools_arena.deinit();
             const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
-            const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const prompt_native_tools_enabled = !prompt_is_streaming and self.provider.supportsNativeTools();
+            const prompt_native_tools_enabled = self.provider.supportsNativeTools();
 
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
@@ -2200,7 +2199,7 @@ pub const Agent = struct {
 
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            const native_tools_enabled = self.provider.supportsNativeTools();
             const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
@@ -2216,7 +2215,7 @@ pub const Agent = struct {
                 turn_max_tokens,
             );
 
-            // Call provider: streaming (no retries, no native tools) or blocking with retry
+            // Call provider: streaming (native tools if supported) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
@@ -2231,7 +2230,7 @@ pub const Agent = struct {
                         .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
-                        .tools = null,
+                        .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                         .include_reasoning = include_reasoning,
@@ -2268,7 +2267,7 @@ pub const Agent = struct {
                                 .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
-                                .tools = null,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                                 .include_reasoning = include_reasoning,
@@ -10785,9 +10784,9 @@ test "filterToolsForPromptText empty group excludes MCP tools" {
     try std.testing.expectEqualStrings("shell", result[0].name());
 }
 
-test "Agent system prompt keeps parameters when streaming disables native tool schemas" {
-    // Regression: streaming turns send tools=null, so the text prompt must keep
-    // Parameters even if the provider supports native tools.
+test "Agent system prompt excludes tool schemas when streaming and native tools are compatible" {
+    // Regression: streaming with native_tools provider should pass API-level tools[]
+    // and exclude text-embedded tool schemas from the system prompt.
     const StreamingPromptCapture = struct {
         captured_system: ?[]u8 = null,
         capture_alloc: std.mem.Allocator,
@@ -10817,7 +10816,7 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
             callback: providers.StreamCallback,
             callback_ctx: *anyopaque,
         ) anyerror!providers.StreamChatResult {
-            try std.testing.expect(request.tools == null);
+            try std.testing.expect(request.tools != null);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             for (request.messages) |msg| {
                 if (msg.role == .system) {
@@ -10887,7 +10886,7 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
     try std.testing.expect(provider_state.captured_system != null);
     const captured = provider_state.captured_system.?;
     try std.testing.expect(std.mem.indexOf(u8, captured, "**shell**: shell") != null);
-    try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") == null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
 }
 
