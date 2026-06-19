@@ -3,8 +3,15 @@
 //! Keeps legacy curl helpers for non-secret requests, but routes credentialed
 //! headers and sensitive token URLs through std.http so secrets are not exposed
 //! through child process argv.
+//!
+//! Android exception: `std.http.Client` cannot complete credentialed HTTPS
+//! requests on `aarch64-linux-android` (TLS handshake / Host header path
+//! regresses in the stdlib client on that target), so on Android we always go
+//! through the curl subprocess path. Credentials are still passed via
+//! `-H @<tempfile>` (`prepareCurlHeaderArg`) and never appear in argv.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
@@ -284,6 +291,11 @@ pub fn prepareCurlHeaderArg(allocator: Allocator, headers: []const []const u8) !
 }
 
 fn credentialedCurlUsesHttpFallback(url: []const u8, headers: []const []const u8, resolve_entry: ?[]const u8) bool {
+    // Regression: aarch64-linux-android.24 (Termux) — std.http.Client cannot
+    // complete credentialed HTTPS requests to mm.agility.plus / Discord etc.
+    // Force the curl subprocess path on Android; credentials still flow via
+    // `-H @<tempfile>` (see prepareCurlHeaderArg), so argv stays clean.
+    if (comptime builtin.abi == .android) return false;
     return hasCredentialedCurlArgs(url, headers) and resolve_entry == null;
 }
 
@@ -1677,6 +1689,29 @@ test "credentialed curl args route to std http fallback" {
     try std.testing.expect(hasCredentialedCurlArgs("https://example.com/v1", &.{"Authorization: Bearer test-token"}));
     try std.testing.expect(hasCredentialedCurlArgs("https://example.com/v1?access_token=test-token", &.{}));
     try std.testing.expect(!hasCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"}));
+}
+
+// Regression: aarch64-linux-android (Termux) — std.http.Client cannot complete
+// credentialed HTTPS requests, so the curl subprocess path must be used on
+// Android. Verified at comptime; the curl subprocess itself is exercised by
+// the existing curlGet/curlPost test suite on every host platform.
+test "credentialed curl falls through to curl on android" {
+    const cred_headers = [_][]const u8{"Authorization: Bearer test-token"};
+    if (comptime builtin.abi == .android) {
+        try std.testing.expect(!credentialedCurlUsesHttpFallback(
+            "https://example.com/v1",
+            &cred_headers,
+            null,
+        ));
+    } else {
+        // On non-Android platforms the existing std.http fallback path is
+        // preserved. Behavior is unchanged from before this fix.
+        try std.testing.expect(credentialedCurlUsesHttpFallback(
+            "https://example.com/v1",
+            &cred_headers,
+            null,
+        ));
+    }
 }
 
 const LegacyCredentialedCurlHelper = enum {
