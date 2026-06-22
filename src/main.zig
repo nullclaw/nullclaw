@@ -6500,7 +6500,47 @@ test "hasStartupProviderCredentials rejects blank configured key" {
 }
 
 test "hasStartupProviderCredentials rejects missing provider and fallback credentials" {
-    // Regression: channel startup must still fail fast when neither the primary provider nor fallbacks can authenticate.
+    // Regression: channel startup must still fail fast when neither the primary
+    // provider nor fallbacks can authenticate. This test is non-hermetic against
+    // env vars leaking from the developer shell — production code's env-var
+    // fallback (api_key.zig) is intentional, so the test must explicitly
+    // save/unset/restore those vars to hold its "no credentials" premise.
+    // Windows is skipped: libc env-var manipulation is platform-specific.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    // Sentinel-terminated names so they pass directly to libc getenv/setenv.
+    const env_vars = [_][*:0]const u8{
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "NULLCLAW_API_KEY",
+        "API_KEY",
+    };
+
+    // Save current values (heap-duped so the bytes survive unsetenv + setenv).
+    var saved = [_]?[:0]u8{null} ** env_vars.len;
+    inline for (env_vars, 0..) |name, i| {
+        if (c.getenv(name)) |ptr| {
+            saved[i] = try std.testing.allocator.dupeZ(u8, std.mem.span(ptr));
+        }
+    }
+    defer inline for (env_vars, 0..) |name, i| {
+        if (saved[i]) |val| {
+            _ = c.setenv(name, val.ptr, 1);
+            std.testing.allocator.free(val);
+        } else {
+            _ = c.unsetenv(name);
+        }
+    };
+
+    // Unset all so the test's "no credentials" premise holds regardless of
+    // what the developer shell has exported.
+    inline for (env_vars) |name| {
+        _ = c.unsetenv(name);
+    }
+
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
