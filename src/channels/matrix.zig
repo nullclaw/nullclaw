@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const url_percent = @import("../url_percent.zig");
+const platform = @import("../platform.zig");
 
 const log = std.log.scoped(.matrix);
 
@@ -67,6 +68,10 @@ pub const MatrixChannel = struct {
         if (cfg.pantalaimon_proxy_url) |proxy| {
             ch.effective_endpoint = stripTrailingSlashes(proxy);
         }
+        // Resume the /sync stream from the last committed position instead of
+        // running a fresh initial sync (which silently drops all messages that
+        // arrived during downtime).
+        ch.loadPersistedNextBatch();
         return ch;
     }
 
@@ -79,11 +84,135 @@ pub const MatrixChannel = struct {
     }
 
     fn setNextBatch(self: *MatrixChannel, token: []const u8) void {
+        // Matrix /sync returns a fresh next_batch on every cycle, including
+        // idle long-poll timeouts (~10-30s). Skip the memcpy + disk write when
+        // the position has not actually advanced — otherwise we'd persist the
+        // same token to disk every poll cycle forever.
+        if (!self.nextBatchChanged(token)) return;
+
         const len = @min(token.len, self.next_batch_buf.len);
         if (len > 0) {
             @memcpy(self.next_batch_buf[0..len], token[0..len]);
         }
         self.next_batch_len = len;
+        // Persist so a restart resumes the sync stream at this position instead
+        // of running a fresh initial sync (which discards everything that
+        // arrived during downtime).
+        self.persistNextBatch();
+    }
+
+    /// True when `token` would change the buffered next_batch position.
+    /// Extracted from setNextBatch so the short-circuit is unit-testable
+    /// independent of the is_test-guarded disk path.
+    fn nextBatchChanged(self: *const MatrixChannel, token: []const u8) bool {
+        const new_len = @min(token.len, self.next_batch_buf.len);
+        if (new_len != self.next_batch_len) return true;
+        return !std.mem.eql(u8, self.next_batch_buf[0..new_len], token[0..new_len]);
+    }
+
+    /// Build absolute path `<dir>/matrix-next-batch-<account_id>`. Caller frees.
+    /// account_id is sanitized to keep the filename path-safe.
+    fn nextBatchPath(allocator: std.mem.Allocator, dir: []const u8, account_id: []const u8) ![]u8 {
+        var name_buf: [128]u8 = undefined;
+        const safe = sanitizeAccountId(account_id, &name_buf);
+        const filename = try std.fmt.allocPrint(allocator, "matrix-next-batch-{s}", .{safe});
+        defer allocator.free(filename);
+        return std_compat.fs.path.join(allocator, &.{ dir, filename });
+    }
+
+    /// Replace any character that is not alphanumeric / `-` / `_` / `.` with
+    /// `_` so a config-supplied account_id can never escape the state dir.
+    fn sanitizeAccountId(account_id: []const u8, buf: []u8) []const u8 {
+        const len = @min(account_id.len, buf.len);
+        if (len == 0) {
+            // Empty account_id would yield a dangling trailing dash; use a stable stem.
+            const fallback = "default";
+            const n = @min(fallback.len, buf.len);
+            @memcpy(buf[0..n], fallback[0..n]);
+            return buf[0..n];
+        }
+        for (account_id[0..len], 0..) |c, i| {
+            buf[i] = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') c else '_';
+        }
+        return buf[0..len];
+    }
+
+    /// Atomically write `token` to `<dir>/matrix-next-batch-<account_id>`,
+    /// creating `dir` if needed.
+    fn writeNextBatchFile(allocator: std.mem.Allocator, dir: []const u8, account_id: []const u8, token: []const u8) !void {
+        std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        const path = try nextBatchPath(allocator, dir, account_id);
+        defer allocator.free(path);
+        const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+        defer allocator.free(tmp_path);
+        {
+            var tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
+            defer tmp_file.close();
+            try tmp_file.writeAll(token);
+        }
+        std_compat.fs.renameAbsolute(tmp_path, path) catch {
+            std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+            var file = try std_compat.fs.createFileAbsolute(path, .{});
+            defer file.close();
+            try file.writeAll(token);
+        };
+    }
+
+    /// Read a persisted token into `out_buf`. Returns the number of bytes read,
+    /// or 0 when no persisted token exists.
+    fn readNextBatchFile(allocator: std.mem.Allocator, dir: []const u8, account_id: []const u8, out_buf: []u8) !usize {
+        const path = try nextBatchPath(allocator, dir, account_id);
+        defer allocator.free(path);
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| {
+            if (err == error.FileNotFound) return 0;
+            return err;
+        };
+        defer file.close();
+        return file.readAll(out_buf);
+    }
+
+    /// Resolve the nullclaw state dir (`~/.nullclaw/state`). Caller frees.
+    fn resolveStateDir(allocator: std.mem.Allocator) ![]u8 {
+        const home = try platform.getHomeDir(allocator);
+        defer allocator.free(home);
+        return std_compat.fs.path.join(allocator, &.{ home, ".nullclaw", "state" });
+    }
+
+    /// Persist the current next_batch token to disk. Best-effort: failures are
+    /// logged, never propagated (must not break the poll loop). Skipped under
+    /// test (no real disk).
+    fn persistNextBatch(self: *MatrixChannel) void {
+        if (builtin.is_test) return;
+        if (self.next_batch_len == 0) return;
+        const dir = resolveStateDir(self.allocator) catch |err| {
+            log.warn("matrix: cannot resolve state dir for next_batch persistence: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(dir);
+        writeNextBatchFile(self.allocator, dir, self.account_id, self.nextBatch()) catch |err| {
+            log.warn("matrix: failed to persist next_batch: {}", .{err});
+        };
+    }
+
+    /// Load a persisted next_batch token into the buffer so a restart resumes
+    /// the sync stream at the last committed position rather than running a
+    /// fresh initial sync (which silently drops all downtime messages).
+    /// Best-effort. Skipped under test.
+    pub fn loadPersistedNextBatch(self: *MatrixChannel) void {
+        if (builtin.is_test) return;
+        const dir = resolveStateDir(self.allocator) catch return;
+        defer self.allocator.free(dir);
+        const n = readNextBatchFile(self.allocator, dir, self.account_id, &self.next_batch_buf) catch |err| {
+            log.warn("matrix: failed to load persisted next_batch: {}", .{err});
+            return;
+        };
+        if (n > 0) {
+            self.next_batch_len = n;
+            log.info("matrix: resumed sync from persisted next_batch ({d} bytes)", .{n});
+        }
     }
 
     fn authHeader(self: *const MatrixChannel, allocator: std.mem.Allocator) ![]u8 {
@@ -1546,4 +1675,72 @@ test "MatrixChannel start + stop under is_test leaks zero bytes" {
     ch.stop();
     // Double stop — must not double-free or crash.
     ch.stop();
+}
+
+test "MatrixChannel nextBatchChanged only flags actual position advances" {
+    // Regression: Matrix /sync returns a fresh next_batch on every cycle,
+    // including idle long-poll timeouts. Without short-circuiting, setNextBatch
+    // would atomic-write the same token to disk every ~10-30s indefinitely.
+    // The comparator must report "no change" for identical tokens and for
+    // tokens that differ only past the 1024-byte buffer truncation point.
+    var ch = MatrixChannel.init(
+        std.testing.allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+
+    // Empty buffer → anything is a change.
+    try std.testing.expect(ch.nextBatchChanged("abc"));
+
+    ch.setNextBatch("abc");
+    // Same token → no change (this is the idle /sync case).
+    try std.testing.expect(!ch.nextBatchChanged("abc"));
+    // Different content → change.
+    try std.testing.expect(ch.nextBatchChanged("abd"));
+    // Different length → change.
+    try std.testing.expect(ch.nextBatchChanged("ab"));
+    try std.testing.expect(ch.nextBatchChanged("abcd"));
+
+    // Tokens that differ only past the buffer cap are observably identical
+    // after truncation, so the comparator (which mirrors setNextBatch's
+    // truncation) must report no change — persisting either would yield the
+    // same buffered bytes.
+    ch.setNextBatch("s" ++ "a" ** 2000);
+    try std.testing.expect(!ch.nextBatchChanged("s" ++ "a" ** 1500));
+}
+
+test "MatrixChannel next_batch persistence roundtrip via writeNextBatchFile + readNextBatchFile" {
+    // Verify the pure disk helpers (no is_test guard) roundtrip correctly.
+    // persistNextBatch/loadPersistedNextBatch are is_test-guarded, so we test
+    // the underlying write/read functions directly with a tmp dir.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Resolve absolute path of the tmp dir.
+    const dir = blk: {
+        var buf: [4096]u8 = undefined;
+        const path = try std_compat.fs.Dir.wrap(tmp.dir).realpath(".", &buf);
+        break :blk try allocator.dupe(u8, path);
+    };
+    defer allocator.free(dir);
+
+    // Write a token, read it back.
+    try MatrixChannel.writeNextBatchFile(allocator, dir, "test-account", "s123456");
+    var read_buf: [1024]u8 = undefined;
+    const n = try MatrixChannel.readNextBatchFile(allocator, dir, "test-account", &read_buf);
+    try std.testing.expectEqual(@as(usize, 7), n);
+    try std.testing.expectEqualStrings("s123456", read_buf[0..n]);
+
+    // Missing file → 0 (not an error).
+    const n2 = try MatrixChannel.readNextBatchFile(allocator, dir, "nonexistent", &read_buf);
+    try std.testing.expectEqual(@as(usize, 0), n2);
+
+    // Overwrite → new value.
+    try MatrixChannel.writeNextBatchFile(allocator, dir, "test-account", "s999");
+    const n3 = try MatrixChannel.readNextBatchFile(allocator, dir, "test-account", &read_buf);
+    try std.testing.expectEqual(@as(usize, 4), n3);
+    try std.testing.expectEqualStrings("s999", read_buf[0..n3]);
 }
