@@ -272,6 +272,7 @@ pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: StreamChunk) void;
 pub const StreamChatResult = struct {
     content: ?[]const u8 = null,
     reasoning_content: ?[]const u8 = null,
+    tool_calls: []const ToolCall = &.{},
     usage: TokenUsage = .{},
     model: []const u8 = "",
 };
@@ -304,6 +305,8 @@ pub fn emitChatResponseAsStream(
 ) StreamChatResult {
     const reasoning_content = response.reasoning_content;
     response.reasoning_content = null;
+    const tool_calls = response.tool_calls;
+    response.tool_calls = &.{};
     if (response.content) |content| {
         if (content.len > 0) {
             callback(callback_ctx, StreamChunk.textDelta(content));
@@ -314,6 +317,7 @@ pub fn emitChatResponseAsStream(
     return .{
         .content = response.content,
         .reasoning_content = reasoning_content,
+        .tool_calls = tool_calls,
         .usage = response.usage,
         .model = response.model,
     };
@@ -409,6 +413,8 @@ pub const Provider = struct {
         chat_with_tools: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, req: ChatRequest) anyerror!ChatResponse = null,
         /// Optional: returns true if provider supports streaming. Default: false.
         supports_streaming: ?*const fn (ptr: *anyopaque) bool = null,
+        /// Optional: returns true if streaming responses can return native tool calls.
+        supports_streaming_native_tools: ?*const fn (ptr: *anyopaque) bool = null,
         /// Optional: returns true if provider supports vision/image input. Default: false.
         supports_vision: ?*const fn (ptr: *anyopaque) bool = null,
         /// Optional: returns true if provider supports vision for a specific model.
@@ -470,6 +476,12 @@ pub const Provider = struct {
         return false;
     }
 
+    /// Returns true if provider can parse native tool calls from streaming responses.
+    pub fn supportsStreamingNativeTools(self: Provider) bool {
+        if (self.vtable.supports_streaming_native_tools) |f| return f(self.ptr);
+        return false;
+    }
+
     /// Returns true if provider supports vision/image input.
     pub fn supportsVision(self: Provider) bool {
         if (self.vtable.supports_vision) |f| return f(self.ptr);
@@ -516,6 +528,7 @@ pub fn assertProviderInterface(comptime T: type) void {
     _ = vt.chat;
     _ = vt.supportsNativeTools;
     _ = vt.supports_vision;
+    _ = vt.supports_streaming_native_tools;
     _ = vt.getName;
     _ = vt.deinit;
 }
@@ -644,6 +657,35 @@ test "provider supportsStreaming returns false when vtable is null" {
     };
     const provider = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
     try std.testing.expect(!provider.supportsStreaming());
+}
+
+test "provider supportsStreamingNativeTools returns false when vtable is null" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return "";
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            return .{};
+        }
+        fn supNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+    try std.testing.expect(provider.supportsNativeTools());
+    try std.testing.expect(!provider.supportsStreamingNativeTools());
 }
 
 test "provider supportsVision returns false when vtable supports_vision is null" {
@@ -820,6 +862,7 @@ test "ChatResponse reasoning_content can be set" {
 test "StreamChatResult defaults" {
     const result = StreamChatResult{};
     try std.testing.expect(result.content == null);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
     try std.testing.expect(result.usage.prompt_tokens == 0);
     try std.testing.expect(result.usage.completion_tokens == 0);
     try std.testing.expectEqualStrings("", result.model);
@@ -893,6 +936,14 @@ test "emitChatResponseAsStream frees unused chat response fields" {
     defer if (result.content) |content| allocator.free(content);
     defer if (result.reasoning_content) |reasoning| allocator.free(reasoning);
     defer if (result.model.len > 0) allocator.free(result.model);
+    defer {
+        for (result.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(result.tool_calls);
+    }
 
     try std.testing.expectEqual(@as(usize, 1), ctx.text_count);
     try std.testing.expect(ctx.saw_final);
@@ -902,6 +953,10 @@ test "emitChatResponseAsStream frees unused chat response fields" {
     try std.testing.expectEqualStrings("hello", result.content.?);
     try std.testing.expectEqualStrings("private reasoning", result.reasoning_content.?);
     try std.testing.expectEqualStrings("test-model", result.model);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("tool-1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("read_file", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", result.tool_calls[0].arguments);
 }
 
 test "Provider.streamChat fallback emits single chunk and final" {

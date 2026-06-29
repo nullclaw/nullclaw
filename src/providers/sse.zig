@@ -41,6 +41,179 @@ fn finalizeStreamResult(
     };
 }
 
+const ToolCallSlot = struct {
+    index: usize,
+    id: ?[]u8 = null,
+    name: ?[]u8 = null,
+    arguments: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *ToolCallSlot, allocator: std.mem.Allocator) void {
+        if (self.id) |id| allocator.free(id);
+        if (self.name) |name| allocator.free(name);
+        self.arguments.deinit(allocator);
+        self.* = .{ .index = self.index };
+    }
+};
+
+const ToolCallAccumulator = struct {
+    slots: std.ArrayListUnmanaged(ToolCallSlot) = .empty,
+
+    fn deinit(self: *ToolCallAccumulator, allocator: std.mem.Allocator) void {
+        for (self.slots.items) |*slot| {
+            slot.deinit(allocator);
+        }
+        self.slots.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn ensureSlot(self: *ToolCallAccumulator, allocator: std.mem.Allocator, index: usize) !*ToolCallSlot {
+        for (self.slots.items) |*slot| {
+            if (slot.index == index) return slot;
+        }
+        try self.slots.append(allocator, .{ .index = index });
+        return &self.slots.items[self.slots.items.len - 1];
+    }
+
+    fn sortSlotsByIndex(self: *ToolCallAccumulator) void {
+        var i: usize = 1;
+        while (i < self.slots.items.len) : (i += 1) {
+            var j = i;
+            while (j > 0 and self.slots.items[j - 1].index > self.slots.items[j].index) : (j -= 1) {
+                std.mem.swap(ToolCallSlot, &self.slots.items[j - 1], &self.slots.items[j]);
+            }
+        }
+    }
+
+    fn appendFromJsonPayload(self: *ToolCallAccumulator, allocator: std.mem.Allocator, json_str: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return;
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return;
+        const choices = parsed.value.object.get("choices") orelse return;
+        if (choices != .array) return;
+
+        for (choices.array.items) |choice| {
+            if (choice != .object) continue;
+            const delta = choice.object.get("delta") orelse continue;
+            if (delta != .object) continue;
+            const tool_calls = delta.object.get("tool_calls") orelse continue;
+            if (tool_calls != .array) continue;
+
+            for (tool_calls.array.items, 0..) |tool_call, fallback_index| {
+                if (tool_call != .object) continue;
+                const index = if (tool_call.object.get("index")) |idx|
+                    switch (idx) {
+                        .integer => |n| @as(usize, @intCast(@max(0, n))),
+                        else => fallback_index,
+                    }
+                else
+                    fallback_index;
+
+                const slot = try self.ensureSlot(allocator, index);
+
+                if (tool_call.object.get("id")) |id_val| {
+                    if (id_val == .string and id_val.string.len > 0 and slot.id == null) {
+                        slot.id = try allocator.dupe(u8, id_val.string);
+                    }
+                }
+
+                const function = tool_call.object.get("function") orelse continue;
+                if (function != .object) continue;
+
+                if (function.object.get("name")) |name_val| {
+                    if (name_val == .string and name_val.string.len > 0) {
+                        if (slot.name) |old| allocator.free(old);
+                        slot.name = try allocator.dupe(u8, name_val.string);
+                    }
+                }
+
+                if (function.object.get("arguments")) |args_val| {
+                    if (args_val == .string and args_val.string.len > 0) {
+                        try slot.arguments.appendSlice(allocator, args_val.string);
+                    }
+                }
+            }
+        }
+    }
+
+    fn toOwnedToolCalls(self: *ToolCallAccumulator, allocator: std.mem.Allocator) ![]const root.ToolCall {
+        self.sortSlotsByIndex();
+
+        var valid_count: usize = 0;
+        for (self.slots.items) |slot| {
+            if (slot.name) |name| {
+                if (name.len > 0) valid_count += 1;
+            }
+        }
+        if (valid_count == 0) return &.{};
+
+        var calls = try allocator.alloc(root.ToolCall, valid_count);
+        var out_i: usize = 0;
+        errdefer {
+            for (calls[0..out_i]) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+
+        for (self.slots.items) |slot| {
+            const name = slot.name orelse continue;
+            if (name.len == 0) continue;
+
+            calls[out_i] = blk: {
+                const id = if (slot.id) |id_value|
+                    try allocator.dupe(u8, id_value)
+                else
+                    try std.fmt.allocPrint(allocator, "call_{d}", .{slot.index});
+                errdefer allocator.free(id);
+
+                const owned_name = try allocator.dupe(u8, name);
+                errdefer allocator.free(owned_name);
+
+                const arguments = if (slot.arguments.items.len > 0)
+                    try allocator.dupe(u8, slot.arguments.items)
+                else
+                    try allocator.dupe(u8, "{}");
+                errdefer allocator.free(arguments);
+
+                break :blk .{
+                    .id = id,
+                    .name = owned_name,
+                    .arguments = arguments,
+                };
+            };
+            out_i += 1;
+        }
+
+        return calls;
+    }
+};
+
+fn finalizeStreamResultWithToolCalls(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    stream_usage: ?root.TokenUsage,
+    tool_call_accumulator: *ToolCallAccumulator,
+) !root.StreamChatResult {
+    var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
+    errdefer {
+        if (result.content) |content| allocator.free(content);
+        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+        if (result.model.len > 0) allocator.free(result.model);
+        for (result.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+    }
+
+    result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
+    return result;
+}
+
 fn parseCurlVersionComponent(component: []const u8) ?u32 {
     var end: usize = 0;
     while (end < component.len and std.ascii.isDigit(component[end])) : (end += 1) {}
@@ -183,20 +356,7 @@ fn appendDeltaContent(
 /// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
 /// - Empty lines, comments (`:`) → `.skip`
 pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
-    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
-
-    if (trimmed.len == 0) return .skip;
-    if (trimmed[0] == ':') return .skip;
-
-    // SSE uses "data:" with an optional single leading space before the value.
-    const prefix = "data:";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
-
-    const data = if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
-        trimmed[prefix.len + 1 ..]
-    else
-        trimmed[prefix.len..];
-
+    const data = extractSseDataPayload(line) orelse return .skip;
     if (data.len == 0) return .skip;
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
@@ -207,6 +367,32 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
         return .skip;
     };
     return .{ .delta = content };
+}
+
+fn extractSseDataPayload(line: []const u8) ?[]const u8 {
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+
+    if (trimmed.len == 0) return null;
+    if (trimmed[0] == ':') return null;
+
+    // SSE uses "data:" with an optional single leading space before the value.
+    const prefix = "data:";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+
+    return if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
+        trimmed[prefix.len + 1 ..]
+    else
+        trimmed[prefix.len..];
+}
+
+fn accumulateToolCallsFromSseLine(
+    accumulator: *ToolCallAccumulator,
+    allocator: std.mem.Allocator,
+    line: []const u8,
+) !void {
+    const data = extractSseDataPayload(line) orelse return;
+    if (std.mem.eql(u8, data, "[DONE]")) return;
+    try accumulator.appendFromJsonPayload(allocator, data);
 }
 
 /// Extract `usage` object from an OpenAI-compatible streaming chunk.
@@ -420,7 +606,7 @@ pub fn curlStream(
     argc += 1;
 
     if (log_enabled) {
-        debug_log.info("curl argc={d}, body_len={d}, header_file={}", .{ argc, body.len, prepared_headers.uses_temp_file });
+        debug_log.debug("curl argc={d}, body_len={d}, header_file={}", .{ argc, body.len, prepared_headers.uses_temp_file });
     }
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
@@ -429,12 +615,12 @@ pub fn curlStream(
     child.stderr_behavior = .Ignore;
 
     if (log_enabled) {
-        debug_log.info("spawning curl process...", .{});
+        debug_log.debug("spawning curl process...", .{});
     }
     try child.spawn();
     if (log_enabled) {
         const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
-        debug_log.info("curl process spawned, pid={d}", .{pid});
+        debug_log.debug("curl process spawned, pid={d}", .{pid});
     }
 
     if (child.stdin) |stdin_file| {
@@ -466,30 +652,32 @@ pub fn curlStream(
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
     var in_reasoning = false;
+    var tool_call_accumulator = ToolCallAccumulator{};
+    defer tool_call_accumulator.deinit(allocator);
 
     outer: while (true) {
         const n = stdout_file.read(&read_buf) catch |err| {
             if (log_enabled) {
-                debug_log.info("stdout read error: {}", .{err});
+                debug_log.debug("stdout read error: {}", .{err});
             }
             break;
         };
         if (n == 0) {
             if (log_enabled) {
-                debug_log.info("stdout read returned 0 bytes (EOF)", .{});
+                debug_log.debug("stdout read returned 0 bytes (EOF)", .{});
             }
             break;
         }
         total_stdout += n;
 
         if (log_enabled) {
-            debug_log.info("stdout read {d} bytes", .{n});
+            debug_log.debug("stdout read {d} bytes", .{n});
         }
 
         // Check if this is JSON (starts with '{')
         if (total_stdout == n and read_buf[0] == '{') {
             if (log_enabled) {
-                debug_log.info("Detected JSON response, not SSE", .{});
+                debug_log.debug("Detected JSON response, not SSE", .{});
             }
             // This is a JSON error, not SSE
             const json_response = try allocator.dupe(u8, read_buf[0..n]);
@@ -514,8 +702,9 @@ pub fn curlStream(
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
                 if (log_enabled) {
-                    debug_log.info("parsing SSE line: len={d}", .{line_buf.items.len});
+                    debug_log.debug("parsing SSE line: len={d}", .{line_buf.items.len});
                 }
+                try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
                     continue;
@@ -529,7 +718,7 @@ pub fn curlStream(
                     .usage => |u| stream_usage = u,
                     .done => {
                         if (log_enabled) {
-                            debug_log.info("SSE stream done", .{});
+                            debug_log.debug("SSE stream done", .{});
                         }
                         saw_done = true;
                         break :outer;
@@ -543,11 +732,12 @@ pub fn curlStream(
     }
 
     if (log_enabled) {
-        debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
+        debug_log.debug("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
     }
 
     // Parse a trailing line when the stream ends without a final '\n'.
     if (!saw_done and line_buf.items.len > 0) {
+        try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
         const trailing = parseSseLine(allocator, line_buf.items) catch null;
         line_buf.clearRetainingCapacity();
         if (trailing) |result| {
@@ -568,12 +758,12 @@ pub fn curlStream(
         const n = stdout_file.read(&read_buf) catch break;
         if (n == 0) break;
         if (log_enabled) {
-            debug_log.info("drained {d} more stdout bytes", .{n});
+            debug_log.debug("drained {d} more stdout bytes", .{n});
         }
     }
 
     if (log_enabled) {
-        debug_log.info("waiting for curl process to exit...", .{});
+        debug_log.debug("waiting for curl process to exit...", .{});
     }
     const term = child.wait() catch |err| {
         log.err("curlStream child.wait failed: {}", .{err});
@@ -581,12 +771,12 @@ pub fn curlStream(
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
         }
         return error.CurlWaitError;
     };
     if (log_enabled) {
-        debug_log.info("curl process terminated: {}", .{term});
+        debug_log.debug("curl process terminated: {}", .{term});
     }
     switch (term) {
         .exited => |code| if (code != 0) {
@@ -594,7 +784,7 @@ pub fn curlStream(
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
             }
             return error.CurlFailed;
         },
@@ -603,7 +793,7 @@ pub fn curlStream(
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
             }
             return error.CurlFailed;
         },
@@ -612,7 +802,7 @@ pub fn curlStream(
     // Signal stream completion only after curl exits successfully.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -993,6 +1183,200 @@ test "parseSseLine empty choices" {
 
 test "parseSseLine invalid JSON" {
     try std.testing.expectError(error.InvalidSseJson, parseSseLine(std.testing.allocator, "data: not-json{{{"));
+}
+
+test "extractSseDataPayload strips data framing" {
+    try std.testing.expectEqualStrings("{\"ok\":true}", extractSseDataPayload("data: {\"ok\":true}").?);
+    try std.testing.expectEqualStrings("{\"ok\":true}", extractSseDataPayload("data:{\"ok\":true}\r").?);
+    try std.testing.expect(extractSseDataPayload("") == null);
+    try std.testing.expect(extractSseDataPayload(":keep-alive") == null);
+    try std.testing.expect(extractSseDataPayload("event: message") == null);
+}
+
+test "ToolCallAccumulator combines chunked OpenAI tool call deltas" {
+    // Regression: OpenAI-compatible streaming can emit function.arguments across
+    // multiple delta.tool_calls chunks before finish_reason="tool_calls".
+    const allocator = std.testing.allocator;
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+
+    try accumulator.appendFromJsonPayload(allocator,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\""}}]}}]}
+    );
+    try accumulator.appendFromJsonPayload(allocator,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ls\"}"}}]}}]}
+    );
+
+    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
+    defer {
+        for (tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (tool_calls.len > 0) allocator.free(tool_calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", tool_calls[0].id);
+    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", tool_calls[0].arguments);
+}
+
+test "ToolCallAccumulator preserves parallel OpenAI tool call indexes" {
+    const allocator = std.testing.allocator;
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+
+    try accumulator.appendFromJsonPayload(allocator,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}},{"index":0,"id":"call_a","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}
+    );
+
+    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
+    defer {
+        for (tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (tool_calls.len > 0) allocator.free(tool_calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), tool_calls.len);
+    try std.testing.expectEqualStrings("call_a", tool_calls[0].id);
+    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
+    try std.testing.expectEqualStrings("call_b", tool_calls[1].id);
+    try std.testing.expectEqualStrings("read_file", tool_calls[1].name);
+}
+
+test "ToolCallAccumulator skips malformed and nameless calls" {
+    const allocator = std.testing.allocator;
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+
+    try accumulator.appendFromJsonPayload(allocator, "not-json{{{");
+    try accumulator.appendFromJsonPayload(allocator,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_missing","function":{"arguments":"{}"}}]}}]}
+    );
+
+    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
+    defer if (tool_calls.len > 0) allocator.free(tool_calls);
+
+    try std.testing.expectEqual(@as(usize, 0), tool_calls.len);
+}
+
+test "ToolCallAccumulator captures tool calls alongside text deltas" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\data: {"choices":[{"delta":{"content":"working","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+    ;
+
+    const result = try parseSseLine(allocator, line);
+    switch (result) {
+        .delta => |content| {
+            defer content.deinit(allocator);
+            try std.testing.expectEqualStrings("working", content.text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+    try accumulateToolCallsFromSseLine(&accumulator, allocator, line);
+
+    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
+    defer {
+        for (tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (tool_calls.len > 0) allocator.free(tool_calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", tool_calls[0].id);
+    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
+    try std.testing.expectEqualStrings("{}", tool_calls[0].arguments);
+}
+
+test "accumulateToolCallsFromSseLine handles trailing data line without newline" {
+    const allocator = std.testing.allocator;
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+
+    try accumulateToolCallsFromSseLine(&accumulator, allocator,
+        \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"shell","arguments":"{}"}}]}}]}
+    );
+
+    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
+    defer {
+        for (tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (tool_calls.len > 0) allocator.free(tool_calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.len);
+    try std.testing.expectEqualStrings("call_0", tool_calls[0].id);
+    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
+}
+
+test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
+    const allocator = std.testing.allocator;
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+
+    try accumulator.appendFromJsonPayload(allocator,
+        \\{"choices":[{"delta":{"content":"ignored","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+    );
+
+    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator);
+    defer {
+        if (result.content) |content| allocator.free(content);
+        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+        for (result.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+    }
+
+    try std.testing.expectEqualStrings("visible", result.content.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("shell", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{}", result.tool_calls[0].arguments);
+}
+
+test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
+    const allocator = std.testing.allocator;
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+
+    try accumulator.appendFromJsonPayload(allocator,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+    );
+
+    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator);
+    defer {
+        if (result.content) |content| allocator.free(content);
+        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+        for (result.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+    }
+
+    try std.testing.expect(result.content == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("shell", result.tool_calls[0].name);
 }
 
 test "extractDeltaContent with content" {
