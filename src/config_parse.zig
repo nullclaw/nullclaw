@@ -1792,11 +1792,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v == .bool) self.agent.enable_pii_redaction = v.bool;
             }
             if (ag.object.get("default_queue_mode")) |v| {
-                if (v == .string) {
-                    if (types.QueueMode.fromSlice(v.string)) |mode| {
-                        self.agent.default_queue_mode = mode;
-                    }
-                }
+                if (v != .string) return error.InvalidDefaultQueueMode;
+                self.agent.default_queue_mode = types.QueueMode.fromSlice(v.string) orelse
+                    return error.InvalidDefaultQueueMode;
             }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {

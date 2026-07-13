@@ -390,13 +390,13 @@ pub const QueueMode = enum {
     }
 
     pub fn fromSlice(s: []const u8) ?QueueMode {
-        return if (std.mem.eql(u8, s, "off"))
+        return if (std.ascii.eqlIgnoreCase(s, "off"))
             .off
-        else if (std.mem.eql(u8, s, "serial"))
+        else if (std.ascii.eqlIgnoreCase(s, "serial"))
             .serial
-        else if (std.mem.eql(u8, s, "latest"))
+        else if (std.ascii.eqlIgnoreCase(s, "latest"))
             .latest
-        else if (std.mem.eql(u8, s, "debounce"))
+        else if (std.ascii.eqlIgnoreCase(s, "debounce"))
             .debounce
         else
             null;
@@ -2288,4 +2288,24 @@ test "markdown_only profile preserves explicit half-life override" {
 
     // Regression: markdown_only should not clobber an explicit half-life override.
     try std.testing.expectEqual(@as(u32, 0), cfg.search.query.hybrid.temporal_decay.half_life_days);
+}
+
+test "QueueMode parser and serializer cover every mode" {
+    // Regression: config parsing and /queue must share one canonical mapping.
+    const cases = [_]struct {
+        mode: QueueMode,
+        text: []const u8,
+    }{
+        .{ .mode = .off, .text = "off" },
+        .{ .mode = .serial, .text = "serial" },
+        .{ .mode = .latest, .text = "latest" },
+        .{ .mode = .debounce, .text = "debounce" },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.text, case.mode.toSlice());
+        try std.testing.expectEqual(case.mode, QueueMode.fromSlice(case.text).?);
+    }
+    try std.testing.expectEqual(QueueMode.latest, QueueMode.fromSlice("LATEST").?);
+    try std.testing.expect(QueueMode.fromSlice("lastest") == null);
 }

@@ -1354,6 +1354,7 @@ pub const Config = struct {
             .max_history_messages = self.agent.max_history_messages,
             .parallel_tools = self.agent.parallel_tools,
             .tool_dispatcher = self.agent.tool_dispatcher,
+            .default_queue_mode = self.agent.default_queue_mode,
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
             .compaction_keep_recent = self.agent.compaction_keep_recent,
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
@@ -2966,6 +2967,7 @@ test "save outputs pretty-printed nested sections" {
     cfg.security.audit.enabled = true;
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 42;
+    cfg.agent.default_queue_mode = .latest;
     try cfg.save();
 
     const file = try std_compat.fs.openFileAbsolute(config_path, .{});
@@ -2985,6 +2987,7 @@ test "save outputs pretty-printed nested sections" {
     try std.testing.expect(std.mem.indexOf(u8, content, "    \"sandbox\": {\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "      \"enabled\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "    \"max_tool_iterations\": 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"default_queue_mode\": \"latest\"") != null);
 
     // Roundtrip: values must survive parse
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -2999,6 +3002,8 @@ test "save outputs pretty-printed nested sections" {
     try std.testing.expect(loaded.security.audit.enabled);
     try std.testing.expect(loaded.agent.compact_context);
     try std.testing.expectEqual(@as(u32, 42), loaded.agent.max_tool_iterations);
+    // Regression: Config.save must not silently erase a non-off queue default.
+    try std.testing.expectEqual(config_types.QueueMode.latest, loaded.agent.default_queue_mode);
 }
 
 test "save escapes string arrays safely" {
@@ -6672,6 +6677,7 @@ test "parse agents.defaults.heartbeat dispatch settings" {
 }
 
 test "parse agent.default_queue_mode" {
+    // Regression: configured queue policy must be parsed before Agent creation.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -6691,6 +6697,20 @@ test "agent.default_queue_mode defaults to off" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(config_types.QueueMode.off, cfg.agent.default_queue_mode);
+}
+
+test "agent.default_queue_mode rejects invalid values" {
+    // Regression: a typo must not silently fall back to off and drop busy-session messages.
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(
+        error.InvalidDefaultQueueMode,
+        cfg.parseJson("{\"agent\":{\"default_queue_mode\":\"lastest\"}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDefaultQueueMode,
+        cfg.parseJson("{\"agent\":{\"default_queue_mode\":42}}"),
+    );
 }
 
 test "save roundtrip preserves heartbeat dispatch settings" {
