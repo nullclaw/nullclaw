@@ -302,7 +302,7 @@ pub const AutonomyConfig = struct {
 };
 
 pub const DockerRuntimeConfig = struct {
-    image: []const u8 = "alpine:3.20",
+    image: []const u8 = "alpine:3.24",
     network: []const u8 = "none",
     memory_limit_mb: ?u64 = 512,
     cpu_limit: ?f64 = 1.0,
@@ -1967,6 +1967,12 @@ pub const SessionConfig = struct {
     /// Higher values enable parallel processing across different sessions.
     max_concurrent_tasks: u32 = 4,
 };
+
+// Regression: the default Docker runtime must not point at an unsupported Alpine branch.
+test "DockerRuntimeConfig defaults to supported pinned image" {
+    const cfg = DockerRuntimeConfig{};
+    try std.testing.expectEqualStrings("alpine:3.24", cfg.image);
+}
 
 test "WebConfig defaults" {
     const cfg = WebConfig{};
