@@ -99,9 +99,9 @@
 | `nullclaw cron list [--json]` | 查看所有计划任务 |
 | `nullclaw cron status [--json]` | 查看 scheduler 层状态与任务计数 |
 | `nullclaw cron add "0 * * * *" "command"` | 新增周期性 shell 任务 |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | 新增周期性 agent 任务 |
+| `nullclaw cron add-agent "0 * * * *" "prompt" [--model <model>] [--session-target <isolated\|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]` | 新增周期性 agent 任务 |
 | `nullclaw cron once 10m "command"` | 新增一次性延迟任务 |
-| `nullclaw cron once-agent 10m "prompt" --model <model>` | 新增一次性 agent 延迟任务 |
+| `nullclaw cron once-agent 10m "prompt" [--model <model>] [--session-target <isolated\|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]` | 新增一次性 agent 延迟任务 |
 | `nullclaw cron run <id>` | 立即执行指定任务 |
 | `nullclaw cron pause <id>` / `resume <id>` | 暂停 / 恢复任务 |
 | `nullclaw cron remove <id>` | 删除任务 |

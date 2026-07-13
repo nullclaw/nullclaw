@@ -14,6 +14,11 @@ pub const AgentRunResult = struct {
     output: []const u8,
 };
 
+pub const AgentRunOptions = struct {
+    origin_channel: ?[]const u8 = null,
+    origin_account_id: ?[]const u8 = null,
+};
+
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 const POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
 const LINUX_SELF_EXE_PATH = "/proc/self/exe";
@@ -173,12 +178,49 @@ fn preferExecPath(self_exe_path: []const u8) []const u8 {
     return self_exe_path;
 }
 
+fn appendAgentArgv(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    exec_path: []const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    options: AgentRunOptions,
+) !void {
+    try argv.append(allocator, exec_path);
+    try argv.append(allocator, "agent");
+    if (model) |m| {
+        try argv.append(allocator, "--model");
+        try argv.append(allocator, m);
+    }
+    if (options.origin_channel) |channel| {
+        try argv.append(allocator, "--origin-channel");
+        try argv.append(allocator, channel);
+    }
+    if (options.origin_account_id) |account_id| {
+        try argv.append(allocator, "--origin-account-id");
+        try argv.append(allocator, account_id);
+    }
+    try argv.append(allocator, "-m");
+    try argv.append(allocator, prompt);
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
     prompt: []const u8,
     model: ?[]const u8,
     timeout_secs: u64,
+) !AgentRunResult {
+    return runWithOptions(allocator, cwd, prompt, model, timeout_secs, .{});
+}
+
+pub fn runWithOptions(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    timeout_secs: u64,
+    options: AgentRunOptions,
 ) !AgentRunResult {
     const exe_path = try std_compat.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
@@ -195,14 +237,7 @@ pub fn run(
     var child: std_compat.process.Child = undefined;
     spawn_loop: while (true) {
         argv.clearRetainingCapacity();
-        try argv.append(allocator, exec_path);
-        try argv.append(allocator, "agent");
-        if (model) |m| {
-            try argv.append(allocator, "--model");
-            try argv.append(allocator, m);
-        }
-        try argv.append(allocator, "-m");
-        try argv.append(allocator, prompt);
+        try appendAgentArgv(allocator, &argv, exec_path, prompt, model, options);
 
         child = std_compat.process.Child.init(argv.items, allocator);
         child.stdin_behavior = .Ignore;
@@ -367,4 +402,33 @@ test "preferExecPath uses proc self exe for deleted linux path" {
 test "pathAgentExecutableName returns platform command name" {
     const expected = if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
     try std.testing.expectEqualStrings(expected, pathAgentExecutableName());
+}
+
+test "appendAgentArgv includes cron origin attribution" {
+    // Regression: scheduled child agents must receive origin metadata in every spawn attempt.
+    const allocator = std.testing.allocator;
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try appendAgentArgv(allocator, &argv, "/usr/bin/nullclaw", "Summarize status", "test-model", .{
+        .origin_channel = "telegram",
+        .origin_account_id = "main",
+    });
+
+    const expected = [_][]const u8{
+        "/usr/bin/nullclaw",
+        "agent",
+        "--model",
+        "test-model",
+        "--origin-channel",
+        "telegram",
+        "--origin-account-id",
+        "main",
+        "-m",
+        "Summarize status",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
 }
