@@ -168,6 +168,10 @@ pub const File = struct {
         return filled;
     }
 
+    pub fn readAllPositional(self: File, buffer: []u8) std.Io.File.ReadPositionalError!usize {
+        return self.toInner().readPositionalAll(shared.io(), buffer, 0);
+    }
+
     pub fn writeAll(self: File, bytes: []const u8) std.Io.File.Writer.Error!void {
         try self.toInner().writeStreamingAll(shared.io(), bytes);
     }

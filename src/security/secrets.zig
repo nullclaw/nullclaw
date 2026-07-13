@@ -346,7 +346,9 @@ pub const SecretStore = struct {
     fn readKeyFromFile(self: *const SecretStore, file: std_compat.fs.File) ![KEY_LEN]u8 {
         _ = self;
         var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined; // some slack for whitespace
-        const bytes_read = file.readAll(&hex_buf) catch return error.KeyReadFailed;
+        // no-follow handles are asynchronous on Windows in Zig 0.16, so they
+        // must be read positionally rather than through readStreaming.
+        const bytes_read = file.readAllPositional(&hex_buf) catch return error.KeyReadFailed;
         const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
         var key: [KEY_LEN]u8 = undefined;
         const decoded = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
@@ -359,7 +361,7 @@ pub const SecretStore = struct {
         const file = fs_compat.openPath(path, .{ .allow_directory = false, .follow_symlinks = false }) catch return error.KeyReadFailed;
         defer file.close();
         var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined;
-        const bytes_read = file.readAll(&hex_buf) catch return error.KeyReadFailed;
+        const bytes_read = file.readAllPositional(&hex_buf) catch return error.KeyReadFailed;
         const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
         var key: [KEY_LEN]u8 = undefined;
         const decoded = hexDecode(hex_str, &key) catch return error.KeyCorrupt;

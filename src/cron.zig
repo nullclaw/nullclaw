@@ -1837,10 +1837,18 @@ pub fn readPairedTokenFromDir(allocator: std.mem.Allocator, config_dir: []const 
         log.warn("paired cron token is not a regular file", .{});
         return null;
     }
-    const raw = file.readToEndAlloc(allocator, 8192) catch |err| {
+    var raw_buf: [8192]u8 = undefined;
+    if (metadata.size > raw_buf.len) {
+        log.warn("paired cron token exceeds size limit", .{});
+        return null;
+    }
+    // no-follow handles are asynchronous on Windows in Zig 0.16, so they
+    // must be read positionally rather than through readStreaming.
+    const raw_len = file.readAllPositional(&raw_buf) catch |err| {
         log.warn("failed to read paired cron token: {s}", .{@errorName(err)});
         return null;
     };
+    const raw = allocator.dupe(u8, raw_buf[0..raw_len]) catch return null;
     const trimmed = trimOwnedRight(allocator, raw) orelse return null;
     // decryptSecret always returns a freshly-allocated buffer: it dupes
     // plaintext values and dupes the decrypted plaintext for enc2: blobs.

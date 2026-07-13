@@ -178,7 +178,10 @@ fn publishSecureTempNoReplace(
             // Older Linux kernels and some filesystems lack renameat2 with
             // RENAME_NOREPLACE. A same-directory hard link provides the same
             // atomic no-replace publication guarantee for regular files.
-            error.OperationUnsupported, error.Unexpected => use_hard_link = true,
+            error.OperationUnsupported, error.Unexpected => {
+                if (builtin.os.tag == .windows) return err;
+                use_hard_link = true;
+            },
             else => |e| return e,
         };
         if (!use_hard_link) return .installed;
@@ -358,6 +361,8 @@ test "writeFileAtomicSecureNoReplace preserves existing file and removes candida
 }
 
 test "secure no-replace publication supports hard-link fallback" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const dir = std_compat.fs.Dir.wrap(tmp_dir.dir);
