@@ -1181,6 +1181,32 @@ pub const OpenAiCompatibleProvider = struct {
         allocator.free(messages);
     }
 
+    fn normalizeStreamingResult(allocator: std.mem.Allocator, result: *root.StreamChatResult) !void {
+        if (result.content) |raw| {
+            const cleaned = try stripThinkBlocks(allocator, raw);
+            allocator.free(raw);
+            if (cleaned.len == 0) {
+                allocator.free(cleaned);
+                result.content = null;
+                result.usage.completion_tokens = 0;
+            } else {
+                result.content = cleaned;
+                // Only fall back to byte-count estimate when the API did not
+                // supply a real token count (e.g. provider that ignores
+                // include_usage). Preserving the real count matters for /cost.
+                if (result.usage.completion_tokens == 0) {
+                    result.usage.completion_tokens = @intCast((cleaned.len + 3) / 4);
+                }
+            }
+        }
+        // Recompute total in case only prompt or only completion was received.
+        if (result.usage.total_tokens == 0 and
+            (result.usage.prompt_tokens > 0 or result.usage.completion_tokens > 0))
+        {
+            result.usage.total_tokens = result.usage.prompt_tokens +| result.usage.completion_tokens;
+        }
+    }
+
     fn streamChatImpl(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -1271,29 +1297,8 @@ pub const OpenAiCompatibleProvider = struct {
             }
             return err;
         };
-
-        if (result.content) |raw| {
-            const cleaned = try stripThinkBlocks(allocator, raw);
-            allocator.free(raw);
-            if (cleaned.len == 0) {
-                result.content = null;
-                result.usage.completion_tokens = 0;
-            } else {
-                result.content = cleaned;
-                // Only fall back to byte-count estimate when the API did not
-                // supply a real token count (e.g. provider that ignores
-                // include_usage). Preserving the real count matters for /cost.
-                if (result.usage.completion_tokens == 0) {
-                    result.usage.completion_tokens = @intCast((cleaned.len + 3) / 4);
-                }
-            }
-        }
-        // Recompute total in case only prompt or only completion was received.
-        if (result.usage.total_tokens == 0 and
-            (result.usage.prompt_tokens > 0 or result.usage.completion_tokens > 0))
-        {
-            result.usage.total_tokens = result.usage.prompt_tokens +| result.usage.completion_tokens;
-        }
+        errdefer result.deinit(allocator);
+        try normalizeStreamingResult(allocator, &result);
 
         return result;
     }
@@ -3168,6 +3173,36 @@ test "max_streaming_prompt_bytes set applies threshold" {
 
 test "DEFAULT_MAX_STREAMING_PROMPT_BYTES legacy value is 32 KiB" {
     try std.testing.expectEqual(@as(usize, 32 * 1024), DEFAULT_MAX_STREAMING_PROMPT_BYTES);
+}
+
+fn normalizeStreamingResultAllocationTest(allocator: std.mem.Allocator) !void {
+    var result: root.StreamChatResult = .{};
+    defer result.deinit(allocator);
+
+    result.content = try allocator.dupe(u8, "<think>hidden</think>visible");
+    result.reasoning_content = try allocator.dupe(u8, "reasoning");
+    result.model = try allocator.dupe(u8, "test-model");
+
+    const tool_calls = try allocator.alloc(root.ToolCall, 1);
+    tool_calls[0] = .{ .id = "", .name = "", .arguments = "" };
+    result.tool_calls = tool_calls;
+    tool_calls[0].id = try allocator.dupe(u8, "call_1");
+    tool_calls[0].name = try allocator.dupe(u8, "shell");
+    tool_calls[0].arguments = try allocator.dupe(u8, "{}");
+
+    try OpenAiCompatibleProvider.normalizeStreamingResult(allocator, &result);
+    try std.testing.expectEqualStrings("visible", result.content.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+}
+
+test "normalizeStreamingResult frees owned stream fields on allocation failure" {
+    // Regression: think-block post-processing must not leak content or native
+    // tool-call fields when its replacement allocation fails.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        normalizeStreamingResultAllocationTest,
+        .{},
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════

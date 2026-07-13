@@ -19,6 +19,7 @@ const TokenUsage = root.TokenUsage;
 pub const OpenAiProvider = struct {
     api_key: ?[]const u8,
     allocator: std.mem.Allocator,
+    native_tools: bool = true,
     /// Optional User-Agent header for HTTP requests.
     user_agent: ?[]const u8 = null,
     /// Optional compact JSON string of additional key-value pairs to merge into
@@ -347,8 +348,9 @@ pub const OpenAiProvider = struct {
         return parseNativeResponse(allocator, resp_body);
     }
 
-    fn supportsNativeToolsImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools;
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
@@ -524,10 +526,12 @@ test "parseNativeResponse with tool calls" {
     try std.testing.expect(response.usage.total_tokens == 15);
 }
 
-test "supportsNativeTools returns true" {
+test "supportsNativeTools honors provider opt-out" {
     var p = OpenAiProvider.init(std.testing.allocator, "key", null, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+    p.native_tools = false;
+    try std.testing.expect(!prov.supportsNativeTools());
 }
 
 test "parseTextResponse multiple choices returns first" {

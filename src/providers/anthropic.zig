@@ -24,6 +24,7 @@ pub const AnthropicProvider = struct {
     credential: ?[]const u8,
     base_url: []const u8,
     allocator: std.mem.Allocator,
+    native_tools: bool = true,
 
     const DEFAULT_BASE_URL = "https://api.anthropic.com";
     const API_VERSION = "2023-06-01";
@@ -353,8 +354,9 @@ pub const AnthropicProvider = struct {
         return parseNativeResponse(allocator, resp_body);
     }
 
-    fn supportsNativeToolsImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools;
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
@@ -412,7 +414,7 @@ pub const AnthropicProvider = struct {
             hdr_count += 1;
         }
 
-        return sse.curlStreamAnthropic(allocator, url, body, headers_buf[0..hdr_count], callback, callback_ctx) catch |err| {
+        return sse.curlStreamAnthropicTimed(allocator, url, body, headers_buf[0..hdr_count], request.timeout_secs, callback, callback_ctx) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("Anthropic streaming failed with {}; falling back to non-streaming response", .{err});
                 var fallback = try chatImpl(ptr, allocator, request, model, temperature);
@@ -770,10 +772,12 @@ test "parseNativeResponse with text and tool_use" {
     try std.testing.expect(response.usage.total_tokens == 30);
 }
 
-test "supportsNativeTools returns true" {
+test "supportsNativeTools honors provider opt-out" {
     var p = AnthropicProvider.init(std.testing.allocator, "key", null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+    p.native_tools = false;
+    try std.testing.expect(!prov.supportsNativeTools());
 }
 
 test "parseTextResponse multiple blocks returns first text" {
