@@ -113,6 +113,132 @@ pub fn deletePath(path: []const u8) !void {
     return try std_compat.fs.cwd().deleteFile(path);
 }
 
+/// Atomically replace `path` with a mode-0600 regular file.
+///
+/// The temporary file is created in the destination directory with a random,
+/// exclusive name so pre-planted symlinks and concurrent writers cannot redirect
+/// or share the write. Failed writes and renames remove the temporary file.
+pub fn writeFileAtomicSecure(path: []const u8, contents: []const u8) !void {
+    const parent_path = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    var parent_dir = try openDirPath(parent_path, .{});
+    defer parent_dir.close();
+
+    var tmp_name_buf: [96]u8 = undefined;
+    var tmp_name: []const u8 = undefined;
+    var tmp_file_opt: ?std_compat.fs.File = null;
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        tmp_name = std.fmt.bufPrint(
+            &tmp_name_buf,
+            ".nullclaw-secure-{x}.tmp",
+            .{std_compat.crypto.random.int(u64)},
+        ) catch return error.NameTooLong;
+        tmp_file_opt = parent_dir.createFile(tmp_name, .{
+            .truncate = false,
+            .exclusive = true,
+            .permissions = std_compat.fs.permissionsFromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => |e| return e,
+        };
+        break;
+    }
+    var tmp_file = tmp_file_opt orelse return error.TempFileUnavailable;
+    var file_open = true;
+    defer if (file_open) tmp_file.close();
+
+    var committed = false;
+    defer if (!committed) parent_dir.deleteFile(tmp_name) catch {};
+
+    try tmp_file.writeAll(contents);
+    try tmp_file.sync();
+    tmp_file.close();
+    file_open = false;
+
+    try parent_dir.rename(tmp_name, basename);
+    committed = true;
+}
+
+pub const SecureInstallResult = enum {
+    installed,
+    already_exists,
+};
+
+fn publishSecureTempNoReplace(
+    parent_dir: std_compat.fs.Dir,
+    tmp_name: []const u8,
+    basename: []const u8,
+    force_hard_link: bool,
+) !SecureInstallResult {
+    var use_hard_link = force_hard_link;
+    if (!use_hard_link) {
+        parent_dir.renamePreserve(tmp_name, basename) catch |err| switch (err) {
+            error.PathAlreadyExists => return .already_exists,
+            // Older Linux kernels and some filesystems lack renameat2 with
+            // RENAME_NOREPLACE. A same-directory hard link provides the same
+            // atomic no-replace publication guarantee for regular files.
+            error.OperationUnsupported, error.Unexpected => use_hard_link = true,
+            else => |e| return e,
+        };
+        if (!use_hard_link) return .installed;
+    }
+
+    parent_dir.hardLink(tmp_name, parent_dir, basename, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.PathAlreadyExists => return .already_exists,
+        else => |e| return e,
+    };
+    try parent_dir.deleteFile(tmp_name);
+    return .installed;
+}
+
+/// Atomically create a mode-0600 regular file without replacing an existing path.
+///
+/// The fully written and synced random candidate is published with no-replace
+/// semantics. Failure cleanup only removes that candidate, never `path`.
+pub fn writeFileAtomicSecureNoReplace(path: []const u8, contents: []const u8) !SecureInstallResult {
+    const parent_path = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    var parent_dir = try openDirPath(parent_path, .{});
+    defer parent_dir.close();
+
+    var tmp_name_buf: [96]u8 = undefined;
+    var tmp_name: []const u8 = undefined;
+    var tmp_file_opt: ?std_compat.fs.File = null;
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        tmp_name = std.fmt.bufPrint(
+            &tmp_name_buf,
+            ".nullclaw-secure-{x}.tmp",
+            .{std_compat.crypto.random.int(u64)},
+        ) catch return error.NameTooLong;
+        tmp_file_opt = parent_dir.createFile(tmp_name, .{
+            .truncate = false,
+            .exclusive = true,
+            .permissions = std_compat.fs.permissionsFromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => |e| return e,
+        };
+        break;
+    }
+    var tmp_file = tmp_file_opt orelse return error.TempFileUnavailable;
+    var file_open = true;
+    defer if (file_open) tmp_file.close();
+
+    var installed = false;
+    defer if (!installed) parent_dir.deleteFile(tmp_name) catch {};
+
+    try tmp_file.writeAll(contents);
+    try tmp_file.sync();
+    tmp_file.close();
+    file_open = false;
+
+    const result = try publishSecureTempNoReplace(parent_dir, tmp_name, basename, false);
+    installed = result == .installed;
+    return result;
+}
+
 pub fn realpathAllocPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) {
         return try std_compat.fs.realpathAlloc(allocator, path);
@@ -152,6 +278,106 @@ test "readFileAlloc reads file contents" {
     defer std.testing.allocator.free(content);
 
     try std.testing.expectEqualStrings("hello", content);
+}
+
+test "writeFileAtomicSecure writes mode 0600 and replaces symlink itself" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "victim", .data = "unchanged" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).symLink("victim", "secure", .{});
+
+    const secure_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "secure" });
+    defer std.testing.allocator.free(secure_path);
+    try writeFileAtomicSecure(secure_path, "secret-data");
+
+    const secure = try readFileAlloc(tmp_dir.dir, std.testing.allocator, "secure", 64);
+    defer std.testing.allocator.free(secure);
+    try std.testing.expectEqualStrings("secret-data", secure);
+    const victim = try readFileAlloc(tmp_dir.dir, std.testing.allocator, "victim", 64);
+    defer std.testing.allocator.free(victim);
+    try std.testing.expectEqualStrings("unchanged", victim);
+
+    const file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).openFile("secure", .{});
+    defer file.close();
+    const metadata = try file.stat();
+    try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), metadata.mode & 0o777);
+}
+
+test "writeFileAtomicSecure removes temporary file after rename failure" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("target");
+
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "target" });
+    defer std.testing.allocator.free(target_path);
+    const result = writeFileAtomicSecure(target_path, "secret-data");
+    try std.testing.expect(std.meta.isError(result));
+
+    var dir = try std_compat.fs.openDirAbsolute(tmp_path, .{ .iterate = true });
+    defer dir.close();
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".nullclaw-secure-"));
+    }
+}
+
+test "writeFileAtomicSecureNoReplace preserves existing file and removes candidate" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "secure" });
+    defer std.testing.allocator.free(target_path);
+    try std.testing.expectEqual(
+        SecureInstallResult.installed,
+        try writeFileAtomicSecureNoReplace(target_path, "first"),
+    );
+    try std.testing.expectEqual(
+        SecureInstallResult.already_exists,
+        try writeFileAtomicSecureNoReplace(target_path, "second"),
+    );
+
+    const content = try readFileAlloc(tmp_dir.dir, std.testing.allocator, "secure", 64);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("first", content);
+
+    var dir = try std_compat.fs.openDirAbsolute(tmp_path, .{ .iterate = true });
+    defer dir.close();
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".nullclaw-secure-"));
+    }
+}
+
+test "secure no-replace publication supports hard-link fallback" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp_dir.dir);
+    const candidate = try dir.createFile("candidate", .{
+        .truncate = false,
+        .exclusive = true,
+        .permissions = std_compat.fs.permissionsFromMode(0o600),
+    });
+    try candidate.writeAll("complete-secret");
+    try candidate.sync();
+    candidate.close();
+
+    try std.testing.expectEqual(
+        SecureInstallResult.installed,
+        try publishSecureTempNoReplace(dir, "candidate", "installed", true),
+    );
+    const content = try readFileAlloc(tmp_dir.dir, std.testing.allocator, "installed", 64);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("complete-secret", content);
+    try std.testing.expectError(error.FileNotFound, dir.access("candidate", .{}));
 }
 
 test "stat returns file size" {

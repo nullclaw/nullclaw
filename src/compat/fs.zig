@@ -277,6 +277,10 @@ pub const Dir = struct {
         try self.toInner().rename(old_sub_path, self.toInner(), new_sub_path, shared.io());
     }
 
+    pub fn renamePreserve(self: Dir, old_sub_path: []const u8, new_sub_path: []const u8) std.Io.Dir.RenamePreserveError!void {
+        try self.toInner().renamePreserve(old_sub_path, self.toInner(), new_sub_path, shared.io());
+    }
+
     pub fn readLink(self: Dir, sub_path: []const u8, buffer: []u8) std.Io.Dir.ReadLinkError![]const u8 {
         const n = try self.toInner().readLink(shared.io(), sub_path, buffer);
         return buffer[0..n];

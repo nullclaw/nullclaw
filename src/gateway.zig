@@ -724,7 +724,7 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
     return guard.isAuthenticated(token);
 }
 
-/// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a,
+/// Returns true when a generic gateway endpoint (/webhook, /a2a,
 /// /media/transcribe) should
 /// be accepted for the current bind exposure and bearer token. Public binds
 /// always require a valid stored bearer token, even when interactive pairing is
@@ -777,9 +777,38 @@ fn isAdminRouteAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[]
     return isWebhookAuthorized(pairing_guard, bearer_token);
 }
 
-fn isCronRouteAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[]const u8, public_bind: bool) bool {
-    if (public_bind) return isGenericGatewayEndpointAuthorized(pairing_guard, bearer_token, true);
-    return isAdminRouteAuthorized(pairing_guard, bearer_token);
+fn isCronRouteAuthorized(
+    pairing_guard: ?*const PairingGuard,
+    bearer_token: ?[]const u8,
+    public_bind: bool,
+) bool {
+    const guard = pairing_guard orelse return !public_bind;
+    if (!public_bind and !guard.requirePairing()) return true;
+    const token = bearer_token orelse return false;
+    return guard.isCronAuthenticated(token);
+}
+
+fn initPairingGuardForGateway(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    public_bind: bool,
+) !PairingGuard {
+    var guard = try PairingGuard.init(
+        allocator,
+        cfg.gateway.require_pairing,
+        cfg.gateway.paired_tokens,
+    );
+    errdefer guard.deinit();
+
+    // Anonymous loopback cron access needs no credential. Avoid making this
+    // legacy-safe mode depend on a writable config directory or encryption key.
+    if (!public_bind and !cfg.gateway.require_pairing) return guard;
+
+    const cron_token = try guard.issueCronToken();
+    defer allocator.free(cron_token);
+    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse ".";
+    try cron_mod.persistPairedToken(allocator, config_dir, cron_token);
+    return guard;
 }
 
 /// Format the /pair success payload. Returns null when buffer is too small.
@@ -5825,11 +5854,7 @@ pub fn run(
             cfg.gateway.webhook_rate_limit_per_minute,
         );
         state.idempotency = IdempotencyStore.init(cfg.gateway.idempotency_ttl_secs);
-        state.pairing_guard = try PairingGuard.init(
-            allocator,
-            cfg.gateway.require_pairing,
-            cfg.gateway.paired_tokens,
-        );
+        state.pairing_guard = try initPairingGuardForGateway(allocator, cfg, public_bind);
         if (cfg.channels.telegramPrimary()) |tg_cfg| {
             state.telegram_bot_token = tg_cfg.bot_token;
             state.telegram_allow_from = tg_cfg.allow_from;
@@ -5994,10 +6019,10 @@ pub fn run(
 
         if (findCronRouteDescriptor(base_path)) |desc| {
             // Auth check for /cron endpoints:
-            // - Loopback/local binds follow admin route auth
-            // - Public binds always require a valid stored bearer token
-            // - Pairing required, no tokens yet → DENY (bootstrap phase; CLI falls back to disk)
-            // - Pairing required, tokens exist → require valid bearer token
+            // - Loopback binds without a pairing guard preserve anonymous local access.
+            // - A configured gateway creates a dedicated cron bearer at startup.
+            // - Full gateway bearers remain valid; the cron bearer cannot authorize other routes.
+            // - Public binds always require one of those valid bearer values.
             const auth_header = extractHeader(raw, "Authorization");
             const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
             const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
@@ -6302,18 +6327,6 @@ pub fn run(
                                     response_status = "500 Internal Server Error";
                                     response_body = "{\"error\":\"pairing response failed\"}";
                                 }
-                                // Persist the freshly-paired token (encrypted at rest via
-                                // the shared SecretStore when secrets.encrypt=true) so the
-                                // schedule/cron tool running in the agent process can
-                                // authenticate to /cron. Without this, /pair only stored
-                                // the token in this gateway's in-memory PairingGuard and
-                                // the cron tool had no way to obtain it — see issue #839.
-                                if (config_opt) |cfg| {
-                                    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse "";
-                                    cron_mod.persistPairedToken(allocator, config_dir, cfg.secrets.encrypt, token) catch |err| {
-                                        log.err("failed to persist paired token for cron tool: {s}", .{@errorName(err)});
-                                    };
-                                }
                             },
                             .missing_code => {
                                 response_status = "400 Bad Request";
@@ -6359,13 +6372,6 @@ pub fn run(
                         response_body = "{\"error\":\"unauthorized\"}";
                     } else {
                         response_body = "{\"status\":\"revoked\"}";
-                        // Drop the persisted paired_token so a revoked credential
-                        // cannot be reused by the cron tool. Best-effort: a
-                        // failed delete must not mask the successful revocation.
-                        if (config_opt) |cfg| {
-                            const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse "";
-                            cron_mod.clearPairedToken(allocator, config_dir);
-                        }
                     }
                 }
             },
@@ -6554,6 +6560,12 @@ test "cron auth matrix: public bind requires stored token" {
 
     try std.testing.expect(isCronRouteAuthorized(&stored_guard, "zc_public_static_token", true));
     try std.testing.expect(!isCronRouteAuthorized(&stored_guard, "wrong", true));
+
+    // Regression: a cron client on the same machine can have a non-loopback
+    // peer address when the gateway binds a concrete local interface.
+    const cron_token = try stored_guard.issueCronToken();
+    defer std.testing.allocator.free(cron_token);
+    try std.testing.expect(isCronRouteAuthorized(&stored_guard, cron_token, true));
 }
 
 test "generic endpoint auth matrix: loopback allows pairing-disabled local access" {
@@ -7060,42 +7072,82 @@ test "idempotency store rejects duplicate key" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
 }
 
-// Regression for issue #839: on a successful /pair, the freshly-issued bearer
-// token must be persisted (encrypted at rest) to <config_dir>/paired_token so
-// the schedule/cron tool can authenticate to /cron. This mirrors the exact
-// call sequence the .pair handler runs: attemptPair -> .paired => |token| ->
-// cron_mod.persistPairedToken, then cron_mod.readPairedTokenFromDir recovers it.
-test "pair handler persists issued token for cron tool access" {
+test "gateway cron token rotates across restart and remains cron scoped" {
+    // Regression: issue #839 requires scheduler authentication to work after
+    // gateway restart without persisting a broad interactive pairing bearer.
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
-
-    // Same guard construction the gateway uses (require_pairing=true, no preset tokens).
-    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
-    defer guard.deinit();
-    _ = try guard.setPairingCode("123456");
-
-    // Mirror the .paired handler arm exactly.
-    const runtime_token = switch (guard.attemptPair("123456")) {
-        .paired => |token| token,
-        else => return error.TestUnexpectedResult,
+    const config_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(config_path);
+    var cfg = Config{
+        .workspace_dir = tmp_path,
+        .config_path = config_path,
+        .allocator = std.testing.allocator,
     };
-    defer std.testing.allocator.free(runtime_token);
+    cfg.gateway.require_pairing = true;
 
-    // The handler then calls persistPairedToken with the live token + config dir.
-    try cron_mod.persistPairedToken(std.testing.allocator, tmp_path, true, runtime_token);
+    var first_guard = try initPairingGuardForGateway(std.testing.allocator, &cfg, true);
+    defer first_guard.deinit();
+    const first_token = cron_mod.readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRecovered;
+    defer std.testing.allocator.free(first_token);
+    try std.testing.expect(isCronRouteAuthorized(&first_guard, first_token, false));
+    try std.testing.expect(isCronRouteAuthorized(&first_guard, first_token, true));
+    try std.testing.expect(!isGenericGatewayEndpointAuthorized(&first_guard, first_token, true));
+    try std.testing.expect(!first_guard.isAuthenticated(first_token));
+    try std.testing.expect(first_guard.pairingCode() != null);
 
-    // The cron tool (separate process) reads it back and gets the plaintext token.
-    const recovered = cron_mod.readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRecovered;
-    defer std.testing.allocator.free(recovered);
-    try std.testing.expectEqualStrings(runtime_token, recovered);
+    var restarted_guard = try initPairingGuardForGateway(std.testing.allocator, &cfg, true);
+    defer restarted_guard.deinit();
+    const restarted_token = cron_mod.readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRecovered;
+    defer std.testing.allocator.free(restarted_token);
+    try std.testing.expect(!std.mem.eql(u8, first_token, restarted_token));
+    try std.testing.expect(!restarted_guard.isCronAuthenticated(first_token));
+    try std.testing.expect(isCronRouteAuthorized(&restarted_guard, restarted_token, true));
+}
 
-    // And the token must authenticate against the gateway's own guard.
-    try std.testing.expect(guard.isAuthenticated(recovered));
+test "gateway cron token initialization fails when credential cannot be persisted" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".secret_key", .data = "corrupt" });
+    const config_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(config_path);
+    var cfg = Config{
+        .workspace_dir = tmp_path,
+        .config_path = config_path,
+        .allocator = std.testing.allocator,
+    };
+    cfg.gateway.require_pairing = true;
 
-    // /logout cleanup: clearing the file removes the credential.
-    cron_mod.clearPairedToken(std.testing.allocator, tmp_path);
+    try std.testing.expectError(
+        error.KeyCorrupt,
+        initPairingGuardForGateway(std.testing.allocator, &cfg, false),
+    );
+}
+
+test "gateway local pairing-disabled startup does not require cron credential" {
+    // Regression: anonymous loopback cron access must not introduce a new
+    // dependency on a writable config directory or valid encryption key.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".secret_key", .data = "corrupt" });
+    const config_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(config_path);
+    var cfg = Config{
+        .workspace_dir = tmp_path,
+        .config_path = config_path,
+        .allocator = std.testing.allocator,
+    };
+    cfg.gateway.require_pairing = false;
+
+    var guard = try initPairingGuardForGateway(std.testing.allocator, &cfg, false);
+    defer guard.deinit();
+    try std.testing.expect(isCronRouteAuthorized(&guard, null, false));
     try std.testing.expect(cron_mod.readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
 }
 
