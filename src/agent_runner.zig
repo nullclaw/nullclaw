@@ -153,20 +153,33 @@ fn terminateChildHard(child: *std_compat.process.Child) !void {
 fn buildAgentOutput(
     allocator: std.mem.Allocator,
     stdout: []const u8,
-    stderr: []const u8,
     timeout_secs: u64,
     timed_out: bool,
+    success: bool,
 ) ![]const u8 {
     if (timed_out) {
-        const source = if (stdout.len > 0) stdout else stderr;
-        if (source.len > 0) {
-            return std.fmt.allocPrint(allocator, "{s}\n\n[agent timed out after {d}s]", .{ source, timeout_secs });
+        if (stdout.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}\n\n[agent timed out after {d}s]", .{ stdout, timeout_secs });
         }
         return std.fmt.allocPrint(allocator, "agent timed out after {d}s", .{timeout_secs});
     }
 
-    const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
-    return allocator.dupe(u8, output_source);
+    if (!success) {
+        if (stdout.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}\n\n[agent execution failed]", .{stdout});
+        }
+        return allocator.dupe(u8, "agent execution failed");
+    }
+
+    // `nullclaw agent -m` writes responses to stdout. Stderr is drained by the
+    // runner to avoid pipe backpressure, but it only contains logs/diagnostics
+    // and must never become user-visible agent output.
+    return allocator.dupe(u8, stdout);
+}
+
+fn isSuccessfulAgentRun(timed_out: bool, exited_zero: bool, stdout: []const u8) bool {
+    if (timed_out or !exited_zero) return false;
+    return std.mem.trim(u8, stdout, " \t\r\n").len > 0;
 }
 
 fn preferExecPath(self_exe_path: []const u8) []const u8 {
@@ -305,11 +318,12 @@ pub fn runWithOptions(
     );
 
     const term = try child.wait();
-    const success = !timed_out and switch (term) {
+    const exited_zero = switch (term) {
         .exited => |code| code == 0,
         else => false,
     };
-    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
+    const success = isSuccessfulAgentRun(timed_out, exited_zero, stdout.items);
+    const output = try buildAgentOutput(allocator, stdout.items, timeout_secs, timed_out, success);
     return .{ .success = success, .output = output };
 }
 
@@ -387,6 +401,55 @@ test "collectChildOutputWithTimeout kills process after deadline" {
         else => false,
     };
     try std.testing.expect(!completed_ok);
+}
+
+test "buildAgentOutput returns stdout on success" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "hello", 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "buildAgentOutput returns generic message for empty failure" {
+    // Regression: stderr-only initialization logs must not replace the missing
+    // response, while on_error delivery still needs a non-sensitive message.
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "", 0, false, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("agent execution failed", result);
+}
+
+test "buildAgentOutput marks partial stdout as failed" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "partial output", 0, false, false);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "partial output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "agent execution failed") != null);
+}
+
+test "buildAgentOutput appends timeout annotation" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "working...", 30, true, false);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "working...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "timed out after 30s") != null);
+}
+
+test "buildAgentOutput timeout without stdout is generic" {
+    // Regression: timeout diagnostics from stderr must not be delivered as an
+    // agent response when the child produced no stdout.
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "", 60, true, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("agent timed out after 60s", result);
+}
+
+test "isSuccessfulAgentRun rejects timeout exit failure and empty stdout" {
+    // Regression: CLI soft failures can exit zero after logging only to stderr.
+    try std.testing.expect(isSuccessfulAgentRun(false, true, "response\n"));
+    try std.testing.expect(!isSuccessfulAgentRun(true, true, "response\n"));
+    try std.testing.expect(!isSuccessfulAgentRun(false, false, "response\n"));
+    try std.testing.expect(!isSuccessfulAgentRun(false, true, "\n"));
 }
 
 test "preferExecPath keeps regular executable path" {
