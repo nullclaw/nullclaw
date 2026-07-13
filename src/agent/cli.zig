@@ -117,12 +117,61 @@ fn cliUsageRecordCallback(ctx: *anyopaque, record: Agent.UsageRecord) void {
     };
 }
 
-fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8) void {
+const CliToolWriteAheadCtx = struct {
+    agent: *const Agent,
+    store: ?memory_mod.SessionStore,
+    session_key: ?[]const u8,
+    raw_original: ?[]const u8 = null,
+    completed: bool = false,
+
+    fn callback(ctx: *anyopaque) !void {
+        const write_ctx: *@This() = @ptrCast(@alignCast(ctx));
+        if (write_ctx.completed) return;
+        const store = write_ctx.store orelse return error.SessionStoreUnavailable;
+        const session_key = write_ctx.session_key orelse return error.SessionStoreUnavailable;
+
+        const persisted_original = if (write_ctx.raw_original) |original|
+            if (write_ctx.agent.redactor) |r|
+                r.redact(write_ctx.agent.allocator, original) catch
+                    return error.ToolTurnPersistenceUnavailable
+            else
+                null
+        else
+            null;
+        defer if (persisted_original) |text| write_ctx.agent.allocator.free(text);
+
+        if (!turn_persistence.persistToolTurnWriteAheadCheckpoint(
+            write_ctx.agent.allocator,
+            store,
+            session_key,
+            persisted_original orelse write_ctx.raw_original,
+            write_ctx.agent.total_tokens,
+        )) return error.ToolTurnPersistenceUnavailable;
+        write_ctx.completed = true;
+    }
+};
+
+fn armCliToolWriteAhead(agent: *Agent, message: []const u8, ctx: *CliToolWriteAheadCtx) bool {
+    if (ctx.store == null or ctx.session_key == null) return false;
+    ctx.raw_original = commands.planTurnInput(message).llm_user_message;
+    agent.before_tool_dispatch_cb = CliToolWriteAheadCtx.callback;
+    agent.before_tool_dispatch_ctx = @ptrCast(ctx);
+    return true;
+}
+
+fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8, tool_turn_checkpointed: bool) void {
     const store = agent.session_store orelse return;
     const session_key = agent.memory_session_id orelse return;
 
-    const persisted_content = if (agent.redactor) |r|
-        r.redact(agent.allocator, content) catch null
+    const raw_persisted_content: ?[]const u8 = if (tool_turn_checkpointed)
+        commands.planTurnInput(content).llm_user_message
+    else
+        content;
+    const persisted_content = if (raw_persisted_content) |raw_content|
+        if (agent.redactor) |r|
+            r.redact(agent.allocator, raw_content) catch null
+        else
+            null
     else
         null;
     defer if (persisted_content) |text| agent.allocator.free(text);
@@ -133,10 +182,94 @@ fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8
         null;
     defer if (persisted_response) |text| agent.allocator.free(text);
 
+    if (agent.redactor != null and
+        (persisted_response == null or (raw_persisted_content != null and persisted_content == null)))
+    {
+        // Redaction is a confidentiality boundary. Never persist raw content
+        // merely because the redaction allocator or parser failed.
+        log.warn("CLI turn persistence skipped because redaction failed", .{});
+        return;
+    }
+
+    if (tool_turn_checkpointed) {
+        const completion_response = blk: {
+            // Agent.turn can decorate its returned text with reasoning and
+            // usage UI. Durable history must keep the canonical assistant
+            // content that is fed back to the model on restore.
+            if (raw_persisted_content != null and agent.history.items.len > 0) {
+                const last = agent.history.items[agent.history.items.len - 1];
+                if (last.role == .assistant) break :blk last.content;
+            }
+            break :blk persisted_response orelse response;
+        };
+        if (!turn_persistence.persistToolTurnCompletionCheckpoint(
+            agent.allocator,
+            store,
+            session_key,
+            persisted_content orelse raw_persisted_content,
+            completion_response,
+            agent.total_tokens,
+        )) {
+            log.warn("CLI tool outcome checkpoint write failed", .{});
+        }
+        return;
+    }
+
     turn_persistence.persistTurn(store, .{
         .history = agent.history.items,
         .total_tokens = agent.total_tokens,
     }, session_key, persisted_content orelse content, persisted_response orelse response);
+}
+
+fn applyCliSessionReset(agent: *const Agent, content: []const u8) !void {
+    const store = agent.session_store orelse return;
+    const session_key = agent.memory_session_id orelse return;
+    if (!turn_persistence.applySessionReset(store, session_key, content)) {
+        return error.SessionResetPersistenceUnavailable;
+    }
+}
+
+/// Restore durable CLI state exactly once, before the first turn. Loading and
+/// projection errors intentionally propagate: an incomplete write-ahead row
+/// may be the only evidence that a tool side effect already happened.
+fn restoreCliSessionState(agent: *Agent) !void {
+    const store = agent.session_store orelse return;
+    const session_key = agent.memory_session_id orelse return;
+    const original_history_len = agent.history.items.len;
+    errdefer {
+        for (agent.history.items[original_history_len..]) |*message| {
+            message.deinit(agent.allocator);
+        }
+        agent.history.items.len = original_history_len;
+    }
+
+    // Isolate backend-owned row allocations. Some stores can fail between
+    // allocating a role and its content without returning the partial slice;
+    // arena teardown still reclaims every byte on that path.
+    var load_arena = std.heap.ArenaAllocator.init(agent.allocator);
+    defer load_arena.deinit();
+    const entries = try store.loadMessages(load_arena.allocator(), session_key);
+
+    // Agent.loadHistory owns checkpoint projection and filters internal
+    // runtime-command rows from model-visible history.
+    try agent.loadHistory(entries);
+
+    // Runtime commands are session state, not conversation. Replay them in
+    // durable order so settings such as /usage, /queue, and /elevated survive
+    // a CLI restart without becoming model-visible messages.
+    for (entries) |entry| {
+        if (!memory_mod.isRuntimeCommandRole(entry.role)) continue;
+        if (commands.persistedRuntimeCommand(entry.content) == null) {
+            return error.InvalidPersistedRuntimeCommand;
+        }
+        const response = (try agent.handleSlashCommand(entry.content)) orelse
+            return error.InvalidPersistedRuntimeCommand;
+        agent.allocator.free(response);
+    }
+
+    if (try store.loadUsage(session_key)) |total_tokens| {
+        agent.total_tokens = total_tokens;
+    }
 }
 
 fn printPendingSubagentNotices(
@@ -625,6 +758,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
+        defer agent.deinit();
         agent.policy = &policy;
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
@@ -637,6 +771,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else if (agent_memory_session_id) |memory_session_id| {
             agent.memory_session_id = memory_session_id;
         }
+        try restoreCliSessionState(&agent);
         if (parsed_args.skill_name) |sname| {
             _ = try commands.activateSkillByName(&agent, sname);
         }
@@ -644,7 +779,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             agent.usage_record_callback = cliUsageRecordCallback;
             agent.usage_record_ctx = @ptrCast(c_tracker);
         }
-        defer agent.deinit();
 
         // Enable streaming if provider supports it.
         // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
@@ -668,6 +802,22 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         stream_ctx.emitted_text = false;
+        // Agent.turn clears live state before later fallible provider work.
+        // Clear durable state at the same boundary so a failed /new or /reset
+        // cannot resurrect the old transcript on restart.
+        try applyCliSessionReset(&agent, message);
+        var tool_write_ahead_ctx = CliToolWriteAheadCtx{
+            .agent = &agent,
+            .store = agent.session_store,
+            .session_key = agent.memory_session_id,
+        };
+        const prev_before_tool_dispatch_cb = agent.before_tool_dispatch_cb;
+        const prev_before_tool_dispatch_ctx = agent.before_tool_dispatch_ctx;
+        defer {
+            agent.before_tool_dispatch_cb = prev_before_tool_dispatch_cb;
+            agent.before_tool_dispatch_ctx = prev_before_tool_dispatch_ctx;
+        }
+        const tool_write_ahead_armed = armCliToolWriteAhead(&agent, message, &tool_write_ahead_ctx);
         const response = agent.turn(message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -690,7 +840,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        persistCliTurn(&agent, message, response);
+        persistCliTurn(&agent, message, response, tool_write_ahead_armed and tool_write_ahead_ctx.completed);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             // unredact() always returns a fresh allocation when the redactor
@@ -762,6 +912,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider_i, tools, mem_opt, obs, selected_profile_storage);
+    defer agent.deinit();
     agent.policy = &policy;
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
@@ -780,10 +931,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else if (agent_memory_session_id) |memory_session_id| {
         agent.memory_session_id = memory_session_id;
     }
+    try restoreCliSessionState(&agent);
     if (parsed_args.skill_name) |sname| {
         _ = try commands.activateSkillByName(&agent, sname);
     }
-    defer agent.deinit();
 
     // Enable streaming if provider supports it.
     // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
@@ -864,6 +1015,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         stream_ctx.emitted_text = false;
         stream_ctx.suppress_live = shouldSuppressLiveForRedaction(agent.redactor, debounced_input.current);
+        try applyCliSessionReset(&agent, debounced_input.current);
+        var tool_write_ahead_ctx = CliToolWriteAheadCtx{
+            .agent = &agent,
+            .store = agent.session_store,
+            .session_key = agent.memory_session_id,
+        };
+        const prev_before_tool_dispatch_cb = agent.before_tool_dispatch_cb;
+        const prev_before_tool_dispatch_ctx = agent.before_tool_dispatch_ctx;
+        defer {
+            agent.before_tool_dispatch_cb = prev_before_tool_dispatch_cb;
+            agent.before_tool_dispatch_ctx = prev_before_tool_dispatch_ctx;
+        }
+        const tool_write_ahead_armed = armCliToolWriteAhead(&agent, debounced_input.current, &tool_write_ahead_ctx);
         const response = agent.turn(debounced_input.current) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -884,7 +1048,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        persistCliTurn(&agent, debounced_input.current, response);
+        persistCliTurn(
+            &agent,
+            debounced_input.current,
+            response,
+            tool_write_ahead_armed and tool_write_ahead_ctx.completed,
+        );
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             const unredacted: ?[]u8 = if (agent.redactor) |r|
@@ -1211,7 +1380,7 @@ test "persistCliTurn redacts PII before session persistence" {
         agent.deinit();
     }
 
-    persistCliTurn(&agent, "contact alice@example.com", "sent to alice@example.com");
+    persistCliTurn(&agent, "contact alice@example.com", "sent to alice@example.com", false);
 
     const detailed = try mem.sessionStore().loadMessagesDetailed(allocator, "cli-redaction-session", 10, 0);
     defer memory_mod.freeDetailedMessages(allocator, detailed);
@@ -1220,6 +1389,458 @@ test "persistCliTurn redacts PII before session persistence" {
     try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "alice@example.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
+}
+
+test "persistCliTurn fails closed when redaction allocation fails" {
+    // Regression: an OOM in the confidentiality boundary must not fall back
+    // to writing the original PII into durable session storage.
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = mem.sessionStore(),
+        .memory_session_id = "cli-redaction-oom-session",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .redactor = &redactor,
+    };
+    defer {
+        agent.redactor = null;
+        agent.deinit();
+    }
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    agent.allocator = failing.allocator();
+    defer agent.allocator = allocator;
+
+    persistCliTurn(&agent, "contact alice@example.com", "sent to alice@example.com", false);
+
+    const detailed = try mem.sessionStore().loadMessagesDetailed(
+        allocator,
+        "cli-redaction-oom-session",
+        10,
+        0,
+    );
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 0), detailed.len);
+}
+
+test "CLI legacy approval arms durable fence and completion" {
+    // Regression: the REPL /approve path bypasses the provider tool loop, so
+    // it must explicitly arm the same write-ahead callback before execution.
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = mem.sessionStore(),
+        .memory_session_id = "cli-legacy-approval",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .pending_exec_command = "guarded command",
+    };
+    defer agent.deinit();
+
+    var write_ahead_ctx = CliToolWriteAheadCtx{
+        .agent = &agent,
+        .store = agent.session_store,
+        .session_key = agent.memory_session_id,
+    };
+    try std.testing.expect(armCliToolWriteAhead(&agent, "/approve allow-once", &write_ahead_ctx));
+    try agent.runBeforeToolDispatchBarrier();
+    try std.testing.expect(write_ahead_ctx.completed);
+    persistCliTurn(&agent, "/approve allow-once", "Approved exec complete", true);
+
+    const detailed = try mem.sessionStore().loadMessagesDetailed(allocator, "cli-legacy-approval", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expectEqualStrings(turn_persistence.TOOL_TURN_CHECKPOINT_ROLE, detailed[0].role);
+    try std.testing.expectEqualStrings(turn_persistence.TOOL_TURN_CHECKPOINT_ROLE, detailed[1].role);
+    try std.testing.expect(std.mem.startsWith(u8, detailed[0].content, turn_persistence.TOOL_TURN_WRITE_AHEAD_CHECKPOINT));
+    try std.testing.expect(std.mem.startsWith(u8, detailed[1].content, turn_persistence.TOOL_TURN_COMPLETION_CHECKPOINT));
+}
+
+test "CLI tool completion persists canonical assistant without UI decoration" {
+    // Regression: Agent.turn can return reasoning and usage decorations that
+    // are not part of model history. A checkpointed CLI tool turn must restore
+    // the canonical assistant message instead.
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = mem.sessionStore(),
+        .memory_session_id = "cli-canonical-tool-turn",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "canonical assistant"),
+    });
+    var write_ahead_ctx = CliToolWriteAheadCtx{
+        .agent = &agent,
+        .store = agent.session_store,
+        .session_key = agent.memory_session_id,
+    };
+    try std.testing.expect(armCliToolWriteAhead(&agent, "run the tool", &write_ahead_ctx));
+    try agent.runBeforeToolDispatchBarrier();
+    persistCliTurn(
+        &agent,
+        "run the tool",
+        "Reasoning:\ninternal\ncanonical assistant\n[usage] total_tokens=10",
+        true,
+    );
+
+    const raw = try mem.sessionStore().loadMessagesDetailed(allocator, "cli-canonical-tool-turn", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, raw);
+    const projected = try memory_mod.projectDetailedSessionMessages(allocator, raw);
+    defer memory_mod.freeDetailedMessages(allocator, projected);
+    try std.testing.expectEqual(@as(usize, 2), projected.len);
+    try std.testing.expectEqualStrings("run the tool", projected[0].content);
+    try std.testing.expectEqualStrings("canonical assistant", projected[1].content);
+}
+
+test "restoreCliSessionState restores saved write ahead fence and runtime state" {
+    // Regression: a restarted CLI must expose an incomplete write-ahead fence
+    // to the model and must not lose session-scoped slash-command settings.
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    const session_key = "cli-restore-write-ahead";
+    try store.saveMessage(session_key, memory_mod.RUNTIME_COMMAND_ROLE, "/usage full");
+    try store.saveMessage(
+        session_key,
+        memory_mod.TOOL_TURN_CHECKPOINT_ROLE,
+        memory_mod.TOOL_TURN_WRITE_AHEAD_CHECKPOINT,
+    );
+    try store.saveUsage(session_key, 42);
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = store,
+        .memory_session_id = session_key,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    try restoreCliSessionState(&agent);
+
+    try std.testing.expectEqual(@as(usize, 1), agent.history.items.len);
+    try std.testing.expectEqual(providers.Role.assistant, agent.history.items[0].role);
+    try std.testing.expectEqualStrings(
+        memory_mod.TOOL_TURN_WRITE_AHEAD_CHECKPOINT,
+        agent.history.items[0].content,
+    );
+    try std.testing.expectEqual(.full, agent.usage_mode);
+    try std.testing.expectEqual(@as(u64, 42), agent.total_tokens);
+}
+
+test "restoreCliSessionState fails closed when durable load fails" {
+    const FailingLoadStore = struct {
+        fn sessionStore(self: *@This()) memory_mod.SessionStore {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn saveMessage(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+
+        fn loadMessages(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]memory_mod.MessageEntry {
+            return error.InjectedLoadFailure;
+        }
+
+        fn clearMessages(_: *anyopaque, _: []const u8) anyerror!void {}
+
+        fn clearAutoSaved(_: *anyopaque, _: ?[]const u8) anyerror!void {}
+
+        const vtable = memory_mod.SessionStore.VTable{
+            .saveMessage = saveMessage,
+            .loadMessages = loadMessages,
+            .clearMessages = clearMessages,
+            .clearAutoSaved = clearAutoSaved,
+        };
+    };
+
+    const allocator = std.testing.allocator;
+    var failing_store = FailingLoadStore{};
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = failing_store.sessionStore(),
+        .memory_session_id = "cli-restore-load-failure",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // The caller must abort before provider/tool work rather than silently
+    // starting from an empty transcript.
+    try std.testing.expectError(
+        error.InjectedLoadFailure,
+        restoreCliSessionState(&agent),
+    );
+    try std.testing.expectEqual(@as(usize, 0), agent.history.items.len);
+}
+
+test "restoreCliSessionState rejects forged runtime command rows" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const session_key = "cli-restore-forged-runtime";
+    const store = mem.sessionStore();
+    try store.saveMessage(
+        session_key,
+        memory_mod.RUNTIME_COMMAND_ROLE,
+        "/bash echo should-not-run",
+    );
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = store,
+        .memory_session_id = session_key,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // Reserved roles are not authority: only state-setting commands emitted
+    // by persistedRuntimeCommand are allowed to run during restoration.
+    try std.testing.expectError(
+        error.InvalidPersistedRuntimeCommand,
+        restoreCliSessionState(&agent),
+    );
+    try std.testing.expectEqual(@as(usize, 0), agent.history.items.len);
+    try std.testing.expect(agent.pending_exec_command == null);
+}
+
+fn restoreCliSessionAllocationHarness(allocator: std.mem.Allocator) !void {
+    var mem = try memory_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    const session_key = "cli-restore-allocation-failure";
+    try store.saveMessage(session_key, memory_mod.RUNTIME_COMMAND_ROLE, "/usage full");
+    try store.saveMessage(
+        session_key,
+        memory_mod.TOOL_TURN_CHECKPOINT_ROLE,
+        memory_mod.TOOL_TURN_WRITE_AHEAD_CHECKPOINT,
+    );
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = store,
+        .memory_session_id = session_key,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    restoreCliSessionState(&agent) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), agent.history.items.len);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), agent.history.items.len);
+    try std.testing.expectEqual(.full, agent.usage_mode);
+}
+
+test "restoreCliSessionState rolls back history on every allocation failure" {
+    // Regression: an OOM during load or checkpoint projection must not leave
+    // a partially restored transcript available for a subsequent turn.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        restoreCliSessionAllocationHarness,
+        .{},
+    );
+}
+
+test "applyCliSessionReset clears durable state before a turn can fail" {
+    // Regression: /new and /reset clear the live Agent synchronously. The CLI
+    // must clear the matching durable transcript before entering fallible
+    // provider work as well.
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("cli-reset-session", "user", "old request");
+    try mem.memory().store(
+        "autosave_user_1",
+        "old autosave",
+        .conversation,
+        "cli-reset-session",
+    );
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = store,
+        .memory_session_id = "cli-reset-session",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    try applyCliSessionReset(&agent, "/new");
+
+    const detailed = try store.loadMessagesDetailed(allocator, "cli-reset-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 0), detailed.len);
+    const autosave = try mem.memory().get(allocator, "autosave_user_1");
+    try std.testing.expect(autosave == null);
+}
+
+test "applyCliSessionReset fails closed when durable clear fails" {
+    const FailingResetStore = struct {
+        fn sessionStore(self: *@This()) memory_mod.SessionStore {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn saveMessage(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+
+        fn loadMessages(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]memory_mod.MessageEntry {
+            return allocator.alloc(memory_mod.MessageEntry, 0);
+        }
+
+        fn clearMessages(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.InjectedClearFailure;
+        }
+
+        fn clearAutoSaved(_: *anyopaque, _: ?[]const u8) anyerror!void {}
+
+        const vtable = memory_mod.SessionStore.VTable{
+            .saveMessage = saveMessage,
+            .loadMessages = loadMessages,
+            .clearMessages = clearMessages,
+            .clearAutoSaved = clearAutoSaved,
+        };
+    };
+
+    const allocator = std.testing.allocator;
+    var failing_store = FailingResetStore{};
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = failing_store.sessionStore(),
+        .memory_session_id = "cli-reset-failure",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // Regression: the CLI must not enter provider/tool work after its live
+    // reset if the matching durable transcript could not be cleared.
+    try std.testing.expectError(
+        error.SessionResetPersistenceUnavailable,
+        applyCliSessionReset(&agent, "/new"),
+    );
 }
 
 test "parseAgentArgs keeps the last override value" {

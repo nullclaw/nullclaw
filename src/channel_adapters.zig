@@ -75,6 +75,17 @@ pub fn findPollingDescriptor(channel_name: []const u8) ?*const PollingDescriptor
 }
 
 pub const InboundMetadata = struct {
+    /// Optional authenticated control-event discriminator. Ordinary channel
+    /// messages leave this unset; WebChannel uses it for typed protocol events
+    /// that must not be interpreted as user-authored text.
+    event_type: ?[]const u8 = null,
+    /// Protocol correlation id. On `approval_response`, this is the
+    /// server-generated one-shot approval capability.
+    request_id: ?[]const u8 = null,
+    /// Decision fields are populated only for an authenticated
+    /// `approval_response` control event.
+    approval_approved: ?bool = null,
+    approval_reason: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
     peer_kind: ?agent_routing.ChatType = null,
     peer_id: ?[]const u8 = null,

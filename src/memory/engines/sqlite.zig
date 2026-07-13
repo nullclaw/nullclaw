@@ -327,6 +327,7 @@ pub const SqliteMemory = struct {
             \\  content TEXT NOT NULL,
             \\  created_at TEXT DEFAULT (datetime('now'))
             \\);
+            \\CREATE INDEX IF NOT EXISTS idx_messages_session_order ON messages(session_id, id);
             \\CREATE TABLE IF NOT EXISTS sessions (
             \\  id TEXT PRIMARY KEY,
             \\  provider TEXT,
@@ -858,10 +859,12 @@ pub const SqliteMemory = struct {
 
             if (role_ptr == null or content_ptr == null) continue;
 
-            try list.append(allocator, .{
-                .role = try allocator.dupe(u8, role_ptr[0..role_len]),
-                .content = try allocator.dupe(u8, content_ptr[0..content_len]),
-            });
+            try list.ensureUnusedCapacity(allocator, 1);
+            const role = try allocator.dupe(u8, role_ptr[0..role_len]);
+            errdefer allocator.free(role);
+            const content = try allocator.dupe(u8, content_ptr[0..content_len]);
+            errdefer allocator.free(content);
+            list.appendAssumeCapacity(.{ .role = role, .content = content });
         }
 
         return list.toOwnedSlice(allocator);
@@ -959,7 +962,10 @@ pub const SqliteMemory = struct {
     /// List sessions with message counts and time bounds.
     pub fn listSessions(self: *Self, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]root.SessionInfo {
         const sql =
-            "SELECT session_id, COUNT(*) as msg_count, MIN(created_at) as first_at, MAX(created_at) as last_at " ++
+            "SELECT session_id, COUNT(*) as msg_count, " ++
+            "SUM(CASE WHEN role = 'assistant' OR (role = '" ++ root.TOOL_TURN_CHECKPOINT_ROLE ++
+            "' AND instr(content, '" ++ root.TOOL_TURN_COMPLETION_CHECKPOINT ++ "') = 1) THEN 1 ELSE 0 END) as turn_count, " ++
+            "MIN(created_at) as first_at, MAX(created_at) as last_at " ++
             "FROM messages WHERE role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' " ++
             "GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT ?1 OFFSET ?2";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -980,22 +986,56 @@ pub const SqliteMemory = struct {
             const sid_ptr = c.sqlite3_column_text(stmt, 0);
             const sid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
             const count = c.sqlite3_column_int64(stmt, 1);
-            const first_ptr = c.sqlite3_column_text(stmt, 2);
-            const first_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
-            const last_ptr = c.sqlite3_column_text(stmt, 3);
-            const last_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+            const turn_count = c.sqlite3_column_int64(stmt, 2);
+            const first_ptr = c.sqlite3_column_text(stmt, 3);
+            const first_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+            const last_ptr = c.sqlite3_column_text(stmt, 4);
+            const last_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 4));
 
             if (sid_ptr == null) continue;
 
-            try list.append(allocator, .{
-                .session_id = try allocator.dupe(u8, sid_ptr[0..sid_len]),
+            try list.ensureUnusedCapacity(allocator, 1);
+            const session_id = try allocator.dupe(u8, sid_ptr[0..sid_len]);
+            errdefer allocator.free(session_id);
+            const first_message_at = if (first_ptr) |p|
+                try allocator.dupe(u8, p[0..first_len])
+            else
+                try allocator.dupe(u8, "");
+            errdefer allocator.free(first_message_at);
+            const last_message_at = if (last_ptr) |p|
+                try allocator.dupe(u8, p[0..last_len])
+            else
+                try allocator.dupe(u8, "");
+            errdefer allocator.free(last_message_at);
+            list.appendAssumeCapacity(.{
+                .session_id = session_id,
                 .message_count = if (count < 0) 0 else @intCast(count),
-                .first_message_at = if (first_ptr) |p| try allocator.dupe(u8, p[0..first_len]) else try allocator.dupe(u8, ""),
-                .last_message_at = if (last_ptr) |p| try allocator.dupe(u8, p[0..last_len]) else try allocator.dupe(u8, ""),
+                .turn_count = if (turn_count < 0) 0 else @intCast(turn_count),
+                .first_message_at = first_message_at,
+                .last_message_at = last_message_at,
             });
         }
 
         return list.toOwnedSlice(allocator);
+    }
+
+    pub fn countSessionTurns(self: *Self, session_id: []const u8) !u64 {
+        // Checkpoint rows are internal and emitted by one serializer. Prefix
+        // matching is sufficient here and keeps the aggregate portable.
+        const sql =
+            "SELECT SUM(CASE WHEN role = 'assistant' OR (role = '" ++ root.TOOL_TURN_CHECKPOINT_ROLE ++
+            "' AND instr(content, '" ++ root.TOOL_TURN_COMPLETION_CHECKPOINT ++ "') = 1) THEN 1 ELSE 0 END) " ++
+            "FROM messages WHERE session_id = ?1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "'";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        const total = c.sqlite3_column_int64(stmt, 0);
+        if (total < 0) return 0;
+        return @intCast(total);
     }
 
     pub fn countDetailedMessages(self: *Self, session_id: []const u8) !u64 {
@@ -1047,10 +1087,20 @@ pub const SqliteMemory = struct {
 
             if (role_ptr == null or content_ptr == null) continue;
 
-            try list.append(allocator, .{
-                .role = try allocator.dupe(u8, role_ptr[0..role_len]),
-                .content = try allocator.dupe(u8, content_ptr[0..content_len]),
-                .created_at = if (ts_ptr) |p| try allocator.dupe(u8, p[0..ts_len]) else try allocator.dupe(u8, ""),
+            try list.ensureUnusedCapacity(allocator, 1);
+            const role = try allocator.dupe(u8, role_ptr[0..role_len]);
+            errdefer allocator.free(role);
+            const content = try allocator.dupe(u8, content_ptr[0..content_len]);
+            errdefer allocator.free(content);
+            const created_at = if (ts_ptr) |p|
+                try allocator.dupe(u8, p[0..ts_len])
+            else
+                try allocator.dupe(u8, "");
+            errdefer allocator.free(created_at);
+            list.appendAssumeCapacity(.{
+                .role = role,
+                .content = content,
+                .created_at = created_at,
             });
         }
 
@@ -1099,6 +1149,11 @@ pub const SqliteMemory = struct {
         return self_.listSessions(allocator, limit, offset);
     }
 
+    fn implSessionCountSessionTurns(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.countSessionTurns(session_id);
+    }
+
     fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         return self_.countDetailedMessages(session_id);
@@ -1118,6 +1173,7 @@ pub const SqliteMemory = struct {
         .loadUsage = &implSessionLoadUsage,
         .countSessions = &implSessionCountSessions,
         .listSessions = &implSessionListSessions,
+        .countSessionTurns = &implSessionCountSessionTurns,
         .countDetailedMessages = &implSessionCountDetailedMessages,
         .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
@@ -2330,6 +2386,37 @@ test "sqlite sessionStore saveMessage + loadMessages roundtrip" {
     try std.testing.expectEqualStrings("hi there", msgs[1].content);
 }
 
+fn sqliteSessionLoadAllocationHarness(allocator: std.mem.Allocator) !void {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("allocation-session", "user", "first");
+    try store.saveMessage("allocation-session", "assistant", "second");
+
+    const messages = try store.loadMessages(allocator, "allocation-session");
+    defer root.freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+
+    const detailed = try store.loadMessagesDetailed(allocator, "allocation-session", 10, 0);
+    defer root.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+
+    const sessions = try store.listSessions(allocator, 10, 0);
+    defer root.freeSessionInfos(allocator, sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+}
+
+test "sqlite session loaders release partial rows on allocation failure" {
+    // Regression: if content allocation failed after role allocation, the
+    // partial row was not yet owned by the result list and leaked its role.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        sqliteSessionLoadAllocationHarness,
+        .{},
+    );
+}
+
 test "sqlite sessionStore history views hide runtime command rows" {
     const allocator = std.testing.allocator;
     var mem = try SqliteMemory.init(allocator, ":memory:");
@@ -2353,6 +2440,8 @@ test "sqlite sessionStore history views hide runtime command rows" {
     try std.testing.expectEqual(@as(usize, 1), sessions.len);
     try std.testing.expectEqualStrings("s1", sessions[0].session_id);
     try std.testing.expectEqual(@as(u64, 2), sessions[0].message_count);
+    try std.testing.expectEqual(@as(?u64, 1), sessions[0].turn_count);
+    try std.testing.expectEqual(@as(u64, 1), try store.countSessionTurns("s1"));
 
     try std.testing.expectEqual(@as(u64, 2), try store.countDetailedMessages("s1"));
     try std.testing.expectEqual(@as(u64, 0), try store.countDetailedMessages("s2"));
@@ -2362,6 +2451,48 @@ test "sqlite sessionStore history views hide runtime command rows" {
     try std.testing.expectEqual(@as(usize, 2), detailed.len);
     try std.testing.expectEqualStrings("user", detailed[0].role);
     try std.testing.expectEqualStrings("assistant", detailed[1].role);
+}
+
+test "sqlite session turn aggregate ignores internal write ahead rows" {
+    // Regression: nested approval checkpoints do not form user/assistant
+    // pairs, so raw message_count / 2 is not a valid completed-turn count.
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+    const store = mem.sessionStore();
+
+    const completion = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n{f}",
+        .{
+            root.TOOL_TURN_COMPLETION_CHECKPOINT,
+            std.json.fmt(root.ToolTurnCompletion{
+                .original_user = null,
+                .assistant_response = "finished",
+            }, .{}),
+        },
+    );
+    defer allocator.free(completion);
+
+    try store.saveMessage("nested", root.TOOL_TURN_CHECKPOINT_ROLE, root.TOOL_TURN_WRITE_AHEAD_CHECKPOINT);
+    try store.saveMessage("nested", "assistant", "approval paused");
+    try store.saveMessage("nested", "user", "execution intent");
+    try store.saveMessage("nested", "user", "tool result");
+    try store.saveMessage("nested", root.TOOL_TURN_CHECKPOINT_ROLE, root.TOOL_TURN_WRITE_AHEAD_CHECKPOINT);
+    try store.saveMessage("nested", root.TOOL_TURN_CHECKPOINT_ROLE, completion);
+    try store.saveMessage(
+        "nested",
+        root.TOOL_TURN_CHECKPOINT_ROLE,
+        "a tool-capable turn completed after its durable write-ahead fence.\nnot-an-internal-marker",
+    );
+
+    try std.testing.expectEqual(@as(u64, 7), try store.countDetailedMessages("nested"));
+    try std.testing.expectEqual(@as(u64, 2), try store.countSessionTurns("nested"));
+
+    const sessions = try store.listSessions(allocator, 10, 0);
+    defer root.freeSessionInfos(allocator, sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqual(@as(?u64, 2), sessions[0].turn_count);
 }
 
 test "sqlite sessionStore clearMessages" {

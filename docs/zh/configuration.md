@@ -634,6 +634,7 @@ Telegram forum topics：
 
 - 想使用“先连上再配对”的本地体验，保持 `listen = "127.0.0.1"`。
 - 在 local transport 下，只有 loopback 才允许未鉴权的 WebSocket upgrade；这样 UI 才能先连上，再发送 `pairing_request`。
+- 基于浏览器的配对还要求页面 Origin 出现在 `allowed_origins` 中。allowlist 为空时，未鉴权的浏览器 upgrade 会被拒绝；不发送 Origin 的本地原生客户端，以及携带有效 upgrade token 的客户端仍然可用。
 - local loopback 配对流程不再依赖固定共享码。`pairing_request` 可以省略 `payload.pairing_code`，仍然发送旧值 `123456` 的 loopback 客户端也保持兼容。
 - 如果把 `listen` 改成 `0.0.0.0` 或其他非 loopback 地址，那么 WebSocket upgrade 一开始就必须带上 channel token：
   - `ws://host:32123/ws?token=<auth_token>`
@@ -644,6 +645,42 @@ Telegram forum topics：
 - `auth_token` 既可以加固 WebSocket upgrade，在非 loopback bind 时也会变成必需项。
 - WebSocket 端点用的是 `/ws`。`/pair` 属于 HTTP gateway API，不是 web channel 的 WebSocket 配对入口。
 - 对于 headless/LAN 场景，更稳妥的运维路径仍然是 SSH 隧道，或者在 loopback 绑定前面加反向代理。
+
+审批控制事件（WebChannel v1）：
+
+```json
+{
+  "v": 1,
+  "type": "approval_request",
+  "session_id": "conversation-123",
+  "agent_id": "default",
+  "request_id": "<opaque-server-generated-id>",
+  "payload": {
+    "action": "command or tool action requiring approval",
+    "reason": "why approval is required"
+  }
+}
+```
+
+客户端必须使用类型化控制事件回复，并在顶层原样回传 `request_id`（不能放进 `payload`）：
+
+```json
+{
+  "v": 1,
+  "type": "approval_response",
+  "session_id": "conversation-123",
+  "request_id": "<same-id>",
+  "payload": {
+    "access_token": "<ui-jwt>",
+    "approved": true,
+    "reason": "optional decision note"
+  }
+}
+```
+
+- 每个 `approval_response` 都必须通过当前配置的消息鉴权，并且匹配收到请求的同一会话。在 pairing 模式下，响应还必须来自该会话最初绑定的已鉴权 UI 身份；token 模式则使用 `auth_token`，而不是 `access_token`。
+- 审批 ID 由服务端生成，是有效期五分钟的一次性 capability。已过期、不匹配或重放的响应绝不会执行受保护的操作。
+- WebChannel v1 的审批 payload 使用明文控制信封，加密的 `approval_response` 会被拒绝。本地回环传输即使启用了消息 E2E，也允许经过身份验证的审批控制，因此标准本地 UI 仍可完成审批。由于中继协议没有面向会话所有者的投递确认，v1 会禁用中继审批投递；绑定到公网或局域网地址的本地传输在启用消息 E2E 时也会拒绝审批控制。两种情况下都不会执行受保护的操作。
 
 远程 / 无头设备示例：
 

@@ -244,7 +244,9 @@ pub const QmdAdapter = struct {
 
             const messages = store.loadMessages(allocator, sid) catch continue;
             defer root.freeMessages(allocator, messages);
-            if (messages.len == 0) continue;
+            const projected_messages = root.projectSessionMessages(allocator, messages) catch continue;
+            defer root.freeMessages(allocator, projected_messages);
+            if (projected_messages.len == 0) continue;
 
             // Build markdown content
             var content: std.ArrayList(u8) = .empty;
@@ -255,7 +257,7 @@ pub const QmdAdapter = struct {
             content.appendSlice(allocator, "\n\n") catch continue;
 
             var wrote_visible_message = false;
-            for (messages) |msg| {
+            for (projected_messages) |msg| {
                 if (root.isRuntimeCommandRole(msg.role)) continue;
                 wrote_visible_message = true;
                 const label: []const u8 = if (std.mem.eql(u8, msg.role, "user"))
@@ -513,13 +515,50 @@ const MockSessionStore = struct {
     call_count: usize = 0,
 
     fn implSaveMessage(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+
+    fn dupeMessage(
+        allocator: std.mem.Allocator,
+        role: []const u8,
+        content: []const u8,
+    ) !root.MessageEntry {
+        const owned_role = try allocator.dupe(u8, role);
+        errdefer allocator.free(owned_role);
+        const owned_content = try allocator.dupe(u8, content);
+        return .{ .role = owned_role, .content = owned_content };
+    }
+
     fn implLoadMessages(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]root.MessageEntry {
         const self: *MockSessionStore = @ptrCast(@alignCast(ptr));
         self.call_count += 1;
-        var msgs = try allocator.alloc(root.MessageEntry, 3);
-        msgs[0] = .{ .role = try allocator.dupe(u8, "user"), .content = try allocator.dupe(u8, "Hello") };
-        msgs[1] = .{ .role = try allocator.dupe(u8, root.RUNTIME_COMMAND_ROLE), .content = try allocator.dupe(u8, "/usage full") };
-        msgs[2] = .{ .role = try allocator.dupe(u8, "assistant"), .content = try allocator.dupe(u8, "Hi there") };
+        const msgs = try allocator.alloc(root.MessageEntry, 5);
+        var initialized: usize = 0;
+        errdefer {
+            for (msgs[0..initialized]) |msg| {
+                allocator.free(msg.role);
+                allocator.free(msg.content);
+            }
+            allocator.free(msgs);
+        }
+
+        msgs[0] = try dupeMessage(allocator, "user", "Hello");
+        initialized += 1;
+        msgs[1] = try dupeMessage(allocator, root.RUNTIME_COMMAND_ROLE, "/usage full");
+        initialized += 1;
+        msgs[2] = try dupeMessage(allocator, "assistant", "Hi there");
+        initialized += 1;
+        msgs[3] = try dupeMessage(
+            allocator,
+            root.TOOL_TURN_CHECKPOINT_ROLE,
+            root.TOOL_TURN_WRITE_AHEAD_CHECKPOINT,
+        );
+        initialized += 1;
+        const completion = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n{{\"original_user\":\"Use probe\",\"assistant_response\":\"Probe done\"}}",
+            .{root.TOOL_TURN_COMPLETION_CHECKPOINT},
+        );
+        defer allocator.free(completion);
+        msgs[4] = try dupeMessage(allocator, root.TOOL_TURN_CHECKPOINT_ROLE, completion);
         return msgs;
     }
     fn implClearMessages(_: *anyopaque, _: []const u8) anyerror!void {}
@@ -562,7 +601,11 @@ test "exportSessions with mock session store writes files" {
     try std.testing.expect(std.mem.indexOf(u8, content, "Session: session-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "**User**: Hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "**Assistant**: Hi there") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "**User**: Use probe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "**Assistant**: Probe done") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, root.RUNTIME_COMMAND_ROLE) == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, root.TOOL_TURN_CHECKPOINT_ROLE) == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, root.TOOL_TURN_WRITE_AHEAD_CHECKPOINT) == null);
 }
 
 test "exportSessions skips unchanged files (hash check)" {

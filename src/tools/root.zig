@@ -86,20 +86,35 @@ pub fn threadMemorySessionId() ?[]const u8 {
     return tls_memory_session_id;
 }
 
-/// Thread-local flag set by the agent when re-executing a tool after the user
-/// grants approval via the structured approval UI. ShellTool reads this flag
-/// and passes `true` to the security policy's `approved` parameter, bypassing
-/// the approval gate on re-execution.
-threadlocal var tls_approved: bool = false;
+/// Exact tool invocation authorized by a one-shot user approval.
+///
+/// The slices are borrowed for the duration of the synchronous `Tool.execute`
+/// call. Keeping every security-relevant shell input in the grant prevents a
+/// broad ambient boolean from authorizing another invocation on the thread.
+pub const ApprovalGrant = struct {
+    tool_name: []const u8,
+    command: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+};
 
-pub fn setThreadApproved(approved: bool) bool {
-    const previous = tls_approved;
-    tls_approved = approved;
+threadlocal var tls_approval_grant: ?ApprovalGrant = null;
+
+pub fn setThreadApprovalGrant(grant: ?ApprovalGrant) ?ApprovalGrant {
+    const previous = tls_approval_grant;
+    tls_approval_grant = grant;
     return previous;
 }
 
-pub fn threadApproved() bool {
-    return tls_approved;
+pub fn threadCommandApproved(tool_name: []const u8, command: []const u8, cwd: ?[]const u8) bool {
+    const grant = tls_approval_grant orelse return false;
+    if (!std.ascii.eqlIgnoreCase(grant.tool_name, tool_name)) return false;
+    const approved_command = grant.command orelse return false;
+    if (!std.mem.eql(u8, approved_command, command)) return false;
+    if (grant.cwd) |approved_cwd| {
+        const requested_cwd = cwd orelse return false;
+        return std.mem.eql(u8, approved_cwd, requested_cwd);
+    }
+    return cwd == null;
 }
 
 // Sub-modules
@@ -1516,21 +1531,19 @@ test "all tools wires anonymize_text and end-to-end redacts an email" {
     try std.testing.expect(saw_anonymize);
 }
 
-test "setThreadApproved and threadApproved cycle" {
-    const prev = setThreadApproved(true);
-    try std.testing.expect(prev == false);
-    try std.testing.expect(threadApproved() == true);
+test "approval grant is scoped to exact tool invocation" {
+    const prev = setThreadApprovalGrant(.{
+        .tool_name = "shell",
+        .command = "printf ok",
+        .cwd = "/tmp/work-a",
+    });
+    defer _ = setThreadApprovalGrant(prev);
 
-    const prev2 = setThreadApproved(false);
-    try std.testing.expect(prev2 == true);
-    try std.testing.expect(threadApproved() == false);
-}
-
-test "setThreadApproved returns previous value on double-set" {
-    _ = setThreadApproved(true);
-    const prev = setThreadApproved(false);
-    try std.testing.expect(prev == true);
-    _ = setThreadApproved(false);
+    try std.testing.expect(threadCommandApproved("shell", "printf ok", "/tmp/work-a"));
+    try std.testing.expect(!threadCommandApproved("other", "printf ok", "/tmp/work-a"));
+    try std.testing.expect(!threadCommandApproved("shell", "rm -rf tmp", "/tmp/work-a"));
+    try std.testing.expect(!threadCommandApproved("shell", "printf ok", "/tmp/work-b"));
+    try std.testing.expect(!threadCommandApproved("shell", "printf ok", null));
 }
 
 test {

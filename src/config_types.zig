@@ -933,7 +933,8 @@ pub const WebConfig = struct {
     /// - "token": require channel auth token in auth_token (or access_token for compatibility).
     message_auth_mode: []const u8 = DEFAULT_MESSAGE_AUTH_MODE,
     /// Optional allowlist for Origin header values (exact match, supports "*").
-    /// Empty = allow any origin.
+    /// Empty permits Origin-less native clients and token-authenticated browser
+    /// upgrades; unauthenticated browser pairing requires an explicit origin.
     allowed_origins: []const []const u8 = &.{},
     /// Relay endpoint for transport="relay" (must be wss://...).
     relay_url: ?[]const u8 = null,

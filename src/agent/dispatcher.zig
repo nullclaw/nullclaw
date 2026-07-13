@@ -65,6 +65,9 @@ pub const ToolExecutionResult = struct {
     output: []const u8,
     success: bool,
     tool_call_id: ?[]const u8 = null,
+    /// Internal control boundary: later calls from the same provider batch
+    /// must not execute because this invocation requires user approval.
+    approval_boundary: bool = false,
 };
 
 /// Parse tool calls from an LLM response.

@@ -722,11 +722,49 @@ Use `channels.web` for browser UI events (WebChannel v1):
   - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
 - `auth_token` hardens the WebSocket upgrade and becomes required when binding non-loopback addresses.
 - Unauthenticated WebSocket upgrade is loopback-only. Pairing-first local UX works on `127.0.0.1`, but a public/LAN bind must authenticate the `/ws` upgrade on the first hop with `?token=<auth_token>` or `Authorization: Bearer <auth_token>`.
+- Browser-based pairing also requires the page Origin in `allowed_origins`. With an empty allowlist, unauthenticated browser upgrades are rejected; Origin-less native loopback clients and clients presenting a valid upgrade token remain supported.
 - Local loopback pairing no longer depends on a fixed shared code. `pairing_request` may omit `payload.pairing_code`, and legacy loopback clients that still send `123456` remain compatible.
 - `/ws` is the WebSocket endpoint. `/pair` belongs to the HTTP gateway API and is not part of the web channel handshake.
 - Remote/headless host: if you bind `"listen": "0.0.0.0"`, prefer a stable configured token plus `message_auth_mode: "token"` behind TLS/reverse proxy, or keep loopback bind and expose it through SSH tunnel/proxy.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
 - For orchestration, use local token mode with a stable token from config or env (`NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`).
+
+Approval control events (WebChannel v1):
+
+```json
+{
+  "v": 1,
+  "type": "approval_request",
+  "session_id": "conversation-123",
+  "agent_id": "default",
+  "request_id": "<opaque-server-generated-id>",
+  "payload": {
+    "action": "command or tool action requiring approval",
+    "reason": "why approval is required"
+  }
+}
+```
+
+Reply with a typed control event, echoing `request_id` at the top level (not inside `payload`):
+
+```json
+{
+  "v": 1,
+  "type": "approval_response",
+  "session_id": "conversation-123",
+  "request_id": "<same-id>",
+  "payload": {
+    "access_token": "<ui-jwt>",
+    "approved": true,
+    "reason": "optional decision note"
+  }
+}
+```
+
+- Every `approval_response` must pass the configured message authentication and match the exact session that received the request. In pairing mode, it must also come from that session's original authenticated UI principal; token mode uses `auth_token` instead of `access_token`.
+- Approval IDs are server-generated, one-shot capabilities with a five-minute lifetime. Expired, mismatched, and replayed responses never execute the protected action.
+- WebChannel v1 approval payloads are plaintext control envelopes, and encrypted `approval_response` events are rejected. Local loopback transport permits these authenticated controls even when message E2E is active, so the standard local UI approval flow remains usable. Relay approval delivery is disabled in v1 because the relay protocol has no owner-addressed delivery acknowledgement. Public/LAN-bound local transport also refuses approval controls while E2E is active; in either case the protected action is not executed.
+
 - Relay transport (outbound agent socket) is configured via:
 
 ```json
@@ -751,9 +789,43 @@ Use `channels.web` for browser UI events (WebChannel v1):
 ```
 
 - Relay token lifecycle (dedicated): `relay_token` (config) -> `NULLCLAW_RELAY_TOKEN` (env) -> persisted `web-relay-<account_id>` credential -> generated token.
-- Relay UI handshake: send `pairing_request` with one-time `pairing_code`, receive `pairing_result` with UI `access_token` JWT (and optional `set_cookie` string for relay HTTP layer).
+- Relay UI pairing always wraps the issued credentials with X25519 + ChaCha20-Poly1305, even when `relay_e2e_required=false`. Send both the one-time `pairing_code` and a base64url X25519 `client_pub`:
+
+```json
+{
+  "v": 1,
+  "type": "pairing_request",
+  "session_id": "conversation-123",
+  "payload": {
+    "pairing_code": "123456",
+    "client_pub": "<base64url-x25519-public-key>"
+  }
+}
+```
+
+The relay `pairing_result` exposes only `payload.ok` and the encrypted credential envelope:
+
+```json
+{
+  "v": 1,
+  "type": "pairing_result",
+  "session_id": "conversation-123",
+  "payload": {
+    "ok": true,
+    "e2e": {
+      "alg": "x25519-chacha20poly1305-v1",
+      "agent_pub": "<base64url-x25519-public-key>",
+      "nonce": "<base64url-nonce>",
+      "ciphertext": "<base64url-ciphertext-and-tag>"
+    }
+  }
+}
+```
+
+Decrypting `payload.e2e.ciphertext` yields JSON containing `client_id`, `access_token`, `token_type`, `expires_in`, `set_cookie`, and `e2e_required`. Local pairing is different: a local client may omit `client_pub` and receive these fields directly in the `pairing_result` sent only to its originating socket (unauthenticated pairing-first access remains loopback-only).
 - Relay `user_message` must include valid UI JWT in `access_token` (top-level or `payload.access_token`).
-- If E2E is enabled (`relay_e2e_required=true`), UI and agent exchange X25519 keys during pairing and send encrypted payloads in `payload.e2e`.
+- `relay_e2e_required=true` additionally requires subsequent message payloads to use `payload.e2e`; it does not control the mandatory relay pairing credential wrapper above.
+- The encrypted pairing result protects credentials in transit from passive observation on the relay path. The relay transport is still trusted for integrity and key delivery: `client_pub` itself travels in the pairing request, so this is not an authenticated PAKE and does not protect against an active relay substituting keys.
 - WebChannel event envelope is defined in [`spec/webchannel_v1.json`](spec/webchannel_v1.json).
 
 ## Gateway API

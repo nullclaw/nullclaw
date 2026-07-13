@@ -14,6 +14,12 @@ const log = std.log.scoped(.web);
 
 pub const WebChannel = struct {
     const MAX_E2E_PAYLOAD_BYTES: usize = 65_536;
+    const MAX_APPROVAL_ACTION_BYTES: usize = 4096;
+    const MAX_APPROVAL_REASON_BYTES: usize = 512;
+    const MAX_REQUEST_ID_BYTES: usize = 128;
+    const MAX_CLIENT_SUB_BYTES: usize = 128;
+    const MAX_SESSION_ID_BYTES: usize = 64;
+    const MAX_SESSION_CLIENT_BINDINGS: usize = 1024;
     const E2E_ALG: []const u8 = "x25519-chacha20poly1305-v1";
     const RelayTokenSource = enum {
         config,
@@ -44,6 +50,11 @@ pub const WebChannel = struct {
 
     const E2eSession = struct {
         key: [32]u8,
+    };
+
+    const SessionClientBinding = struct {
+        client_sub: []const u8,
+        expires_at: i64,
     };
 
     const WebTransport = enum {
@@ -101,7 +112,7 @@ pub const WebChannel = struct {
     jwt_signing_key: [32]u8 = [_]u8{0} ** 32,
     jwt_ready: bool = false,
     relay_security_mu: std_compat.sync.Mutex = .{},
-    session_client_bindings: std.StringHashMapUnmanaged([]const u8) = .empty,
+    session_client_bindings: std.StringHashMapUnmanaged(SessionClientBinding) = .empty,
     e2e_sessions: std.StringHashMapUnmanaged(E2eSession) = .empty,
 
     const SocketFd = std_compat.net.Stream.Handle;
@@ -149,6 +160,7 @@ pub const WebChannel = struct {
         .stop = wsStop,
         .send = wsSend,
         .sendEvent = wsSendEvent,
+        .sendApprovalRequest = wsSendApprovalRequest,
         .name = wsName,
         .healthCheck = wsHealthCheck,
         .supportsStreamingOutbound = wsSupportsStreamingOutbound,
@@ -423,7 +435,7 @@ pub const WebChannel = struct {
         var it = self.session_client_bindings.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.value_ptr.client_sub);
         }
         self.session_client_bindings.deinit(self.allocator);
         self.session_client_bindings = .empty;
@@ -692,21 +704,65 @@ pub const WebChannel = struct {
         };
     }
 
-    fn upsertSessionBinding(self: *WebChannel, session_id: []const u8, client_sub: []const u8) !void {
+    /// Bind a conversation to its first authenticated UI principal for the
+    /// lifetime of that principal's JWT. A newly paired client may reclaim the
+    /// session only after the old binding has expired.
+    fn bindSessionToClient(self: *WebChannel, session_id: []const u8, client_sub: []const u8, expires_at: i64) !bool {
+        if (session_id.len == 0 or session_id.len > MAX_SESSION_ID_BYTES) return error.InvalidSessionId;
         self.relay_security_mu.lock();
         defer self.relay_security_mu.unlock();
 
+        const now = std_compat.time.timestamp();
+        self.evictExpiredSessionBindingsLocked(now);
         if (self.session_client_bindings.getPtr(session_id)) |existing| {
-            self.allocator.free(existing.*);
-            existing.* = try self.allocator.dupe(u8, client_sub);
-            return;
+            if (std.mem.eql(u8, existing.client_sub, client_sub)) {
+                existing.expires_at = expires_at;
+                return true;
+            }
+            if (now < existing.expires_at) return false;
+
+            const replacement = try self.allocator.dupe(u8, client_sub);
+            self.allocator.free(existing.client_sub);
+            existing.* = .{
+                .client_sub = replacement,
+                .expires_at = expires_at,
+            };
+            return true;
+        }
+        if (self.session_client_bindings.count() >= MAX_SESSION_CLIENT_BINDINGS) {
+            return error.TooManySessionBindings;
         }
 
         const key_copy = try self.allocator.dupe(u8, session_id);
         errdefer self.allocator.free(key_copy);
         const value_copy = try self.allocator.dupe(u8, client_sub);
         errdefer self.allocator.free(value_copy);
-        try self.session_client_bindings.put(self.allocator, key_copy, value_copy);
+        try self.session_client_bindings.put(self.allocator, key_copy, .{
+            .client_sub = value_copy,
+            .expires_at = expires_at,
+        });
+        return true;
+    }
+
+    fn evictExpiredSessionBindingsLocked(self: *WebChannel, now: i64) void {
+        var it = self.session_client_bindings.iterator();
+        while (it.next()) |entry| {
+            if (now < entry.value_ptr.expires_at) continue;
+            const owned_session_id = entry.key_ptr.*;
+            const owned_client_sub = entry.value_ptr.client_sub;
+            self.session_client_bindings.removeByPtr(entry.key_ptr);
+            self.allocator.free(owned_session_id);
+            self.allocator.free(owned_client_sub);
+        }
+    }
+
+    fn sessionBindingMatches(self: *WebChannel, session_id: []const u8, client_sub: []const u8) bool {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+
+        const existing = self.session_client_bindings.get(session_id) orelse return false;
+        return std_compat.time.timestamp() < existing.expires_at and
+            std.mem.eql(u8, existing.client_sub, client_sub);
     }
 
     fn upsertE2eSession(self: *WebChannel, client_sub: []const u8, e2e: E2eSession) !void {
@@ -745,9 +801,10 @@ pub const WebChannel = struct {
             self.relay_security_mu.lock();
             defer self.relay_security_mu.unlock();
 
-            const client_sub = self.session_client_bindings.get(session_id) orelse break :blk null;
-            if (self.e2e_sessions.get(client_sub)) |session| return session;
-            break :blk self.allocator.dupe(u8, client_sub) catch null;
+            const binding = self.session_client_bindings.get(session_id) orelse break :blk null;
+            if (std_compat.time.timestamp() >= binding.expires_at) break :blk null;
+            if (self.e2e_sessions.get(binding.client_sub)) |session| return session;
+            break :blk self.allocator.dupe(u8, binding.client_sub) catch null;
         };
         if (client_sub_copy) |client_sub| {
             defer self.allocator.free(client_sub);
@@ -757,6 +814,8 @@ pub const WebChannel = struct {
     }
 
     fn deriveE2eSession(self: *WebChannel, client_pub_b64: []const u8) !struct { session: E2eSession, agent_public_b64: []u8 } {
+        const expected_public_key_len = std.base64.url_safe_no_pad.Encoder.calcSize(std.crypto.dh.X25519.public_length);
+        if (client_pub_b64.len != expected_public_key_len) return error.InvalidClientPublicKey;
         const client_pub_raw = try self.base64UrlDecodeAlloc(client_pub_b64);
         defer self.allocator.free(client_pub_raw);
         if (client_pub_raw.len != std.crypto.dh.X25519.public_length) return error.InvalidClientPublicKey;
@@ -785,13 +844,21 @@ pub const WebChannel = struct {
         defer self.allocator.free(cipher);
         const encrypted = try secret_crypto.encrypt(key, nonce, plaintext, cipher);
 
+        const nonce_b64 = try self.base64UrlEncodeAlloc(&nonce);
+        errdefer self.allocator.free(nonce_b64);
+        const ciphertext_b64 = try self.base64UrlEncodeAlloc(encrypted);
         return .{
-            .nonce_b64 = try self.base64UrlEncodeAlloc(&nonce),
-            .ciphertext_b64 = try self.base64UrlEncodeAlloc(encrypted),
+            .nonce_b64 = nonce_b64,
+            .ciphertext_b64 = ciphertext_b64,
         };
     }
 
     fn decryptE2ePayload(self: *WebChannel, key: [32]u8, nonce_b64: []const u8, ciphertext_b64: []const u8) ![]u8 {
+        const Encoder = std.base64.url_safe_no_pad.Encoder;
+        if (nonce_b64.len != Encoder.calcSize(12)) return error.InvalidNonce;
+        if (ciphertext_b64.len > Encoder.calcSize(MAX_E2E_PAYLOAD_BYTES + secret_crypto.TAG_LEN)) {
+            return error.CiphertextTooLarge;
+        }
         const nonce_raw = try self.base64UrlDecodeAlloc(nonce_b64);
         defer self.allocator.free(nonce_raw);
         if (nonce_raw.len != 12) return error.InvalidNonce;
@@ -818,6 +885,40 @@ pub const WebChannel = struct {
                         log.warn("Web relay write failed: {}", .{err});
                     };
                 }
+            },
+        }
+    }
+
+    /// Approval requests are security-sensitive control messages. Unlike
+    /// ordinary assistant output, their delivery must be confirmed so the
+    /// agent does not retain an unreachable pending approval indefinitely.
+    fn sendApprovalOutboundEvent(self: *WebChannel, session_id: []const u8, message: []const u8) !void {
+        switch (self.transport) {
+            .local => {
+                self.relay_security_mu.lock();
+                defer self.relay_security_mu.unlock();
+                const owner: ?[]const u8 = switch (self.message_auth_mode) {
+                    .pairing => blk: {
+                        const binding = self.session_client_bindings.get(session_id) orelse
+                            return error.ApprovalDeliveryUnavailable;
+                        if (std_compat.time.timestamp() >= binding.expires_at) {
+                            return error.ApprovalDeliveryUnavailable;
+                        }
+                        break :blk binding.client_sub;
+                    },
+                    .token => null,
+                    .invalid => return error.ApprovalDeliveryUnavailable,
+                };
+                try self.connections.broadcastApprovalChecked(session_id, owner, message);
+            },
+            .relay => {
+                // WebChannel v1 relay envelopes do not carry an authenticated
+                // recipient or delivery acknowledgement. A successful write
+                // to the shared agent socket therefore cannot prove that the
+                // session owner received this capability. Fail closed until
+                // the relay protocol supports owner-addressed, acknowledged
+                // control delivery.
+                return error.ApprovalDeliveryUnavailable;
             },
         }
     }
@@ -865,8 +966,95 @@ pub const WebChannel = struct {
         self.sendOutboundEvent(session_id, buf.items);
     }
 
-    fn handleRelayPairingRequest(self: *WebChannel, session_id: []const u8, request_id: ?[]const u8, payload_obj: ?std.json.ObjectMap) void {
+    fn buildEncryptedRelayPairingResult(
+        self: *WebChannel,
+        session_id: []const u8,
+        request_id: ?[]const u8,
+        client_sub: []const u8,
+        access_token: []const u8,
+        cookie: []const u8,
+        agent_public_b64: []const u8,
+        e2e_session: E2eSession,
+    ) ![]u8 {
+        var sensitive_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer sensitive_writer.deinit();
+        const sw = &sensitive_writer.writer;
+        try sw.writeAll("{\"client_id\":");
+        try root.appendJsonStringW(sw, client_sub);
+        try sw.writeAll(",\"access_token\":");
+        try root.appendJsonStringW(sw, access_token);
+        try sw.writeAll(",\"token_type\":\"Bearer\",\"expires_in\":");
+        try sw.print("{d}", .{self.relay_ui_token_ttl_secs});
+        try sw.writeAll(",\"set_cookie\":");
+        try root.appendJsonStringW(sw, cookie);
+        try sw.writeAll(",\"e2e_required\":");
+        try sw.writeAll(if (self.relay_e2e_required) "true" else "false");
+        try sw.writeByte('}');
+        var sensitive = sensitive_writer.toArrayList();
+        defer {
+            @memset(sensitive.items, 0);
+            sensitive.deinit(self.allocator);
+        }
+
+        const encrypted = try self.encryptE2ePayload(e2e_session.key, sensitive.items);
+        defer self.allocator.free(encrypted.nonce_b64);
+        defer self.allocator.free(encrypted.ciphertext_b64);
+
+        var response_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer response_writer.deinit();
+        const w = &response_writer.writer;
+        try w.writeAll("{\"v\":1,\"type\":\"pairing_result\",\"session_id\":");
+        try root.appendJsonStringW(w, session_id);
+        try w.writeAll(",\"agent_id\":");
+        try root.appendJsonStringW(w, self.account_id);
+        if (request_id) |rid| {
+            try w.writeAll(",\"request_id\":");
+            try root.appendJsonStringW(w, rid);
+        }
+        try w.writeAll(",\"payload\":{\"ok\":true,\"e2e\":{\"alg\":");
+        try root.appendJsonStringW(w, E2E_ALG);
+        try w.writeAll(",\"agent_pub\":");
+        try root.appendJsonStringW(w, agent_public_b64);
+        try w.writeAll(",\"nonce\":");
+        try root.appendJsonStringW(w, encrypted.nonce_b64);
+        try w.writeAll(",\"ciphertext\":");
+        try root.appendJsonStringW(w, encrypted.ciphertext_b64);
+        try w.writeAll("}}}");
+        var response = response_writer.toArrayList();
+        defer response.deinit(self.allocator);
+        return try response.toOwnedSlice(self.allocator);
+    }
+
+    fn handleRelayPairingRequest(
+        self: *WebChannel,
+        session_id: []const u8,
+        request_id: ?[]const u8,
+        payload_obj: ?std.json.ObjectMap,
+        source_conn: ?*websocket.Conn,
+    ) void {
         const pairing_code = payloadStringField(payload_obj, "pairing_code");
+        const client_pub = payloadStringField(payload_obj, "client_pub") orelse
+            payloadStringField(payload_obj, "client_public_key");
+
+        // Validate and derive the client key before consuming the one-time
+        // pairing code. A missing or malformed key must not burn a valid code.
+        var agent_public_b64: ?[]u8 = null;
+        defer if (agent_public_b64) |value| self.allocator.free(value);
+        var pairing_e2e_session: ?E2eSession = null;
+        if (client_pub) |public_key| {
+            const derived = self.deriveE2eSession(public_key) catch {
+                self.sendRelayError(session_id, request_id, "pairing_invalid_client_pub", "client_pub must be a base64url X25519 public key");
+                return;
+            };
+            pairing_e2e_session = derived.session;
+            agent_public_b64 = derived.agent_public_b64;
+        } else if (self.transport == .relay) {
+            // Relay pairing results contain a bearer token but the v1 relay
+            // route has no authenticated recipient.
+            self.sendRelayError(session_id, request_id, "pairing_client_pub_required", "client_pub is required for secure relay pairing");
+            return;
+        }
+
         const PairingAttempt = union(enum) {
             paired: []const u8,
             failed: struct {
@@ -968,41 +1156,21 @@ pub const WebChannel = struct {
         };
         defer self.allocator.free(client_sub);
 
-        var agent_public_b64: ?[]u8 = null;
-        defer if (agent_public_b64) |value| self.allocator.free(value);
-
-        if (payloadStringField(payload_obj, "client_pub")) |client_pub| {
-            const derived = self.deriveE2eSession(client_pub) catch {
-                self.sendRelayError(session_id, request_id, "pairing_invalid_client_pub", "client_pub must be base64url X25519 public key");
-                return;
-            };
-            self.upsertE2eSession(client_sub, derived.session) catch {
-                self.allocator.free(derived.agent_public_b64);
+        if (pairing_e2e_session) |session| {
+            self.upsertE2eSession(client_sub, session) catch {
                 self.sendRelayError(session_id, request_id, "pairing_internal_error", "failed to persist e2e session");
                 return;
             };
-            agent_public_b64 = derived.agent_public_b64;
-        } else if (payloadStringField(payload_obj, "client_public_key")) |client_pub| {
-            const derived = self.deriveE2eSession(client_pub) catch {
-                self.sendRelayError(session_id, request_id, "pairing_invalid_client_pub", "client_public_key must be base64url X25519 public key");
-                return;
-            };
-            self.upsertE2eSession(client_sub, derived.session) catch {
-                self.allocator.free(derived.agent_public_b64);
-                self.sendRelayError(session_id, request_id, "pairing_internal_error", "failed to persist e2e session");
-                return;
-            };
-            agent_public_b64 = derived.agent_public_b64;
-        } else if (self.relay_e2e_required) {
-            self.sendRelayError(session_id, request_id, "pairing_e2e_required", "client_pub is required because relay_e2e_required=true");
-            return;
         }
 
         const access_token = self.issueUiAccessToken(client_sub) catch {
             self.sendRelayError(session_id, request_id, "pairing_internal_error", "failed to issue UI access token");
             return;
         };
-        defer self.allocator.free(access_token);
+        defer {
+            @memset(access_token, 0);
+            self.allocator.free(access_token);
+        }
 
         const cookie = std.fmt.allocPrint(
             self.allocator,
@@ -1012,7 +1180,36 @@ pub const WebChannel = struct {
             self.sendRelayError(session_id, request_id, "pairing_internal_error", "failed to build UI cookie");
             return;
         };
-        defer self.allocator.free(cookie);
+        defer {
+            @memset(cookie, 0);
+            self.allocator.free(cookie);
+        }
+
+        if (self.transport == .relay) {
+            const pairing_session = pairing_e2e_session orelse {
+                self.sendRelayError(session_id, request_id, "pairing_internal_error", "secure relay pairing session is unavailable");
+                return;
+            };
+            const agent_pub = agent_public_b64 orelse {
+                self.sendRelayError(session_id, request_id, "pairing_internal_error", "secure relay pairing key is unavailable");
+                return;
+            };
+            const encrypted_response = self.buildEncryptedRelayPairingResult(
+                session_id,
+                request_id,
+                client_sub,
+                access_token,
+                cookie,
+                agent_pub,
+                pairing_session,
+            ) catch {
+                self.sendRelayError(session_id, request_id, "pairing_internal_error", "failed to encrypt UI access token");
+                return;
+            };
+            defer self.allocator.free(encrypted_response);
+            self.sendOutboundEvent(session_id, encrypted_response);
+            return;
+        }
 
         var response: std.ArrayListUnmanaged(u8) = .empty;
         defer response.deinit(self.allocator);
@@ -1035,7 +1232,7 @@ pub const WebChannel = struct {
         w.writeAll(",\"set_cookie\":") catch return;
         root.appendJsonStringW(w, cookie) catch return;
         w.writeAll(",\"e2e_required\":") catch return;
-        w.writeAll(if (self.relay_e2e_required) "true" else "false") catch return;
+        w.writeAll(if (self.transport == .relay and self.relay_e2e_required) "true" else "false") catch return;
         if (agent_public_b64) |agent_pub| {
             w.writeAll(",\"e2e\":{\"alg\":") catch return;
             root.appendJsonStringW(w, E2E_ALG) catch return;
@@ -1045,7 +1242,9 @@ pub const WebChannel = struct {
         }
         w.writeAll("}}") catch return;
         response = response_writer.toArrayList();
-        self.sendOutboundEvent(session_id, response.items);
+        sendLocalPairingResult(source_conn, response.items) catch |err| {
+            log.warn("failed to send local WebChannel pairing result: {}", .{err});
+        };
     }
 
     // ── vtable implementations ──
@@ -1367,6 +1566,59 @@ pub const WebChannel = struct {
         self.sendOutboundEvent(target, buf.items);
     }
 
+    fn buildApprovalRequestEvent(
+        self: *WebChannel,
+        target: []const u8,
+        request: root.Channel.ApprovalRequest,
+    ) ![]u8 {
+        if (request.request_id.len == 0 or request.request_id.len > MAX_REQUEST_ID_BYTES) {
+            return error.InvalidRequestId;
+        }
+        if (request.action.len == 0 or request.action.len > MAX_APPROVAL_ACTION_BYTES) {
+            return error.InvalidApprovalAction;
+        }
+        if (request.reason.len > MAX_APPROVAL_REASON_BYTES) return error.ApprovalReasonTooLong;
+
+        // The current UI E2E codec only supports message `content`. Local
+        // transport may use the authenticated plaintext control envelope so
+        // the standard UI remains usable; relay transport crosses an
+        // intermediary and therefore stays fail-closed while E2E is active or
+        // required.
+        const plaintext_with_message_e2e_allowed = self.transport == .local and
+            !pairing_mod.isPublicBind(self.listen_address);
+        if (!plaintext_with_message_e2e_allowed and
+            (self.e2eSessionByChat(target) != null or
+                (self.transport == .relay and self.relay_e2e_required)))
+        {
+            return error.ApprovalE2eUnsupported;
+        }
+
+        var buf_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer buf_writer.deinit();
+        const w = &buf_writer.writer;
+
+        try w.writeAll("{\"v\":1,\"type\":\"approval_request\",\"session_id\":");
+        try root.appendJsonStringW(w, target);
+        try w.writeAll(",\"agent_id\":");
+        try root.appendJsonStringW(w, self.account_id);
+        try w.writeAll(",\"request_id\":");
+        try root.appendJsonStringW(w, request.request_id);
+        try w.writeAll(",\"payload\":");
+
+        try w.writeAll("{\"action\":");
+        try root.appendJsonStringW(w, request.action);
+        if (request.reason.len > 0) {
+            try w.writeAll(",\"reason\":");
+            try root.appendJsonStringW(w, request.reason);
+        }
+        try w.writeByte('}');
+
+        try w.writeByte('}');
+        var buf = buf_writer.toArrayList();
+        defer buf.deinit(self.allocator);
+        return try buf.toOwnedSlice(self.allocator);
+    }
+
     fn wsSend(ctx: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *WebChannel = @ptrCast(@alignCast(ctx));
         return self.sendAssistantEvent(target, message, .final);
@@ -1381,6 +1633,17 @@ pub const WebChannel = struct {
     ) anyerror!void {
         const self: *WebChannel = @ptrCast(@alignCast(ctx));
         return self.sendAssistantEvent(target, message, stage);
+    }
+
+    fn wsSendApprovalRequest(
+        ctx: *anyopaque,
+        target: []const u8,
+        request: root.Channel.ApprovalRequest,
+    ) anyerror!void {
+        const self: *WebChannel = @ptrCast(@alignCast(ctx));
+        const event = try self.buildApprovalRequestEvent(target, request);
+        defer self.allocator.free(event);
+        try self.sendApprovalOutboundEvent(target, event);
     }
 
     fn wsName(_: *anyopaque) []const u8 {
@@ -1400,6 +1663,15 @@ pub const WebChannel = struct {
     }
 
     fn handleInboundEvent(self: *WebChannel, data: []const u8, forced_session_id: ?[]const u8) void {
+        self.handleInboundEventFromConnection(data, forced_session_id, null);
+    }
+
+    fn handleInboundEventFromConnection(
+        self: *WebChannel,
+        data: []const u8,
+        forced_session_id: ?[]const u8,
+        source_conn: ?*websocket.Conn,
+    ) void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch {
             log.warn("WS: invalid JSON from client", .{});
             return;
@@ -1433,6 +1705,10 @@ pub const WebChannel = struct {
             if (eventStringField(obj, "session_id")) |sid| break :blk sid;
             break :blk "default";
         };
+        if (session_id.len == 0 or session_id.len > MAX_SESSION_ID_BYTES) {
+            self.sendRelayError("default", request_id, "invalid_session_id", "session_id must be 1..64 bytes");
+            return;
+        }
 
         if (forced_session_id) |bound_sid| {
             if (eventStringField(obj, "session_id")) |sid| {
@@ -1447,46 +1723,13 @@ pub const WebChannel = struct {
                 self.sendRelayError(session_id, request_id, "pairing_disabled", "pairing_request is disabled when message_auth_mode=token");
                 return;
             }
-            self.handleRelayPairingRequest(session_id, request_id, payload_obj);
+            self.handleRelayPairingRequest(session_id, request_id, payload_obj, source_conn);
             return;
         }
 
-        if (std.mem.eql(u8, event_type, "approval_response")) {
-            // Structured approval response from the UI. Convert to a well-known
-            // text format that the agent's tryResolveApproval will recognize.
-            const approved = blk: {
-                if (payload_obj) |p| {
-                    if (p.get("approved")) |val| {
-                        if (val == .bool) break :blk val.bool;
-                        if (val == .string) break :blk std.mem.eql(u8, val.string, "true") or std.mem.eql(u8, val.string, "yes");
-                    }
-                }
-                break :blk false;
-            };
-            const tool_call_id = payloadStringField(payload_obj, "tool_call_id") orelse "";
-            const reason = payloadStringField(payload_obj, "reason") orelse "";
-            const decision = if (approved) "yes" else "no";
-
-            var approval_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer approval_buf.deinit(self.allocator);
-            var approval_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &approval_buf);
-            const aw = &approval_writer.writer;
-            aw.print("__approval_response__:{s}:{s}", .{ tool_call_id, decision }) catch {
-                self.sendRelayError(session_id, request_id, "internal_error", "failed to build approval response");
-                return;
-            };
-            if (reason.len > 0) {
-                aw.print(":{s}", .{reason}) catch {};
-            }
-            approval_buf = approval_writer.toArrayList();
-
-            const plain_content = approval_buf.items;
-            const plain_sender = payloadStringField(payload_obj, "sender_id") orelse eventStringField(obj, "sender_id") orelse "web-user";
-            self.publishInboundMessage(plain_sender, session_id, plain_content, request_id);
-            return;
-        }
-
-        if (!std.mem.eql(u8, event_type, "user_message")) return;
+        const is_user_message = std.mem.eql(u8, event_type, "user_message");
+        const is_approval_response = std.mem.eql(u8, event_type, "approval_response");
+        if (!is_user_message and !is_approval_response) return;
 
         const access_token = payloadStringField(payload_obj, "access_token") orelse eventStringField(obj, "access_token");
         const auth_token = payloadStringField(payload_obj, "auth_token") orelse eventStringField(obj, "auth_token");
@@ -1505,10 +1748,21 @@ pub const WebChannel = struct {
                     return;
                 };
 
-                self.upsertSessionBinding(session_id, verified_opt.?.sub) catch {
-                    self.sendRelayError(session_id, request_id, "internal_error", "failed to bind session to UI client");
-                    return;
-                };
+                if (is_approval_response) {
+                    if (!self.sessionBindingMatches(session_id, verified_opt.?.sub)) {
+                        self.sendRelayError(session_id, request_id, "session_owner_mismatch", "approval_response principal does not own this session");
+                        return;
+                    }
+                } else {
+                    const bound = self.bindSessionToClient(session_id, verified_opt.?.sub, verified_opt.?.exp) catch {
+                        self.sendRelayError(session_id, request_id, "internal_error", "failed to bind session to UI client");
+                        return;
+                    };
+                    if (!bound) {
+                        self.sendRelayError(session_id, request_id, "session_owner_mismatch", "session is bound to another UI client");
+                        return;
+                    }
+                }
             },
             .token => {
                 const inbound_token = auth_token orelse access_token orelse {
@@ -1526,6 +1780,37 @@ pub const WebChannel = struct {
             },
         }
 
+        if (self.transport == .local) {
+            if (source_conn) |conn| {
+                const principal = if (verified_opt) |verified| verified.sub else null;
+                const expires_at = if (verified_opt) |verified| verified.exp else 0;
+                if (!self.connections.markAuthenticated(conn, principal, expires_at)) {
+                    self.sendRelayError(session_id, request_id, "connection_auth_failed", "failed to bind authenticated WebSocket connection");
+                    return;
+                }
+            }
+        }
+
+        if (is_approval_response) {
+            const version = obj.get("v") orelse {
+                self.sendRelayError(session_id, request_id, "invalid_payload", "approval_response protocol version is required");
+                return;
+            };
+            if (version != .integer or version.integer != 1) {
+                self.sendRelayError(session_id, request_id, "invalid_payload", "approval_response protocol version is unsupported");
+                return;
+            }
+            const approval_request_id = request_id orelse {
+                self.sendRelayError(session_id, null, "invalid_payload", "approval_response request_id is required");
+                return;
+            };
+            if (approval_request_id.len > MAX_REQUEST_ID_BYTES) {
+                self.sendRelayError(session_id, null, "invalid_payload", "approval_response request_id is too long");
+                return;
+            }
+        }
+        const authenticated_sub: ?[]const u8 = if (verified_opt) |verified_jwt| verified_jwt.sub else null;
+
         const e2e_obj = blk: {
             if (payload_obj) |p| {
                 if (p.get("e2e")) |value| {
@@ -1534,6 +1819,23 @@ pub const WebChannel = struct {
             }
             break :blk null;
         };
+        const approval_e2e_active = if (is_approval_response) blk: {
+            const verified = verified_opt orelse break :blk false;
+            break :blk self.e2eSessionByClient(verified.sub) != null;
+        } else false;
+
+        // WebChannel v1 does not define authenticated encryption for the
+        // approval envelope fields (type/session/request_id). Accepting an
+        // encrypted decision body would allow relay replay/substitution. The
+        // outbound side likewise fails closed while any E2E session is active.
+        const plaintext_with_message_e2e_allowed = self.transport == .local and
+            !pairing_mod.isPublicBind(self.listen_address);
+        if (is_approval_response and
+            (e2e_obj != null or (approval_e2e_active and !plaintext_with_message_e2e_allowed)))
+        {
+            self.sendRelayError(session_id, request_id, "approval_e2e_unsupported", "approval_response is unavailable while WebChannel E2E is active");
+            return;
+        }
 
         var decrypted_payload_owned: ?[]u8 = null;
         defer if (decrypted_payload_owned) |owned| self.allocator.free(owned);
@@ -1579,27 +1881,79 @@ pub const WebChannel = struct {
                     return;
                 },
             };
-            const decrypted_content = eventStringField(decrypted_obj, "content") orelse {
-                self.sendRelayError(session_id, request_id, "invalid_e2e_payload", "decrypted payload.content is required");
-                return;
-            };
-            const decrypted_sender = eventStringField(decrypted_obj, "sender_id") orelse "web-user";
-            self.publishInboundMessage(decrypted_sender, session_id, decrypted_content, request_id);
+            self.handleAuthenticatedPayload(event_type, obj, decrypted_obj, session_id, request_id, authenticated_sub);
             return;
         } else {
-            if (self.relay_e2e_required) {
+            if (self.transport == .relay and self.relay_e2e_required) {
                 self.sendRelayError(session_id, request_id, "e2e_required", "web channel requires encrypted payloads");
                 return;
             }
-            const plain_content = payloadStringField(payload_obj, "content") orelse
-                eventStringField(obj, "content") orelse {
+            const plain_payload = payload_obj orelse {
+                if (is_approval_response) {
+                    self.sendRelayError(session_id, request_id, "invalid_payload", "approval_response payload object is required");
+                    return;
+                }
+                self.handleAuthenticatedPayload(event_type, obj, obj, session_id, request_id, authenticated_sub);
+                return;
+            };
+            self.handleAuthenticatedPayload(event_type, obj, plain_payload, session_id, request_id, authenticated_sub);
+            return;
+        }
+    }
+
+    fn handleAuthenticatedPayload(
+        self: *WebChannel,
+        event_type: []const u8,
+        envelope_obj: std.json.ObjectMap,
+        payload_obj: std.json.ObjectMap,
+        session_id: []const u8,
+        request_id: ?[]const u8,
+        authenticated_sub: ?[]const u8,
+    ) void {
+        if (std.mem.eql(u8, event_type, "user_message")) {
+            const content = eventStringField(payload_obj, "content") orelse eventStringField(envelope_obj, "content") orelse {
                 self.sendRelayError(session_id, request_id, "invalid_payload", "content is required");
                 return;
             };
-            const plain_sender = payloadStringField(payload_obj, "sender_id") orelse eventStringField(obj, "sender_id") orelse "web-user";
-            self.publishInboundMessage(plain_sender, session_id, plain_content, request_id);
+            // Pairing mode is keyed by the verified JWT subject. Token mode has
+            // one shared authenticated principal, regardless of sender_id.
+            const sender = authenticated_sub orelse "web-token";
+            self.publishInboundMessage(sender, session_id, content, request_id);
             return;
         }
+
+        const approval_request_id = request_id orelse {
+            self.sendRelayError(session_id, null, "invalid_payload", "approval_response request_id is required");
+            return;
+        };
+        const approved_value = payload_obj.get("approved") orelse {
+            self.sendRelayError(session_id, request_id, "invalid_payload", "approval_response payload.approved is required");
+            return;
+        };
+        if (approved_value != .bool) {
+            self.sendRelayError(session_id, request_id, "invalid_payload", "approval_response payload.approved must be a boolean");
+            return;
+        }
+
+        const reason: ?[]const u8 = blk: {
+            const reason_value = payload_obj.get("reason") orelse break :blk null;
+            if (reason_value != .string) {
+                self.sendRelayError(session_id, request_id, "invalid_payload", "approval_response payload.reason must be a string");
+                return;
+            }
+            if (reason_value.string.len > MAX_APPROVAL_REASON_BYTES) {
+                self.sendRelayError(session_id, request_id, "invalid_payload", "approval_response payload.reason is too long");
+                return;
+            }
+            if (reason_value.string.len == 0) break :blk null;
+            break :blk reason_value.string;
+        };
+
+        // Approval decisions are attributed to the authenticated JWT subject.
+        // Token mode authenticates every request as the same shared principal;
+        // never let an untrusted sender_id split or spoof that identity.
+        const sender = authenticated_sub orelse "web-token";
+        self.publishInboundApprovalResponse(sender, session_id, approval_request_id, approved_value.bool, reason);
     }
 
     fn publishInboundMessage(self: *WebChannel, sender_id: []const u8, session_id: []const u8, content: []const u8, request_id: ?[]const u8) void {
@@ -1610,9 +1964,8 @@ pub const WebChannel = struct {
         }) catch return;
         defer allocator.free(session_key);
 
-        var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer metadata_buf.deinit(allocator);
-        var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &metadata_buf);
+        var metadata_writer: std.Io.Writer.Allocating = .init(allocator);
+        defer metadata_writer.deinit();
         const mw = &metadata_writer.writer;
         mw.writeAll("{\"is_dm\":true,\"account_id\":") catch return;
         root.appendJsonStringW(mw, self.account_id) catch return;
@@ -1621,7 +1974,8 @@ pub const WebChannel = struct {
             root.appendJsonStringW(mw, rid) catch return;
         }
         mw.writeByte('}') catch return;
-        metadata_buf = metadata_writer.toArrayList();
+        var metadata_buf = metadata_writer.toArrayList();
+        defer metadata_buf.deinit(allocator);
 
         const msg = bus_mod.makeInboundFull(
             allocator,
@@ -1647,6 +2001,62 @@ pub const WebChannel = struct {
         }
     }
 
+    fn publishInboundApprovalResponse(
+        self: *WebChannel,
+        sender_id: []const u8,
+        session_id: []const u8,
+        request_id: []const u8,
+        approved: bool,
+        reason: ?[]const u8,
+    ) void {
+        const allocator = self.allocator;
+        const session_key = std.fmt.allocPrint(allocator, "web:{s}:direct:{s}", .{
+            self.account_id,
+            session_id,
+        }) catch return;
+        defer allocator.free(session_key);
+
+        var metadata_writer: std.Io.Writer.Allocating = .init(allocator);
+        defer metadata_writer.deinit();
+        const mw = &metadata_writer.writer;
+        mw.writeAll("{\"is_dm\":true,\"account_id\":") catch return;
+        root.appendJsonStringW(mw, self.account_id) catch return;
+        mw.writeAll(",\"event_type\":\"approval_response\",\"request_id\":") catch return;
+        root.appendJsonStringW(mw, request_id) catch return;
+        mw.writeAll(",\"approval_approved\":") catch return;
+        mw.writeAll(if (approved) "true" else "false") catch return;
+        if (reason) |value| {
+            mw.writeAll(",\"approval_reason\":") catch return;
+            root.appendJsonStringW(mw, value) catch return;
+        }
+        mw.writeByte('}') catch return;
+        var metadata_buf = metadata_writer.toArrayList();
+        defer metadata_buf.deinit(allocator);
+
+        const msg = bus_mod.makeInboundFull(
+            allocator,
+            "web",
+            sender_id,
+            session_id,
+            "",
+            session_key,
+            &.{},
+            metadata_buf.items,
+        ) catch |err| {
+            log.warn("WS: failed to create inbound approval response: {}", .{err});
+            return;
+        };
+
+        if (self.bus) |b| {
+            b.publishInbound(msg) catch |err| {
+                log.warn("WS: failed to publish inbound approval response: {}", .{err});
+                msg.deinit(allocator);
+            };
+        } else {
+            msg.deinit(allocator);
+        }
+    }
+
     // ── Connection tracking ──
 
     pub const ConnectionList = struct {
@@ -1659,6 +2069,24 @@ pub const WebChannel = struct {
             conn: *websocket.Conn,
             session_id: [64]u8 = [_]u8{0} ** 64,
             session_len: u8 = 0,
+            authenticated: bool = false,
+            client_sub: [MAX_CLIENT_SUB_BYTES]u8 = [_]u8{0} ** MAX_CLIENT_SUB_BYTES,
+            client_sub_len: u8 = 0,
+            auth_expires_at: i64 = 0,
+
+            fn matchesApprovalRecipient(
+                self: *const ConnEntry,
+                session_id: []const u8,
+                owner: ?[]const u8,
+            ) bool {
+                if (!self.authenticated) return false;
+                if (self.auth_expires_at != 0 and std_compat.time.timestamp() >= self.auth_expires_at) return false;
+                if (!std.mem.eql(u8, self.session_id[0..self.session_len], session_id)) return false;
+                if (owner) |expected_owner| {
+                    return std.mem.eql(u8, self.client_sub[0..self.client_sub_len], expected_owner);
+                }
+                return true;
+            }
         };
 
         fn add(self: *ConnectionList, conn: *websocket.Conn, session_id: []const u8) bool {
@@ -1690,9 +2118,54 @@ pub const WebChannel = struct {
             }
         }
 
-        fn broadcast(self: *ConnectionList, session_id: []const u8, data: []const u8) void {
+        fn markAuthenticated(
+            self: *ConnectionList,
+            conn: *websocket.Conn,
+            client_sub: ?[]const u8,
+            expires_at: i64,
+        ) bool {
+            if (client_sub) |sub| {
+                if (sub.len == 0 or sub.len > MAX_CLIENT_SUB_BYTES) return false;
+            }
             self.mutex.lock();
             defer self.mutex.unlock();
+            for (&self.entries) |*slot| {
+                if (slot.*) |*entry| {
+                    if (entry.conn != conn) continue;
+                    entry.authenticated = true;
+                    entry.auth_expires_at = expires_at;
+                    @memset(entry.client_sub[0..], 0);
+                    if (client_sub) |sub| {
+                        @memcpy(entry.client_sub[0..sub.len], sub);
+                        entry.client_sub_len = @intCast(sub.len);
+                    } else {
+                        entry.client_sub_len = 0;
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn broadcast(self: *ConnectionList, session_id: []const u8, data: []const u8) void {
+            _ = self.broadcastCount(session_id, data);
+        }
+
+        fn broadcastApprovalChecked(
+            self: *ConnectionList,
+            session_id: []const u8,
+            owner: ?[]const u8,
+            data: []const u8,
+        ) !void {
+            if (self.broadcastApprovalCount(session_id, owner, data) == 0) {
+                return error.ApprovalDeliveryUnavailable;
+            }
+        }
+
+        fn broadcastCount(self: *ConnectionList, session_id: []const u8, data: []const u8) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var delivered: usize = 0;
             for (&self.entries) |*slot| {
                 if (slot.*) |entry| {
                     const sid = entry.session_id[0..entry.session_len];
@@ -1700,10 +2173,36 @@ pub const WebChannel = struct {
                         entry.conn.write(data) catch |err| {
                             log.warn("Failed to send to WS client: {}", .{err});
                             slot.* = null;
+                            continue;
                         };
+                        delivered += 1;
                     }
                 }
             }
+            return delivered;
+        }
+
+        fn broadcastApprovalCount(
+            self: *ConnectionList,
+            session_id: []const u8,
+            owner: ?[]const u8,
+            data: []const u8,
+        ) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var delivered: usize = 0;
+            for (&self.entries) |*slot| {
+                if (slot.*) |entry| {
+                    if (!entry.matchesApprovalRecipient(session_id, owner)) continue;
+                    entry.conn.write(data) catch |err| {
+                        log.warn("Failed to send approval to WS client: {}", .{err});
+                        slot.* = null;
+                        continue;
+                    };
+                    delivered += 1;
+                }
+            }
+            return delivered;
         }
 
         fn closeAll(self: *ConnectionList) void {
@@ -1734,17 +2233,6 @@ pub const WebChannel = struct {
                 return error.Forbidden;
             }
 
-            if (web_channel.allowed_origins.len > 0) {
-                const origin = h.headers.get("origin") orelse {
-                    log.warn("WS connection rejected: missing origin", .{});
-                    return error.Forbidden;
-                };
-                if (!isOriginAllowed(web_channel.allowed_origins, origin)) {
-                    log.warn("WS connection rejected: origin not allowed", .{});
-                    return error.Forbidden;
-                }
-            }
-
             const auth_header = h.headers.get("authorization");
             const token = extractQueryParam(url, "token") orelse extractBearerToken(auth_header orelse "");
             if (token) |candidate| {
@@ -1752,7 +2240,21 @@ pub const WebChannel = struct {
                     log.warn("WS connection rejected: invalid token", .{});
                     return error.Forbidden;
                 }
-            } else {
+            }
+
+            const origin = h.headers.get("origin");
+            if (!isUpgradeOriginAllowed(web_channel.allowed_origins, origin, token != null)) {
+                if (origin == null) {
+                    log.warn("WS connection rejected: missing origin", .{});
+                } else if (web_channel.allowed_origins.len == 0 and token == null) {
+                    log.warn("WS connection rejected: browser pairing requires an explicit allowed_origins entry or upgrade token", .{});
+                } else {
+                    log.warn("WS connection rejected: origin not allowed", .{});
+                }
+                return error.Forbidden;
+            }
+
+            if (token == null) {
                 // Pairing-first local UX: allow unauthenticated upgrade only on loopback.
                 if (pairing_mod.isPublicBind(web_channel.listen_address)) {
                     log.warn("{s}", .{publicBindTokenRequiredLogMessage(web_channel.message_auth_mode)});
@@ -1788,7 +2290,7 @@ pub const WebChannel = struct {
 
         pub fn clientMessage(self: *WsHandler, data: []const u8) !void {
             const msg_session = self.session_id[0..self.session_len];
-            self.web_channel.handleInboundEvent(data, msg_session);
+            self.web_channel.handleInboundEventFromConnection(data, msg_session, self.conn);
         }
 
         pub fn close(self: *WsHandler) void {
@@ -1844,6 +2346,30 @@ fn isOriginAllowed(allowed_origins: []const []const u8, origin: []const u8) bool
         if (std.ascii.eqlIgnoreCase(entry, normalized_origin)) return true;
     }
     return false;
+}
+
+/// Browser WebSocket handshakes always carry Origin. With no configured
+/// allowlist, possession of a valid upgrade token is the only safe way to
+/// accept such a browser connection; native loopback clients without Origin
+/// may still use the pairing-first flow.
+fn isUpgradeOriginAllowed(
+    allowed_origins: []const []const u8,
+    origin: ?[]const u8,
+    has_valid_upgrade_token: bool,
+) bool {
+    if (allowed_origins.len > 0) {
+        const supplied_origin = origin orelse return false;
+        return isOriginAllowed(allowed_origins, supplied_origin);
+    }
+    if (origin != null and !has_valid_upgrade_token) return false;
+    return true;
+}
+
+fn sendLocalPairingResult(source_conn: ?*websocket.Conn, response: []const u8) !void {
+    // pairing_result contains a bearer token. Never fall back to the ordinary
+    // session broadcast when the originating local socket is unavailable.
+    const conn = source_conn orelse return error.PairingResponseUnavailable;
+    try conn.write(response);
 }
 
 fn extractBearerToken(authorization_header: []const u8) ?[]const u8 {
@@ -1913,6 +2439,29 @@ fn parseRelayEndpoint(url: []const u8) !RelayEndpoint {
 // ═══════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════
+
+fn putTestE2eSession(ch: *WebChannel, client_sub: []const u8, key: [32]u8) !void {
+    // Test-only in-memory setup: production upsert persists credentials, which
+    // would make unit tests mutate the caller's real auth.json.
+    const owned_sub = try ch.allocator.dupe(u8, client_sub);
+    errdefer ch.allocator.free(owned_sub);
+    try ch.e2e_sessions.put(ch.allocator, owned_sub, .{ .key = key });
+}
+
+fn buildApprovalRequestEventAllocationHarness(allocator: std.mem.Allocator) !void {
+    var ch = WebChannel.initFromConfig(allocator, .{ .account_id = "web-main" });
+    const event = ch.buildApprovalRequestEvent("sess-approval", .{
+        .request_id = "0123456789abcdef0123456789abcdef",
+        .action = "run guarded command",
+        .reason = "policy requires approval",
+    }) catch |err| switch (err) {
+        // Allocating Writer deliberately erases allocator errors behind its
+        // Writer interface; normalize that signal for the std test harness.
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer allocator.free(event);
+}
 
 test "WebChannel initFromConfig uses defaults" {
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{});
@@ -2052,6 +2601,176 @@ test "WebChannel vtable name returns web" {
     try std.testing.expectEqualStrings("web", iface.name());
 }
 
+test "WebChannel builds protocol approval_request envelope" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "web-main",
+    });
+    const event = try ch.buildApprovalRequestEvent("sess-approval", .{
+        .request_id = "0123456789abcdef0123456789abcdef",
+        .action = "delete \"report\"",
+        .reason = "destructive operation",
+    });
+    defer std.testing.allocator.free(event);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 1), obj.get("v").?.integer);
+    try std.testing.expectEqualStrings("approval_request", obj.get("type").?.string);
+    try std.testing.expectEqualStrings("sess-approval", obj.get("session_id").?.string);
+    try std.testing.expectEqualStrings("web-main", obj.get("agent_id").?.string);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", obj.get("request_id").?.string);
+    const payload = obj.get("payload").?.object;
+    try std.testing.expectEqualStrings("delete \"report\"", payload.get("action").?.string);
+    try std.testing.expectEqualStrings("destructive operation", payload.get("reason").?.string);
+
+    const oversized_action = "x" ** (WebChannel.MAX_APPROVAL_ACTION_BYTES + 1);
+    try std.testing.expectError(error.InvalidApprovalAction, ch.buildApprovalRequestEvent("sess-approval", .{
+        .request_id = "0123456789abcdef0123456789abcdef",
+        .action = oversized_action,
+        .reason = "requires approval",
+    }));
+}
+
+test "WebChannel approval_request builder releases allocations on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        buildApprovalRequestEventAllocationHarness,
+        .{},
+    );
+}
+
+// Regression: pending approval state must not be retained when no WebChannel
+// client can receive the corresponding approval_request.
+test "WebChannel approval_request fails when target is unavailable" {
+    var local = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+    });
+    try std.testing.expectError(error.ApprovalDeliveryUnavailable, local.channel().sendApprovalRequest("missing-session", .{
+        .request_id = "0123456789abcdef0123456789abcdef",
+        .action = "run command",
+        .reason = "requires approval",
+    }));
+
+    var relay = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+    });
+    defer relay.deinitRelaySecurityState();
+    // Regression: an active session binding is not a delivery receipt. The
+    // v1 relay envelope has no authenticated recipient or UI acknowledgement.
+    try std.testing.expect(try relay.bindSessionToClient(
+        "bound-session",
+        "ui-owner",
+        std_compat.time.timestamp() + 3600,
+    ));
+    try std.testing.expectError(error.ApprovalDeliveryUnavailable, relay.channel().sendApprovalRequest("missing-session", .{
+        .request_id = "fedcba9876543210fedcba9876543210",
+        .action = "run command",
+        .reason = "requires approval",
+    }));
+    try std.testing.expectError(error.ApprovalDeliveryUnavailable, relay.channel().sendApprovalRequest("bound-session", .{
+        .request_id = "00112233445566778899aabbccddeeff",
+        .action = "run command",
+        .reason = "requires approval",
+    }));
+}
+
+test "WebChannel approval_request fails closed when an E2E session is active" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+    });
+    defer ch.deinitRelaySecurityState();
+    try std.testing.expect(try ch.bindSessionToClient(
+        "sess-e2e-approval",
+        "ui-owner",
+        std_compat.time.timestamp() + 3600,
+    ));
+    const key = [_]u8{0x5a} ** 32;
+    try putTestE2eSession(&ch, "ui-owner", key);
+
+    try std.testing.expectError(error.ApprovalE2eUnsupported, ch.buildApprovalRequestEvent("sess-e2e-approval", .{
+        .request_id = "fedcba9876543210fedcba9876543210",
+        .action = "restart gateway",
+        .reason = "interrupts active sessions",
+    }));
+    var required = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .relay_e2e_required = true,
+    });
+    try std.testing.expectError(error.ApprovalE2eUnsupported, required.buildApprovalRequestEvent("unbound", .{
+        .request_id = "00112233445566778899aabbccddeeff",
+        .action = "run command",
+        .reason = "",
+    }));
+}
+
+test "WebChannel loopback approval controls remain usable with message E2E" {
+    // Regression: the standard local UI negotiates message E2E, but its typed
+    // approval controls are authenticated plaintext envelopes in protocol v1.
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .listen = "127.0.0.1",
+        .account_id = "local-main",
+        // Relay policy must not alter local transport behavior.
+        .relay_e2e_required = true,
+    });
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+    ch.jwt_signing_key = [_]u8{0x6b} ** 32;
+    ch.jwt_ready = true;
+    try std.testing.expect(try ch.bindSessionToClient(
+        "sess-local-e2e-approval",
+        "ui-owner",
+        std_compat.time.timestamp() + 3600,
+    ));
+    try putTestE2eSession(&ch, "ui-owner", [_]u8{0x44} ** 32);
+
+    const outbound = try ch.buildApprovalRequestEvent("sess-local-e2e-approval", .{
+        .request_id = "fedcba9876543210fedcba9876543210",
+        .action = "restart gateway",
+        .reason = "interrupts active sessions",
+    });
+    defer std.testing.allocator.free(outbound);
+    try std.testing.expect(std.mem.indexOf(u8, outbound, "\"type\":\"approval_request\"") != null);
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    const access_token = try ch.issueUiAccessToken("ui-owner");
+    defer std.testing.allocator.free(access_token);
+    const inbound = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-local-e2e-approval\",\"request_id\":\"fedcba9876543210fedcba9876543210\",\"payload\":{{\"access_token\":\"{s}\",\"approved\":true}}}}",
+        .{access_token},
+    );
+    defer std.testing.allocator.free(inbound);
+    ch.handleInboundEvent(inbound, null);
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+    const message = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer message.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, message.metadata_json.?, "\"event_type\":\"approval_response\"") != null);
+}
+
+test "WebChannel public local bind rejects approval controls with message E2E" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .listen = "0.0.0.0",
+    });
+    defer ch.deinitRelaySecurityState();
+    try std.testing.expect(try ch.bindSessionToClient(
+        "sess-public-e2e-approval",
+        "ui-owner",
+        std_compat.time.timestamp() + 3600,
+    ));
+    try putTestE2eSession(&ch, "ui-owner", [_]u8{0x55} ** 32);
+
+    try std.testing.expectError(error.ApprovalE2eUnsupported, ch.buildApprovalRequestEvent("sess-public-e2e-approval", .{
+        .request_id = "00112233445566778899aabbccddeeff",
+        .action = "run command",
+        .reason = "requires approval",
+    }));
+}
+
 test "WebChannel generateToken produces 64 hex chars" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
     try std.testing.expect(!ch.token_initialized);
@@ -2137,6 +2856,28 @@ test "isOriginAllowed handles exact wildcard and slash normalization" {
     try std.testing.expect(isOriginAllowed(&wildcard, "https://anything.example"));
 }
 
+test "WebChannel upgrade origin policy blocks cross-site unauthenticated pairing" {
+    // Regression: a browser page must not use code-less loopback pairing when
+    // the operator has not explicitly trusted its Origin.
+    try std.testing.expect(!isUpgradeOriginAllowed(&.{}, "https://attacker.example", false));
+    try std.testing.expect(isUpgradeOriginAllowed(&.{}, null, false));
+    try std.testing.expect(isUpgradeOriginAllowed(&.{}, "https://ui.example", true));
+
+    const allowed = [_][]const u8{"https://ui.example"};
+    try std.testing.expect(isUpgradeOriginAllowed(&allowed, "https://ui.example", false));
+    try std.testing.expect(!isUpgradeOriginAllowed(&allowed, "https://attacker.example", true));
+    try std.testing.expect(!isUpgradeOriginAllowed(&allowed, null, true));
+}
+
+test "WebChannel local pairing result never broadcasts without source connection" {
+    // Regression: pairing_result carries the UI bearer token and must not fall
+    // back to a session-wide broadcast when the requesting socket is missing.
+    try std.testing.expectError(
+        error.PairingResponseUnavailable,
+        sendLocalPairingResult(null, "{\"type\":\"pairing_result\"}"),
+    );
+}
+
 test "extractBearerToken parses bearer auth header" {
     try std.testing.expectEqualStrings("tok123", extractBearerToken("Bearer tok123").?);
     try std.testing.expectEqualStrings("tok123", extractBearerToken("bearer tok123").?);
@@ -2174,6 +2915,49 @@ test "ConnectionList add and remove" {
     try std.testing.expectEqual(@as(usize, 64), list.entries.len);
 }
 
+test "ConnectionList approval recipients require matching authenticated principal" {
+    var list = WebChannel.ConnectionList{};
+    var conn: websocket.Conn = undefined;
+    try std.testing.expect(list.add(&conn, "session-a"));
+
+    if (list.entries[0]) |*entry| {
+        try std.testing.expect(!entry.matchesApprovalRecipient("session-a", "owner-a"));
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expect(list.markAuthenticated(&conn, "owner-a", std_compat.time.timestamp() + 3600));
+    if (list.entries[0]) |*entry| {
+        try std.testing.expect(entry.matchesApprovalRecipient("session-a", "owner-a"));
+        try std.testing.expect(entry.matchesApprovalRecipient("session-a", null));
+        try std.testing.expect(!entry.matchesApprovalRecipient("session-a", "owner-b"));
+        try std.testing.expect(!entry.matchesApprovalRecipient("session-b", "owner-a"));
+        entry.auth_expires_at = std_compat.time.timestamp();
+        try std.testing.expect(!entry.matchesApprovalRecipient("session-a", "owner-a"));
+    } else return error.TestUnexpectedResult;
+}
+
+test "WebChannel pairing session binding can be reclaimed only after JWT expiry" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    defer ch.deinitRelaySecurityState();
+
+    const now = std_compat.time.timestamp();
+    try std.testing.expect(try ch.bindSessionToClient("session-a", "owner-a", now + 3600));
+    try std.testing.expect(!try ch.bindSessionToClient("session-a", "owner-b", now + 3600));
+    try std.testing.expect(ch.sessionBindingMatches("session-a", "owner-a"));
+
+    ch.session_client_bindings.getPtr("session-a").?.expires_at = now;
+    try std.testing.expect(!ch.sessionBindingMatches("session-a", "owner-a"));
+    try std.testing.expect(try ch.bindSessionToClient("session-a", "owner-b", now + 3600));
+    try std.testing.expect(!ch.sessionBindingMatches("session-a", "owner-a"));
+    try std.testing.expect(ch.sessionBindingMatches("session-a", "owner-b"));
+    try std.testing.expectEqual(@as(u32, 1), ch.session_client_bindings.count());
+
+    const oversized_session_id = "s" ** (WebChannel.MAX_SESSION_ID_BYTES + 1);
+    try std.testing.expectError(
+        error.InvalidSessionId,
+        ch.bindSessionToClient(oversized_session_id, "owner-c", now + 3600),
+    );
+}
+
 test "WsHandler clientMessage uses connection session id" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .account_id = "web-main",
@@ -2186,22 +2970,25 @@ test "WsHandler clientMessage uses connection session id" {
     const access_token = try ch.issueUiAccessToken("ui-conn");
     defer std.testing.allocator.free(access_token);
 
+    var fake_conn: websocket.Conn = undefined;
     var handler = WebChannel.WsHandler{
         .web_channel = &ch,
-        .conn = undefined,
+        .conn = &fake_conn,
     };
     const connection_sid = "conn-session";
     @memcpy(handler.session_id[0..connection_sid.len], connection_sid);
     handler.session_len = @intCast(connection_sid.len);
+    try std.testing.expect(ch.connections.add(&fake_conn, connection_sid));
+    defer ch.connections.remove(&fake_conn);
 
-    var event_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer event_buf.deinit(std.testing.allocator);
-    var event_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &event_buf);
+    var event_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer event_writer.deinit();
     const w = &event_writer.writer;
     try w.writeAll("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"other-session\",\"payload\":{\"access_token\":");
     try root.appendJsonStringW(w, access_token);
     try w.writeAll(",\"content\":\"hello\",\"sender_id\":\"user-1\"}}");
-    event_buf = event_writer.toArrayList();
+    var event_buf = event_writer.toArrayList();
+    defer event_buf.deinit(std.testing.allocator);
 
     try handler.clientMessage(event_buf.items);
 
@@ -2252,6 +3039,8 @@ test "WebChannel local token mode accepts user_message with auth_token" {
         .transport = "local",
         .account_id = "web-main",
         .message_auth_mode = "token",
+        // Regression: this setting is scoped to relay transport.
+        .relay_e2e_required = true,
     });
     try ch.setActiveToken("token-mode-1234567890");
 
@@ -2263,7 +3052,9 @@ test "WebChannel local token mode accepts user_message with auth_token" {
     const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
     defer msg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sess-token", msg.chat_id);
-    try std.testing.expectEqualStrings("orchestrator", msg.sender_id);
+    // Regression: token-mode sender_id is attacker-controlled and must not
+    // become a distinct approval principal.
+    try std.testing.expectEqualStrings("web-token", msg.sender_id);
     try std.testing.expectEqualStrings("hello token", msg.content);
 }
 
@@ -2311,6 +3102,114 @@ test "WebChannel local token mode rejects user_message with invalid token" {
     ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-token\",\"payload\":{\"auth_token\":\"wrong-token-xxxxxxxx\",\"content\":\"hello\"}}", null);
 
     try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+}
+
+test "WebChannel approval_response requires token auth and publishes control metadata" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .account_id = "web-main",
+        .message_auth_mode = "token",
+    });
+    try ch.setActiveToken("approval-token-1234567890");
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"req-missing-token\",\"payload\":{\"approved\":true}}", null);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"req-invalid-token\",\"payload\":{\"auth_token\":\"wrong-token-xxxxxxxx\",\"approved\":true}}", null);
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"0123456789abcdef0123456789abcdef\",\"payload\":{\"auth_token\":\"approval-token-1234567890\",\"approved\":false,\"reason\":\"needs review\"}}", null);
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+
+    const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("sess-token", msg.chat_id);
+    // Regression: a valid response may omit sender_id and still matches the
+    // canonical token-mode principal used by the original user message.
+    try std.testing.expectEqualStrings("web-token", msg.sender_id);
+    try std.testing.expectEqualStrings("", msg.content);
+    const metadata = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, msg.metadata_json.?, .{});
+    defer metadata.deinit();
+    const metadata_obj = metadata.value.object;
+    try std.testing.expectEqualStrings("approval_response", metadata_obj.get("event_type").?.string);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", metadata_obj.get("request_id").?.string);
+    try std.testing.expect(!metadata_obj.get("approval_approved").?.bool);
+    try std.testing.expectEqualStrings("needs review", metadata_obj.get("approval_reason").?.string);
+}
+
+test "WebChannel approval_response rejects malformed protocol fields" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    try ch.setActiveToken("approval-token-1234567890");
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+
+    const malformed = [_][]const u8{
+        "{\"v\":2,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"wrong-version\",\"payload\":{\"auth_token\":\"approval-token-1234567890\",\"approved\":true}}",
+        "{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"payload\":{\"auth_token\":\"approval-token-1234567890\",\"approved\":true}}",
+        "{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"req-1\",\"payload\":{\"auth_token\":\"approval-token-1234567890\"}}",
+        "{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"req-2\",\"payload\":{\"auth_token\":\"approval-token-1234567890\",\"approved\":\"yes\"}}",
+        "{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"req-3\",\"payload\":{\"auth_token\":\"approval-token-1234567890\",\"approved\":true,\"reason\":7}}",
+    };
+    for (malformed) |event| ch.handleInboundEvent(event, null);
+
+    const too_long_reason = "x" ** (WebChannel.MAX_APPROVAL_REASON_BYTES + 1);
+    const oversized = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-token\",\"request_id\":\"req-4\",\"payload\":{{\"auth_token\":\"approval-token-1234567890\",\"approved\":true,\"reason\":\"{s}\"}}}}",
+        .{too_long_reason},
+    );
+    defer std.testing.allocator.free(oversized);
+    ch.handleInboundEvent(oversized, null);
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+}
+
+test "WebChannel approval_response pairing principal must own session" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+    });
+    defer ch.deinitRelaySecurityState();
+    ch.jwt_signing_key = [_]u8{0x2a} ** 32;
+    ch.jwt_ready = true;
+    try std.testing.expect(try ch.bindSessionToClient(
+        "sess-owner",
+        "ui-owner",
+        std_compat.time.timestamp() + 3600,
+    ));
+
+    const owner_token = try ch.issueUiAccessToken("ui-owner");
+    defer std.testing.allocator.free(owner_token);
+    const attacker_token = try ch.issueUiAccessToken("ui-attacker");
+    defer std.testing.allocator.free(attacker_token);
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    const owner_event = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-owner\",\"request_id\":\"owner-request\",\"payload\":{{\"access_token\":\"{s}\",\"approved\":true}}}}",
+        .{owner_token},
+    );
+    defer std.testing.allocator.free(owner_event);
+    ch.handleInboundEvent(owner_event, null);
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+
+    const attacker_event = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-owner\",\"request_id\":\"attacker-request\",\"payload\":{{\"access_token\":\"{s}\",\"approved\":true}}}}",
+        .{attacker_token},
+    );
+    defer std.testing.allocator.free(attacker_event);
+    ch.handleInboundEvent(attacker_event, null);
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+
+    const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ui-owner", msg.sender_id);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"request_id\":\"owner-request\"") != null);
 }
 
 test "WebChannel local token mode requires stable token source before start" {
@@ -2393,6 +3292,81 @@ test "WebChannel relay e2e payload helpers roundtrip" {
     try std.testing.expectEqualStrings(plain, decrypted);
 }
 
+test "WebChannel relay e2e helpers reject oversized encoded fields before decode" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{ .transport = "relay" });
+    try std.testing.expectError(
+        error.InvalidClientPublicKey,
+        ch.deriveE2eSession("A" ** 128),
+    );
+    try std.testing.expectError(
+        error.InvalidNonce,
+        ch.decryptE2ePayload([_]u8{0x31} ** 32, "A" ** 128, "AAAA"),
+    );
+
+    const nonce = [_]u8{0} ** 12;
+    const nonce_b64 = try ch.base64UrlEncodeAlloc(&nonce);
+    defer std.testing.allocator.free(nonce_b64);
+    const max_ciphertext_b64 = std.base64.url_safe_no_pad.Encoder.calcSize(
+        WebChannel.MAX_E2E_PAYLOAD_BYTES + secret_crypto.TAG_LEN,
+    );
+    const oversized_ciphertext = try std.testing.allocator.alloc(u8, max_ciphertext_b64 + 1);
+    defer std.testing.allocator.free(oversized_ciphertext);
+    @memset(oversized_ciphertext, 'A');
+    try std.testing.expectError(
+        error.CiphertextTooLarge,
+        ch.decryptE2ePayload([_]u8{0x31} ** 32, nonce_b64, oversized_ciphertext),
+    );
+}
+
+fn encryptE2ePayloadAllocationHarness(allocator: std.mem.Allocator) !void {
+    var ch = WebChannel.initFromConfig(allocator, .{ .transport = "relay" });
+    const encrypted = try ch.encryptE2ePayload([_]u8{0x31} ** 32, "{\"content\":\"hello\"}");
+    defer allocator.free(encrypted.nonce_b64);
+    defer allocator.free(encrypted.ciphertext_b64);
+}
+
+test "WebChannel relay e2e encryption releases partial output on allocation failure" {
+    // Regression: a ciphertext encoding failure after nonce encoding must not
+    // leak the already allocated nonce string.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        encryptE2ePayloadAllocationHarness,
+        .{},
+    );
+}
+
+test "WebChannel relay pairing result encrypts bearer credentials" {
+    // Regression: the relay route is not owner-addressed, so a pairing bearer
+    // token must never appear in its plaintext pairing_result envelope.
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+    });
+    const key = [_]u8{0x42} ** 32;
+    const response = try ch.buildEncryptedRelayPairingResult(
+        "sess-pair",
+        "pair-request",
+        "ui-client",
+        "secret-ui-bearer",
+        "nullclaw_ui_token=secret-ui-bearer",
+        "agent-public-key",
+        .{ .key = key },
+    );
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "secret-ui-bearer") == null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{});
+    defer parsed.deinit();
+    const payload = parsed.value.object.get("payload") orelse return error.TestUnexpectedResult;
+    const encrypted_value = payload.object.get("e2e") orelse return error.TestUnexpectedResult;
+    const nonce = WebChannel.eventStringField(encrypted_value.object, "nonce") orelse return error.TestUnexpectedResult;
+    const ciphertext = WebChannel.eventStringField(encrypted_value.object, "ciphertext") orelse return error.TestUnexpectedResult;
+    const decrypted = try ch.decryptE2ePayload(key, nonce, ciphertext);
+    defer std.testing.allocator.free(decrypted);
+    try std.testing.expect(std.mem.indexOf(u8, decrypted, "\"access_token\":\"secret-ui-bearer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decrypted, "\"set_cookie\":\"nullclaw_ui_token=secret-ui-bearer\"") != null);
+}
+
 test "WebChannel relay pairing request rotates one-time code and initializes e2e" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .transport = "relay",
@@ -2425,6 +3399,40 @@ test "WebChannel relay pairing request rotates one-time code and initializes e2e
     const next_code = ch.relay_pairing_guard.?.pairingCode() orelse return error.TestUnexpectedResult;
     try std.testing.expect(!std.mem.eql(u8, code_copy, next_code));
     try std.testing.expectEqual(@as(usize, 1), ch.e2e_sessions.count());
+}
+
+test "WebChannel relay pairing rejects invalid client key without consuming code" {
+    // Regression: the mandatory credential-encryption key is validated before
+    // the one-time pairing capability is consumed.
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+    });
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+
+    const code = ch.relay_pairing_guard.?.pairingCode() orelse return error.TestUnexpectedResult;
+    const code_copy = try std.testing.allocator.dupe(u8, code);
+    defer std.testing.allocator.free(code_copy);
+    const missing_key_event = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":1,\"type\":\"pairing_request\",\"session_id\":\"sess-pair\",\"payload\":{{\"pairing_code\":\"{s}\"}}}}",
+        .{code_copy},
+    );
+    defer std.testing.allocator.free(missing_key_event);
+    ch.handleInboundEvent(missing_key_event, null);
+    try std.testing.expect(!ch.relay_pairing_guard.?.isPaired());
+    try std.testing.expectEqualStrings(code_copy, ch.relay_pairing_guard.?.pairingCode().?);
+
+    const invalid_key_event = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":1,\"type\":\"pairing_request\",\"session_id\":\"sess-pair\",\"payload\":{{\"pairing_code\":\"{s}\",\"client_pub\":\"invalid\"}}}}",
+        .{code_copy},
+    );
+    defer std.testing.allocator.free(invalid_key_event);
+    ch.handleInboundEvent(invalid_key_event, null);
+    try std.testing.expect(!ch.relay_pairing_guard.?.isPaired());
+    try std.testing.expectEqualStrings(code_copy, ch.relay_pairing_guard.?.pairingCode().?);
 }
 
 test "WebChannel local pairing code is random and rotates" {
@@ -2478,6 +3486,8 @@ test "WebChannel local pairing request succeeds without pairing_code payload" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .transport = "local",
         .account_id = "local-main",
+        // Regression: relay-only E2E policy must not require client_pub here.
+        .relay_e2e_required = true,
     });
     defer ch.deinitRelaySecurityState();
     try ch.initRelaySecurityState();
@@ -2533,7 +3543,7 @@ test "WebChannel relay encrypted user_message is published to bus" {
     ch.setBus(&bus);
 
     const key = [_]u8{0x44} ** 32;
-    try ch.upsertE2eSession("ui-42", .{ .key = key });
+    try putTestE2eSession(&ch, "ui-42", key);
 
     const access_token = try ch.issueUiAccessToken("ui-42");
     defer std.testing.allocator.free(access_token);
@@ -2543,9 +3553,8 @@ test "WebChannel relay encrypted user_message is published to bus" {
     defer std.testing.allocator.free(encrypted.nonce_b64);
     defer std.testing.allocator.free(encrypted.ciphertext_b64);
 
-    var event_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer event_buf.deinit(std.testing.allocator);
-    var event_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &event_buf);
+    var event_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer event_writer.deinit();
     const w = &event_writer.writer;
     try w.writeAll("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-e2e\",\"payload\":{\"access_token\":");
     try root.appendJsonStringW(w, access_token);
@@ -2554,7 +3563,8 @@ test "WebChannel relay encrypted user_message is published to bus" {
     try w.writeAll(",\"ciphertext\":");
     try root.appendJsonStringW(w, encrypted.ciphertext_b64);
     try w.writeAll("}}}");
-    event_buf = event_writer.toArrayList();
+    var event_buf = event_writer.toArrayList();
+    defer event_buf.deinit(std.testing.allocator);
 
     ch.handleInboundEvent(event_buf.items, null);
 
@@ -2564,6 +3574,73 @@ test "WebChannel relay encrypted user_message is published to bus" {
     try std.testing.expectEqualStrings("ui-42", msg.sender_id);
     try std.testing.expectEqualStrings("sess-e2e", msg.chat_id);
     try std.testing.expectEqualStrings("secret hello", msg.content);
+}
+
+test "WebChannel relay rejects plaintext and replayable encrypted approval responses when E2E is active" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+        .relay_e2e_required = false,
+    });
+    defer ch.deinitRelaySecurityState();
+    ch.jwt_signing_key = [_]u8{0x6b} ** 32;
+    ch.jwt_ready = true;
+    try std.testing.expect(try ch.bindSessionToClient(
+        "sess-approval-e2e",
+        "ui-owner",
+        std_compat.time.timestamp() + 3600,
+    ));
+
+    const key = [_]u8{0x44} ** 32;
+    try putTestE2eSession(&ch, "ui-owner", key);
+    const access_token = try ch.issueUiAccessToken("ui-owner");
+    defer std.testing.allocator.free(access_token);
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    const plaintext_event = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-approval-e2e\",\"request_id\":\"plain-request\",\"payload\":{{\"access_token\":\"{s}\",\"approved\":true}}}}",
+        .{access_token},
+    );
+    defer std.testing.allocator.free(plaintext_event);
+    ch.handleInboundEvent(plaintext_event, null);
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+
+    const encrypted = try ch.encryptE2ePayload(key, "{\"approved\":false,\"reason\":\"review incomplete\"}");
+    defer std.testing.allocator.free(encrypted.nonce_b64);
+    defer std.testing.allocator.free(encrypted.ciphertext_b64);
+    var event_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer event_writer.deinit();
+    const w = &event_writer.writer;
+    try w.writeAll("{\"v\":1,\"type\":\"approval_response\",\"session_id\":\"sess-approval-e2e\",\"request_id\":\"encrypted-request\",\"payload\":{\"access_token\":");
+    try root.appendJsonStringW(w, access_token);
+    try w.writeAll(",\"e2e\":{\"alg\":");
+    try root.appendJsonStringW(w, WebChannel.E2E_ALG);
+    try w.writeAll(",\"nonce\":");
+    try root.appendJsonStringW(w, encrypted.nonce_b64);
+    try w.writeAll(",\"ciphertext\":");
+    try root.appendJsonStringW(w, encrypted.ciphertext_b64);
+    try w.writeAll("}}}");
+    var event_buf = event_writer.toArrayList();
+    defer event_buf.deinit(std.testing.allocator);
+    ch.handleInboundEvent(event_buf.items, null);
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+
+    // Regression: the same authenticated ciphertext cannot be substituted
+    // under another top-level request id because v1 encrypted approvals are
+    // rejected until envelope fields are cryptographically bound.
+    const replay_event = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        event_buf.items,
+        "encrypted-request",
+        "substitute-request",
+    );
+    defer std.testing.allocator.free(replay_event);
+    ch.handleInboundEvent(replay_event, null);
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
 }
 
 test "WebChannel relay user_message without access token is rejected" {

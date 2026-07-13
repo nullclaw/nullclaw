@@ -105,7 +105,7 @@ fn sandboxRestrictsToWorkspace(sandbox: ?Sandbox) bool {
     return false;
 }
 
-fn normalizeCommandInput(command: []const u8) []const u8 {
+pub fn normalizeCommandInput(command: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (unwrapMarkdownFence(trimmed)) |unfenced| {
         return std.mem.trim(u8, unfenced, " \t\r\n");
@@ -180,14 +180,14 @@ pub const ShellTool = struct {
         const command_input = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
         const command = normalizeCommandInput(command_input);
+        const requested_cwd = root.getString(args, "cwd");
 
         // Validate command against security policy.
-        // ApprovalRequired is NOT caught here — it propagates as an error so the
-        // agent can send a structured approval event to the channel on re-execution.
-        // The thread-local approved flag (set by the agent after the user grants
-        // approval) bypasses the approval gate on re-execution.
+        // ApprovalRequired is NOT caught here: the agent emits a structured
+        // approval request and suspends the turn. The exact thread-local grant,
+        // set only around the matching re-execution, bypasses this approval gate.
         if (self.policy) |pol| {
-            const approved = root.threadApproved();
+            const approved = root.threadCommandApproved(tool_name, command_input, requested_cwd);
             _ = pol.validateCommandExecution(command, approved) catch |err| switch (err) {
                 error.CommandNotAllowed => {
                     const summary = command_summary.summarizeBlockedCommand(command);
@@ -682,7 +682,7 @@ test "shell ApprovalRequired propagates as error" {
     try std.testing.expectError(error.ApprovalRequired, st.execute(std.testing.allocator, parsed.value.object));
 }
 
-test "shell ApprovalRequired bypassed when thread-approved flag set" {
+test "shell ApprovalRequired bypassed only for exact approved command" {
     const policy_mod = @import("../security/policy.zig");
     var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
     defer tracker.deinit();
@@ -697,18 +697,24 @@ test "shell ApprovalRequired bypassed when thread-approved flag set" {
         .allowed_commands = &allowed,
     };
 
-    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
     const parsed = try root.parseTestArgs("{\"command\": \"touch test.txt\"}");
     defer parsed.deinit();
 
-    _ = root.setThreadApproved(true);
-    defer _ = root.setThreadApproved(false);
-    // With the thread-local flag set, the approval gate is bypassed.
-    // The command may fail for other reasons, but it should NOT
-    // return ApprovalRequired.
-    const result = try st.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
-    if (result.error_msg) |msg| std.testing.allocator.free(msg);
+    const previous = root.setThreadApprovalGrant(.{
+        .tool_name = "shell",
+        .command = "touch test.txt",
+        .cwd = "/tmp/work-a",
+    });
+    defer _ = root.setThreadApprovalGrant(previous);
+
+    // Regression: #900 approval is an exact capability, not a thread-wide
+    // boolean. Validate the policy directly to avoid spawning a real process.
+    _ = try policy.validateCommandExecution("touch test.txt", root.threadCommandApproved("shell", "touch test.txt", "/tmp/work-a"));
+    try std.testing.expectError(
+        error.ApprovalRequired,
+        policy.validateCommandExecution("touch other.txt", root.threadCommandApproved("shell", "touch other.txt", "/tmp/work-a")),
+    );
+    try std.testing.expect(!root.threadCommandApproved("shell", "touch test.txt", "/tmp/work-b"));
 }
 
 test "shell MediumRiskBlocked error is user-facing" {

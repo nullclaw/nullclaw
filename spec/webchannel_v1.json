@@ -29,26 +29,37 @@
     "pairing_request": {
       "direction": "ui_to_core",
       "payload": {
-        "pairing_code": "string required for relay; optional on local loopback transport",
-        "client_pub": "string optional base64url X25519 public key",
-        "client_public_key": "string optional alias for client_pub"
-      }
+        "pairing_code": "string required for relay; optional on local transport",
+        "client_pub": "string base64url X25519 public key; required for relay pairing and optional for local pairing",
+        "client_public_key": "string compatibility alias accepted for client_pub"
+      },
+      "constraints": [
+        "relay pairing rejects requests without a client X25519 public key",
+        "local pairing may omit client_pub and use a direct plaintext pairing_result on the originating local socket; unauthenticated pairing-first access is loopback-only"
+      ]
     },
     "pairing_result": {
       "direction": "core_to_ui",
       "payload": {
         "ok": "boolean required",
-        "client_id": "string required UI identity",
-        "access_token": "string required JWT for subsequent relay events",
-        "token_type": "string required (Bearer)",
-        "expires_in": "integer required seconds",
-        "set_cookie": "string optional cookie value for relay HTTP layer",
-        "e2e_required": "boolean required",
+        "client_id": "string present directly for local pairing; encrypted inside relay payload.e2e.ciphertext",
+        "access_token": "string UI JWT present directly for local pairing; encrypted inside relay payload.e2e.ciphertext",
+        "token_type": "string (Bearer) present directly for local pairing; encrypted for relay pairing",
+        "expires_in": "integer seconds present directly for local pairing; encrypted for relay pairing",
+        "set_cookie": "string cookie value present directly for local pairing; encrypted for relay pairing",
+        "e2e_required": "boolean present directly for local pairing; encrypted for relay pairing and controls subsequent message payloads only",
         "e2e": {
-          "alg": "string optional (x25519-chacha20poly1305-v1)",
-          "agent_pub": "string optional base64url X25519 public key"
+          "alg": "string required for relay (x25519-chacha20poly1305-v1)",
+          "agent_pub": "string required for relay, base64url X25519 public key",
+          "nonce": "string required for relay, base64url nonce",
+          "ciphertext": "string required for relay, base64url ciphertext and authentication tag; decrypted JSON contains client_id, access_token, token_type, expires_in, set_cookie, and e2e_required"
         }
-      }
+      },
+      "constraints": [
+        "relay plaintext payload contains ok plus e2e only; bearer credentials and cookie are never exposed outside ciphertext",
+        "the relay credential wrapper is mandatory even when relay_e2e_required is false",
+        "local pairing may return credentials directly to the originating local socket"
+      ]
     },
     "user_message": {
       "direction": "ui_to_core",
@@ -103,17 +114,34 @@
     },
     "approval_request": {
       "direction": "core_to_ui",
+      "envelope": {
+        "request_id": "string required opaque server-generated one-shot id"
+      },
       "payload": {
         "action": "string required",
         "reason": "string optional"
-      }
+      },
+      "constraints": [
+        "authenticated plaintext control; local transport only in v1 because relay lacks owner-addressed delivery acknowledgement; local loopback permits it with message E2E while public/LAN local binds do not",
+        "request_id expires after 300 seconds and can be consumed once"
+      ]
     },
     "approval_response": {
       "direction": "ui_to_core",
+      "envelope": {
+        "request_id": "string required; must echo the approval_request id"
+      },
       "payload": {
         "approved": "boolean required",
-        "reason": "string optional"
-      }
+        "reason": "string optional",
+        "access_token": "string required in pairing mode (can be top-level access_token)",
+        "auth_token": "string required in local token mode (can be top-level auth_token)"
+      },
+      "constraints": [
+        "plaintext only; encrypted decisions are rejected",
+        "session and authenticated principal must match the original request",
+        "expired, mismatched, and replayed ids are rejected"
+      ]
     },
     "error": {
       "direction": "both",
@@ -137,9 +165,20 @@
       "lifecycle": "config relay_token -> env NULLCLAW_RELAY_TOKEN -> persisted auth credential -> generated token",
       "ttl_seconds": "configurable via relay_token_ttl_secs (3600..31536000)"
     },
+    "relay_pairing_credential_envelope": {
+      "description": "X25519 + ChaCha20-Poly1305 wrapper for client_id, access_token, and cookie returned by relay pairing",
+      "confidentiality": "protects pairing credentials in transit from passive observation on the relay path",
+      "trust_boundary": "relay transport remains trusted for integrity and key delivery because client_pub travels in the pairing request",
+      "limitation": "not an authenticated PAKE and does not protect against active key substitution by the relay"
+    },
     "local_message_token": {
       "description": "Local user_message token auth for orchestration mode",
       "config": "channels.web.accounts.<id>.message_auth_mode=token + channels.web.accounts.<id>.auth_token (or NULLCLAW_WEB_TOKEN / NULLCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_TOKEN)"
+    },
+    "approval_capability": {
+      "description": "Server-generated request_id bound to session and authenticated principal",
+      "ttl_seconds": 300,
+      "lifecycle": "single use; fail closed on expiry, mismatch, replay, unavailable delivery, relay transport, or unsupported public-bind E2E context"
     }
   }
 }

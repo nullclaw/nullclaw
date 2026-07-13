@@ -31,6 +31,7 @@ const outbound = @import("outbound.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
+const agent_mod = @import("agent/root.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
@@ -675,6 +676,18 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
     if (parsed.parsed) |*pm| {
         if (pm.value != .object) return parsed;
 
+        if (pm.value.object.get("event_type")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.event_type = v.string;
+        }
+        if (pm.value.object.get("request_id")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.request_id = v.string;
+        }
+        if (pm.value.object.get("approval_approved")) |v| {
+            if (v == .bool) parsed.fields.approval_approved = v.bool;
+        }
+        if (pm.value.object.get("approval_reason")) |v| {
+            if (v == .string) parsed.fields.approval_reason = v.string;
+        }
         if (pm.value.object.get("account_id")) |v| {
             if (v == .string) parsed.fields.account_id = v.string;
         }
@@ -988,6 +1001,74 @@ fn resolveOutboundChannel(
         registry.findByName(channel_name);
 }
 
+const InboundApprovalResponse = struct {
+    request_id: []const u8,
+    approved: bool,
+    reason: ?[]const u8,
+};
+
+/// Recognize only the authenticated WebChannel control envelope. Keeping the
+/// discriminator out of message content prevents ordinary user text (or
+/// metadata from another transport) from entering the approval capability
+/// path.
+fn inboundApprovalResponse(
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) error{InvalidApprovalResponse}!?InboundApprovalResponse {
+    // Metadata namespaces are transport-specific. An unrelated channel may
+    // legitimately expose an `event_type` key, but it must never enter (or be
+    // rejected by) the WebChannel control protocol.
+    if (!std.mem.eql(u8, msg.channel, "web")) return null;
+
+    const event_type = meta.event_type orelse return null;
+    if (!std.mem.eql(u8, event_type, "approval_response")) {
+        return error.InvalidApprovalResponse;
+    }
+
+    if (msg.content.len != 0) {
+        return error.InvalidApprovalResponse;
+    }
+
+    return .{
+        .request_id = meta.request_id orelse return error.InvalidApprovalResponse,
+        .approved = meta.approval_approved orelse return error.InvalidApprovalResponse,
+        .reason = meta.approval_reason,
+    };
+}
+
+const ApprovalOutboundCtx = struct {
+    channel: channels_mod.Channel,
+    target: []const u8,
+};
+
+fn sendInboundApprovalRequest(ctx: *anyopaque, request: agent_mod.ApprovalRequest) bool {
+    const outbound_ctx: *ApprovalOutboundCtx = @ptrCast(@alignCast(ctx));
+    outbound_ctx.channel.sendApprovalRequest(outbound_ctx.target, .{
+        .request_id = request.request_id,
+        .action = request.action,
+        .reason = request.reason,
+    }) catch |err| {
+        log.warn("approval_request delivery failed: {}", .{err});
+        return false;
+    };
+    return true;
+}
+
+fn makeInboundApprovalSink(
+    channel: ?channels_mod.Channel,
+    target: []const u8,
+    ctx: *ApprovalOutboundCtx,
+) ?agent_mod.ApprovalSink {
+    const resolved = channel orelse return null;
+    if (resolved.vtable.sendApprovalRequest == null) return null;
+
+    ctx.* = .{ .channel = resolved, .target = target };
+    return .{
+        .callback = sendInboundApprovalRequest,
+        .ctx = @ptrCast(ctx),
+    };
+}
+
 fn buildInboundMessageRef(
     msg: *const bus_mod.InboundMessage,
     meta: channel_adapters.InboundMetadata,
@@ -1290,12 +1371,27 @@ fn processInboundMessage(
     var routing_plan = buildInboundRoutingPlan(allocator, runtime.config, msg, parsed_meta.fields);
     defer routing_plan.deinit(allocator);
 
+    const approval_response = inboundApprovalResponse(msg, parsed_meta.fields) catch {
+        // WebChannel is responsible for authenticating and validating this
+        // control event before publishing it. Never fall back to treating a
+        // malformed control envelope as ordinary user text.
+        log.warn("dropping invalid inbound control event", .{});
+        return;
+    };
+
     const outbound_channel = resolveOutboundChannel(registry, routing_plan.outbound_channel, routing_plan.outbound_account_id);
     if (outbound_channel) |channel| {
         markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
     }
 
-    if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip) return;
+    // Approval responses are bound to the exact resolved session and enter a
+    // dedicated SessionManager control path. In particular, they must never
+    // be queued or injected as user-authored text by routeInbound().
+    if (approval_response == null and
+        runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip)
+    {
+        return;
+    }
 
     const typing_recipient = sendInboundProcessingIndicator(
         allocator,
@@ -1345,13 +1441,33 @@ fn processInboundMessage(
         defer channels_mod.max.setInteractiveOwnerContext(null);
     }
 
-    const reply = runtime.session_mgr.processMessageStreaming(
-        routing_plan.session_key,
-        msg.content,
-        routing_plan.conversation_context,
-        stream_sink,
-        null,
-    ) catch |err| {
+    var approval_outbound_ctx: ApprovalOutboundCtx = undefined;
+    const approval_sink = makeInboundApprovalSink(
+        outbound_channel,
+        routing_plan.outbound_chat_id,
+        &approval_outbound_ctx,
+    );
+
+    const reply = (if (approval_response) |response|
+        runtime.session_mgr.processApprovalResponseStreaming(
+            routing_plan.session_key,
+            response.request_id,
+            response.approved,
+            response.reason,
+            routing_plan.conversation_context,
+            stream_sink,
+            null,
+            approval_sink,
+        )
+    else
+        runtime.session_mgr.processMessageStreamingWithApprovalSink(
+            routing_plan.session_key,
+            msg.content,
+            routing_plan.conversation_context,
+            stream_sink,
+            null,
+            approval_sink,
+        )) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
 
         // Send user-visible error reply back to the originating channel
@@ -2829,6 +2945,63 @@ test "parseInboundMetadata extracts discord sender identity fields" {
     try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
 }
 
+test "parseInboundMetadata extracts typed approval control fields" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"event_type\":\"approval_response\",\"request_id\":\"req-7\",\"approval_approved\":false,\"approval_reason\":\"not now\"}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("approval_response", parsed.fields.event_type.?);
+    try std.testing.expectEqualStrings("req-7", parsed.fields.request_id.?);
+    try std.testing.expectEqual(false, parsed.fields.approval_approved.?);
+    try std.testing.expectEqualStrings("not now", parsed.fields.approval_reason.?);
+}
+
+test "inboundApprovalResponse accepts only empty WebChannel control events" {
+    const valid_msg = bus_mod.InboundMessage{
+        .channel = "web",
+        .sender_id = "paired-client",
+        .chat_id = "session-a",
+        .content = "",
+        .session_key = "web:web-main:direct:session-a",
+    };
+    const fields = channel_adapters.InboundMetadata{
+        .event_type = "approval_response",
+        .request_id = "req-7",
+        .approval_approved = false,
+        .approval_reason = "not now",
+    };
+
+    const response = (try inboundApprovalResponse(&valid_msg, fields)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("req-7", response.request_id);
+    try std.testing.expect(!response.approved);
+    try std.testing.expectEqualStrings("not now", response.reason.?);
+
+    var wrong_channel = valid_msg;
+    wrong_channel.channel = "discord";
+    // A non-Web event_type belongs to that transport's metadata namespace. It
+    // remains an ordinary message and never receives approval privileges.
+    try std.testing.expect((try inboundApprovalResponse(&wrong_channel, fields)) == null);
+    var unrelated_event = fields;
+    unrelated_event.event_type = "interaction_create";
+    try std.testing.expect((try inboundApprovalResponse(&wrong_channel, unrelated_event)) == null);
+
+    var text_smuggling = valid_msg;
+    text_smuggling.content = "approve this";
+    try std.testing.expectError(error.InvalidApprovalResponse, inboundApprovalResponse(&text_smuggling, fields));
+
+    var missing_request = fields;
+    missing_request.request_id = null;
+    try std.testing.expectError(error.InvalidApprovalResponse, inboundApprovalResponse(&valid_msg, missing_request));
+
+    var unknown_control = fields;
+    unknown_control.event_type = "future_control";
+    try std.testing.expectError(error.InvalidApprovalResponse, inboundApprovalResponse(&valid_msg, unknown_control));
+
+    try std.testing.expect((try inboundApprovalResponse(&valid_msg, .{})) == null);
+}
+
 test "buildInboundConversationContext preserves discord identity metadata" {
     const msg = bus_mod.InboundMessage{
         .channel = "discord",
@@ -3113,6 +3286,56 @@ test "markInboundMessageRead dispatches through channel vtable" {
 
     try std.testing.expectEqualStrings("room-9", mock.target.?);
     try std.testing.expectEqualStrings("msg-42", mock.message_id.?);
+}
+
+test "makeInboundApprovalSink binds request to resolved channel target" {
+    const Mock = struct {
+        target: ?[]const u8 = null,
+        request_id: ?[]const u8 = null,
+        action: ?[]const u8 = null,
+        reason: ?[]const u8 = null,
+
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "web";
+        }
+        fn mockHealth(_: *anyopaque) bool {
+            return true;
+        }
+        fn sendApproval(ptr: *anyopaque, target: []const u8, request: channels_mod.Channel.ApprovalRequest) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.target = target;
+            self.request_id = request.request_id;
+            self.action = request.action;
+            self.reason = request.reason;
+        }
+
+        const vtable = channels_mod.Channel.VTable{
+            .start = &start,
+            .stop = &stop,
+            .send = &send,
+            .name = &name,
+            .healthCheck = &mockHealth,
+            .sendApprovalRequest = &sendApproval,
+        };
+    };
+
+    var mock = Mock{};
+    const channel = channels_mod.Channel{ .ptr = @ptrCast(&mock), .vtable = &Mock.vtable };
+    var outbound_ctx: ApprovalOutboundCtx = undefined;
+    const sink = makeInboundApprovalSink(channel, "session-a", &outbound_ctx) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(sink.emit(.{
+        .request_id = "req-7",
+        .action = "shell: rm example.txt",
+        .reason = "high-risk command",
+    }));
+    try std.testing.expectEqualStrings("session-a", mock.target.?);
+    try std.testing.expectEqualStrings("req-7", mock.request_id.?);
+    try std.testing.expectEqualStrings("shell: rm example.txt", mock.action.?);
+    try std.testing.expectEqualStrings("high-risk command", mock.reason.?);
 }
 
 test "hasSupervisedChannels true for nostr" {

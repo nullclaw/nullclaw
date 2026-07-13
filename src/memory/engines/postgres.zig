@@ -80,6 +80,53 @@ fn generateId(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, rand_hi, rand_lo });
 }
 
+fn dupeSessionMessage(allocator: std.mem.Allocator, role: []const u8, content: []const u8) !root.MessageEntry {
+    const owned_role = try allocator.dupe(u8, role);
+    errdefer allocator.free(owned_role);
+    const owned_content = try allocator.dupe(u8, content);
+    return .{ .role = owned_role, .content = owned_content };
+}
+
+fn dupeDetailedSessionMessage(
+    allocator: std.mem.Allocator,
+    role: []const u8,
+    content: []const u8,
+    created_at: []const u8,
+) !root.DetailedMessageEntry {
+    const owned_role = try allocator.dupe(u8, role);
+    errdefer allocator.free(owned_role);
+    const owned_content = try allocator.dupe(u8, content);
+    errdefer allocator.free(owned_content);
+    const owned_created_at = try allocator.dupe(u8, created_at);
+    return .{
+        .role = owned_role,
+        .content = owned_content,
+        .created_at = owned_created_at,
+    };
+}
+
+fn dupeSessionInfo(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    message_count: u64,
+    turn_count: u64,
+    first_message_at: []const u8,
+    last_message_at: []const u8,
+) !root.SessionInfo {
+    const owned_session_id = try allocator.dupe(u8, session_id);
+    errdefer allocator.free(owned_session_id);
+    const owned_first_message_at = try allocator.dupe(u8, first_message_at);
+    errdefer allocator.free(owned_first_message_at);
+    const owned_last_message_at = try allocator.dupe(u8, last_message_at);
+    return .{
+        .session_id = owned_session_id,
+        .message_count = message_count,
+        .turn_count = turn_count,
+        .first_message_at = owned_first_message_at,
+        .last_message_at = owned_last_message_at,
+    };
+}
+
 // ── PostgresMemory (only available when enable_postgres is true) ──
 
 pub const PostgresMemory = if (build_options.enable_postgres) PostgresMemoryImpl else struct {};
@@ -108,6 +155,7 @@ const PostgresMemoryImpl = struct {
     q_clear_usage: []const u8,
     q_count_sessions: []const u8,
     q_list_sessions: []const u8,
+    q_count_session_turns: []const u8,
     q_count_detailed_msgs: []const u8,
     q_load_msgs_detailed: []const u8,
     q_clear_auto: []const u8,
@@ -155,6 +203,7 @@ const PostgresMemoryImpl = struct {
             .q_clear_usage = undefined,
             .q_count_sessions = undefined,
             .q_list_sessions = undefined,
+            .q_count_session_turns = undefined,
             .q_count_detailed_msgs = undefined,
             .q_load_msgs_detailed = undefined,
             .q_clear_auto = undefined,
@@ -223,11 +272,25 @@ const PostgresMemoryImpl = struct {
 
         self_.q_list_sessions = try buildQuery(
             allocator,
-            "SELECT session_id, COUNT(*), MIN(created_at)::text, MAX(created_at)::text FROM {schema}.messages WHERE instance_id = $1 AND role <> '" ++ root.RUNTIME_COMMAND_ROLE ++ "' GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT $2 OFFSET $3",
+            "SELECT session_id, COUNT(*), SUM(CASE WHEN role = 'assistant' OR (role = '" ++ root.TOOL_TURN_CHECKPOINT_ROLE ++
+                "' AND content LIKE '" ++ root.TOOL_TURN_COMPLETION_CHECKPOINT ++
+                "%') THEN 1 ELSE 0 END), MIN(created_at)::text, MAX(created_at)::text FROM {schema}.messages WHERE instance_id = $1 AND role <> '" ++
+                root.RUNTIME_COMMAND_ROLE ++ "' GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT $2 OFFSET $3",
             schema_q,
             table_q,
         );
         errdefer allocator.free(self_.q_list_sessions);
+
+        self_.q_count_session_turns = try buildQuery(
+            allocator,
+            "SELECT SUM(CASE WHEN role = 'assistant' OR (role = '" ++ root.TOOL_TURN_CHECKPOINT_ROLE ++
+                "' AND content LIKE '" ++ root.TOOL_TURN_COMPLETION_CHECKPOINT ++
+                "%') THEN 1 ELSE 0 END) FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2 AND role <> '" ++
+                root.RUNTIME_COMMAND_ROLE ++ "'",
+            schema_q,
+            table_q,
+        );
+        errdefer allocator.free(self_.q_count_session_turns);
 
         self_.q_count_detailed_msgs = try buildQuery(
             allocator,
@@ -287,6 +350,7 @@ const PostgresMemoryImpl = struct {
         self.allocator.free(self.q_clear_usage);
         self.allocator.free(self.q_count_sessions);
         self.allocator.free(self.q_list_sessions);
+        self.allocator.free(self.q_count_session_turns);
         self.allocator.free(self.q_count_detailed_msgs);
         self.allocator.free(self.q_load_msgs_detailed);
         self.allocator.free(self.q_clear_auto);
@@ -415,13 +479,15 @@ const PostgresMemoryImpl = struct {
         return result;
     }
 
-    fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) ![]u8 {
-        if (c.PQgetisnull(result, row, col) != 0) {
-            return allocator.dupe(u8, "");
-        }
+    fn resultValue(result: *c.PGresult, row: c_int, col: c_int) []const u8 {
+        if (c.PQgetisnull(result, row, col) != 0) return "";
         const val = c.PQgetvalue(result, row, col);
         const len: usize = @intCast(c.PQgetlength(result, row, col));
-        return allocator.dupe(u8, val[0..len]);
+        return val[0..len];
+    }
+
+    fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) ![]u8 {
+        return allocator.dupe(u8, resultValue(result, row, col));
     }
 
     fn dupeResultValueOpt(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?[]u8 {
@@ -857,10 +923,11 @@ const PostgresMemoryImpl = struct {
         var row: c_int = 0;
         while (row < nrows) : (row += 1) {
             const idx: usize = @intCast(row);
-            messages[idx] = .{
-                .role = try dupeResultValue(allocator, result, row, 0),
-                .content = try dupeResultValue(allocator, result, row, 1),
-            };
+            messages[idx] = try dupeSessionMessage(
+                allocator,
+                resultValue(result, row, 0),
+                resultValue(result, row, 1),
+            );
             filled += 1;
         }
 
@@ -990,13 +1057,17 @@ const PostgresMemoryImpl = struct {
 
             const raw_count = c.PQgetvalue(result, row, 1);
             const raw_count_len: usize = @intCast(c.PQgetlength(result, row, 1));
+            const raw_turn_count = c.PQgetvalue(result, row, 2);
+            const raw_turn_count_len: usize = @intCast(c.PQgetlength(result, row, 2));
 
-            sessions[filled] = .{
-                .session_id = try dupeResultValue(allocator, result, row, 0),
-                .message_count = std.fmt.parseInt(u64, raw_count[0..raw_count_len], 10) catch 0,
-                .first_message_at = try dupeResultValue(allocator, result, row, 2),
-                .last_message_at = try dupeResultValue(allocator, result, row, 3),
-            };
+            sessions[filled] = try dupeSessionInfo(
+                allocator,
+                resultValue(result, row, 0),
+                std.fmt.parseInt(u64, raw_count[0..raw_count_len], 10) catch 0,
+                std.fmt.parseInt(u64, raw_turn_count[0..raw_turn_count_len], 10) catch 0,
+                resultValue(result, row, 3),
+                resultValue(result, row, 4),
+            );
             filled += 1;
         }
 
@@ -1004,6 +1075,25 @@ const PostgresMemoryImpl = struct {
             return allocator.realloc(sessions, filled);
         }
         return sessions;
+    }
+
+    fn implSessionCountSessionTurns(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sid_z = try self_.allocator.dupeZ(u8, session_id);
+        defer self_.allocator.free(sid_z);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
+
+        const params = [_]?[*:0]const u8{ sid_z, iid_z };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
+        const result = try self_.execParams(self_.q_count_session_turns, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0 or c.PQgetisnull(result, 0, 0) != 0) return 0;
+        const raw = c.PQgetvalue(result, 0, 0);
+        const len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        return std.fmt.parseInt(u64, raw[0..len], 10) catch 0;
     }
 
     fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
@@ -1063,11 +1153,12 @@ const PostgresMemoryImpl = struct {
 
         var row: c_int = 0;
         while (row < nrows) : (row += 1) {
-            messages[filled] = .{
-                .role = try dupeResultValue(allocator, result, row, 0),
-                .content = try dupeResultValue(allocator, result, row, 1),
-                .created_at = try dupeResultValue(allocator, result, row, 2),
-            };
+            messages[filled] = try dupeDetailedSessionMessage(
+                allocator,
+                resultValue(result, row, 0),
+                resultValue(result, row, 1),
+                resultValue(result, row, 2),
+            );
             filled += 1;
         }
 
@@ -1086,6 +1177,7 @@ const PostgresMemoryImpl = struct {
         .loadUsage = &implSessionLoadUsage,
         .countSessions = &implSessionCountSessions,
         .listSessions = &implSessionListSessions,
+        .countSessionTurns = &implSessionCountSessionTurns,
         .countDetailedMessages = &implSessionCountDetailedMessages,
         .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
@@ -1159,6 +1251,46 @@ test "buildQuery no placeholders" {
     const result = try buildQuery(std.testing.allocator, "SELECT 1", "\"s\"", "\"t\"");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("SELECT 1", result);
+}
+
+fn postgresSessionDuplicationAllocationHarness(allocator: std.mem.Allocator) !void {
+    const message = try dupeSessionMessage(allocator, "user", "first");
+    defer {
+        allocator.free(message.role);
+        allocator.free(message.content);
+    }
+
+    const detailed = try dupeDetailedSessionMessage(
+        allocator,
+        "assistant",
+        "second",
+        "2026-01-01 00:00:00",
+    );
+    defer {
+        allocator.free(detailed.role);
+        allocator.free(detailed.content);
+        allocator.free(detailed.created_at);
+    }
+
+    const info = try dupeSessionInfo(
+        allocator,
+        "session-a",
+        2,
+        1,
+        "2026-01-01 00:00:00",
+        "2026-01-01 00:00:01",
+    );
+    defer info.deinit(allocator);
+}
+
+test "postgres session duplication releases partial rows on allocation failure" {
+    // Regression: a failed later field duplicate must release earlier fields
+    // before the row becomes visible to its owning result slice.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        postgresSessionDuplicationAllocationHarness,
+        .{},
+    );
 }
 
 test "getNowTimestamp returns numeric string" {
