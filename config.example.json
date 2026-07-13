@@ -15,6 +15,9 @@
       "evolink": {
         "api_key": "YOUR_EVOLINK_API_KEY"
       },
+      "anthropic": {
+        "api_key": "YOUR_ANTHROPIC_API_KEY"
+      },
       "azure": {
         "api_key": "YOUR_AZURE_OPENAI_API_KEY",
         "base_url": "https://your-resource.openai.azure.com"

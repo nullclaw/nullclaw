@@ -741,6 +741,8 @@ pub fn curlStreamAnthropic(
     argc += 1;
     argv_buf[argc] = "--no-buffer";
     argc += 1;
+    argv_buf[argc] = curlFailFastArg(allocator);
+    argc += 1;
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";
@@ -897,8 +899,15 @@ pub fn curlStreamAnthropic(
         },
     }
 
+    try validateAnthropicStreamOutcome(accumulated.items.len, saw_done);
     callback(ctx, root.StreamChunk.finalChunk());
     return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+}
+
+fn validateAnthropicStreamOutcome(accumulated_len: usize, saw_done: bool) !void {
+    if (!root.shouldRecoverPartialStream(accumulated_len, saw_done)) {
+        return error.CurlFailed;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1157,6 +1166,14 @@ test "parseAnthropicSseLine data with unknown event returns skip" {
     const json = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}";
     const result = try parseAnthropicSseLine(std.testing.allocator, json, "message_start");
     try std.testing.expect(result == .skip);
+}
+
+test "Anthropic stream rejects response without SSE progress" {
+    // Regression: #767 JSON API errors and event:error have neither text
+    // deltas nor message_stop and must trigger the non-streaming fallback.
+    try std.testing.expectError(error.CurlFailed, validateAnthropicStreamOutcome(0, false));
+    try validateAnthropicStreamOutcome(0, true);
+    try validateAnthropicStreamOutcome(1, false);
 }
 
 test "extractAnthropicDelta correct JSON returns text" {
