@@ -135,6 +135,23 @@ nullclaw onboard --interactive
 - 设置默认模型路由，通常是 `provider/vendor/model`。
 - 示例：`openrouter/anthropic/claude-sonnet-4`
 
+### `agent.default_queue_mode`
+
+- 设置新建会话的入站队列模式。可选值为 `off`、`serial`、`latest` 和 `debounce`，默认值为 `off`。
+- `off` 会丢弃正在执行回合时到达的消息，`serial` 会等待当前回合结束，`latest` 会保留最新的待注入消息。`debounce` 选择现有的运行时 debounce 模式；此字段不配置其时长、容量或丢弃策略。
+- `/queue` 可以覆盖当前会话的模式。`/queue reset`、`/restart` 和 `/debug reset` 会恢复这里配置的默认值。
+- 修改后需要重启，确保 session manager 与后续新建会话使用同一个默认值。
+
+示例：
+
+```json
+{
+  "agent": {
+    "default_queue_mode": "latest"
+  }
+}
+```
+
 ### `workspace_audit.llm_triage`
 
 - 选择 `nullclaw workspace audit --llm-triage external` 使用的 provider/model。
