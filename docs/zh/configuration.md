@@ -460,16 +460,17 @@ WeChat 示例：
 ```json
 {
   "channels": {
-    "wechat": [
-      {
-        "account_id": "main",
-        "callback_token": "wechat-callback-token",
-        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
-        "app_id": "wx1234567890abcdef",
-        "app_secret": "wechat-app-secret",
-        "allow_from": ["openid_123"]
+    "wechat": {
+      "accounts": {
+        "main": {
+          "callback_token": "wechat-callback-token",
+          "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+          "app_id": "wx1234567890abcdef",
+          "app_secret": "wechat-app-secret",
+          "allow_from": ["openid_123"]
+        }
       }
-    ]
+    }
   }
 }
 ```
@@ -481,15 +482,68 @@ WeChat 说明：
 - `callback_token` 是签名校验必填项。
 - `encoding_aes_key` 是可选项；当 WeChat 回调配置为 `encrypt_type=aes` 时必须提供。
 - `app_id` 和 `app_secret` 只有在需要通过 WeChat custom message API 主动发送消息时才需要。
-- `allow_from` 应显式列出可信 OpenID，不要依赖空 allowlist 来实现隐私隔离。
+- 空 `allow_from` 会拒绝入站消息；请显式列出可信 OpenID，仅在有意开放账号时使用 `"*"`。
 - 如果当前二进制未编译 WeChat channel，请使用 `-Dchannels=wechat`（或 `-Dchannels=all`）重新构建。
+
+#### Weixin — 微信 iLink Bot（扫码登录）
+
+`weixin` channel 通过二维码授权微信 iLink bot。这与上方使用签名 webhook 的
+`wechat` 公众号 channel 不同。
+
+首先，扫码登录获取 token：
+
+```bash
+nullclaw auth login weixin
+```
+
+此命令会在终端渲染二维码。使用微信扫码并在手机上确认授权后，命令会把生成的
+`token` 保存到配置文件；如果服务返回了非默认主机，也会保存对应的 `base_url`。
+
+登录后，编辑该命令更新的 Weixin 账号条目，显式设置 `allow_from`。新配置会使用
+下方所示的内联条目；已有的 `accounts` 对象会保留原布局。如果登录命令提供了
+`--proxy`，该代理会保存到同一账号，并继续用于运行时 API 请求。
+
+```json
+{
+  "channels": {
+    "weixin": {
+      "account_id": "default",
+      "token": "<扫码登录获取的 bot token>",
+      "base_url": "https://ilinkai.weixin.qq.com/",
+      "proxy": null,
+      "allow_from": ["<你的微信用户 ID>"]
+    }
+  }
+}
+```
+
+Weixin channel 字段：
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `account_id` | `"default"` | routing 和 session key 使用的内部账号标识 |
+| `token` | `""` | 从 `nullclaw auth login weixin` 获取的 bot token（必填） |
+| `base_url` | `https://ilinkai.weixin.qq.com/` | 不含 query/fragment 的绝对 HTTPS iLink API URL（地区重定向后可能变化） |
+| `proxy` | `null` | 运行时 API 请求使用的可选 `http://`、`https://` 或 `socks5://` 代理 URL |
+| `allow_from` | `[]` | 允许向 bot 发消息的精确微信用户 ID 列表；请显式配置 |
+
+说明：
+
+- 在 `allow_from` 列出可信用户 ID（或明确使用通配符 `"*"`）之前，不会接受任何入站消息。
+- `nullclaw auth status weixin` 只报告是否配置了非空 token，不会探测远端 iLink session。
+- 使用 `nullclaw auth logout weixin` 删除已配置的 token。
+- 需要代理时，使用 `nullclaw auth login weixin --proxy http://localhost:7890`；
+  该命令会保存代理，供登录流程和运行时 API 请求共同使用。
+- 如果二进制未编译 weixin channel，请使用 `-Dchannels=weixin`（或 `-Dchannels=all`）重新构建。
+- `nullclaw gateway` 会启动并监管已配置的 `weixin` 轮询循环。
+- 当前 adapter 把入站会话视为私聊并发送文本回复；尚未实现群聊 routing 和媒体/文件投递。
 
 规则说明：
 
 - 对基于 allowlist 的渠道，空 `allow_from` 会拒绝入站消息；如果要做私有机器人，请显式填写 ID/OpenID。
 - `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
 - Telegram webhook 必须配置 `channels.telegram.accounts.<id>.webhook_secret`，并要求 Telegram 的 `X-Telegram-Bot-Api-Secret-Token` header 匹配。
-- Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams[].webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
+- Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams.accounts.<id>.webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：
 
@@ -672,32 +726,33 @@ Max 示例：
 ```json
 {
   "channels": {
-    "max": [
-      {
-        "account_id": "main",
-        "bot_token": "MAX_BOT_TOKEN",
-        "allow_from": ["YOUR_MAX_USER_ID"],
-        "group_allow_from": ["YOUR_MAX_USER_ID"],
-        "group_policy": "allowlist",
-        "mode": "webhook",
-        "webhook_url": "https://bot.example.com/max?account_id=main",
-        "webhook_secret": "replace-with-random-secret",
-        "require_mention": true,
-        "streaming": true,
-        "interactive": {
-          "enabled": true,
-          "ttl_secs": 900,
-          "owner_only": true
+    "max": {
+      "accounts": {
+        "main": {
+          "bot_token": "MAX_BOT_TOKEN",
+          "allow_from": ["YOUR_MAX_USER_ID"],
+          "group_allow_from": ["YOUR_MAX_USER_ID"],
+          "group_policy": "allowlist",
+          "mode": "webhook",
+          "webhook_url": "https://bot.example.com/max?account_id=main",
+          "webhook_secret": "replace-with-random-secret",
+          "require_mention": true,
+          "streaming": true,
+          "interactive": {
+            "enabled": true,
+            "ttl_secs": 900,
+            "owner_only": true
+          }
         }
       }
-    ]
+    }
   }
 }
 ```
 
 Max 说明：
 
-- `channels.max` 是账号条目数组；`account_id` 用于区分多个 Max bot。
+- `channels.max.accounts` 是账号条目对象；每个对象 key 就是用于区分多个 Max bot 的 `account_id`。
 - 生产环境推荐 `mode = "webhook"`。Max 文档将 long polling 定位为开发/测试用途，webhook 是推荐的生产路径。
 - `webhook_url` 必须使用 HTTPS。
 - 多账号 webhook 场景下，每个账号应使用独立的 `webhook_secret` 或在 webhook URL 中使用独立的 `account_id` query，例如 `/max?account_id=main`。

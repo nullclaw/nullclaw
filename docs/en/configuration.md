@@ -520,16 +520,17 @@ WeChat example:
 ```json
 {
   "channels": {
-    "wechat": [
-      {
-        "account_id": "main",
-        "callback_token": "wechat-callback-token",
-        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
-        "app_id": "wx1234567890abcdef",
-        "app_secret": "wechat-app-secret",
-        "allow_from": ["openid_123"]
+    "wechat": {
+      "accounts": {
+        "main": {
+          "callback_token": "wechat-callback-token",
+          "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+          "app_id": "wx1234567890abcdef",
+          "app_secret": "wechat-app-secret",
+          "allow_from": ["openid_123"]
+        }
       }
-    ]
+    }
   }
 }
 ```
@@ -541,8 +542,67 @@ WeChat notes:
 - `callback_token` is required for signature verification.
 - `encoding_aes_key` is optional but required when your WeChat callback is configured for `encrypt_type=aes`.
 - `app_id` and `app_secret` are optional unless you want outbound active-message delivery through the WeChat custom message API.
-- `allow_from` should list trusted OpenIDs. Keep it explicit; do not rely on an empty allowlist for privacy.
+- An empty `allow_from` denies inbound messages; list trusted OpenIDs explicitly, or use `"*"` only for an intentionally open account.
 - Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
+
+#### Weixin — WeChat iLink Bot (QR Code Login)
+
+The `weixin` channel authorizes a WeChat iLink bot by QR code. This is separate
+from the `wechat` Official Account channel above, which uses signed webhooks.
+
+First, log in and obtain a token:
+
+```bash
+nullclaw auth login weixin
+```
+
+This renders a QR code in the terminal. Scan it with WeChat and confirm the
+authorization on your phone. The command saves the resulting `token` and, when
+the service returns a non-default host, its `base_url` to your config.
+
+After login, edit the Weixin account entry updated by the command to set an
+explicit `allow_from` list. On a new config this is the inline entry shown
+below; an existing `accounts` object keeps its layout. When supplied, the login
+command's `--proxy` value is saved in the same account and reused for runtime
+API requests.
+
+```json
+{
+  "channels": {
+    "weixin": {
+      "account_id": "default",
+      "token": "<bot-token-from-qr-login>",
+      "base_url": "https://ilinkai.weixin.qq.com/",
+      "proxy": null,
+      "allow_from": ["<your-wechat-user-id>"]
+    }
+  }
+}
+```
+
+Weixin channel fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `account_id` | `"default"` | Internal account identifier used by routing and session keys |
+| `token` | `""` | Bot token from `nullclaw auth login weixin` (required) |
+| `base_url` | `https://ilinkai.weixin.qq.com/` | Absolute HTTPS iLink API URL without query/fragment (may change after region redirect) |
+| `proxy` | `null` | Optional `http://`, `https://`, or `socks5://` proxy URL for runtime API requests |
+| `allow_from` | `[]` | Exact WeChat user IDs allowed to message the bot; configure this explicitly |
+
+Notes:
+
+- No inbound messages are accepted until `allow_from` lists trusted user IDs
+  (or the intentional wildcard `"*"`).
+- `nullclaw auth status weixin` reports whether a non-empty token is configured;
+  it does not probe the remote iLink session.
+- Use `nullclaw auth logout weixin` to remove the configured token.
+- Use `nullclaw auth login weixin --proxy http://localhost:7890` when a proxy is
+  required; the command persists it for both login and runtime API requests.
+- Build with `-Dchannels=weixin` (or `-Dchannels=all`) if your binary was compiled without it.
+- `nullclaw gateway` starts and supervises the configured `weixin` polling loop.
+- The current adapter treats inbound conversations as direct messages and sends
+  text replies; group routing and media/file delivery are not implemented.
 
 Telegram forum topics:
 
@@ -735,39 +795,40 @@ Rules:
 - Empty `allow_from` denies inbound messages on allowlist-based channels. Set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
 - Telegram webhooks require `channels.telegram.accounts.<id>.webhook_secret` and Telegram's `X-Telegram-Bot-Api-Secret-Token` header to match.
-- Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams[].webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
+- Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams.accounts.<id>.webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
 
 ```json
 {
   "channels": {
-    "max": [
-      {
-        "account_id": "main",
-        "bot_token": "MAX_BOT_TOKEN",
-        "allow_from": ["YOUR_MAX_USER_ID"],
-        "group_allow_from": ["YOUR_MAX_USER_ID"],
-        "group_policy": "allowlist",
-        "mode": "webhook",
-        "webhook_url": "https://bot.example.com/max?account_id=main",
-        "webhook_secret": "replace-with-random-secret",
-        "require_mention": true,
-        "streaming": true,
-        "interactive": {
-          "enabled": true,
-          "ttl_secs": 900,
-          "owner_only": true
+    "max": {
+      "accounts": {
+        "main": {
+          "bot_token": "MAX_BOT_TOKEN",
+          "allow_from": ["YOUR_MAX_USER_ID"],
+          "group_allow_from": ["YOUR_MAX_USER_ID"],
+          "group_policy": "allowlist",
+          "mode": "webhook",
+          "webhook_url": "https://bot.example.com/max?account_id=main",
+          "webhook_secret": "replace-with-random-secret",
+          "require_mention": true,
+          "streaming": true,
+          "interactive": {
+            "enabled": true,
+            "ttl_secs": 900,
+            "owner_only": true
+          }
         }
       }
-    ]
+    }
   }
 }
 ```
 
 Max notes:
 
-- `channels.max` is an array of account entries; `account_id` distinguishes multiple Max bots.
+- `channels.max.accounts` is an object of account entries; each object key is the `account_id` that distinguishes multiple Max bots.
 - Prefer `mode = "webhook"` for production. Max documents long polling as suitable for development/testing, while webhooks are the recommended production path.
 - `webhook_url` must be HTTPS.
 - For multi-account webhook setups, give each account either a unique `webhook_secret` or a unique `account_id` query in the webhook URL, for example `/max?account_id=main`.
