@@ -378,39 +378,6 @@ const search_api_key_env_vars = [_][]const u8{
     "WEB_SEARCH_API_KEY",
 };
 
-const SearchApiKeyEnvGuard = struct {
-    values: [search_api_key_env_vars.len]?[]const u8 = [_]?[]const u8{null} ** search_api_key_env_vars.len,
-
-    fn init(allocator: std.mem.Allocator) !SearchApiKeyEnvGuard {
-        var guard = SearchApiKeyEnvGuard{};
-        errdefer guard.deinit(allocator);
-        errdefer guard.restore(allocator) catch {};
-
-        for (search_api_key_env_vars, 0..) |name, i| {
-            guard.values[i] = platform.getEnvOrNull(allocator, name);
-            try platform.setProcessEnv(allocator, name, null);
-        }
-
-        return guard;
-    }
-
-    fn restore(self: *const SearchApiKeyEnvGuard, allocator: std.mem.Allocator) !void {
-        for (search_api_key_env_vars, 0..) |name, i| {
-            try platform.setProcessEnv(allocator, name, self.values[i]);
-        }
-    }
-
-    fn deinit(self: *SearchApiKeyEnvGuard, allocator: std.mem.Allocator) void {
-        for (self.values) |value| {
-            if (value) |owned| allocator.free(owned);
-        }
-    }
-};
-
-fn restoreSearchApiKeyEnvOrPanic(allocator: std.mem.Allocator, guard: *const SearchApiKeyEnvGuard) void {
-    guard.restore(allocator) catch @panic("failed to restore web_search API key environment");
-}
-
 test "WebSearchTool name and description" {
     var wst = WebSearchTool{};
     const t = wst.tool();
@@ -439,9 +406,8 @@ test "WebSearchTool empty query fails" {
 
 test "WebSearchTool without working provider chain returns aggregate error" {
     // Regression: process-level web search API keys must not make this aggregate-failure test hit real providers.
-    var env_guard = try SearchApiKeyEnvGuard.init(testing.allocator);
-    defer env_guard.deinit(testing.allocator);
-    defer restoreSearchApiKeyEnvOrPanic(testing.allocator, &env_guard);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(testing.allocator, &search_api_key_env_vars);
+    defer env_guard.deinit();
 
     var wst = WebSearchTool{};
     const parsed = try root.parseTestArgs("{\"query\":\"zig programming\"}");

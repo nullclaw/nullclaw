@@ -6471,17 +6471,9 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
 }
 
 test "hasStartupProviderCredentials accepts gemini oauth env token" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
-    defer std.testing.allocator.free(env_name);
-    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
-    defer std.testing.allocator.free(env_value);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
-    defer _ = c.unsetenv(env_name.ptr);
+    var env_guard = try yc.platform.TestEnvGuard.capture(std.testing.allocator, &.{"GEMINI_OAUTH_TOKEN"});
+    defer env_guard.deinit();
+    try yc.platform.setProcessEnv(std.testing.allocator, "GEMINI_OAUTH_TOKEN", "ya29.test-oauth-token");
 
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
@@ -6530,41 +6522,14 @@ test "hasStartupProviderCredentials rejects missing provider and fallback creden
     // env vars leaking from the developer shell — production code's env-var
     // fallback (api_key.zig) is intentional, so the test must explicitly
     // save/unset/restore those vars to hold its "no credentials" premise.
-    // Windows is skipped: libc env-var manipulation is platform-specific.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    // Sentinel-terminated names so they pass directly to libc getenv/setenv.
-    const env_vars = [_][*:0]const u8{
+    const env_vars = [_][]const u8{
         "ANTHROPIC_OAUTH_TOKEN",
         "ANTHROPIC_API_KEY",
         "NULLCLAW_API_KEY",
         "API_KEY",
     };
-
-    // Save current values (heap-duped so the bytes survive unsetenv + setenv).
-    var saved = [_]?[:0]u8{null} ** env_vars.len;
-    inline for (env_vars, 0..) |name, i| {
-        if (c.getenv(name)) |ptr| {
-            saved[i] = try std.testing.allocator.dupeZ(u8, std.mem.span(ptr));
-        }
-    }
-    defer inline for (env_vars, 0..) |name, i| {
-        if (saved[i]) |val| {
-            _ = c.setenv(name, val.ptr, 1);
-            std.testing.allocator.free(val);
-        } else {
-            _ = c.unsetenv(name);
-        }
-    };
-
-    // Unset all so the test's "no credentials" premise holds regardless of
-    // what the developer shell has exported.
-    inline for (env_vars) |name| {
-        _ = c.unsetenv(name);
-    }
+    var env_guard = try yc.platform.TestEnvGuard.captureAndClear(std.testing.allocator, &env_vars);
+    defer env_guard.deinit();
 
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
