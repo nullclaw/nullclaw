@@ -13,9 +13,9 @@
 //!       .drop              => {},
 //!   }
 
-const agent_mod = @import("agent/root.zig");
+const config_types = @import("config_types.zig");
 
-pub const QueueMode = agent_mod.Agent.QueueMode;
+pub const QueueMode = config_types.QueueMode;
 
 /// Snapshot of the state needed to make a routing decision.
 /// Obtained via SessionManager.routeInput().
