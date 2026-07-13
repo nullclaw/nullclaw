@@ -150,6 +150,23 @@ Common per-provider fields:
 - Sets default model route, typically `provider/vendor/model`.
 - Example: `openrouter/anthropic/claude-sonnet-4`
 
+### `agent.default_queue_mode`
+
+- Sets the inbound queue mode for newly created sessions. Accepted values are `off`, `serial`, `latest`, and `debounce`; the default is `off`.
+- `off` drops messages that arrive while a turn is running, `serial` waits for the active turn, and `latest` keeps the newest pending injection. `debounce` selects the existing runtime debounce mode; this field does not configure its duration, cap, or drop policy.
+- `/queue` can override the mode for the current session. `/queue reset`, `/restart`, and `/debug reset` restore the configured default.
+- Changes require a restart so the session manager and newly created sessions use the same default.
+
+Example:
+
+```json
+{
+  "agent": {
+    "default_queue_mode": "latest"
+  }
+}
+```
+
 ### `workspace_audit.llm_triage`
 
 - Selects the provider/model used by `nullclaw workspace audit --llm-triage external`.
