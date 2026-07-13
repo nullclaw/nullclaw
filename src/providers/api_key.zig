@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const auth = @import("../auth.zig");
 const config_mod = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
 const json_util = @import("../json_util.zig");
 const platform = @import("../platform.zig");
 const provider_names = @import("../provider_names.zig");
@@ -217,9 +218,7 @@ fn writeQwenCredentialsJson(
 
     try buf.append(allocator, '}');
 
-    const file = std_compat.fs.createFileAbsolute(path, .{ .permissions = std_compat.fs.permissionsFromMode(0o600) }) catch return error.FileWriteError;
-    defer file.close();
-    try file.writeAll(buf.items);
+    fs_compat.writeFileAtomicSecure(path, buf.items) catch return error.FileWriteError;
 }
 
 fn refreshQwenCliCredentials(
@@ -618,6 +617,10 @@ test "writeQwenCredentialsJson preserves qwen oauth fields" {
     try std.testing.expectEqualStrings("id-token", obj.get("id_token").?.string);
     try std.testing.expectEqualStrings("https://portal.qwen.ai/v1", obj.get("resource_url").?.string);
     try std.testing.expectEqual(@as(i64, 1735689600000), obj.get("expiry_date").?.integer);
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        const metadata = try file.stat();
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), metadata.mode & 0o777);
+    }
 }
 
 test "resolveApiKey qwen-portal prefers oauth env over dashscope key" {

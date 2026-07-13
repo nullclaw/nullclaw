@@ -719,8 +719,9 @@ Max 说明：
   - `host = "127.0.0.1"`
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
-- 如果绑定到非 loopback 地址，像 `/webhook`、`/cron/*`、`/a2a`、`/media/transcribe` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求已存储的 bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。
+- 如果绑定到非 loopback 地址，像 `/webhook`、`/a2a`、`/media/transcribe` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求完整权限的 gateway bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。`/cron/*` 也接受下文所述的独立 cron-scoped 凭据。
 - 如果绑定到非 loopback 地址，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `paired_tokens`。
+- 需要 cron 鉴权时，gateway 会在启动时创建一个仅限 `/cron/*` 使用的 bearer token。gateway 只保留其哈希，并把加密后的凭据以 `0600` 权限写入配置目录下的 `paired_token`，因此启用了 `require_pairing` 或公开绑定时，schedule/cron 工具也能完成认证，包括配置了预设 pairing token 的情况。该凭据会在每次 gateway 重启时轮换，不属于交互式 `/pair` token。与其他 bearer 凭据一样，它不绑定客户端 IP；必须防止配置目录泄露。`require_pairing = false` 的匿名 loopback gateway 不会创建此凭据。
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|

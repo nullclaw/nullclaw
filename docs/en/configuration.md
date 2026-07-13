@@ -908,8 +908,10 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
-On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, `/a2a`, and `/media/transcribe` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
+On non-loopback binds, generic gateway endpoints such as `/webhook`, `/a2a`, and `/media/transcribe` still require a full gateway bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`. `/cron/*` also accepts the separate cron-scoped credential described below.
 On non-loopback binds, `/pair` only accepts loopback clients; do the initial pairing locally or preconfigure `paired_tokens` before exposing the gateway.
+
+When cron authentication is required, the gateway creates a bearer token scoped only to `/cron/*` at startup. It retains only the token hash and writes the encrypted credential to `paired_token` in the config directory with mode `0600`, allowing the schedule/cron tool to authenticate when `require_pairing = true` or the gateway is publicly bound, including configurations with preconfigured pairing tokens. The credential is rotated on every gateway restart and is not an interactive `/pair` token. Like any bearer credential, it is not bound to a client IP; protect the config directory from disclosure. An anonymous loopback gateway with `require_pairing = false` does not create this credential.
 
 | Field | Default | Description |
 |-------|---------|-------------|
