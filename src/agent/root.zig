@@ -206,21 +206,7 @@ pub const Agent = struct {
         }
     };
 
-    pub const QueueMode = enum {
-        off,
-        serial,
-        latest,
-        debounce,
-
-        pub fn toSlice(self: QueueMode) []const u8 {
-            return switch (self) {
-                .off => "off",
-                .serial => "serial",
-                .latest => "latest",
-                .debounce => "debounce",
-            };
-        }
-    };
+    pub const QueueMode = config_types.QueueMode;
 
     const QueueDrop = enum {
         summarize,
@@ -355,6 +341,7 @@ pub const Agent = struct {
     exec_ask: ExecAsk = .on_miss,
     exec_node_id: ?[]const u8 = null,
     exec_node_id_owned: bool = false,
+    default_queue_mode: QueueMode = .off,
     queue_mode: QueueMode = .off,
     queue_debounce_ms: u32 = 0,
     queue_cap: u32 = 0,
@@ -670,6 +657,8 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .default_queue_mode = cfg.agent.default_queue_mode,
+            .queue_mode = cfg.agent.default_queue_mode,
             .tools_config = cfg.tools,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .default_exec_security = resolved_exec_security,
@@ -5535,6 +5524,25 @@ test "Agent.fromConfig applies compact_context flag" {
     try std.testing.expect(!agent.maybeAutoCompactHistory());
 }
 
+test "Agent.fromConfig applies default_queue_mode" {
+    // Regression: parsing the default is insufficient unless both runtime fields receive it.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.default_queue_mode = .latest;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.default_queue_mode);
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
+}
+
 test "slash /new clears history" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -6878,6 +6886,23 @@ test "slash /queue updates queue settings" {
     try std.testing.expect(agent.queue_drop == .newest);
 }
 
+test "slash /queue reset restores configured default" {
+    // Regression: reset must not hardcode off after a non-off config default.
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.default_queue_mode = .latest;
+    agent.queue_mode = .serial;
+
+    const response = (try agent.handleSlashCommand("/queue reset")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
+    try std.testing.expectEqual(@as(u32, 0), agent.queue_debounce_ms);
+    try std.testing.expectEqual(@as(u32, 0), agent.queue_cap);
+    try std.testing.expect(agent.queue_drop == .summarize);
+}
+
 test "slash /usage updates usage mode" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -7149,6 +7174,8 @@ test "slash /restart clears runtime command settings" {
     defer allocator.free(usage_resp);
     const tts_resp = (try agent.handleSlashCommand("/tts always provider test-provider")).?;
     defer allocator.free(tts_resp);
+    agent.default_queue_mode = .latest;
+    agent.queue_mode = .serial;
     agent.total_tokens = 42;
     agent.last_turn_usage = .{ .prompt_tokens = 7, .completion_tokens = 5, .total_tokens = 12 };
 
@@ -7161,6 +7188,8 @@ test "slash /restart clears runtime command settings" {
     try std.testing.expect(agent.usage_mode == .off);
     try std.testing.expect(agent.tts_mode == .off);
     try std.testing.expect(agent.tts_provider == null);
+    // Regression: /restart clears overrides but keeps the configured queue default.
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
     try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
     try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
 }

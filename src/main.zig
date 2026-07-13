@@ -951,27 +951,36 @@ fn parseCronSessionTargetArg(raw: []const u8) !yc.cron.SessionTarget {
     return yc.cron.SessionTarget.parseStrict(raw);
 }
 
+fn cronAgentOptionValue(sub_args: []const []const u8, option_index: usize) ![]const u8 {
+    if (option_index + 1 >= sub_args.len or std.mem.startsWith(u8, sub_args[option_index + 1], "--")) {
+        return error.MissingCronOptionValue;
+    }
+    return sub_args[option_index + 1];
+}
+
 fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !CronAddAgentOptions {
     var options = CronAddAgentOptions{};
     var i: usize = start_index;
     while (i < sub_args.len) : (i += 1) {
-        if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
-            options.model = sub_args[i + 1];
+        if (std.mem.eql(u8, sub_args[i], "--model")) {
+            options.model = try cronAgentOptionValue(sub_args, i);
             i += 1;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--session-target")) {
-            options.session_target = try parseCronSessionTargetArg(sub_args[i + 1]);
+        } else if (std.mem.eql(u8, sub_args[i], "--session-target")) {
+            options.session_target = try parseCronSessionTargetArg(try cronAgentOptionValue(sub_args, i));
             i += 1;
         } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
             options.delivery.mode = .always;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
-            options.delivery.channel = sub_args[i + 1];
+        } else if (std.mem.eql(u8, sub_args[i], "--channel")) {
+            options.delivery.channel = try cronAgentOptionValue(sub_args, i);
             i += 1;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
-            options.delivery.account_id = sub_args[i + 1];
+        } else if (std.mem.eql(u8, sub_args[i], "--account")) {
+            options.delivery.account_id = try cronAgentOptionValue(sub_args, i);
             i += 1;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
-            options.delivery.to = sub_args[i + 1];
+        } else if (std.mem.eql(u8, sub_args[i], "--to")) {
+            options.delivery.to = try cronAgentOptionValue(sub_args, i);
             i += 1;
+        } else {
+            return error.UnknownCronOption;
         }
     }
     return options;
@@ -991,10 +1000,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  get <id> [--json]             Show one scheduled task
             \\  status [--json]               Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
+            \\  add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
-            \\  once-agent <delay> <prompt> [--model <model>]
+            \\  once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a one-shot delayed agent task
             \\  remove <id>                   Remove a scheduled task
             \\  pause <id>                    Pause a scheduled task
@@ -1067,6 +1076,14 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
                 std_compat.process.exit(1);
             },
+            error.MissingCronOptionValue => {
+                std.debug.print("Missing value for cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
+            error.UnknownCronOption => {
+                std.debug.print("Unknown cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
         };
         try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "once")) {
@@ -1077,7 +1094,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "once-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>]\n", .{});
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std_compat.process.exit(1);
         }
         const options = parseCronAgentOptions(sub_args, 3) catch |err| switch (err) {
@@ -1085,8 +1102,16 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
                 std_compat.process.exit(1);
             },
+            error.MissingCronOptionValue => {
+                std.debug.print("Missing value for cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
+            error.UnknownCronOption => {
+                std.debug.print("Unknown cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
         };
-        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target);
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});
@@ -6528,7 +6553,7 @@ test "parseCronAddAgentOptions preserves delivery account flag" {
         "--account",
         "main",
         "--to",
-        "7972814626",
+        "chat-42",
     };
 
     const options = try parseCronAddAgentOptions(&args);
@@ -6537,10 +6562,28 @@ test "parseCronAddAgentOptions preserves delivery account flag" {
     try std.testing.expectEqual(yc.cron.DeliveryMode.always, options.delivery.mode);
     try std.testing.expectEqualStrings("telegram", options.delivery.channel.?);
     try std.testing.expectEqualStrings("main", options.delivery.account_id.?);
-    try std.testing.expectEqualStrings("7972814626", options.delivery.to.?);
+    try std.testing.expectEqualStrings("chat-42", options.delivery.to.?);
     try std.testing.expect(!options.delivery.channel_owned);
     try std.testing.expect(!options.delivery.account_id_owned);
     try std.testing.expect(!options.delivery.to_owned);
+}
+
+test "parseCronAgentOptions rejects missing option values" {
+    // Regression: malformed cron agent flags must fail fast instead of being ignored.
+    const flags = [_][]const u8{ "--model", "--session-target", "--channel", "--account", "--to" };
+    for (flags) |flag| {
+        const args = [_][]const u8{ "once-agent", "30s", "Summarize status", flag };
+        try std.testing.expectError(error.MissingCronOptionValue, parseCronAgentOptions(&args, 3));
+
+        const followed_by_flag = [_][]const u8{ "once-agent", "30s", "Summarize status", flag, "--announce" };
+        try std.testing.expectError(error.MissingCronOptionValue, parseCronAgentOptions(&followed_by_flag, 3));
+    }
+}
+
+test "parseCronAgentOptions rejects unknown options" {
+    // Regression: cron agent CLI typos must not be silently ignored.
+    const args = [_][]const u8{ "once-agent", "30s", "Summarize status", "--unknown" };
+    try std.testing.expectError(error.UnknownCronOption, parseCronAgentOptions(&args, 3));
 }
 
 test "appendAgentInvokeResponseJson renders machine-readable turn payload" {

@@ -214,6 +214,14 @@ fn heartbeatDeliveryConfig(config: *const Config) ?cron.DeliveryConfig {
     });
 }
 
+fn heartbeatAgentRunOptions(delivery: ?cron.DeliveryConfig) agent_runner.AgentRunOptions {
+    const config = delivery orelse return .{};
+    return .{
+        .origin_channel = config.channel,
+        .origin_account_id = config.account_id,
+    };
+}
+
 fn recordGatewayFailure(err: anyerror, state: *DaemonState) void {
     requestShutdown();
     state.markError("gateway", @errorName(err));
@@ -295,7 +303,14 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                     } else {
                         const delivery = heartbeatDeliveryConfig(config);
                         const prompt = config.heartbeat.prompt orelse DEFAULT_HEARTBEAT_PROMPT;
-                        const result = agent_runner.run(allocator, config.workspace_dir, prompt, config.heartbeat.model, config.heartbeat.timeout_secs) catch |err| {
+                        const result = agent_runner.runWithOptions(
+                            allocator,
+                            config.workspace_dir,
+                            prompt,
+                            config.heartbeat.model,
+                            config.heartbeat.timeout_secs,
+                            heartbeatAgentRunOptions(delivery),
+                        ) catch |err| {
                             log.warn("heartbeat agent dispatch failed: {s}", .{@errorName(err)});
                             if (delivery) |cfg| {
                                 const failure_output = std.fmt.allocPrint(allocator, "heartbeat agent dispatch failed: {s}", .{@errorName(err)}) catch null;
@@ -3256,6 +3271,11 @@ test "heartbeatDeliveryConfig enriches routing" {
     try std.testing.expectEqualStrings("-100123", delivery.peer_id.?);
     try std.testing.expectEqualStrings("77", delivery.thread_id.?);
     try std.testing.expect(!delivery.best_effort);
+
+    // Regression: scheduled heartbeat agents must not be attributed to the CLI.
+    const options = heartbeatAgentRunOptions(delivery);
+    try std.testing.expectEqualStrings("telegram", options.origin_channel.?);
+    try std.testing.expectEqualStrings("backup", options.origin_account_id.?);
 }
 
 test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {

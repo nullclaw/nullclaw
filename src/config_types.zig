@@ -374,6 +374,35 @@ pub const ToolFilterGroup = struct {
     keywords: []const []const u8 = &.{},
 };
 
+pub const QueueMode = enum {
+    off,
+    serial,
+    latest,
+    debounce,
+
+    pub fn toSlice(self: QueueMode) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .serial => "serial",
+            .latest => "latest",
+            .debounce => "debounce",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?QueueMode {
+        return if (std.ascii.eqlIgnoreCase(s, "off"))
+            .off
+        else if (std.ascii.eqlIgnoreCase(s, "serial"))
+            .serial
+        else if (std.ascii.eqlIgnoreCase(s, "latest"))
+            .latest
+        else if (std.ascii.eqlIgnoreCase(s, "debounce"))
+            .debounce
+        else
+            null;
+    }
+};
+
 pub const AgentConfig = struct {
     /// When true (default), history is auto-compacted once it crosses the
     /// token / message thresholds. Set to false to skip proactive LLM
@@ -384,6 +413,7 @@ pub const AgentConfig = struct {
     max_history_messages: u32 = 100,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
+    default_queue_mode: QueueMode = .off,
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.
     /// Not serialized; used to distinguish override vs default fallback chain.
@@ -2258,4 +2288,24 @@ test "markdown_only profile preserves explicit half-life override" {
 
     // Regression: markdown_only should not clobber an explicit half-life override.
     try std.testing.expectEqual(@as(u32, 0), cfg.search.query.hybrid.temporal_decay.half_life_days);
+}
+
+test "QueueMode parser and serializer cover every mode" {
+    // Regression: config parsing and /queue must share one canonical mapping.
+    const cases = [_]struct {
+        mode: QueueMode,
+        text: []const u8,
+    }{
+        .{ .mode = .off, .text = "off" },
+        .{ .mode = .serial, .text = "serial" },
+        .{ .mode = .latest, .text = "latest" },
+        .{ .mode = .debounce, .text = "debounce" },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.text, case.mode.toSlice());
+        try std.testing.expectEqual(case.mode, QueueMode.fromSlice(case.text).?);
+    }
+    try std.testing.expectEqual(QueueMode.latest, QueueMode.fromSlice("LATEST").?);
+    try std.testing.expect(QueueMode.fromSlice("lastest") == null);
 }
