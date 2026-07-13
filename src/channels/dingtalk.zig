@@ -626,6 +626,8 @@ pub const DingTalkChannel = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ws_thread: ?std.Thread = null,
+    lifecycle_mu: std_compat.sync.Mutex = .{},
+    ws_mu: std_compat.sync.Mutex = .{},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     token_mu: std_compat.sync.Mutex = .{},
     access_token: ?[]u8 = null,
@@ -831,6 +833,35 @@ pub const DingTalkChannel = struct {
 
     pub fn healthCheck(self: *DingTalkChannel) bool {
         return self.running.load(.acquire) and self.connected.load(.acquire);
+    }
+
+    fn shutdownActiveWebsocket(self: *DingTalkChannel) void {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+    }
+
+    fn closeOwnedWebsocket(self: *DingTalkChannel, ws: *websocket.WsClient) void {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        ws.deinit();
+    }
+
+    fn closeOwnedWebsocketStream(self: *DingTalkChannel, stream: std_compat.net.Stream) void {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        stream.close();
+    }
+
+    fn publishWebsocket(self: *DingTalkChannel, fd: SocketFd) bool {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        self.ws_fd.store(fd, .release);
+        if (self.running.load(.acquire)) return true;
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        return false;
     }
 
     fn clearEphemeralState(self: *DingTalkChannel) void {
@@ -1537,14 +1568,26 @@ pub const DingTalkChannel = struct {
         var path_buf: [2048]u8 = undefined;
         const endpoint = try parse_endpoint_url(connection.endpoint, connection.ticket, &host_buf, &path_buf);
 
-        var ws = try websocket.WsClient.connect(self.allocator, endpoint.host, endpoint.port, endpoint.path, &.{});
-        self.ws_fd.store(ws.stream.handle, .release);
+        const ws_stream = try websocket.WsClient.connectTcp(self.allocator, endpoint.host, endpoint.port);
+        if (!self.publishWebsocket(ws_stream.handle)) {
+            self.closeOwnedWebsocketStream(ws_stream);
+            return error.ConnectionClosed;
+        }
+        var ws = websocket.WsClient.connectFromStream(
+            self.allocator,
+            ws_stream,
+            endpoint.host,
+            endpoint.path,
+            &.{},
+        ) catch |err| {
+            self.closeOwnedWebsocketStream(ws_stream);
+            return err;
+        };
         self.connected.store(true, .release);
         log.info("dingtalk websocket connected to {s}", .{endpoint.host});
         defer {
             self.connected.store(false, .release);
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
+            self.closeOwnedWebsocket(&ws);
         }
 
         while (self.running.load(.acquire)) {
@@ -1612,6 +1655,8 @@ pub const DingTalkChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         if (self.running.load(.acquire)) return;
 
         self.running.store(true, .release);
@@ -1628,13 +1673,14 @@ pub const DingTalkChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.running.store(false, .release);
         self.connected.store(false, .release);
 
-        const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).close();
-        }
+        // shutdown() wakes the websocket reader while runWebsocketOnce retains final
+        // close ownership through WsClient.deinit().
+        self.shutdownActiveWebsocket();
 
         if (self.ws_thread) |t| {
             t.join();
@@ -1701,6 +1747,29 @@ pub const DingTalkChannel = struct {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "dingtalk websocket published after stop is shut down safely" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        var ch = DingTalkChannel.init(std.testing.allocator, "cid", "secret", &.{});
+        ch.running.store(false, .release);
+
+        // Regression: stop must wake the reader without taking final close ownership
+        // away from WsClient.deinit in the websocket thread.
+        try std.testing.expect(!ch.publishWebsocket(sockets[0]));
+        try std.testing.expectEqual(invalid_socket, ch.ws_fd.load(.acquire));
+
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
+    }
+}
 
 test "build_open_connection_body subscribes to bot callback topic" {
     const body = try build_open_connection_body(std.testing.allocator, "cid", "secret");

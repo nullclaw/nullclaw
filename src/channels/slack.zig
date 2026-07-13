@@ -129,6 +129,7 @@ pub const SlackChannel = struct {
     lifecycle_mu: std_compat.sync.Mutex = .{},
     poll_thread: ?std.Thread = null,
     socket_thread: ?std.Thread = null,
+    socket_mu: std_compat.sync.Mutex = .{},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
     bot_team_id: ?[]u8 = null,
@@ -266,6 +267,35 @@ pub const SlackChannel = struct {
             .http => true,
             .socket => (self.connected.load(.acquire) and self.socket_thread != null) or self.poll_thread != null,
         };
+    }
+
+    fn shutdownActiveSocket(self: *SlackChannel) void {
+        self.socket_mu.lock();
+        defer self.socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+    }
+
+    fn closeOwnedSocket(self: *SlackChannel, ws: *websocket.WsClient) void {
+        self.socket_mu.lock();
+        defer self.socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        ws.deinit();
+    }
+
+    fn closeOwnedSocketStream(self: *SlackChannel, stream: std_compat.net.Stream) void {
+        self.socket_mu.lock();
+        defer self.socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        stream.close();
+    }
+
+    fn publishSocket(self: *SlackChannel, fd: SocketFd) bool {
+        self.socket_mu.lock();
+        defer self.socket_mu.unlock();
+        self.ws_fd.store(fd, .release);
+        if (self.running.load(.acquire)) return true;
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        return false;
     }
 
     fn setLastTs(self: *SlackChannel, ts: []const u8) !void {
@@ -860,13 +890,19 @@ pub const SlackChannel = struct {
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [2048]u8 = undefined;
         const parts = try parseSocketConnectParts(ws_url, &host_buf, &path_buf);
-        var ws = try websocket.WsClient.connect(self.allocator, parts.host, parts.port, parts.path, &.{});
+        const ws_stream = try websocket.WsClient.connectTcp(self.allocator, parts.host, parts.port);
+        if (!self.publishSocket(ws_stream.handle)) {
+            self.closeOwnedSocketStream(ws_stream);
+            return error.ConnectionClosed;
+        }
+        var ws = websocket.WsClient.connectFromStream(self.allocator, ws_stream, parts.host, parts.path, &.{}) catch |err| {
+            self.closeOwnedSocketStream(ws_stream);
+            return err;
+        };
         defer {
             self.connected.store(false, .release);
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
+            self.closeOwnedSocket(&ws);
         }
-        self.ws_fd.store(ws.stream.handle, .release);
         self.connected.store(true, .release);
 
         while (self.running.load(.acquire)) {
@@ -1292,11 +1328,9 @@ pub const SlackChannel = struct {
         self.running.store(false, .release);
         self.connected.store(false, .release);
 
-        const fd = self.ws_fd.load(.acquire);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).close();
-            self.ws_fd.store(invalid_socket, .release);
-        }
+        // shutdown() unblocks the socket reader while WsClient retains final close
+        // ownership in runSocketOnce's defer.
+        self.shutdownActiveSocket();
 
         if (self.socket_thread) |t| {
             t.join();
@@ -1626,6 +1660,29 @@ test "slack channel health check" {
     ch.poll_thread = t;
     defer ch.poll_thread = null;
     try std.testing.expect(ch.healthCheck());
+}
+
+test "slack socket published after stop is shut down without stealing close ownership" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &.{});
+        ch.running.store(false, .release);
+
+        // Regression: close() before joining could leave a blocked reader alive and
+        // let the later WsClient.deinit double-close a reused descriptor.
+        try std.testing.expect(!ch.publishSocket(sockets[0]));
+        try std.testing.expectEqual(invalid_socket, ch.ws_fd.load(.acquire));
+
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
+    }
 }
 
 test "slack socket thread stack size is 2MB" {
