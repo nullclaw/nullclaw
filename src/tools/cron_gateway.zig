@@ -22,63 +22,7 @@ pub fn buildAddBody(
     delivery: ?cron.DeliveryConfig,
     session_target: ?cron.SessionTarget,
 ) ![]u8 {
-    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer body_buf.deinit(allocator);
-
-    try body_buf.appendSlice(allocator, "{");
-    var wrote_field = false;
-
-    if (expression) |value| {
-        try appendBodyField(&body_buf, allocator, &wrote_field, "expression", value);
-    }
-    if (delay) |value| {
-        try appendBodyField(&body_buf, allocator, &wrote_field, "delay", value);
-    }
-    if (command) |value| {
-        try appendBodyField(&body_buf, allocator, &wrote_field, "command", value);
-    }
-    if (prompt) |value| {
-        try appendBodyField(&body_buf, allocator, &wrote_field, "prompt", value);
-    }
-    if (model) |value| {
-        try appendBodyField(&body_buf, allocator, &wrote_field, "model", value);
-    }
-    if (session_target) |value| {
-        try appendBodyField(&body_buf, allocator, &wrote_field, "session_target", value.asStr());
-    }
-    if (delivery) |cfg| {
-        if (cfg.mode != .none) {
-            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_mode", cfg.mode.asStr());
-        }
-        if (cfg.channel) |value| {
-            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_channel", value);
-        }
-        if (cfg.account_id) |value| {
-            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_account_id", value);
-        }
-        if (cfg.to) |value| {
-            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_to", value);
-        }
-        if (cfg.peer_kind) |value| {
-            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_kind", switch (value) {
-                .direct => "direct",
-                .group => "group",
-                .channel => "channel",
-            });
-        }
-        if (cfg.peer_id) |value| {
-            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_id", value);
-        }
-        if (cfg.thread_id) |value| {
-            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_thread_id", value);
-        }
-        if (!cfg.best_effort) {
-            try appendBodyLiteral(&body_buf, allocator, &wrote_field, "\"delivery_best_effort\":false");
-        }
-    }
-
-    try body_buf.appendSlice(allocator, "}");
-    return try body_buf.toOwnedSlice(allocator);
+    return cron.buildGatewayAddBody(allocator, expression, delay, command, prompt, model, delivery, session_target);
 }
 
 pub fn buildUpdateBody(
@@ -196,6 +140,27 @@ test "buildAddBody includes delivery fields" {
     try std.testing.expectEqualStrings("-100123", parsed.value.object.get("delivery_peer_id").?.string);
     try std.testing.expectEqualStrings("77", parsed.value.object.get("delivery_thread_id").?.string);
     try std.testing.expect(!parsed.value.object.get("delivery_best_effort").?.bool);
+}
+
+test "buildAddBody preserves explicit disabled delivery" {
+    // Regression: gateway and local CLI fallbacks must agree without --announce.
+    const body = try buildAddBody(
+        std.testing.allocator,
+        null,
+        "5m",
+        null,
+        "Summarize status",
+        null,
+        .{ .mode = .none, .channel = "telegram", .to = "chat-42" },
+        null,
+    );
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("none", parsed.value.object.get("delivery_mode").?.string);
+    try std.testing.expectEqualStrings("telegram", parsed.value.object.get("delivery_channel").?.string);
+    try std.testing.expectEqualStrings("chat-42", parsed.value.object.get("delivery_to").?.string);
 }
 
 test "buildUpdateBody includes enabled flag" {
