@@ -380,7 +380,7 @@ pub fn refreshAccessToken(
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    const result = try client.client.fetch(.{
+    const result = try client.fetch(.{
         .location = .{ .url = token_url },
         .method = .POST,
         .payload = payload,
@@ -506,7 +506,7 @@ pub fn startDeviceCodeFlow(
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    const result = try client.client.fetch(.{
+    const result = try client.fetch(.{
         .location = .{ .url = device_auth_url },
         .method = .POST,
         .payload = payload,
@@ -599,7 +599,7 @@ pub fn pollDeviceCode(
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = token_url },
             .method = .POST,
             .payload = payload,

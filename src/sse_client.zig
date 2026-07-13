@@ -82,6 +82,10 @@ pub const SseConnection = struct {
     /// Connect to SSE endpoint and start streaming
     /// Returns the HTTP status code
     pub fn connect(self: *SseConnection) !u16 {
+        // Android note: this persistent streaming request cannot use the
+        // buffered curl fallback in http_util. Signal's supported default is
+        // the local 127.0.0.1 daemon (no DNS lookup); a remote hostname still
+        // requires a dedicated long-lived curl transport.
         // URL already includes account query param from Signal channel config.
         const uri = try std.Uri.parse(self.url);
         self.body_reader = null;
