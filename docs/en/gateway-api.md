@@ -117,7 +117,7 @@ curl -X POST \
 Max webhook notes:
 
 - `nullclaw` routes `/max` to the configured Max account by `account_id` query first, then by `X-Max-Bot-Api-Secret`.
-- If `channels.max[].webhook_secret` is configured, the header is required and must match exactly.
+- If `channels.max.accounts.<id>.webhook_secret` is configured, the header is required and must match exactly.
 - Use HTTPS in the configured Max-side webhook URL.
 
 Teams webhook notes:
@@ -125,7 +125,7 @@ Teams webhook notes:
 - `nullclaw` validates the Bot Framework bearer token against Microsoft's OpenID metadata and signing keys before accepting the activity.
 - The token issuer must be `https://api.botframework.com`, the audience must match the configured Teams `client_id`, and the token `serviceUrl` must match the activity body.
 - Teams `channelId` endorsements are enforced from the published Bot Framework key metadata.
-- If `channels.teams[].webhook_secret` is configured, `X-Webhook-Secret` must also match exactly.
+- If `channels.teams.accounts.<id>.webhook_secret` is configured, `X-Webhook-Secret` must also match exactly.
 
 ## Media Transcription
 
