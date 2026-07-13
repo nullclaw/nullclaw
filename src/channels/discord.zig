@@ -495,11 +495,12 @@ pub const DiscordChannel = struct {
         }
 
         for (choices, 0..) |choice, i| {
-            options[i] = .{
-                .id = try self.allocator.dupe(u8, choice.id),
-                .label = try self.allocator.dupe(u8, choice.label),
-                .submit_text = try self.allocator.dupe(u8, choice.submit_text),
-            };
+            options[i] = try interaction_choices.ChoiceOption.initOwned(
+                self.allocator,
+                choice.id,
+                choice.label,
+                choice.submit_text,
+            );
             built += 1;
         }
 
@@ -555,10 +556,16 @@ pub const DiscordChannel = struct {
         }
 
         for (directive.options, 0..) |opt, i| {
+            const owned = try interaction_choices.ChoiceOption.initOwned(
+                self.allocator,
+                opt.id,
+                opt.label,
+                opt.submit_text,
+            );
             options[i] = .{
-                .id = try self.allocator.dupe(u8, opt.id),
-                .label = try self.allocator.dupe(u8, opt.label),
-                .submit_text = try self.allocator.dupe(u8, opt.submit_text),
+                .id = owned.id,
+                .label = owned.label,
+                .submit_text = owned.submit_text,
             };
             built += 1;
         }
