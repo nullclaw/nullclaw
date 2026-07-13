@@ -123,6 +123,7 @@ pub fn pathRequiresRestart(path: []const u8) bool {
     if (std.mem.startsWith(u8, path, "channels.")) return true;
     if (std.mem.startsWith(u8, path, "runtime.")) return true;
     if (std.mem.eql(u8, path, "memory.backend") or std.mem.eql(u8, path, "memory.profile")) return true;
+    if (std.mem.eql(u8, path, "agent.default_queue_mode")) return true;
     return false;
 }
 
@@ -505,6 +506,8 @@ test "pathRequiresRestart detects structural paths" {
     try std.testing.expect(pathRequiresRestart("channels.telegram.accounts.default.bot_token"));
     try std.testing.expect(pathRequiresRestart("runtime.kind"));
     try std.testing.expect(pathRequiresRestart("memory.backend"));
+    // A running session may have a /queue override; only new sessions read the configured default.
+    try std.testing.expect(pathRequiresRestart("agent.default_queue_mode"));
     try std.testing.expect(!pathRequiresRestart("default_temperature"));
 }
 
