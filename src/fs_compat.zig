@@ -398,6 +398,35 @@ test "stat returns file size" {
     try std.testing.expectEqual(@as(u64, 5), meta.size);
 }
 
+test "nofollow files remain readable through relative and absolute opens" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const dir = std_compat.fs.Dir.wrap(tmp_dir.dir);
+    try dir.writeFile(.{ .sub_path = "nofollow.txt", .data = "safe" });
+
+    // Regression: Zig 0.16 creates asynchronous no-follow handles on Windows
+    // but labels them blocking, causing INVALID_PARAMETER or a PENDING panic.
+    const relative_file = try dir.openFile("nofollow.txt", .{ .follow_symlinks = false });
+    defer relative_file.close();
+    if (builtin.os.tag == .windows) try std.testing.expect(relative_file.flags.nonblocking);
+    var relative_buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try relative_file.readAllPositional(&relative_buf));
+    try std.testing.expectEqualStrings("safe", &relative_buf);
+
+    const tmp_path = try dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const absolute_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "nofollow.txt" });
+    defer std.testing.allocator.free(absolute_path);
+
+    const absolute_file = try openPath(absolute_path, .{ .follow_symlinks = false });
+    defer absolute_file.close();
+    if (builtin.os.tag == .windows) try std.testing.expect(absolute_file.flags.nonblocking);
+    var absolute_buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try absolute_file.readAllPositional(&absolute_buf));
+    try std.testing.expectEqualStrings("safe", &absolute_buf);
+}
+
 test "makePath creates single directory" {
     if (builtin.os.tag == .wasi) return;
 
