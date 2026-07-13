@@ -211,6 +211,93 @@ pub fn freeTsvRows(allocator: std.mem.Allocator, rows: []const []const []const u
     allocator.free(rows);
 }
 
+fn messageEntriesFromTsvRows(allocator: std.mem.Allocator, rows: []const []const []const u8) ![]MessageEntry {
+    var messages = try allocator.alloc(MessageEntry, rows.len);
+    var filled: usize = 0;
+    errdefer {
+        for (messages[0..filled]) |entry| {
+            allocator.free(entry.role);
+            allocator.free(entry.content);
+        }
+        allocator.free(messages);
+    }
+
+    for (rows) |row| {
+        if (row.len < 2) continue;
+        const role = try allocator.dupe(u8, row[0]);
+        errdefer allocator.free(role);
+        const content = try allocator.dupe(u8, row[1]);
+        errdefer allocator.free(content);
+        messages[filled] = .{ .role = role, .content = content };
+        filled += 1;
+    }
+
+    if (filled < messages.len) return allocator.realloc(messages, filled);
+    return messages;
+}
+
+fn detailedMessageEntriesFromTsvRows(allocator: std.mem.Allocator, rows: []const []const []const u8) ![]root.DetailedMessageEntry {
+    var messages = try allocator.alloc(root.DetailedMessageEntry, rows.len);
+    var filled: usize = 0;
+    errdefer {
+        for (messages[0..filled]) |entry| {
+            allocator.free(entry.role);
+            allocator.free(entry.content);
+            allocator.free(entry.created_at);
+        }
+        allocator.free(messages);
+    }
+
+    for (rows) |row| {
+        if (row.len < 3) continue;
+        const role = try allocator.dupe(u8, row[0]);
+        errdefer allocator.free(role);
+        const content = try allocator.dupe(u8, row[1]);
+        errdefer allocator.free(content);
+        const created_at = try allocator.dupe(u8, row[2]);
+        errdefer allocator.free(created_at);
+        messages[filled] = .{
+            .role = role,
+            .content = content,
+            .created_at = created_at,
+        };
+        filled += 1;
+    }
+
+    if (filled < messages.len) return allocator.realloc(messages, filled);
+    return messages;
+}
+
+fn sessionInfosFromTsvRows(allocator: std.mem.Allocator, rows: []const []const []const u8) ![]root.SessionInfo {
+    var sessions = try allocator.alloc(root.SessionInfo, rows.len);
+    var filled: usize = 0;
+    errdefer {
+        for (sessions[0..filled]) |info| info.deinit(allocator);
+        allocator.free(sessions);
+    }
+
+    for (rows) |row| {
+        if (row.len < 5) continue;
+        const session_id = try allocator.dupe(u8, row[0]);
+        errdefer allocator.free(session_id);
+        const first_message_at = try allocator.dupe(u8, row[3]);
+        errdefer allocator.free(first_message_at);
+        const last_message_at = try allocator.dupe(u8, row[4]);
+        errdefer allocator.free(last_message_at);
+        sessions[filled] = .{
+            .session_id = session_id,
+            .message_count = std.fmt.parseInt(u64, row[1], 10) catch 0,
+            .turn_count = std.fmt.parseInt(u64, row[2], 10) catch 0,
+            .first_message_at = first_message_at,
+            .last_message_at = last_message_at,
+        };
+        filled += 1;
+    }
+
+    if (filled < sessions.len) return allocator.realloc(sessions, filled);
+    return sessions;
+}
+
 /// Build a MemoryEntry from a TSV row.
 /// Expected columns: [id, key, content, category, timestamp, session_id]
 fn buildEntry(allocator: std.mem.Allocator, row: []const []const u8) !MemoryEntry {
@@ -1131,32 +1218,7 @@ const ClickHouseMemoryImpl = struct {
         const rows = try parseTsvRows(allocator, body);
         defer freeTsvRows(allocator, rows);
 
-        var messages = try allocator.alloc(MessageEntry, rows.len);
-        var filled: usize = 0;
-        errdefer {
-            for (messages[0..filled]) |entry| {
-                allocator.free(entry.role);
-                allocator.free(entry.content);
-            }
-            allocator.free(messages);
-        }
-
-        for (rows) |row| {
-            if (row.len < 2) continue;
-            messages[filled] = .{
-                .role = try allocator.dupe(u8, row[0]),
-                .content = try allocator.dupe(u8, row[1]),
-            };
-            filled += 1;
-        }
-
-        // Shrink if some rows were skipped
-        if (filled < messages.len) {
-            const result = try allocator.realloc(messages, filled);
-            return result;
-        }
-
-        return messages;
+        return messageEntriesFromTsvRows(allocator, rows);
     }
 
     fn implSessionClearMessages(ptr: *anyopaque, session_id: []const u8) anyerror!void {
@@ -1283,13 +1345,21 @@ const ClickHouseMemoryImpl = struct {
         const offset_str = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
 
         const query = try std.fmt.allocPrint(allocator,
-            \\SELECT session_id, toString(count()), toString(min(created_at)), toString(max(created_at))
+            \\SELECT session_id, toString(count()),
+            \\       toString(countIf(role = 'assistant' OR (role = '{s}' AND startsWith(content, '{s}')))),
+            \\       toString(min(created_at)), toString(max(created_at))
             \\FROM {s}.{s}
             \\WHERE instance_id = {{iid:String}} AND role != '{s}'
             \\GROUP BY session_id
             \\ORDER BY max(created_at) DESC
             \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
-        , .{ self_.db_q, self_.messages_table_q, root.RUNTIME_COMMAND_ROLE });
+        , .{
+            root.TOOL_TURN_CHECKPOINT_ROLE,
+            root.TOOL_TURN_COMPLETION_CHECKPOINT,
+            self_.db_q,
+            self_.messages_table_q,
+            root.RUNTIME_COMMAND_ROLE,
+        });
         defer allocator.free(query);
 
         const body = try self_.executeQuery(allocator, query, &.{
@@ -1302,28 +1372,34 @@ const ClickHouseMemoryImpl = struct {
         const rows = try parseTsvRows(allocator, body);
         defer freeTsvRows(allocator, rows);
 
-        var sessions = try allocator.alloc(root.SessionInfo, rows.len);
-        var filled: usize = 0;
-        errdefer {
-            for (sessions[0..filled]) |info| info.deinit(allocator);
-            allocator.free(sessions);
-        }
+        return sessionInfosFromTsvRows(allocator, rows);
+    }
 
-        for (rows) |row| {
-            if (row.len < 4) continue;
-            sessions[filled] = .{
-                .session_id = try allocator.dupe(u8, row[0]),
-                .message_count = std.fmt.parseInt(u64, row[1], 10) catch 0,
-                .first_message_at = try allocator.dupe(u8, row[2]),
-                .last_message_at = try allocator.dupe(u8, row[3]),
-            };
-            filled += 1;
-        }
+    fn implSessionCountSessionTurns(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        if (filled < sessions.len) {
-            return allocator.realloc(sessions, filled);
-        }
-        return sessions;
+        const query = try std.fmt.allocPrint(self_.allocator,
+            \\SELECT toString(countIf(role = 'assistant' OR (role = '{s}' AND startsWith(content, '{s}'))))
+            \\FROM {s}.{s}
+            \\WHERE session_id = {{sid:String}} AND instance_id = {{iid:String}} AND role != '{s}'
+        , .{
+            root.TOOL_TURN_CHECKPOINT_ROLE,
+            root.TOOL_TURN_COMPLETION_CHECKPOINT,
+            self_.db_q,
+            self_.messages_table_q,
+            root.RUNTIME_COMMAND_ROLE,
+        });
+        defer self_.allocator.free(query);
+
+        const body = try self_.executeQuery(self_.allocator, query, &.{
+            .{ "sid", session_id },
+            .{ "iid", self_.instance_id },
+        });
+        defer self_.allocator.free(body);
+
+        const trimmed = std.mem.trim(u8, body, " \t\n\r");
+        if (trimmed.len == 0) return 0;
+        return std.fmt.parseInt(u64, trimmed, 10) catch 0;
     }
 
     fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
@@ -1373,31 +1449,7 @@ const ClickHouseMemoryImpl = struct {
         const rows = try parseTsvRows(allocator, body);
         defer freeTsvRows(allocator, rows);
 
-        var messages = try allocator.alloc(root.DetailedMessageEntry, rows.len);
-        var filled: usize = 0;
-        errdefer {
-            for (messages[0..filled]) |entry| {
-                allocator.free(entry.role);
-                allocator.free(entry.content);
-                allocator.free(entry.created_at);
-            }
-            allocator.free(messages);
-        }
-
-        for (rows) |row| {
-            if (row.len < 3) continue;
-            messages[filled] = .{
-                .role = try allocator.dupe(u8, row[0]),
-                .content = try allocator.dupe(u8, row[1]),
-                .created_at = try allocator.dupe(u8, row[2]),
-            };
-            filled += 1;
-        }
-
-        if (filled < messages.len) {
-            return allocator.realloc(messages, filled);
-        }
-        return messages;
+        return detailedMessageEntriesFromTsvRows(allocator, rows);
     }
 
     const session_vtable = SessionStore.VTable{
@@ -1409,6 +1461,7 @@ const ClickHouseMemoryImpl = struct {
         .loadUsage = &implSessionLoadUsage,
         .countSessions = &implSessionCountSessions,
         .listSessions = &implSessionListSessions,
+        .countSessionTurns = &implSessionCountSessionTurns,
         .countDetailedMessages = &implSessionCountDetailedMessages,
         .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
@@ -1585,6 +1638,37 @@ test "parseTsvRows multiple rows" {
     try std.testing.expectEqualStrings("b", rows[0][1]);
     try std.testing.expectEqualStrings("c", rows[1][0]);
     try std.testing.expectEqualStrings("d", rows[1][1]);
+}
+
+fn clickhouseSessionRowAllocationHarness(allocator: std.mem.Allocator) !void {
+    const first = [_][]const u8{ "user", "first", "2026-01-01 00:00:00" };
+    const skipped = [_][]const u8{"invalid"};
+    const second = [_][]const u8{ "assistant", "second", "2026-01-01 00:00:01" };
+    const rows = [_][]const []const u8{ first[0..], skipped[0..], second[0..] };
+
+    const messages = try messageEntriesFromTsvRows(allocator, &rows);
+    defer root.freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+
+    const detailed = try detailedMessageEntriesFromTsvRows(allocator, &rows);
+    defer root.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+
+    const session = [_][]const u8{ "session-a", "2", "1", "2026-01-01 00:00:00", "2026-01-01 00:00:01" };
+    const session_rows = [_][]const []const u8{session[0..]};
+    const sessions = try sessionInfosFromTsvRows(allocator, &session_rows);
+    defer root.freeSessionInfos(allocator, sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+}
+
+test "clickhouse session row conversion releases partial rows on allocation failure" {
+    // Regression: if a later field allocation failed, the in-progress row
+    // was not included in `filled` and its earlier duplicates leaked.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        clickhouseSessionRowAllocationHarness,
+        .{},
+    );
 }
 
 test "validateTransportSecurity allows loopback plaintext" {

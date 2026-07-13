@@ -475,7 +475,25 @@ fn trimTrailingNewline(text: []const u8) []const u8 {
     return trimmed;
 }
 
-fn appendAgentSessionListJson(out: anytype, sessions: []const yc.memory.SessionInfo, total: u64) !void {
+fn effectiveSessionTurnCount(
+    store: yc.memory.SessionStore,
+    session_id: []const u8,
+    known_raw_count: ?u64,
+) !u64 {
+    return store.countSessionTurns(session_id) catch |err| switch (err) {
+        // Compatibility with older API/custom SessionStore implementations.
+        // Their rows predate checkpoint projection, so retain the legacy
+        // pair-count approximation without scanning the transcript.
+        error.NotSupported => (known_raw_count orelse try store.countDetailedMessages(session_id)) / 2,
+        else => return err,
+    };
+}
+
+fn appendAgentSessionListJson(
+    out: anytype,
+    sessions: []const yc.memory.SessionInfo,
+    total: u64,
+) !void {
     try out.writeAll("{\"sessions\":[");
     for (sessions, 0..) |session, idx| {
         if (idx > 0) try out.writeAll(",");
@@ -485,7 +503,9 @@ fn appendAgentSessionListJson(out: anytype, sessions: []const yc.memory.SessionI
         try writeJsonString(out, session.first_message_at);
         try out.writeAll(",\"last_active\":");
         try writeJsonString(out, session.last_message_at);
-        try out.print(",\"turn_count\":{d},\"turn_running\":false}}", .{session.message_count / 2});
+        try out.print(",\"turn_count\":{d},\"turn_running\":false}}", .{
+            session.turn_count orelse return error.SessionTurnCountUnavailable,
+        });
     }
     try out.print("],\"total\":{d}}}", .{total});
 }
@@ -501,7 +521,9 @@ fn appendAgentSessionDetailJson(out: anytype, session: yc.memory.SessionInfo) !v
     try writeJsonString(out, session.first_message_at);
     try out.writeAll(",\"last_active\":");
     try writeJsonString(out, session.last_message_at);
-    try out.print(",\"turn_count\":{d},\"turn_running\":false}}", .{session.message_count / 2});
+    try out.print(",\"turn_count\":{d},\"turn_running\":false}}", .{
+        session.turn_count orelse return error.SessionTurnCountUnavailable,
+    });
 }
 
 fn writeAgentSessionDetailJson(session: yc.memory.SessionInfo) void {
@@ -714,8 +736,10 @@ fn runAgentInvokeJson(allocator: std.mem.Allocator, sub_args: []const []const u8
         };
         defer ctx.deinit();
 
-        const total = ctx.session_store.countDetailedMessages(effective_session) catch 0;
-        const turn_count: u64 = total / 2;
+        const turn_count = effectiveSessionTurnCount(ctx.session_store, effective_session, null) catch |err| {
+            writeJsonError("agent_invoke_failed", @errorName(err), ctx.cfg.memory.backend);
+            std_compat.process.exit(1);
+        };
         const response_text = trimTrailingNewline(result.stdout);
 
         writeRenderedJsonLine(appendAgentInvokeResponseJson, .{ effective_session, response_text, turn_count });
@@ -768,7 +792,22 @@ fn runAgentSessionsAdmin(allocator: std.mem.Allocator, sub_args: []const []const
             std_compat.process.exit(1);
         };
         defer yc.memory.freeSessionInfos(allocator, sessions);
-        try writeAgentSessionListJson(sessions, total);
+        for (sessions) |*session_info| {
+            if (session_info.turn_count == null) {
+                session_info.turn_count = effectiveSessionTurnCount(
+                    ctx.session_store,
+                    session_info.session_id,
+                    session_info.message_count,
+                ) catch |err| {
+                    writeJsonError("session_list_failed", @errorName(err), ctx.cfg.memory.backend);
+                    std_compat.process.exit(1);
+                };
+            }
+        }
+        writeAgentSessionListJson(sessions, total) catch |err| {
+            writeJsonError("session_list_failed", @errorName(err), ctx.cfg.memory.backend);
+            std_compat.process.exit(1);
+        };
         return;
     }
 
@@ -797,7 +836,18 @@ fn runAgentSessionsAdmin(allocator: std.mem.Allocator, sub_args: []const []const
 
     if (std.mem.eql(u8, subcmd, "get")) {
         if (session) |value| {
-            writeAgentSessionDetailJson(value);
+            var detail = value;
+            if (detail.turn_count == null) {
+                detail.turn_count = effectiveSessionTurnCount(
+                    ctx.session_store,
+                    value.session_id,
+                    value.message_count,
+                ) catch |err| {
+                    writeJsonError("session_get_failed", @errorName(err), ctx.cfg.memory.backend);
+                    std_compat.process.exit(1);
+                };
+            }
+            writeAgentSessionDetailJson(detail);
             return;
         }
         writeJsonError("session_not_found", "No session with that key", ctx.cfg.memory.backend);
@@ -3447,9 +3497,24 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
                 const shown_to: u64 = @intCast(offset + sessions.len);
                 std.debug.print("Sessions: showing {d}-{d} of {d}\n", .{ shown_from, shown_to, total });
                 for (sessions, 0..) |s, idx| {
-                    std.debug.print("  {d}. {s}  msgs={d}  first={s}  last={s}\n", .{
-                        offset + idx + 1, s.session_id, s.message_count, s.first_message_at, s.last_message_at,
-                    });
+                    if (s.turn_count) |turn_count| {
+                        std.debug.print("  {d}. {s}  records={d}  turns={d}  first={s}  last={s}\n", .{
+                            offset + idx + 1,
+                            s.session_id,
+                            s.message_count,
+                            turn_count,
+                            s.first_message_at,
+                            s.last_message_at,
+                        });
+                    } else {
+                        std.debug.print("  {d}. {s}  records={d}  first={s}  last={s}\n", .{
+                            offset + idx + 1,
+                            s.session_id,
+                            s.message_count,
+                            s.first_message_at,
+                            s.last_message_at,
+                        });
+                    }
                 }
             }
         }
@@ -3496,7 +3561,7 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             }
         }
 
-        const total = session_store.countDetailedMessages(session_id) catch |err| {
+        const raw_total = session_store.countDetailedMessages(session_id) catch |err| {
             if (err == error.NotSupported) {
                 if (json_mode) {
                     var msg_buf: [256]u8 = undefined;
@@ -3515,7 +3580,17 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             std_compat.process.exit(1);
         };
 
-        const messages = session_store.loadMessagesDetailed(allocator, session_id, limit, offset) catch |err| {
+        // Projection can collapse or expand a reserved checkpoint pair. Scan
+        // fixed-size raw chunks so offsets cannot split a pair without making
+        // even a tiny logical page materialize the entire session.
+        const projected_page = yc.memory.loadProjectedDetailedSessionPage(
+            allocator,
+            session_store,
+            session_id,
+            raw_total,
+            limit,
+            offset,
+        ) catch |err| {
             if (err == error.NotSupported) {
                 if (json_mode) {
                     var msg_buf: [256]u8 = undefined;
@@ -3533,10 +3608,13 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             std.debug.print("Failed to load messages: {s}\n", .{@errorName(err)});
             std_compat.process.exit(1);
         };
-        defer yc.memory.freeDetailedMessages(allocator, messages);
+        defer projected_page.deinit(allocator);
+        const total = projected_page.total;
+        const turn_count = projected_page.turn_count;
+        const messages = projected_page.messages;
 
         if (json_mode) {
-            writeHistoryShowJson(session_id, messages, total, limit, offset);
+            writeHistoryShowJson(session_id, messages, total, turn_count, limit, offset);
         } else {
             if (messages.len == 0) {
                 std.debug.print("No messages for session: {s}\n", .{session_id});
@@ -3562,7 +3640,13 @@ fn appendHistoryListJson(out: anytype, sessions: []const yc.memory.SessionInfo, 
         if (idx > 0) try out.writeAll(",");
         try out.writeAll("{\"session_id\":");
         try writeJsonString(out, s.session_id);
-        try out.print(",\"message_count\":{d},\"first_message_at\":", .{s.message_count});
+        try out.print(",\"message_count\":{d},\"turn_count\":", .{s.message_count});
+        if (s.turn_count) |turn_count| {
+            try out.print("{d}", .{turn_count});
+        } else {
+            try out.writeAll("null");
+        }
+        try out.writeAll(",\"first_message_at\":");
         try writeJsonString(out, s.first_message_at);
         try out.writeAll(",\"last_message_at\":");
         try writeJsonString(out, s.last_message_at);
@@ -3575,10 +3659,23 @@ fn writeHistoryListJson(sessions: []const yc.memory.SessionInfo, total: u64, lim
     writeRenderedJsonLine(appendHistoryListJson, .{ sessions, total, limit, offset });
 }
 
-fn appendHistoryShowJson(out: anytype, session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry, total: u64, limit: usize, offset: usize) !void {
+fn appendHistoryShowJson(
+    out: anytype,
+    session_id: []const u8,
+    messages: []const yc.memory.DetailedMessageEntry,
+    total: u64,
+    turn_count: u64,
+    limit: usize,
+    offset: usize,
+) !void {
     try out.writeAll("{\"session_id\":");
     try writeJsonString(out, session_id);
-    try out.print(",\"total\":{d},\"limit\":{d},\"offset\":{d},\"messages\":[", .{ total, limit, offset });
+    try out.print(",\"total\":{d},\"turn_count\":{d},\"limit\":{d},\"offset\":{d},\"messages\":[", .{
+        total,
+        turn_count,
+        limit,
+        offset,
+    });
     for (messages, 0..) |m, idx| {
         if (idx > 0) try out.writeAll(",");
         try out.writeAll("{\"role\":");
@@ -3592,8 +3689,15 @@ fn appendHistoryShowJson(out: anytype, session_id: []const u8, messages: []const
     try out.writeAll("]}");
 }
 
-fn writeHistoryShowJson(session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry, total: u64, limit: usize, offset: usize) void {
-    writeRenderedJsonLine(appendHistoryShowJson, .{ session_id, messages, total, limit, offset });
+fn writeHistoryShowJson(
+    session_id: []const u8,
+    messages: []const yc.memory.DetailedMessageEntry,
+    total: u64,
+    turn_count: u64,
+    limit: usize,
+    offset: usize,
+) void {
+    writeRenderedJsonLine(appendHistoryShowJson, .{ session_id, messages, total, turn_count, limit, offset });
 }
 
 fn writeJsonEscaped(out: anytype, s: []const u8) !void {
@@ -6597,17 +6701,60 @@ test "appendAgentInvokeResponseJson renders machine-readable turn payload" {
     );
 }
 
+test "effectiveSessionTurnCount preserves legacy store compatibility" {
+    const TestStore = struct {
+        exact_supported: bool,
+
+        fn store(self: *@This()) yc.memory.SessionStore {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn saveMessage(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+        fn loadMessages(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]yc.memory.MessageEntry {
+            return allocator.alloc(yc.memory.MessageEntry, 0);
+        }
+        fn clearMessages(_: *anyopaque, _: []const u8) anyerror!void {}
+        fn clearAutoSaved(_: *anyopaque, _: ?[]const u8) anyerror!void {}
+        fn countDetailedMessages(_: *anyopaque, _: []const u8) anyerror!u64 {
+            return 7;
+        }
+        fn countSessionTurns(ptr: *anyopaque, _: []const u8) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.exact_supported) return error.NotSupported;
+            return 2;
+        }
+
+        const vtable = yc.memory.SessionStore.VTable{
+            .saveMessage = saveMessage,
+            .loadMessages = loadMessages,
+            .clearMessages = clearMessages,
+            .clearAutoSaved = clearAutoSaved,
+            .countSessionTurns = countSessionTurns,
+            .countDetailedMessages = countDetailedMessages,
+        };
+    };
+
+    var legacy = TestStore{ .exact_supported = false };
+    try std.testing.expectEqual(@as(u64, 3), try effectiveSessionTurnCount(legacy.store(), "legacy", null));
+    try std.testing.expectEqual(@as(u64, 4), try effectiveSessionTurnCount(legacy.store(), "legacy", 9));
+
+    var exact = TestStore{ .exact_supported = true };
+    try std.testing.expectEqual(@as(u64, 2), try effectiveSessionTurnCount(exact.store(), "exact", null));
+}
+
 test "appendAgentSessionListJson renders persisted session metadata" {
     const sessions = [_]yc.memory.SessionInfo{
         .{
             .session_id = "s-1",
             .message_count = 4,
+            .turn_count = 2,
             .first_message_at = "2026-04-17T00:00:00Z",
             .last_message_at = "2026-04-17T00:05:00Z",
         },
         .{
             .session_id = "s-2",
             .message_count = 2,
+            .turn_count = 1,
             .first_message_at = "2026-04-17T00:10:00Z",
             .last_message_at = "2026-04-17T00:11:00Z",
         },
@@ -6626,6 +6773,7 @@ test "appendAgentSessionDetailJson renders one persisted session" {
     const session: yc.memory.SessionInfo = .{
         .session_id = "s-1",
         .message_count = 6,
+        .turn_count = 3,
         .first_message_at = "2026-04-17T00:00:00Z",
         .last_message_at = "2026-04-17T00:12:00Z",
     };
@@ -6644,6 +6792,7 @@ test "appendHistoryListJson renders paginated session history metadata" {
         .{
             .session_id = "s-1",
             .message_count = 3,
+            .turn_count = 2,
             .first_message_at = "2026-04-17T00:00:00Z",
             .last_message_at = "2026-04-17T00:03:00Z",
         },
@@ -6653,7 +6802,7 @@ test "appendHistoryListJson renders paginated session history metadata" {
 
     try appendHistoryListJson(&writer, &sessions, 9, 50, 0);
     try std.testing.expectEqualStrings(
-        "{\"total\":9,\"limit\":50,\"offset\":0,\"sessions\":[{\"session_id\":\"s-1\",\"message_count\":3,\"first_message_at\":\"2026-04-17T00:00:00Z\",\"last_message_at\":\"2026-04-17T00:03:00Z\"}]}",
+        "{\"total\":9,\"limit\":50,\"offset\":0,\"sessions\":[{\"session_id\":\"s-1\",\"message_count\":3,\"turn_count\":2,\"first_message_at\":\"2026-04-17T00:00:00Z\",\"last_message_at\":\"2026-04-17T00:03:00Z\"}]}",
         writer.buffered(),
     );
 }
@@ -6674,9 +6823,9 @@ test "appendHistoryShowJson renders paginated message history" {
     var buf: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
 
-    try appendHistoryShowJson(&writer, "s-1", &messages, 2, 100, 0);
+    try appendHistoryShowJson(&writer, "s-1", &messages, 2, 1, 100, 0);
     try std.testing.expectEqualStrings(
-        "{\"session_id\":\"s-1\",\"total\":2,\"limit\":100,\"offset\":0,\"messages\":[{\"role\":\"user\",\"content\":\"hi\",\"created_at\":\"2026-04-17T00:00:00Z\"},{\"role\":\"assistant\",\"content\":\"hello\",\"created_at\":\"2026-04-17T00:00:01Z\"}]}",
+        "{\"session_id\":\"s-1\",\"total\":2,\"turn_count\":1,\"limit\":100,\"offset\":0,\"messages\":[{\"role\":\"user\",\"content\":\"hi\",\"created_at\":\"2026-04-17T00:00:00Z\"},{\"role\":\"assistant\",\"content\":\"hello\",\"created_at\":\"2026-04-17T00:00:01Z\"}]}",
         writer.buffered(),
     );
 }
@@ -6698,6 +6847,7 @@ test "admin output renders large history payloads without truncation" {
     const rendered = try yc.admin_output.renderBytes(allocator, appendHistoryShowJson, .{
         "s-large",
         &messages,
+        @as(u64, 1),
         @as(u64, 1),
         @as(usize, 100),
         @as(usize, 0),

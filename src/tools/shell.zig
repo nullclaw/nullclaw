@@ -105,7 +105,7 @@ fn sandboxRestrictsToWorkspace(sandbox: ?Sandbox) bool {
     return false;
 }
 
-fn normalizeCommandInput(command: []const u8) []const u8 {
+pub fn normalizeCommandInput(command: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (unwrapMarkdownFence(trimmed)) |unfenced| {
         return std.mem.trim(u8, unfenced, " \t\r\n");
@@ -180,27 +180,27 @@ pub const ShellTool = struct {
         const command_input = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
         const command = normalizeCommandInput(command_input);
+        const requested_cwd = root.getString(args, "cwd");
 
-        // Validate command against security policy
+        // Validate command against security policy.
+        // ApprovalRequired is NOT caught here: the agent emits a structured
+        // approval request and suspends the turn. The exact thread-local grant,
+        // set only around the matching re-execution, bypasses this approval gate.
         if (self.policy) |pol| {
-            _ = pol.validateCommandExecution(command, false) catch |err| {
-                return switch (err) {
-                    error.CommandNotAllowed => blk: {
-                        const summary = command_summary.summarizeBlockedCommand(command);
-                        log.warn("command blocked by security policy: head={s} bytes={d} assignments={d}", .{
-                            summary.head,
-                            summary.byte_len,
-                            summary.assignment_count,
-                        });
-                        break :blk ToolResult.fail("Command not allowed by security policy");
-                    },
-                    error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
-                    error.MediumRiskBlocked => ToolResult.fail("Medium-risk command blocked by security policy"),
-                    error.ApprovalRequired => blk: {
-                        const msg = try std.fmt.allocPrint(allocator, "Command requires approval (medium/high risk): {s}", .{command});
-                        break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
-                    },
-                };
+            const approved = root.threadCommandApproved(tool_name, command_input, requested_cwd);
+            _ = pol.validateCommandExecution(command, approved) catch |err| switch (err) {
+                error.CommandNotAllowed => {
+                    const summary = command_summary.summarizeBlockedCommand(command);
+                    log.warn("command blocked by security policy: head={s} bytes={d} assignments={d}", .{
+                        summary.head,
+                        summary.byte_len,
+                        summary.assignment_count,
+                    });
+                    return ToolResult.fail("Command not allowed by security policy");
+                },
+                error.HighRiskBlocked => return ToolResult.fail("High-risk command blocked by security policy"),
+                error.MediumRiskBlocked => return ToolResult.fail("Medium-risk command blocked by security policy"),
+                error.ApprovalRequired => return error.ApprovalRequired,
             };
         }
 
@@ -660,7 +660,7 @@ test "shell sandboxed cwd outside workspace is rejected before spawn" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "sandboxed cwd must stay within workspace") != null);
 }
 
-test "shell ApprovalRequired error includes command name" {
+test "shell ApprovalRequired propagates as error" {
     const policy_mod = @import("../security/policy.zig");
     var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
     defer tracker.deinit();
@@ -670,7 +670,6 @@ test "shell ApprovalRequired error includes command name" {
         .workspace_dir = "/tmp",
         .require_approval_for_medium_risk = true,
         .block_high_risk_commands = false,
-        // touch is medium-risk; set false so the approval gate is reachable
         .block_medium_risk_commands = false,
         .tracker = &tracker,
         .allowed_commands = &allowed,
@@ -679,17 +678,11 @@ test "shell ApprovalRequired error includes command name" {
     var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
     const parsed = try root.parseTestArgs("{\"command\": \"touch test.txt\"}");
     defer parsed.deinit();
-    const result = try st.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
 
-    try std.testing.expect(!result.success);
-    try std.testing.expect(result.error_msg != null);
-    defer std.testing.allocator.free(result.error_msg.?);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "touch test.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "approval") != null);
+    try std.testing.expectError(error.ApprovalRequired, st.execute(std.testing.allocator, parsed.value.object));
 }
 
-test "shell ApprovalRequired propagates oom for error message allocation" {
+test "shell ApprovalRequired bypassed only for exact approved command" {
     const policy_mod = @import("../security/policy.zig");
     var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
     defer tracker.deinit();
@@ -699,22 +692,29 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
         .workspace_dir = "/tmp",
         .require_approval_for_medium_risk = true,
         .block_high_risk_commands = false,
-        // touch is medium-risk; set false so the approval gate is reachable
         .block_medium_risk_commands = false,
         .tracker = &tracker,
         .allowed_commands = &allowed,
     };
 
-    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
     const parsed = try root.parseTestArgs("{\"command\": \"touch test.txt\"}");
     defer parsed.deinit();
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    failing.fail_index = failing.alloc_index;
+    const previous = root.setThreadApprovalGrant(.{
+        .tool_name = "shell",
+        .command = "touch test.txt",
+        .cwd = "/tmp/work-a",
+    });
+    defer _ = root.setThreadApprovalGrant(previous);
+
+    // Regression: #900 approval is an exact capability, not a thread-wide
+    // boolean. Validate the policy directly to avoid spawning a real process.
+    _ = try policy.validateCommandExecution("touch test.txt", root.threadCommandApproved("shell", "touch test.txt", "/tmp/work-a"));
     try std.testing.expectError(
-        error.OutOfMemory,
-        st.execute(failing.allocator(), parsed.value.object),
+        error.ApprovalRequired,
+        policy.validateCommandExecution("touch other.txt", root.threadCommandApproved("shell", "touch other.txt", "/tmp/work-a")),
     );
+    try std.testing.expect(!root.threadCommandApproved("shell", "touch test.txt", "/tmp/work-b"));
 }
 
 test "shell MediumRiskBlocked error is user-facing" {

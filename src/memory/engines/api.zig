@@ -49,6 +49,7 @@ pub const ApiMemory = struct {
 
     const HistoryShowResponse = struct {
         total: u64,
+        turn_count: ?u64,
         messages: []DetailedMessageEntry,
 
         fn deinit(self: @This(), alloc: Allocator) void {
@@ -664,6 +665,10 @@ pub const ApiMemory = struct {
                 try parseJsonU64(v)
             else
                 continue;
+            const turn_count = if (obj.get("turn_count")) |v| switch (v) {
+                .null => null,
+                else => try parseJsonU64(v),
+            } else null;
 
             const first_message_at = if (obj.get("first_message_at")) |v| switch (v) {
                 .string => |s| s,
@@ -685,6 +690,7 @@ pub const ApiMemory = struct {
             try results.append(alloc, .{
                 .session_id = owned_session_id,
                 .message_count = message_count,
+                .turn_count = turn_count,
                 .first_message_at = owned_first,
                 .last_message_at = owned_last,
             });
@@ -773,6 +779,10 @@ pub const ApiMemory = struct {
         };
 
         const total = try parseJsonU64(obj.get("total") orelse return error.ApiInvalidResponse);
+        const turn_count = if (obj.get("turn_count")) |value| switch (value) {
+            .null => null,
+            else => try parseJsonU64(value),
+        } else null;
         const messages_arr = switch (obj.get("messages") orelse return error.ApiInvalidResponse) {
             .array => |a| a,
             else => return error.ApiInvalidResponse,
@@ -780,6 +790,7 @@ pub const ApiMemory = struct {
 
         return .{
             .total = total,
+            .turn_count = turn_count,
             .messages = try parseHistoryDetailedMessages(alloc, messages_arr),
         };
     }
@@ -1125,6 +1136,26 @@ pub const ApiMemory = struct {
         return parsed.total;
     }
 
+    fn implCountSessionTurns(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+
+        const url = try self.buildHistoryShowUrl(alloc, session_id, 1, 0);
+        defer alloc.free(url);
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return error.NotSupported;
+        if (resp.status != .ok) {
+            log.warn("API history countSessionTurns failed: status={d}", .{@intFromEnum(resp.status)});
+            return error.ApiRequestFailed;
+        }
+
+        var parsed = try parseHistoryShowResponse(alloc, resp.body);
+        defer parsed.deinit(alloc);
+        return parsed.turn_count orelse error.NotSupported;
+    }
+
     fn implLoadMessagesDetailed(ptr: *anyopaque, alloc: Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]DetailedMessageEntry {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -1153,6 +1184,7 @@ pub const ApiMemory = struct {
         .loadUsage = &implLoadUsage,
         .countSessions = &implCountSessions,
         .listSessions = &implListSessions,
+        .countSessionTurns = &implCountSessionTurns,
         .countDetailedMessages = &implCountDetailedMessages,
         .loadMessagesDetailed = &implLoadMessagesDetailed,
     };
@@ -1492,8 +1524,8 @@ test "api parse history list response" {
     const alloc = std.testing.allocator;
     const json =
         \\{"total":2,"limit":50,"offset":0,"sessions":[
-        \\  {"session_id":"sess-1","message_count":4,"first_message_at":"2026-03-01T10:00:00Z","last_message_at":"2026-03-01T10:05:00Z"},
-        \\  {"session_id":"sess-2","message_count":"2","first_message_at":"2026-03-02T11:00:00Z","last_message_at":"2026-03-02T11:01:00Z"}
+        \\  {"session_id":"sess-1","message_count":4,"turn_count":2,"first_message_at":"2026-03-01T10:00:00Z","last_message_at":"2026-03-01T10:05:00Z"},
+        \\  {"session_id":"sess-2","message_count":"2","turn_count":null,"first_message_at":"2026-03-02T11:00:00Z","last_message_at":"2026-03-02T11:01:00Z"}
         \\]}
     ;
 
@@ -1504,6 +1536,8 @@ test "api parse history list response" {
     try std.testing.expectEqual(@as(usize, 2), parsed.sessions.len);
     try std.testing.expectEqualStrings("sess-1", parsed.sessions[0].session_id);
     try std.testing.expectEqual(@as(u64, 4), parsed.sessions[0].message_count);
+    try std.testing.expectEqual(@as(?u64, 2), parsed.sessions[0].turn_count);
+    try std.testing.expectEqual(@as(?u64, null), parsed.sessions[1].turn_count);
     try std.testing.expectEqualStrings("2026-03-01T10:00:00Z", parsed.sessions[0].first_message_at);
     try std.testing.expectEqualStrings("2026-03-02T11:01:00Z", parsed.sessions[1].last_message_at);
 }
@@ -1511,7 +1545,7 @@ test "api parse history list response" {
 test "api parse history show response" {
     const alloc = std.testing.allocator;
     const json =
-        \\{"session_id":"sess-1","total":"2","limit":100,"offset":0,"messages":[
+        \\{"session_id":"sess-1","total":"2","turn_count":1,"limit":100,"offset":0,"messages":[
         \\  {"role":"user","content":"Hello","created_at":"2026-03-01T10:00:00Z"},
         \\  {"role":"assistant","content":"Hi","created_at":"2026-03-01T10:00:01Z"}
         \\]}
@@ -1521,6 +1555,7 @@ test "api parse history show response" {
     defer parsed.deinit(alloc);
 
     try std.testing.expectEqual(@as(u64, 2), parsed.total);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.turn_count);
     try std.testing.expectEqual(@as(usize, 2), parsed.messages.len);
     try std.testing.expectEqualStrings("user", parsed.messages[0].role);
     try std.testing.expectEqualStrings("Hello", parsed.messages[0].content);

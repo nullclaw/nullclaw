@@ -2,7 +2,8 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
-const Tool = @import("../tools/root.zig").Tool;
+const tools_mod = @import("../tools/root.zig");
+const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
 const spawn_tool_mod = @import("../tools/spawn.zig");
 const subagent_mod = @import("../subagent.zig");
@@ -141,6 +142,27 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
 
 fn slashCommandClearsSession(kind: SlashCommandKind) bool {
     return kind == .new_reset or kind == .restart;
+}
+
+pub fn isPendingApprovalControlMessage(message: []const u8) bool {
+    const cmd = parseSlashCommand(message) orelse return false;
+    return switch (classifySlashCommand(cmd)) {
+        .stop, .new_reset, .restart, .poll => true,
+        else => false,
+    };
+}
+
+pub fn isPendingApprovalStatusMessage(message: []const u8) bool {
+    const cmd = parseSlashCommand(message) orelse return false;
+    return classifySlashCommand(cmd) == .poll;
+}
+
+pub fn isPendingExecControlMessage(message: []const u8) bool {
+    const cmd = parseSlashCommand(message) orelse return false;
+    return switch (classifySlashCommand(cmd)) {
+        .approve, .stop, .new_reset, .restart, .poll => true,
+        else => false,
+    };
 }
 
 pub fn planTurnInput(message: []const u8) TurnInputPlan {
@@ -1047,6 +1069,15 @@ test "planTurnInput keeps /menu on local-only path" {
     try std.testing.expect(plan.llm_user_message == null);
 }
 
+test "pending exec controls exclude ordinary messages and replacement bash" {
+    for ([_][]const u8{ "/approve allow-once", "/stop", "/new", "/reset", "/restart", "/poll" }) |message| {
+        try std.testing.expect(isPendingExecControlMessage(message));
+    }
+    try std.testing.expect(!isPendingExecControlMessage("replace the pending command"));
+    try std.testing.expect(!isPendingExecControlMessage("/bash replacement"));
+    try std.testing.expect(!isPendingExecControlMessage("/status"));
+}
+
 test "planTurnInput keeps interactive skill activation local-only" {
     // Regression: /iskill must stay on the local handler path so it can arm an
     // interactive session skill instead of being treated as unknown slash text.
@@ -1783,11 +1814,30 @@ fn clearPendingExecCommand(self: anytype) void {
     }
     self.pending_exec_command = null;
     self.pending_exec_command_owned = false;
+    if (comptime @hasDecl(@TypeOf(self.*), "clearPendingExecOrigin")) {
+        self.clearPendingExecOrigin();
+    }
+}
+
+fn clearStructuredPendingApproval(self: anytype) bool {
+    if (comptime @hasField(@TypeOf(self.*), "pending_approval") and
+        @hasDecl(@TypeOf(self.*), "clearPendingApproval"))
+    {
+        const had_pending = self.pending_approval != null;
+        self.clearPendingApproval();
+        return had_pending;
+    }
+    return false;
 }
 
 fn setPendingExecCommand(self: anytype, command: []const u8) !void {
     clearPendingExecCommand(self);
-    self.pending_exec_command = try self.allocator.dupe(u8, command);
+    const owned_command = try self.allocator.dupe(u8, command);
+    errdefer self.allocator.free(owned_command);
+    if (comptime @hasDecl(@TypeOf(self.*), "capturePendingExecOrigin")) {
+        try self.capturePendingExecOrigin();
+    }
+    self.pending_exec_command = owned_command;
     self.pending_exec_command_owned = true;
     self.pending_exec_id += 1;
     if (self.pending_exec_id == 0) self.pending_exec_id = 1;
@@ -3310,6 +3360,7 @@ fn findShellTool(self: anytype) ?Tool {
 fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
+    _ = clearStructuredPendingApproval(self);
     clearActiveSkillSession(self);
     if (@hasField(@TypeOf(self.*), "total_tokens")) {
         self.total_tokens = 0;
@@ -3470,6 +3521,7 @@ fn resetRuntimeCommandState(self: anytype) void {
     self.tts_summary = false;
     self.tts_audio = false;
     clearPendingExecCommand(self);
+    _ = clearStructuredPendingApproval(self);
     self.session_ttl_secs = null;
     if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
     self.focus_target = null;
@@ -4057,7 +4109,12 @@ fn parseApproveDecision(raw: []const u8) ?enum { allow_once, allow_always, deny 
     return null;
 }
 
-fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool) ![]const u8 {
+fn runShellCommand(
+    self: anytype,
+    command: []const u8,
+    skip_approval_gate: bool,
+    barrier_already_run: bool,
+) ![]const u8 {
     if (self.exec_host == .node) {
         return try self.allocator.dupe(u8, "Exec blocked: host=node is not available in this runtime");
     }
@@ -4096,7 +4153,27 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     var args: std.json.ObjectMap = .empty;
     try args.put(arena, "command", .{ .string = command });
 
+    const previous_approval_grant = tools_mod.setThreadApprovalGrant(if (skip_approval_gate) .{
+        .tool_name = shell_tool.name(),
+        .command = command,
+        .cwd = null,
+    } else null);
+    defer _ = tools_mod.setThreadApprovalGrant(previous_approval_grant);
+
+    // Direct /bash commands bypass the provider tool loop, but they still
+    // execute the same external side effect. Require the caller's durable
+    // write-ahead fence immediately before dispatch.
+    if (!barrier_already_run) try self.runBeforeToolDispatchBarrier();
+
     const result = shell_tool.execute(arena, args) catch |err| {
+        if (err == error.ApprovalRequired and !skip_approval_gate) {
+            try setPendingExecCommand(self, command);
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Exec approval required (id={d}). Use /approve {d} allow-once|allow-always|deny",
+                .{ self.pending_exec_id, self.pending_exec_id },
+            );
+        }
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
     };
 
@@ -4107,6 +4184,13 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
 fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {
     const pending_command = self.pending_exec_command orelse
         return try self.allocator.dupe(u8, "No pending approval requests.");
+    if (comptime @hasDecl(@TypeOf(self.*), "pendingExecOriginMatchesCurrent")) {
+        if (!self.pendingExecOriginMatchesCurrent()) {
+            // A collapsed DM scope may share one Agent across authenticated
+            // principals. Never reveal or execute another principal's request.
+            return try self.allocator.dupe(u8, "No pending approval requests.");
+        }
+    }
 
     const trimmed = std.mem.trim(u8, arg, " \t");
     if (trimmed.len == 0) {
@@ -4145,13 +4229,18 @@ fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     const command_to_run = pending_command;
-    defer clearPendingExecCommand(self);
+
+    // A legacy slash approval can execute the same shell side effects as a
+    // provider tool call. Require the caller's durable write-ahead barrier
+    // before consuming the one-shot pending command or weakening ask policy.
+    try self.runBeforeToolDispatchBarrier();
 
     if (decision == .allow_always) {
         self.exec_ask = .off;
     }
 
-    const output = try runShellCommand(self, command_to_run, true);
+    defer clearPendingExecCommand(self);
+    const output = try runShellCommand(self, command_to_run, true, true);
     defer self.allocator.free(output);
     return try std.fmt.allocPrint(
         self.allocator,
@@ -4524,15 +4613,26 @@ fn handleTellCommand(self: anytype, arg: []const u8) ![]const u8 {
 }
 
 fn handlePollCommand(self: anytype) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(self.allocator);
-    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    var out_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out_writer.deinit();
     const w = &out_writer.writer;
 
     var wrote_any = false;
-    if (self.pending_exec_command) |cmd| {
+    if (self.pending_exec_command != null) {
         wrote_any = true;
-        try w.print("Pending approval id={d}: {s}\n", .{ self.pending_exec_id, cmd });
+        try w.writeAll("Pending exec approval.\n");
+    }
+    if (comptime @hasField(@TypeOf(self.*), "pending_approval")) {
+        if (self.pending_approval) |pending| {
+            wrote_any = true;
+            // The random request id is an authenticated one-shot capability;
+            // status output may be shared by multiple principals under a
+            // collapsed DM scope, so never disclose it through `/poll`.
+            try w.print("Pending tool approval: tool={s}, risk={s}\n", .{
+                pending.tool_name,
+                pending.risk_level.toString(),
+            });
+        }
     }
 
     if (findSubagentManager(self)) |manager| {
@@ -4566,7 +4666,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
     if (!wrote_any) {
         return try self.allocator.dupe(u8, "No pending approvals or background tasks.");
     }
-    out = out_writer.toArrayList();
+    var out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -4576,6 +4676,7 @@ fn handleStopCommand(self: anytype) ![]const u8 {
         clearPendingExecCommand(self);
         cleared_pending = true;
     }
+    if (clearStructuredPendingApproval(self)) cleared_pending = true;
 
     if (findSubagentManager(self)) |manager| {
         var running: u32 = 0;
@@ -4593,7 +4694,7 @@ fn handleStopCommand(self: anytype) ![]const u8 {
             if (cleared_pending) {
                 return try std.fmt.allocPrint(
                     self.allocator,
-                    "Cleared pending exec approval. {d} running subagent tasks cannot be interrupted in this runtime.",
+                    "Cleared pending approval. {d} running subagent tasks cannot be interrupted in this runtime.",
                     .{running},
                 );
             }
@@ -4606,7 +4707,7 @@ fn handleStopCommand(self: anytype) ![]const u8 {
     }
 
     if (cleared_pending) {
-        return try self.allocator.dupe(u8, "Cleared pending exec approval.");
+        return try self.allocator.dupe(u8, "Cleared pending approval.");
     }
     return try self.allocator.dupe(u8, "No active background task to stop.");
 }
@@ -5302,7 +5403,7 @@ fn handleBashCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (std.ascii.eqlIgnoreCase(command, "stop")) {
         return try self.allocator.dupe(u8, "No background command is running.");
     }
-    return try runShellCommand(self, command, false);
+    return try runShellCommand(self, command, false, false);
 }
 
 pub fn isExecToolName(tool_name: []const u8) bool {
@@ -5310,16 +5411,24 @@ pub fn isExecToolName(tool_name: []const u8) bool {
 }
 
 pub fn execBlockMessage(self: anytype, args: std.json.ObjectMap) ?[]const u8 {
+    return execBlockMessageWithOptions(self, args, false);
+}
+
+pub fn execBlockMessageWithOptions(
+    self: anytype,
+    args: std.json.ObjectMap,
+    approval_granted: bool,
+) ?[]const u8 {
     if (self.exec_host == .node) {
         return "Exec blocked: host=node is not available in this runtime";
     }
     if (self.exec_security == .deny) {
         return "Exec blocked by /exec security=deny";
     }
-    if (self.exec_ask == .always) {
-        if (args.get("command")) |v| {
-            if (v == .string) {
-                _ = setPendingExecCommand(self, v.string) catch {};
+    if (!approval_granted and self.exec_ask == .always) {
+        if (args.get("command")) |value| {
+            if (value == .string) {
+                _ = setPendingExecCommand(self, value.string) catch {};
             }
         }
         return "Exec blocked: approval required. Use /approve allow-once|allow-always|deny";

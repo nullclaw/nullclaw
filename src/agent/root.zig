@@ -29,6 +29,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const CommandRiskLevel = @import("../security/root.zig").CommandRiskLevel;
 const util = @import("../util.zig");
 const verbose_mod = @import("../verbose.zig");
 const cost_mod = @import("../cost.zig");
@@ -79,9 +80,301 @@ pub const ProgressSink = struct {
     }
 };
 
+/// Structured approval request emitted by the agent runtime.
+/// All slices are borrowed and valid only for the callback invocation.
+pub const ApprovalRequest = struct {
+    request_id: []const u8,
+    action: []const u8,
+    reason: []const u8,
+};
+
+/// Returns true only when the request was accepted by an interactive channel.
+pub const ApprovalCallback = *const fn (ctx: *anyopaque, request: ApprovalRequest) bool;
+
+pub const ApprovalSink = struct {
+    callback: ApprovalCallback,
+    ctx: *anyopaque,
+
+    pub fn emit(self: ApprovalSink, request: ApprovalRequest) bool {
+        return self.callback(self.ctx, request);
+    }
+};
+
 /// Callback invoked at each tool-loop boundary to drain a pending mid-turn injection.
 /// Returns an owned slice allocated with the provided allocator, or null if empty.
 pub const DrainCallback = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8;
+
+/// Called once before the first tool batch in a turn can dispatch. Session
+/// runtimes use this as a durable write-ahead barrier; returning an error must
+/// abort the batch before any external side effect starts.
+pub const BeforeToolDispatchCallback = *const fn (ctx: *anyopaque) anyerror!void;
+
+// ── Structured approval (approval_request / approval_response) ────────────
+
+const APPROVAL_REQUEST_TTL_SECS: i64 = 300;
+const APPROVAL_REQUEST_ENTROPY_BYTES: usize = 16;
+pub const APPROVAL_REQUEST_ID_LEN: usize = APPROVAL_REQUEST_ENTROPY_BYTES * 2;
+const APPROVAL_DENIED_PERSISTENCE_RESULT =
+    "The approval-gated tool was denied and was not executed. Do not retry it automatically.";
+
+const CachedToolCallResult = struct {
+    success: bool,
+    output: []const u8,
+    output_owned: bool,
+};
+
+const ToolCallResultCache = std.AutoHashMapUnmanaged(u64, CachedToolCallResult);
+
+fn deinitToolCallResultCache(
+    allocator: std.mem.Allocator,
+    result_cache: *ToolCallResultCache,
+) void {
+    var it = result_cache.valueIterator();
+    while (it.next()) |cached_result| {
+        if (cached_result.output_owned and cached_result.output.len > 0) allocator.free(cached_result.output);
+    }
+    result_cache.deinit(allocator);
+    result_cache.* = .empty;
+}
+
+fn dupeOptionalApprovalOriginField(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) !?[]const u8 {
+    return if (value) |field| try allocator.dupe(u8, field) else null;
+}
+
+fn optionalApprovalOriginFieldEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |a_value| {
+        const b_value = b orelse return false;
+        return std.mem.eql(u8, a_value, b_value);
+    }
+    return b == null;
+}
+
+/// Immutable authenticated route that requested an approval. Session routing
+/// may intentionally collapse multiple DMs into one Agent, so the one-shot ID
+/// alone is not enough to decide which channel principal may consume it.
+const ApprovalOrigin = struct {
+    channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    delivery_chat_id: ?[]const u8 = null,
+    sender_id: ?[]const u8 = null,
+    peer_id: ?[]const u8 = null,
+    group_id: ?[]const u8 = null,
+    is_group: ?bool = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        conversation_context: ?prompt.ConversationContext,
+    ) !ApprovalOrigin {
+        const ctx = conversation_context orelse return .{};
+        const channel = try dupeOptionalApprovalOriginField(allocator, ctx.channel);
+        errdefer if (channel) |value| allocator.free(value);
+        const account_id = try dupeOptionalApprovalOriginField(allocator, ctx.account_id);
+        errdefer if (account_id) |value| allocator.free(value);
+        const delivery_chat_id = try dupeOptionalApprovalOriginField(allocator, ctx.delivery_chat_id);
+        errdefer if (delivery_chat_id) |value| allocator.free(value);
+        const sender_id = try dupeOptionalApprovalOriginField(allocator, ctx.sender_id);
+        errdefer if (sender_id) |value| allocator.free(value);
+        const peer_id = try dupeOptionalApprovalOriginField(allocator, ctx.peer_id);
+        errdefer if (peer_id) |value| allocator.free(value);
+        const group_id = try dupeOptionalApprovalOriginField(allocator, ctx.group_id);
+        errdefer if (group_id) |value| allocator.free(value);
+
+        return .{
+            .channel = channel,
+            .account_id = account_id,
+            .delivery_chat_id = delivery_chat_id,
+            .sender_id = sender_id,
+            .peer_id = peer_id,
+            .group_id = group_id,
+            .is_group = ctx.is_group,
+        };
+    }
+
+    fn deinit(self: *ApprovalOrigin, allocator: std.mem.Allocator) void {
+        if (self.channel) |value| allocator.free(value);
+        if (self.account_id) |value| allocator.free(value);
+        if (self.delivery_chat_id) |value| allocator.free(value);
+        if (self.sender_id) |value| allocator.free(value);
+        if (self.peer_id) |value| allocator.free(value);
+        if (self.group_id) |value| allocator.free(value);
+        self.* = .{};
+    }
+
+    fn matches(self: ApprovalOrigin, conversation_context: ?prompt.ConversationContext) bool {
+        const ctx = conversation_context orelse return self.channel == null and
+            self.account_id == null and
+            self.delivery_chat_id == null and
+            self.sender_id == null and
+            self.peer_id == null and
+            self.group_id == null and
+            self.is_group == null;
+        return optionalApprovalOriginFieldEql(self.channel, ctx.channel) and
+            optionalApprovalOriginFieldEql(self.account_id, ctx.account_id) and
+            optionalApprovalOriginFieldEql(self.delivery_chat_id, ctx.delivery_chat_id) and
+            optionalApprovalOriginFieldEql(self.sender_id, ctx.sender_id) and
+            optionalApprovalOriginFieldEql(self.peer_id, ctx.peer_id) and
+            optionalApprovalOriginFieldEql(self.group_id, ctx.group_id) and
+            self.is_group == ctx.is_group;
+    }
+};
+
+/// Pending tool-execution approval, set when a tool raises ApprovalRequired.
+/// Stored across turns; resolved only through an authenticated approval_response control event.
+pub const PendingApproval = struct {
+    request_id: [APPROVAL_REQUEST_ID_LEN]u8,
+    tool_name: []const u8,
+    tool_call_id: ?[]const u8,
+    action: []const u8,
+    risk_level: CommandRiskLevel,
+    args_json: []const u8,
+    timestamp: i64,
+    origin: ApprovalOrigin = .{},
+    continuation_user_message: ?[]const u8 = null,
+    continuation_model_name: ?[]const u8 = null,
+    persistence_user_message: ?[]const u8 = null,
+    /// Assistant entry for the provider batch that opened this request.
+    history_rollback_index: ?usize = null,
+    /// Same assistant response with the pending call and unexecuted tail
+    /// removed. Cancellation swaps this in while preserving completed calls
+    /// and their results from earlier in the batch.
+    cancel_assistant_content: ?[]const u8 = null,
+    /// Dedup results from calls completed before the approval boundary. This is
+    /// moved into the continuation so one logical tool loop stays exactly-once.
+    replay_results: ToolCallResultCache = .empty,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        request_id: [APPROVAL_REQUEST_ID_LEN]u8,
+        tool_name: []const u8,
+        tool_call_id: ?[]const u8,
+        action: []const u8,
+        risk_level: CommandRiskLevel,
+        args_json: []const u8,
+        conversation_context: ?prompt.ConversationContext,
+        continuation_user_message: ?[]const u8,
+        continuation_model_name: ?[]const u8,
+        persistence_user_message: ?[]const u8,
+    ) !PendingApproval {
+        const owned_name = try allocator.dupe(u8, tool_name);
+        errdefer allocator.free(owned_name);
+        const owned_id = if (tool_call_id) |id| try allocator.dupe(u8, id) else null;
+        errdefer if (owned_id) |id| allocator.free(id);
+        const owned_action = try allocator.dupe(u8, action);
+        errdefer allocator.free(owned_action);
+        const owned_args = try allocator.dupe(u8, args_json);
+        errdefer allocator.free(owned_args);
+        const origin = try ApprovalOrigin.init(allocator, conversation_context);
+        errdefer {
+            var owned_origin = origin;
+            owned_origin.deinit(allocator);
+        }
+        const owned_continuation_user_message = try dupeOptionalApprovalOriginField(allocator, continuation_user_message);
+        errdefer if (owned_continuation_user_message) |value| allocator.free(value);
+        const owned_continuation_model_name = try dupeOptionalApprovalOriginField(allocator, continuation_model_name);
+        errdefer if (owned_continuation_model_name) |value| allocator.free(value);
+        const owned_persistence_user_message = try dupeOptionalApprovalOriginField(allocator, persistence_user_message);
+        errdefer if (owned_persistence_user_message) |value| allocator.free(value);
+
+        return .{
+            .request_id = request_id,
+            .tool_name = owned_name,
+            .tool_call_id = owned_id,
+            .action = owned_action,
+            .risk_level = risk_level,
+            .args_json = owned_args,
+            .timestamp = std_compat.time.timestamp(),
+            .origin = origin,
+            .continuation_user_message = owned_continuation_user_message,
+            .continuation_model_name = owned_continuation_model_name,
+            .persistence_user_message = owned_persistence_user_message,
+        };
+    }
+
+    pub fn deinit(self: *PendingApproval, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_name);
+        if (self.tool_call_id) |id| allocator.free(id);
+        allocator.free(self.action);
+        allocator.free(self.args_json);
+        self.origin.deinit(allocator);
+        if (self.continuation_user_message) |value| allocator.free(value);
+        if (self.continuation_model_name) |value| allocator.free(value);
+        if (self.persistence_user_message) |value| allocator.free(value);
+        if (self.cancel_assistant_content) |value| allocator.free(value);
+        deinitToolCallResultCache(allocator, &self.replay_results);
+    }
+};
+
+pub const ApprovalContinuation = struct {
+    tool_result_message: []u8,
+    /// Safe borrowed projection for immediate durable persistence. It points
+    /// either into Agent history or at a static denial marker and must not be
+    /// freed by ApprovalContinuation.
+    persistence_tool_result_message: []const u8,
+    user_message: ?[]const u8,
+    model_name: ?[]const u8,
+    persistence_user_message: ?[]const u8,
+    replay_results: ToolCallResultCache = .empty,
+
+    fn deinit(self: *ApprovalContinuation, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_result_message);
+        if (self.user_message) |value| allocator.free(value);
+        if (self.model_name) |value| allocator.free(value);
+        if (self.persistence_user_message) |value| allocator.free(value);
+        deinitToolCallResultCache(allocator, &self.replay_results);
+    }
+};
+
+pub const ApprovalResolution = union(enum) {
+    no_pending,
+    request_mismatch,
+    expired,
+    resolved: ApprovalContinuation,
+
+    pub fn deinit(self: *ApprovalResolution, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .resolved => |*continuation| continuation.deinit(allocator),
+            else => {},
+        }
+        self.* = .no_pending;
+    }
+};
+
+const PreparedApprovalBoundary = struct {
+    assistant_content: ?[]const u8,
+    cancel_assistant_content: ?[]const u8,
+    completed_results: ?[]const u8,
+    failure_results: ?[]const u8,
+
+    fn deinit(self: *PreparedApprovalBoundary, allocator: std.mem.Allocator) void {
+        if (self.assistant_content) |content| allocator.free(content);
+        if (self.cancel_assistant_content) |content| allocator.free(content);
+        if (self.completed_results) |content| allocator.free(content);
+        if (self.failure_results) |content| allocator.free(content);
+        self.* = .{
+            .assistant_content = null,
+            .cancel_assistant_content = null,
+            .completed_results = null,
+            .failure_results = null,
+        };
+    }
+};
+
+const PreparedInterruptedPrefix = struct {
+    assistant_content: ?[]const u8,
+    completed_results: ?[]const u8,
+
+    fn deinit(self: *PreparedInterruptedPrefix, allocator: std.mem.Allocator) void {
+        if (self.assistant_content) |content| allocator.free(content);
+        if (self.completed_results) |content| allocator.free(content);
+        self.* = .{
+            .assistant_content = null,
+            .completed_results = null,
+        };
+    }
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
@@ -328,6 +621,7 @@ pub const Agent = struct {
     pending_exec_command: ?[]const u8 = null,
     pending_exec_command_owned: bool = false,
     pending_exec_id: u64 = 0,
+    pending_exec_origin: ApprovalOrigin = .{},
     session_ttl_secs: ?u64 = null,
     focus_target: ?[]const u8 = null,
     focus_target_owned: bool = false,
@@ -356,6 +650,21 @@ pub const Agent = struct {
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
+    /// Pending tool-execution approval. Set when a tool raises ApprovalRequired.
+    /// Stored across turns; resolved only through a typed control path.
+    pending_approval: ?PendingApproval = null,
+
+    /// Optional first-class approval request callback. It is wired only for
+    /// channels that can deliver authenticated structured approval events.
+    approval_callback: ?ApprovalCallback = null,
+    approval_ctx: ?*anyopaque = null,
+    /// Borrowed only while a turn is executing. PendingApproval duplicates
+    /// these values so an authenticated continuation can preserve routing and
+    /// dynamic tool selection after the original stack unwinds.
+    approval_turn_user_message: ?[]const u8 = null,
+    approval_turn_model_name: ?[]const u8 = null,
+    approval_turn_persistence_message: ?[]const u8 = null,
+
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
@@ -370,6 +679,10 @@ pub const Agent = struct {
     drain_injection_cb: ?DrainCallback = null,
     /// Context pointer passed to drain_injection_cb.
     drain_injection_ctx: ?*anyopaque = null,
+    /// Optional durable barrier invoked before this turn's first tool batch.
+    before_tool_dispatch_cb: ?BeforeToolDispatchCallback = null,
+    /// Context pointer passed to before_tool_dispatch_cb.
+    before_tool_dispatch_ctx: ?*anyopaque = null,
     /// Optional callback invoked for each LLM response usage record.
     usage_record_callback: ?UsageRecordCallback = null,
     /// Context pointer passed to usage_record_callback.
@@ -482,6 +795,10 @@ pub const Agent = struct {
     }
 
     fn drainPendingInjection(self: *Agent) !?[]u8 {
+        // A tool can create either approval kind after the session-level turn
+        // routing decision. Keep queued user text intact until that approval
+        // is resolved instead of absorbing it into the paused tool turn.
+        if (self.pending_approval != null or self.pending_exec_command != null) return null;
         if (self.drain_injection_cb) |drain_cb| {
             if (self.drain_injection_ctx) |drain_ctx| {
                 return try drain_cb(drain_ctx, self.allocator);
@@ -657,6 +974,7 @@ pub const Agent = struct {
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
+        self.pending_exec_origin.deinit(self.allocator);
         if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
         if (self.dock_target_owned and self.dock_target != null) self.allocator.free(self.dock_target.?);
         if (self.active_skill_name_owned and self.active_skill_name != null) self.allocator.free(self.active_skill_name.?);
@@ -673,6 +991,7 @@ pub const Agent = struct {
             msg.deinit(self.allocator);
         }
         self.history.deinit(self.allocator);
+        if (self.pending_approval) |*pa| pa.deinit(self.allocator);
         for (self.detected_vision_disabled.items) |model| {
             self.allocator.free(model);
         }
@@ -699,8 +1018,9 @@ pub const Agent = struct {
     fn setActiveToolName(self: *Agent, name: []const u8) !void {
         self.tool_state_mu.lock();
         defer self.tool_state_mu.unlock();
+        const owned = try self.allocator.dupe(u8, name);
         if (self.active_tool_name) |old| self.allocator.free(old);
-        self.active_tool_name = try self.allocator.dupe(u8, name);
+        self.active_tool_name = owned;
     }
 
     fn clearActiveToolName(self: *Agent) void {
@@ -716,7 +1036,9 @@ pub const Agent = struct {
         for (self.interrupted_tools.items) |existing| {
             if (std.ascii.eqlIgnoreCase(existing, name)) return;
         }
-        try self.interrupted_tools.append(self.allocator, try self.allocator.dupe(u8, name));
+        try self.interrupted_tools.ensureUnusedCapacity(self.allocator, 1);
+        const owned = try self.allocator.dupe(u8, name);
+        self.interrupted_tools.appendAssumeCapacity(owned);
     }
 
     fn takeInterruptedToolsSummary(self: *Agent) !?[]u8 {
@@ -737,6 +1059,365 @@ pub const Agent = struct {
         return try out.toOwnedSlice(self.allocator);
     }
 
+    fn discardInterruptedTools(self: *Agent) void {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        for (self.interrupted_tools.items) |name| self.allocator.free(name);
+        self.interrupted_tools.clearRetainingCapacity();
+    }
+
+    fn generateApprovalRequestId() [APPROVAL_REQUEST_ID_LEN]u8 {
+        var entropy: [APPROVAL_REQUEST_ENTROPY_BYTES]u8 = undefined;
+        std_compat.crypto.random.bytes(&entropy);
+        return std.fmt.bytesToHex(entropy, .lower);
+    }
+
+    fn approvalExpired(pending: PendingApproval, now: i64) bool {
+        // Wall-clock rollback must fail closed rather than extending a bearer
+        // approval beyond its advertised lifetime.
+        if (now < pending.timestamp) return true;
+        return now - pending.timestamp >= APPROVAL_REQUEST_TTL_SECS;
+    }
+
+    fn truncateHistoryFrom(self: *Agent, index: usize) void {
+        if (index >= self.history.items.len) return;
+        for (self.history.items[index..]) |*message| message.deinit(self.allocator);
+        self.history.shrinkRetainingCapacity(index);
+    }
+
+    fn discardPendingApproval(self: *Agent) void {
+        if (self.pending_approval) |*pending| pending.deinit(self.allocator);
+        self.pending_approval = null;
+    }
+
+    pub fn clearPendingApproval(self: *Agent) void {
+        var pending = self.pending_approval orelse return;
+        self.pending_approval = null;
+        if (pending.history_rollback_index) |index| {
+            if (index < self.history.items.len) {
+                if (pending.cancel_assistant_content) |content| {
+                    self.history.items[index].deinit(self.allocator);
+                    self.history.items[index] = .{ .role = .assistant, .content = content };
+                    pending.cancel_assistant_content = null;
+                } else {
+                    self.truncateHistoryFrom(index);
+                }
+            }
+        }
+        pending.deinit(self.allocator);
+    }
+
+    pub fn pendingApprovalOriginMatchesCurrent(self: *const Agent) bool {
+        const pending = self.pending_approval orelse return false;
+        return pending.origin.matches(self.conversation_context);
+    }
+
+    /// Read-only preflight used by SessionManager before writing a durable
+    /// execution-intent receipt. resolveApproval repeats every check at the
+    /// actual one-shot commit point.
+    pub fn pendingApprovalResponseMatchesCurrent(
+        self: *const Agent,
+        request_id: []const u8,
+    ) bool {
+        const pending = self.pending_approval orelse return false;
+        if (approvalExpired(pending, std_compat.time.timestamp())) return false;
+        if (!pending.origin.matches(self.conversation_context)) return false;
+        if (request_id.len != APPROVAL_REQUEST_ID_LEN) return false;
+        const supplied: [APPROVAL_REQUEST_ID_LEN]u8 = request_id[0..APPROVAL_REQUEST_ID_LEN].*;
+        return std.crypto.timing_safe.eql(
+            [APPROVAL_REQUEST_ID_LEN]u8,
+            pending.request_id,
+            supplied,
+        );
+    }
+
+    /// Drop an expired approval before ordinary message routing applies the
+    /// pending-turn gate. Without this eager check, a stale request could keep
+    /// the session blocked forever because only approval responses reached the
+    /// TTL validation path.
+    pub fn clearExpiredPendingApproval(self: *Agent) bool {
+        const pending = self.pending_approval orelse return false;
+        if (!approvalExpired(pending, std_compat.time.timestamp())) return false;
+        self.clearPendingApproval();
+        return true;
+    }
+
+    pub fn capturePendingExecOrigin(self: *Agent) !void {
+        const origin = try ApprovalOrigin.init(self.allocator, self.conversation_context);
+        self.pending_exec_origin.deinit(self.allocator);
+        self.pending_exec_origin = origin;
+    }
+
+    pub fn clearPendingExecOrigin(self: *Agent) void {
+        self.pending_exec_origin.deinit(self.allocator);
+    }
+
+    pub fn pendingExecOriginMatchesCurrent(self: *const Agent) bool {
+        return self.pending_exec_origin.matches(self.conversation_context);
+    }
+
+    fn emitApprovalRequest(self: *Agent, pending: *const PendingApproval) bool {
+        const callback = self.approval_callback orelse return false;
+        const ctx = self.approval_ctx orelse return false;
+
+        var reason_buf: [128]u8 = undefined;
+        const reason = std.fmt.bufPrint(
+            &reason_buf,
+            "Policy requires approval for this {s}-risk tool execution.",
+            .{pending.risk_level.toString()},
+        ) catch "Policy requires approval for this tool execution.";
+
+        return callback(ctx, .{
+            .request_id = &pending.request_id,
+            .action = pending.action,
+            .reason = reason,
+        });
+    }
+
+    fn setPendingToolApproval(
+        self: *Agent,
+        tool_name: []const u8,
+        tool_call_id: ?[]const u8,
+        action: []const u8,
+        risk_level: CommandRiskLevel,
+        args_json: []const u8,
+    ) !void {
+        if (self.pending_approval) |pending| {
+            if (!approvalExpired(pending, std_compat.time.timestamp())) {
+                return error.ApprovalAlreadyPending;
+            }
+            self.clearPendingApproval();
+        }
+        if (self.approval_callback == null or self.approval_ctx == null) {
+            return error.ApprovalUnavailable;
+        }
+
+        self.pending_approval = try PendingApproval.init(
+            self.allocator,
+            generateApprovalRequestId(),
+            tool_name,
+            tool_call_id,
+            action,
+            risk_level,
+            args_json,
+            self.conversation_context,
+            self.approval_turn_user_message,
+            self.approval_turn_model_name,
+            self.approval_turn_persistence_message,
+        );
+
+        // Delivery is deliberately deferred until the outer tool loop has
+        // committed a canonical, tail-truncated history state. This prevents a
+        // usable request id from escaping before every fallible allocation is
+        // complete.
+    }
+
+    /// Resolve a typed, authenticated approval response. This is intentionally
+    /// not reachable from ordinary user-message text; SessionManager calls it
+    /// through the dedicated control path.
+    pub fn resolveApproval(
+        self: *Agent,
+        request_id: []const u8,
+        approved: bool,
+        reason: ?[]const u8,
+    ) !ApprovalResolution {
+        const pending = self.pending_approval orelse return .no_pending;
+        if (approvalExpired(pending, std_compat.time.timestamp())) {
+            self.clearPendingApproval();
+            return .expired;
+        }
+        const origin_matches = pending.origin.matches(self.conversation_context);
+        if (request_id.len != pending.request_id.len) return .request_mismatch;
+        const supplied_request_id: [APPROVAL_REQUEST_ID_LEN]u8 = request_id[0..APPROVAL_REQUEST_ID_LEN].*;
+        const request_matches = std.crypto.timing_safe.eql(
+            [APPROVAL_REQUEST_ID_LEN]u8,
+            pending.request_id,
+            supplied_request_id,
+        );
+        if (!request_matches or !origin_matches) {
+            return .request_mismatch;
+        }
+        const approval_history_index = pending.history_rollback_index orelse return error.InvalidApprovalState;
+        if (approval_history_index >= self.history.items.len or
+            self.history.items[approval_history_index].role != .assistant)
+        {
+            return error.InvalidApprovalState;
+        }
+
+        if (!approved) {
+            const message = if (reason) |why|
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Tool execution '{s}' was explicitly denied by the user. Reason: {s}. Do not retry it unless the user asks again. Any later calls from the paused batch were not executed and must be reconsidered.",
+                    .{ pending.action, why },
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Tool execution '{s}' was explicitly denied by the user. Do not retry it unless the user asks again. Any later calls from the paused batch were not executed and must be reconsidered.",
+                    .{pending.action},
+                );
+            errdefer self.allocator.free(message);
+            var history_message: ?[]const u8 = if (self.redactor) |redactor|
+                try redactor.redact(self.allocator, message)
+            else
+                try self.allocator.dupe(u8, message);
+            errdefer if (history_message) |content| self.allocator.free(content);
+            const denied_call = ParsedToolCall{
+                .name = pending.tool_name,
+                .arguments_json = pending.args_json,
+                .tool_call_id = pending.tool_call_id,
+            };
+            // Finish every fallible allocation before consuming the one-shot
+            // request. If this fails, the caller can safely retry the same
+            // denial and the paused history remains gated.
+            try self.history.ensureUnusedCapacity(self.allocator, 1);
+            try rememberApprovalToolCallResultExact(self.allocator, &self.pending_approval.?.replay_results, denied_call, .{
+                .name = pending.tool_name,
+                .output = message,
+                .success = false,
+                .tool_call_id = pending.tool_call_id,
+            });
+            // The replay insertion above is the commit point. Everything from
+            // here through ownership transfer is allocation-free.
+            self.history.appendAssumeCapacity(.{ .role = .user, .content = history_message.? });
+            history_message = null;
+            var owned = self.pending_approval.?;
+            self.pending_approval = null;
+            defer owned.deinit(self.allocator);
+            const continuation_user_message = owned.continuation_user_message;
+            owned.continuation_user_message = null;
+            const continuation_model_name = owned.continuation_model_name;
+            owned.continuation_model_name = null;
+            const persistence_user_message = owned.persistence_user_message;
+            owned.persistence_user_message = null;
+            const replay_results = owned.replay_results;
+            owned.replay_results = .empty;
+            return .{ .resolved = .{
+                .tool_result_message = message,
+                .persistence_tool_result_message = APPROVAL_DENIED_PERSISTENCE_RESULT,
+                .user_message = continuation_user_message,
+                .model_name = continuation_model_name,
+                .persistence_user_message = persistence_user_message,
+                .replay_results = replay_results,
+            } };
+        }
+
+        const approved_call = ParsedToolCall{
+            .name = pending.tool_name,
+            .arguments_json = pending.args_json,
+            .tool_call_id = pending.tool_call_id,
+        };
+        const fallback_message = try self.allocator.dupe(
+            u8,
+            "The approved tool invocation was attempted, but its result could not be fully recorded because of an internal allocation failure. Treat this approval as consumed and do not repeat the action automatically. Any later calls from the paused batch were not executed and must be reconsidered.",
+        );
+        errdefer self.allocator.free(fallback_message);
+        var fallback_history: ?[]u8 = try self.allocator.dupe(
+            u8,
+            "The approved tool invocation was attempted, but its result could not be fully recorded because of an internal allocation failure. Treat this approval as consumed and do not repeat the action automatically.",
+        );
+        errdefer if (fallback_history) |content| self.allocator.free(content);
+        try self.history.ensureUnusedCapacity(self.allocator, 1);
+        // Reserve an exact-once replay entry before executing the side effect.
+        // Post-execution formatting can then degrade to this owned fallback
+        // without either retrying the action or leaving a dangling tool call.
+        try rememberApprovalToolCallResultExact(
+            self.allocator,
+            &self.pending_approval.?.replay_results,
+            approved_call,
+            .{
+                .name = pending.tool_name,
+                .output = fallback_message,
+                .success = false,
+                .tool_call_id = pending.tool_call_id,
+            },
+        );
+        const message = self.runApprovedTool(&self.pending_approval.?, fallback_message);
+        // No propagated errors are allowed after the approved side effect. A
+        // rich history copy is best effort; the separately owned safe fallback
+        // closes the assistant tool call under OOM.
+        const rich_history = self.allocator.dupe(u8, message) catch null;
+        const history_content = rich_history orelse fallback_history.?;
+        if (rich_history != null) self.allocator.free(fallback_history.?);
+        fallback_history = null;
+        self.history.appendAssumeCapacity(.{ .role = .user, .content = history_content });
+        var owned = self.pending_approval.?;
+        self.pending_approval = null;
+        defer owned.deinit(self.allocator);
+        const continuation_user_message = owned.continuation_user_message;
+        owned.continuation_user_message = null;
+        const continuation_model_name = owned.continuation_model_name;
+        owned.continuation_model_name = null;
+        const persistence_user_message = owned.persistence_user_message;
+        owned.persistence_user_message = null;
+        const replay_results = owned.replay_results;
+        owned.replay_results = .empty;
+        return .{ .resolved = .{
+            .tool_result_message = message,
+            .persistence_tool_result_message = history_content,
+            .user_message = continuation_user_message,
+            .model_name = continuation_model_name,
+            .persistence_user_message = persistence_user_message,
+            .replay_results = replay_results,
+        } };
+    }
+
+    /// Re-execute an approved invocation through the same dispatcher and
+    /// redaction path as a normal tool call. The approval grant removes only
+    /// the matching policy approval gate.
+    fn runApprovedTool(self: *Agent, pending: *PendingApproval, fallback_message: []u8) []u8 {
+        var arena_impl = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+
+        const call = ParsedToolCall{
+            .name = pending.tool_name,
+            .arguments_json = pending.args_json,
+            .tool_call_id = pending.tool_call_id,
+        };
+        const start_event = ObserverEvent{ .tool_call_start = .{ .tool = pending.tool_name } };
+        self.observer.recordEvent(&start_event);
+        if (self.progress_callback) |cb| {
+            if (self.progress_ctx) |ctx| cb(ctx, .{ .text = pending.tool_name });
+        }
+        const started_at = std_compat.time.milliTimestamp();
+        const result = self.executeToolWithOptions(arena, call, .{
+            .approved = true,
+            .record_action = false,
+        });
+        updateApprovalToolCallResult(self.allocator, &pending.replay_results, call, result);
+        const duration_ms: u64 = @intCast(@max(0, std_compat.time.milliTimestamp() - started_at));
+
+        const event = ObserverEvent{ .tool_call = .{
+            .tool = pending.tool_name,
+            .duration_ms = duration_ms,
+            .success = result.success,
+            .args = null,
+            .detail = null,
+        } };
+        self.observer.recordEvent(&event);
+
+        const formatted = dispatcher.formatToolResults(arena, &.{result}) catch return fallback_message;
+        const scrubbed = providers.scrubToolOutput(arena, formatted) catch return fallback_message;
+        const safe_output = if (self.redactor) |redactor|
+            redactor.redact(arena, scrubbed) catch return fallback_message
+        else
+            scrubbed;
+
+        const message = std.fmt.allocPrint(
+            self.allocator,
+            "The user approved tool '{s}'. The approved execution {s}:\n{s}\n\nReflect on this tool result and continue the original task. Do not repeat the approved action unless needed. Any later calls from the paused batch were not executed and must be reconsidered.",
+            .{
+                pending.tool_name,
+                if (result.success) "succeeded" else "failed",
+                safe_output,
+            },
+        ) catch return fallback_message;
+        self.allocator.free(fallback_message);
+        return message;
+    }
+
     pub fn snapshotActiveToolName(self: *Agent, allocator: std.mem.Allocator) !?[]u8 {
         self.tool_state_mu.lock();
         defer self.tool_state_mu.unlock();
@@ -755,13 +1436,45 @@ pub const Agent = struct {
         else
             try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
         errdefer self.allocator.free(msg);
-        try self.history.append(self.allocator, .{
+        const history_content = try self.dupeForHistory(msg);
+        errdefer self.allocator.free(history_content);
+        try self.history.ensureUnusedCapacity(self.allocator, 1);
+        self.history.appendAssumeCapacity(.{
             .role = .assistant,
-            .content = try self.dupeForHistory(msg),
+            .content = history_content,
         });
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
         return msg;
+    }
+
+    /// Finish an interrupt observed after a tool side effect without making
+    /// another allocation. The caller must reserve history capacity and own
+    /// two independent fallback buffers before execution starts.
+    fn interruptedToolBatchReply(
+        self: *Agent,
+        response_fallback: *?[]u8,
+        history_fallback: *?[]const u8,
+    ) []const u8 {
+        self.clearInterruptRequest();
+        self.discardInterruptedTools();
+
+        const response = response_fallback.*.?;
+        response_fallback.* = null;
+        // Inner batch exits reserve this slot. The outer iteration gate can be
+        // reached after unrelated history growth, so degrade to returning the
+        // owned response while preserving the already-closed tool prefix.
+        if (self.history.items.len < self.history.capacity) {
+            const history_content = history_fallback.*.?;
+            history_fallback.* = null;
+            self.history.appendAssumeCapacity(.{
+                .role = .assistant,
+                .content = history_content,
+            });
+        }
+        const complete_event = ObserverEvent{ .turn_complete = {} };
+        self.observer.recordEvent(&complete_event);
+        return response;
     }
 
     /// Estimate total tokens in conversation history.
@@ -1604,6 +2317,14 @@ pub const Agent = struct {
         return commands.execBlockMessage(self, args);
     }
 
+    fn execBlockMessageWithOptions(
+        self: *Agent,
+        args: std.json.ObjectMap,
+        approval_granted: bool,
+    ) ?[]const u8 {
+        return commands.execBlockMessageWithOptions(self, args, approval_granted);
+    }
+
     pub fn formatModelStatus(self: *const Agent) ![]const u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
@@ -1756,6 +2477,15 @@ pub const Agent = struct {
     /// Returns an owned response string, or null if not a slash command.
     pub fn handleSlashCommand(self: *Agent, message: []const u8) !?[]const u8 {
         return commands.handleSlashCommand(self, message);
+    }
+
+    /// Run the caller-provided durable barrier before an external tool effect.
+    /// Local approval commands use the same hook as provider-issued tool calls.
+    pub fn runBeforeToolDispatchBarrier(self: *Agent) !void {
+        const callback = self.before_tool_dispatch_cb orelse return;
+        const callback_ctx = self.before_tool_dispatch_ctx orelse
+            return error.MissingToolDispatchContext;
+        try callback(callback_ctx);
     }
 
     /// Returns true if `name` matches `pattern` using simple `*` glob.
@@ -1938,13 +2668,47 @@ pub const Agent = struct {
         return self.prioritizeToolSpecsForTurn(arena, try result.toOwnedSlice(arena), user_message);
     }
 
+    const TurnOptions = struct {
+        internal_tool_result: bool = false,
+        input_already_in_history: bool = false,
+        continuation_user_message: ?[]const u8 = null,
+        model_name_override: ?[]const u8 = null,
+        continuation_persistence_message: ?[]const u8 = null,
+        replay_results: ?*ToolCallResultCache = null,
+    };
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        return self.turnWithOptions(user_message, .{});
+    }
+
+    pub fn continueAfterApproval(
+        self: *Agent,
+        tool_result_message: []const u8,
+        continuation_user_message: ?[]const u8,
+        model_name: ?[]const u8,
+        persistence_user_message: ?[]const u8,
+        replay_results: *ToolCallResultCache,
+    ) ![]const u8 {
+        return self.turnWithOptions(tool_result_message, .{
+            .internal_tool_result = true,
+            .input_already_in_history = true,
+            .continuation_user_message = continuation_user_message,
+            .model_name_override = model_name,
+            .continuation_persistence_message = persistence_user_message,
+            .replay_results = replay_results,
+        });
+    }
+
+    fn turnWithOptions(self: *Agent, user_message: []const u8, options: TurnOptions) ![]const u8 {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
-        const turn_input = commands.planTurnInput(user_message);
+        const turn_input = if (options.internal_tool_result)
+            commands.TurnInputPlan{ .llm_user_message = user_message }
+        else
+            commands.planTurnInput(user_message);
         const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
                 const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
@@ -1964,16 +2728,35 @@ pub const Agent = struct {
             break :blk safe_user_message_owned.?;
         } else effective_user_message;
 
-        const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
+        const tool_selection_message = options.continuation_user_message orelse effective_user_message;
+        const turn_route_selection = if (options.internal_tool_result)
+            null
+        else
+            self.routeSelectionForTurn(effective_user_message);
         if (turn_route_selection) |selection| {
             try self.setLastRouteTrace(selection);
         }
-        const turn_model_name = if (turn_route_selection) |selection|
+        const turn_model_name = if (options.model_name_override) |model_name|
+            model_name
+        else if (turn_route_selection) |selection|
             try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ selection.route.provider, selection.route.model })
         else
             self.model_name;
-        const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
+        const turn_model_name_owned = options.model_name_override == null and
+            !std.mem.eql(u8, turn_model_name, self.model_name);
         defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
+
+        const previous_approval_turn_user_message = self.approval_turn_user_message;
+        const previous_approval_turn_model_name = self.approval_turn_model_name;
+        const previous_approval_turn_persistence_message = self.approval_turn_persistence_message;
+        self.approval_turn_user_message = tool_selection_message;
+        self.approval_turn_model_name = turn_model_name;
+        self.approval_turn_persistence_message = options.continuation_persistence_message orelse user_message;
+        defer {
+            self.approval_turn_user_message = previous_approval_turn_user_message;
+            self.approval_turn_model_name = previous_approval_turn_model_name;
+            self.approval_turn_persistence_message = previous_approval_turn_persistence_message;
+        }
 
         var cfg_for_prompt_opt: ?Config = Config.load(self.allocator) catch null;
         defer if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded.deinit();
@@ -2095,7 +2878,7 @@ pub const Agent = struct {
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
-        if (self.auto_save) {
+        if (self.auto_save and !options.internal_tool_result) {
             if (self.mem) |mem| {
                 const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
@@ -2111,16 +2894,19 @@ pub const Agent = struct {
             }
         }
 
-        // Enrich message with memory context (always returns owned slice; ownership → history)
-        // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enriched_raw = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
-        else
-            try self.allocator.dupe(u8, safe_user_message);
-        const enriched = try self.redactOwnedForHistory(enriched_raw);
+        // Internal tool results bypass memory retrieval and autosave. They are
+        // generated by the authenticated approval control path, not user text.
+        if (!options.input_already_in_history) {
+            const enriched_raw = if (options.internal_tool_result)
+                try self.allocator.dupe(u8, safe_user_message)
+            else if (self.mem) |mem|
+                try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
+            else
+                try self.allocator.dupe(u8, safe_user_message);
+            const enriched = try self.redactOwnedForHistory(enriched_raw);
 
-        // Keep the user message retained even if provider/tool steps fail.
-        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+            try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+        }
 
         var sys_bytes: usize = 0;
         var hist_bytes: usize = 0;
@@ -2135,7 +2921,7 @@ pub const Agent = struct {
         self.last_history_bytes = hist_bytes;
 
         // ── Response cache check ──
-        const response_cache_allowed = self.responseCacheSafeForTurn(safe_user_message);
+        const response_cache_allowed = !options.internal_tool_result and self.responseCacheSafeForTurn(safe_user_message);
         if (response_cache_allowed) {
             if (self.response_cache) |rc| {
                 var key_buf: [16]u8 = undefined;
@@ -2171,10 +2957,26 @@ pub const Agent = struct {
         var injection_followups: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
-        var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
+        var seen_tool_call_results: ToolCallResultCache = if (options.replay_results) |seed| blk: {
+            const moved = seed.*;
+            seed.* = .empty;
+            break :blk moved;
+        } else .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
+        var tool_dispatch_started = false;
+        var tool_write_ahead_completed = false;
+        var interrupt_response_fallback: ?[]u8 = null;
+        defer if (interrupt_response_fallback) |content| self.allocator.free(content);
+        var interrupt_history_fallback: ?[]const u8 = null;
+        defer if (interrupt_history_fallback) |content| self.allocator.free(content);
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
             if (self.isInterruptRequested()) {
+                if (tool_dispatch_started) {
+                    return self.interruptedReply() catch self.interruptedToolBatchReply(
+                        &interrupt_response_fallback,
+                        &interrupt_history_fallback,
+                    );
+                }
                 return self.interruptedReply();
             }
 
@@ -2193,8 +2995,14 @@ pub const Agent = struct {
             const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
-            const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
-            const priority_tool = self.priorityToolForSpecsMessage(turn_tool_specs, effective_user_message);
+            const turn_tool_specs = try self.filterToolSpecsForTurn(arena, tool_selection_message);
+            // Preserve dynamic availability from the original request, but do
+            // not re-inject a hard "call immediately" hint after that tool has
+            // already executed (or been denied) during an approval continuation.
+            const priority_tool = if (options.internal_tool_result)
+                null
+            else
+                self.priorityToolForSpecsMessage(turn_tool_specs, tool_selection_message);
 
             // Build messages slice for provider (arena-owned; freed at end of iteration).
             const messages = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
@@ -2453,6 +3261,10 @@ pub const Agent = struct {
                 };
             }
             self.logLlmResponse(iteration + 1, response_attempt, &response);
+            // Provider responses own all non-empty slices. Keep a scope guard
+            // so every early error/continue path releases them; explicit frees
+            // below clear the fields and make this final cleanup a no-op.
+            defer self.freeResponseFields(&response);
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
 
@@ -2541,6 +3353,19 @@ pub const Agent = struct {
                 // For XML path, never preserve model-fabricated <tool_result> markup in history.
                 assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
                 free_assistant_history = true;
+            }
+
+            // Parse every call before the first tool can produce a side effect.
+            // Otherwise an allocation failure while parsing a later call could
+            // unwind the turn after an earlier call already ran, losing the
+            // exact-once replay receipts that prevent duplicate execution.
+            const prepared_tool_arguments: []const PreparedToolArguments = if (parsed_calls.len > 0)
+                try prepareToolArgumentsBatch(arena, parsed_calls)
+            else
+                &.{};
+            if (parsed_calls.len > 0 and !tool_write_ahead_completed) {
+                try self.runBeforeToolDispatchBarrier();
+                tool_write_ahead_completed = true;
             }
 
             // Determine display text.
@@ -2702,14 +3527,71 @@ pub const Agent = struct {
             } else try self.allocator.dupe(u8, assistant_history_content);
 
             // Once appended, history owns the buffer.
-            const safe_assistant_content = try self.redactOwnedForHistory(assistant_content);
-            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content });
+            var safe_assistant_content: ?[]const u8 = try self.redactOwnedForHistory(assistant_content);
+            errdefer if (safe_assistant_content) |content| self.allocator.free(content);
 
-            // Execute each tool call
+            // Reserve every allocation needed by the execution loop before
+            // recording its assistant calls or allowing a side effect. Exact
+            // receipts and result collection are infallible after this point.
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
-            const batch_updates_tools_md = tool_call_batch_updates_tools_md(arena, parsed_calls);
+            try seen_tool_call_results.ensureUnusedCapacity(self.allocator, @intCast(parsed_calls.len));
+            // The interrupt path closes the completed tool prefix and then
+            // appends its final assistant reply, so it needs one more slot
+            // than the normal and approval-boundary paths.
+            try self.history.ensureUnusedCapacity(self.allocator, 3);
+            if (interrupt_response_fallback == null) {
+                interrupt_response_fallback = try self.allocator.dupe(
+                    u8,
+                    "Interrupted by /stop. Halting tool execution for this turn.",
+                );
+                interrupt_history_fallback = try self.allocator.dupe(
+                    u8,
+                    "Interrupted by /stop. Halting tool execution for this turn.",
+                );
+            }
+            var tool_results_fallback: ?[]const u8 = try self.allocator.dupe(
+                u8,
+                "<tool_results status=\"memory_pressure\">The tool batch finished, but detailed results could not be recorded. Treat earlier calls as potentially executed and do not repeat them automatically.</tool_results>",
+            );
+            defer if (tool_results_fallback) |content| self.allocator.free(content);
+            var boundary_assistant_fallback: ?[]const u8 = try self.allocator.dupe(
+                u8,
+                "The tool batch stopped at an approval boundary. Calls before the boundary may have completed; the approval-gated call and every later call were not executed.",
+            );
+            defer if (boundary_assistant_fallback) |content| self.allocator.free(content);
+            var boundary_cancel_fallback: ?[]const u8 = try self.allocator.dupe(
+                u8,
+                "The tool batch stopped before its approval-gated call. Earlier calls may have completed; do not repeat them automatically.",
+            );
+            defer if (boundary_cancel_fallback) |content| self.allocator.free(content);
+            var approval_waiting_response: ?[]u8 = try self.allocator.dupe(
+                u8,
+                "Approval requested. Waiting for your decision.",
+            );
+            defer if (approval_waiting_response) |content| self.allocator.free(content);
+            var approval_failure_response: ?[]u8 = try self.allocator.dupe(
+                u8,
+                "Approval could not be delivered. Later calls from the same batch were not executed.",
+            );
+            defer if (approval_failure_response) |content| self.allocator.free(content);
+            var interrupt_assistant_fallback: ?[]const u8 = try self.allocator.dupe(
+                u8,
+                "The tool batch was interrupted. Calls before the interruption may have completed; every later call was not executed and must not be assumed to have run.",
+            );
+            defer if (interrupt_assistant_fallback) |content| self.allocator.free(content);
+
+            const assistant_history_index = self.history.items.len;
+            self.history.appendAssumeCapacity(.{ .role = .assistant, .content = safe_assistant_content.? });
+            safe_assistant_content = null;
+
+            // Execute each tool call
+            var approval_boundary = false;
+            var approval_created = false;
+            var approval_call_count: usize = 0;
+            var approval_result: ToolExecutionResult = undefined;
+            var tools_md_updated = false;
 
             const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
             if (self.log_tool_calls) {
@@ -2718,8 +3600,54 @@ pub const Agent = struct {
 
             for (parsed_calls, 0..) |call, idx| {
                 if (self.isInterruptRequested()) {
+                    const assistant_base_text = if (use_native) response_text else parsed_text;
+                    var prepared = self.prepareInterruptedPrefixRich(
+                        arena,
+                        assistant_base_text,
+                        parsed_calls,
+                        idx,
+                        results_buf.items,
+                    ) catch {
+                        // A completed prefix may already contain side effects.
+                        // Even under memory pressure, remove the unexecuted
+                        // tail and close the prefix with the preallocated
+                        // replay-receipt fallback before returning.
+                        self.history.items[assistant_history_index].deinit(self.allocator);
+                        self.history.items[assistant_history_index] = .{
+                            .role = .assistant,
+                            .content = interrupt_assistant_fallback.?,
+                        };
+                        interrupt_assistant_fallback = null;
+                        if (results_buf.items.len > 0) {
+                            self.history.appendAssumeCapacity(.{
+                                .role = .user,
+                                .content = tool_results_fallback.?,
+                            });
+                            tool_results_fallback = null;
+                        }
+                        self.freeResponseFields(&response);
+                        return self.interruptedToolBatchReply(
+                            &interrupt_response_fallback,
+                            &interrupt_history_fallback,
+                        );
+                    };
+                    defer prepared.deinit(self.allocator);
+
+                    self.history.items[assistant_history_index].deinit(self.allocator);
+                    self.history.items[assistant_history_index] = .{
+                        .role = .assistant,
+                        .content = prepared.assistant_content.?,
+                    };
+                    prepared.assistant_content = null;
+                    if (prepared.completed_results) |content| {
+                        self.history.appendAssumeCapacity(.{ .role = .user, .content = content });
+                        prepared.completed_results = null;
+                    }
                     self.freeResponseFields(&response);
-                    return self.interruptedReply();
+                    return self.interruptedToolBatchReply(
+                        &interrupt_response_fallback,
+                        &interrupt_history_fallback,
+                    );
                 }
 
                 if (self.log_tool_calls) {
@@ -2736,6 +3664,10 @@ pub const Agent = struct {
                 }
 
                 const tool_timer = std_compat.time.milliTimestamp();
+                const pending_request_before: ?[APPROVAL_REQUEST_ID_LEN]u8 = if (self.pending_approval) |pending|
+                    pending.request_id
+                else
+                    null;
                 const result = blk: {
                     if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
                         break :blk ToolExecutionResult{
@@ -2745,18 +3677,46 @@ pub const Agent = struct {
                             .tool_call_id = call.tool_call_id,
                         };
                     }
-                    const executed_result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                    prepareToolCallResultReceipt(&seen_tool_call_results, call);
+                    const executed_result = if (shouldSkipToolsMemoryStoreDuplicatePrepared(
+                        tools_md_updated,
+                        call,
+                        prepared_tool_arguments[idx],
+                    ))
                         ToolExecutionResult{
                             .name = call.name,
                             .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
                             .success = true,
                             .tool_call_id = call.tool_call_id,
                         }
-                    else
-                        self.executeTool(arena, call);
-                    rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
+                    else dispatch: {
+                        tool_dispatch_started = true;
+                        break :dispatch self.executeToolWithPreparedArguments(
+                            arena,
+                            call,
+                            .{},
+                            prepared_tool_arguments[idx],
+                        );
+                    };
+                    if (executed_result.approval_boundary) {
+                        discardPreparedToolCallResultReceipt(self.allocator, &seen_tool_call_results, call);
+                    } else {
+                        finalizePreparedToolCallResultReceipt(
+                            self.allocator,
+                            &seen_tool_call_results,
+                            call,
+                            executed_result,
+                            false,
+                        );
+                    }
                     break :blk executed_result;
                 };
+                if (result.success and toolCallUpdatesToolsMdPrepared(call, prepared_tool_arguments[idx])) {
+                    // Only earlier successful writes may suppress a duplicate
+                    // memory_store. A later call can be canceled at an approval
+                    // boundary or fail, so scanning the full batch loses data.
+                    tools_md_updated = true;
+                }
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
@@ -2787,29 +3747,202 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&tool_event);
 
-                try results_buf.append(self.allocator, result);
+                if (result.approval_boundary) {
+                    approval_boundary = true;
+                    approval_call_count = idx + 1;
+                    approval_result = result;
+                    approval_created = if (self.pending_approval) |pending|
+                        if (pending_request_before) |previous|
+                            !std.mem.eql(u8, &previous, &pending.request_id)
+                        else
+                            true
+                    else
+                        false;
+                    break;
+                }
+                results_buf.appendAssumeCapacity(result);
+            }
+
+            // Stop at every approval boundary. A successfully prepared request
+            // pauses the logical tool loop; delivery failure and an already
+            // pending request still cancel the unexecuted tail fail-closed.
+            if (approval_boundary) {
+                const assistant_base_text = if (use_native) response_text else parsed_text;
+                // The fixed-capacity result slice remains valid after adding
+                // the boundary failure record below.
+                const completed_results = results_buf.items;
+                const delivery_failure_result = if (approval_created)
+                    ToolExecutionResult{
+                        .name = approval_result.name,
+                        .output = "Command requires approval, but this channel cannot deliver an interactive approval request",
+                        .success = false,
+                        .tool_call_id = approval_result.tool_call_id,
+                        .approval_boundary = true,
+                    }
+                else
+                    approval_result;
+                results_buf.appendAssumeCapacity(delivery_failure_result);
+
+                var prepared = self.prepareApprovalBoundaryRich(
+                    arena,
+                    assistant_base_text,
+                    parsed_calls,
+                    approval_call_count,
+                    completed_results,
+                    results_buf.items,
+                ) catch {
+                    // A prior tool may already have produced a side effect, so
+                    // boundary formatting OOM cannot unwind the turn. Commit a
+                    // preallocated canonical summary and retain exact receipts
+                    // in the pending continuation instead.
+                    self.history.items[assistant_history_index].deinit(self.allocator);
+                    self.history.items[assistant_history_index] = .{
+                        .role = .assistant,
+                        .content = boundary_assistant_fallback.?,
+                    };
+                    boundary_assistant_fallback = null;
+                    self.history.appendAssumeCapacity(.{
+                        .role = .user,
+                        .content = tool_results_fallback.?,
+                    });
+                    tool_results_fallback = null;
+
+                    if (approval_created) {
+                        const pending = &self.pending_approval.?;
+                        pending.history_rollback_index = assistant_history_index;
+                        pending.cancel_assistant_content = boundary_cancel_fallback.?;
+                        boundary_cancel_fallback = null;
+                        pending.replay_results = seen_tool_call_results;
+                        seen_tool_call_results = .empty;
+                    }
+
+                    const delivered_fallback = approval_created and self.emitApprovalRequest(&self.pending_approval.?);
+                    if (!delivered_fallback and approval_created) {
+                        self.pending_approval.?.history_rollback_index = null;
+                        self.discardPendingApproval();
+                    }
+                    self.freeResponseFields(&response);
+                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                    self.observer.recordEvent(&complete_event);
+                    if (delivered_fallback) {
+                        const output = approval_waiting_response.?;
+                        approval_waiting_response = null;
+                        return output;
+                    }
+                    const output = approval_failure_response.?;
+                    approval_failure_response = null;
+                    return output;
+                };
+                defer prepared.deinit(self.allocator);
+
+                // Calls after the approval boundary were never executed. The
+                // rich canonical assistant contains only the completed prefix
+                // and the single approval-gated call.
+                self.history.items[assistant_history_index].deinit(self.allocator);
+                self.history.items[assistant_history_index] = .{
+                    .role = .assistant,
+                    .content = prepared.assistant_content.?,
+                };
+                prepared.assistant_content = null;
+                if (prepared.completed_results) |content| {
+                    self.history.appendAssumeCapacity(.{ .role = .user, .content = content });
+                    prepared.completed_results = null;
+                }
+
+                if (approval_created) {
+                    const pending = &self.pending_approval.?;
+                    pending.history_rollback_index = assistant_history_index;
+                    pending.cancel_assistant_content = prepared.cancel_assistant_content.?;
+                    prepared.cancel_assistant_content = null;
+                    pending.replay_results = seen_tool_call_results;
+                    seen_tool_call_results = .empty;
+                }
+
+                const delivered = approval_created and self.emitApprovalRequest(&self.pending_approval.?);
+                if (!delivered) {
+                    // Replace the completed-only history result with a canonical
+                    // failure result, closing the current tool call without
+                    // executing anything after it.
+                    if (approval_created) {
+                        self.pending_approval.?.history_rollback_index = null;
+                        self.discardPendingApproval();
+                    }
+                    if (completed_results.len > 0) {
+                        self.history.items[self.history.items.len - 1].deinit(self.allocator);
+                        self.history.items[self.history.items.len - 1] = .{
+                            .role = .user,
+                            .content = prepared.failure_results.?,
+                        };
+                    } else {
+                        self.history.appendAssumeCapacity(.{
+                            .role = .user,
+                            .content = prepared.failure_results.?,
+                        });
+                    }
+                    prepared.failure_results = null;
+                    self.freeResponseFields(&response);
+                    const complete_event = ObserverEvent{ .turn_complete = {} };
+                    self.observer.recordEvent(&complete_event);
+                    const output = approval_failure_response.?;
+                    approval_failure_response = null;
+                    return output;
+                }
+
+                self.freeResponseFields(&response);
+                const complete_event = ObserverEvent{ .turn_complete = {} };
+                self.observer.recordEvent(&complete_event);
+                const output = approval_waiting_response.?;
+                approval_waiting_response = null;
+                return output;
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
-            const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
-            const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
-            const redacted_results = if (self.redactor) |r| try r.redact(arena, scrubbed_results) else scrubbed_results;
-            const with_reflection = try std.fmt.allocPrint(
-                arena,
-                "{s}\n\nReflect on the tool results above and decide your next steps. " ++
-                    "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
-                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
-                .{redacted_results},
-            );
-            try self.history.append(self.allocator, .{
+            var owned_tool_results: ?[]const u8 = null;
+            if (dispatcher.formatToolResults(arena, results_buf.items) catch null) |formatted_results| {
+                if (providers.scrubToolOutput(arena, formatted_results) catch null) |scrubbed_results| {
+                    const redacted_results: ?[]const u8 = if (self.redactor) |redactor|
+                        redactor.redact(arena, scrubbed_results) catch null
+                    else
+                        scrubbed_results;
+                    if (redacted_results) |safe_results| {
+                        const with_reflection = std.fmt.allocPrint(
+                            arena,
+                            "{s}\n\nReflect on the tool results above and decide your next steps. " ++
+                                "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+                                "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
+                            .{safe_results},
+                        ) catch null;
+                        if (with_reflection) |content| {
+                            owned_tool_results = self.allocator.dupe(u8, content) catch null;
+                        }
+                    }
+                }
+            }
+            const canonical_tool_results = owned_tool_results orelse tool_results_fallback.?;
+            if (owned_tool_results != null) self.allocator.free(tool_results_fallback.?);
+            tool_results_fallback = null;
+            self.history.appendAssumeCapacity(.{
                 .role = .user,
-                .content = try self.allocator.dupe(u8, with_reflection),
+                .content = canonical_tool_results,
             });
 
             self.trimHistory();
 
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);
+        }
+
+        // A tool can request /stop while completing the final allowed
+        // iteration. There is no next loop gate in that case, so close the
+        // completed prefix instead of making an unauthorized summary call.
+        if (self.isInterruptRequested()) {
+            if (tool_dispatch_started) {
+                return self.interruptedReply() catch self.interruptedToolBatchReply(
+                    &interrupt_response_fallback,
+                    &interrupt_history_fallback,
+                );
+            }
+            return self.interruptedReply();
         }
 
         // ── Graceful degradation: tool iterations exhausted ──────────
@@ -2848,25 +3981,25 @@ pub const Agent = struct {
             summary_messages;
 
         const summary_timer_start = std_compat.time.milliTimestamp();
-        self.recordLlmRequestEvent(self.model_name, send_summary_messages);
-        self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, send_summary_messages, false, false);
+        self.recordLlmRequestEvent(turn_model_name, send_summary_messages);
+        self.logLlmRequest(self.max_tool_iterations + 1, 1, turn_model_name, send_summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
             .{
                 .messages = send_summary_messages,
                 .session_id = self.memory_session_id,
-                .model = self.model_name,
+                .model = turn_model_name,
                 .temperature = self.temperature,
                 .max_tokens = summary_max_tokens,
                 .tools = null, // force text-only
                 .timeout_secs = self.message_timeout_secs,
                 .reasoning_effort = self.reasoning_effort,
             },
-            self.model_name,
+            turn_model_name,
             self.temperature,
         ) catch |err| {
             const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
-            self.recordLlmFailureEvent(self.model_name, fail_duration, @errorName(err));
+            self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
@@ -2891,13 +4024,13 @@ pub const Agent = struct {
         }
         summary_response.usage = normalized_summary_usage;
         self.total_tokens += normalized_summary_usage.total_tokens;
-        self.total_cost_usd += cost_mod.TokenUsage.fromProviders(self.model_name, normalized_summary_usage).cost();
+        self.total_cost_usd += cost_mod.TokenUsage.fromProviders(turn_model_name, normalized_summary_usage).cost();
         self.last_turn_usage = normalized_summary_usage;
         if (normalized_summary_usage.total_tokens > 0) {
             const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_summary_usage.total_tokens };
             self.observer.recordMetric(&usage_metric);
         }
-        self.recordLlmResponseEvent(self.model_name, summary_duration_ms, &summary_response);
+        self.recordLlmResponseEvent(turn_model_name, summary_duration_ms, &summary_response);
         self.emitUsageRecord(&summary_response, true);
         defer self.freeResponseFields(&summary_response);
 
@@ -2920,56 +4053,50 @@ pub const Agent = struct {
         return prefixed;
     }
 
-    /// Execute a tool by name lookup.
-    /// Parses arguments_json once into a std.json.ObjectMap and passes it to the tool.
-    fn tool_call_batch_updates_tools_md(allocator: std.mem.Allocator, calls: []const ParsedToolCall) bool {
-        for (calls) |call| {
-            if (tool_call_updates_tools_md(allocator, call)) return true;
-        }
-        return false;
-    }
-
-    fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
+    fn toolCallUpdatesToolsMdPrepared(
+        call: ParsedToolCall,
+        prepared: PreparedToolArguments,
+    ) bool {
         if (!std.mem.eql(u8, call.name, "file_write") and
             !std.mem.eql(u8, call.name, "file_append") and
             !std.mem.eql(u8, call.name, "file_edit") and
             !std.mem.eql(u8, call.name, "file_edit_hashed")) return false;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{}) catch return false;
-        defer parsed.deinit();
-        if (parsed.value != .object) return false;
-
-        const path_value = parsed.value.object.get("path") orelse return false;
+        const args = switch (prepared) {
+            .object => |object| object,
+            else => return false,
+        };
+        const path_value = args.get("path") orelse return false;
         const path = switch (path_value) {
-            .string => |s| s,
+            .string => |value| value,
             else => return false,
         };
         return is_tools_markdown_path(path);
     }
 
-    fn should_skip_tools_memory_store_duplicate(
-        allocator: std.mem.Allocator,
-        batch_updates_tools_md: bool,
+    fn shouldSkipToolsMemoryStoreDuplicatePrepared(
+        tools_md_updated: bool,
         call: ParsedToolCall,
+        prepared: PreparedToolArguments,
     ) bool {
-        if (!batch_updates_tools_md) return false;
+        if (!tools_md_updated) return false;
         if (!std.mem.eql(u8, call.name, "memory_store")) return false;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{}) catch return false;
-        defer parsed.deinit();
-        if (parsed.value != .object) return false;
-
-        if (parsed.value.object.get("key")) |key_value| {
+        const args = switch (prepared) {
+            .object => |object| object,
+            else => return false,
+        };
+        if (args.get("key")) |key_value| {
             const key = switch (key_value) {
-                .string => |s| s,
+                .string => |value| value,
                 else => "",
             };
             if (is_tools_memory_key(key)) return true;
         }
 
-        if (parsed.value.object.get("content")) |content_value| {
+        if (args.get("content")) |content_value| {
             const content = switch (content_value) {
-                .string => |s| s,
+                .string => |value| value,
                 else => "",
             };
             if (std.ascii.indexOfIgnoreCase(content, "tools.md") != null) return true;
@@ -2995,56 +4122,208 @@ pub const Agent = struct {
         return hasher.final();
     }
 
-    const CachedToolCallResult = struct {
-        success: bool,
-        output: []const u8,
-    };
-
     fn deinitSeenToolCallResults(
         allocator: std.mem.Allocator,
-        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        seen_tool_call_results: *ToolCallResultCache,
     ) void {
-        var it = seen_tool_call_results.valueIterator();
-        while (it.next()) |cached_result| {
-            if (cached_result.output.len > 0) allocator.free(cached_result.output);
-        }
-        seen_tool_call_results.deinit(allocator);
+        deinitToolCallResultCache(allocator, seen_tool_call_results);
     }
 
     fn cachedToolCallResultInTurn(
-        seen_tool_call_results: *const std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        seen_tool_call_results: *const ToolCallResultCache,
         call: ParsedToolCall,
     ) ?CachedToolCallResult {
         return seen_tool_call_results.get(toolCallDedupFingerprint(call));
     }
 
-    fn rememberToolCallResultInTurn(
+    const TOOL_RESULT_RECEIPT_FALLBACK =
+        "Tool execution completed, but detailed output is unavailable due to memory pressure; do not repeat this call automatically";
+
+    /// Install an allocation-free result receipt after reserving map capacity,
+    /// before any tool side effect can run. Rich output replaces it best-effort.
+    fn prepareToolCallResultReceipt(
+        seen_tool_call_results: *ToolCallResultCache,
+        call: ParsedToolCall,
+    ) void {
+        const fingerprint = toolCallDedupFingerprint(call);
+        if (seen_tool_call_results.contains(fingerprint)) return;
+        seen_tool_call_results.putAssumeCapacity(fingerprint, .{
+            .success = false,
+            .output = TOOL_RESULT_RECEIPT_FALLBACK,
+            .output_owned = false,
+        });
+    }
+
+    fn discardPreparedToolCallResultReceipt(
         allocator: std.mem.Allocator,
-        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        seen_tool_call_results: *ToolCallResultCache,
+        call: ParsedToolCall,
+    ) void {
+        const removed = seen_tool_call_results.fetchRemove(toolCallDedupFingerprint(call)) orelse return;
+        if (removed.value.output_owned and removed.value.output.len > 0) allocator.free(removed.value.output);
+    }
+
+    fn finalizePreparedToolCallResultReceipt(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *ToolCallResultCache,
         call: ParsedToolCall,
         result: ToolExecutionResult,
+        cache_failed_signature: bool,
     ) void {
-        // Only cache successful results, unless it's a native tool call with an ID.
-        // For ID-based calls, we must preserve the result (even if failed) to support
-        // exact replays requested by the provider.
-        // Signature-based calls (XML) that failed are not cached so they can be
-        // re-tried if a subsequent tool in the same turn fixes the environment.
         const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
-        if (!result.success and !has_id) return;
+        if (!result.success and !has_id and !cache_failed_signature) {
+            discardPreparedToolCallResultReceipt(allocator, seen_tool_call_results, call);
+            return;
+        }
 
+        const cached = seen_tool_call_results.getPtr(toolCallDedupFingerprint(call)) orelse return;
+        // The side effect already completed. Preserve its true status even if
+        // copying the rich output fails, otherwise the reflection prompt may
+        // misclassify a successful receipt as transient and repeat the call.
+        cached.success = result.success;
+        const output_copy = if (result.output.len == 0)
+            ""
+        else
+            allocator.dupe(u8, result.output) catch return;
+        if (cached.output_owned and cached.output.len > 0) allocator.free(cached.output);
+        cached.* = .{
+            .success = result.success,
+            .output = output_copy,
+            .output_owned = output_copy.len > 0,
+        };
+    }
+
+    fn prepareApprovalBoundaryRich(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        assistant_base_text: []const u8,
+        parsed_calls: []const ParsedToolCall,
+        approval_call_count: usize,
+        completed_results: []const ToolExecutionResult,
+        failure_results: []const ToolExecutionResult,
+    ) !PreparedApprovalBoundary {
+        const raw_assistant = try dispatcher.buildAssistantHistoryWithToolCalls(
+            self.allocator,
+            assistant_base_text,
+            parsed_calls[0..approval_call_count],
+        );
+        var assistant_content: ?[]const u8 = try self.redactOwnedForHistory(raw_assistant);
+        errdefer if (assistant_content) |content| self.allocator.free(content);
+
+        const raw_cancel = try dispatcher.buildAssistantHistoryWithToolCalls(
+            self.allocator,
+            assistant_base_text,
+            parsed_calls[0 .. approval_call_count - 1],
+        );
+        var cancel_content: ?[]const u8 = try self.redactOwnedForHistory(raw_cancel);
+        errdefer if (cancel_content) |content| self.allocator.free(content);
+
+        var owned_completed: ?[]const u8 = null;
+        if (completed_results.len > 0) {
+            const formatted = try dispatcher.formatToolResults(arena, completed_results);
+            const scrubbed = try providers.scrubToolOutput(arena, formatted);
+            const safe = if (self.redactor) |redactor| try redactor.redact(arena, scrubbed) else scrubbed;
+            owned_completed = try self.allocator.dupe(u8, safe);
+        }
+        errdefer if (owned_completed) |content| self.allocator.free(content);
+
+        const formatted_failure = try dispatcher.formatToolResults(arena, failure_results);
+        const scrubbed_failure = try providers.scrubToolOutput(arena, formatted_failure);
+        const safe_failure = if (self.redactor) |redactor| try redactor.redact(arena, scrubbed_failure) else scrubbed_failure;
+        var owned_failure: ?[]const u8 = try self.allocator.dupe(u8, safe_failure);
+        errdefer if (owned_failure) |content| self.allocator.free(content);
+
+        const prepared = PreparedApprovalBoundary{
+            .assistant_content = assistant_content,
+            .cancel_assistant_content = cancel_content,
+            .completed_results = owned_completed,
+            .failure_results = owned_failure,
+        };
+        assistant_content = null;
+        cancel_content = null;
+        owned_completed = null;
+        owned_failure = null;
+        return prepared;
+    }
+
+    fn prepareInterruptedPrefixRich(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        assistant_base_text: []const u8,
+        parsed_calls: []const ParsedToolCall,
+        completed_call_count: usize,
+        completed_results: []const ToolExecutionResult,
+    ) !PreparedInterruptedPrefix {
+        const raw_assistant = try dispatcher.buildAssistantHistoryWithToolCalls(
+            self.allocator,
+            assistant_base_text,
+            parsed_calls[0..completed_call_count],
+        );
+        var assistant_content: ?[]const u8 = try self.redactOwnedForHistory(raw_assistant);
+        errdefer if (assistant_content) |content| self.allocator.free(content);
+
+        var owned_completed: ?[]const u8 = null;
+        if (completed_results.len > 0) {
+            const formatted = try dispatcher.formatToolResults(arena, completed_results);
+            const scrubbed = try providers.scrubToolOutput(arena, formatted);
+            const safe = if (self.redactor) |redactor| try redactor.redact(arena, scrubbed) else scrubbed;
+            owned_completed = try self.allocator.dupe(u8, safe);
+        }
+        errdefer if (owned_completed) |content| self.allocator.free(content);
+
+        const prepared = PreparedInterruptedPrefix{
+            .assistant_content = assistant_content,
+            .completed_results = owned_completed,
+        };
+        assistant_content = null;
+        owned_completed = null;
+        return prepared;
+    }
+
+    fn rememberApprovalToolCallResultExact(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *ToolCallResultCache,
+        call: ParsedToolCall,
+        result: ToolExecutionResult,
+    ) !void {
         const fingerprint = toolCallDedupFingerprint(call);
         if (seen_tool_call_results.contains(fingerprint)) return;
 
         const output_copy = if (result.output.len == 0)
             ""
         else
-            allocator.dupe(u8, result.output) catch return;
+            try allocator.dupe(u8, result.output);
+        errdefer if (output_copy.len > 0) allocator.free(output_copy);
 
-        seen_tool_call_results.put(allocator, fingerprint, .{
+        try seen_tool_call_results.put(allocator, fingerprint, .{
             .success = result.success,
             .output = output_copy,
-        }) catch {
-            if (output_copy.len > 0) allocator.free(output_copy);
+            .output_owned = output_copy.len > 0,
+        });
+    }
+
+    /// Replace a replay result without growing the map. The map entry is
+    /// reserved before an approved side effect runs, so allocation failure here
+    /// safely retains the generic exact-once fallback.
+    fn updateApprovalToolCallResult(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *ToolCallResultCache,
+        call: ParsedToolCall,
+        result: ToolExecutionResult,
+    ) void {
+        const cached = seen_tool_call_results.getPtr(toolCallDedupFingerprint(call)) orelse return;
+        // Keep the exact execution outcome independently of best-effort rich
+        // output allocation. A false failure receipt could trigger a replay.
+        cached.success = result.success;
+        const output_copy = if (result.output.len == 0)
+            ""
+        else
+            allocator.dupe(u8, result.output) catch return;
+        if (cached.output_owned and cached.output.len > 0) allocator.free(cached.output);
+        cached.* = .{
+            .success = result.success,
+            .output = output_copy,
+            .output_owned = output_copy.len > 0,
         };
     }
 
@@ -3076,7 +4355,138 @@ pub const Agent = struct {
             std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
     }
 
+    const PreparedToolArguments = union(enum) {
+        invalid_json,
+        non_object,
+        object: std.json.ObjectMap,
+    };
+
+    fn prepareToolArgumentsBatch(
+        arena: std.mem.Allocator,
+        calls: []const ParsedToolCall,
+    ) ![]PreparedToolArguments {
+        const prepared = try arena.alloc(PreparedToolArguments, calls.len);
+        for (calls, prepared) |call, *entry| {
+            const value = std.json.parseFromSliceLeaky(
+                std.json.Value,
+                arena,
+                call.arguments_json,
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    entry.* = .invalid_json;
+                    continue;
+                },
+            };
+            entry.* = switch (value) {
+                .object => |object| .{ .object = object },
+                else => .non_object,
+            };
+        }
+        return prepared;
+    }
+
+    const ToolExecutionOptions = struct {
+        approved: bool = false,
+        record_action: bool = true,
+    };
+
+    fn queueToolCallApproval(
+        self: *Agent,
+        tool_allocator: std.mem.Allocator,
+        tool_name: []const u8,
+        call: ParsedToolCall,
+        args: std.json.ObjectMap,
+    ) !void {
+        const command = tools_mod.getString(args, "command");
+        const display_command = if (command) |cmd|
+            if (isExecToolName(tool_name)) tools_mod.shell.normalizeCommandInput(cmd) else cmd
+        else
+            null;
+        const cwd = tools_mod.getString(args, "cwd");
+        var owned_action: ?[]u8 = null;
+        defer if (owned_action) |value| tool_allocator.free(value);
+        const action = if (display_command) |cmd|
+            if (cwd) |requested_cwd| blk: {
+                owned_action = try std.fmt.allocPrint(tool_allocator, "{s} (cwd: {s})", .{ cmd, requested_cwd });
+                break :blk owned_action.?;
+            } else cmd
+        else
+            tool_name;
+        const risk_level: CommandRiskLevel = blk: {
+            if (display_command) |cmd| {
+                if (self.policy) |pol| break :blk pol.commandRiskLevel(cmd);
+            }
+            break :blk .medium;
+        };
+        try self.setPendingToolApproval(
+            tool_name,
+            call.tool_call_id,
+            action,
+            risk_level,
+            call.arguments_json,
+        );
+    }
+
+    fn approvalFailureResult(
+        call: ParsedToolCall,
+        approval_err: anyerror,
+    ) ToolExecutionResult {
+        const output = switch (approval_err) {
+            error.OutOfMemory => "OutOfMemory",
+            error.ApprovalAlreadyPending => "Another tool approval is already pending",
+            error.ApprovalUnavailable => "Command requires approval, but this channel cannot deliver an interactive approval request",
+            else => @errorName(approval_err),
+        };
+        return .{
+            .name = call.name,
+            .output = output,
+            .success = false,
+            .tool_call_id = call.tool_call_id,
+            .approval_boundary = true,
+        };
+    }
+
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+        return self.executeToolWithOptions(tool_allocator, call, .{});
+    }
+
+    fn executeToolWithOptions(
+        self: *Agent,
+        tool_allocator: std.mem.Allocator,
+        call: ParsedToolCall,
+        options: ToolExecutionOptions,
+    ) ToolExecutionResult {
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            tool_allocator,
+            call.arguments_json,
+            .{},
+        ) catch {
+            return self.executeToolWithPreparedArguments(
+                tool_allocator,
+                call,
+                options,
+                .invalid_json,
+            );
+        };
+        defer parsed.deinit();
+
+        const prepared: PreparedToolArguments = switch (parsed.value) {
+            .object => |object| .{ .object = object },
+            else => .non_object,
+        };
+        return self.executeToolWithPreparedArguments(tool_allocator, call, options, prepared);
+    }
+
+    fn executeToolWithPreparedArguments(
+        self: *Agent,
+        tool_allocator: std.mem.Allocator,
+        call: ParsedToolCall,
+        options: ToolExecutionOptions,
+        prepared: PreparedToolArguments,
+    ) ToolExecutionResult {
         if (self.isInterruptRequested()) {
             return .{
                 .name = call.name,
@@ -3096,14 +4506,16 @@ pub const Agent = struct {
                     .tool_call_id = call.tool_call_id,
                 };
             }
-            const allowed = pol.recordAction() catch true;
-            if (!allowed) {
-                return .{
-                    .name = call.name,
-                    .output = "Rate limit exceeded",
-                    .success = false,
-                    .tool_call_id = call.tool_call_id,
-                };
+            if (options.record_action) {
+                const allowed = pol.recordAction() catch true;
+                if (!allowed) {
+                    return .{
+                        .name = call.name,
+                        .output = "Rate limit exceeded",
+                        .success = false,
+                        .tool_call_id = call.tool_call_id,
+                    };
+                }
             }
         }
 
@@ -3111,39 +4523,52 @@ pub const Agent = struct {
 
         for (self.tools) |t| {
             if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
-                // Parse arguments JSON to ObjectMap ONCE. Placeholders are
-                // intentionally passed through unchanged; provider-bound
-                // redaction must not become an implicit provider-to-tool
-                // rehydration channel.
-                var parsed = std.json.parseFromSlice(
-                    std.json.Value,
-                    tool_allocator,
-                    call.arguments_json,
-                    .{},
-                ) catch {
-                    return .{
+                // Placeholders are intentionally passed through unchanged;
+                // provider-bound redaction must not become an implicit
+                // provider-to-tool rehydration channel.
+                const args: std.json.ObjectMap = switch (prepared) {
+                    .invalid_json => return .{
                         .name = call.name,
                         .output = "Invalid arguments JSON",
                         .success = false,
                         .tool_call_id = call.tool_call_id,
-                    };
+                    },
+                    .non_object => return .{
+                        .name = call.name,
+                        .output = "Arguments must be a JSON object",
+                        .success = false,
+                        .tool_call_id = call.tool_call_id,
+                    },
+                    .object => |object| object,
                 };
-                defer parsed.deinit();
 
-                const args: std.json.ObjectMap = switch (parsed.value) {
-                    .object => |o| o,
-                    else => {
+                // Gate the authoritative matched tool name. Provider output is
+                // whitespace-tolerant for lookup, so checking the raw call name
+                // would let ` shell ` bypass exec approval and policy checks.
+                if (isExecToolName(t.name())) {
+                    // `/bash` keeps its explicit slash-command approval UX;
+                    // model-issued shell calls use the structured WebChannel
+                    // flow so the tool batch can suspend before later effects.
+                    if (!options.approved and
+                        self.exec_ask == .always and
+                        self.exec_host != .node and
+                        self.exec_security != .deny and
+                        self.approval_callback != null and
+                        self.approval_ctx != null and
+                        tools_mod.getString(args, "command") != null)
+                    {
+                        self.queueToolCallApproval(tool_allocator, t.name(), call, args) catch |approval_err| {
+                            return approvalFailureResult(call, approval_err);
+                        };
                         return .{
                             .name = call.name,
-                            .output = "Arguments must be a JSON object",
+                            .output = "Approval pending",
                             .success = false,
                             .tool_call_id = call.tool_call_id,
+                            .approval_boundary = true,
                         };
-                    },
-                };
-
-                if (isExecToolName(call.name)) {
-                    if (self.execBlockMessage(args)) |msg| {
+                    }
+                    if (self.execBlockMessageWithOptions(args, options.approved)) |msg| {
                         return .{
                             .name = call.name,
                             .output = msg,
@@ -3161,7 +4586,33 @@ pub const Agent = struct {
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const previous_memory_session_id = tools_mod.setThreadMemorySessionId(self.memory_session_id);
                 defer _ = tools_mod.setThreadMemorySessionId(previous_memory_session_id);
+                const previous_approval_grant = tools_mod.setThreadApprovalGrant(if (options.approved) .{
+                    .tool_name = t.name(),
+                    .command = tools_mod.getString(args, "command"),
+                    .cwd = tools_mod.getString(args, "cwd"),
+                } else null);
+                defer _ = tools_mod.setThreadApprovalGrant(previous_approval_grant);
                 const result = t.execute(tool_allocator, args) catch |err| {
+                    if (err == error.ApprovalRequired) {
+                        if (options.approved) {
+                            return .{
+                                .name = call.name,
+                                .output = "Approved tool invocation requested approval again",
+                                .success = false,
+                                .tool_call_id = call.tool_call_id,
+                            };
+                        }
+                        self.queueToolCallApproval(tool_allocator, t.name(), call, args) catch |approval_err| {
+                            return approvalFailureResult(call, approval_err);
+                        };
+                        return .{
+                            .name = call.name,
+                            .output = "Approval pending",
+                            .success = false,
+                            .tool_call_id = call.tool_call_id,
+                            .approval_boundary = true,
+                        };
+                    }
                     if (verbose_mod.isVerbose()) {
                         log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
                     }
@@ -3857,18 +5308,23 @@ pub const Agent = struct {
 
     /// Load persisted messages into history (for session restore).
     /// Each entry has .role ("user"/"assistant") and .content.
-    /// The agent takes ownership of the content strings.
+    /// Entries remain borrowed; the agent duplicates projected content.
     pub fn loadHistory(self: *Agent, entries: anytype) !void {
-        for (entries) |entry| {
+        const projected = try memory_mod.projectSessionMessages(self.allocator, entries);
+        defer memory_mod.freeMessages(self.allocator, projected);
+        for (projected) |entry| {
+            if (memory_mod.isRuntimeCommandRole(entry.role)) continue;
             const role: providers.Role = if (std.mem.eql(u8, entry.role, "assistant"))
                 .assistant
             else if (std.mem.eql(u8, entry.role, "system"))
                 .system
             else
                 .user;
+            const owned_content = try self.allocator.dupe(u8, entry.content);
+            errdefer self.allocator.free(owned_content);
             try self.history.append(self.allocator, .{
                 .role = role,
-                .content = try self.allocator.dupe(u8, entry.content),
+                .content = owned_content,
             });
         }
     }
@@ -4016,6 +5472,96 @@ test "Agent clear history" {
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
     try std.testing.expect(agent.workspace_prompt_fingerprint == null);
+}
+
+test "Agent loadHistory projects completed tool checkpoints" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const completion = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n{{\"original_user\":\"run probe\",\"assistant_response\":\"probe complete\"}}",
+        .{memory_mod.TOOL_TURN_COMPLETION_CHECKPOINT},
+    );
+    defer allocator.free(completion);
+    const raw = [_]memory_mod.MessageEntry{
+        .{ .role = memory_mod.RUNTIME_COMMAND_ROLE, .content = "/usage full" },
+        .{
+            .role = memory_mod.TOOL_TURN_CHECKPOINT_ROLE,
+            .content = memory_mod.TOOL_TURN_WRITE_AHEAD_CHECKPOINT,
+        },
+        .{ .role = memory_mod.TOOL_TURN_CHECKPOINT_ROLE, .content = completion },
+    };
+
+    try agent.loadHistory(&raw);
+    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+    try std.testing.expectEqual(providers.Role.user, agent.history.items[0].role);
+    try std.testing.expectEqualStrings("run probe", agent.history.items[0].content);
+    try std.testing.expectEqual(providers.Role.assistant, agent.history.items[1].role);
+    try std.testing.expectEqualStrings("probe complete", agent.history.items[1].content);
+}
+
+fn loadHistoryAllocationHarness(allocator: std.mem.Allocator) !void {
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const completion = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n{{\"original_user\":\"first\",\"assistant_response\":\"second\"}}",
+        .{memory_mod.TOOL_TURN_COMPLETION_CHECKPOINT},
+    );
+    defer allocator.free(completion);
+    const raw = [_]memory_mod.MessageEntry{
+        .{ .role = memory_mod.TOOL_TURN_CHECKPOINT_ROLE, .content = memory_mod.TOOL_TURN_WRITE_AHEAD_CHECKPOINT },
+        .{ .role = memory_mod.TOOL_TURN_CHECKPOINT_ROLE, .content = completion },
+        .{ .role = "assistant", .content = "third" },
+    };
+    try agent.loadHistory(&raw);
+    try std.testing.expectEqual(@as(usize, 3), agent.historyLen());
+}
+
+test "Agent loadHistory frees partial projection on every allocation failure" {
+    // Regression: an append failure after duplicating one projected message
+    // must not leak either the duplicate or earlier history entries.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        loadHistoryAllocationHarness,
+        .{},
+    );
 }
 
 test "dispatcher module reexport" {
@@ -6780,6 +8326,235 @@ test "interruption reply lists effectively interrupted tools" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted tools: shell, web_fetch") != null);
 }
 
+test "active and interrupted tool names remain owned across allocation failure" {
+    // Regression: replacing an active name used to free the old value before
+    // duplication, and interrupted-name append could leak when growth failed.
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try agent.setActiveToolName("existing-tool");
+
+    var replace_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    agent.allocator = replace_failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, agent.setActiveToolName("replacement-tool"));
+    agent.allocator = allocator;
+
+    const active = (try agent.snapshotActiveToolName(allocator)).?;
+    defer allocator.free(active);
+    try std.testing.expectEqualStrings("existing-tool", active);
+
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        agent.allocator = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, agent.noteInterruptedTool("shell"));
+        agent.allocator = allocator;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), agent.interrupted_tools.items.len);
+    }
+}
+
+test "interrupt between tool calls commits completed prefix and skips tail" {
+    // Regression: an interrupt observed between calls used to return with the
+    // full provider batch in history, no result for the completed side effect,
+    // and the remaining calls ambiguously recorded as if they had run.
+    const InterruptingPrefixTool = struct {
+        const Self = @This();
+        agent: ?*Agent = null,
+        execution_count: *usize,
+        failing: ?*std.testing.FailingAllocator = null,
+        arm_oom: bool = false,
+
+        pub const tool_name = "interrupt_prefix_probe";
+        pub const tool_description = "Completes once, then requests a turn interrupt";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.execution_count.* += 1;
+            const output = try allocator.dupe(u8, "prefix-side-effect-complete");
+            self.agent.?.requestInterrupt();
+            // Arm persistent OOM only after the simulated side effect and its
+            // owned result exist. Closing the canonical prefix must now be
+            // entirely allocation-free.
+            if (self.arm_oom) {
+                if (self.failing) |failing| failing.fail_index = failing.alloc_index;
+            }
+            return .{ .success = true, .output = output };
+        }
+    };
+
+    const TailProbeTool = struct {
+        const Self = @This();
+        execution_count: *usize,
+
+        pub const tool_name = "interrupt_tail_probe";
+        pub const tool_description = "Must not execute after an interrupt";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.execution_count.* += 1;
+            return .{ .success = true, .output = try allocator.dupe(u8, "tail-side-effect-complete") };
+        }
+    };
+
+    const BatchProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "interrupt-prefix-id"),
+                .name = try allocator.dupe(u8, "interrupt_prefix_probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            tool_calls[1] = .{
+                .id = try allocator.dupe(u8, "interrupt-tail-id"),
+                .name = try allocator.dupe(u8, "interrupt_tail_probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "executing interrupt batch"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "interrupt-batch-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var prefix_execution_count: usize = 0;
+    var tail_execution_count: usize = 0;
+    var prefix_impl = InterruptingPrefixTool{
+        .execution_count = &prefix_execution_count,
+        .failing = &failing,
+    };
+    var tail_impl = TailProbeTool{ .execution_count = &tail_execution_count };
+    const tools = [_]Tool{ prefix_impl.tool(), tail_impl.tool() };
+
+    const specs = try allocator.alloc(ToolSpec, tools.len);
+    for (tools, 0..) |tool, i| {
+        specs[i] = .{
+            .name = tool.name(),
+            .description = tool.description(),
+            .parameters_json = tool.parametersJson(),
+        };
+    }
+
+    var provider_state = BatchProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = BatchProvider.chatWithSystem,
+        .chat = BatchProvider.chat,
+        .supportsNativeTools = BatchProvider.supportsNativeTools,
+        .getName = BatchProvider.getName,
+        .deinit = BatchProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tools,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+    prefix_impl.agent = &agent;
+
+    const rich_response = try agent.turn("run interrupt batch");
+    defer allocator.free(rich_response);
+
+    try std.testing.expect(std.mem.indexOf(u8, rich_response, "Interrupted by /stop") != null);
+    try std.testing.expectEqual(@as(usize, 1), prefix_execution_count);
+    try std.testing.expectEqual(@as(usize, 0), tail_execution_count);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+
+    var found_rich_assistant = false;
+    var found_rich_result = false;
+    for (agent.history.items) |message| {
+        if (message.role == .assistant and
+            std.mem.indexOf(u8, message.content, "interrupt_prefix_probe") != null)
+        {
+            found_rich_assistant = true;
+            try std.testing.expect(std.mem.indexOf(u8, message.content, "interrupt_tail_probe") == null);
+        }
+        if (message.role == .user and
+            std.mem.indexOf(u8, message.content, "prefix-side-effect-complete") != null)
+        {
+            found_rich_result = true;
+            try std.testing.expect(std.mem.indexOf(u8, message.content, "tail-side-effect-complete") == null);
+        }
+    }
+    try std.testing.expect(found_rich_assistant);
+    try std.testing.expect(found_rich_result);
+    try std.testing.expectEqualStrings(rich_response, agent.history.items[agent.history.items.len - 1].content);
+
+    prefix_impl.arm_oom = true;
+    const response = try agent.turn("run interrupt batch under memory pressure");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+    try std.testing.expectEqual(@as(usize, 2), prefix_execution_count);
+    try std.testing.expectEqual(@as(usize, 0), tail_execution_count);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(failing.has_induced_failure);
+
+    var found_prefix_assistant = false;
+    var found_prefix_result = false;
+    for (agent.history.items) |message| {
+        if (message.role == .assistant and
+            std.mem.indexOf(u8, message.content, "tool batch was interrupted") != null)
+        {
+            found_prefix_assistant = true;
+            try std.testing.expect(std.mem.indexOf(u8, message.content, "interrupt_tail_probe") == null);
+        }
+        if (message.role == .user and
+            std.mem.indexOf(u8, message.content, "status=\"memory_pressure\"") != null)
+        {
+            found_prefix_result = true;
+            try std.testing.expect(std.mem.indexOf(u8, message.content, "tail-side-effect-complete") == null);
+        }
+    }
+    try std.testing.expect(found_prefix_assistant);
+    try std.testing.expect(found_prefix_result);
+    try std.testing.expectEqualStrings(response, agent.history.items[agent.history.items.len - 1].content);
+}
+
 test "hard stop mock interruption lists exactly interrupted tool" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -6900,7 +8675,9 @@ test "hard stop mock interruption lists exactly interrupted tool" {
         .model_name = "test-model",
         .temperature = 0.7,
         .workspace_dir = "/tmp",
-        .max_tool_iterations = 4,
+        // Regression: an interrupt requested by the only tool on the final
+        // allowed iteration must return now, without a summary provider call.
+        .max_tool_iterations = 1,
         .max_history_messages = 50,
         .auto_save = false,
         .history = .empty,
@@ -6960,6 +8737,58 @@ test "slash /approve executes pending bash command" {
     try std.testing.expect(std.mem.indexOf(u8, approve_resp, "Approved exec") != null);
     try std.testing.expect(std.mem.indexOf(u8, approve_resp, "hello-approve") != null);
     try std.testing.expect(agent.pending_exec_command == null);
+}
+
+test "direct slash bash waits for durable tool barrier" {
+    // Regression: /bash bypasses the provider tool loop, but must not execute
+    // its shell tool when the caller cannot establish a durable write-ahead
+    // fence first.
+    const DirectShellProbe = struct {
+        execution_count: usize = 0,
+
+        pub const tool_name = "shell";
+        pub const tool_description = "Direct slash barrier regression tool";
+        pub const tool_params =
+            \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+        ;
+        const vtable = tools_mod.ToolVTable(@This());
+
+        fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *@This(), _: std.mem.Allocator, _: std.json.ObjectMap) !tools_mod.ToolResult {
+            self.execution_count += 1;
+            return tools_mod.ToolResult.ok("unexpected execution");
+        }
+    };
+    const BarrierProbe = struct {
+        calls: usize = 0,
+
+        fn callback(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.InjectedToolFenceFailure;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var shell_impl = DirectShellProbe{};
+    const shell_tools = [_]Tool{shell_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &shell_tools, noop.observer(), &capture);
+    defer agent.deinit();
+    var barrier = BarrierProbe{};
+    agent.before_tool_dispatch_cb = BarrierProbe.callback;
+    agent.before_tool_dispatch_ctx = @ptrCast(&barrier);
+
+    try std.testing.expectError(
+        error.InjectedToolFenceFailure,
+        agent.handleSlashCommand("/bash guarded-command"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+    try std.testing.expectEqual(@as(usize, 0), shell_impl.execution_count);
 }
 
 test "slash /restart clears runtime command settings" {
@@ -7538,7 +9367,9 @@ test "exec security deny blocks shell tool execution" {
     defer allocator.free(cmd_resp);
 
     const call = ParsedToolCall{
-        .name = "shell",
+        // Regression: lookup trims provider tool names; the approval gate must
+        // use the matched tool identity instead of this untrusted spelling.
+        .name = " shell ",
         .arguments_json = "{\"command\":\"echo hello\"}",
         .tool_call_id = null,
     };
@@ -7549,6 +9380,57 @@ test "exec security deny blocks shell tool execution" {
 }
 
 test "exec ask always registers pending approval from tool path" {
+    const allocator = std.testing.allocator;
+    const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
+    shell_impl.* = .{ .workspace_dir = "." };
+    const shell_tool = shell_impl.tool();
+    defer shell_tool.deinit(allocator);
+
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{shell_tool},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .approval_callback = ApprovalCapture.callback,
+        .approval_ctx = @ptrCast(&capture),
+    };
+    defer agent.deinit();
+
+    const cmd_resp = (try agent.handleSlashCommand("/exec ask=always")).?;
+    defer allocator.free(cmd_resp);
+
+    const call = ParsedToolCall{
+        .name = "\tShell \n",
+        .arguments_json = "{\"command\":\"```bash\\necho hello\\n```\",\"cwd\":\"/tmp/work-a\"}",
+        .tool_call_id = null,
+    };
+    const result = agent.executeTool(allocator, call);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Approval pending", result.output);
+    try std.testing.expect(agent.pending_approval != null);
+    try std.testing.expect(agent.pending_exec_command == null);
+    try emitPreparedApprovalForTest(&agent);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    // Regression: the prompt and risk evaluation must describe the same
+    // normalized command ShellTool will execute, while the grant stays exact.
+    try std.testing.expectEqualStrings("echo hello (cwd: /tmp/work-a)", agent.pending_approval.?.action);
+}
+
+test "exec ask always preserves legacy approval without structured sink" {
+    // Regression: CLI and non-Web channels do not install an approval sink;
+    // model-issued shell calls must retain the existing `/approve` workflow.
     const allocator = std.testing.allocator;
     const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
     shell_impl.* = .{ .workspace_dir = "." };
@@ -7575,16 +9457,15 @@ test "exec ask always registers pending approval from tool path" {
 
     const cmd_resp = (try agent.handleSlashCommand("/exec ask=always")).?;
     defer allocator.free(cmd_resp);
-
-    const call = ParsedToolCall{
+    const result = agent.executeTool(allocator, .{
         .name = "shell",
         .arguments_json = "{\"command\":\"echo hello\"}",
-        .tool_call_id = null,
-    };
-    const result = agent.executeTool(allocator, call);
+        .tool_call_id = "cli-shell-call",
+    });
 
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "approval required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Use /approve") != null);
+    try std.testing.expect(agent.pending_approval == null);
     try std.testing.expect(agent.pending_exec_command != null);
     try std.testing.expectEqualStrings("echo hello", agent.pending_exec_command.?);
 }
@@ -8307,43 +10188,60 @@ test "milliTimestamp negative difference clamps to zero" {
     try std.testing.expectEqual(@as(u64, 0), duration);
 }
 
-test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
-    const allocator = std.testing.allocator;
-
-    const calls_match = [_]ParsedToolCall{
-        .{ .name = "file_write", .arguments_json = "{\"path\":\"TOOLS.md\",\"content\":\"x\"}" },
-        .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"target\":\"L1:abc\",\"new_text\":\"b\"}" },
-    };
-    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
-
-    const calls_append_match = [_]ParsedToolCall{
-        .{ .name = "file_append", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"content\":\"\\nmore guidance\"}" },
-    };
-    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_append_match));
-
-    const calls_no_match = [_]ParsedToolCall{
-        .{ .name = "file_write", .arguments_json = "{\"path\":\"README.md\",\"content\":\"x\"}" },
-        .{ .name = "memory_store", .arguments_json = "{\"key\":\"pref.tools.file_read_over_cat\",\"content\":\"rule\"}" },
-    };
-    try std.testing.expect(!Agent.tool_call_batch_updates_tools_md(allocator, &calls_no_match));
-}
-
-test "should_skip_tools_memory_store_duplicate skips only tools-related memory_store entries" {
-    const allocator = std.testing.allocator;
-
+test "prepared tool arguments apply TOOLS.md dedup sequentially" {
     const calls = [_]ParsedToolCall{
         .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"target\":\"L4:def\",\"new_text\":\"new\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"pref.tools.file_read_over_cat\",\"content\":\"Always use file_read\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"user.nickname\",\"content\":\"DonPrus\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"session.note\",\"content\":\"Rule is documented in TOOLS.md\"}" },
     };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const prepared = try Agent.prepareToolArgumentsBatch(arena.allocator(), &calls);
 
-    const batch_updates_tools_md = Agent.tool_call_batch_updates_tools_md(allocator, &calls);
-    try std.testing.expect(batch_updates_tools_md);
-    try std.testing.expect(Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[1]));
-    try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[2]));
-    try std.testing.expect(Agent.should_skip_tools_memory_store_duplicate(allocator, batch_updates_tools_md, calls[3]));
-    try std.testing.expect(!Agent.should_skip_tools_memory_store_duplicate(allocator, false, calls[1]));
+    try std.testing.expect(Agent.toolCallUpdatesToolsMdPrepared(calls[0], prepared[0]));
+    // A later TOOLS.md write must never suppress an earlier memory_store.
+    try std.testing.expect(!Agent.shouldSkipToolsMemoryStoreDuplicatePrepared(false, calls[1], prepared[1]));
+    try std.testing.expect(Agent.shouldSkipToolsMemoryStoreDuplicatePrepared(true, calls[1], prepared[1]));
+    try std.testing.expect(!Agent.shouldSkipToolsMemoryStoreDuplicatePrepared(true, calls[2], prepared[2]));
+    try std.testing.expect(Agent.shouldSkipToolsMemoryStoreDuplicatePrepared(true, calls[3], prepared[3]));
+}
+
+test "tool argument batch parsing completes before the first side effect" {
+    // Regression: OOM while parsing a later call must occur before an earlier
+    // call is allowed to execute. The large second value forces the arena to
+    // request more than its initial backing allocation.
+    const large_arguments = "{\"content\":\"" ++ ("x" ** 32_768) ++ "\"}";
+    const calls = [_]ParsedToolCall{
+        .{ .name = "first_effect", .arguments_json = "{\"value\":1}" },
+        .{ .name = "later_call", .arguments_json = large_arguments },
+    };
+
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var arena = std.heap.ArenaAllocator.init(counting.allocator());
+        defer arena.deinit();
+        _ = try Agent.prepareToolArgumentsBatch(arena.allocator(), &calls);
+    }
+    const allocation_count = counting.alloc_index;
+    try std.testing.expect(allocation_count > 1);
+
+    var observed_late_failure = false;
+    for (0..allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var arena = std.heap.ArenaAllocator.init(failing.allocator());
+        defer arena.deinit();
+        var side_effect_count: usize = 0;
+        if (Agent.prepareToolArgumentsBatch(arena.allocator(), &calls)) |_| {
+            side_effect_count += 1;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), side_effect_count);
+            if (fail_index > 0) observed_late_failure = true;
+        }
+        try std.testing.expect(failing.has_induced_failure);
+    }
+    try std.testing.expect(observed_late_failure);
 }
 
 test "toolCallDedupFingerprint prefers tool_call_id over arguments" {
@@ -8360,9 +10258,9 @@ test "toolCallDedupFingerprint prefers tool_call_id over arguments" {
     try std.testing.expectEqual(Agent.toolCallDedupFingerprint(call_a), Agent.toolCallDedupFingerprint(call_b));
 }
 
-test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
+test "prepared tool receipt reuses repeated calls in same batch" {
     const allocator = std.testing.allocator;
-    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    var seen: ToolCallResultCache = .empty;
     defer Agent.deinitSeenToolCallResults(allocator, &seen);
 
     const call_a = ParsedToolCall{
@@ -8383,12 +10281,14 @@ test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
 
     try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_a) == null);
 
-    Agent.rememberToolCallResultInTurn(allocator, &seen, call_a, .{
+    try seen.ensureUnusedCapacity(allocator, 1);
+    Agent.prepareToolCallResultReceipt(&seen, call_a);
+    Agent.finalizePreparedToolCallResultReceipt(allocator, &seen, call_a, .{
         .name = call_a.name,
         .output = "first result",
         .success = true,
         .tool_call_id = null,
-    });
+    }, false);
 
     const cached_b = Agent.cachedToolCallResultInTurn(&seen, call_b).?;
     try std.testing.expect(cached_b.success);
@@ -8396,9 +10296,9 @@ test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
     try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_c) == null);
 }
 
-test "rememberToolCallResultInTurn preserves failed result for replayed tool_call_id" {
+test "prepared tool receipt preserves failed result for replayed tool_call_id" {
     const allocator = std.testing.allocator;
-    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    var seen: ToolCallResultCache = .empty;
     defer Agent.deinitSeenToolCallResults(allocator, &seen);
 
     const original_call = ParsedToolCall{
@@ -8412,21 +10312,23 @@ test "rememberToolCallResultInTurn preserves failed result for replayed tool_cal
         .tool_call_id = "call_retry_me",
     };
 
-    Agent.rememberToolCallResultInTurn(allocator, &seen, original_call, .{
+    try seen.ensureUnusedCapacity(allocator, 1);
+    Agent.prepareToolCallResultReceipt(&seen, original_call);
+    Agent.finalizePreparedToolCallResultReceipt(allocator, &seen, original_call, .{
         .name = original_call.name,
         .output = "Rate limit exceeded",
         .success = false,
         .tool_call_id = original_call.tool_call_id,
-    });
+    }, false);
 
     const cached_replay = Agent.cachedToolCallResultInTurn(&seen, replayed_call).?;
     try std.testing.expect(!cached_replay.success);
     try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
 }
 
-test "rememberToolCallResultInTurn skips failed signature-only calls" {
+test "prepared tool receipt skips failed signature-only calls" {
     const allocator = std.testing.allocator;
-    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    var seen: ToolCallResultCache = .empty;
     defer Agent.deinitSeenToolCallResults(allocator, &seen);
 
     const failed_call = ParsedToolCall{
@@ -8435,14 +10337,74 @@ test "rememberToolCallResultInTurn skips failed signature-only calls" {
         .tool_call_id = null,
     };
 
-    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, .{
+    try seen.ensureUnusedCapacity(allocator, 1);
+    Agent.prepareToolCallResultReceipt(&seen, failed_call);
+    Agent.finalizePreparedToolCallResultReceipt(allocator, &seen, failed_call, .{
         .name = failed_call.name,
         .output = "FileNotFound",
         .success = false,
         .tool_call_id = null,
-    });
+    }, false);
 
     try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call) == null);
+}
+
+test "prepared tool receipt survives post execution allocation failure" {
+    // Regression: a successful call before an approval boundary must retain an
+    // exact replay receipt even if copying its rich output runs out of memory.
+    const allocator = std.testing.allocator;
+    var seen: ToolCallResultCache = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+    try seen.ensureUnusedCapacity(allocator, 1);
+
+    const call = ParsedToolCall{
+        .name = "side_effect_probe",
+        .arguments_json = "{}",
+        .tool_call_id = "completed-before-approval",
+    };
+    Agent.prepareToolCallResultReceipt(&seen, call);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    Agent.finalizePreparedToolCallResultReceipt(failing.allocator(), &seen, call, .{
+        .name = call.name,
+        .output = "rich side effect result",
+        .success = true,
+        .tool_call_id = call.tool_call_id,
+    }, false);
+    try std.testing.expect(failing.has_induced_failure);
+
+    const replay = Agent.cachedToolCallResultInTurn(&seen, call) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(replay.success);
+    try std.testing.expectEqualStrings(Agent.TOOL_RESULT_RECEIPT_FALLBACK, replay.output);
+}
+
+test "approved tool receipt preserves success when rich output allocation fails" {
+    // Regression: the approved side effect already ran, so OOM while copying
+    // its output must not leave a false failure receipt that invites a retry.
+    const allocator = std.testing.allocator;
+    var seen: ToolCallResultCache = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+    try seen.ensureUnusedCapacity(allocator, 1);
+
+    const call = ParsedToolCall{
+        .name = "approved_side_effect_probe",
+        .arguments_json = "{}",
+        .tool_call_id = "approved-complete",
+    };
+    Agent.prepareToolCallResultReceipt(&seen, call);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    Agent.updateApprovalToolCallResult(failing.allocator(), &seen, call, .{
+        .name = call.name,
+        .output = "rich approved result",
+        .success = true,
+        .tool_call_id = call.tool_call_id,
+    });
+    try std.testing.expect(failing.has_induced_failure);
+
+    const replay = Agent.cachedToolCallResultInTurn(&seen, call) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(replay.success);
+    try std.testing.expectEqualStrings(Agent.TOOL_RESULT_RECEIPT_FALLBACK, replay.output);
 }
 
 test "Agent turn skips replayed tool_call_id across iterations" {
@@ -10553,6 +12515,94 @@ test "filterToolSpecsForTurn dynamic group includes tool on keyword match" {
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
 }
 
+test "approval continuation preserves routed model and original dynamic tool trigger" {
+    // Regression: #900 the synthetic tool-result text must not replace the
+    // original user request for model routing or dynamic MCP tool filtering.
+    const ContinuationProvider = struct {
+        model_preserved: bool = false,
+        task_tool_present: bool = false,
+        browser_tool_present: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "continued");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.model_preserved = std.mem.eql(u8, request.model, "provider/routed-model") and
+                std.mem.eql(u8, model, "provider/routed-model");
+            for (request.tools orelse &.{}) |spec| {
+                if (std.mem.eql(u8, spec.name, "mcp_vikunja_list_tasks")) self.task_tool_present = true;
+                if (std.mem.eql(u8, spec.name, "mcp_browser_open")) self.browser_tool_present = true;
+            }
+            return .{
+                .content = try allocator.dupe(u8, "continued"),
+                .usage = .{},
+                .model = try allocator.dupe(u8, "provider/routed-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "continuation-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ContinuationProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ContinuationProvider.chatWithSystem,
+        .chat = ContinuationProvider.chat,
+        .supportsNativeTools = ContinuationProvider.supportsNativeTools,
+        .getName = ContinuationProvider.getName,
+        .deinit = ContinuationProvider.deinitFn,
+    };
+    var noop = observability.NoopObserver{};
+    const specs = try allocator.dupe(ToolSpec, &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "list tasks", .parameters_json = "{}" },
+        .{ .name = "mcp_browser_open", .description = "open browser", .parameters_json = "{}" },
+    });
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "default-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .tool_filter_groups = &.{
+            .{ .mode = .dynamic, .tools = &.{"mcp_vikunja_*"}, .keywords = &.{"task"} },
+            .{ .mode = .dynamic, .tools = &.{"mcp_browser_*"}, .keywords = &.{"browser"} },
+        },
+    };
+    defer agent.deinit();
+
+    var replay_results: ToolCallResultCache = .empty;
+    defer deinitToolCallResultCache(allocator, &replay_results);
+    const response = try agent.continueAfterApproval(
+        "approved execution completed",
+        "show my tasks",
+        "provider/routed-model",
+        "show my tasks",
+        &replay_results,
+    );
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("continued", response);
+    try std.testing.expect(provider_state.model_preserved);
+    try std.testing.expect(provider_state.task_tool_present);
+    try std.testing.expect(!provider_state.browser_tool_present);
+}
+
 test "filterToolSpecsForTurn dynamic group keyword match is case-insensitive" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -12214,4 +14264,977 @@ test "Agent: redactor scrubs PII in system prompt" {
     // System prompt content must reach provider with email redacted.
     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+}
+
+// ── Approval flow tests ───────────────────────────────────────────────────
+
+const ApprovalTestTool = struct {
+    execution_count: usize = 0,
+
+    pub const tool_name = "approval_test";
+    pub const tool_description = "Approval regression test tool";
+    pub const tool_params =
+        \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    ;
+    const vtable = tools_mod.ToolVTable(@This());
+
+    fn tool(self: *ApprovalTestTool) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *ApprovalTestTool, _: std.mem.Allocator, args: std.json.ObjectMap) !tools_mod.ToolResult {
+        const command = tools_mod.getString(args, "command") orelse return tools_mod.ToolResult.fail("missing command");
+        if (!tools_mod.threadCommandApproved(tool_name, command, null)) return error.ApprovalRequired;
+        self.execution_count += 1;
+        return tools_mod.ToolResult.ok("api_key=test-key-approved-output");
+    }
+};
+
+const SlashApprovalTestTool = struct {
+    execution_count: usize = 0,
+
+    pub const tool_name = "shell";
+    pub const tool_description = "Slash approval regression test tool";
+    pub const tool_params =
+        \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    ;
+    const vtable = tools_mod.ToolVTable(@This());
+
+    fn tool(self: *SlashApprovalTestTool) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *SlashApprovalTestTool, _: std.mem.Allocator, args: std.json.ObjectMap) !tools_mod.ToolResult {
+        const command = tools_mod.getString(args, "command") orelse return tools_mod.ToolResult.fail("missing command");
+        if (!tools_mod.threadCommandApproved(tool_name, command, null)) return error.ApprovalRequired;
+        self.execution_count += 1;
+        return tools_mod.ToolResult.ok("mock command completed");
+    }
+};
+
+const ApprovalCapture = struct {
+    accepted: bool = true,
+    count: usize = 0,
+    request_id: [APPROVAL_REQUEST_ID_LEN]u8 = [_]u8{0} ** APPROVAL_REQUEST_ID_LEN,
+
+    fn callback(ctx: *anyopaque, request: ApprovalRequest) bool {
+        const self: *ApprovalCapture = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        if (request.request_id.len == APPROVAL_REQUEST_ID_LEN) {
+            @memcpy(&self.request_id, request.request_id);
+        }
+        return self.accepted;
+    }
+};
+
+fn makeApprovalTestAgent(
+    allocator: std.mem.Allocator,
+    tools: []const Tool,
+    observer: Observer,
+    capture: *ApprovalCapture,
+) !Agent {
+    return .{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = tools,
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = observer,
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp/test",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .approval_callback = ApprovalCapture.callback,
+        .approval_ctx = @ptrCast(capture),
+    };
+}
+
+fn emitPreparedApprovalForTest(agent: *Agent) !void {
+    const pending = if (agent.pending_approval) |*value| value else return error.TestUnexpectedResult;
+    if (pending.history_rollback_index == null) {
+        const assistant_content = try agent.allocator.dupe(u8, "<tool_call name=\"approval_test\">{}</tool_call>");
+        errdefer agent.allocator.free(assistant_content);
+        const cancel_content = try agent.allocator.dupe(u8, "");
+        errdefer agent.allocator.free(cancel_content);
+        const history_index = agent.history.items.len;
+        try agent.history.append(agent.allocator, .{ .role = .assistant, .content = assistant_content });
+        pending.history_rollback_index = history_index;
+        pending.cancel_assistant_content = cancel_content;
+    }
+    if (!agent.emitApprovalRequest(pending)) {
+        agent.clearPendingApproval();
+        return error.ApprovalUnavailable;
+    }
+}
+
+test "pending approvals prevent mid-turn injection drain" {
+    // Regression: an approval created inside Agent.turn must not consume text
+    // that arrived while the turn was running; the text remains queued for a
+    // separate authenticated turn after the approval is resolved.
+    const DrainProbe = struct {
+        call_count: usize = 0,
+
+        fn callback(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.call_count += 1;
+            return try allocator.dupe(u8, "queued user text");
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const no_tools = [_]Tool{};
+    var noop = observability.NoopObserver{};
+    var approval_capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &no_tools, noop.observer(), &approval_capture);
+    defer agent.deinit();
+    var drain_probe = DrainProbe{};
+    agent.drain_injection_cb = DrainProbe.callback;
+    agent.drain_injection_ctx = @ptrCast(&drain_probe);
+
+    agent.pending_exec_command = "legacy pending command";
+    try std.testing.expect((try agent.drainPendingInjection()) == null);
+    try std.testing.expectEqual(@as(usize, 0), drain_probe.call_count);
+    agent.pending_exec_command = null;
+
+    try agent.setPendingToolApproval(
+        "approval_test",
+        "provider-call-id",
+        "guarded action",
+        .medium,
+        "{\"command\":\"guarded action\"}",
+    );
+    try std.testing.expect((try agent.drainPendingInjection()) == null);
+    try std.testing.expectEqual(@as(usize, 0), drain_probe.call_count);
+    agent.clearPendingApproval();
+
+    const drained = (try agent.drainPendingInjection()) orelse return error.TestUnexpectedResult;
+    defer allocator.free(drained);
+    try std.testing.expectEqualStrings("queued user text", drained);
+    try std.testing.expectEqual(@as(usize, 1), drain_probe.call_count);
+}
+
+test "approval request uses one-shot server id and exact approved invocation" {
+    const allocator = std.testing.allocator;
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const call = ParsedToolCall{
+        .name = "approval_test",
+        .arguments_json = "{\"command\":\"approved command\"}",
+        .tool_call_id = "provider-call-id",
+    };
+
+    const pending_result = agent.executeTool(arena_impl.allocator(), call);
+    try std.testing.expect(!pending_result.success);
+    try std.testing.expect(agent.pending_approval != null);
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try emitPreparedApprovalForTest(&agent);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+
+    var mismatch = try agent.resolveApproval("not-the-server-id", true, null);
+    defer mismatch.deinit(allocator);
+    try std.testing.expect(mismatch == .request_mismatch);
+    try std.testing.expect(agent.pending_approval != null);
+
+    var resolved = try agent.resolveApproval(&capture.request_id, true, null);
+    defer resolved.deinit(allocator);
+    try std.testing.expect(resolved == .resolved);
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.execution_count);
+    try std.testing.expect(agent.pending_approval == null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved.resolved.tool_result_message, "test-key-approved-output") == null);
+
+    var replay = try agent.resolveApproval(&capture.request_id, true, null);
+    defer replay.deinit(allocator);
+    try std.testing.expect(replay == .no_pending);
+}
+
+test "slash approve supplies an exact grant to approval-aware shell tools" {
+    const BarrierProbe = struct {
+        calls: usize = 0,
+
+        fn callback(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.calls > 1) return error.DuplicateBarrierCall;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tool_impl = SlashApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+
+    const exec_response = (try agent.handleSlashCommand("/exec ask=always")).?;
+    defer allocator.free(exec_response);
+    const owner_context: prompt.ConversationContext = .{
+        .channel = "web",
+        .account_id = "web-main",
+        .sender_id = "owner-a",
+        .peer_id = "shared-session",
+        .is_group = false,
+    };
+    agent.conversation_context = owner_context;
+    const pending_response = (try agent.handleSlashCommand("/bash guarded-command")).?;
+    defer allocator.free(pending_response);
+    try std.testing.expect(agent.pending_exec_command != null);
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+
+    // Regression: collapsed DM scopes can share an Agent. A different
+    // authenticated principal must neither inspect nor consume the owner's
+    // legacy slash-command approval.
+    agent.conversation_context = .{
+        .channel = "web",
+        .account_id = "web-main",
+        .sender_id = "attacker-b",
+        .peer_id = "shared-session",
+        .is_group = false,
+    };
+    const foreign_response = (try agent.handleSlashCommand("/approve allow-once")).?;
+    defer allocator.free(foreign_response);
+    try std.testing.expectEqualStrings("No pending approval requests.", foreign_response);
+    try std.testing.expect(agent.pending_exec_command != null);
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+
+    agent.conversation_context = owner_context;
+    var barrier = BarrierProbe{};
+    agent.before_tool_dispatch_cb = BarrierProbe.callback;
+    agent.before_tool_dispatch_ctx = @ptrCast(&barrier);
+    const approved_response = (try agent.handleSlashCommand("/approve allow-always")).?;
+    defer allocator.free(approved_response);
+    try std.testing.expect(std.mem.indexOf(u8, approved_response, "mock command completed") != null);
+    try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.execution_count);
+    try std.testing.expect(agent.pending_exec_command == null);
+    try std.testing.expect(agent.exec_ask == .off);
+}
+
+test "approved tool rechecks current execution security" {
+    const allocator = std.testing.allocator;
+    var tool_impl = SlashApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+
+    try agent.setPendingToolApproval("shell", null, "guarded-command", .medium, "{\"command\":\"guarded-command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    agent.exec_security = .deny;
+    var blocked = try agent.resolveApproval(&capture.request_id, true, null);
+    defer blocked.deinit(allocator);
+    try std.testing.expect(blocked == .resolved);
+    try std.testing.expect(std.mem.indexOf(u8, blocked.resolved.tool_result_message, "security=deny") != null);
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .always;
+    try agent.setPendingToolApproval("shell", null, "guarded-command", .medium, "{\"command\":\"guarded-command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    var allowed = try agent.resolveApproval(&capture.request_id, true, null);
+    defer allowed.deinit(allocator);
+    try std.testing.expect(allowed == .resolved);
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.execution_count);
+}
+
+test "approval denial and expiry never execute tool" {
+    const allocator = std.testing.allocator;
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+
+    try agent.setPendingToolApproval("approval_test", null, "denied command", .high, "{\"command\":\"denied command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    var denied = try agent.resolveApproval(&capture.request_id, false, "not now");
+    defer denied.deinit(allocator);
+    try std.testing.expect(denied == .resolved);
+    try std.testing.expect(std.mem.indexOf(u8, denied.resolved.tool_result_message, "denied") != null);
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+
+    try agent.setPendingToolApproval("approval_test", null, "expired command", .medium, "{\"command\":\"expired command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    agent.pending_approval.?.timestamp = std_compat.time.timestamp() - APPROVAL_REQUEST_TTL_SECS - 1;
+    var expired = try agent.resolveApproval(&agent.pending_approval.?.request_id, true, null);
+    defer expired.deinit(allocator);
+    try std.testing.expect(expired == .expired);
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+}
+
+test "approval TTL expires at boundary and on wall clock rollback" {
+    const allocator = std.testing.allocator;
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+
+    try agent.setPendingToolApproval("approval_test", null, "boundary command", .medium, "{\"command\":\"boundary command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    agent.pending_approval.?.timestamp = std_compat.time.timestamp() - APPROVAL_REQUEST_TTL_SECS;
+    var boundary = try agent.resolveApproval(&capture.request_id, true, null);
+    defer boundary.deinit(allocator);
+    try std.testing.expect(boundary == .expired);
+
+    try agent.setPendingToolApproval("approval_test", null, "rollback command", .medium, "{\"command\":\"rollback command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    agent.pending_approval.?.timestamp = std_compat.time.timestamp() + 60;
+    var rollback = try agent.resolveApproval(&capture.request_id, true, null);
+    defer rollback.deinit(allocator);
+    try std.testing.expect(rollback == .expired);
+    try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+}
+
+test "approval request fails closed when delivery is unavailable or another request is pending" {
+    const allocator = std.testing.allocator;
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{ .accepted = false };
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+
+    try agent.setPendingToolApproval("approval_test", null, "first command", .medium, "{\"command\":\"first command\"}");
+    try std.testing.expectError(error.ApprovalUnavailable, emitPreparedApprovalForTest(&agent));
+    try std.testing.expect(agent.pending_approval == null);
+
+    capture.accepted = true;
+    try agent.setPendingToolApproval("approval_test", null, "first command", .medium, "{\"command\":\"first command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    const first_request_id = agent.pending_approval.?.request_id;
+    try std.testing.expectError(
+        error.ApprovalAlreadyPending,
+        agent.setPendingToolApproval("approval_test", null, "second command", .medium, "{\"command\":\"second command\"}"),
+    );
+    try std.testing.expectEqualSlices(u8, &first_request_id, &agent.pending_approval.?.request_id);
+    try std.testing.expectEqualStrings("first command", agent.pending_approval.?.action);
+}
+
+test "approval lifecycle is visible to poll and cleared by stop and reset" {
+    const allocator = std.testing.allocator;
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+
+    try agent.setPendingToolApproval("approval_test", null, "lifecycle command", .medium, "{\"command\":\"lifecycle command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    const poll_response = (try agent.handleSlashCommand("/poll")).?;
+    defer allocator.free(poll_response);
+    try std.testing.expect(std.mem.indexOf(u8, poll_response, "request_id=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_response, &capture.request_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_response, "lifecycle command") == null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_response, "tool=approval_test") != null);
+
+    const stop_response = (try agent.handleSlashCommand("/stop")).?;
+    defer allocator.free(stop_response);
+    try std.testing.expect(agent.pending_approval == null);
+
+    try agent.setPendingToolApproval("approval_test", null, "reset command", .medium, "{\"command\":\"reset command\"}");
+    try emitPreparedApprovalForTest(&agent);
+    const reset_response = (try agent.handleSlashCommand("/new")).?;
+    defer allocator.free(reset_response);
+    try std.testing.expect(agent.pending_approval == null);
+}
+
+test "approval pauses a multi-tool batch before later side effects" {
+    // Regression: #900 a pending approval must suspend the turn instead of
+    // allowing later tool calls in the same provider batch to execute.
+    const SideEffectProbe = struct {
+        execution_count: usize = 0,
+
+        pub const tool_name = "side_effect_probe";
+        pub const tool_description = "Approval batch regression probe";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{}}";
+        const vtable = tools_mod.ToolVTable(@This());
+
+        fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *@This(), _: std.mem.Allocator, _: std.json.ObjectMap) !tools_mod.ToolResult {
+            self.execution_count += 1;
+            return tools_mod.ToolResult.ok("probe executed");
+        }
+    };
+
+    const PreApprovalProbe = struct {
+        execution_count: usize = 0,
+
+        pub const tool_name = "pre_approval_probe";
+        pub const tool_description = "Completed-result preservation probe";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{}}";
+        const vtable = tools_mod.ToolVTable(@This());
+
+        fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *@This(), _: std.mem.Allocator, _: std.json.ObjectMap) !tools_mod.ToolResult {
+            self.execution_count += 1;
+            return tools_mod.ToolResult.ok("pre-approval result preserved");
+        }
+    };
+
+    const BatchProvider = struct {
+        call_count: usize = 0,
+        continuation_model_preserved: bool = false,
+        continuation_has_tool_result: bool = false,
+        continuation_has_later_call: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count > 1) {
+                self.continuation_model_preserved = std.mem.eql(u8, request.model, "test-model") and
+                    std.mem.eql(u8, model, "test-model");
+                for (request.messages) |message| {
+                    if (std.mem.indexOf(u8, message.content, "<tool_result name=\"approval_test\"") != null) {
+                        self.continuation_has_tool_result = true;
+                    }
+                    if (message.role == .assistant and std.mem.indexOf(u8, message.content, "side_effect_probe") != null) {
+                        self.continuation_has_later_call = true;
+                    }
+                }
+                if (self.call_count == 2) {
+                    // Regression: provider retries the exact completed calls
+                    // after the approval split. The logical-turn dedup cache
+                    // must return prior results without repeating side effects.
+                    const repeated_calls = try allocator.alloc(providers.ToolCall, 2);
+                    repeated_calls[0] = .{
+                        .id = try allocator.dupe(u8, "pre-approval-call"),
+                        .name = try allocator.dupe(u8, "pre_approval_probe"),
+                        .arguments = try allocator.dupe(u8, "{}"),
+                    };
+                    repeated_calls[1] = .{
+                        .id = try allocator.dupe(u8, "approval-call"),
+                        .name = try allocator.dupe(u8, "approval_test"),
+                        .arguments = try allocator.dupe(u8, "{\"command\":\"guarded command\"}"),
+                    };
+                    return .{
+                        .content = try allocator.dupe(u8, "replaying completed calls"),
+                        .tool_calls = repeated_calls,
+                        .usage = .{},
+                        .model = try allocator.dupe(u8, "test-model"),
+                    };
+                }
+                return .{
+                    .content = try allocator.dupe(u8, "batch continued after approval"),
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            const tool_calls = try allocator.alloc(providers.ToolCall, 3);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "pre-approval-call"),
+                .name = try allocator.dupe(u8, "pre_approval_probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            tool_calls[1] = .{
+                .id = try allocator.dupe(u8, "approval-call"),
+                .name = try allocator.dupe(u8, "approval_test"),
+                .arguments = try allocator.dupe(u8, "{\"command\":\"guarded command\"}"),
+            };
+            tool_calls[2] = .{
+                .id = try allocator.dupe(u8, "side-effect-call"),
+                .name = try allocator.dupe(u8, "side_effect_probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "requesting tools"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "approval-batch-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = BatchProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = BatchProvider.chatWithSystem,
+        .chat = BatchProvider.chat,
+        .supportsNativeTools = BatchProvider.supportsNativeTools,
+        .getName = BatchProvider.getName,
+        .deinit = BatchProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var pre_approval_tool_impl = PreApprovalProbe{};
+    var approval_tool_impl = ApprovalTestTool{};
+    var side_effect_tool_impl = SideEffectProbe{};
+    const test_tools = [_]Tool{ pre_approval_tool_impl.tool(), approval_tool_impl.tool(), side_effect_tool_impl.tool() };
+    var specs = try allocator.alloc(ToolSpec, test_tools.len);
+    for (test_tools, 0..) |tool, index| {
+        specs[index] = .{
+            .name = tool.name(),
+            .description = tool.description(),
+            .parameters_json = tool.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &test_tools,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .approval_callback = ApprovalCapture.callback,
+        .approval_ctx = @ptrCast(&capture),
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run guarded batch");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("Approval requested. Waiting for your decision.", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), pre_approval_tool_impl.execution_count);
+    try std.testing.expectEqual(@as(usize, 0), approval_tool_impl.execution_count);
+    try std.testing.expectEqual(@as(usize, 0), side_effect_tool_impl.execution_count);
+    try std.testing.expect(agent.pending_approval != null);
+    var preserved_result_found = false;
+    var later_call_found = false;
+    for (agent.history.items) |message| {
+        if (std.mem.indexOf(u8, message.content, "pre-approval result preserved") != null) {
+            preserved_result_found = true;
+        }
+        if (message.role == .assistant and std.mem.indexOf(u8, message.content, "side_effect_probe") != null) {
+            later_call_found = true;
+        }
+    }
+    try std.testing.expect(preserved_result_found);
+    try std.testing.expect(!later_call_found);
+
+    var resolution = try agent.resolveApproval(&capture.request_id, true, null);
+    defer resolution.deinit(allocator);
+    if (resolution != .resolved) return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("run guarded batch", resolution.resolved.user_message.?);
+    try std.testing.expectEqualStrings("test-model", resolution.resolved.model_name.?);
+    const continued = try agent.continueAfterApproval(
+        resolution.resolved.tool_result_message,
+        resolution.resolved.user_message,
+        resolution.resolved.model_name,
+        resolution.resolved.persistence_user_message,
+        &resolution.resolved.replay_results,
+    );
+    defer allocator.free(continued);
+    try std.testing.expectEqualStrings("batch continued after approval", continued);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), approval_tool_impl.execution_count);
+    try std.testing.expectEqual(@as(usize, 0), side_effect_tool_impl.execution_count);
+    try std.testing.expect(provider_state.continuation_model_preserved);
+    try std.testing.expect(provider_state.continuation_has_tool_result);
+    try std.testing.expect(!provider_state.continuation_has_later_call);
+}
+
+fn configureApprovalAllocationContext(agent: *Agent) void {
+    agent.conversation_context = .{
+        .channel = "web",
+        .account_id = "web-main",
+        .delivery_chat_id = "session-a",
+        .sender_id = "owner-a",
+        .peer_id = "session-a",
+        .group_id = "group-a",
+        .is_group = false,
+    };
+    agent.approval_turn_user_message = "original routed user request";
+    agent.approval_turn_model_name = "provider/routed-model";
+    agent.approval_turn_persistence_message = "raw original user request";
+}
+
+fn approvalAllocationHarness(allocator: std.mem.Allocator) !void {
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+    configureApprovalAllocationContext(&agent);
+    try agent.setPendingToolApproval(
+        "approval_test",
+        "provider-call-id",
+        "test command",
+        .medium,
+        "{\"command\":\"test command\"}",
+    );
+}
+
+const ApprovalResolutionFailureOutcome = struct {
+    resolved: bool = false,
+    execution_count: usize = 0,
+};
+
+fn approvalResolutionFailureCase(
+    failing: *std.testing.FailingAllocator,
+    outcome: *ApprovalResolutionFailureOutcome,
+) !void {
+    const allocator = std.testing.allocator;
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+    configureApprovalAllocationContext(&agent);
+    try agent.setPendingToolApproval(
+        "approval_test",
+        "provider-call-id",
+        "test command",
+        .medium,
+        "{\"command\":\"test command\"}",
+    );
+    try emitPreparedApprovalForTest(&agent);
+    const request_id = capture.request_id;
+
+    agent.allocator = failing.allocator();
+    const history_len_before = agent.history.items.len;
+    var resolved = agent.resolveApproval(&request_id, true, null) catch |err| {
+        agent.allocator = allocator;
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        // Every propagated OOM occurs before the approved invocation starts,
+        // so the authenticated one-shot request remains safely retryable.
+        try std.testing.expect(agent.pending_approval != null);
+        try std.testing.expectEqual(@as(usize, 0), tool_impl.execution_count);
+        try std.testing.expectEqual(history_len_before, agent.history.items.len);
+        return;
+    };
+    agent.allocator = allocator;
+    defer resolved.deinit(allocator);
+    if (resolved != .resolved) return error.TestUnexpectedResult;
+    outcome.resolved = true;
+    outcome.execution_count = tool_impl.execution_count;
+    try std.testing.expect(agent.pending_approval == null);
+    try std.testing.expectEqual(history_len_before + 1, agent.history.items.len);
+    try std.testing.expectEqual(providers.Role.user, agent.history.items[agent.history.items.len - 1].role);
+    try std.testing.expectEqual(@as(usize, 1), resolved.resolved.replay_results.count());
+    try std.testing.expect(tool_impl.execution_count <= 1);
+
+    var replay = try agent.resolveApproval(&request_id, true, null);
+    defer replay.deinit(allocator);
+    try std.testing.expect(replay == .no_pending);
+    try std.testing.expectEqual(outcome.execution_count, tool_impl.execution_count);
+}
+
+test "approval pending state handles every allocation failure without leaks" {
+    // Regression: #900 approval creation must fail closed on OOM rather than
+    // dropping its correlation id or leaking a partially built request.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, approvalAllocationHarness, .{});
+}
+
+test "approval resolution remains exact once at every allocation failure" {
+    // Regression: #900 OOM before execution leaves the request pending, while
+    // OOM after execution consumes it with a replay fallback. Neither path may
+    // execute the approved side effect twice or leak owned approval state.
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var counted_outcome = ApprovalResolutionFailureOutcome{};
+    try approvalResolutionFailureCase(&counting, &counted_outcome);
+    try std.testing.expect(counted_outcome.resolved);
+    const allocation_count = counting.alloc_index;
+    try std.testing.expect(allocation_count > 0);
+
+    for (0..allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var outcome = ApprovalResolutionFailureOutcome{};
+        try approvalResolutionFailureCase(&failing, &outcome);
+        try std.testing.expect(failing.has_induced_failure);
+    }
+}
+
+test "approval continuation OOM leaves canonical paired history" {
+    // Regression: once an approved side effect has run, a later continuation
+    // allocation failure must not leave the assistant tool call dangling.
+    const allocator = std.testing.allocator;
+    var tool_impl = ApprovalTestTool{};
+    const test_tools = [_]Tool{tool_impl.tool()};
+    var noop = observability.NoopObserver{};
+    var capture = ApprovalCapture{};
+    var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+    defer agent.deinit();
+    var provider_state = CompactionTestProvider{};
+    agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+    configureApprovalAllocationContext(&agent);
+    try agent.setPendingToolApproval(
+        "approval_test",
+        "provider-call-id",
+        "test command",
+        .medium,
+        "{\"command\":\"test command\"}",
+    );
+    try emitPreparedApprovalForTest(&agent);
+
+    var resolution = try agent.resolveApproval(&capture.request_id, true, null);
+    defer resolution.deinit(allocator);
+    if (resolution != .resolved) return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), tool_impl.execution_count);
+    const paired_history_len = agent.history.items.len;
+    try std.testing.expectEqual(providers.Role.user, agent.history.items[paired_history_len - 1].role);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    agent.allocator = failing.allocator();
+    _ = agent.continueAfterApproval(
+        resolution.resolved.tool_result_message,
+        resolution.resolved.user_message,
+        resolution.resolved.model_name,
+        resolution.resolved.persistence_user_message,
+        &resolution.resolved.replay_results,
+    ) catch {
+        agent.allocator = allocator;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(paired_history_len, agent.history.items.len);
+        try std.testing.expectEqual(@as(usize, 1), tool_impl.execution_count);
+        return;
+    };
+    agent.allocator = allocator;
+    return error.TestUnexpectedResult;
+}
+
+test "approval boundary formatting OOM after prior side effect remains exact once" {
+    // Regression: #900 a failure while canonicalizing an approval boundary
+    // happens after earlier calls in the same batch may have produced side
+    // effects. That failure must use the preallocated fallback, retain replay
+    // receipts, and never run either completed call again on continuation.
+    const Harness = struct {
+        const Stats = struct {
+            first_effect_alloc_index: usize = 0,
+            allocation_count: usize = 0,
+        };
+
+        const PreApprovalProbe = struct {
+            failing: *std.testing.FailingAllocator,
+            execution_count: usize = 0,
+            alloc_index_at_effect: usize = 0,
+
+            pub const tool_name = "approval_boundary_pre_probe";
+            pub const tool_description = "Approval boundary allocation regression probe";
+            pub const tool_params = "{\"type\":\"object\",\"properties\":{}}";
+            const vtable = tools_mod.ToolVTable(@This());
+
+            fn tool(self: *@This()) Tool {
+                return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+            }
+
+            pub fn execute(self: *@This(), _: std.mem.Allocator, _: std.json.ObjectMap) !tools_mod.ToolResult {
+                self.execution_count += 1;
+                self.alloc_index_at_effect = self.failing.alloc_index;
+                return tools_mod.ToolResult.ok("pre-approval side effect completed");
+            }
+        };
+
+        const BatchProvider = struct {
+            call_count: usize = 0,
+
+            fn makeToolCall(
+                allocator: std.mem.Allocator,
+                id: []const u8,
+                name: []const u8,
+                arguments: []const u8,
+            ) !providers.ToolCall {
+                const owned_id = try allocator.dupe(u8, id);
+                errdefer allocator.free(owned_id);
+                const owned_name = try allocator.dupe(u8, name);
+                errdefer allocator.free(owned_name);
+                const owned_arguments = try allocator.dupe(u8, arguments);
+                return .{
+                    .id = owned_id,
+                    .name = owned_name,
+                    .arguments = owned_arguments,
+                };
+            }
+
+            fn batchResponse(allocator: std.mem.Allocator) !ChatResponse {
+                const calls = try allocator.alloc(providers.ToolCall, 2);
+                var initialized: usize = 0;
+                errdefer {
+                    for (calls[0..initialized]) |call| {
+                        allocator.free(call.id);
+                        allocator.free(call.name);
+                        allocator.free(call.arguments);
+                    }
+                    allocator.free(calls);
+                }
+                calls[0] = try makeToolCall(
+                    allocator,
+                    "pre-approval-call",
+                    "approval_boundary_pre_probe",
+                    "{}",
+                );
+                initialized = 1;
+                calls[1] = try makeToolCall(
+                    allocator,
+                    "approval-call",
+                    "approval_test",
+                    "{\"command\":\"guarded command\"}",
+                );
+                return .{ .tool_calls = calls };
+            }
+
+            fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+                return allocator.dupe(u8, "unused");
+            }
+
+            fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.call_count += 1;
+                if (self.call_count <= 2) return batchResponse(allocator);
+                return .{ .content = try allocator.dupe(u8, "continued after approval") };
+            }
+
+            fn supportsNativeTools(_: *anyopaque) bool {
+                return true;
+            }
+
+            fn getName(_: *anyopaque) []const u8 {
+                return "approval-boundary-oom-provider";
+            }
+
+            fn deinitFn(_: *anyopaque) void {}
+
+            const vtable = Provider.VTable{
+                .chatWithSystem = chatWithSystem,
+                .chat = chat,
+                .supportsNativeTools = supportsNativeTools,
+                .getName = getName,
+                .deinit = deinitFn,
+            };
+        };
+
+        fn run(fail_index: usize, stats: *Stats) !bool {
+            const allocator = std.testing.allocator;
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+            var pre_approval_tool = PreApprovalProbe{ .failing = &failing };
+            var approval_tool = ApprovalTestTool{};
+            const test_tools = [_]Tool{ pre_approval_tool.tool(), approval_tool.tool() };
+            var noop = observability.NoopObserver{};
+            var capture = ApprovalCapture{};
+            var provider_state = BatchProvider{};
+            var agent = try makeApprovalTestAgent(allocator, &test_tools, noop.observer(), &capture);
+            defer {
+                // FailingAllocator delegates to testing.allocator, so restoring
+                // the base allocator is sufficient to release all surviving
+                // allocations even when the injected failure remains armed.
+                agent.allocator = allocator;
+                agent.deinit();
+            }
+            agent.provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &BatchProvider.vtable };
+            agent.model_name = "approval-boundary-oom-model";
+
+            agent.allocator = failing.allocator();
+            const response = agent.turn("run guarded batch") catch |err| {
+                agent.allocator = allocator;
+                stats.* = .{
+                    .first_effect_alloc_index = pre_approval_tool.alloc_index_at_effect,
+                    .allocation_count = failing.alloc_index,
+                };
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                // This index failed before a prepared approval existed. The
+                // regression below selects only the later index that reaches
+                // the boundary's canonical preallocated fallback.
+                return false;
+            };
+            agent.allocator = allocator;
+            defer allocator.free(response);
+            stats.* = .{
+                .first_effect_alloc_index = pre_approval_tool.alloc_index_at_effect,
+                .allocation_count = failing.alloc_index,
+            };
+
+            if (!failing.has_induced_failure) return false;
+            const pending = if (agent.pending_approval) |*value| value else return false;
+            const history_index = pending.history_rollback_index orelse return false;
+            if (history_index + 1 >= agent.history.items.len) return false;
+            const assistant_entry = agent.history.items[history_index];
+            const result_entry = agent.history.items[history_index + 1];
+            const used_boundary_fallback =
+                std.mem.indexOf(u8, assistant_entry.content, "stopped at an approval boundary") != null and
+                std.mem.indexOf(u8, result_entry.content, "<tool_results status=\"memory_pressure\">") != null;
+            if (!used_boundary_fallback) return false;
+
+            try std.testing.expectEqualStrings("Approval requested. Waiting for your decision.", response);
+            try std.testing.expectEqual(providers.Role.assistant, assistant_entry.role);
+            try std.testing.expectEqual(providers.Role.user, result_entry.role);
+            try std.testing.expectEqual(@as(usize, 1), pre_approval_tool.execution_count);
+            try std.testing.expectEqual(@as(usize, 0), approval_tool.execution_count);
+            try std.testing.expectEqual(@as(usize, 1), capture.count);
+            try std.testing.expectEqual(@as(usize, 1), pending.replay_results.count());
+
+            const request_id = capture.request_id;
+            var resolution = try agent.resolveApproval(&request_id, true, null);
+            defer resolution.deinit(allocator);
+            if (resolution != .resolved) return error.TestUnexpectedResult;
+            try std.testing.expect(agent.pending_approval == null);
+            try std.testing.expectEqual(@as(usize, 1), pre_approval_tool.execution_count);
+            try std.testing.expectEqual(@as(usize, 1), approval_tool.execution_count);
+
+            var replay = try agent.resolveApproval(&request_id, true, null);
+            defer replay.deinit(allocator);
+            try std.testing.expect(replay == .no_pending);
+
+            const continued = try agent.continueAfterApproval(
+                resolution.resolved.tool_result_message,
+                resolution.resolved.user_message,
+                resolution.resolved.model_name,
+                resolution.resolved.persistence_user_message,
+                &resolution.resolved.replay_results,
+            );
+            defer allocator.free(continued);
+            try std.testing.expectEqualStrings("continued after approval", continued);
+            try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+            try std.testing.expectEqual(@as(usize, 1), pre_approval_tool.execution_count);
+            try std.testing.expectEqual(@as(usize, 1), approval_tool.execution_count);
+            return true;
+        }
+    };
+
+    var baseline_stats = Harness.Stats{};
+    try std.testing.expect(!try Harness.run(std.math.maxInt(usize), &baseline_stats));
+    try std.testing.expect(baseline_stats.allocation_count > baseline_stats.first_effect_alloc_index);
+
+    var found_boundary_failure = false;
+    for (baseline_stats.first_effect_alloc_index..baseline_stats.allocation_count) |fail_index| {
+        var failure_stats = Harness.Stats{};
+        if (try Harness.run(fail_index, &failure_stats)) {
+            found_boundary_failure = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_boundary_failure);
 }

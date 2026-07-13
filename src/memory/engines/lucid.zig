@@ -548,6 +548,11 @@ pub const LucidMemory = struct {
         return self.local.listSessions(allocator, limit, offset);
     }
 
+    fn implSessionCountSessionTurns(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.local.countSessionTurns(session_id);
+    }
+
     fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
         const self = castSelf(ptr);
         return self.local.countDetailedMessages(session_id);
@@ -567,6 +572,7 @@ pub const LucidMemory = struct {
         .loadUsage = &implSessionLoadUsage,
         .countSessions = &implSessionCountSessions,
         .listSessions = &implSessionListSessions,
+        .countSessionTurns = &implSessionCountSessionTurns,
         .countDetailedMessages = &implSessionCountDetailedMessages,
         .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
@@ -1005,4 +1011,7 @@ test "lucid sessionStore saveMessage + loadMessages roundtrip" {
     try std.testing.expectEqualStrings("hello from lucid", msgs[0].content);
     try std.testing.expectEqualStrings("assistant", msgs[1].role);
     try std.testing.expectEqualStrings("hi back", msgs[1].content);
+    // Regression: Lucid must expose the SQLite logical-turn aggregate through
+    // its SessionStore vtable instead of falling back to raw row pairs.
+    try std.testing.expectEqual(@as(u64, 1), try store.countSessionTurns("s1"));
 }

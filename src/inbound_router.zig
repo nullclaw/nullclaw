@@ -26,6 +26,9 @@ pub const RouteInput = struct {
     queue_mode: QueueMode,
     /// True when there is already a message pending in the injection buffer.
     has_pending_injection: bool,
+    /// False for approval-capable or paused turns where text-only injection
+    /// would lose the authenticated route and corrupt a pending continuation.
+    accepts_injection: bool = true,
 };
 
 /// Action the effectful shell should perform for an inbound message.
@@ -46,12 +49,32 @@ pub const RoutingDecision = enum {
 /// Decide how to handle an inbound message given the current session state.
 pub fn route(input: RouteInput) RoutingDecision {
     if (!input.turn_running) return .process;
+    if (!input.accepts_injection) {
+        return if (input.queue_mode == .off) .drop else .queue;
+    }
     return switch (input.queue_mode) {
         .off => .drop,
         .serial => .queue,
         .latest => if (input.has_pending_injection) .replace_injection else .inject,
         .debounce => .inject,
     };
+}
+
+test "route queues approval-capable active turns instead of injecting text" {
+    for ([_]QueueMode{ .serial, .latest, .debounce }) |mode| {
+        try testing.expectEqual(RoutingDecision.queue, route(.{
+            .turn_running = true,
+            .queue_mode = mode,
+            .has_pending_injection = false,
+            .accepts_injection = false,
+        }));
+    }
+    try testing.expectEqual(RoutingDecision.drop, route(.{
+        .turn_running = true,
+        .queue_mode = .off,
+        .has_pending_injection = false,
+        .accepts_injection = false,
+    }));
 }
 
 // Tests

@@ -690,6 +690,7 @@ Practical rules:
 
 - Keep `listen = "127.0.0.1"` for the pairing-first local UX.
 - In local transport, unauthenticated WebSocket upgrade is allowed only on loopback. This is what lets a UI connect first and then send `pairing_request`.
+- Browser-based pairing requires the page Origin in `allowed_origins`. With an empty allowlist, unauthenticated browser upgrades are rejected; Origin-less native loopback clients and clients presenting a valid upgrade token remain supported.
 - Local loopback pairing no longer depends on a fixed shared code. `pairing_request` may omit `payload.pairing_code`, and legacy loopback clients that still send `123456` remain compatible.
 - If you change `listen` to `0.0.0.0` or another non-loopback address, the WebSocket upgrade must already include the channel token:
   - `ws://host:32123/ws?token=<auth_token>`
@@ -700,6 +701,42 @@ Practical rules:
 - `auth_token` hardens the WebSocket upgrade and becomes mandatory for non-loopback bind.
 - Use `/ws` for the WebSocket endpoint. `/pair` belongs to the HTTP gateway API, not the web channel WebSocket flow.
 - For headless/LAN access, the safest operator path is still SSH tunnel or reverse proxy in front of a loopback-bound web channel.
+
+Approval control events (WebChannel v1):
+
+```json
+{
+  "v": 1,
+  "type": "approval_request",
+  "session_id": "conversation-123",
+  "agent_id": "default",
+  "request_id": "<opaque-server-generated-id>",
+  "payload": {
+    "action": "command or tool action requiring approval",
+    "reason": "why approval is required"
+  }
+}
+```
+
+Reply with a typed control event, echoing `request_id` at the top level (not inside `payload`):
+
+```json
+{
+  "v": 1,
+  "type": "approval_response",
+  "session_id": "conversation-123",
+  "request_id": "<same-id>",
+  "payload": {
+    "access_token": "<ui-jwt>",
+    "approved": true,
+    "reason": "optional decision note"
+  }
+}
+```
+
+- Every `approval_response` must pass the configured message authentication and match the exact session that received the request. In pairing mode, it must also come from that session's original authenticated UI principal; token mode uses `auth_token` instead of `access_token`.
+- Approval IDs are server-generated, one-shot capabilities with a five-minute lifetime. Expired, mismatched, and replayed responses never execute the protected action.
+- WebChannel v1 approval payloads are plaintext control envelopes, and encrypted `approval_response` events are rejected. Local loopback transport permits these authenticated controls even when message E2E is active, so the standard local UI approval flow remains usable. Relay approval delivery is disabled in v1 because the relay protocol has no owner-addressed delivery acknowledgement. Public/LAN-bound local transport also refuses approval controls while E2E is active; in either case the protected action is not executed.
 
 Remote/headless example:
 
