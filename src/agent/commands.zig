@@ -3390,14 +3390,6 @@ fn parseExecAsk(comptime T: type, raw: []const u8) ?T {
     return null;
 }
 
-fn parseQueueMode(comptime T: type, raw: []const u8) ?T {
-    if (std.ascii.eqlIgnoreCase(raw, "off")) return .off;
-    if (std.ascii.eqlIgnoreCase(raw, "serial")) return .serial;
-    if (std.ascii.eqlIgnoreCase(raw, "latest")) return .latest;
-    if (std.ascii.eqlIgnoreCase(raw, "debounce")) return .debounce;
-    return null;
-}
-
 fn parseQueueDrop(comptime T: type, raw: []const u8) ?T {
     if (std.ascii.eqlIgnoreCase(raw, "summarize")) return .summarize;
     if (std.ascii.eqlIgnoreCase(raw, "oldest")) return .oldest;
@@ -3466,7 +3458,7 @@ fn resetRuntimeCommandState(self: anytype) void {
     if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
     self.exec_node_id = null;
     self.exec_node_id_owned = false;
-    self.queue_mode = .off;
+    self.queue_mode = self.default_queue_mode;
     self.queue_debounce_ms = 0;
     self.queue_cap = 0;
     self.queue_drop = .summarize;
@@ -3688,7 +3680,7 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     if (std.ascii.eqlIgnoreCase(arg, "reset")) {
-        self.queue_mode = .off;
+        self.queue_mode = self.default_queue_mode;
         self.queue_debounce_ms = 0;
         self.queue_cap = 0;
         self.queue_drop = .summarize;
@@ -3697,7 +3689,7 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     var it = std.mem.tokenizeAny(u8, arg, " \t");
     while (it.next()) |tok| {
-        if (parseQueueMode(@TypeOf(self.queue_mode), tok)) |mode| {
+        if (@TypeOf(self.queue_mode).fromSlice(tok)) |mode| {
             self.queue_mode = mode;
             continue;
         }

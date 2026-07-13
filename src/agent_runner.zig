@@ -14,6 +14,11 @@ pub const AgentRunResult = struct {
     output: []const u8,
 };
 
+pub const AgentRunOptions = struct {
+    origin_channel: ?[]const u8 = null,
+    origin_account_id: ?[]const u8 = null,
+};
+
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 const POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
 const LINUX_SELF_EXE_PATH = "/proc/self/exe";
@@ -148,20 +153,33 @@ fn terminateChildHard(child: *std_compat.process.Child) !void {
 fn buildAgentOutput(
     allocator: std.mem.Allocator,
     stdout: []const u8,
-    stderr: []const u8,
     timeout_secs: u64,
     timed_out: bool,
+    success: bool,
 ) ![]const u8 {
     if (timed_out) {
-        const source = if (stdout.len > 0) stdout else stderr;
-        if (source.len > 0) {
-            return std.fmt.allocPrint(allocator, "{s}\n\n[agent timed out after {d}s]", .{ source, timeout_secs });
+        if (stdout.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}\n\n[agent timed out after {d}s]", .{ stdout, timeout_secs });
         }
         return std.fmt.allocPrint(allocator, "agent timed out after {d}s", .{timeout_secs});
     }
 
-    const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
-    return allocator.dupe(u8, output_source);
+    if (!success) {
+        if (stdout.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}\n\n[agent execution failed]", .{stdout});
+        }
+        return allocator.dupe(u8, "agent execution failed");
+    }
+
+    // `nullclaw agent -m` writes responses to stdout. Stderr is drained by the
+    // runner to avoid pipe backpressure, but it only contains logs/diagnostics
+    // and must never become user-visible agent output.
+    return allocator.dupe(u8, stdout);
+}
+
+fn isSuccessfulAgentRun(timed_out: bool, exited_zero: bool, stdout: []const u8) bool {
+    if (timed_out or !exited_zero) return false;
+    return std.mem.trim(u8, stdout, " \t\r\n").len > 0;
 }
 
 fn preferExecPath(self_exe_path: []const u8) []const u8 {
@@ -173,12 +191,49 @@ fn preferExecPath(self_exe_path: []const u8) []const u8 {
     return self_exe_path;
 }
 
+fn appendAgentArgv(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    exec_path: []const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    options: AgentRunOptions,
+) !void {
+    try argv.append(allocator, exec_path);
+    try argv.append(allocator, "agent");
+    if (model) |m| {
+        try argv.append(allocator, "--model");
+        try argv.append(allocator, m);
+    }
+    if (options.origin_channel) |channel| {
+        try argv.append(allocator, "--origin-channel");
+        try argv.append(allocator, channel);
+    }
+    if (options.origin_account_id) |account_id| {
+        try argv.append(allocator, "--origin-account-id");
+        try argv.append(allocator, account_id);
+    }
+    try argv.append(allocator, "-m");
+    try argv.append(allocator, prompt);
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     cwd: ?[]const u8,
     prompt: []const u8,
     model: ?[]const u8,
     timeout_secs: u64,
+) !AgentRunResult {
+    return runWithOptions(allocator, cwd, prompt, model, timeout_secs, .{});
+}
+
+pub fn runWithOptions(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    timeout_secs: u64,
+    options: AgentRunOptions,
 ) !AgentRunResult {
     const exe_path = try std_compat.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
@@ -195,14 +250,7 @@ pub fn run(
     var child: std_compat.process.Child = undefined;
     spawn_loop: while (true) {
         argv.clearRetainingCapacity();
-        try argv.append(allocator, exec_path);
-        try argv.append(allocator, "agent");
-        if (model) |m| {
-            try argv.append(allocator, "--model");
-            try argv.append(allocator, m);
-        }
-        try argv.append(allocator, "-m");
-        try argv.append(allocator, prompt);
+        try appendAgentArgv(allocator, &argv, exec_path, prompt, model, options);
 
         child = std_compat.process.Child.init(argv.items, allocator);
         child.stdin_behavior = .Ignore;
@@ -270,11 +318,12 @@ pub fn run(
     );
 
     const term = try child.wait();
-    const success = !timed_out and switch (term) {
+    const exited_zero = switch (term) {
         .exited => |code| code == 0,
         else => false,
     };
-    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
+    const success = isSuccessfulAgentRun(timed_out, exited_zero, stdout.items);
+    const output = try buildAgentOutput(allocator, stdout.items, timeout_secs, timed_out, success);
     return .{ .success = success, .output = output };
 }
 
@@ -354,6 +403,55 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     try std.testing.expect(!completed_ok);
 }
 
+test "buildAgentOutput returns stdout on success" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "hello", 0, false, true);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "buildAgentOutput returns generic message for empty failure" {
+    // Regression: stderr-only initialization logs must not replace the missing
+    // response, while on_error delivery still needs a non-sensitive message.
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "", 0, false, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("agent execution failed", result);
+}
+
+test "buildAgentOutput marks partial stdout as failed" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "partial output", 0, false, false);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "partial output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "agent execution failed") != null);
+}
+
+test "buildAgentOutput appends timeout annotation" {
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "working...", 30, true, false);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "working...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "timed out after 30s") != null);
+}
+
+test "buildAgentOutput timeout without stdout is generic" {
+    // Regression: timeout diagnostics from stderr must not be delivered as an
+    // agent response when the child produced no stdout.
+    const allocator = std.testing.allocator;
+    const result = try buildAgentOutput(allocator, "", 60, true, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("agent timed out after 60s", result);
+}
+
+test "isSuccessfulAgentRun rejects timeout exit failure and empty stdout" {
+    // Regression: CLI soft failures can exit zero after logging only to stderr.
+    try std.testing.expect(isSuccessfulAgentRun(false, true, "response\n"));
+    try std.testing.expect(!isSuccessfulAgentRun(true, true, "response\n"));
+    try std.testing.expect(!isSuccessfulAgentRun(false, false, "response\n"));
+    try std.testing.expect(!isSuccessfulAgentRun(false, true, "\n"));
+}
+
 test "preferExecPath keeps regular executable path" {
     const input = "/home/user/bin/nullclaw";
     try std.testing.expectEqualStrings(input, preferExecPath(input));
@@ -367,4 +465,33 @@ test "preferExecPath uses proc self exe for deleted linux path" {
 test "pathAgentExecutableName returns platform command name" {
     const expected = if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
     try std.testing.expectEqualStrings(expected, pathAgentExecutableName());
+}
+
+test "appendAgentArgv includes cron origin attribution" {
+    // Regression: scheduled child agents must receive origin metadata in every spawn attempt.
+    const allocator = std.testing.allocator;
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try appendAgentArgv(allocator, &argv, "/usr/bin/nullclaw", "Summarize status", "test-model", .{
+        .origin_channel = "telegram",
+        .origin_account_id = "main",
+    });
+
+    const expected = [_][]const u8{
+        "/usr/bin/nullclaw",
+        "agent",
+        "--model",
+        "test-model",
+        "--origin-channel",
+        "telegram",
+        "--origin-account-id",
+        "main",
+        "-m",
+        "Summarize status",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
 }

@@ -268,6 +268,8 @@ const ParsedAgentArgs = struct {
     agent_name: ?[]const u8 = null,
     workspace_override: ?[]const u8 = null,
     skill_name: ?[]const u8 = null,
+    origin_channel: ?[]const u8 = null,
+    origin_account_id: ?[]const u8 = null,
     verbose: bool = false,
 };
 
@@ -315,6 +317,14 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.skill_name = args[i];
+        } else if (std.mem.eql(u8, arg, "--origin-channel")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.origin_channel = args[i];
+        } else if (std.mem.eql(u8, arg, "--origin-account-id")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.origin_account_id = args[i];
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
         }
@@ -497,7 +507,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const start_event = ObserverEvent{ .agent_start = .{
         .provider = if (selected_profile_storage) |profile| profile.provider else cfg.default_provider,
         .model = if (selected_profile_storage) |profile| profile.model else (cfg.default_model orelse "(default)"),
-        .channel = "cli",
+        .channel = parsed_args.origin_channel orelse "cli",
+        .bot_account = parsed_args.origin_account_id,
     } };
     obs.recordEvent(&start_event);
 
@@ -1300,11 +1311,42 @@ test "parseAgentArgs parses --skill" {
     try std.testing.expectEqualStrings("go", parsed.message_arg.?);
 }
 
+test "parseAgentArgs parses cron origin attribution" {
+    // Regression: scheduled child agents must retain delivery origin observability fields.
+    const args = [_][]const u8{
+        "--origin-channel",
+        "telegram",
+        "--origin-account-id",
+        "main",
+        "-m",
+        "go",
+    };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings("telegram", parsed.origin_channel.?);
+    try std.testing.expectEqualStrings("main", parsed.origin_account_id.?);
+    try std.testing.expectEqualStrings("go", parsed.message_arg.?);
+}
+
 test "parseAgentArgs returns missing value for --skill" {
     const args = [_][]const u8{"--skill"};
     switch (parseAgentArgs(&args)) {
         .missing_value => |value| try std.testing.expectEqualStrings("--skill", value),
         else => unreachable,
+    }
+}
+
+test "parseAgentArgs returns missing value for origin attribution" {
+    // Regression: incomplete internal origin flags must fail before agent startup.
+    const flags = [_][]const u8{ "--origin-channel", "--origin-account-id" };
+    for (flags) |flag| {
+        const args = [_][]const u8{flag};
+        switch (parseAgentArgs(&args)) {
+            .missing_value => |value| try std.testing.expectEqualStrings(flag, value),
+            else => unreachable,
+        }
     }
 }
 
