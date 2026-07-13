@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
 const url_percent = @import("../url_percent.zig");
 
 const log = std.log.scoped(.matrix);
@@ -29,11 +30,25 @@ pub const MatrixChannel = struct {
     effective_endpoint: []const u8 = "",
     running: bool = false,
 
-    next_batch_buf: [1024]u8 = undefined,
+    next_batch_buf: [MAX_NEXT_BATCH_LEN]u8 = undefined,
     next_batch_len: usize = 0,
+    next_batch_dirty: bool = false,
     txn_counter: u64 = 0,
 
     pub const MAX_MESSAGE_LEN: usize = 4000;
+    pub const MAX_NEXT_BATCH_LEN: usize = 1024;
+    const NEXT_BATCH_STORE_VERSION: u32 = 1;
+    const NEXT_BATCH_STORE_MAX_BYTES: usize = 16 * 1024;
+    const NEXT_BATCH_FILE_STEM_MAX_LEN: usize = 48;
+
+    const NextBatchStore = struct {
+        version: u32,
+        account_id: []const u8,
+        homeserver: []const u8,
+        user_id: ?[]const u8 = null,
+        credential_fingerprint: []const u8,
+        next_batch: []const u8,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -78,12 +93,273 @@ pub const MatrixChannel = struct {
         return self.next_batch_buf[0..self.next_batch_len];
     }
 
-    fn setNextBatch(self: *MatrixChannel, token: []const u8) void {
-        const len = @min(token.len, self.next_batch_buf.len);
-        if (len > 0) {
-            @memcpy(self.next_batch_buf[0..len], token[0..len]);
+    fn setNextBatch(self: *MatrixChannel, token: []const u8) !void {
+        if (token.len > self.next_batch_buf.len) return error.NextBatchTooLong;
+
+        // Matrix /sync returns a fresh next_batch on every cycle, including
+        // idle long-poll timeouts. Preserve a failed commit's dirty bit when
+        // the same token is returned so persistence is retried by the loop.
+        if (!self.nextBatchChanged(token)) return;
+
+        if (token.len > 0) {
+            @memcpy(self.next_batch_buf[0..token.len], token);
         }
-        self.next_batch_len = len;
+        self.next_batch_len = token.len;
+        self.next_batch_dirty = true;
+    }
+
+    /// True when `token` would change the buffered next_batch position.
+    /// Extracted from setNextBatch so the short-circuit is unit-testable.
+    fn nextBatchChanged(self: *const MatrixChannel, token: []const u8) bool {
+        if (token.len != self.next_batch_len) return true;
+        return !std.mem.eql(u8, self.next_batch_buf[0..token.len], token);
+    }
+
+    fn accountIdShortHash(account_id: []const u8) [32]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(account_id, &digest, .{});
+        return std.fmt.bytesToHex(digest[0..16], .lower);
+    }
+
+    fn credentialFingerprint(access_token: []const u8) [64]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(access_token, &digest, .{});
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    /// Build absolute path `<dir>/matrix-next-batch-<account>-<hash>.json`.
+    /// The hash covers the full raw account id, preventing collisions caused by
+    /// filename sanitization or truncation. Caller frees.
+    fn nextBatchPath(allocator: std.mem.Allocator, dir: []const u8, account_id: []const u8) ![]u8 {
+        var name_buf: [NEXT_BATCH_FILE_STEM_MAX_LEN]u8 = undefined;
+        const safe = sanitizeAccountId(account_id, &name_buf);
+        const account_hash = accountIdShortHash(account_id);
+        const filename = try std.fmt.allocPrint(allocator, "matrix-next-batch-{s}-{s}.json", .{ safe, account_hash });
+        defer allocator.free(filename);
+        return std_compat.fs.path.join(allocator, &.{ dir, filename });
+    }
+
+    /// Replace any character that is not alphanumeric / `-` / `_` / `.` with
+    /// `_` so a config-supplied account_id can never escape the state dir.
+    fn sanitizeAccountId(account_id: []const u8, buf: []u8) []const u8 {
+        const len = @min(account_id.len, buf.len);
+        if (len == 0) {
+            // Empty account_id would yield a dangling trailing dash; use a stable stem.
+            const fallback = "default";
+            const n = @min(fallback.len, buf.len);
+            @memcpy(buf[0..n], fallback[0..n]);
+            return buf[0..n];
+        }
+        for (account_id[0..len], 0..) |c, i| {
+            buf[i] = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') c else '_';
+        }
+        return buf[0..len];
+    }
+
+    fn buildNextBatchStore(
+        allocator: std.mem.Allocator,
+        account_id: []const u8,
+        homeserver: []const u8,
+        user_id: ?[]const u8,
+        access_token: []const u8,
+        token: []const u8,
+    ) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        const fingerprint = credentialFingerprint(access_token);
+        try out.print(allocator, "{{\n  \"version\": {d},\n  \"account_id\": ", .{NEXT_BATCH_STORE_VERSION});
+        try root.json_util.appendJsonString(&out, allocator, account_id);
+        try out.appendSlice(allocator, ",\n  \"homeserver\": ");
+        try root.json_util.appendJsonString(&out, allocator, homeserver);
+        try out.appendSlice(allocator, ",\n  \"user_id\": ");
+        if (user_id) |value| {
+            try root.json_util.appendJsonString(&out, allocator, value);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.appendSlice(allocator, ",\n  \"credential_fingerprint\": ");
+        try root.json_util.appendJsonString(&out, allocator, &fingerprint);
+        try out.appendSlice(allocator, ",\n  \"next_batch\": ");
+        try root.json_util.appendJsonString(&out, allocator, token);
+        try out.appendSlice(allocator, "\n}\n");
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Atomically write a versioned cursor record, creating `dir` if needed.
+    /// A unique 0600 temp file is synced and renamed in the same directory. On
+    /// failure the previous committed record is left untouched.
+    fn writeNextBatchFile(
+        allocator: std.mem.Allocator,
+        dir: []const u8,
+        account_id: []const u8,
+        homeserver: []const u8,
+        user_id: ?[]const u8,
+        access_token: []const u8,
+        token: []const u8,
+    ) !void {
+        if (token.len == 0 or token.len > MAX_NEXT_BATCH_LEN) return error.InvalidNextBatch;
+        try fs_compat.makePath(dir);
+
+        const path = try nextBatchPath(allocator, dir, account_id);
+        defer allocator.free(path);
+
+        const body = try buildNextBatchStore(allocator, account_id, homeserver, user_id, access_token, token);
+        defer allocator.free(body);
+        if (body.len > NEXT_BATCH_STORE_MAX_BYTES) return error.NextBatchStoreTooLarge;
+
+        var attempt: u8 = 0;
+        while (attempt < 8) : (attempt += 1) {
+            const tmp_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}.tmp-{x}",
+                .{ path, std_compat.crypto.random.int(u64) },
+            );
+            defer allocator.free(tmp_path);
+
+            var tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{
+                .exclusive = true,
+                .permissions = std_compat.fs.permissionsFromMode(0o600),
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            var file_open = true;
+            errdefer {
+                if (file_open) tmp_file.close();
+                std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+            }
+
+            try tmp_file.writeAll(body);
+            try tmp_file.sync();
+            tmp_file.close();
+            file_open = false;
+            try std_compat.fs.renameAbsolute(tmp_path, path);
+            return;
+        }
+        return error.TempFileCreateFailed;
+    }
+
+    /// Read a valid, identity-matching persisted token into `out_buf`. Missing
+    /// or stale records return 0; malformed and oversized records are errors.
+    fn readNextBatchFile(
+        allocator: std.mem.Allocator,
+        dir: []const u8,
+        account_id: []const u8,
+        homeserver: []const u8,
+        user_id: ?[]const u8,
+        access_token: []const u8,
+        out_buf: []u8,
+    ) !usize {
+        const path = try nextBatchPath(allocator, dir, account_id);
+        defer allocator.free(path);
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| {
+            if (err == error.FileNotFound) return 0;
+            return err;
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(allocator, NEXT_BATCH_STORE_MAX_BYTES) catch |err| switch (err) {
+            error.StreamTooLong => return error.NextBatchStoreTooLarge,
+            else => return err,
+        };
+        defer allocator.free(content);
+
+        const parsed = std.json.parseFromSlice(NextBatchStore, allocator, content, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.InvalidNextBatchStore;
+        defer parsed.deinit();
+        const record = parsed.value;
+
+        const expected_fingerprint = credentialFingerprint(access_token);
+        const user_identity_matches = if (user_id) |expected_user_id|
+            record.user_id != null and std.mem.eql(u8, record.user_id.?, expected_user_id)
+        else
+            record.user_id == null and std.mem.eql(u8, record.credential_fingerprint, &expected_fingerprint);
+        if (record.version != NEXT_BATCH_STORE_VERSION or
+            !std.mem.eql(u8, record.account_id, account_id) or
+            !std.mem.eql(u8, record.homeserver, homeserver) or
+            !user_identity_matches)
+        {
+            return 0;
+        }
+        if (record.next_batch.len == 0 or record.next_batch.len > out_buf.len) {
+            return error.InvalidNextBatchStore;
+        }
+
+        @memcpy(out_buf[0..record.next_batch.len], record.next_batch);
+        return record.next_batch.len;
+    }
+
+    /// Resolve `<config dir>/state/matrix`, including relative config paths.
+    /// Caller frees.
+    pub fn stateDirFromConfigPath(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
+        const config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
+        const relative_path = try std_compat.fs.path.join(allocator, &.{ config_dir, "state", "matrix" });
+        defer allocator.free(relative_path);
+
+        if (std_compat.fs.path.isAbsolute(relative_path)) {
+            return std_compat.fs.path.resolve(allocator, &.{relative_path});
+        }
+
+        const cwd = try std_compat.fs.cwd().realpathAlloc(allocator, ".");
+        defer allocator.free(cwd);
+        return std_compat.fs.path.resolve(allocator, &.{ cwd, relative_path });
+    }
+
+    fn commitNextBatchToDir(self: *MatrixChannel, dir: []const u8) !void {
+        if (!self.next_batch_dirty or self.next_batch_len == 0) return;
+        try writeNextBatchFile(
+            self.allocator,
+            dir,
+            self.account_id,
+            self.homeserver,
+            self.user_id,
+            self.access_token,
+            self.nextBatch(),
+        );
+        self.next_batch_dirty = false;
+    }
+
+    /// Commit the cursor only after the caller has processed the entire batch.
+    /// Failures remain dirty and are retried after the next successful poll.
+    pub fn commitNextBatch(self: *MatrixChannel, dir: []const u8) void {
+        self.commitNextBatchToDir(dir) catch |err| {
+            log.warn("matrix: failed to persist next_batch: {}", .{err});
+        };
+    }
+
+    /// Load a persisted next_batch token into the buffer so a restart resumes
+    /// the sync stream at the last committed position rather than running a
+    /// fresh initial sync (which silently drops all downtime messages).
+    /// Best-effort. Identity mismatches intentionally behave like a fresh sync.
+    pub fn loadPersistedNextBatch(self: *MatrixChannel, dir: []const u8) void {
+        const n = readNextBatchFile(
+            self.allocator,
+            dir,
+            self.account_id,
+            self.homeserver,
+            self.user_id,
+            self.access_token,
+            &self.next_batch_buf,
+        ) catch |err| {
+            log.warn("matrix: failed to load persisted next_batch: {}", .{err});
+            return;
+        };
+        if (n > 0) {
+            self.next_batch_len = n;
+            self.next_batch_dirty = false;
+            log.info("matrix: resumed sync from persisted next_batch ({d} bytes)", .{n});
+        }
+    }
+
+    pub fn discardPersistedNextBatch(self: *MatrixChannel, dir: []const u8) void {
+        const path = nextBatchPath(self.allocator, dir, self.account_id) catch return;
+        defer self.allocator.free(path);
+        std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => log.warn("matrix: failed to discard stale next_batch: {}", .{err}),
+        };
     }
 
     fn authHeader(self: *const MatrixChannel, allocator: std.mem.Allocator) ![]u8 {
@@ -557,6 +833,21 @@ pub const MatrixChannel = struct {
         return false;
     }
 
+    fn finishSyncResponse(
+        self: *MatrixChannel,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(root.ChannelMessage),
+        pending_next_batch: ?[]const u8,
+    ) ![]root.ChannelMessage {
+        const messages = try toOwnedMessages(allocator, out);
+        errdefer {
+            for (messages) |*msg| msg.deinit(allocator);
+            if (messages.len > 0) allocator.free(messages);
+        }
+        if (pending_next_batch) |token| try self.setNextBatch(token);
+        return messages;
+    }
+
     pub fn parseSyncResponse(self: *MatrixChannel, allocator: std.mem.Allocator, payload: []const u8) ![]root.ChannelMessage {
         var out: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
         errdefer {
@@ -564,25 +855,31 @@ pub const MatrixChannel = struct {
             out.deinit(allocator);
         }
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return &.{};
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return &.{},
+        };
         defer parsed.deinit();
 
         if (parsed.value != .object) return &.{};
         const root_obj = parsed.value.object;
+        const pending_next_batch: ?[]const u8 = blk: {
+            const value = root_obj.get("next_batch") orelse break :blk null;
+            if (value != .string or value.string.len == 0) break :blk null;
+            if (value.string.len > self.next_batch_buf.len) return error.NextBatchTooLong;
+            break :blk value.string;
+        };
+
         var direct_rooms = try collectDirectRooms(allocator, root_obj);
         defer direct_rooms.deinit(allocator);
 
-        if (root_obj.get("next_batch")) |next_batch| {
-            if (next_batch == .string and next_batch.string.len > 0) {
-                self.setNextBatch(next_batch.string);
-            }
-        }
+        const rooms_val = root_obj.get("rooms") orelse
+            return self.finishSyncResponse(allocator, &out, pending_next_batch);
+        if (rooms_val != .object) return self.finishSyncResponse(allocator, &out, pending_next_batch);
 
-        const rooms_val = root_obj.get("rooms") orelse return toOwnedMessages(allocator, &out);
-        if (rooms_val != .object) return toOwnedMessages(allocator, &out);
-
-        const join_val = rooms_val.object.get("join") orelse return toOwnedMessages(allocator, &out);
-        if (join_val != .object) return toOwnedMessages(allocator, &out);
+        const join_val = rooms_val.object.get("join") orelse
+            return self.finishSyncResponse(allocator, &out, pending_next_batch);
+        if (join_val != .object) return self.finishSyncResponse(allocator, &out, pending_next_batch);
 
         var rooms_it = join_val.object.iterator();
         while (rooms_it.next()) |room_entry| {
@@ -648,19 +945,40 @@ pub const MatrixChannel = struct {
                     break :blk root.nowEpochSecs();
                 };
 
+                const owned_id = try allocator.dupe(u8, event_id);
+                errdefer allocator.free(owned_id);
+                const owned_sender = try allocator.dupe(u8, sender);
+                errdefer allocator.free(owned_sender);
+                const owned_content = try allocator.dupe(u8, body);
+                errdefer allocator.free(owned_content);
+                const owned_reply_target = try allocator.dupe(u8, room_id);
+                errdefer allocator.free(owned_reply_target);
+
                 try out.append(allocator, .{
-                    .id = try allocator.dupe(u8, event_id),
-                    .sender = try allocator.dupe(u8, sender),
-                    .content = try allocator.dupe(u8, body),
+                    .id = owned_id,
+                    .sender = owned_sender,
+                    .content = owned_content,
                     .channel = "matrix",
                     .timestamp = timestamp,
-                    .reply_target = try allocator.dupe(u8, room_id),
+                    .reply_target = owned_reply_target,
                     .is_group = !room_is_direct,
                 });
             }
         }
 
-        return toOwnedMessages(allocator, &out);
+        return self.finishSyncResponse(allocator, &out, pending_next_batch);
+    }
+
+    fn responseIndicatesExpiredPosition(allocator: std.mem.Allocator, payload: []const u8) bool {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const errcode = parsed.value.object.get("errcode") orelse return false;
+        if (errcode != .string) return false;
+        if (std.mem.eql(u8, errcode.string, "M_UNKNOWN_POS")) return true;
+        if (!std.mem.eql(u8, errcode.string, "M_UNKNOWN")) return false;
+        const message = parsed.value.object.get("error") orelse return false;
+        return message == .string and std.mem.startsWith(u8, message.string, "Invalid stream token");
     }
 
     pub fn pollMessages(self: *MatrixChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
@@ -674,16 +992,31 @@ pub const MatrixChannel = struct {
         defer allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlGet(allocator, url, &headers, "35") catch |err| {
+        const resp = root.http_util.curlGetWithStatusAndTimeout(allocator, url, &headers, "35") catch |err| {
             log.warn("Matrix sync failed: {}", .{err});
             return err;
         };
-        defer allocator.free(resp);
+        defer allocator.free(resp.body);
 
-        if (resp.len == 0) return &.{};
-        try self.acceptInvitesFromSync(allocator, resp);
+        if (resp.status_code < 200 or resp.status_code >= 300) {
+            if (resp.status_code == 400 and self.next_batch_len > 0 and
+                responseIndicatesExpiredPosition(allocator, resp.body))
+            {
+                // A persisted `since` token may expire server-side. Clear the
+                // in-memory position; the loop removes the durable record and
+                // performs one fresh sync instead of retrying forever.
+                self.next_batch_len = 0;
+                self.next_batch_dirty = false;
+                return error.MatrixSyncPositionExpired;
+            }
+            log.warn("Matrix sync returned HTTP status {d}", .{resp.status_code});
+            return error.MatrixSyncHttpError;
+        }
 
-        const messages = try self.parseSyncResponse(allocator, resp);
+        if (resp.body.len == 0) return &.{};
+        try self.acceptInvitesFromSync(allocator, resp.body);
+
+        const messages = try self.parseSyncResponse(allocator, resp.body);
         if (!is_initial_sync) return messages;
 
         for (messages) |*msg| msg.deinit(allocator);
@@ -954,6 +1287,9 @@ test "MatrixChannel parseSyncResponse extracts messages and next_batch" {
     try std.testing.expectEqualStrings("!room:example", msgs[0].reply_target.?);
     try std.testing.expect(msgs[0].is_group);
     try std.testing.expectEqualStrings("s123", ch.nextBatch());
+    // Regression: parsing stages the cursor but must not durably commit it
+    // before the caller has processed every event in this batch.
+    try std.testing.expect(ch.next_batch_dirty);
 }
 
 test "MatrixChannel parseSyncResponse marks m.direct rooms as direct chats" {
@@ -1546,4 +1882,424 @@ test "MatrixChannel start + stop under is_test leaks zero bytes" {
     ch.stop();
     // Double stop — must not double-free or crash.
     ch.stop();
+}
+
+test "MatrixChannel nextBatchChanged only flags actual position advances" {
+    // Regression: Matrix /sync returns a fresh next_batch on every cycle,
+    // including idle long-poll timeouts. Identical tokens must not cause an
+    // unnecessary copy, while a failed durable commit remains dirty for retry.
+    var ch = MatrixChannel.init(
+        std.testing.allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+
+    // Empty buffer → anything is a change.
+    try std.testing.expect(ch.nextBatchChanged("abc"));
+
+    try ch.setNextBatch("abc");
+    try std.testing.expect(ch.next_batch_dirty);
+    // Same token → no change (this is the idle /sync case).
+    try std.testing.expect(!ch.nextBatchChanged("abc"));
+    try ch.setNextBatch("abc");
+    try std.testing.expect(ch.next_batch_dirty);
+    // Different content → change.
+    try std.testing.expect(ch.nextBatchChanged("abd"));
+    // Different length → change.
+    try std.testing.expect(ch.nextBatchChanged("ab"));
+    try std.testing.expect(ch.nextBatchChanged("abcd"));
+
+    // Opaque Matrix cursors must never be truncated into an invalid token.
+    try std.testing.expectError(error.NextBatchTooLong, ch.setNextBatch("s" ++ "a" ** 2000));
+    try std.testing.expectEqualStrings("abc", ch.nextBatch());
+}
+
+test "MatrixChannel next_batch persistence is identity-bound and roundtrips" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Resolve absolute path of the tmp dir.
+    const dir = blk: {
+        var buf: [4096]u8 = undefined;
+        const path = try std_compat.fs.Dir.wrap(tmp.dir).realpath(".", &buf);
+        break :blk try allocator.dupe(u8, path);
+    };
+    defer allocator.free(dir);
+
+    // Write a token, read it back.
+    try MatrixChannel.writeNextBatchFile(
+        allocator,
+        dir,
+        "test-account",
+        "https://matrix.example",
+        null,
+        "test-access-token",
+        "s123456",
+    );
+    var read_buf: [1024]u8 = undefined;
+    const n = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        "test-account",
+        "https://matrix.example",
+        null,
+        "test-access-token",
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 7), n);
+    try std.testing.expectEqualStrings("s123456", read_buf[0..n]);
+
+    // Missing file → 0 (not an error).
+    const n2 = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        "nonexistent",
+        "https://matrix.example",
+        null,
+        "test-access-token",
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 0), n2);
+
+    // A reused account id cannot consume a cursor from another server or token.
+    const wrong_server = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        "test-account",
+        "https://other.example",
+        null,
+        "test-access-token",
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 0), wrong_server);
+    const wrong_credential = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        "test-account",
+        "https://matrix.example",
+        null,
+        "different-token",
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 0), wrong_credential);
+
+    // When a stable Matrix user id is configured, ordinary access-token
+    // rotation must not invalidate that user's cursor.
+    try MatrixChannel.writeNextBatchFile(
+        allocator,
+        dir,
+        "configured-user",
+        "https://matrix.example",
+        "@bot:example",
+        "old-access-token",
+        "user-cursor",
+    );
+    const after_token_rotation = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        "configured-user",
+        "https://matrix.example",
+        "@bot:example",
+        "new-access-token",
+        &read_buf,
+    );
+    try std.testing.expectEqualStrings("user-cursor", read_buf[0..after_token_rotation]);
+    const wrong_user = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        "configured-user",
+        "https://matrix.example",
+        "@other:example",
+        "old-access-token",
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 0), wrong_user);
+
+    // Atomic replace → new value.
+    try MatrixChannel.writeNextBatchFile(
+        allocator,
+        dir,
+        "test-account",
+        "https://matrix.example",
+        null,
+        "test-access-token",
+        "s999",
+    );
+    const n3 = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        "test-account",
+        "https://matrix.example",
+        null,
+        "test-access-token",
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 4), n3);
+    try std.testing.expectEqualStrings("s999", read_buf[0..n3]);
+
+    if (comptime builtin.os.tag != .windows) {
+        const path = try MatrixChannel.nextBatchPath(allocator, dir, "test-account");
+        defer allocator.free(path);
+        const file = try std_compat.fs.openFileAbsolute(path, .{});
+        defer file.close();
+        const stat = try file.stat();
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0), stat.mode & 0o077);
+    }
+
+    const corrupt_path = try MatrixChannel.nextBatchPath(allocator, dir, "corrupt-account");
+    defer allocator.free(corrupt_path);
+    const corrupt_file = try std_compat.fs.createFileAbsolute(corrupt_path, .{});
+    try corrupt_file.writeAll("not-json");
+    corrupt_file.close();
+    try std.testing.expectError(
+        error.InvalidNextBatchStore,
+        MatrixChannel.readNextBatchFile(
+            allocator,
+            dir,
+            "corrupt-account",
+            "https://matrix.example",
+            null,
+            "test-access-token",
+            &read_buf,
+        ),
+    );
+
+    const nested_dir = try std_compat.fs.path.join(allocator, &.{ dir, "nested", "state", "matrix" });
+    defer allocator.free(nested_dir);
+    try MatrixChannel.writeNextBatchFile(
+        allocator,
+        nested_dir,
+        "nested-account",
+        "https://matrix.example",
+        null,
+        "test-access-token",
+        "nested-cursor",
+    );
+    const nested_n = try MatrixChannel.readNextBatchFile(
+        allocator,
+        nested_dir,
+        "nested-account",
+        "https://matrix.example",
+        null,
+        "test-access-token",
+        &read_buf,
+    );
+    try std.testing.expectEqualStrings("nested-cursor", read_buf[0..nested_n]);
+
+    const oversized_path = try MatrixChannel.nextBatchPath(allocator, dir, "oversized-account");
+    defer allocator.free(oversized_path);
+    const oversized_file = try std_compat.fs.createFileAbsolute(oversized_path, .{});
+    const oversized_body: [MatrixChannel.NEXT_BATCH_STORE_MAX_BYTES + 1]u8 = @splat('x');
+    try oversized_file.writeAll(&oversized_body);
+    oversized_file.close();
+    try std.testing.expectError(
+        error.NextBatchStoreTooLarge,
+        MatrixChannel.readNextBatchFile(
+            allocator,
+            dir,
+            "oversized-account",
+            "https://matrix.example",
+            null,
+            "test-access-token",
+            &read_buf,
+        ),
+    );
+    try std.testing.expectError(
+        error.NextBatchStoreTooLarge,
+        MatrixChannel.writeNextBatchFile(
+            allocator,
+            dir,
+            "oversized-writer-account",
+            "h" ** (MatrixChannel.NEXT_BATCH_STORE_MAX_BYTES + 1),
+            null,
+            "test-access-token",
+            "cursor",
+        ),
+    );
+}
+
+test "MatrixChannel next_batch commit is delayed and retries after failure" {
+    // Regression: persisting in parseSyncResponse could advance the durable
+    // cursor before the corresponding events were processed, losing them on a
+    // crash. A failed write must also remain dirty for a later retry.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "test-access-token",
+        "!room:example",
+        &.{"*"},
+    );
+    ch.account_id = "test-account";
+    try ch.setNextBatch("s123456");
+    try std.testing.expect(ch.next_batch_dirty);
+
+    var read_buf: [MatrixChannel.MAX_NEXT_BATCH_LEN]u8 = undefined;
+    const before_commit = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        ch.account_id,
+        ch.homeserver,
+        ch.user_id,
+        ch.access_token,
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 0), before_commit);
+
+    const blocking_file = try std_compat.fs.path.join(allocator, &.{ dir, "not-a-directory" });
+    defer allocator.free(blocking_file);
+    const file = try std_compat.fs.createFileAbsolute(blocking_file, .{});
+    file.close();
+    const invalid_dir = try std_compat.fs.path.join(allocator, &.{ blocking_file, "matrix" });
+    defer allocator.free(invalid_dir);
+
+    var failed = false;
+    ch.commitNextBatchToDir(invalid_dir) catch {
+        failed = true;
+    };
+    try std.testing.expect(failed);
+    try std.testing.expect(ch.next_batch_dirty);
+
+    try ch.commitNextBatchToDir(dir);
+    try std.testing.expect(!ch.next_batch_dirty);
+
+    var resumed = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "test-access-token",
+        "!room:example",
+        &.{"*"},
+    );
+    resumed.account_id = "test-account";
+    resumed.loadPersistedNextBatch(dir);
+    try std.testing.expectEqualStrings("s123456", resumed.nextBatch());
+    try std.testing.expect(!resumed.next_batch_dirty);
+
+    resumed.discardPersistedNextBatch(dir);
+    const discarded = try MatrixChannel.readNextBatchFile(
+        allocator,
+        dir,
+        resumed.account_id,
+        resumed.homeserver,
+        resumed.user_id,
+        resumed.access_token,
+        &read_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 0), discarded);
+}
+
+test "MatrixChannel next_batch paths do not collide after sanitization" {
+    const allocator = std.testing.allocator;
+    const path_a = try MatrixChannel.nextBatchPath(allocator, "/tmp", "work/a");
+    defer allocator.free(path_a);
+    const path_b = try MatrixChannel.nextBatchPath(allocator, "/tmp", "work?a");
+    defer allocator.free(path_b);
+    try std.testing.expect(!std.mem.eql(u8, path_a, path_b));
+
+    const long_a = "a" ** 80 ++ "x";
+    const long_b = "a" ** 80 ++ "y";
+    const long_path_a = try MatrixChannel.nextBatchPath(allocator, "/tmp", long_a);
+    defer allocator.free(long_path_a);
+    const long_path_b = try MatrixChannel.nextBatchPath(allocator, "/tmp", long_b);
+    defer allocator.free(long_path_b);
+    try std.testing.expect(!std.mem.eql(u8, long_path_a, long_path_b));
+}
+
+test "MatrixChannel state directory follows config path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root_dir);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ root_dir, "portable", "config.json" });
+    defer allocator.free(config_path);
+    const expected = try std_compat.fs.path.join(allocator, &.{ root_dir, "portable", "state", "matrix" });
+    defer allocator.free(expected);
+
+    const actual = try MatrixChannel.stateDirFromConfigPath(allocator, config_path);
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+
+    const cwd = try std_compat.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const expected_relative = try std_compat.fs.path.resolve(allocator, &.{ cwd, "portable", "state", "matrix" });
+    defer allocator.free(expected_relative);
+    const actual_relative = try MatrixChannel.stateDirFromConfigPath(allocator, "portable/config.json");
+    defer allocator.free(actual_relative);
+    try std.testing.expectEqualStrings(expected_relative, actual_relative);
+}
+
+fn parseSyncResponseCursorAllocationTest(allocator: std.mem.Allocator) !void {
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "test-access-token",
+        "!room:example",
+        &.{"*"},
+    );
+    try ch.setNextBatch("old-cursor");
+    ch.next_batch_dirty = false;
+
+    const payload =
+        \\{
+        \\  "next_batch": "new-cursor",
+        \\  "rooms": {"join": {"!room:example": {"timeline": {"events": [
+        \\    {"type":"m.room.message","sender":"@alice:example","event_id":"$evt","content":{"msgtype":"m.text","body":"hello"}}
+        \\  ]}}}}
+        \\}
+    ;
+
+    const messages = ch.parseSyncResponse(allocator, payload) catch |err| {
+        // Regression: an OOM while materializing the batch must leave `since`
+        // on the prior cursor so the same events are fetched again.
+        try std.testing.expectEqualStrings("old-cursor", ch.nextBatch());
+        try std.testing.expect(!ch.next_batch_dirty);
+        return err;
+    };
+    defer {
+        for (messages) |*message| message.deinit(allocator);
+        if (messages.len > 0) allocator.free(messages);
+    }
+
+    try std.testing.expectEqualStrings("new-cursor", ch.nextBatch());
+    try std.testing.expect(ch.next_batch_dirty);
+}
+
+test "MatrixChannel parseSyncResponse advances cursor only after successful materialization" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseSyncResponseCursorAllocationTest,
+        .{},
+    );
+}
+
+test "MatrixChannel recognizes expired sync position responses" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(MatrixChannel.responseIndicatesExpiredPosition(
+        allocator,
+        "{\"errcode\":\"M_UNKNOWN_POS\",\"error\":\"stale since\"}",
+    ));
+    try std.testing.expect(MatrixChannel.responseIndicatesExpiredPosition(
+        allocator,
+        "{\"errcode\":\"M_UNKNOWN\",\"error\":\"Invalid stream token 'stale'\"}",
+    ));
+    try std.testing.expect(!MatrixChannel.responseIndicatesExpiredPosition(
+        allocator,
+        "{\"errcode\":\"M_FORBIDDEN\"}",
+    ));
+    try std.testing.expect(!MatrixChannel.responseIndicatesExpiredPosition(
+        allocator,
+        "{\"errcode\":\"M_UNKNOWN\",\"error\":\"Different error\"}",
+    ));
+    try std.testing.expect(!MatrixChannel.responseIndicatesExpiredPosition(allocator, "not-json"));
 }
