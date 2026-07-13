@@ -350,6 +350,17 @@ pub const ProviderHolder = union(enum) {
         self.provider().deinit();
     }
 
+    fn openRouterHolder(
+        allocator: std.mem.Allocator,
+        api_key: ?[]const u8,
+        extra_body_params: ?[]const u8,
+        native_tools: bool,
+    ) ProviderHolder {
+        var prov = openrouter.OpenRouterProvider.init(allocator, api_key, extra_body_params);
+        prov.native_tools = native_tools;
+        return .{ .openrouter = prov };
+    }
+
     /// Create a ProviderHolder from a provider name string and optional API key.
     /// Uses `classifyProvider` to route to the correct concrete provider.
     pub fn fromConfig(
@@ -391,18 +402,26 @@ pub const ProviderHolder = union(enum) {
     ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
-            .anthropic_provider => .{ .anthropic = anthropic.AnthropicProvider.init(
-                allocator,
-                api_key,
-                if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
-                    if (config_types.ProviderEntry.isValidBaseUrl(provider_name["anthropic-custom:".len..]))
-                        provider_name["anthropic-custom:".len..]
+            .anthropic_provider => blk: {
+                var prov = anthropic.AnthropicProvider.init(
+                    allocator,
+                    api_key,
+                    if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
+                        if (config_types.ProviderEntry.isValidBaseUrl(provider_name["anthropic-custom:".len..]))
+                            provider_name["anthropic-custom:".len..]
+                        else
+                            validatedBaseUrl(base_url)
                     else
-                        validatedBaseUrl(base_url)
-                else
-                    validatedBaseUrl(base_url),
-            ) },
-            .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent, extra_body_params) },
+                        validatedBaseUrl(base_url),
+                );
+                prov.native_tools = native_tools;
+                break :blk .{ .anthropic = prov };
+            },
+            .openai_provider => blk: {
+                var prov = openai.OpenAiProvider.init(allocator, api_key, user_agent, extra_body_params);
+                prov.native_tools = native_tools;
+                break :blk .{ .openai = prov };
+            },
             .azure_openai_provider => blk: {
                 const azure_url = normalizeAzureBaseUrlOwned(allocator, validatedBaseUrl(base_url)) catch null;
                 var prov = compatible.OpenAiCompatibleProvider.init(
@@ -431,7 +450,7 @@ pub const ProviderHolder = union(enum) {
                 prov.native_tools = native_tools;
                 break :blk .{ .ollama = prov };
             },
-            .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, extra_body_params) },
+            .openrouter_provider => openRouterHolder(allocator, api_key, extra_body_params, native_tools),
             .compatible_provider => blk: {
                 // Config base_url overrides built-in URL table and custom: prefix
                 const url = validatedBaseUrl(base_url) orelse
@@ -481,15 +500,15 @@ pub const ProviderHolder = union(enum) {
             .claude_cli_provider => if (claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
                 .{ .claude_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+                openRouterHolder(allocator, api_key, null, native_tools),
             .codex_cli_provider => if (codex_cli.CodexCliProvider.init(allocator, null)) |p|
                 .{ .codex_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+                openRouterHolder(allocator, api_key, null, native_tools),
             .gemini_cli_provider => if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p|
                 .{ .gemini_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+                openRouterHolder(allocator, api_key, null, native_tools),
             .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
             // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
             // otherwise fall back to OpenRouter.
@@ -511,7 +530,7 @@ pub const ProviderHolder = union(enum) {
                 if (chat_template_enable_thinking_param) prov.chat_template_enable_thinking_param = true;
                 prov.extra_body_params = extra_body_params;
                 break :blk .{ .compatible = prov };
-            } else .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+            } else openRouterHolder(allocator, api_key, null, native_tools),
         };
     }
 };
@@ -1051,6 +1070,27 @@ test "fromConfig applies native_tools override for ollama" {
     defer h.deinit();
     try std.testing.expect(h == .ollama);
     try std.testing.expect(!h.provider().supportsNativeTools());
+}
+
+test "fromConfig applies native_tools opt-out to dedicated and fallback providers" {
+    // Regression: the shared ProviderEntry flag must not be ignored by the
+    // dedicated implementations or by the default OpenRouter fallback.
+    const configurable_provider_names = [_][]const u8{ "openai", "openrouter", "anthropic", "unlisted-provider" };
+    for (configurable_provider_names) |provider_name| {
+        var holder = ProviderHolder.fromConfig(
+            std.testing.allocator,
+            provider_name,
+            "test-key",
+            null,
+            false,
+            null,
+            null,
+            false,
+            null,
+        );
+        defer holder.deinit();
+        try std.testing.expect(!holder.provider().supportsNativeTools());
+    }
 }
 
 test "fromConfig passes api_key through to ollama" {

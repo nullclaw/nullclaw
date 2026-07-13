@@ -366,9 +366,12 @@ pub const ReliableProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supportsNativeToolsForModel = supportsNativeToolsForModelImpl,
+        .supportsStreamingNativeToolsForModel = supportsStreamingNativeToolsForModelImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supportsStreamingForModel = supportsStreamingForModelImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -606,6 +609,17 @@ pub const ReliableProvider = struct {
         return false;
     }
 
+    fn supportsStreamingForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const target = self.resolveProviderTarget(model);
+        if (target.explicit) return target.provider.supportsStreamingForModel(target.model);
+
+        // Agent error recovery differs between blocking and streaming calls.
+        // An unrelated streaming extra must not move ordinary primary traffic
+        // onto the streaming path and bypass Agent-level recovery.
+        return self.inner.supportsStreamingForModel(model);
+    }
+
     fn streamChatImpl(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -625,7 +639,7 @@ pub const ReliableProvider = struct {
             }
             var resolved_request = request;
             resolved_request.model = target.model;
-            return target.provider.streamChat(allocator, resolved_request, target.model, temperature, callback, callback_ctx);
+            return streamSelectedProvider(target.provider, allocator, resolved_request, target.model, temperature, callback, callback_ctx);
         }
 
         // Streaming cannot recover mid-stream (doing so would require buffering the
@@ -634,14 +648,35 @@ pub const ReliableProvider = struct {
         // Note: model-chain fallback is not supported in the streaming path — this is
         // a pre-existing limitation and is not regressed by this change.
         if (!needs_vision or self.inner.supportsVisionForModel(model)) {
-            return self.inner.streamChat(allocator, request, model, temperature, callback, callback_ctx);
+            return streamSelectedProvider(self.inner, allocator, request, model, temperature, callback, callback_ctx);
         }
         for (self.extras) |entry| {
             if (entry.provider.supportsVisionForModel(model)) {
-                return entry.provider.streamChat(allocator, request, model, temperature, callback, callback_ctx);
+                return streamSelectedProvider(entry.provider, allocator, request, model, temperature, callback, callback_ctx);
             }
         }
         return error.ProviderDoesNotSupportVision;
+    }
+
+    fn streamSelectedProvider(
+        selected_provider: Provider,
+        allocator: std.mem.Allocator,
+        request: root.ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) !root.StreamChatResult {
+        if (selected_provider.supportsStreamingForModel(model)) {
+            return selected_provider.streamChat(allocator, request, model, temperature, callback, callback_ctx);
+        }
+
+        // Selection can change after Agent's capability check (for example an
+        // image request routed to a vision-only fallback). Honor that target's
+        // streaming opt-out and bridge its blocking response into the stream.
+        var response = try selected_provider.chat(allocator, request, model, temperature);
+        defer response.deinit(allocator);
+        return root.emitChatResponseAsStream(allocator, &response, callback, callback_ctx);
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
@@ -651,6 +686,60 @@ pub const ReliableProvider = struct {
             if (entry.provider.supportsNativeTools()) return true;
         }
         return false;
+    }
+
+    fn modelRefSupportsNativeTools(self: *const ReliableProvider, model_ref: []const u8) bool {
+        const target = self.resolveProviderTarget(model_ref);
+        if (target.explicit) return target.provider.supportsNativeToolsForModel(target.model);
+
+        if (!self.inner.supportsNativeToolsForModel(model_ref)) return false;
+        for (self.extras) |entry| {
+            if (!entry.provider.supportsNativeToolsForModel(model_ref)) return false;
+        }
+        return true;
+    }
+
+    fn supportsNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        // Blocking chat can fail over across both providers and configured
+        // model refs after the system prompt is built. Native schemas are safe
+        // to omit only when every possible target accepts them.
+        if (!self.modelRefSupportsNativeTools(model)) return false;
+        for (self.model_fallbacks) |entry| {
+            if (!std.mem.eql(u8, entry.model, model)) continue;
+            for (entry.fallbacks) |fallback| {
+                if (!self.modelRefSupportsNativeTools(fallback)) return false;
+            }
+            break;
+        }
+        return true;
+    }
+
+    fn supportsStreamingNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const target = self.resolveProviderTarget(model);
+        if (target.explicit) {
+            return target.provider.supportsStreamingNativeToolsForModel(target.model);
+        }
+
+        // If the primary cannot stream, streamChatImpl bridges the normal
+        // retry/failover path, so the blocking capability remains authoritative.
+        if (!self.inner.supportsStreamingForModel(model)) {
+            return supportsNativeToolsForModelImpl(ptr, model);
+        }
+        if (!self.inner.supportsStreamingNativeToolsForModel(model)) return false;
+
+        // Image content may select a vision extra after this model-level check.
+        // If the primary itself handles vision, it remains the selected target.
+        if (self.inner.supportsVisionForModel(model)) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsVisionForModel(model) and
+                !entry.provider.supportsStreamingNativeToolsForModel(model))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {
@@ -852,6 +941,7 @@ const MockInnerProvider = struct {
     fail_error: anyerror = error.ProviderError,
     supports_tools: bool,
     supports_vision: bool = true,
+    supports_streaming: bool = false,
     warmed_up: bool = false,
     name: []const u8 = "MockProvider",
 
@@ -859,6 +949,7 @@ const MockInnerProvider = struct {
         .chatWithSystem = mockChatWithSystem,
         .chat = mockChat,
         .supportsNativeTools = mockSupportsNativeTools,
+        .supports_streaming = mockSupportsStreaming,
         .supports_vision = mockSupportsVision,
         .getName = mockGetName,
         .deinit = mockDeinit,
@@ -908,6 +999,11 @@ const MockInnerProvider = struct {
     fn mockSupportsVision(ptr: *anyopaque) bool {
         const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
         return self.supports_vision;
+    }
+
+    fn mockSupportsStreaming(ptr: *anyopaque) bool {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_streaming;
     }
 
     fn mockGetName(ptr: *anyopaque) []const u8 {
@@ -1398,7 +1494,9 @@ test "model failover all models fail returns error" {
     try std.testing.expect(seen.len == 3);
 }
 
-test "supportsNativeTools returns true if any extra supports it" {
+test "supportsNativeToolsForModel is conservative across fallback providers" {
+    // Regression: the Agent builds one prompt before ReliableProvider may
+    // fail over, so schemas can be omitted only when every target is native.
     var inner_mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
     var extra_mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
 
@@ -1406,7 +1504,87 @@ test "supportsNativeTools returns true if any extra supports it" {
         .{ .name = "extra", .provider = extra_mock.toProvider() },
     };
     var reliable = ReliableProvider.initWithProvider(inner_mock.toProvider(), 0, 50).withExtras(&extras);
-    try std.testing.expect(reliable.provider().supportsNativeTools() == true);
+    try std.testing.expect(reliable.provider().supportsNativeTools());
+    try std.testing.expect(!reliable.provider().supportsNativeToolsForModel("model"));
+}
+
+test "model-specific capabilities follow explicit target and implicit primary" {
+    var inner_mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+        .supports_streaming = false,
+        .name = "inner",
+    };
+    var extra_mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = true,
+        .supports_streaming = true,
+        .name = "extra",
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra_mock.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(inner_mock.toProvider(), 0, 50).withExtras(&extras);
+    const provider = reliable.provider();
+
+    try std.testing.expect(!provider.supportsNativeToolsForModel("ordinary-model"));
+    try std.testing.expect(!provider.supportsStreamingForModel("ordinary-model"));
+    try std.testing.expect(provider.supportsNativeToolsForModel("extra/tool-model"));
+    try std.testing.expect(provider.supportsStreamingForModel("extra/tool-model"));
+}
+
+test "streaming native tools use selected primary instead of blocking fallbacks" {
+    // Regression: a non-native fallback must not disable API-level tool calls
+    // when the streaming path is pinned to a native, vision-capable primary.
+    var inner_mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = true,
+        .supports_vision = true,
+        .supports_streaming = true,
+    };
+    var extra_mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+        .supports_vision = true,
+        .supports_streaming = false,
+    };
+    const extras = [_]ProviderEntry{.{ .name = "extra", .provider = extra_mock.toProvider() }};
+    var reliable = ReliableProvider.initWithProvider(inner_mock.toProvider(), 0, 50).withExtras(&extras);
+    const provider = reliable.provider();
+
+    try std.testing.expect(!provider.supportsNativeToolsForModel("model"));
+    try std.testing.expect(provider.supportsStreamingNativeToolsForModel("model"));
+}
+
+test "native tool capability includes configured model fallbacks" {
+    var inner_mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = true,
+        .name = "inner",
+    };
+    var extra_mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+        .name = "extra",
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra_mock.toProvider() },
+    };
+    const fallback_models = [_][]const u8{"extra/fallback-model"};
+    const model_fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "inner/primary-model", .fallbacks = &fallback_models },
+    };
+    var reliable = ReliableProvider.initWithProvider(inner_mock.toProvider(), 0, 50)
+        .withExtras(&extras)
+        .withModelFallbacks(&model_fallbacks);
+
+    try std.testing.expect(!reliable.provider().supportsNativeToolsForModel("inner/primary-model"));
 }
 
 test "multi-provider chat fallback" {
@@ -1563,12 +1741,123 @@ test "streamChatImpl routes image request to vision-capable extra, skips inner" 
         fn cb(_: *anyopaque, _: root.StreamChunk) void {}
     };
     var dummy: u8 = 0;
-    const sr = try prov.streamChat(std.testing.allocator, request, "codex", 0.7, NoopCtx.cb, &dummy);
-    defer if (sr.content) |c| std.testing.allocator.free(c);
-    defer if (sr.model.len > 0) std.testing.allocator.free(sr.model);
+    var sr = try prov.streamChat(std.testing.allocator, request, "codex", 0.7, NoopCtx.cb, &dummy);
+    defer sr.deinit(std.testing.allocator);
 
     try std.testing.expect(inner.call_count == 0);
     try std.testing.expect(vision_extra.call_count == 1);
+}
+
+test "streamChatImpl honors streaming opt-out on selected vision extra" {
+    // Regression: request content can select a different target after the
+    // primary provider's streaming capability enabled the Agent stream path.
+    const VisionExtra = struct {
+        chat_calls: usize = 0,
+        stream_calls: usize = 0,
+
+        const vtable = Provider.VTable{
+            .chatWithSystem = chatWithSystem,
+            .chat = chat,
+            .supportsNativeTools = supportsNativeTools,
+            .supports_vision = supportsVision,
+            .supports_streaming = supportsStreaming,
+            .stream_chat = streamChat,
+            .getName = getName,
+            .deinit = deinit,
+        };
+
+        fn provider(self: *@This()) Provider {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "vision fallback");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            return .{ .content = try allocator.dupe(u8, "vision fallback") };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsVision(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: root.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!root.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            return error.StreamingOptOutIgnored;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "vision-extra";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    var inner = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+        .supports_vision = false,
+        .supports_streaming = true,
+    };
+    var vision_extra = VisionExtra{};
+    const extras = [_]ProviderEntry{.{ .name = "vision-extra", .provider = vision_extra.provider() }};
+    var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const parts = [_]root.ContentPart{.{ .image_url = .{ .url = "https://example.com/img.png" } }};
+    const msgs = [_]root.ChatMessage{.{ .role = .user, .content = "", .content_parts = &parts }};
+    const request = ChatRequest{ .messages = &msgs };
+
+    const CallbackCtx = struct {
+        text: []const u8 = "",
+        saw_final: bool = false,
+
+        fn cb(ptr: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (chunk.is_final) {
+                self.saw_final = true;
+            } else {
+                self.text = chunk.delta;
+            }
+        }
+    };
+    var callback_ctx = CallbackCtx{};
+    var result = try prov.streamChat(
+        std.testing.allocator,
+        request,
+        "codex",
+        0.7,
+        CallbackCtx.cb,
+        @ptrCast(&callback_ctx),
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), vision_extra.chat_calls);
+    try std.testing.expectEqual(@as(usize, 0), vision_extra.stream_calls);
+    try std.testing.expectEqualStrings("vision fallback", result.content.?);
+    try std.testing.expectEqualStrings("vision fallback", callback_ctx.text);
+    try std.testing.expect(callback_ctx.saw_final);
 }
 
 test "streamChatImpl returns ProviderDoesNotSupportVision when all providers lack vision" {

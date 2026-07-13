@@ -379,10 +379,17 @@ pub fn parseStructuredToolCalls(
     for (tool_calls) |tc| {
         if (tc.name.len == 0) continue;
 
+        const name = try allocator.dupe(u8, tc.name);
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, tc.arguments);
+        errdefer allocator.free(arguments_json);
+        const tool_call_id = if (tc.id.len > 0) try allocator.dupe(u8, tc.id) else null;
+        errdefer if (tool_call_id) |id| allocator.free(id);
+
         try calls.append(allocator, .{
-            .name = try allocator.dupe(u8, tc.name),
-            .arguments_json = try allocator.dupe(u8, tc.arguments),
-            .tool_call_id = if (tc.id.len > 0) try allocator.dupe(u8, tc.id) else null,
+            .name = name,
+            .arguments_json = arguments_json,
+            .tool_call_id = tool_call_id,
         });
     }
 
@@ -2562,6 +2569,32 @@ test "parseStructuredToolCalls empty id becomes null" {
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expect(result[0].tool_call_id == null);
+}
+
+fn parseStructuredToolCallsAllocationTest(allocator: std.mem.Allocator) !void {
+    const tool_calls = [_]providers.ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"pwd\"}" },
+        .{ .id = "call_2", .name = "file_read", .arguments = "{\"path\":\"README.md\"}" },
+    };
+    const result = try parseStructuredToolCalls(allocator, &tool_calls);
+    defer {
+        for (result) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result);
+    }
+}
+
+test "parseStructuredToolCalls allocation failures do not leak" {
+    // Regression: native streaming tool calls exercise every intermediate
+    // allocation before the ParsedToolCall is owned by the result list.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseStructuredToolCallsAllocationTest,
+        .{},
+    );
 }
 
 // ── extractJsonObject with arrays ───────────────────────────────

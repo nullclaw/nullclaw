@@ -19,26 +19,33 @@ fn finalizeStreamResult(
     allocator: std.mem.Allocator,
     accumulated: []const u8,
     stream_usage: ?root.TokenUsage,
+    tool_call_accumulators: ?*const ToolCallAccumulators,
 ) !root.StreamChatResult {
-    var content: ?[]const u8 = null;
-    var reasoning_content: ?[]const u8 = null;
+    var result = root.StreamChatResult{};
+    errdefer result.deinit(allocator);
+
     if (accumulated.len > 0) {
         const split = try root.splitThinkContent(allocator, accumulated);
-        content = split.visible;
-        reasoning_content = split.reasoning;
+        result.content = split.visible;
+        result.reasoning_content = split.reasoning;
+    }
+    if (tool_call_accumulators) |accumulators| {
+        result.tool_calls = try accumulators.toOwnedToolCalls(allocator);
     }
 
     var usage = stream_usage orelse root.TokenUsage{};
     if (usage.completion_tokens == 0) {
-        usage.completion_tokens = @intCast((accumulated.len + 3) / 4);
+        const tool_bytes = if (tool_call_accumulators) |accumulators|
+            accumulators.estimatedOutputBytes()
+        else
+            0;
+        usage.completion_tokens = @intCast((accumulated.len +| tool_bytes +| 3) / 4);
     }
-
-    return .{
-        .content = content,
-        .reasoning_content = reasoning_content,
-        .usage = usage,
-        .model = "",
-    };
+    if (usage.total_tokens == 0 and (usage.prompt_tokens > 0 or usage.completion_tokens > 0)) {
+        usage.total_tokens = usage.prompt_tokens +| usage.completion_tokens;
+    }
+    result.usage = usage;
+    return result;
 }
 
 fn parseCurlVersionComponent(component: []const u8) ?u32 {
@@ -109,6 +116,20 @@ pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
     }
 }
 
+fn appendCurlTimeoutArgs(
+    argv_buf: [][]const u8,
+    argc: *usize,
+    timeout_buf: []u8,
+    timeout_secs: u64,
+) void {
+    if (timeout_secs == 0) return;
+    const timeout_str = std.fmt.bufPrint(timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
+    argv_buf[argc.*] = "--max-time";
+    argc.* += 1;
+    argv_buf[argc.*] = timeout_str;
+    argc.* += 1;
+}
+
 /// Content delta from an SSE chunk.
 pub const DeltaContent = union(enum) {
     text: []const u8,
@@ -122,6 +143,182 @@ pub const DeltaContent = union(enum) {
     }
 };
 
+const MAX_STREAM_TOOL_CALLS: usize = 128;
+
+/// One fragmented OpenAI-compatible tool-call update from an SSE chunk.
+const ToolCallDelta = struct {
+    index: usize,
+    id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
+
+    fn deinit(self: ToolCallDelta, allocator: std.mem.Allocator) void {
+        if (self.id) |id| allocator.free(id);
+        if (self.name) |name| allocator.free(name);
+        if (self.arguments) |arguments| allocator.free(arguments);
+    }
+};
+
+fn deinitToolCallDeltas(allocator: std.mem.Allocator, deltas: []const ToolCallDelta) void {
+    for (deltas) |delta| delta.deinit(allocator);
+    if (deltas.len > 0) allocator.free(deltas);
+}
+
+const ToolCallAccumulator = struct {
+    index: usize,
+    id: std.ArrayListUnmanaged(u8) = .empty,
+    name: std.ArrayListUnmanaged(u8) = .empty,
+    arguments: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *ToolCallAccumulator, allocator: std.mem.Allocator) void {
+        self.id.deinit(allocator);
+        self.name.deinit(allocator);
+        self.arguments.deinit(allocator);
+    }
+};
+
+const ToolCallAccumulators = struct {
+    entries: std.ArrayListUnmanaged(ToolCallAccumulator) = .empty,
+
+    fn deinit(self: *ToolCallAccumulators, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*entry| entry.deinit(allocator);
+        self.entries.deinit(allocator);
+    }
+
+    fn getOrCreate(
+        self: *ToolCallAccumulators,
+        allocator: std.mem.Allocator,
+        index: usize,
+    ) !*ToolCallAccumulator {
+        var insert_at: usize = 0;
+        while (insert_at < self.entries.items.len and self.entries.items[insert_at].index < index) : (insert_at += 1) {}
+        if (insert_at < self.entries.items.len and self.entries.items[insert_at].index == index) {
+            return &self.entries.items[insert_at];
+        }
+        if (self.entries.items.len >= MAX_STREAM_TOOL_CALLS) return error.TooManyStreamToolCalls;
+        try self.entries.insert(allocator, insert_at, .{ .index = index });
+        return &self.entries.items[insert_at];
+    }
+
+    fn appendDelta(
+        self: *ToolCallAccumulators,
+        allocator: std.mem.Allocator,
+        delta: ToolCallDelta,
+    ) !void {
+        const entry = try self.getOrCreate(allocator, delta.index);
+        if (delta.id) |id| try entry.id.appendSlice(allocator, id);
+        if (delta.name) |name| try entry.name.appendSlice(allocator, name);
+        if (delta.arguments) |arguments| try entry.arguments.appendSlice(allocator, arguments);
+    }
+
+    fn estimatedOutputBytes(self: *const ToolCallAccumulators) usize {
+        var total: usize = 0;
+        for (self.entries.items) |entry| {
+            total +|= entry.id.items.len;
+            total +|= entry.name.items.len;
+            total +|= entry.arguments.items.len;
+        }
+        return total;
+    }
+
+    fn toOwnedToolCalls(
+        self: *const ToolCallAccumulators,
+        allocator: std.mem.Allocator,
+    ) ![]const root.ToolCall {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.name.items.len > 0) count += 1;
+        }
+        if (count == 0) return &.{};
+
+        const tool_calls = try allocator.alloc(root.ToolCall, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (tool_calls[0..initialized]) |tool_call| {
+                if (tool_call.id.len > 0) allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                allocator.free(tool_call.arguments);
+            }
+            allocator.free(tool_calls);
+        }
+
+        for (self.entries.items) |entry| {
+            if (entry.name.items.len == 0) continue;
+            const id: []const u8 = if (entry.id.items.len > 0)
+                try allocator.dupe(u8, entry.id.items)
+            else
+                "";
+            errdefer if (id.len > 0) allocator.free(id);
+            const name = try allocator.dupe(u8, entry.name.items);
+            errdefer allocator.free(name);
+            const arguments = try allocator.dupe(
+                u8,
+                if (entry.arguments.items.len > 0) entry.arguments.items else "{}",
+            );
+            tool_calls[initialized] = .{
+                .id = id,
+                .name = name,
+                .arguments = arguments,
+            };
+            initialized += 1;
+        }
+        return tool_calls;
+    }
+};
+
+fn toolCallStreamIsConfirmed(
+    finish_reason: OpenAiFinishReason,
+    has_tool_call_fragments: bool,
+    had_invalid_data: bool,
+) bool {
+    // A truncated native call is executable data, not display-only partial
+    // text. `[DONE]` alone is insufficient because it is also emitted after
+    // finish_reason=length; require the explicit tool_calls finish reason.
+    return !has_tool_call_fragments or (!had_invalid_data and finish_reason == .tool_calls);
+}
+
+fn shouldRecoverPartialStreamSafely(
+    accumulated_len: usize,
+    saw_done: bool,
+    finish_reason: OpenAiFinishReason,
+    has_tool_call_fragments: bool,
+    had_invalid_data: bool,
+    saw_stream_error: bool,
+) bool {
+    if (saw_stream_error) return false;
+    if (has_tool_call_fragments) return !had_invalid_data and finish_reason == .tool_calls;
+    return root.shouldRecoverPartialStream(accumulated_len, saw_done);
+}
+
+const OpenAiFinishReason = enum {
+    none,
+    tool_calls,
+    length,
+    other,
+};
+
+const OpenAiSseEvent = struct {
+    content: ?DeltaContent = null,
+    tool_call_deltas: []const ToolCallDelta = &.{},
+    usage: ?root.TokenUsage = null,
+    finish_reason: OpenAiFinishReason = .none,
+    api_error: bool = false,
+
+    fn deinit(self: *OpenAiSseEvent, allocator: std.mem.Allocator) void {
+        if (self.content) |content| content.deinit(allocator);
+        deinitToolCallDeltas(allocator, self.tool_call_deltas);
+        self.* = .{};
+    }
+
+    fn hasPayload(self: OpenAiSseEvent) bool {
+        return self.content != null or
+            self.tool_call_deltas.len > 0 or
+            self.usage != null or
+            self.finish_reason != .none or
+            self.api_error;
+    }
+};
+
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
     /// Text or reasoning delta content (owned, caller frees).
@@ -131,6 +328,12 @@ pub const SseLineResult = union(enum) {
     /// Token usage from a stream chunk.
     usage: root.TokenUsage,
     /// Line should be skipped (empty, comment, or no content).
+    skip: void,
+};
+
+const OpenAiSseLineResult = union(enum) {
+    event: OpenAiSseEvent,
+    done: void,
     skip: void,
 };
 
@@ -176,13 +379,39 @@ fn appendDeltaContent(
     }
 }
 
+fn applyOpenAiStreamEvent(
+    allocator: std.mem.Allocator,
+    event_value: OpenAiSseEvent,
+    accumulated: *std.ArrayListUnmanaged(u8),
+    in_reasoning: *bool,
+    tool_call_accumulators: *ToolCallAccumulators,
+    stream_usage: *?root.TokenUsage,
+    finish_reason: *OpenAiFinishReason,
+    saw_stream_error: *bool,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !void {
+    var event = event_value;
+    defer event.deinit(allocator);
+
+    if (event.content) |content| {
+        try appendDeltaContent(allocator, accumulated, in_reasoning, callback, ctx, content);
+    }
+    for (event.tool_call_deltas) |delta| {
+        try tool_call_accumulators.appendDelta(allocator, delta);
+    }
+    if (event.usage) |usage| stream_usage.* = usage;
+    if (event.finish_reason != .none) finish_reason.* = event.finish_reason;
+    if (event.api_error) saw_stream_error.* = true;
+}
+
 /// Parse a single SSE line in OpenAI streaming format.
 ///
 /// Handles:
 /// - `data: [DONE]` → `.done`
-/// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
+/// - `data: {JSON}` → extracts text/reasoning and fragmented native tool calls
 /// - Empty lines, comments (`:`) → `.skip`
-pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
+fn parseOpenAiSseLine(allocator: std.mem.Allocator, line: []const u8) !OpenAiSseLineResult {
     const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
     if (trimmed.len == 0) return .skip;
@@ -201,18 +430,176 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
-    const content = try extractDeltaContent(allocator, data) orelse {
-        // No content delta — check for usage data (sent in the final chunk).
-        if (extractStreamUsage(data)) |u| return .{ .usage = u };
-        return .skip;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSseJson;
     };
-    return .{ .delta = content };
+    defer parsed.deinit();
+
+    var event = OpenAiSseEvent{};
+    errdefer event.deinit(allocator);
+    event.content = try extractDeltaContentFromValue(allocator, parsed.value);
+    event.tool_call_deltas = try extractToolCallDeltasFromValue(allocator, parsed.value);
+    event.usage = extractStreamUsageFromValue(parsed.value);
+    event.finish_reason = extractOpenAiFinishReason(parsed.value);
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("error")) |error_value| {
+            // OpenAI-compatible APIs sometimes include `"error": null` in a
+            // successful envelope. Only a concrete error payload terminates
+            // the stream.
+            event.api_error = error_value != .null;
+        }
+    }
+    if (!event.hasPayload()) return .skip;
+    return .{ .event = event };
+}
+
+/// Parse one OpenAI-compatible SSE line using the legacy public result shape.
+/// Rich tool-call and terminal metadata is consumed by curlStream internally.
+pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
+    const parsed = try parseOpenAiSseLine(allocator, line);
+    return switch (parsed) {
+        .event => |event_value| blk: {
+            var event = event_value;
+            if (event.content) |content| {
+                event.content = null;
+                event.deinit(allocator);
+                break :blk .{ .delta = content };
+            }
+            if (event.usage) |usage| {
+                event.deinit(allocator);
+                break :blk .{ .usage = usage };
+            }
+            event.deinit(allocator);
+            break :blk .skip;
+        },
+        .done => .done,
+        .skip => .skip,
+    };
+}
+
+fn parseToolCallDelta(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    fallback_index: usize,
+) !?ToolCallDelta {
+    if (value != .object) return null;
+    const obj = value.object;
+
+    const index = if (obj.get("index")) |index_value| switch (index_value) {
+        .integer => |raw| if (raw >= 0) std.math.cast(usize, raw) orelse return null else return null,
+        else => return null,
+    } else fallback_index;
+
+    const id_source: ?[]const u8 = if (obj.get("id")) |id_value|
+        if (id_value == .string and id_value.string.len > 0) id_value.string else null
+    else
+        null;
+
+    var name_source: ?[]const u8 = null;
+    var arguments_source: ?[]const u8 = null;
+    if (obj.get("function")) |function_value| {
+        if (function_value == .object) {
+            if (function_value.object.get("name")) |name_value| {
+                if (name_value == .string and name_value.string.len > 0) name_source = name_value.string;
+            }
+            if (function_value.object.get("arguments")) |arguments_value| {
+                if (arguments_value == .string and arguments_value.string.len > 0) arguments_source = arguments_value.string;
+            }
+        }
+    }
+
+    if (id_source == null and name_source == null and arguments_source == null) return null;
+
+    var result = ToolCallDelta{ .index = index };
+    errdefer result.deinit(allocator);
+    if (id_source) |id| result.id = try allocator.dupe(u8, id);
+    if (name_source) |name| result.name = try allocator.dupe(u8, name);
+    if (arguments_source) |arguments| result.arguments = try allocator.dupe(u8, arguments);
+    return result;
+}
+
+/// Extract OpenAI-compatible `choices[0].delta.tool_calls` fragments.
+fn extractToolCallDeltas(
+    allocator: std.mem.Allocator,
+    json_str: []const u8,
+) ![]const ToolCallDelta {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSseJson;
+    };
+    defer parsed.deinit();
+
+    return extractToolCallDeltasFromValue(allocator, parsed.value);
+}
+
+fn extractToolCallDeltasFromValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const ToolCallDelta {
+    if (value != .object) return &.{};
+    const choices = value.object.get("choices") orelse return &.{};
+    if (choices != .array or choices.array.items.len == 0) return &.{};
+    const first = choices.array.items[0];
+    if (first != .object) return &.{};
+    const delta = first.object.get("delta") orelse return &.{};
+    if (delta != .object) return &.{};
+    const tool_calls = delta.object.get("tool_calls") orelse return &.{};
+    if (tool_calls != .array or tool_calls.array.items.len == 0) return &.{};
+
+    var result: std.ArrayListUnmanaged(ToolCallDelta) = .empty;
+    errdefer {
+        for (result.items) |item| item.deinit(allocator);
+        result.deinit(allocator);
+    }
+    for (tool_calls.array.items, 0..) |item, fallback_index| {
+        const parsed_delta = try parseToolCallDelta(allocator, item, fallback_index) orelse continue;
+        result.append(allocator, parsed_delta) catch |err| {
+            parsed_delta.deinit(allocator);
+            return err;
+        };
+    }
+    if (result.items.len == 0) {
+        result.deinit(allocator);
+        return &.{};
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+fn extractOpenAiFinishReason(value: std.json.Value) OpenAiFinishReason {
+    if (value != .object) return .none;
+    const choices = value.object.get("choices") orelse return .none;
+    if (choices != .array or choices.array.items.len == 0) return .none;
+    const first = choices.array.items[0];
+    if (first != .object) return .none;
+    const finish_reason = first.object.get("finish_reason") orelse return .none;
+    if (finish_reason == .null) return .none;
+    if (finish_reason != .string) return .other;
+    if (std.mem.eql(u8, finish_reason.string, "tool_calls")) return .tool_calls;
+    if (std.mem.eql(u8, finish_reason.string, "length")) return .length;
+    return .other;
 }
 
 /// Extract `usage` object from an OpenAI-compatible streaming chunk.
 /// The final chunk typically has `choices:[]` and a top-level `usage` object.
 /// OpenAI usage chunks may contain nested objects (prompt_tokens_details,
 /// completion_tokens_details) so we use a generous 32 KB stack buffer.
+fn tokenCountFromJsonValue(value: std.json.Value) ?u32 {
+    return switch (value) {
+        .integer => |raw| if (raw <= 0)
+            0
+        else
+            std.math.cast(u32, raw) orelse std.math.maxInt(u32),
+        .float => |raw| if (std.math.isNan(raw) or raw <= 0)
+            0
+        else if (!std.math.isFinite(raw) or raw >= @as(f64, @floatFromInt(std.math.maxInt(u32))))
+            std.math.maxInt(u32)
+        else
+            @intFromFloat(raw),
+        else => null,
+    };
+}
+
 fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
     // 32 KB is sufficient for OpenAI's nested usage objects.
     var buf: [32 * 1024]u8 = undefined;
@@ -223,8 +610,12 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
         return null;
     defer parsed.deinit();
 
-    if (parsed.value != .object) return null;
-    const obj = parsed.value.object;
+    return extractStreamUsageFromValue(parsed.value);
+}
+
+fn extractStreamUsageFromValue(value: std.json.Value) ?root.TokenUsage {
+    if (value != .object) return null;
+    const obj = value.object;
     const usage_val = obj.get("usage") orelse return null;
     if (usage_val != .object) return null;
 
@@ -233,29 +624,17 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
     const prompt_val = usage_val.object.get("prompt_tokens") orelse
         usage_val.object.get("input_tokens");
     if (prompt_val) |v| {
-        switch (v) {
-            .integer => |n| usage.prompt_tokens = @intCast(@max(0, n)),
-            .float => |f| usage.prompt_tokens = @intFromFloat(@max(0.0, f)),
-            else => {},
-        }
+        usage.prompt_tokens = tokenCountFromJsonValue(v) orelse 0;
     }
 
     const completion_val = usage_val.object.get("completion_tokens") orelse
         usage_val.object.get("output_tokens");
     if (completion_val) |v| {
-        switch (v) {
-            .integer => |n| usage.completion_tokens = @intCast(@max(0, n)),
-            .float => |f| usage.completion_tokens = @intFromFloat(@max(0.0, f)),
-            else => {},
-        }
+        usage.completion_tokens = tokenCountFromJsonValue(v) orelse 0;
     }
 
     if (usage_val.object.get("total_tokens")) |v| {
-        switch (v) {
-            .integer => |n| usage.total_tokens = @intCast(@max(0, n)),
-            .float => |f| usage.total_tokens = @intFromFloat(@max(0.0, f)),
-            else => {},
-        }
+        usage.total_tokens = tokenCountFromJsonValue(v) orelse 0;
     } else {
         usage.total_tokens = usage.prompt_tokens +| usage.completion_tokens;
     }
@@ -281,11 +660,20 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
         if (verbose.isVerbose()) log.err("Failed to parse SSE JSON payload: len={d} error={s}", .{ json_str.len, @errorName(err) });
+        if (err == error.OutOfMemory) return err;
         return error.InvalidSseJson;
     };
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    return extractDeltaContentFromValue(allocator, parsed.value);
+}
+
+fn extractDeltaContentFromValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?DeltaContent {
+    if (value != .object) return null;
+    const obj = value.object;
     const choices = obj.get("choices") orelse return null;
     if (choices != .array or choices.array.items.len == 0) return null;
 
@@ -354,13 +742,7 @@ pub fn curlStream(
     argc += 1;
 
     var timeout_buf: [32]u8 = undefined;
-    if (timeout_secs > 0) {
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = timeout_str;
-        argc += 1;
-    }
+    appendCurlTimeoutArgs(argv_buf[0..], &argc, &timeout_buf, timeout_secs);
 
     // Kill the curl process if transfer rate drops below 1 byte/second for 60 seconds.
     // This catches providers that open the SSE connection but stall mid-stream without
@@ -432,6 +814,11 @@ pub fn curlStream(
         debug_log.info("spawning curl process...", .{});
     }
     try child.spawn();
+    var child_reaped = false;
+    errdefer if (!child_reaped) {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    };
     if (log_enabled) {
         const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
         debug_log.info("curl process spawned, pid={d}", .{pid});
@@ -441,21 +828,20 @@ pub fn curlStream(
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
         return error.CurlWriteError;
     }
 
     // Read stdout line by line, parse SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
     defer accumulated.deinit(allocator);
+
+    var tool_call_accumulators = ToolCallAccumulators{};
+    defer tool_call_accumulators.deinit(allocator);
 
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
@@ -465,6 +851,9 @@ pub fn curlStream(
     var saw_done = false;
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
+    var finish_reason: OpenAiFinishReason = .none;
+    var had_invalid_data = false;
+    var saw_stream_error = false;
     var in_reasoning = false;
 
     outer: while (true) {
@@ -501,12 +890,14 @@ pub fn curlStream(
                 defer p.deinit();
                 if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
                     _ = child.wait() catch {};
+                    child_reaped = true;
                     return error_classify.kindToError(kind);
                 }
             }
 
             // Return a meaningful error
             _ = child.wait() catch {};
+            child_reaped = true;
             debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
             return error.ServerError;
         }
@@ -516,17 +907,26 @@ pub fn curlStream(
                 if (log_enabled) {
                     debug_log.info("parsing SSE line: len={d}", .{line_buf.items.len});
                 }
-                const result = parseSseLine(allocator, line_buf.items) catch {
+                const result = parseOpenAiSseLine(allocator, line_buf.items) catch |err| {
                     line_buf.clearRetainingCapacity();
+                    if (err == error.OutOfMemory) return err;
+                    had_invalid_data = true;
                     continue;
                 };
                 line_buf.clearRetainingCapacity();
                 switch (result) {
-                    .delta => |content| {
-                        defer content.deinit(allocator);
-                        try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
-                    },
-                    .usage => |u| stream_usage = u,
+                    .event => |event| try applyOpenAiStreamEvent(
+                        allocator,
+                        event,
+                        &accumulated,
+                        &in_reasoning,
+                        &tool_call_accumulators,
+                        &stream_usage,
+                        &finish_reason,
+                        &saw_stream_error,
+                        callback,
+                        ctx,
+                    ),
                     .done => {
                         if (log_enabled) {
                             debug_log.info("SSE stream done", .{});
@@ -548,16 +948,27 @@ pub fn curlStream(
 
     // Parse a trailing line when the stream ends without a final '\n'.
     if (!saw_done and line_buf.items.len > 0) {
-        const trailing = parseSseLine(allocator, line_buf.items) catch null;
+        const trailing = parseOpenAiSseLine(allocator, line_buf.items) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            had_invalid_data = true;
+            break :blk null;
+        };
         line_buf.clearRetainingCapacity();
         if (trailing) |result| {
             switch (result) {
-                .delta => |content| {
-                    defer content.deinit(allocator);
-                    try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
-                },
-                .usage => |u| stream_usage = u,
-                .done => {},
+                .event => |event| try applyOpenAiStreamEvent(
+                    allocator,
+                    event,
+                    &accumulated,
+                    &in_reasoning,
+                    &tool_call_accumulators,
+                    &stream_usage,
+                    &finish_reason,
+                    &saw_stream_error,
+                    callback,
+                    ctx,
+                ),
+                .done => saw_done = true,
                 .skip => {},
             }
         }
@@ -576,48 +987,89 @@ pub fn curlStream(
         debug_log.info("waiting for curl process to exit...", .{});
     }
     const term = child.wait() catch |err| {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        child_reaped = true;
         log.err("curlStream child.wait failed: {}", .{err});
-        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+        if (shouldRecoverPartialStreamSafely(accumulated.items.len, saw_done, finish_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data, saw_stream_error)) {
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+            return finalizeStreamResult(allocator, accumulated.items, stream_usage, &tool_call_accumulators);
         }
         return error.CurlWaitError;
     };
+    child_reaped = true;
     if (log_enabled) {
         debug_log.info("curl process terminated: {}", .{term});
     }
     switch (term) {
         .exited => |code| if (code != 0) {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+            if (shouldRecoverPartialStreamSafely(accumulated.items.len, saw_done, finish_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data, saw_stream_error)) {
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeStreamResult(allocator, accumulated.items, stream_usage, &tool_call_accumulators);
             }
             return error.CurlFailed;
         },
         else => {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+            if (shouldRecoverPartialStreamSafely(accumulated.items.len, saw_done, finish_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data, saw_stream_error)) {
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeStreamResult(allocator, accumulated.items, stream_usage, &tool_call_accumulators);
             }
             return error.CurlFailed;
         },
     }
 
+    if (saw_stream_error or !toolCallStreamIsConfirmed(finish_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data)) {
+        return error.CurlFailed;
+    }
+
     // Signal stream completion only after curl exits successfully.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+    return finalizeStreamResult(allocator, accumulated.items, stream_usage, &tool_call_accumulators);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Anthropic SSE Parsing
 // ════════════════════════════════════════════════════════════════════════════
+
+const AnthropicStopReason = enum {
+    none,
+    tool_use,
+    max_tokens,
+    other,
+};
+
+const AnthropicMessageDelta = struct {
+    usage: ?u32 = null,
+    stop_reason: AnthropicStopReason = .none,
+};
+
+fn anthropicToolCallStreamIsConfirmed(
+    stop_reason: AnthropicStopReason,
+    has_tool_call_fragments: bool,
+    had_invalid_data: bool,
+) bool {
+    return !has_tool_call_fragments or (!had_invalid_data and stop_reason == .tool_use);
+}
+
+fn shouldRecoverAnthropicPartialStreamSafely(
+    accumulated_len: usize,
+    saw_done: bool,
+    stop_reason: AnthropicStopReason,
+    has_tool_call_fragments: bool,
+    had_invalid_data: bool,
+    saw_stream_error: bool,
+) bool {
+    if (saw_stream_error) return false;
+    if (has_tool_call_fragments) return !had_invalid_data and stop_reason == .tool_use;
+    return root.shouldRecoverPartialStream(accumulated_len, saw_done);
+}
 
 /// Result of parsing a single Anthropic SSE line.
 pub const AnthropicSseResult = union(enum) {
@@ -633,6 +1085,17 @@ pub const AnthropicSseResult = union(enum) {
     skip: void,
 };
 
+const AnthropicStreamResult = union(enum) {
+    event: []const u8,
+    delta: []const u8,
+    tool_call_start: ToolCallDelta,
+    tool_call_delta: ToolCallDelta,
+    message_delta: AnthropicMessageDelta,
+    done: void,
+    stream_error: void,
+    skip: void,
+};
+
 /// Parse a single SSE line in Anthropic streaming format.
 ///
 /// Anthropic SSE is stateful: `event:` lines set the context for subsequent `data:` lines.
@@ -640,10 +1103,11 @@ pub const AnthropicSseResult = union(enum) {
 ///
 /// - `event: X` → `.event` (caller remembers X)
 /// - `data: {JSON}` + current_event=="content_block_delta" → extracts `delta.text` → `.delta`
+/// - `content_block_start`/`input_json_delta` → native tool-call fragments
 /// - `data: {JSON}` + current_event=="message_delta" → extracts `usage.output_tokens` → `.usage`
 /// - `data: {JSON}` + current_event=="message_stop" → `.done`
 /// - Everything else → `.skip`
-pub fn parseAnthropicSseLine(allocator: std.mem.Allocator, line: []const u8, current_event: []const u8) !AnthropicSseResult {
+fn parseAnthropicStreamLine(allocator: std.mem.Allocator, line: []const u8, current_event: []const u8) !AnthropicStreamResult {
     const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
     if (trimmed.len == 0) return .skip;
@@ -662,28 +1126,139 @@ pub fn parseAnthropicSseLine(allocator: std.mem.Allocator, line: []const u8, cur
     const data = trimmed[data_prefix.len..];
 
     if (std.mem.eql(u8, current_event, "message_stop")) return .done;
+    if (std.mem.eql(u8, current_event, "error")) return .stream_error;
+
+    if (std.mem.eql(u8, current_event, "content_block_start")) {
+        const start = try extractAnthropicToolCallStart(allocator, data) orelse return .skip;
+        return .{ .tool_call_start = start };
+    }
 
     if (std.mem.eql(u8, current_event, "content_block_delta")) {
-        const text = try extractAnthropicDelta(allocator, data) orelse return .skip;
-        return .{ .delta = text };
+        return extractAnthropicContentBlockDelta(allocator, data);
     }
 
     if (std.mem.eql(u8, current_event, "message_delta")) {
-        const tokens = try extractAnthropicUsage(data) orelse return .skip;
-        return .{ .usage = tokens };
+        const message_delta = try extractAnthropicMessageDelta(allocator, data);
+        if (message_delta.usage == null and message_delta.stop_reason == .none) return .skip;
+        return .{ .message_delta = message_delta };
     }
 
     return .skip;
 }
 
+/// Parse an Anthropic SSE line using the original public result variants.
+/// Structured tool-call and terminal metadata remains internal to the curl
+/// streaming implementation.
+pub fn parseAnthropicSseLine(allocator: std.mem.Allocator, line: []const u8, current_event: []const u8) !AnthropicSseResult {
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+    if (trimmed.len == 0 or trimmed[0] == ':') return .skip;
+
+    const event_prefix = "event: ";
+    if (std.mem.startsWith(u8, trimmed, event_prefix)) {
+        return .{ .event = trimmed[event_prefix.len..] };
+    }
+
+    const data_prefix = "data: ";
+    if (!std.mem.startsWith(u8, trimmed, data_prefix)) return .skip;
+    const data = trimmed[data_prefix.len..];
+
+    if (std.mem.eql(u8, current_event, "message_stop")) return .done;
+    if (std.mem.eql(u8, current_event, "content_block_delta")) {
+        const text = try extractAnthropicDelta(allocator, data) orelse return .skip;
+        return .{ .delta = text };
+    }
+    if (std.mem.eql(u8, current_event, "message_delta")) {
+        const usage = try extractAnthropicUsage(data) orelse return .skip;
+        return .{ .usage = usage };
+    }
+    return .skip;
+}
+
+fn extractNonNegativeIndex(obj: std.json.ObjectMap) ?usize {
+    const index_value = obj.get("index") orelse return null;
+    if (index_value != .integer or index_value.integer < 0) return null;
+    return std.math.cast(usize, index_value.integer);
+}
+
+/// Parse an Anthropic `content_block_start` event for a client tool call.
+fn extractAnthropicToolCallStart(
+    allocator: std.mem.Allocator,
+    json_str: []const u8,
+) !?ToolCallDelta {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSseJson;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const index = extractNonNegativeIndex(parsed.value.object) orelse return null;
+    const content_block = parsed.value.object.get("content_block") orelse return null;
+    if (content_block != .object) return null;
+    const block_type = content_block.object.get("type") orelse return null;
+    if (block_type != .string or !std.mem.eql(u8, block_type.string, "tool_use")) return null;
+    const id_value = content_block.object.get("id") orelse return null;
+    const name_value = content_block.object.get("name") orelse return null;
+    if (id_value != .string or name_value != .string or name_value.string.len == 0) return null;
+
+    var result = ToolCallDelta{ .index = index };
+    errdefer result.deinit(allocator);
+    if (id_value.string.len > 0) result.id = try allocator.dupe(u8, id_value.string);
+    result.name = try allocator.dupe(u8, name_value.string);
+    return result;
+}
+
+/// Parse an Anthropic `input_json_delta` fragment.
+fn extractAnthropicToolCallDelta(
+    allocator: std.mem.Allocator,
+    json_str: []const u8,
+) !?ToolCallDelta {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSseJson;
+    };
+    defer parsed.deinit();
+
+    return extractAnthropicToolCallDeltaFromValue(allocator, parsed.value);
+}
+
+fn extractAnthropicToolCallDeltaFromValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?ToolCallDelta {
+    if (value != .object) return null;
+    const index = extractNonNegativeIndex(value.object) orelse return null;
+    const delta = value.object.get("delta") orelse return null;
+    if (delta != .object) return null;
+    const delta_type = delta.object.get("type") orelse return null;
+    if (delta_type != .string or !std.mem.eql(u8, delta_type.string, "input_json_delta")) return null;
+    const partial_json = delta.object.get("partial_json") orelse return null;
+    if (partial_json != .string or partial_json.string.len == 0) return null;
+
+    return .{
+        .index = index,
+        .arguments = try allocator.dupe(u8, partial_json.string),
+    };
+}
+
 /// Extract `delta.text` from an Anthropic content_block_delta JSON payload.
 /// Returns owned slice or null if not a text_delta.
 pub fn extractAnthropicDelta(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidSseJson;
+    };
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    return extractAnthropicDeltaFromValue(allocator, parsed.value);
+}
+
+fn extractAnthropicDeltaFromValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?[]const u8 {
+    if (value != .object) return null;
+    const obj = value.object;
     const delta = obj.get("delta") orelse return null;
     if (delta != .object) return null;
 
@@ -695,6 +1270,62 @@ pub fn extractAnthropicDelta(allocator: std.mem.Allocator, json_str: []const u8)
     if (text.string.len == 0) return null;
 
     return try allocator.dupe(u8, text.string);
+}
+
+fn extractAnthropicContentBlockDelta(
+    allocator: std.mem.Allocator,
+    json_str: []const u8,
+) !AnthropicStreamResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSseJson;
+    };
+    defer parsed.deinit();
+
+    if (try extractAnthropicDeltaFromValue(allocator, parsed.value)) |text| {
+        return .{ .delta = text };
+    }
+    const delta = try extractAnthropicToolCallDeltaFromValue(allocator, parsed.value) orelse return .skip;
+    return .{ .tool_call_delta = delta };
+}
+
+fn extractAnthropicMessageDelta(
+    allocator: std.mem.Allocator,
+    json_str: []const u8,
+) !AnthropicMessageDelta {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSseJson;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    const obj = parsed.value.object;
+    var result = AnthropicMessageDelta{};
+    if (obj.get("usage")) |usage| {
+        if (usage == .object) {
+            if (usage.object.get("output_tokens")) |output_tokens| {
+                if (output_tokens == .integer) {
+                    result.usage = std.math.cast(u32, output_tokens.integer);
+                }
+            }
+        }
+    }
+    if (obj.get("delta")) |delta| {
+        if (delta == .object) {
+            if (delta.object.get("stop_reason")) |stop_reason| {
+                if (stop_reason == .string) {
+                    result.stop_reason = if (std.mem.eql(u8, stop_reason.string, "tool_use"))
+                        .tool_use
+                    else if (std.mem.eql(u8, stop_reason.string, "max_tokens"))
+                        .max_tokens
+                    else
+                        .other;
+                }
+            }
+        }
+    }
+    return result;
 }
 
 /// Extract `usage.output_tokens` from an Anthropic message_delta JSON payload.
@@ -709,6 +1340,7 @@ pub fn extractAnthropicUsage(json_str: []const u8) !?u32 {
         return error.InvalidSseJson;
     defer parsed.deinit();
 
+    if (parsed.value != .object) return null;
     const obj = parsed.value.object;
     const usage = obj.get("usage") orelse return null;
     if (usage != .object) return null;
@@ -716,18 +1348,19 @@ pub fn extractAnthropicUsage(json_str: []const u8) !?u32 {
     const output_tokens = usage.object.get("output_tokens") orelse return null;
     if (output_tokens != .integer) return null;
 
-    return @intCast(output_tokens.integer);
+    return std.math.cast(u32, output_tokens.integer);
 }
 
 /// Run curl in SSE streaming mode for Anthropic and parse output line by line.
 ///
 /// Similar to `curlStream()` but uses stateful Anthropic SSE parsing.
 /// `headers` is a slice of pre-formatted header strings (e.g. "x-api-key: sk-...").
-pub fn curlStreamAnthropic(
+pub fn curlStreamAnthropicTimed(
     allocator: std.mem.Allocator,
     url: []const u8,
     body: []const u8,
     headers: []const []const u8,
+    timeout_secs: u64,
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
@@ -741,6 +1374,13 @@ pub fn curlStreamAnthropic(
     argc += 1;
     argv_buf[argc] = "--no-buffer";
     argc += 1;
+    argv_buf[argc] = curlFailFastArg(allocator);
+    argc += 1;
+
+    var timeout_buf: [32]u8 = undefined;
+    appendCurlTimeoutArgs(argv_buf[0..], &argc, &timeout_buf, timeout_secs);
+    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
+
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";
@@ -793,20 +1433,21 @@ pub fn curlStreamAnthropic(
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+    var child_reaped = false;
+    errdefer if (!child_reaped) {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    };
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
         return error.CurlWriteError;
     }
 
@@ -814,12 +1455,19 @@ pub fn curlStreamAnthropic(
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
     defer accumulated.deinit(allocator);
 
+    var tool_call_accumulators = ToolCallAccumulators{};
+    defer tool_call_accumulators.deinit(allocator);
+
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
     var current_event: []const u8 = "";
+    defer if (current_event.len > 0) allocator.free(@constCast(current_event));
     var anthropic_usage: root.TokenUsage = .{};
     var saw_done = false;
+    var stop_reason: AnthropicStopReason = .none;
+    var had_invalid_data = false;
+    var saw_stream_error = false;
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
@@ -830,27 +1478,40 @@ pub fn curlStreamAnthropic(
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
-                const result = parseAnthropicSseLine(allocator, line_buf.items, current_event) catch {
+                const result = parseAnthropicStreamLine(allocator, line_buf.items, current_event) catch |err| {
                     line_buf.clearRetainingCapacity();
+                    if (err == error.OutOfMemory) return err;
+                    had_invalid_data = true;
                     continue;
                 };
                 switch (result) {
                     .event => |ev| {
                         // Dupe event name — it points into line_buf which we're about to clear
-                        if (current_event.len > 0) allocator.free(@constCast(current_event));
-                        current_event = allocator.dupe(u8, ev) catch "";
+                        if (current_event.len > 0) {
+                            allocator.free(@constCast(current_event));
+                            current_event = "";
+                        }
+                        current_event = try allocator.dupe(u8, ev);
                     },
                     .delta => |text| {
                         defer allocator.free(text);
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
-                    .usage => |tokens| anthropic_usage.completion_tokens = tokens,
+                    .tool_call_start, .tool_call_delta => |delta| {
+                        defer delta.deinit(allocator);
+                        try tool_call_accumulators.appendDelta(allocator, delta);
+                    },
+                    .message_delta => |message_delta| {
+                        if (message_delta.usage) |tokens| anthropic_usage.completion_tokens = tokens;
+                        if (message_delta.stop_reason != .none) stop_reason = message_delta.stop_reason;
+                    },
                     .done => {
                         saw_done = true;
                         line_buf.clearRetainingCapacity();
                         break :outer;
                     },
+                    .stream_error => saw_stream_error = true,
                     .skip => {},
                 }
                 line_buf.clearRetainingCapacity();
@@ -860,8 +1521,34 @@ pub fn curlStreamAnthropic(
         }
     }
 
-    // Free owned event string
-    if (current_event.len > 0) allocator.free(@constCast(current_event));
+    // Parse a trailing line when the stream ends without a final newline.
+    if (!saw_done and line_buf.items.len > 0) {
+        const trailing = parseAnthropicStreamLine(allocator, line_buf.items, current_event) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            had_invalid_data = true;
+            break :blk null;
+        };
+        line_buf.clearRetainingCapacity();
+        if (trailing) |result| switch (result) {
+            .event => {},
+            .delta => |text| {
+                defer allocator.free(text);
+                try accumulated.appendSlice(allocator, text);
+                callback(ctx, root.StreamChunk.textDelta(text));
+            },
+            .tool_call_start, .tool_call_delta => |delta| {
+                defer delta.deinit(allocator);
+                try tool_call_accumulators.appendDelta(allocator, delta);
+            },
+            .message_delta => |message_delta| {
+                if (message_delta.usage) |tokens| anthropic_usage.completion_tokens = tokens;
+                if (message_delta.stop_reason != .none) stop_reason = message_delta.stop_reason;
+            },
+            .done => saw_done = true,
+            .stream_error => saw_stream_error = true,
+            .skip => {},
+        };
+    }
 
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
@@ -870,35 +1557,56 @@ pub fn curlStreamAnthropic(
     }
 
     const term = child.wait() catch |err| {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        child_reaped = true;
         log.err("curlStreamAnthropic child.wait failed: {}", .{err});
-        if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+        if (shouldRecoverAnthropicPartialStreamSafely(accumulated.items.len, saw_done, stop_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data, saw_stream_error)) {
             log.warn("curlStreamAnthropic proceeding despite wait failure after partial stream output", .{});
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &tool_call_accumulators);
         }
         return error.CurlWaitError;
     };
+    child_reaped = true;
     switch (term) {
         .exited => |code| if (code != 0) {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+            if (shouldRecoverAnthropicPartialStreamSafely(accumulated.items.len, saw_done, stop_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data, saw_stream_error)) {
                 log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &tool_call_accumulators);
             }
             return error.CurlFailed;
         },
         else => {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+            if (shouldRecoverAnthropicPartialStreamSafely(accumulated.items.len, saw_done, stop_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data, saw_stream_error)) {
                 log.warn("curlStreamAnthropic abnormal termination after partial stream output; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &tool_call_accumulators);
             }
             return error.CurlFailed;
         },
     }
 
+    if (saw_stream_error or !anthropicToolCallStreamIsConfirmed(stop_reason, tool_call_accumulators.entries.items.len > 0, had_invalid_data)) {
+        return error.CurlFailed;
+    }
+
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+    return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &tool_call_accumulators);
+}
+
+/// Backward-compatible Anthropic streaming entry point without an explicit
+/// timeout. New callers should use curlStreamAnthropicTimed.
+pub fn curlStreamAnthropic(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !root.StreamChatResult {
+    return curlStreamAnthropicTimed(allocator, url, body, headers, 0, callback, ctx);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -909,9 +1617,9 @@ test "parseSseLine valid delta" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
     switch (result) {
-        .delta => |d| {
-            defer d.deinit(allocator);
-            try std.testing.expectEqualStrings("Hello", d.text);
+        .delta => |delta| {
+            defer delta.deinit(allocator);
+            try std.testing.expectEqualStrings("Hello", delta.text);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -921,12 +1629,146 @@ test "parseSseLine valid delta without optional space" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
     switch (result) {
-        .delta => |d| {
-            defer d.deinit(allocator);
-            try std.testing.expectEqualStrings("Hello", d.text);
+        .delta => |delta| {
+            defer delta.deinit(allocator);
+            try std.testing.expectEqualStrings("Hello", delta.text);
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "parseSseLine returns text and native tool fields from one chunk" {
+    // Regression: providers may emit visible content and the first tool-call
+    // fragment together; neither side of the chunk may be discarded.
+    const allocator = std.testing.allocator;
+    const line = "data: {\"choices\":[{\"delta\":{\"content\":\"Calling tool\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{}\"}}]}}]}";
+    const result = try parseOpenAiSseLine(allocator, line);
+    switch (result) {
+        .event => |event_value| {
+            var event = event_value;
+            defer event.deinit(allocator);
+            try std.testing.expectEqualStrings("Calling tool", event.content.?.text);
+            try std.testing.expectEqual(@as(usize, 1), event.tool_call_deltas.len);
+            try std.testing.expectEqualStrings("call_1", event.tool_call_deltas[0].id.?);
+            try std.testing.expectEqualStrings("weather", event.tool_call_deltas[0].name.?);
+            try std.testing.expectEqualStrings("{}", event.tool_call_deltas[0].arguments.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseSseLine exposes terminal tool reason and streamed API errors" {
+    const allocator = std.testing.allocator;
+    const finished = try parseOpenAiSseLine(
+        allocator,
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+    );
+    switch (finished) {
+        .event => |event_value| {
+            var event = event_value;
+            defer event.deinit(allocator);
+            try std.testing.expect(event.finish_reason == .tool_calls);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const api_error = try parseOpenAiSseLine(
+        allocator,
+        "data: {\"error\":{\"message\":\"stream failed\"}}",
+    );
+    switch (api_error) {
+        .event => |event_value| {
+            var event = event_value;
+            defer event.deinit(allocator);
+            try std.testing.expect(event.api_error);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Regression: compatible APIs may include an explicit null error field in
+    // otherwise successful streaming envelopes.
+    const null_error = try parseOpenAiSseLine(
+        allocator,
+        "data: {\"error\":null,\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}",
+    );
+    switch (null_error) {
+        .event => |event_value| {
+            var event = event_value;
+            defer event.deinit(allocator);
+            try std.testing.expect(!event.api_error);
+            try std.testing.expectEqualStrings("ok", event.content.?.text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "OpenAI streaming tool call fragments accumulate by index" {
+    // Regression: Chat Completions and vLLM split function arguments across
+    // multiple delta.tool_calls chunks.
+    const allocator = std.testing.allocator;
+    const lines = [_][]const u8{
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"\"}}]}}]}",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]}}]}",
+    };
+
+    var accumulators = ToolCallAccumulators{};
+    defer accumulators.deinit(allocator);
+    for (lines) |line| {
+        const parsed = try parseOpenAiSseLine(allocator, line);
+        switch (parsed) {
+            .event => |event_value| {
+                var event = event_value;
+                defer event.deinit(allocator);
+                for (event.tool_call_deltas) |delta| try accumulators.appendDelta(allocator, delta);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var result = try finalizeStreamResult(allocator, "", null, &accumulators);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.content == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("weather", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", result.tool_calls[0].arguments);
+    try std.testing.expect(result.usage.completion_tokens > 0);
+}
+
+test "partial stream recovery rejects unconfirmed native tool calls" {
+    // Regression: a premature EOF must never turn a truncated function name
+    // or argument fragment into an executable call.
+    try std.testing.expect(!shouldRecoverPartialStreamSafely(0, false, .none, true, false, false));
+    try std.testing.expect(!shouldRecoverPartialStreamSafely(12, true, .length, true, false, false));
+    try std.testing.expect(shouldRecoverPartialStreamSafely(0, false, .tool_calls, true, false, false));
+    try std.testing.expect(!shouldRecoverPartialStreamSafely(0, true, .tool_calls, true, true, false));
+    try std.testing.expect(shouldRecoverPartialStreamSafely(12, false, .none, false, true, false));
+    try std.testing.expect(!toolCallStreamIsConfirmed(.length, true, false));
+    try std.testing.expect(!toolCallStreamIsConfirmed(.tool_calls, true, true));
+    try std.testing.expect(toolCallStreamIsConfirmed(.tool_calls, true, false));
+}
+
+fn streamingToolCallAllocationTest(allocator: std.mem.Allocator) !void {
+    var accumulators = ToolCallAccumulators{};
+    defer accumulators.deinit(allocator);
+    const line = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]}}]}";
+    const parsed = try parseOpenAiSseLine(allocator, line);
+    switch (parsed) {
+        .event => |event_value| {
+            var event = event_value;
+            defer event.deinit(allocator);
+            for (event.tool_call_deltas) |delta| try accumulators.appendDelta(allocator, delta);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var result = try finalizeStreamResult(allocator, "", null, &accumulators);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+}
+
+test "streaming tool call allocation failures do not leak" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, streamingToolCallAllocationTest, .{});
 }
 
 test "appendCurlStallDetectionArgs appends curl speed flags in order" {
@@ -941,6 +1783,20 @@ test "appendCurlStallDetectionArgs appends curl speed flags in order" {
     try std.testing.expectEqualStrings("1", argv_buf[1]);
     try std.testing.expectEqualStrings("--speed-time", argv_buf[2]);
     try std.testing.expectEqualStrings("60", argv_buf[3]);
+}
+
+test "appendCurlTimeoutArgs preserves configured stream timeout" {
+    var argv_buf: [4][]const u8 = undefined;
+    var timeout_buf: [32]u8 = undefined;
+    var argc: usize = 0;
+    appendCurlTimeoutArgs(argv_buf[0..], &argc, &timeout_buf, 42);
+    try std.testing.expectEqual(@as(usize, 2), argc);
+    try std.testing.expectEqualStrings("--max-time", argv_buf[0]);
+    try std.testing.expectEqualStrings("42", argv_buf[1]);
+
+    argc = 0;
+    appendCurlTimeoutArgs(argv_buf[0..], &argc, &timeout_buf, 0);
+    try std.testing.expectEqual(@as(usize, 0), argc);
 }
 
 test "parseSseLine DONE sentinel" {
@@ -1005,6 +1861,12 @@ test "extractDeltaContent with content" {
 test "extractDeltaContent without content" {
     const result = try extractDeltaContent(std.testing.allocator, "{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}");
     try std.testing.expect(result == null);
+}
+
+test "extractDeltaContent ignores non-object JSON" {
+    // Regression: provider-controlled JSON must not reach `.object` on a
+    // non-object value and panic the streaming process.
+    try std.testing.expect((try extractDeltaContent(std.testing.allocator, "[]")) == null);
 }
 
 test "extractDeltaContent empty content" {
@@ -1129,11 +1991,85 @@ test "parseAnthropicSseLine data with content_block_delta returns delta" {
     }
 }
 
+test "Anthropic streaming tool_use fragments become a native tool call" {
+    // Regression: tool_use metadata arrives in content_block_start while its
+    // arguments arrive later as fragmented input_json_delta events.
+    const allocator = std.testing.allocator;
+    const start_line = "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather\",\"input\":{}}}";
+    const delta_lines = [_][]const u8{
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Paris\\\"}\"}}",
+    };
+
+    var accumulators = ToolCallAccumulators{};
+    defer accumulators.deinit(allocator);
+
+    const start = try parseAnthropicStreamLine(allocator, start_line, "content_block_start");
+    switch (start) {
+        .tool_call_start => |delta| {
+            defer delta.deinit(allocator);
+            try accumulators.appendDelta(allocator, delta);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    for (delta_lines) |line| {
+        const parsed = try parseAnthropicStreamLine(allocator, line, "content_block_delta");
+        switch (parsed) {
+            .tool_call_delta => |delta| {
+                defer delta.deinit(allocator);
+                try accumulators.appendDelta(allocator, delta);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var result = try finalizeStreamResult(allocator, "", null, &accumulators);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("toolu_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("weather", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"city\":\"Paris\"}", result.tool_calls[0].arguments);
+}
+
+test "Anthropic empty tool input defaults to empty JSON object" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_empty\",\"name\":\"ping\",\"input\":{}}}";
+    const parsed = try parseAnthropicStreamLine(allocator, line, "content_block_start");
+    var accumulators = ToolCallAccumulators{};
+    defer accumulators.deinit(allocator);
+    switch (parsed) {
+        .tool_call_start => |delta| {
+            defer delta.deinit(allocator);
+            try accumulators.appendDelta(allocator, delta);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var result = try finalizeStreamResult(allocator, "", null, &accumulators);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("{}", result.tool_calls[0].arguments);
+}
+
 test "parseAnthropicSseLine data with message_delta returns usage" {
     const json = "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":42}}";
     const result = try parseAnthropicSseLine(std.testing.allocator, json, "message_delta");
     switch (result) {
-        .usage => |tokens| try std.testing.expect(tokens == 42),
+        .usage => |usage| try std.testing.expect(usage == 42),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Anthropic tool stream rejects max_tokens termination" {
+    // Regression: message_stop also follows max_tokens, where partial_json may
+    // be truncated and must never become an executable tool call.
+    try std.testing.expect(!anthropicToolCallStreamIsConfirmed(.max_tokens, true, false));
+    try std.testing.expect(!anthropicToolCallStreamIsConfirmed(.tool_use, true, true));
+    try std.testing.expect(anthropicToolCallStreamIsConfirmed(.tool_use, true, false));
+
+    const json = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":42}}";
+    const result = try parseAnthropicStreamLine(std.testing.allocator, json, "message_delta");
+    switch (result) {
+        .message_delta => |message_delta| try std.testing.expect(message_delta.stop_reason == .max_tokens),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1141,6 +2077,15 @@ test "parseAnthropicSseLine data with message_delta returns usage" {
 test "parseAnthropicSseLine data with message_stop returns done" {
     const result = try parseAnthropicSseLine(std.testing.allocator, "data: {\"type\":\"message_stop\"}", "message_stop");
     try std.testing.expect(result == .done);
+}
+
+test "parseAnthropicSseLine surfaces HTTP-200 stream errors" {
+    const result = try parseAnthropicStreamLine(
+        std.testing.allocator,
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}",
+        "error",
+    );
+    try std.testing.expect(result == .stream_error);
 }
 
 test "parseAnthropicSseLine empty line returns skip" {
@@ -1173,10 +2118,26 @@ test "extractAnthropicDelta without text returns null" {
     try std.testing.expect(result == null);
 }
 
+test "extractAnthropicDelta ignores non-object JSON" {
+    try std.testing.expect((try extractAnthropicDelta(std.testing.allocator, "[]")) == null);
+}
+
 test "extractAnthropicUsage correct JSON returns token count" {
     const json = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":57}}";
     const result = (try extractAnthropicUsage(json)).?;
     try std.testing.expect(result == 57);
+}
+
+test "extractAnthropicUsage rejects out-of-range token counts" {
+    try std.testing.expect((try extractAnthropicUsage("{\"usage\":{\"output_tokens\":-1}}")) == null);
+    try std.testing.expect((try extractAnthropicUsage("{\"usage\":{\"output_tokens\":4294967296}}")) == null);
+}
+
+test "extractAnthropicUsage ignores non-object JSON" {
+    // Regression: provider-controlled usage events must not select `.object`
+    // on a different JSON union tag.
+    try std.testing.expect((try extractAnthropicUsage("[]")) == null);
+    try std.testing.expect((try extractAnthropicUsage("null")) == null);
 }
 
 // ── Stream Usage Extraction Tests ───────────────────────────────
@@ -1198,16 +2159,22 @@ test "extractStreamUsage returns null for invalid JSON" {
     try std.testing.expect(extractStreamUsage("not-json{{{") == null);
 }
 
+test "extractStreamUsage clamps provider-controlled token counts" {
+    const json = "{\"usage\":{\"prompt_tokens\":9223372036854775807,\"completion_tokens\":1e40}}";
+    const usage = extractStreamUsage(json).?;
+    try std.testing.expectEqual(std.math.maxInt(u32), usage.prompt_tokens);
+    try std.testing.expectEqual(std.math.maxInt(u32), usage.completion_tokens);
+    try std.testing.expectEqual(std.math.maxInt(u32), usage.total_tokens);
+}
+
 test "finalizeStreamResult separates think blocks into reasoning content" {
-    const result = try finalizeStreamResult(
+    var result = try finalizeStreamResult(
         std.testing.allocator,
         "<think>private trace</think>Visible answer",
         .{ .completion_tokens = 4, .total_tokens = 4 },
+        null,
     );
-    defer {
-        if (result.content) |content| std.testing.allocator.free(content);
-        if (result.reasoning_content) |reasoning| std.testing.allocator.free(reasoning);
-    }
+    defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("Visible answer", result.content.?);
     try std.testing.expectEqualStrings("private trace", result.reasoning_content.?);

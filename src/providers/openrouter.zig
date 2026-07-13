@@ -22,6 +22,7 @@ const TokenUsage = root.TokenUsage;
 pub const OpenRouterProvider = struct {
     api_key: ?[]const u8,
     allocator: std.mem.Allocator,
+    native_tools: bool = true,
     extra_body_params: ?[]const u8 = null,
 
     const BASE_URL = "https://openrouter.ai/api/v1/chat/completions";
@@ -422,8 +423,9 @@ pub const OpenRouterProvider = struct {
         return parseNativeResponse(allocator, resp_body);
     }
 
-    fn supportsNativeToolsImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *OpenRouterProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools;
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
@@ -678,10 +680,12 @@ test "parseTextResponse classifies context errors" {
     try std.testing.expectError(error.ContextLengthExceeded, OpenRouterProvider.parseTextResponse(std.testing.allocator, body));
 }
 
-test "supportsNativeTools returns true" {
+test "supportsNativeTools honors provider opt-out" {
     var p = OpenRouterProvider.init(std.testing.allocator, "key", null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+    p.native_tools = false;
+    try std.testing.expect(!prov.supportsNativeTools());
 }
 
 test "convertMessages produces valid JSON with system, user, assistant" {

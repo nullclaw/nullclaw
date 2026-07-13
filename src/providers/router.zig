@@ -155,9 +155,12 @@ pub const RouterProvider = struct {
         .chat = chatImpl,
         .chat_with_tools = chatWithToolsImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supportsNativeToolsForModel = supportsNativeToolsForModelImpl,
+        .supportsStreamingNativeToolsForModel = supportsStreamingNativeToolsForModelImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supportsStreamingForModel = supportsStreamingForModelImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -218,10 +221,25 @@ pub const RouterProvider = struct {
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
         const self: *RouterProvider = @ptrCast(@alignCast(ptr));
-        const resolved = self.resolve(self.default_model);
+        return supportsNativeToolsForModelImpl(ptr, self.default_model);
+    }
+
+    fn supportsNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        const resolved = self.resolve(model);
         const provider_idx = resolved[0];
+        const resolved_model = resolved[1];
         if (provider_idx >= self.providers.len) return false;
-        return self.providers[provider_idx].supportsNativeTools();
+        return self.providers[provider_idx].supportsNativeToolsForModel(resolved_model);
+    }
+
+    fn supportsStreamingNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        const resolved = self.resolve(model);
+        const provider_idx = resolved[0];
+        const resolved_model = resolved[1];
+        if (provider_idx >= self.providers.len) return false;
+        return self.providers[provider_idx].supportsStreamingNativeToolsForModel(resolved_model);
     }
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {
@@ -240,10 +258,16 @@ pub const RouterProvider = struct {
 
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *RouterProvider = @ptrCast(@alignCast(ptr));
-        const resolved = self.resolve(self.default_model);
+        return supportsStreamingForModelImpl(ptr, self.default_model);
+    }
+
+    fn supportsStreamingForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        const resolved = self.resolve(model);
         const provider_idx = resolved[0];
+        const resolved_model = resolved[1];
         if (provider_idx >= self.providers.len) return false;
-        return self.providers[provider_idx].supportsStreaming();
+        return self.providers[provider_idx].supportsStreamingForModel(resolved_model);
     }
 
     fn streamChatImpl(
@@ -817,6 +841,31 @@ test "vtable supportsNativeTools follows default model route" {
     try std.testing.expect(prov.supportsNativeTools());
 }
 
+test "vtable supportsNativeToolsForModel follows selected route" {
+    // Regression: Agent may route a turn away from RouterProvider.default_model;
+    // capabilities must describe the actual provider/model pair.
+    const provider_names = [_][]const u8{ "default", "tools" };
+    var mock_default = MockProvider.init("ok", false);
+    var mock_tools = MockProvider.init("ok", true);
+    const providers = [_]Provider{ mock_default.provider(), mock_tools.provider() };
+    const routes = [_]RouterProvider.RouteEntry{
+        .{ .hint = "tools", .route = .{ .provider_name = "tools", .model = "tools-model" } },
+    };
+    var router = try RouterProvider.init(
+        std.testing.allocator,
+        &provider_names,
+        &providers,
+        &routes,
+        "default-model",
+    );
+    const prov = router.provider();
+    defer prov.deinit();
+
+    try std.testing.expect(!prov.supportsNativeTools());
+    try std.testing.expect(prov.supportsNativeToolsForModel("hint:tools"));
+    try std.testing.expect(prov.supportsStreamingNativeToolsForModel("hint:tools"));
+}
+
 test "vtable supportsVisionForModel follows hint routing" {
     const provider_names = [_][]const u8{ "default", "vision" };
     var mock_default = MockProvider.initWithVision("ok", false, false);
@@ -878,6 +927,29 @@ test "vtable supportsStreaming follows default model route" {
     try std.testing.expect(prov.supportsStreaming());
 }
 
+test "vtable supportsStreamingForModel follows selected route" {
+    const provider_names = [_][]const u8{ "default", "streaming" };
+    var mock_default = MockProvider.init("ok", false);
+    var mock_streaming = MockProvider.init("streamed", false);
+    mock_streaming.supports_streaming = true;
+    const providers = [_]Provider{ mock_default.provider(), mock_streaming.provider() };
+    const routes = [_]RouterProvider.RouteEntry{
+        .{ .hint = "stream", .route = .{ .provider_name = "streaming", .model = "stream-model" } },
+    };
+    var router = try RouterProvider.init(
+        std.testing.allocator,
+        &provider_names,
+        &providers,
+        &routes,
+        "default-model",
+    );
+    const prov = router.provider();
+    defer prov.deinit();
+
+    try std.testing.expect(!prov.supportsStreaming());
+    try std.testing.expect(prov.supportsStreamingForModel("hint:stream"));
+}
+
 test "vtable streamChat delegates using explicit provider ref" {
     const provider_names = [_][]const u8{ "openrouter", "groq" };
     var mock_default = MockProvider.init("default", false);
@@ -906,7 +978,7 @@ test "vtable streamChat delegates using explicit provider ref" {
         }
     }.onChunk;
 
-    const result = try prov.streamChat(
+    var result = try prov.streamChat(
         std.testing.allocator,
         request,
         request.model,
@@ -914,8 +986,7 @@ test "vtable streamChat delegates using explicit provider ref" {
         cb,
         @ptrCast(&cb_ctx),
     );
-    defer if (result.content) |content| std.testing.allocator.free(content);
-    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
+    defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(cb_ctx.saw_final);
     try std.testing.expectEqualStrings("llama-3.3-70b", mock_groq.last_stream_model);

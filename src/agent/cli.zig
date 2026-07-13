@@ -65,8 +65,8 @@ const CliProviderContext = struct {
     }
 };
 
-fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
-    return !supports_streaming or !emitted_text;
+fn shouldPrintTurnResponse(emitted_text: bool) bool {
+    return !emitted_text;
 }
 
 fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8) bool {
@@ -74,10 +74,15 @@ fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []con
     return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
 }
 
-fn shouldPrintSeparateUsage(supports_streaming: bool, emitted_text: bool) bool {
+fn shouldPrintSeparateUsage(emitted_text: bool) bool {
     // Agent.turn already embeds usage in the returned final text. The CLI only
     // needs a separate usage line when streaming printed that final text live.
-    return supports_streaming and emitted_text;
+    return emitted_text;
+}
+
+fn attachCliStream(agent: *Agent, stream_ctx: *CliStreamCtx) void {
+    agent.stream_callback = cliStreamCallback;
+    agent.stream_ctx = @ptrCast(stream_ctx);
 }
 
 fn maybePrintUsage(w: anytype, agent: *const Agent) !void {
@@ -646,7 +651,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         defer agent.deinit();
 
-        // Enable streaming if provider supports it.
+        // Attach the streaming sink; Agent.turn gates it per selected model.
         // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
         // <think> content is printed live instead of being silently stripped.
         var stream_ctx = CliStreamCtx{
@@ -662,10 +667,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
         }
-        if (supports_streaming) {
-            agent.stream_callback = cliStreamCallback;
-            agent.stream_ctx = @ptrCast(&stream_ctx);
-        }
+        // Always attach the sink. Agent.turn decides per selected turn model
+        // whether streaming is supported (important for router/model overrides).
+        attachCliStream(&agent, &stream_ctx);
 
         stream_ctx.emitted_text = false;
         const response = agent.turn(message) catch |err| {
@@ -692,7 +696,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         persistCliTurn(&agent, message, response);
 
-        if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
+        if (shouldPrintTurnResponse(stream_ctx.emitted_text)) {
             // unredact() always returns a fresh allocation when the redactor
             // is on. Use an optional so cleanup logic doesn't depend on
             // pointer identity.
@@ -706,7 +710,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             try w.print("\n", .{});
         }
-        if (shouldPrintSeparateUsage(supports_streaming, stream_ctx.emitted_text)) {
+        if (shouldPrintSeparateUsage(stream_ctx.emitted_text)) {
             try maybePrintUsage(w, &agent);
         }
         try w.flush();
@@ -785,7 +789,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     defer agent.deinit();
 
-    // Enable streaming if provider supports it.
+    // Attach the streaming sink; Agent.turn gates it per selected model.
     // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
     // <think> content is printed live instead of being silently stripped.
     var stream_ctx = CliStreamCtx{
@@ -801,10 +805,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else {
         stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
     }
-    if (supports_streaming) {
-        agent.stream_callback = cliStreamCallback;
-        agent.stream_ctx = @ptrCast(&stream_ctx);
-    }
+    // Always attach the sink. Agent.turn decides per selected turn model
+    // whether streaming is supported (including models selected via /model).
+    attachCliStream(&agent, &stream_ctx);
 
     const stdin = std_compat.fs.File.stdin();
     var line_buf: [4096]u8 = undefined;
@@ -886,7 +889,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         persistCliTurn(&agent, debounced_input.current, response);
 
-        if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
+        if (shouldPrintTurnResponse(stream_ctx.emitted_text)) {
             const unredacted: ?[]u8 = if (agent.redactor) |r|
                 (if (r.wouldRehydrate()) try r.unredact(allocator, response) else null)
             else
@@ -897,7 +900,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             try w.print("\n\n", .{});
         }
-        if (shouldPrintSeparateUsage(supports_streaming, stream_ctx.emitted_text)) {
+        if (shouldPrintSeparateUsage(stream_ctx.emitted_text)) {
             try maybePrintUsage(w, &agent);
         }
         try w.flush();
@@ -1110,7 +1113,7 @@ test "cliStreamCallback keeps emitted_text false for filtered tool_call-only chu
     cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.finalChunk());
 
     try std.testing.expect(!ctx.emitted_text);
-    try std.testing.expect(shouldPrintTurnResponse(true, ctx.emitted_text));
+    try std.testing.expect(shouldPrintTurnResponse(ctx.emitted_text));
 }
 
 test "parseAgentArgs parses provider and model overrides" {
@@ -1171,12 +1174,27 @@ test "activeCliProvider uses returned holder storage for named agents" {
 }
 
 test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
-    try std.testing.expect(shouldPrintTurnResponse(true, false));
-    try std.testing.expect(shouldPrintTurnResponse(false, false));
+    try std.testing.expect(shouldPrintTurnResponse(false));
 }
 
 test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {
-    try std.testing.expect(!shouldPrintTurnResponse(true, true));
+    // Regression: the provider-wide capability may be false even when a
+    // dynamically routed turn streams. Observed output is authoritative.
+    try std.testing.expect(!shouldPrintTurnResponse(true));
+}
+
+test "attachCliStream does not pre-gate dynamically routed models" {
+    // Regression: Provider.supportsStreaming() may describe a non-streaming
+    // default route while the selected turn model supports streaming.
+    var agent: Agent = undefined;
+    var stream_ctx = CliStreamCtx{ .sink = undefined };
+    attachCliStream(&agent, &stream_ctx);
+
+    try std.testing.expect(agent.stream_callback != null);
+    try std.testing.expectEqual(
+        @intFromPtr(&stream_ctx),
+        @intFromPtr(agent.stream_ctx.?),
+    );
 }
 
 test "persistCliTurn redacts PII before session persistence" {
@@ -1372,9 +1390,8 @@ test "providerFailureLooksQuotaConstrained detects rate and quota detail" {
 test "shouldPrintSeparateUsage only for streaming text already emitted" {
     // Regression: non-streaming CLI responses already include composeFinalReply
     // usage details, so a second CLI usage line would duplicate the same turn.
-    try std.testing.expect(!shouldPrintSeparateUsage(false, false));
-    try std.testing.expect(!shouldPrintSeparateUsage(true, false));
-    try std.testing.expect(shouldPrintSeparateUsage(true, true));
+    try std.testing.expect(!shouldPrintSeparateUsage(false));
+    try std.testing.expect(shouldPrintSeparateUsage(true));
 }
 
 test "writeRateLimitHint mentions reliability knobs and logs" {
