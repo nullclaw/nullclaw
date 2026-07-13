@@ -32,7 +32,6 @@ const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
 const redaction = @import("../redaction.zig");
-const cli_line_editor = @import("../channels/cli_line_editor.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
@@ -234,151 +233,6 @@ fn writeRateLimitHint(w: *std.Io.Writer, default_provider: []const u8) !void {
     try w.writeAll(
         "Hint: use `nullclaw agent --verbose` for foreground runs. In service mode, inspect `~/.nullclaw/logs/daemon.stdout.log` and `~/.nullclaw/logs/daemon.stderr.log`.\n",
     );
-}
-
-fn supportsCliRawMode() bool {
-    return comptime builtin.os.tag != .windows and builtin.os.tag != .wasi;
-}
-
-const CliRawMode = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
-    struct {
-        fn enable(_: std_compat.fs.File.Handle) !CliRawMode {
-            return error.NotSupported;
-        }
-
-        fn disable(_: *CliRawMode) void {}
-    }
-else
-    struct {
-        fd: std.posix.fd_t,
-        original: std.posix.termios,
-
-        fn enable(fd: std.posix.fd_t) !CliRawMode {
-            const original = try std.posix.tcgetattr(fd);
-            var raw = original;
-            raw.lflag.ICANON = false;
-            raw.lflag.ECHO = false;
-            raw.lflag.ISIG = false;
-            raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-            raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-            try std.posix.tcsetattr(fd, .FLUSH, raw);
-            return .{ .fd = fd, .original = original };
-        }
-
-        fn disable(self: *CliRawMode) void {
-            std.posix.tcsetattr(self.fd, .FLUSH, self.original) catch {};
-        }
-    };
-
-fn readInteractiveCliLine(
-    stdin: std_compat.fs.File,
-    stdout: std_compat.fs.File,
-    writer: *std.Io.Writer,
-    prompt: []const u8,
-    history: []const []const u8,
-    line_buf: []u8,
-) !?[]const u8 {
-    if (!supportsCliRawMode() or !stdin.isTty() or !stdout.isTty()) {
-        return readCliCanonicalLine(stdin, writer, prompt, line_buf);
-    }
-
-    var raw = CliRawMode.enable(stdin.handle) catch {
-        return readCliCanonicalLine(stdin, writer, prompt, line_buf);
-    };
-    defer raw.disable();
-
-    try writer.writeAll(prompt);
-    try writer.flush();
-
-    var editor = cli_line_editor.LineEditor.init(history);
-    var esc_buf: [8]u8 = undefined;
-    while (true) {
-        var byte_buf: [1]u8 = undefined;
-        const n = stdin.read(&byte_buf) catch return null;
-        if (n == 0) return null;
-
-        switch (byte_buf[0]) {
-            '\r', '\n' => {
-                try writer.writeAll("\n");
-                try writer.flush();
-                const line = editor.line();
-                if (line.len > line_buf.len) return error.LineTooLong;
-                @memcpy(line_buf[0..line.len], line);
-                return line_buf[0..line.len];
-            },
-            0x03 => {
-                try writer.writeAll("^C\n");
-                try writer.flush();
-                return error.Interrupted;
-            },
-            0x04 => {
-                if (editor.line().len == 0) {
-                    try writer.writeAll("\n");
-                    try writer.flush();
-                    return null;
-                }
-            },
-            0x1b => {
-                const seq = readCliEscapeSequence(stdin, &esc_buf) catch null;
-                if (seq) |s| {
-                    try editor.feedEscapeSequence(s);
-                    try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.cursor());
-                    try writer.flush();
-                }
-            },
-            else => {
-                try editor.feed(byte_buf[0]);
-                try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.cursor());
-                try writer.flush();
-            },
-        }
-    }
-}
-
-fn readCliCanonicalLine(
-    stdin: std_compat.fs.File,
-    writer: *std.Io.Writer,
-    prompt: []const u8,
-    line_buf: []u8,
-) !?[]const u8 {
-    try writer.writeAll(prompt);
-    try writer.flush();
-
-    var pos: usize = 0;
-    while (pos < line_buf.len) {
-        const n = stdin.read(line_buf[pos .. pos + 1]) catch return null;
-        if (n == 0) return null;
-        if (line_buf[pos] == '\n') break;
-        pos += 1;
-    }
-    return line_buf[0..pos];
-}
-
-fn readCliEscapeSequence(stdin: std_compat.fs.File, buf: []u8) !?[]const u8 {
-    if (buf.len < 3) return null;
-    buf[0] = 0x1b;
-    const n1 = try stdin.read(buf[1..2]);
-    if (n1 == 0) return null;
-
-    if (buf[1] == 'b' or buf[1] == 'f') return buf[0..2];
-    if (buf[1] == 'O') {
-        const n2 = try stdin.read(buf[2..3]);
-        if (n2 == 0) return null;
-        return buf[0..3];
-    }
-    if (buf[1] != '[') return buf[0..2];
-
-    var len: usize = 2;
-    while (len < buf.len) {
-        const n = try stdin.read(buf[len .. len + 1]);
-        if (n == 0) return null;
-        const byte = buf[len];
-        len += 1;
-        if ((byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z') or byte == '~') {
-            return buf[0..len];
-        }
-    }
-    return buf[0..len];
 }
 
 fn maybePrintRateLimitHint(
@@ -970,7 +824,22 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 break :blk queued;
             }
 
-            const read_line = readInteractiveCliLine(stdin, std_compat.fs.File.stdout(), w, "> ", repl_history.items, &line_buf) catch return;
+            const read_line = cli_mod.readInteractiveLine(
+                stdin,
+                std_compat.fs.File.stdout(),
+                w,
+                "> ",
+                repl_history.items,
+                &line_buf,
+            ) catch |err| switch (err) {
+                error.Interrupted => continue,
+                error.LineTooLong => {
+                    try w.print("Input is too long (maximum {d} bytes).\n", .{line_buf.len});
+                    try w.flush();
+                    continue;
+                },
+                else => return err,
+            };
             break :blk read_line orelse return;
         };
 
@@ -985,7 +854,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         // Append the effective turn input after debounce coalescing.
-        repl_history.append(allocator, allocator.dupe(u8, debounced_input.current) catch continue) catch {};
+        rememberReplInput(allocator, &repl_history, debounced_input.current);
 
         // Re-evaluate sink in case reasoning_mode was changed by a previous slash command
         const repl_raw_sink = streaming.Sink{
@@ -1040,6 +909,26 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 }
 
+fn appendReplHistory(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged([]const u8),
+    line: []const u8,
+) !void {
+    const entry = try allocator.dupe(u8, line);
+    errdefer allocator.free(entry);
+    try history.append(allocator, entry);
+}
+
+fn rememberReplInput(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged([]const u8),
+    line: []const u8,
+) void {
+    // History is optional state: allocation failure must not discard a user
+    // turn that is already ready for provider execution.
+    appendReplHistory(allocator, history, line) catch {};
+}
+
 fn collectCliDebouncedInput(
     allocator: std.mem.Allocator,
     stdin: std_compat.fs.File,
@@ -1085,7 +974,7 @@ fn collectCliDebouncedInput(
         const events = std.posix.poll(&poll_fds, poll_timeout) catch 0;
         if (events > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
             var extra_line_buf: [4096]u8 = undefined;
-            const extra_line = readCliLine(stdin, &extra_line_buf) orelse break;
+            const extra_line = (cli_mod.readCanonicalLine(stdin, &extra_line_buf) catch break) orelse break;
             if (extra_line.len > 0) {
                 try debouncer.push(try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", extra_line, "cli:repl"), inbound_debounce.nowMs(), &ready);
             }
@@ -1098,17 +987,6 @@ fn collectCliDebouncedInput(
         return .{ .current = try allocator.dupe(u8, first_line) };
     }
     return try buildCliDebouncedInput(allocator, ready.items);
-}
-
-fn readCliLine(stdin: std_compat.fs.File, buf: []u8) ?[]const u8 {
-    var pos: usize = 0;
-    while (pos < buf.len) {
-        const n = stdin.read(buf[pos .. pos + 1]) catch return null;
-        if (n == 0) return null;
-        if (buf[pos] == '\n') break;
-        pos += 1;
-    }
-    return buf[0..pos];
 }
 
 const CliDebouncedInput = struct {
@@ -1143,6 +1021,34 @@ fn buildCliDebouncedInput(
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn noopSinkEvent(_: *anyopaque, _: streaming.Event) void {}
+
+fn appendReplHistoryAllocationTest(allocator: std.mem.Allocator) !void {
+    var history: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (history.items) |entry| allocator.free(entry);
+        history.deinit(allocator);
+    }
+    try appendReplHistory(allocator, &history, "hello");
+    try std.testing.expectEqual(@as(usize, 1), history.items.len);
+    try std.testing.expectEqualStrings("hello", history.items[0]);
+}
+
+test "appendReplHistory frees duplicated entry when append runs out of memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        appendReplHistoryAllocationTest,
+        .{},
+    );
+}
+
+test "REPL history allocation failure does not gate user input" {
+    var no_memory: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_memory);
+    var history: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    rememberReplInput(fixed.allocator(), &history, "still deliver this turn");
+    try std.testing.expectEqual(@as(usize, 0), history.items.len);
+}
 
 test "cliStreamCallback handles empty delta" {
     var sink_ctx: u8 = 0;

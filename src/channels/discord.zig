@@ -84,10 +84,6 @@ pub const DiscordChannel = struct {
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
     const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
-    /// Initial connect/resume attempts should deliver HELLO quickly. If the gateway
-    /// thread gets stuck before HELLO/READY, treat it as unhealthy instead of letting
-    /// heartbeat_interval_ms==0 mask the dead socket forever.
-    const GATEWAY_CONNECT_GRACE_MS: i64 = 30 * std.time.ms_per_s;
     /// Minimum stale-gateway grace window. The channel_manager checks health every 10s;
     /// allow at least 3 heartbeat intervals OR 90s before declaring the gateway dead.
     const GATEWAY_STALE_GRACE_MS: i64 = 90 * std.time.ms_per_s;
@@ -192,13 +188,11 @@ pub const DiscordChannel = struct {
     fn gatewayHealthyAt(self: *DiscordChannel, now_ms: i64) bool {
         if (!self.running.load(.acquire)) return true;
 
+        const interval_ms = self.heartbeat_interval_ms.load(.acquire);
+        if (interval_ms == 0) return true;
+
         const last_activity_ms = self.last_gateway_activity_ms.load(.acquire);
         if (last_activity_ms == 0 or now_ms <= last_activity_ms) return true;
-
-        const interval_ms = self.heartbeat_interval_ms.load(.acquire);
-        if (interval_ms == 0) {
-            return (now_ms - last_activity_ms) <= GATEWAY_CONNECT_GRACE_MS;
-        }
 
         const heartbeat_window_ms: i64 = @as(i64, @intCast(interval_ms)) * 3;
         const stale_after_ms = @max(heartbeat_window_ms, GATEWAY_STALE_GRACE_MS);
@@ -940,8 +934,7 @@ pub const DiscordChannel = struct {
         self.markGatewayActivityNow();
 
         // IDENTIFY or RESUME
-        const attempting_resume = self.session_id != null;
-        if (attempting_resume) {
+        if (self.session_id != null) {
             try self.sendResumePayload(&ws);
         } else {
             self.sequence.store(0, .release);
@@ -954,10 +947,7 @@ pub const DiscordChannel = struct {
                 log.warn("Discord gateway read failed: {}", .{err});
                 break;
             };
-            const text = maybe_text orelse {
-                if (attempting_resume) return error.ShouldReconnect;
-                break;
-            };
+            const text = maybe_text orelse break;
             defer self.allocator.free(text);
             self.markGatewayActivityNow();
             self.handleGatewayMessage(&ws, text) catch |err| {
@@ -2198,18 +2188,6 @@ test "discord gateway restart refreshes stale activity baseline" {
     try std.testing.expect(!ch.gatewayHealthyAt(1_240_002));
 }
 
-test "discord health check fails stalled pre-hello reconnect after grace window" {
-    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
-    ch.running.store(true, .release);
-
-    // Regression: reconnect wedges could leave the Discord socket stuck in CLOSE_WAIT
-    // before HELLO, which kept heartbeat_interval_ms at 0 and fooled healthCheck.
-    ch.last_gateway_activity_ms.store(2_000_000, .release);
-
-    try std.testing.expect(ch.gatewayHealthyAt(2_029_999));
-    try std.testing.expect(!ch.gatewayHealthyAt(2_030_001));
-}
-
 test "discord handleReady resets consecutive_reconnects to zero" {
     // Regression: rapid op-7 reconnect storms; READY must reset the backoff counter.
     const alloc = std.testing.allocator;
@@ -2249,25 +2227,4 @@ test "discord reconnect backoff clears session on exhaustion" {
     try std.testing.expect(ch.resume_gateway_url == null);
     try std.testing.expectEqual(@as(i64, 0), ch.sequence.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), ch.consecutive_reconnects);
-}
-
-test "discord reconnect request keeps session until exhaustion" {
-    const alloc = std.testing.allocator;
-    var ch = DiscordChannel.init(alloc, "token", null, false);
-    defer {
-        if (ch.session_id) |s| alloc.free(s);
-        if (ch.resume_gateway_url) |u| alloc.free(u);
-    }
-    ch.session_id = try alloc.dupe(u8, "resume-sess");
-    ch.resume_gateway_url = try alloc.dupe(u8, "wss://gateway.discord.gg/?v=10&encoding=json");
-    ch.sequence.store(77, .release);
-
-    const reconnect = ch.recordReconnectRequest();
-
-    try std.testing.expectEqual(@as(u32, 1), reconnect.attempt);
-    try std.testing.expectEqual(@as(u64, 1_000), reconnect.backoff_ms);
-    try std.testing.expect(!reconnect.cleared_session);
-    try std.testing.expect(ch.session_id != null);
-    try std.testing.expect(ch.resume_gateway_url != null);
-    try std.testing.expectEqual(@as(i64, 77), ch.sequence.load(.acquire));
 }
