@@ -198,7 +198,7 @@ pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     // Use curl subprocess approach (from http_util pattern)
     const result = std_compat.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "curl", "-sf", "--max-time", "30", url },
+        .argv = &.{ "curl", "-q", "-sf", "--proto", "=https", "--max-time", "30", url },
         .max_output_bytes = 10 * 1024 * 1024,
     }) catch |err| {
         log.err("curl failed: {}", .{err});
@@ -359,7 +359,21 @@ inline fn logDownloadToFileError(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std_compat.fs.File) !usize {
-    const argv = &[_][]const u8{ "curl", "-sfL", "--max-time", "60", url };
+    // Production updates are HTTPS-only. Tests use a local file URL so they can
+    // exercise streaming deterministically without a network dependency.
+    const allowed_protocols = if (builtin.is_test) "=file,https" else "=https";
+    const argv = &[_][]const u8{
+        "curl",
+        "-q",
+        "-sfL",
+        "--proto",
+        allowed_protocols,
+        "--proto-redir",
+        allowed_protocols,
+        "--max-time",
+        "60",
+        url,
+    };
     var child = std_compat.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
