@@ -349,6 +349,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "claude-cli", .{ "ANTHROPIC_API_KEY", "", "" } },
         .{ "codex-cli", .{ "OPENAI_API_KEY", "", "" } },
         .{ "gemini-cli", .{ "GEMINI_API_KEY", "", "" } },
+        .{ "grok-cli", .{ "XAI_API_KEY", "", "" } },
     });
     return map.get(canonical) orelse .{ "", "", "" };
 }

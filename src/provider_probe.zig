@@ -40,7 +40,7 @@ fn isLocalEndpoint(url: []const u8) bool {
 
 pub fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
     return switch (providers.classifyProvider(provider_name)) {
-        .ollama_provider, .claude_cli_provider, .codex_cli_provider, .gemini_cli_provider, .openai_codex_provider => false,
+        .ollama_provider, .claude_cli_provider, .codex_cli_provider, .gemini_cli_provider, .grok_cli_provider, .openai_codex_provider => false,
         .compatible_provider => blk: {
             if (base_url) |configured| {
                 break :blk !isLocalEndpoint(configured);
@@ -193,6 +193,10 @@ fn probeCliProvider(
             "gemini",
             "--version",
         },
+        .grok_cli_provider => &[_][]const u8{
+            "grok",
+            "--version",
+        },
         else => unreachable,
     };
 
@@ -335,7 +339,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    if (provider_kind == .claude_cli_provider or provider_kind == .codex_cli_provider or provider_kind == .gemini_cli_provider) {
+    if (provider_kind == .claude_cli_provider or provider_kind == .codex_cli_provider or provider_kind == .gemini_cli_provider or provider_kind == .grok_cli_provider) {
         try writeProbeResult(probeCliProvider(allocator, provider_kind, provider, model, timeout_secs));
         return;
     }
@@ -406,6 +410,7 @@ test "providerRequiresApiKey marks local providers as keyless" {
     try std.testing.expect(!providerRequiresApiKey("codex-cli", null));
     try std.testing.expect(!providerRequiresApiKey("openai-codex", null));
     try std.testing.expect(!providerRequiresApiKey("gemini-cli", null));
+    try std.testing.expect(!providerRequiresApiKey("grok-cli", null));
     try std.testing.expect(providerRequiresApiKey("openai", null));
     try std.testing.expect(!providerRequiresApiKey("lmstudio", null));
     // Regression: local-network compatible endpoints should not require API keys.
