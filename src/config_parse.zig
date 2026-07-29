@@ -1912,6 +1912,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (mem.object.get("auto_save")) |v| {
                 if (v == .bool) self.memory.auto_save = v.bool;
             }
+            if (mem.object.get("auto_recall")) |v| {
+                if (v == .bool) self.memory.auto_recall = v.bool;
+            }
+            if (mem.object.get("recall_limit")) |v| {
+                if (v == .integer) self.memory.recall_limit = @intCast(v.integer);
+            }
+            if (mem.object.get("max_context_bytes")) |v| {
+                if (v == .integer) self.memory.max_context_bytes = @intCast(v.integer);
+            }
             if (mem.object.get("citations")) |v| {
                 if (v == .string) self.memory.citations = try self.allocator.dupe(u8, v.string);
             }

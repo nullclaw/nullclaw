@@ -252,6 +252,9 @@ pub const Config = struct {
     max_tokens: ?u32 = null,
     memory_backend: []const u8 = config_types.MemoryConfig.DEFAULT_MEMORY_BACKEND,
     memory_auto_save: bool = true,
+    memory_auto_recall: bool = true,
+    memory_recall_limit: u32 = 5,
+    memory_max_context_bytes: u32 = 4_000,
     heartbeat_enabled: bool = false,
     heartbeat_interval_minutes: u32 = 30,
     gateway_host: []const u8 = "127.0.0.1",
@@ -425,6 +428,9 @@ pub const Config = struct {
         self.temperature = self.default_temperature;
         self.memory_backend = self.memory.backend;
         self.memory_auto_save = self.memory.auto_save;
+        self.memory_auto_recall = self.memory.auto_recall;
+        self.memory_recall_limit = self.memory.recall_limit;
+        self.memory_max_context_bytes = self.memory.max_context_bytes;
         self.heartbeat_enabled = self.heartbeat.enabled;
         self.heartbeat_interval_minutes = self.heartbeat.interval_minutes;
         self.gateway_host = self.gateway.host;
@@ -1976,7 +1982,7 @@ test "json parse roundtrip" {
         \\  "default_temperature": 0.5,
         \\  "models": {"providers": {"anthropic": {"api_key": "sk-test"}}},
         \\  "agents": {"defaults": {"model": {"primary": "anthropic/claude-opus-4"}, "heartbeat": {"every": "15m"}}},
-        \\  "memory": {"backend": "markdown", "auto_save": false},
+        \\  "memory": {"backend": "markdown", "auto_save": false, "auto_recall": false, "recall_limit": 3, "max_context_bytes": 2000},
         \\  "gateway": {"port": 9090, "host": "0.0.0.0"},
         \\  "autonomy": {"level": "full", "workspace_only": false, "max_actions_per_hour": 50},
         \\  "runtime": {"kind": "docker"},
@@ -2007,6 +2013,12 @@ test "json parse roundtrip" {
     try std.testing.expectEqualStrings("markdown", cfg.memory_backend);
     try std.testing.expect(!cfg.memory.auto_save);
     try std.testing.expect(!cfg.memory_auto_save);
+    try std.testing.expect(!cfg.memory.auto_recall);
+    try std.testing.expect(!cfg.memory_auto_recall);
+    try std.testing.expectEqual(@as(u32, 3), cfg.memory.recall_limit);
+    try std.testing.expectEqual(@as(u32, 3), cfg.memory_recall_limit);
+    try std.testing.expectEqual(@as(u32, 2000), cfg.memory.max_context_bytes);
+    try std.testing.expectEqual(@as(u32, 2000), cfg.memory_max_context_bytes);
     try std.testing.expectEqual(@as(u16, 9090), cfg.gateway.port);
 
     try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);

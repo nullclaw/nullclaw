@@ -10,15 +10,14 @@ const MemoryRuntime = memory_mod.MemoryRuntime;
 // Memory Loader — inject relevant memory context into user messages
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Default number of memory entries to recall per query.
-const DEFAULT_RECALL_LIMIT: usize = 5;
-const SCOPED_RECALL_CANDIDATE_LIMIT: usize = 64;
-const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
-
-/// Maximum total bytes of memory context injected into a message.
-/// Prevents a few large entries from blowing the token budget.
-/// ~4000 chars ~ 1000 tokens — a safe ceiling for context injection.
-const MAX_CONTEXT_BYTES: usize = 4_000;
+/// Configurable recall parameters — controls how many memories to inject,
+/// how large the context block can be, and how many candidates to fetch.
+pub const RecallParams = struct {
+    recall_limit: usize = 5,
+    max_context_bytes: usize = 4_000,
+    scoped_candidate_limit: usize = 64,
+    global_candidate_limit: usize = 64,
+};
 
 fn containsKey(entries: []const MemoryEntry, key: []const u8) bool {
     for (entries) |entry| {
@@ -89,8 +88,9 @@ pub fn loadContext(
     mem: Memory,
     user_message: []const u8,
     session_id: ?[]const u8,
+    params: RecallParams,
 ) ![]const u8 {
-    const scoped_entries = mem.recall(allocator, user_message, SCOPED_RECALL_CANDIDATE_LIMIT, session_id) catch {
+    const scoped_entries = mem.recall(allocator, user_message, params.scoped_candidate_limit, session_id) catch {
         return try allocator.dupe(u8, "");
     };
     defer memory_mod.freeEntries(allocator, scoped_entries);
@@ -109,25 +109,25 @@ pub fn loadContext(
         for (scoped_entries) |entry| {
             if (isInternalMemoryEntry(entry)) continue;
             if (isArchiveConversationEntry(entry) != include_archived) continue;
+            if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
             if (!wrote_header) {
                 try w.writeAll("[Memory context]\n");
                 wrote_header = true;
             }
             // Truncate individual entry content to prevent a single large memory from blowing the budget
-            const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+            const content = util.truncateUtf8(entry.content, params.max_context_bytes / 2);
             const sanitized = try sanitizeMemoryText(allocator, content);
             defer allocator.free(sanitized);
             try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
             appended += 1;
-            if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
-        if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+        if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
     }
 
-    if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES and session_id != null) {
+    if (appended < params.recall_limit and buf.items.len < params.max_context_bytes and session_id != null) {
         // When scoped recall is enabled, also include global (session_id = null)
         // memory so long-term facts from memory_store remain visible in session chats.
-        const global_entries = mem.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
+        const global_entries = mem.recall(allocator, user_message, params.global_candidate_limit, null) catch null;
         defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
         if (global_entries) |entries| {
@@ -136,17 +136,17 @@ pub fn loadContext(
                 if (containsKey(scoped_entries, entry.key)) continue;
                 if (isInternalMemoryEntry(entry)) continue;
                 if (isArchiveConversationEntry(entry)) continue; // avoid low-provenance global archive bleed
+                if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
 
                 if (!wrote_header) {
                     try w.writeAll("[Memory context]\n");
                     wrote_header = true;
                 }
-                const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+                const content = util.truncateUtf8(entry.content, params.max_context_bytes / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
                 try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                 appended += 1;
-                if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
     }
@@ -167,15 +167,16 @@ pub fn loadContextWithRuntime(
     rt: *MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
+    params: RecallParams,
 ) ![]const u8 {
-    const scoped_candidates = rt.search(allocator, user_message, SCOPED_RECALL_CANDIDATE_LIMIT, session_id) catch {
+    const scoped_candidates = rt.search(allocator, user_message, params.scoped_candidate_limit, session_id) catch {
         return try allocator.dupe(u8, "");
     };
     defer memory_mod.retrieval.freeCandidates(allocator, scoped_candidates);
 
     var scoped_fallback_entries: ?[]MemoryEntry = null;
-    if (scoped_candidates.len < SCOPED_RECALL_CANDIDATE_LIMIT) {
-        scoped_fallback_entries = rt.memory.recall(allocator, user_message, SCOPED_RECALL_CANDIDATE_LIMIT, session_id) catch null;
+    if (scoped_candidates.len < params.scoped_candidate_limit) {
+        scoped_fallback_entries = rt.memory.recall(allocator, user_message, params.scoped_candidate_limit, session_id) catch null;
     }
     defer if (scoped_fallback_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
@@ -193,41 +194,41 @@ pub fn loadContextWithRuntime(
                 if (isInternalMemoryKey(extracted)) continue;
             }
             if (isArchiveConversationCandidate(cand) != include_archived) continue;
+            if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
             if (!wrote_header) {
                 try w.writeAll("[Memory context]\n");
                 wrote_header = true;
             }
-            const snippet = util.truncateUtf8(cand.snippet, MAX_CONTEXT_BYTES / 2);
+            const snippet = util.truncateUtf8(cand.snippet, params.max_context_bytes / 2);
             const sanitized = try sanitizeMemoryText(allocator, snippet);
             defer allocator.free(sanitized);
             try w.print("- {s}: {s}\n", .{ cand.key, sanitized });
             appended += 1;
-            if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
         }
-        if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES) {
+        if (appended < params.recall_limit and buf.items.len < params.max_context_bytes) {
             if (scoped_fallback_entries) |entries| {
                 for (entries) |entry| {
                     if (containsCandidateKey(scoped_candidates, entry.key)) continue;
                     if (isInternalMemoryEntry(entry)) continue;
                     if (isArchiveConversationEntry(entry) != include_archived) continue;
+                    if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
                     if (!wrote_header) {
                         try w.writeAll("[Memory context]\n");
                         wrote_header = true;
                     }
-                    const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+                    const content = util.truncateUtf8(entry.content, params.max_context_bytes / 2);
                     const sanitized = try sanitizeMemoryText(allocator, content);
                     defer allocator.free(sanitized);
                     try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                     appended += 1;
-                    if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
                 }
             }
         }
-        if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+        if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
     }
 
-    if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES and session_id != null) {
-        const global_entries = rt.memory.recall(allocator, user_message, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch null;
+    if (appended < params.recall_limit and buf.items.len < params.max_context_bytes and session_id != null) {
+        const global_entries = rt.memory.recall(allocator, user_message, params.global_candidate_limit, null) catch null;
         defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
         if (global_entries) |entries| {
@@ -239,17 +240,17 @@ pub fn loadContextWithRuntime(
                 }
                 if (isInternalMemoryEntry(entry)) continue;
                 if (isArchiveConversationEntry(entry)) continue; // avoid low-provenance global archive bleed
+                if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
 
                 if (!wrote_header) {
                     try w.writeAll("[Memory context]\n");
                     wrote_header = true;
                 }
-                const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+                const content = util.truncateUtf8(entry.content, params.max_context_bytes / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
                 try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                 appended += 1;
-                if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
         }
     }
@@ -268,8 +269,9 @@ pub fn enrichMessage(
     mem: Memory,
     user_message: []const u8,
     session_id: ?[]const u8,
+    params: RecallParams,
 ) ![]const u8 {
-    const context = try loadContext(allocator, mem, user_message, session_id);
+    const context = try loadContext(allocator, mem, user_message, session_id, params);
     if (context.len == 0) {
         allocator.free(context);
         return try allocator.dupe(u8, user_message);
@@ -286,11 +288,12 @@ pub fn enrichMessageWithRuntime(
     mem_rt: ?*MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
+    params: RecallParams,
 ) ![]const u8 {
     const context = if (mem_rt) |rt|
-        try loadContextWithRuntime(allocator, rt, user_message, session_id)
+        try loadContextWithRuntime(allocator, rt, user_message, session_id, params)
     else
-        try loadContext(allocator, mem, user_message, session_id);
+        try loadContext(allocator, mem, user_message, session_id, params);
 
     if (context.len == 0) {
         allocator.free(context);
@@ -305,12 +308,14 @@ pub fn enrichMessageWithRuntime(
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
+const test_recall_params = RecallParams{};
+
 test "loadContext returns empty for no-op memory" {
     const allocator = std.testing.allocator;
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const context = try loadContext(allocator, mem, "hello", null);
+    const context = try loadContext(allocator, mem, "hello", null, test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expectEqualStrings("", context);
@@ -321,7 +326,7 @@ test "enrichMessage with no context returns original" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const enriched = try enrichMessage(allocator, mem, "hello", null);
+    const enriched = try enrichMessage(allocator, mem, "hello", null, test_recall_params);
     defer allocator.free(enriched);
 
     try std.testing.expectEqualStrings("hello", enriched);
@@ -338,7 +343,7 @@ test "loadContext with session_id includes global entries but not other sessions
     try mem.store("global_fact", "global favorite", .core, null);
     try mem.store("sess_b_fact", "session B favorite", .core, "sess-b");
 
-    const context = try loadContext(allocator, mem, "favorite", "sess-a");
+    const context = try loadContext(allocator, mem, "favorite", "sess-a", test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
@@ -351,10 +356,27 @@ test "enrichMessageWithRuntime with no memories returns original message" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "hello world", null);
+    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "hello world", null, test_recall_params);
     defer allocator.free(enriched);
 
     try std.testing.expectEqualStrings("hello world", enriched);
+}
+
+test "enrichMessageWithRuntime recall_limit 0 skips context injection" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_lang", "Zig is the favorite language", .core, null);
+
+    const params_disabled = RecallParams{ .recall_limit = 0 };
+    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "language", null, params_disabled);
+    defer allocator.free(enriched);
+
+    // Should return the original message unchanged — no context injected
+    try std.testing.expectEqualStrings("language", enriched);
 }
 
 test "enrichMessageWithRuntime with memories prepends context" {
@@ -366,7 +388,7 @@ test "enrichMessageWithRuntime with memories prepends context" {
 
     try mem.store("user_lang", "Zig is the favorite language", .core, null);
 
-    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "language", null);
+    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "language", null, test_recall_params);
     defer allocator.free(enriched);
 
     // Should contain [Memory context] header and the stored entry
@@ -389,7 +411,7 @@ test "loadContext filters internal autosave and hygiene entries" {
     try mem.store("last_hygiene_at", "1772051598", .core, null);
     try mem.store("user_language", "Отвечай на русском языке", .core, null);
 
-    const context = try loadContext(allocator, mem, "русском", null);
+    const context = try loadContext(allocator, mem, "русском", null, test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "user_language") != null);
@@ -409,7 +431,7 @@ test "loadContext filters markdown-encoded internal entries" {
     try mem.store("MEMORY:3", "**last_hygiene_at**: 1772051598", .core, null);
     try mem.store("MEMORY:4", "**Name**: User", .core, null);
 
-    const context = try loadContext(allocator, mem, "User", null);
+    const context = try loadContext(allocator, mem, "User", null, test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "last_hygiene_at") == null);
@@ -426,7 +448,7 @@ test "loadContext filters bootstrap prompt internal keys" {
     try mem.store("__bootstrap.prompt.SOUL.md", "persona-internal", .core, null);
     try mem.store("user_goal", "ship reliable builds", .core, null);
 
-    const context = try loadContext(allocator, mem, "ship", null);
+    const context = try loadContext(allocator, mem, "ship", null, test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "user_goal") != null);
@@ -477,7 +499,7 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
         ._allocator = allocator,
     };
 
-    const context = try loadContextWithRuntime(allocator, &rt, "привет", null);
+    const context = try loadContextWithRuntime(allocator, &rt, "привет", null, test_recall_params);
     defer allocator.free(context);
     try std.testing.expectEqualStrings("", context);
 }
@@ -525,7 +547,7 @@ test "loadContextWithRuntime with session_id includes global entries but not oth
         ._allocator = allocator,
     };
 
-    const context = try loadContextWithRuntime(allocator, &rt, "favorite", "sess-a");
+    const context = try loadContextWithRuntime(allocator, &rt, "favorite", "sess-a", test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
@@ -550,7 +572,7 @@ test "loadContext skips globally preserved archive conversation entries" {
         null,
     );
 
-    const context = try loadContext(allocator, mem, "favorite", "sess-a");
+    const context = try loadContext(allocator, mem, "favorite", "sess-a", test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
@@ -607,7 +629,7 @@ test "loadContextWithRuntime skips globally preserved archive conversation entri
         ._allocator = allocator,
     };
 
-    const context = try loadContextWithRuntime(allocator, &rt, "favorite", "sess-a");
+    const context = try loadContextWithRuntime(allocator, &rt, "favorite", "sess-a", test_recall_params);
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
@@ -624,7 +646,7 @@ test "loadContext prefers scoped facts when archive candidates fill recall windo
 
     try mem.store("scoped_fact", "needle scoped answer", .core, "sess-a");
     var idx: usize = 0;
-    while (idx < DEFAULT_RECALL_LIMIT) : (idx += 1) {
+    while (idx < test_recall_params.recall_limit) : (idx += 1) {
         var key_buf: [96]u8 = undefined;
         const key = try std.fmt.bufPrint(
             &key_buf,
@@ -635,7 +657,7 @@ test "loadContext prefers scoped facts when archive candidates fill recall windo
     }
 
     // Regression: archive chunks can fill the raw recall limit and hide a lower-ranked scoped fact.
-    const context = try loadContext(allocator, mem, "needle", "sess-a");
+    const context = try loadContext(allocator, mem, "needle", "sess-a", test_recall_params);
     defer allocator.free(context);
 
     const fact_pos = std.mem.indexOf(u8, context, "scoped_fact") orelse return error.TestUnexpectedResult;
@@ -652,7 +674,7 @@ test "loadContextWithRuntime prefers scoped facts when engine candidates fill wi
 
     try mem.store("scoped_fact", "needle scoped answer", .core, "sess-a");
     var idx: usize = 0;
-    while (idx < DEFAULT_RECALL_LIMIT) : (idx += 1) {
+    while (idx < test_recall_params.recall_limit) : (idx += 1) {
         var key_buf: [96]u8 = undefined;
         const key = try std.fmt.bufPrint(
             &key_buf,
@@ -663,7 +685,7 @@ test "loadContextWithRuntime prefers scoped facts when engine candidates fill wi
     }
 
     var primary = memory_mod.PrimaryAdapter.init(mem);
-    var engine = memory_mod.RetrievalEngine.init(allocator, .{ .max_results = DEFAULT_RECALL_LIMIT });
+    var engine = memory_mod.RetrievalEngine.init(allocator, .{ .max_results = test_recall_params.recall_limit });
     defer engine.deinit();
     try engine.addSource(primary.adapter());
 
@@ -700,7 +722,7 @@ test "loadContextWithRuntime prefers scoped facts when engine candidates fill wi
     };
 
     // Regression: engine top_k can fill with archive chunks and hide a lower-ranked scoped fact.
-    const context = try loadContextWithRuntime(allocator, &rt, "needle", "sess-a");
+    const context = try loadContextWithRuntime(allocator, &rt, "needle", "sess-a", test_recall_params);
     defer allocator.free(context);
 
     const fact_pos = std.mem.indexOf(u8, context, "scoped_fact") orelse return error.TestUnexpectedResult;

@@ -298,6 +298,9 @@ pub const Agent = struct {
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
+    auto_recall: bool = true,
+    recall_limit: usize = 5,
+    max_context_bytes: usize = 4_000,
     compact_context: bool = true,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
@@ -613,6 +616,9 @@ pub const Agent = struct {
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
+            .auto_recall = cfg.memory.auto_recall,
+            .recall_limit = @intCast(cfg.memory.recall_limit),
+            .max_context_bytes = @intCast(cfg.memory.max_context_bytes),
             .compact_context = cfg.agent.compact_context,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
@@ -2113,10 +2119,14 @@ pub const Agent = struct {
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enriched_raw = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
-        else
-            try self.allocator.dupe(u8, safe_user_message);
+        const enriched_raw = if (self.mem) |mem| blk: {
+            if (!self.auto_recall) break :blk try self.allocator.dupe(u8, safe_user_message);
+            const params = memory_loader.RecallParams{
+                .recall_limit = self.recall_limit,
+                .max_context_bytes = self.max_context_bytes,
+            };
+            break :blk try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id, params);
+        } else try self.allocator.dupe(u8, safe_user_message);
         const enriched = try self.redactOwnedForHistory(enriched_raw);
 
         // Keep the user message retained even if provider/tool steps fail.
