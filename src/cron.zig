@@ -14,6 +14,7 @@ const signal = @import("channels/signal.zig");
 const Config = @import("config.zig").Config;
 const process_util = @import("tools/process_util.zig");
 const security_policy = @import("security/policy.zig");
+const secrets = @import("security/secrets.zig");
 
 const log = std.log.scoped(.cron);
 const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -1800,12 +1801,26 @@ fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
 }
 
 /// Read the paired bearer token from paired_token in the config directory (if present).
+/// Supports both plaintext tokens (backward compat) and tokens encrypted at rest
+/// via SecretStore ("enc2:" prefix).
 fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
     const dir = config_paths.defaultConfigDir(allocator) catch return null;
     defer allocator.free(dir);
     const token_path = config_paths.pathFromConfigDir(allocator, dir, "paired_token") catch return null;
     defer allocator.free(token_path);
     const raw = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096) catch return null;
+
+    // Decrypt if the token was encrypted at rest by the gateway's /pair handler.
+    if (secrets.SecretStore.isEncrypted(raw)) {
+        var store = secrets.SecretStore.init(dir, true);
+        const decrypted = store.decryptSecret(allocator, raw) catch {
+            allocator.free(raw);
+            return null;
+        };
+        allocator.free(raw);
+        return trimOwnedRight(allocator, decrypted);
+    }
+
     return trimOwnedRight(allocator, raw);
 }
 
@@ -4121,4 +4136,69 @@ test "cron rejects obviously malformed expressions" {
         const result = nextRunForCronExpression(input, 0);
         try std.testing.expect(std.meta.isError(result));
     }
+}
+
+test "paired token roundtrip: encrypt at rest then decrypt on read" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const test_token = "test-tok-abc123";
+
+    // Set up SecretStore and encrypt the token as the gateway would.
+    var store = secrets.SecretStore.init(base, true);
+    const encrypted = try store.encryptSecret(allocator, test_token);
+    defer allocator.free(encrypted);
+    try std.testing.expect(secrets.SecretStore.isEncrypted(encrypted));
+
+    // Write the encrypted token to paired_token file (as the gateway does).
+    const token_path = try std_compat.fs.path.join(allocator, &.{ base, "paired_token" });
+    defer allocator.free(token_path);
+    const file = try fs_compat.createPath(token_path, .{});
+    defer file.close();
+    try file.writeAll(encrypted);
+
+    // Read it back and decrypt (as cron does).
+    const raw = try fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096);
+    defer allocator.free(raw);
+    try std.testing.expect(secrets.SecretStore.isEncrypted(raw));
+
+    var read_store = secrets.SecretStore.init(base, true);
+    const decrypted = try read_store.decryptSecret(allocator, raw);
+    defer allocator.free(decrypted);
+
+    try std.testing.expectEqualStrings(test_token, decrypted);
+}
+
+test "paired token: plaintext backward compat" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const test_token = "old-plaintext-token";
+
+    // Write a plaintext token (backward compat — no "enc2:" prefix).
+    const token_path = try std_compat.fs.path.join(allocator, &.{ base, "paired_token" });
+    defer allocator.free(token_path);
+    const file = try fs_compat.createPath(token_path, .{});
+    defer file.close();
+    try file.writeAll(test_token);
+
+    // Read it back — should not be treated as encrypted.
+    const raw = try fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096);
+    defer allocator.free(raw);
+    try std.testing.expect(!secrets.SecretStore.isEncrypted(raw));
+
+    // decryptSecret on plaintext returns it as-is.
+    var store = secrets.SecretStore.init(base, true);
+    const result = try store.decryptSecret(allocator, raw);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings(test_token, result);
 }

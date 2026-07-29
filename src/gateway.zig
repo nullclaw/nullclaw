@@ -39,6 +39,7 @@ const root_mod = @import("root.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const isPublicBindHost = @import("security/pairing.zig").isPublicBind;
+const secrets = @import("security/secrets.zig");
 const channels = @import("channels/root.zig");
 const telegram_update_ingress = @import("channels/telegram_update_ingress.zig");
 const bus_mod = @import("bus.zig");
@@ -789,6 +790,22 @@ pub fn formatPairSuccessResponse(buf: []u8, token: []const u8, expires_in_secs: 
         "{{\"status\":\"paired\",\"token\":\"{s}\",\"expires_in\":{d}}}",
         .{ token, expires_in_secs },
     ) catch null;
+}
+
+/// Persist the paired token to disk (encrypted at rest via SecretStore) so the
+/// cron/schedule tool can authenticate against gateway admin routes.
+fn persistPairedToken(allocator: std.mem.Allocator, cfg: *const Config, token: []const u8) !void {
+    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse ".";
+    var store = secrets.SecretStore.init(config_dir, cfg.secrets.encrypt);
+    const encrypted = try store.encryptSecret(allocator, token);
+    defer allocator.free(encrypted);
+
+    const token_path = try std_compat.fs.path.join(allocator, &.{ config_dir, "paired_token" });
+    defer allocator.free(token_path);
+
+    const file = try fs_compat.createPath(token_path, .{});
+    defer file.close();
+    try file.writeAll(encrypted);
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -6302,6 +6319,13 @@ pub fn run(
                                     response_status = "500 Internal Server Error";
                                     response_body = "{\"error\":\"pairing response failed\"}";
                                 }
+
+                                // Persist the paired token so cron/schedule can authenticate.
+                                if (config_opt) |cfg| {
+                                    persistPairedToken(allocator, cfg, token) catch |err| {
+                                        log.warn("failed to persist paired token: {}", .{err});
+                                    };
+                                }
                             },
                             .missing_code => {
                                 response_status = "400 Bad Request";
@@ -10666,4 +10690,45 @@ test "run rejects unsafe public bind before address resolution" {
     // gateway allocation for a non-loopback host.
     const result = run(failing.allocator(), "example.com", 3000, &cfg, null, null);
     try std.testing.expectError(error.PublicBindRequiresTunnel, result);
+}
+
+test "persistPairedToken writes encrypted token to paired_token file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    const test_token = "paired-test-token-xyz";
+
+    // Create a minimal Config with encryption enabled.
+    var cfg = Config{
+        .config_path = config_path,
+        .workspace_dir = base,
+        .allocator = allocator,
+        .secrets = .{ .encrypt = true },
+    };
+
+    // Call persistPairedToken.
+    try persistPairedToken(allocator, &cfg, test_token);
+
+    // Verify the file was created and is encrypted.
+    const token_path = try std_compat.fs.path.join(allocator, &.{ base, "paired_token" });
+    defer allocator.free(token_path);
+
+    const raw = try fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096);
+    defer allocator.free(raw);
+
+    try std.testing.expect(secrets.SecretStore.isEncrypted(raw));
+
+    // Verify the encrypted content decrypts back to the original token.
+    var store = secrets.SecretStore.init(base, true);
+    const decrypted = try store.decryptSecret(allocator, raw);
+    defer allocator.free(decrypted);
+
+    try std.testing.expectEqualStrings(test_token, decrypted);
 }
