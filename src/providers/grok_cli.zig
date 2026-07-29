@@ -109,19 +109,35 @@ pub const GrokCliProvider = struct {
         var child = std_compat.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
 
         try child.spawn();
 
         const stdout_result = try child.stdout.?.readToEndAlloc(allocator, MAX_OUTPUT_BYTES);
         defer allocator.free(stdout_result);
 
+        const stderr_result = child.stderr.?.readToEndAlloc(allocator, 4096) catch null;
+
         const term = try child.wait();
         switch (term) {
             .exited => |code| {
-                if (code != 0) return error.CliProcessFailed;
+                if (code != 0) {
+                    if (stderr_result) |s| {
+                        std.log.err("runGrok: {s} exited with code {}, stderr: \"{s}\"", .{ CLI_NAME, code, std.mem.trim(u8, s, " \t\r\n") });
+                        allocator.free(s);
+                    } else {
+                        std.log.err("runGrok: {s} exited with code {}, no stderr", .{ CLI_NAME, code });
+                    }
+                    std.log.err("runGrok: stdout was: \"{s}\"", .{std.mem.trim(u8, stdout_result, " \t\r\n")});
+                    return error.CliProcessFailed;
+                }
+                if (stderr_result) |s| allocator.free(s);
             },
-            else => return error.CliProcessFailed,
+            else => {
+                if (stderr_result) |s| allocator.free(s);
+                std.log.err("runGrok: {s} terminated abnormally", .{CLI_NAME});
+                return error.CliProcessFailed;
+            },
         }
 
         // Trim trailing whitespace
