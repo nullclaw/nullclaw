@@ -9,8 +9,8 @@ const ChatMessage = root.ChatMessage;
 
 /// Provider that delegates to the local `grok` CLI (xAI Grok).
 ///
-/// Runs `grok -p <prompt>` non-interactively and captures the response
-/// from stdout. Uses `--single` mode for single-turn completions.
+/// Runs `grok -p <prompt>` non-interactively (prompt mode) and captures the
+/// response from stdout for single-turn completions.
 pub const GrokCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -72,6 +72,7 @@ pub const GrokCliProvider = struct {
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
         const resolved_model = effectiveModel(model, self.model);
         const content = try runGrok(allocator, resolved_model, prompt);
+        errdefer allocator.free(content);
         return ChatResponse{ .content = content, .model = try allocator.dupe(u8, resolved_model) };
     }
 
@@ -114,42 +115,60 @@ pub const GrokCliProvider = struct {
         try child.spawn();
 
         const stdout_result = try child.stdout.?.readToEndAlloc(allocator, MAX_OUTPUT_BYTES);
-        defer allocator.free(stdout_result);
-
         const stderr_result = child.stderr.?.readToEndAlloc(allocator, 4096) catch null;
 
-        const term = try child.wait();
-        switch (term) {
-            .exited => |code| {
+        const term = child.wait() catch {
+            // wait() failed: release both captured buffers before propagating.
+            if (stderr_result) |s| allocator.free(s);
+            allocator.free(stdout_result);
+            return error.CliProcessFailed;
+        };
+
+        const exit_ok: bool = switch (term) {
+            .exited => |code| blk: {
                 if (code != 0) {
                     if (stderr_result) |s| {
                         std.log.err("runGrok: {s} exited with code {}, stderr: \"{s}\"", .{ CLI_NAME, code, std.mem.trim(u8, s, " \t\r\n") });
-                        allocator.free(s);
                     } else {
                         std.log.err("runGrok: {s} exited with code {}, no stderr", .{ CLI_NAME, code });
                     }
                     std.log.err("runGrok: stdout was: \"{s}\"", .{std.mem.trim(u8, stdout_result, " \t\r\n")});
-                    return error.CliProcessFailed;
                 }
-                if (stderr_result) |s| allocator.free(s);
+                break :blk code == 0;
             },
-            else => {
-                if (stderr_result) |s| allocator.free(s);
+            else => blk: {
                 std.log.err("runGrok: {s} terminated abnormally", .{CLI_NAME});
-                return error.CliProcessFailed;
+                break :blk false;
             },
-        }
+        };
+        if (stderr_result) |s| allocator.free(s);
 
-        // Trim trailing whitespace
-        const trimmed = std_compat.mem.trimRight(u8, stdout_result, " \t\r\n");
-        if (trimmed.len == stdout_result.len) {
-            return stdout_result;
-        }
-        const duped = try allocator.dupe(u8, trimmed);
-        allocator.free(stdout_result);
-        return duped;
+        return finishGrokOutput(allocator, stdout_result, exit_ok);
     }
 };
+
+/// Consume the captured stdout of the `grok` CLI and produce the final content.
+///
+/// Takes ownership of `stdout_result` and frees it exactly once on every path
+/// that does not transfer ownership to the caller:
+/// - `exit_ok == false`: returns `error.CliProcessFailed` and frees it (errdefer).
+/// - no trailing whitespace: returns it as-is (ownership transferred; not freed).
+/// - trailing whitespace: returns a trimmed copy and frees the original.
+///
+/// Regression: the pre-fix `runGrok` used `defer` plus an explicit free, which
+/// double-freed the buffer and corrupted the allocator (intermittent segfault
+/// in agent response processing, `SmpAllocator` corruption in `stripDelimitedBlocks`).
+fn finishGrokOutput(allocator: std.mem.Allocator, stdout_result: []u8, exit_ok: bool) ![]const u8 {
+    errdefer allocator.free(stdout_result);
+    if (!exit_ok) return error.CliProcessFailed;
+
+    const trimmed = std_compat.mem.trimRight(u8, stdout_result, " \t\r\n");
+    if (trimmed.len == stdout_result.len) return stdout_result;
+
+    const duped = try allocator.dupe(u8, trimmed);
+    allocator.free(stdout_result);
+    return duped;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Shared helpers
@@ -255,4 +274,50 @@ test "extractLastUserMessage empty messages" {
 
 test "GrokCliProvider default model is grok-4.5" {
     try std.testing.expectEqualStrings("grok-4.5", GrokCliProvider.DEFAULT_MODEL);
+}
+
+test "finishGrokOutput failure path frees stdout exactly once" {
+    // Regression: the pre-fix runGrok freed stdout_result explicitly AND via a
+    // `defer`, double-freeing it (SmpAllocator corruption / intermittent segfault
+    // in agent response processing). std.testing.allocator fails on any double
+    // free; with the fix the errdefer frees the buffer exactly once.
+    const buf = try std.testing.allocator.alloc(u8, 8);
+    @memset(buf, 'x');
+    try std.testing.expectError(error.CliProcessFailed, finishGrokOutput(std.testing.allocator, buf, false));
+    // buf is now freed by errdefer; a leak would also fail this test.
+}
+
+test "finishGrokOutput no-trim success transfers ownership without freeing" {
+    // Regression: with a `defer` instead of `errdefer`, the returned slice was
+    // freed on return, handing the caller a dangling pointer (use-after-free).
+    const buf = try std.testing.allocator.alloc(u8, 8);
+    @memset(buf, 'x');
+    const out = try finishGrokOutput(std.testing.allocator, buf, true);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(out.ptr == buf.ptr);
+    try std.testing.expectEqualStrings("xxxxxxxx", out);
+}
+
+test "finishGrokOutput trimmed success frees original and returns copy" {
+    // Regression: the pre-fix code freed the original via an explicit free AND
+    // again via `defer` (double free). With the fix the original is freed once
+    // and the trimmed copy is returned.
+    const buf = try std.testing.allocator.dupe(u8, "hello world\n");
+    const out = try finishGrokOutput(std.testing.allocator, buf, true);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(out.ptr != buf.ptr);
+    try std.testing.expectEqualStrings("hello world", out);
+}
+
+test "chatImpl returns NoUserMessage for empty messages" {
+    // No CLI spawn occurs on this path: extraction fails before runGrok.
+    // The dummy must be the provider type (alignment 8), not a u8, because
+    // chatImpl alignCasts the vtable ptr before reading any field.
+    const vtable = GrokCliProvider.vtable;
+    var dummy: GrokCliProvider = undefined;
+    const req = ChatRequest{ .messages = &[_]ChatMessage{} };
+    try std.testing.expectError(
+        error.NoUserMessage,
+        vtable.chat(@ptrCast(&dummy), std.testing.allocator, req, "grok-4.5", 0.0),
+    );
 }
