@@ -502,12 +502,33 @@ pub fn convertToolsResponses(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
 /// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
-    _ = timeout_secs;
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
         error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);
+
+    var timeout_buf: [32]u8 = undefined;
+    const max_time: ?[]const u8 = if (timeout_secs > 0)
+        try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs})
+    else
+        null;
+
+    // A pinned resolve entry lets curl keep credential headers in a mode-0600
+    // temporary file instead of argv. Prefer that path because std.http proxy
+    // support is not available on every target libc/architecture combination.
+    if (resolve_entry) |entry| {
+        return http_util.curlPostWithProxyAndResolve(
+            allocator,
+            url,
+            body,
+            headers,
+            null,
+            max_time,
+            entry,
+        );
+    }
+
     // Provider requests often carry Authorization/x-api-key credentials.
     // Use std.http so secrets are never exposed through child process argv.
     return http_util.httpPostJsonWithProxy(allocator, url, body, headers, null);
