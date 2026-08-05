@@ -29,8 +29,17 @@ pub const DAEMON_SERVICE_STACK_SIZE: usize = 1024 * 1024;
 pub const HEAVY_RUNTIME_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Dedicated threads that execute `SessionManager.processMessage*()` /
-/// `Agent.turn()`. Keep this aligned with the heavy runtime budget.
-pub const SESSION_TURN_STACK_SIZE: usize = HEAVY_RUNTIME_STACK_SIZE;
+/// `Agent.turn()`.
+///
+/// The turn path (channel decode -> session -> agent -> provider -> tools) is
+/// the deepest stack in the runtime, and aarch64 frames are larger than x86_64
+/// ones, so 2 MiB overflowed into the guard page and killed the process on
+/// every inbound message there. `nullclaw agent` never hit it because it runs
+/// on the 8 MiB main-thread stack.
+///
+/// This is address space, not resident memory: Linux commits stack pages on
+/// first touch, so a thread that stays shallow still costs a few pages of RSS.
+pub const SESSION_TURN_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 test "coordination stack size can spawn a thread" {
     const thread = try std.Thread.spawn(.{ .stack_size = COORDINATION_STACK_SIZE }, struct {
@@ -44,4 +53,21 @@ test "auxiliary stack size can spawn a thread" {
         fn run() void {}
     }.run, .{});
     thread.join();
+}
+
+test "session turn stack size can spawn a thread" {
+    const thread = try std.Thread.spawn(.{ .stack_size = SESSION_TURN_STACK_SIZE }, struct {
+        fn run() void {}
+    }.run, .{});
+    thread.join();
+}
+
+test "session turn stack clears the main-thread budget" {
+    // Regression: every inbound message segfaulted on aarch64 because the turn
+    // path ran on a 2 MiB thread and overflowed into the guard page, while the
+    // same path was fine on the 8 MiB main-thread stack. Anything at or below
+    // that 8 MiB reference is not a safe budget for the deepest path we have.
+    const main_thread_reference: usize = 8 * 1024 * 1024;
+    try std.testing.expect(SESSION_TURN_STACK_SIZE > main_thread_reference);
+    try std.testing.expect(SESSION_TURN_STACK_SIZE > HEAVY_RUNTIME_STACK_SIZE);
 }
