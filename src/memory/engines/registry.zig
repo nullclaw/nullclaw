@@ -5,6 +5,7 @@
 //! `joinZ` logic that was previously duplicated across 6 entry points.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const build_options = @import("build_options");
 const config_types = @import("../../config_types.zig");
@@ -286,15 +287,20 @@ pub fn resolvePaths(
     allocator: std.mem.Allocator,
     desc: *const BackendDescriptor,
     workspace_dir: []const u8,
+    database_path: []const u8,
     postgres_cfg: ?config_types.MemoryPostgresConfig,
     redis_cfg: ?config_types.MemoryRedisConfig,
     api_cfg: ?config_types.MemoryApiConfig,
     clickhouse_cfg: ?config_types.MemoryClickHouseConfig,
 ) !BackendConfig {
-    const db_path: ?[*:0]const u8 = if (desc.needs_db_path)
+    const db_path: ?[*:0]const u8 = if (!desc.needs_db_path)
+        null
+    else if (database_path.len == 0)
         try std_compat.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" })
+    else if (std_compat.fs.path.isAbsolute(database_path))
+        try allocator.dupeZ(u8, database_path)
     else
-        null;
+        try std_compat.fs.path.joinZ(allocator, &.{ workspace_dir, database_path });
     errdefer if (db_path) |p| allocator.free(std.mem.span(p));
 
     var pg_url: ?[*:0]const u8 = null;
@@ -681,7 +687,7 @@ test "resolvePaths sqlite has db_path" {
         return;
     }
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, null, null, null);
     defer if (cfg.db_path) |p| std.testing.allocator.free(std.mem.span(p));
 
     try std.testing.expect(cfg.db_path != null);
@@ -690,13 +696,32 @@ test "resolvePaths sqlite has db_path" {
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
 }
 
+test "resolvePaths sqlite honors configured database path" {
+    if (!build_options.enable_memory_sqlite) {
+        try std.testing.expect(findBackend("sqlite") == null);
+        return;
+    }
+    const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
+
+    const relative = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "state/dialogs.db", null, null, null, null);
+    defer if (relative.db_path) |p| std.testing.allocator.free(std.mem.span(p));
+    const expected_relative = try std_compat.fs.path.join(std.testing.allocator, &.{ "/tmp/ws", "state/dialogs.db" });
+    defer std.testing.allocator.free(expected_relative);
+    try std.testing.expectEqualStrings(expected_relative, std.mem.span(relative.db_path.?));
+
+    const absolute_database_path = if (builtin.os.tag == .windows) "C:\\nullclaw\\dialogs.db" else "/var/lib/nullclaw/dialogs.db";
+    const absolute = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", absolute_database_path, null, null, null, null);
+    defer if (absolute.db_path) |p| std.testing.allocator.free(std.mem.span(p));
+    try std.testing.expectEqualStrings(absolute_database_path, std.mem.span(absolute.db_path.?));
+}
+
 test "resolvePaths markdown has no db_path" {
     if (!build_options.enable_memory_markdown) {
         try std.testing.expect(findBackend("markdown") == null);
         return;
     }
     const desc = findBackend("markdown") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -708,7 +733,7 @@ test "resolvePaths none has no db_path" {
         return;
     }
     const desc = findBackend("none") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -750,7 +775,7 @@ test "resolvePaths redis config is preserved" {
         return;
     }
     const desc = findBackend("redis") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, .{
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, .{
         .host = "10.10.10.10",
         .port = 6380,
         .password = "pw",

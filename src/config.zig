@@ -2573,6 +2573,21 @@ test "json parse memory weights accept integer values" {
     try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.search.query.hybrid.text_weight);
 }
 
+test "json parse memory database path" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"database_path":"/var/lib/nullclaw/dialogs.db"}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    defer allocator.free(cfg.memory.database_path);
+    try std.testing.expectEqualStrings("/var/lib/nullclaw/dialogs.db", cfg.memory.database_path);
+}
+
 test "json parse memory sqlite_ann store options" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

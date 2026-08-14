@@ -1909,6 +1909,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (mem.object.get("backend")) |v| {
                 if (v == .string) self.memory.backend = try self.allocator.dupe(u8, v.string);
             }
+            if (mem.object.get("database_path")) |v| {
+                if (v == .string) self.memory.database_path = try self.allocator.dupe(u8, v.string);
+            }
             if (mem.object.get("auto_save")) |v| {
                 if (v == .bool) self.memory.auto_save = v.bool;
             }

@@ -942,7 +942,7 @@ pub fn initRuntime(
     const redis_cfg: ?config_types.MemoryRedisConfig = if (std.mem.eql(u8, config.backend, "redis")) config.redis else null;
     const api_cfg: ?config_types.MemoryApiConfig = if (std.mem.eql(u8, config.backend, "api")) config.api else null;
     const clickhouse_cfg: ?config_types.MemoryClickHouseConfig = if (std.mem.eql(u8, config.backend, "clickhouse")) config.clickhouse else null;
-    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg, redis_cfg, api_cfg, clickhouse_cfg) catch |err| {
+    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, config.database_path, pg_cfg, redis_cfg, api_cfg, clickhouse_cfg) catch |err| {
         log.warn("memory path resolution failed for backend '{s}': {}", .{ config.backend, err });
         return null;
     };
@@ -1954,6 +1954,23 @@ test "initRuntime sqlite returns full runtime" {
     try std.testing.expect(rt._db_path != null);
     const path_slice = std.mem.span(rt._db_path.?);
     try std.testing.expect(std.mem.endsWith(u8, path_slice, "memory.db"));
+}
+
+test "initRuntime sqlite uses configured database path" {
+    if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+    const database_path = try std_compat.fs.path.join(std.testing.allocator, &.{ ws.path, "dialogs.db" });
+    defer std.testing.allocator.free(database_path);
+
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .database_path = database_path,
+    }, ws.path) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expectEqualStrings(database_path, std.mem.span(rt._db_path.?));
+    try std.testing.expect(rt.session_store != null);
 }
 
 test "initRuntime with lifecycle defaults does not crash" {

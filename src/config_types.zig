@@ -1300,6 +1300,7 @@ pub const MemoryConfig = struct {
     /// Profile preset — convenience shortcut for common setups.
     profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    database_path: []const u8 = "",
     instance_id: []const u8 = "",
     auto_save: bool = true,
     citations: []const u8 = "auto",

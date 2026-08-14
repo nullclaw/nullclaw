@@ -254,7 +254,7 @@ NullClaw has a built-in memory system. This means it can remember things you tol
 
 ### How it stores memories
 
-Memories are stored in a local database on your computer (by default, a SQLite database at `~/.nullclaw/memory.db`). Nothing is sent to the cloud unless you configure it to use a remote memory backend.
+Memories are stored in a local database on your computer (by default, a SQLite database at `~/.nullclaw/memory.db`). Set `memory.database_path` to use another location; relative paths are resolved from the workspace directory. Nothing is sent to the cloud unless you configure it to use a remote memory backend.
 
 ### Types of memory operations
 
