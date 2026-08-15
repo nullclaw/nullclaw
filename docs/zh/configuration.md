@@ -797,6 +797,36 @@ Max 说明：
 - `tailscale.auth_key` 是可选项；当你希望启动 `serve`/`funnel` 之前自动执行 `tailscale up` 时再配置它。
 - `cloudflare.token`、`ngrok.auth_token`、`tailscale.auth_key` 这类隧道凭据在 `secrets.encrypt = true` 时会以加密形式落盘。
 
+### `agent`
+
+面向长工具链循环（尤其是本地模型）的上下文与循环卫生设置。
+
+- `parallel_tools`（默认：`false`）：为 `true` 且同一 assistant 批次中的工具调用全部为只读白名单工具（如 `file_read`、`memory_recall`、`web_fetch` 等）时，NullClaw 可并发执行这些调用，并发上限为 `agent.local_loop.max_parallel_readonly`。混合批次或可写工具仍按顺序执行。
+- `local_loop`：可选的压缩、循环检测与并行只读批次限制。
+
+```json
+{
+  "agent": {
+    "parallel_tools": true,
+    "local_loop": {
+      "enabled": false,
+      "max_result_chars": 8192,
+      "max_result_tail_lines": 12,
+      "identical_call_warn": 3,
+      "identical_call_veto": 5,
+      "identical_call_force_reply": 3,
+      "max_parallel_readonly": 4
+    }
+  }
+}
+```
+
+说明：
+
+- `local_loop.enabled = true` 时，工具结果写入历史的默认字符上限收紧为 400（除非显式设置了 `max_result_chars`）。
+- 同一 turn 内相同 `name + arguments_json` 的工具调用会指纹识别；warn/veto/force-reply 阈值按 turn 计算。
+- 省略 `local_loop` 时默认行为与现有配置兼容。
+
 ### `autonomy`
 
 - `level`: 推荐先用 `supervised`。
