@@ -124,6 +124,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "nearai", .label = "NEAR AI Cloud", .default_model = "zai-org/GLM-5.1-FP8", .env_var = "NEARAI_API_KEY" },
     .{ .key = "atlas-cloud", .label = "Atlas Cloud", .default_model = "qwen/qwen3-32b", .env_var = "ATLASCLOUD_API_KEY" },
     .{ .key = "evolink", .label = "Evolink", .default_model = "gpt-5.2", .env_var = "EVOLINK_API_KEY" },
+    .{ .key = "edenai", .label = "Eden AI (EU gateway)", .default_model = "anthropic/claude-sonnet-5", .env_var = "EDENAI_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
     .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
@@ -484,6 +485,7 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "bedrock", .key = "amazon-bedrock" },
     .{ .canonical = "copilot", .key = "github-copilot" },
     .{ .canonical = "poe", .key = "poe" },
+    .{ .canonical = "edenai", .key = "edenai" },
 };
 
 const NativeModelCatalog = struct {
