@@ -4,6 +4,7 @@
 //! the standard Tool vtable so the agent can call them like any built-in tool.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const tools_mod = @import("tools/root.zig");
 const config_mod = @import("config.zig");
@@ -17,6 +18,15 @@ const verbose = @import("verbose.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.mcp);
+
+extern "kernel32" fn PeekNamedPipe(
+    pipe: std.os.windows.HANDLE,
+    buffer: ?*anyopaque,
+    buffer_size: std.os.windows.DWORD,
+    bytes_read: ?*std.os.windows.DWORD,
+    total_bytes_available: ?*std.os.windows.DWORD,
+    bytes_left_this_message: ?*std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
 
 pub const McpServerConfig = config_mod.McpServerConfig;
 
@@ -96,6 +106,11 @@ pub const McpServer = struct {
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
+        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            // Put launchers and their descendants in one group so a timed-out
+            // MCP request cannot strand wrappers such as flock, ssh, or npx.
+            child.pgid = 0;
+        }
 
         // Build environment: inherit parent + config overrides
         var env = std_compat.process.EnvMap.init(self.allocator);
@@ -166,16 +181,7 @@ pub const McpServer = struct {
             self.allocator.free(sid);
             self.mcp_session_id = null;
         }
-        if (self.child) |*child| {
-            // Close stdin to signal the server to exit
-            if (child.stdin) |stdin| {
-                stdin.close();
-                child.stdin = null;
-            }
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-        }
-        self.child = null;
+        self.terminateChild();
     }
 
     // ── Internal I/O ────────────────────────────────────────────
@@ -217,7 +223,10 @@ pub const McpServer = struct {
         const stdin = self.child.?.stdin orelse return error.NoStdin;
         try stdin.writeAll(msg);
 
-        return try self.readLine(allocator);
+        return self.readLine(allocator) catch |err| {
+            if (err == error.Timeout) self.terminateChild();
+            return err;
+        };
     }
 
     fn sendNotification(self: *McpServer, method: []const u8, params: ?[]const u8) !void {
@@ -331,7 +340,9 @@ pub const McpServer = struct {
         errdefer line_buf.deinit(allocator);
         var byte: [1]u8 = undefined;
         const stdout = self.child.?.stdout orelse return error.NoStdout;
+        const started_at_ns = std_compat.time.nanoTimestamp();
         while (true) {
+            try waitForReadable(stdout, started_at_ns, self.config.timeout_ms);
             const n = stdout.read(&byte) catch return error.ReadFailed;
             if (n == 0) return error.EndOfStream;
             if (byte[0] == '\n') break;
@@ -341,6 +352,62 @@ pub const McpServer = struct {
         }
         if (line_buf.items.len == 0) return error.EmptyLine;
         return line_buf.toOwnedSlice(allocator);
+    }
+
+    fn terminateChild(self: *McpServer) void {
+        if (self.child) |*child| {
+            if (child.stdin) |stdin| {
+                stdin.close();
+                child.stdin = null;
+            }
+            if (comptime builtin.os.tag == .windows) {
+                _ = child.kill() catch {};
+            } else if (comptime builtin.os.tag != .wasi) {
+                const process_group_id: std.posix.pid_t = -child.id;
+                std.posix.kill(process_group_id, std.posix.SIG.KILL) catch {
+                    _ = child.kill() catch {};
+                };
+            }
+            _ = child.wait() catch {};
+        }
+        self.child = null;
+    }
+
+    fn waitForReadable(stdout: std_compat.fs.File, started_at_ns: i128, timeout_ms: u32) !void {
+        while (true) {
+            const elapsed_ns = std_compat.time.nanoTimestamp() - started_at_ns;
+            const timeout_ns = @as(i128, timeout_ms) * std.time.ns_per_ms;
+            if (elapsed_ns >= timeout_ns) return error.Timeout;
+
+            const remaining_ns: u64 = @intCast(timeout_ns - elapsed_ns);
+            const remaining_ms: u32 = @intCast(@min(
+                @as(u64, std.math.maxInt(u32)),
+                @divFloor(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+            ));
+
+            if (comptime builtin.os.tag == .windows) {
+                var available: std.os.windows.DWORD = 0;
+                if (PeekNamedPipe(stdout.handle, null, 0, null, &available, null) == .FALSE) {
+                    return error.EndOfStream;
+                }
+                if (available > 0) return;
+                std_compat.thread.sleep(@as(u64, @min(remaining_ms, 10)) * std.time.ns_per_ms);
+            } else if (comptime builtin.os.tag == .wasi) {
+                return error.UnsupportedOperation;
+            } else {
+                var poll_fds = [_]std.posix.pollfd{.{
+                    .fd = stdout.handle,
+                    .events = std.posix.POLL.IN | std.posix.POLL.HUP,
+                    .revents = 0,
+                }};
+                const poll_ms: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+                const ready = std.posix.poll(&poll_fds, poll_ms) catch return error.ReadFailed;
+                if (ready == 0) return error.Timeout;
+                const revents = poll_fds[0].revents;
+                if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0) return;
+                if (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) return error.ReadFailed;
+            }
+        }
     }
 };
 
@@ -518,6 +585,7 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
 
         server.connect() catch |err| {
             log.err("MCP server '{s}': connect failed: {}", .{ cfg.name, err });
+            server.deinit();
             allocator.destroy(server);
             continue;
         };
@@ -645,6 +713,22 @@ test "McpServer connectStdio deinit frees env map after spawn" {
     // Regression: connectStdio used to leak its EnvMap when stdio servers had env overrides.
     try server.connectStdio();
     try std.testing.expect(server.child != null);
+}
+
+test "McpServer stdio request timeout terminates blocked child" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var server = McpServer.init(std.testing.allocator, .{
+        .name = "blocked",
+        .transport = "stdio",
+        .command = "sh",
+        .args = &.{ "-c", "sleep 1" },
+        .timeout_ms = 20,
+    });
+    defer server.deinit();
+
+    try std.testing.expectError(error.Timeout, server.connect());
+    try std.testing.expect(server.child == null);
 }
 
 test "McpServer sendRequest requires http client for http transport" {

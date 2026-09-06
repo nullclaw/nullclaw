@@ -1880,7 +1880,7 @@ pub const McpServerConfig = struct {
     transport: []const u8 = DEFAULT_TRANSPORT,
     command: []const u8 = "",
     url: ?[]const u8 = null,
-    /// Per-request wall clock timeout for HTTP transport. 0 = default.
+    /// Per-request wall clock timeout for HTTP and stdio transports.
     timeout_ms: u32 = 10_000,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
