@@ -481,7 +481,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
     "filesystem": {
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+      "timeout_ms": 10000
     },
     "remote": {
       "transport": "http",
@@ -539,6 +540,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 Config values are literal. NullClaw does not expand `${VAR}` inside `config.json`
 strings, including custom header values. If you need environment-based secrets,
 render `config.json` ahead of time with your own deployment tooling.
+MCP `timeout_ms` bounds each HTTP or stdio request; a timed-out stdio server is
+terminated with its launcher process group so blocked child processes do not remain.
 
 Telegram forum topics:
 
