@@ -31,6 +31,15 @@ pub const Frame = struct {
     payload: []u8,
 };
 
+/// Atomically stop tracking an active socket and interrupt any blocking I/O.
+/// The caller must serialize this with the owning WsClient's final close.
+pub fn shutdownTrackedSocket(tracked_fd: anytype, invalid_socket: anytype, how: std.Io.net.ShutdownHow) void {
+    const fd = tracked_fd.swap(invalid_socket, .acq_rel);
+    if (fd != invalid_socket) {
+        (std_compat.net.Stream{ .handle = fd }).shutdown(how) catch {};
+    }
+}
+
 /// Heap-allocated TLS state.
 /// Must be heap-allocated so internal pointers remain stable after init.
 pub const TlsState = struct {
@@ -85,6 +94,7 @@ pub const WsClient = struct {
         extra_headers: []const []const u8,
     ) !WsClient {
         const stream = try connectTcp(allocator, host, port);
+        errdefer stream.close();
         return connectFromStream(allocator, stream, host, path, extra_headers);
     }
 
@@ -105,7 +115,8 @@ pub const WsClient = struct {
 
     /// Complete TLS init + WebSocket handshake on an already-established TCP stream.
     ///
-    /// On failure the stream is closed and an error is returned.
+    /// On failure the caller still owns the stream and must close it. Keeping failure
+    /// ownership with the caller allows tracked-fd users to unpublish before close.
     /// On success the returned `WsClient` owns the stream (call `deinit()` to release).
     ///
     /// A single adaptive errdefer handles tls_state cleanup across all failure stages:
@@ -120,9 +131,6 @@ pub const WsClient = struct {
         path: []const u8,
         extra_headers: []const []const u8,
     ) !WsClient {
-        // Ensures stream is closed on any failure path.
-        errdefer stream.close();
-
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
 
         // Stage flags for the single adaptive tls_state errdefer below.
@@ -706,7 +714,7 @@ pub fn applyMask(payload: []u8, mask_key: [4]u8) void {
     for (payload, 0..) |*b, i| b.* ^= mask_key[i % 4];
 }
 
-fn createWsTestSocketPair() ![2]std.posix.socket_t {
+pub fn createTestSocketPair() ![2]std.posix.socket_t {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
         @TypeOf(std.posix.system.socketpair) == void)
     {
@@ -1056,7 +1064,7 @@ test "ws buildFrame zero-len payload close" {
 }
 
 test "ws readMessage aggregates fragmented text and binary frames" {
-    const sockets = try createWsTestSocketPair();
+    const sockets = try createTestSocketPair();
     defer std.Io.Threaded.closeFd(sockets[1]);
 
     var client = WsClient{
@@ -1084,7 +1092,7 @@ test "ws readMessage aggregates fragmented text and binary frames" {
 }
 
 test "ws readFrame auto-pongs ping and returns null on close frame" {
-    const sockets = try createWsTestSocketPair();
+    const sockets = try createTestSocketPair();
     defer std.Io.Threaded.closeFd(sockets[1]);
 
     var client = WsClient{
@@ -1114,15 +1122,16 @@ test "ws readFrame auto-pongs ping and returns null on close frame" {
     try std.testing.expect(closed == null);
 }
 
-// Regression: connectFromStream must free all TLS buffers and close the stream on
-// TLS init failure, leaving no leaks detectable by the test allocator.
+// Regression: connectFromStream must free all TLS buffers on TLS init failure while
+// leaving stream ownership with the caller, with no test-allocator leaks.
 test "connectFromStream cleans up TLS state on init failure" {
     // Use a socketpair as the stream; close the server side immediately so
     // std.crypto.tls.Client.init() sees EOF during the TLS handshake and fails.
-    const sockets = try createWsTestSocketPair();
+    const sockets = try createTestSocketPair();
     std.Io.Threaded.closeFd(sockets[1]); // server side → EOF on first read
 
     const stream = std_compat.net.Stream{ .handle = sockets[0] };
+    defer stream.close();
     const result = WsClient.connectFromStream(
         std.testing.allocator,
         stream,
@@ -1288,7 +1297,7 @@ test "readFrame rejects oversized payload claim before allocation" {
     // triggers before any heap allocation. We send only the 10-byte header
     // claiming 5 MiB — readFrame must return error.FrameTooLarge without
     // attempting to allocate or read the (absent) payload bytes.
-    const sockets = try createWsTestSocketPair();
+    const sockets = try createTestSocketPair();
     defer std.Io.Threaded.closeFd(sockets[1]);
 
     var client = WsClient{

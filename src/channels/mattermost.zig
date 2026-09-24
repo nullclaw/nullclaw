@@ -152,6 +152,8 @@ pub const MattermostChannel = struct {
     connected: Atomic(bool) = Atomic(bool).init(false),
     ws_seq: Atomic(u64) = Atomic(u64).init(0),
     tmp_counter: Atomic(u64) = Atomic(u64).init(0),
+    lifecycle_mu: std_compat.sync.Mutex = .{},
+    gateway_socket_mu: std_compat.sync.Mutex = .{},
     ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
     gateway_thread: ?std.Thread = null,
 
@@ -198,6 +200,35 @@ pub const MattermostChannel = struct {
 
     pub fn healthCheck(self: *const MattermostChannel) bool {
         return self.running.load(.acquire);
+    }
+
+    fn shutdownActiveGatewaySocket(self: *MattermostChannel) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+    }
+
+    fn closeOwnedGatewaySocket(self: *MattermostChannel, ws: *websocket.WsClient) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        ws.deinit();
+    }
+
+    fn closeOwnedGatewayStream(self: *MattermostChannel, stream: std_compat.net.Stream) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        stream.close();
+    }
+
+    fn publishGatewaySocket(self: *MattermostChannel, fd: SocketFd) bool {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        self.ws_fd.store(fd, .release);
+        if (self.running.load(.acquire)) return true;
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        return false;
     }
 
     pub fn sendMessage(self: *MattermostChannel, target: []const u8, text: []const u8) !void {
@@ -372,6 +403,8 @@ pub const MattermostChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *MattermostChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
@@ -381,14 +414,14 @@ pub const MattermostChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *MattermostChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.running.store(false, .release);
         self.connected.store(false, .release);
 
-        const fd = self.ws_fd.load(.acquire);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).close();
-            self.ws_fd.store(invalid_socket, .release);
-        }
+        // shutdown() interrupts the gateway read while WsClient retains final close
+        // ownership in runGatewayOnce's defer.
+        self.shutdownActiveGatewaySocket();
 
         if (self.gateway_thread) |t| {
             t.join();
@@ -473,18 +506,24 @@ pub const MattermostChannel = struct {
 
         log.info("mattermost: connecting to wss://{s}:{d}{s}", .{ parts.host, parts.port, parts.path });
 
-        var ws = try websocket.WsClient.connect(
+        const ws_stream = try websocket.WsClient.connectTcp(self.allocator, parts.host, parts.port);
+        if (!self.publishGatewaySocket(ws_stream.handle)) {
+            self.closeOwnedGatewayStream(ws_stream);
+            return error.ConnectionClosed;
+        }
+        var ws = websocket.WsClient.connectFromStream(
             self.allocator,
+            ws_stream,
             parts.host,
-            parts.port,
             parts.path,
             &.{},
-        );
+        ) catch |err| {
+            self.closeOwnedGatewayStream(ws_stream);
+            return err;
+        };
         defer {
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
+            self.closeOwnedGatewaySocket(&ws);
         }
-        self.ws_fd.store(ws.stream.handle, .release);
 
         var auth_buf: [1024]u8 = undefined;
         const seq = self.ws_seq.fetchAdd(1, .monotonic) + 1;
@@ -956,6 +995,29 @@ fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "mattermost gateway socket published after stop is shut down safely" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        var ch = MattermostChannel.init(std.testing.allocator, "tok", "https://chat.example.com");
+        ch.running.store(false, .release);
+
+        // Regression: close() before joining could fail to wake the reader and let
+        // WsClient.deinit double-close a descriptor whose number was already reused.
+        try std.testing.expect(!ch.publishGatewaySocket(sockets[0]));
+        try std.testing.expectEqual(invalid_socket, ch.ws_fd.load(.acquire));
+
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
+    }
+}
 
 test "mattermost parseTarget supports prefixes and thread suffix" {
     const a = try parseTarget("channel:chan-1");
