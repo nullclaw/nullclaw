@@ -707,45 +707,45 @@ test "NativeRuntime storage path contains nullclaw" {
 }
 
 test "DockerRuntime name" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expectEqualStrings("docker", rt.getName());
 }
 
 test "DockerRuntime memory budget" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", 256, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", 256, false);
     const rt = docker.adapter();
     try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024), rt.memoryBudget());
 }
 
 test "DockerRuntime memory budget none" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expectEqual(@as(u64, 0), rt.memoryBudget());
 }
 
 test "DockerRuntime shell access" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expect(rt.hasShellAccess());
 }
 
 test "DockerRuntime filesystem with mount" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, true);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, true);
     const rt = docker.adapter();
     try std.testing.expect(rt.hasFilesystemAccess());
     try std.testing.expectEqualStrings("/workspace/.nullclaw", rt.storagePath());
 }
 
 test "DockerRuntime filesystem without mount" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expect(!rt.hasFilesystemAccess());
     try std.testing.expectEqualStrings("/tmp/.nullclaw", rt.storagePath());
 }
 
 test "DockerRuntime does not support long running" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expect(!rt.supportsLongRunning());
 }
@@ -829,7 +829,7 @@ test "DockerRuntime init stores all fields" {
 }
 
 test "DockerRuntime different images" {
-    var d1 = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var d1 = DockerRuntime.init("alpine:3.24", "none", null, false);
     var d2 = DockerRuntime.init("ubuntu:24.04", "host", 1024, true);
     const rt1 = d1.adapter();
     const rt2 = d2.adapter();
@@ -848,25 +848,25 @@ test "DockerRuntime different images" {
 }
 
 test "DockerRuntime storage path with workspace mount" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, true);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, true);
     const rt = docker.adapter();
     try std.testing.expect(std.mem.indexOf(u8, rt.storagePath(), "workspace") != null);
 }
 
 test "DockerRuntime storage path without workspace mount" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expect(std.mem.indexOf(u8, rt.storagePath(), "tmp") != null);
 }
 
 test "DockerRuntime does not support long running with mount" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, true);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, true);
     const rt = docker.adapter();
     try std.testing.expect(!rt.supportsLongRunning());
 }
 
 test "DockerRuntime has shell access" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", null, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", null, false);
     const rt = docker.adapter();
     try std.testing.expect(rt.hasShellAccess());
 }
@@ -896,14 +896,14 @@ test "RuntimeAdapter vtable dispatch for DockerRuntime" {
 }
 
 test "DockerRuntime memory budget with large value" {
-    var docker = DockerRuntime.init("alpine:3.20", "none", 4096, false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", 4096, false);
     const rt = docker.adapter();
     try std.testing.expectEqual(@as(u64, 4096 * 1024 * 1024), rt.memoryBudget());
 }
 
 test "DockerRuntime memory budget saturating mul" {
     // Test with a very large value to ensure no overflow
-    var docker = DockerRuntime.init("alpine:3.20", "none", std.math.maxInt(u64), false);
+    var docker = DockerRuntime.init("alpine:3.24", "none", std.math.maxInt(u64), false);
     const rt = docker.adapter();
     // Should use saturating mul, result should be maxInt(u64)
     try std.testing.expectEqual(std.math.maxInt(u64), rt.memoryBudget());

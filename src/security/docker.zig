@@ -19,7 +19,7 @@ pub const DockerSandbox = struct {
     mount_arg_buf: [MAX_WORKSPACE_LEN * 2 + 1]u8 = undefined,
     mount_arg_len: usize = 0,
 
-    pub const default_image = "alpine:latest";
+    pub const default_image = "alpine:3.24";
 
     pub const sandbox_vtable = Sandbox.VTable{
         .wrapCommand = wrapCommand,
@@ -282,7 +282,8 @@ test "docker sandbox wrap command prepends docker run" {
     // Regression: preserve the shell tool's default workspace cwd inside the container.
     try std.testing.expectEqualStrings("/tmp/workspace", result[12]);
     // Image
-    try std.testing.expectEqualStrings("alpine:latest", result[13]);
+    // Regression: keep the sandbox reproducible instead of following a mutable latest tag.
+    try std.testing.expectEqualStrings("alpine:3.24", result[13]);
     // Original command
     try std.testing.expectEqualStrings("echo", result[14]);
     try std.testing.expectEqualStrings("hello", result[15]);

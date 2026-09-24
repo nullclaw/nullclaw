@@ -516,7 +516,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   "runtime": {
     "kind": "native",
     "docker": {
-      "image": "alpine:3.20",
+      "image": "alpine:3.24",
       "network": "none",
       "memory_limit_mb": 512,
       "read_only_rootfs": true
