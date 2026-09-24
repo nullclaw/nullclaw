@@ -310,10 +310,15 @@ pub const Client = struct {
     }
 
     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
-        _ = timeout;
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
-        return root.http_util.httpPostJsonWithProxy(allocator, url, body, &.{}, self.proxy);
+        // The live channel probe already uses curl for explicit proxies. Keep
+        // runtime requests on that proven path while retaining native HTTP for
+        // direct connections.
+        if (self.proxy != null) {
+            return root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, timeout);
+        }
+        return root.http_util.httpPostJsonWithProxy(allocator, url, body, &.{}, null);
     }
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
