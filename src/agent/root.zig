@@ -2686,7 +2686,7 @@ pub const Agent = struct {
             // so avoid writing arbitrary text that can corrupt the control channel.
             if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&out_buf);
+                var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
                 const w = &bw.interface;
                 w.print("{s}", .{display_text}) catch {};
                 w.flush() catch {};
