@@ -147,6 +147,12 @@ pub const File = struct {
         return self.toInner().writer(shared.io(), buffer);
     }
 
+    /// Append-only writer. Stdout and pipes are not seekable; the positional
+    /// writer pwrites at offset 0 and on macOS that overwrites earlier bytes.
+    pub fn writerStreaming(self: File, buffer: []u8) Writer {
+        return self.toInner().writerStreaming(shared.io(), buffer);
+    }
+
     pub fn reader(self: File, buffer: []u8) Reader {
         return self.toInner().reader(shared.io(), buffer);
     }

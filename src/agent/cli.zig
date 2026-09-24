@@ -169,11 +169,7 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     // In tests, stdout is used by Zig's test runner protocol (`--listen`).
     if (builtin.is_test) return;
 
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const wr = &bw.interface;
-    wr.print("{s}", .{event.text}) catch {};
-    wr.flush() catch {};
+    writeStdoutAppend(std_compat.fs.File.stdout(), event.text);
 }
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
@@ -483,7 +479,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
 
     var out_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&out_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
     const w = &bw.interface;
 
     const message_arg = parsed_args.message_arg;
@@ -1173,6 +1169,39 @@ test "activeCliProvider uses returned holder storage for named agents" {
 test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
     try std.testing.expect(shouldPrintTurnResponse(true, false));
     try std.testing.expect(shouldPrintTurnResponse(false, false));
+}
+
+test "piped agent stdout appends the reply instead of overwriting offset zero" {
+    // Regression: a streamed "pong" plus the trailing newline was printed with
+    // positional writers. On macOS, pwrite to a pipe starts at offset 0, so the
+    // newline replaced the first byte and the command printed "\nong".
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var fds: [2]std.posix.fd_t = undefined;
+    switch (std.c.errno(std.c.pipe(&fds))) {
+        .SUCCESS => {},
+        else => return error.PipeFailed,
+    }
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const out = std_compat.fs.File{
+        .handle = fds[1],
+        .flags = .{ .nonblocking = false },
+    };
+
+    writeStdoutAppend(out, "pong");
+    writeStdoutAppend(out, "\n");
+
+    var got: [8]u8 = undefined;
+    const n = try std.posix.read(fds[0], &got);
+    try std.testing.expectEqualStrings("pong\n", got[0..n]);
+}
+
+fn writeStdoutAppend(file: std_compat.fs.File, text: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var bw = file.writerStreaming(&buf);
+    bw.interface.print("{s}", .{text}) catch {};
+    bw.interface.flush() catch {};
 }
 
 test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {
