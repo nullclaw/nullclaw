@@ -139,11 +139,65 @@ Example:
 Common per-provider fields:
 
 - `api_key`: credential for that provider entry.
-- `base_url`: override for custom or self-hosted OpenAI-compatible endpoints.
+- `base_url`: provider-specific API endpoint override. The expected path shape
+  depends on the provider; OpenAI-compatible providers usually expect a `/v1`
+  base, while the native Anthropic provider does not.
 - `api_mode`: select `chat_completions` or `responses` for compatible providers.
 - `user_agent`: optional `User-Agent` header override.
 - `max_streaming_prompt_bytes`: skip streaming above this estimated prompt size.
 - `chat_template_enable_thinking_param`: for custom OpenAI-compatible vLLM/Qwen endpoints, map `reasoning_effort` to `chat_template_kwargs.enable_thinking`.
+
+#### Native Anthropic provider
+
+NullClaw has a dedicated Anthropic provider that connects directly to the Anthropic API
+— no OpenRouter or proxy is required.
+
+Authentication options:
+
+- **Anthropic Console API keys** are sent in the `x-api-key` header. Put the key
+  in `models.providers.anthropic.api_key` or set `ANTHROPIC_API_KEY`.
+- **Claude subscription setup tokens** beginning with `sk-ant-oat01-` are sent
+  with Bearer authentication. Generate a long-lived token with `claude setup-token`,
+  then put it in `models.providers.anthropic.api_key` or set
+  `ANTHROPIC_OAUTH_TOKEN`. NullClaw does not read Claude Code's credential store
+  or refresh the token. See the [Claude Code authentication guide](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token).
+
+The provider supports text streaming, URL and base64 image inputs, and native
+tool calls on non-streaming requests. Setting `reasoning_effort` (or using
+`/think`) enables Anthropic extended thinking on models that support it.
+NullClaw uses adaptive thinking for Claude Opus/Sonnet 4.6 and a manual budget
+for older supported models; model-specific Anthropic restrictions still apply.
+
+Example (direct Anthropic API key):
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": { "api_key": "sk-ant-api03-..." }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-sonnet-4-6" }
+    }
+  }
+}
+```
+
+Notes:
+
+- In `agents.defaults.model.primary`, prefix the Anthropic model ID with
+  `anthropic/`, for example `anthropic/claude-sonnet-4-6`. When an agent entry
+  has a separate `"provider": "anthropic"` field, use the bare model ID instead.
+  Browse NullClaw's cataloged Anthropic model IDs with
+  `nullclaw --list-models --provider anthropic`; this command does not inspect
+  the models enabled for your Anthropic account.
+- The `base_url` field is optional and defaults to `https://api.anthropic.com`.
+  For an Anthropic-compatible proxy or gateway, set it to the API root before
+  `/v1/messages` (do not include the final `/v1`); NullClaw appends that path.
+  Remote endpoints must use HTTPS. Plain HTTP is accepted only for local or
+  private-network hosts.
 
 ### `agents.defaults.model.primary`
 

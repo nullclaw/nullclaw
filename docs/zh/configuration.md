@@ -124,11 +124,60 @@ nullclaw onboard --interactive
 常见的 provider 级字段：
 
 - `api_key`：该 provider 条目的凭据。
-- `base_url`：用于自定义或自托管 OpenAI 兼容端点的地址覆盖。
+- `base_url`：provider 专用的 API 端点覆盖。所需的路径格式取决于 provider；
+  OpenAI 兼容 provider 通常需要以 `/v1` 结尾的 base，而原生 Anthropic provider 不需要。
 - `api_mode`：为兼容 provider 选择 `chat_completions` 或 `responses`。
 - `user_agent`：可选的 `User-Agent` 请求头覆盖。
 - `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
 - `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
+
+#### 原生 Anthropic provider
+
+NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API，无需经过 OpenRouter 或代理。
+
+认证方式：
+
+- **Anthropic Console API Key** 通过 `x-api-key` 请求头发送。请将密钥写入
+  `models.providers.anthropic.api_key`，或设置 `ANTHROPIC_API_KEY`。
+- **Claude 订阅 setup token**（以 `sk-ant-oat01-` 开头）通过 Bearer 认证发送。
+  先运行 `claude setup-token` 生成长期令牌，再将其写入
+  `models.providers.anthropic.api_key`，或设置 `ANTHROPIC_OAUTH_TOKEN`。
+  NullClaw 不会读取 Claude Code 的凭据存储，也不会刷新该令牌。请参阅
+  [Claude Code 认证指南](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)。
+
+该 provider 支持文本流式输出、URL 和 base64 图片输入，以及非流式请求中的原生工具调用。
+设置 `reasoning_effort`（或使用 `/think`）可在支持该功能的模型上启用 Anthropic
+扩展思考。NullClaw 对 Claude Opus/Sonnet 4.6 使用自适应思考，对支持该功能的旧模型
+使用手动预算；Anthropic 针对具体模型的限制仍然适用。
+
+示例（直接使用 Anthropic API Key）：
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": { "api_key": "sk-ant-api03-..." }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-sonnet-4-6" }
+    }
+  }
+}
+```
+
+说明：
+
+- 在 `agents.defaults.model.primary` 中，为 Anthropic 模型 ID 添加
+  `anthropic/` provider 前缀，例如 `anthropic/claude-sonnet-4-6`。如果 agent
+  条目单独设置了 `"provider": "anthropic"`，则使用不带前缀的模型 ID。
+  可通过 `nullclaw --list-models --provider anthropic` 浏览 NullClaw 收录的
+  Anthropic 模型 ID；该命令不会检查你的 Anthropic 账户实际启用了哪些模型。
+- `base_url` 字段是可选的，默认值为 `https://api.anthropic.com`。
+  对于 Anthropic 兼容的代理或网关，请将其设为 `/v1/messages` 之前的 API root
+  （不要包含末尾的 `/v1`）；NullClaw 会自行追加该路径。远程端点必须使用 HTTPS；
+  只有本地或私有网络主机才允许使用普通 HTTP。
 
 ### `agents.defaults.model.primary`
 
