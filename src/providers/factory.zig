@@ -86,6 +86,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "nearai", .url = "https://cloud-api.near.ai/v1", .display = "NEAR AI Cloud" },
     .{ .name = "atlas-cloud", .url = "https://api.atlascloud.ai/v1", .display = "Atlas Cloud" },
     .{ .name = "evolink", .url = "https://direct.evolink.ai/v1", .display = "Evolink" },
+    .{ .name = "edenai", .url = "https://api.edenai.run/v3", .display = "Eden AI" },
     .{ .name = "vercel", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "together", .url = "https://api.together.xyz", .display = "Together AI" },
@@ -593,6 +594,8 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("atlas") == .compatible_provider);
     try std.testing.expect(classifyProvider("atlascloud") == .compatible_provider);
     try std.testing.expect(classifyProvider("evolink") == .compatible_provider);
+    try std.testing.expect(classifyProvider("edenai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("eden-ai") == .compatible_provider);
     try std.testing.expect(classifyProvider("poe") == .compatible_provider);
     try std.testing.expect(classifyProvider("custom:https://example.com") == .compatible_provider);
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
@@ -635,6 +638,8 @@ test "compatibleProviderUrl returns correct URLs" {
     try std.testing.expectEqualStrings("https://api.venice.ai", compatibleProviderUrl("venice").?);
     try std.testing.expectEqualStrings("https://cloud-api.near.ai/v1", compatibleProviderUrl("nearai").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas-cloud").?);
+    try std.testing.expectEqualStrings("https://api.edenai.run/v3", compatibleProviderUrl("edenai").?);
+    try std.testing.expectEqualStrings("https://api.edenai.run/v3", compatibleProviderUrl("eden-ai").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlascloud").?);
     try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", compatibleProviderUrl("evolink").?);

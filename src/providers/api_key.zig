@@ -325,6 +325,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "nearai", .{ "NEARAI_API_KEY", "NEARAI_CLOUD_API_KEY", "NEAR_AI_API_KEY" } },
         .{ "atlas-cloud", .{ "ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY", "ATLAS_API_KEY" } },
         .{ "evolink", .{ "EVOLINK_API_KEY", "", "" } },
+        .{ "edenai", .{ "EDENAI_API_KEY", "", "" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
@@ -426,6 +427,12 @@ test "atlas cloud env candidates include documented ATLASCLOUD_API_KEY" {
 test "evolink env candidate is EVOLINK_API_KEY" {
     const candidates = providerEnvCandidates("evolink");
     try std.testing.expectEqualStrings("EVOLINK_API_KEY", candidates[0]);
+}
+
+test "edenai env candidate is EDENAI_API_KEY across aliases" {
+    try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("edenai")[0]);
+    try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden-ai")[0]);
+    try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden_ai")[0]);
 }
 
 test "azure aliases share Azure env candidate" {

@@ -70,6 +70,7 @@ const known_url_model_provider_namespaces = std.StaticStringMap(void).initCompti
     .{ "nearai", {} },
     .{ "atlas-cloud", {} },
     .{ "evolink", {} },
+    .{ "edenai", {} },
     .{ "vercel-ai", {} },
     .{ "poe", {} },
     .{ "xiaomi", {} },
