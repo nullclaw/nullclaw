@@ -1,9 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
 const root = @import("root.zig");
 const ToolSpec = root.ToolSpec;
+
+const log = std.log.scoped(.providers);
 
 // ── Think-block parsing ───────────────────────────────────────────────────
 
@@ -534,12 +537,34 @@ fn curlPostTypedTimed(
     });
     allocator.free(response.headers);
     errdefer allocator.free(response.body);
-    if (response.status_code < 200 or response.status_code >= 300) return error.HttpStatusError;
+    if (response.status_code < 200 or response.status_code >= 300) {
+        logProviderHttpError(allocator, url, response.status_code, response.body);
+        return error.HttpStatusError;
+    }
     return response.body;
 }
 
 pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
     return curlPostTypedTimed(allocator, url, body, headers, "application/json", timeout_secs);
+}
+
+/// Provider-agnostic diagnostics: surface the server's own error text when a
+/// provider POST fails with a non-2xx status, so the reason for a rejection
+/// (e.g. "model does not support tools" from Ollama) is visible without a
+/// packet capture. The body is secret-scrubbed and length-capped by
+/// sanitizeApiError before logging; NullClaw deliberately does NOT interpret
+/// or classify it — knowing which models support what is the model card's
+/// job, not a capability list maintained here (upstream #1000).
+/// NOTE: No unit test for this log-only path (AGENTS.md §8.1) — the returned
+/// error identity and allocation behavior are unchanged. Suppressed under
+/// zig test to keep expected-error suites quiet, matching the compatible
+/// provider's log-only precedent.
+fn logProviderHttpError(allocator: std.mem.Allocator, url: []const u8, status_code: u16, body: []const u8) void {
+    if (builtin.is_test) return;
+    const sanitized = root.sanitizeApiError(allocator, body) catch null;
+    defer if (sanitized) |s| allocator.free(s);
+    const preview = sanitized orelse "<provider error body unavailable>";
+    log.err("provider http error: status={d} url={s} body={s}", .{ status_code, url, preview });
 }
 
 /// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
