@@ -1056,6 +1056,14 @@ test "supportsStreamingImpl returns true" {
     try std.testing.expect(prov.supportsStreaming());
 }
 
+test "supportsStreamingNativeTools returns false until input_json_delta is parsed" {
+    var p = AnthropicProvider.init(std.testing.allocator, "key", null);
+    const prov = p.provider();
+    try std.testing.expect(prov.supportsNativeTools());
+    try std.testing.expect(prov.supportsStreaming());
+    try std.testing.expect(!prov.supportsStreamingNativeTools());
+}
+
 test "vtable stream_chat is not null" {
     try std.testing.expect(AnthropicProvider.vtable.stream_chat != null);
 }
