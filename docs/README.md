@@ -22,7 +22,6 @@ This directory is the documentation index for nullclaw.
 
 - MCP integration: [`en/mcp.md`](./en/mcp.md) / [`zh/mcp.md`](./zh/mcp.md)
 - Subagents: [`en/subagents.md`](./en/subagents.md) / [`zh/subagents.md`](./zh/subagents.md)
-- Skills: [`en/skills.md`](./en/skills.md) / [`zh/skills.md`](./zh/skills.md)
 - Voice: [`en/voice.md`](./en/voice.md) / [`zh/voice.md`](./zh/voice.md)
 - Hardware & peripherals: [`en/hardware.md`](./en/hardware.md) / [`zh/hardware.md`](./zh/hardware.md)
 - External channel plugins: [`en/external-channels.md`](./en/external-channels.md) / [`zh/external-channels.md`](./zh/external-channels.md)
