@@ -141,7 +141,7 @@ pub const WhatsAppChannel = struct {
                         false;
 
                     if (!is_group_msg) {
-                        if (self.allow_from.len > 0 and !self.isNumberAllowed(normalized)) continue;
+                        if (!self.isNumberAllowed(normalized)) continue;
                     } else {
                         if (std.mem.eql(u8, self.group_policy, "disabled")) continue;
                         if (!std.mem.eql(u8, self.group_policy, "open")) {
@@ -435,6 +435,19 @@ test "whatsapp parse unauthorized number filtered" {
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"9999999999","timestamp":"1","type":"text","text":{"body":"Spam"}}]}}]}]}
     ;
 
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "whatsapp direct message empty allow_from denies sender" {
+    const allocator = std.testing.allocator;
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &.{}, &.{}, "allowlist");
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","timestamp":"1","type":"text","text":{"body":"Blocked"}}]}}]}]}
+    ;
+
+    // Regression: Meta webhook delivery does not authorize the end-user number.
     const msgs = try ch.parseWebhookPayload(allocator, payload);
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);

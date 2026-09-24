@@ -1539,6 +1539,8 @@ pub const Config = struct {
         InvalidRetryCount,
         InvalidBackoffMs,
         InvalidHttpProxyUrl,
+        InvalidWeixinBaseUrl,
+        InvalidWeixinProxyUrl,
         InvalidApiErrorMaxChars,
         InvalidOtelEndpoint,
         InvalidOtelHeader,
@@ -1631,6 +1633,16 @@ pub const Config = struct {
         if (self.http_request.proxy) |proxy_url| {
             if (!config_types.HttpRequestConfig.isValidProxyUrl(proxy_url)) {
                 return ValidationError.InvalidHttpProxyUrl;
+            }
+        }
+        for (self.channels.weixin) |weixin_cfg| {
+            if (!config_types.WeixinConfig.isValidBaseUrl(weixin_cfg.base_url)) {
+                return ValidationError.InvalidWeixinBaseUrl;
+            }
+            if (weixin_cfg.proxy) |proxy_url| {
+                if (!config_types.WeixinConfig.isValidProxyUrl(proxy_url)) {
+                    return ValidationError.InvalidWeixinProxyUrl;
+                }
             }
         }
         if (self.diagnostics.api_error_max_chars) |n| {
@@ -1822,6 +1834,8 @@ pub const Config = struct {
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
+            ValidationError.InvalidWeixinBaseUrl => std.debug.print("Config error: channels.weixin base_url must be an absolute HTTPS URL without a query or fragment.\n", .{}),
+            ValidationError.InvalidWeixinProxyUrl => std.debug.print("Config error: channels.weixin proxy must be a valid http://, https://, or socks5:// proxy URL.\n", .{}),
             ValidationError.InvalidApiErrorMaxChars => std.debug.print("Config error: diagnostics.api_error_max_chars must be in [200, 10000].\n", .{}),
             ValidationError.InvalidOtelEndpoint => std.debug.print("Config error: diagnostics.otel.endpoint/otel_endpoint must be an absolute https:// URL (or http:// for localhost/private or container-local collector hosts).\n", .{}),
             ValidationError.InvalidOtelHeader => std.debug.print("Config error: diagnostics.otel.headers/otel_headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
@@ -3340,6 +3354,39 @@ test "validation rejects invalid http_request proxy URL" {
     };
     cfg.http_request.proxy = "ftp://proxy.example.com:21";
     try std.testing.expectError(Config.ValidationError.InvalidHttpProxyUrl, cfg.validate());
+}
+
+test "validation rejects insecure weixin base URL" {
+    const weixin_accounts = [_]config_types.WeixinConfig{.{
+        .token = "test-token",
+        .base_url = "http://ilink.example.com/",
+    }};
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.channels.weixin = &weixin_accounts;
+
+    // Regression: bearer credentials must never be sent over plaintext HTTP.
+    try std.testing.expectError(Config.ValidationError.InvalidWeixinBaseUrl, cfg.validate());
+}
+
+test "validation rejects invalid weixin proxy URL" {
+    const weixin_accounts = [_]config_types.WeixinConfig{.{
+        .token = "test-token",
+        .proxy = "ftp://proxy.example.com",
+    }};
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.channels.weixin = &weixin_accounts;
+
+    try std.testing.expectError(Config.ValidationError.InvalidWeixinProxyUrl, cfg.validate());
 }
 
 test "validation rejects out-of-range diagnostics api_error_max_chars" {

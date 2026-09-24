@@ -103,7 +103,7 @@ curl -X POST \
 Max webhook 说明：
 
 - `nullclaw` 对 `/max` 路由优先按 `account_id` query 参数匹配，其次按 `X-Max-Bot-Api-Secret` 匹配。
-- 如果 `channels.max[].webhook_secret` 已配置，header 必须存在且完全匹配。
+- 如果 `channels.max.accounts.<id>.webhook_secret` 已配置，header 必须存在且完全匹配。
 - Max 侧配置的 webhook URL 必须使用 HTTPS。
 
 Teams webhook 说明：
@@ -111,7 +111,7 @@ Teams webhook 说明：
 - `nullclaw` 会先用 Microsoft 发布的 OpenID metadata 和 signing keys 验证 Bot Framework bearer token，再接受该 activity。
 - token 的 issuer 必须是 `https://api.botframework.com`，audience 必须匹配配置中的 Teams `client_id`，并且 token 中的 `serviceUrl` 必须与 activity body 一致。
 - 会按 Bot Framework key metadata 中公布的 endorsement 校验 Teams `channelId`。
-- 如果配置了 `channels.teams[].webhook_secret`，还会额外要求 `X-Webhook-Secret` 精确匹配。
+- 如果配置了 `channels.teams.accounts.<id>.webhook_secret`，还会额外要求 `X-Webhook-Secret` 精确匹配。
 
 ## Media Transcription
 
