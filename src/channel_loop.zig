@@ -1245,6 +1245,19 @@ fn matrixRoomPeerId(reply_target: ?[]const u8) []const u8 {
     return reply_target orelse "unknown";
 }
 
+/// Backoff bounds shared by every polling loop's failure path.
+pub const POLL_BACKOFF_INITIAL_NS: u64 = std.time.ns_per_s;
+pub const POLL_BACKOFF_MAX_NS: u64 = 30 * std.time.ns_per_s;
+
+/// Next delay after a failed poll: doubles up to POLL_BACKOFF_MAX_NS.
+///
+/// Poll failures deliberately leave `last_activity` untouched. It is the only
+/// signal that survives a long-poll which fails forever — `healthCheck()` issues
+/// a separate short request that keeps succeeding while the poll is dead.
+pub fn nextPollBackoffNs(current_ns: u64) u64 {
+    return @min(current_ns *| 2, POLL_BACKOFF_MAX_NS);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // TelegramLoopState — shared state between supervisor and polling thread
 // ════════════════════════════════════════════════════════════════════════════
@@ -1568,15 +1581,18 @@ pub fn runTelegramLoop(
         1;
     const enable_parallel = max_parallel_tasks > 1;
 
+    var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
+
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = tg_ptr.pollUpdates(allocator) catch |err| {
             log.warn("Telegram poll error: {}", .{err});
-            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
-            std_compat.thread.sleep(5 * std.time.ns_per_s);
+            std_compat.thread.sleep(poll_backoff_ns);
+            poll_backoff_ns = nextPollBackoffNs(poll_backoff_ns);
             continue;
         };
 
         // Update activity after each poll (even if no messages)
+        poll_backoff_ns = POLL_BACKOFF_INITIAL_NS;
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
@@ -1912,16 +1928,18 @@ pub fn runSignalLoop(
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
+    var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = sg_ptr.pollMessages(allocator) catch |err| {
             log.warn("Signal poll error: {}", .{err});
-            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
-            std_compat.thread.sleep(5 * std.time.ns_per_s);
+            std_compat.thread.sleep(poll_backoff_ns);
+            poll_backoff_ns = nextPollBackoffNs(poll_backoff_ns);
             continue;
         };
 
         // Update activity after each poll (even if no messages)
+        poll_backoff_ns = POLL_BACKOFF_INITIAL_NS;
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
@@ -2040,15 +2058,17 @@ pub fn runWeixinLoop(
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
+    var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = wx_ptr.pollMessages(allocator) catch |err| {
             log.warn("Weixin poll error: {}", .{err});
-            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
-            std_compat.thread.sleep(5 * std.time.ns_per_s);
+            std_compat.thread.sleep(poll_backoff_ns);
+            poll_backoff_ns = nextPollBackoffNs(poll_backoff_ns);
             continue;
         };
 
+        poll_backoff_ns = POLL_BACKOFF_INITIAL_NS;
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
@@ -2298,15 +2318,17 @@ pub fn runMatrixLoop(
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
+    var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = mx_ptr.pollMessages(allocator) catch |err| {
             log.warn("Matrix poll error: {}", .{err});
-            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
-            std_compat.thread.sleep(5 * std.time.ns_per_s);
+            std_compat.thread.sleep(poll_backoff_ns);
+            poll_backoff_ns = nextPollBackoffNs(poll_backoff_ns);
             continue;
         };
 
+        poll_backoff_ns = POLL_BACKOFF_INITIAL_NS;
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
@@ -2446,20 +2468,18 @@ pub fn runMaxLoop(
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
-    var backoff_ns: u64 = std.time.ns_per_s;
-    const max_backoff_ns: u64 = 30 * std.time.ns_per_s;
+    var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = mx_ptr.pollUpdates(allocator) catch |err| {
             log.warn("Max poll error: {}", .{err});
-            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
-            std_compat.thread.sleep(backoff_ns);
-            backoff_ns = @min(backoff_ns * 2, max_backoff_ns);
+            std_compat.thread.sleep(poll_backoff_ns);
+            poll_backoff_ns = nextPollBackoffNs(poll_backoff_ns);
             continue;
         };
 
         // Reset backoff on success
-        backoff_ns = std.time.ns_per_s;
+        poll_backoff_ns = POLL_BACKOFF_INITIAL_NS;
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
@@ -2580,6 +2600,20 @@ test "TelegramLoopState stop_requested toggle" {
     try std.testing.expect(!state.stop_requested.load(.acquire));
     state.stop_requested.store(true, .release);
     try std.testing.expect(state.stop_requested.load(.acquire));
+}
+
+test "nextPollBackoffNs doubles up to the cap" {
+    // Regression #972: the Telegram/Signal/Weixin/Matrix loops retried a failing
+    // poll every 5s forever. Consecutive failures now back off so a channel that
+    // is down for hours stops hammering the API.
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), nextPollBackoffNs(POLL_BACKOFF_INITIAL_NS));
+    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_s), nextPollBackoffNs(2 * std.time.ns_per_s));
+    try std.testing.expectEqual(POLL_BACKOFF_MAX_NS, nextPollBackoffNs(16 * std.time.ns_per_s));
+    try std.testing.expectEqual(POLL_BACKOFF_MAX_NS, nextPollBackoffNs(POLL_BACKOFF_MAX_NS));
+}
+
+test "nextPollBackoffNs saturates instead of overflowing" {
+    try std.testing.expectEqual(POLL_BACKOFF_MAX_NS, nextPollBackoffNs(std.math.maxInt(u64)));
 }
 
 test "TelegramLoopState last_activity update" {

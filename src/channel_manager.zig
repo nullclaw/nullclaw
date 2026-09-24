@@ -32,6 +32,10 @@ const Channel = channels_mod.Channel;
 
 const log = std.log.scoped(.channel_manager);
 
+/// How long a polling thread may go without a successful poll before the
+/// supervisor restarts it.
+pub const STALE_THRESHOLD_SECS: i64 = 600;
+
 pub const ListenerType = enum {
     /// Telegram, Signal — poll in a loop
     polling,
@@ -100,6 +104,14 @@ pub const ChannelManager = struct {
             .matrix => |ls| ls.last_activity.load(.acquire),
             .max => |ls| ls.last_activity.load(.acquire),
         };
+    }
+
+    /// A polling thread is stale once it has not completed a successful poll for
+    /// STALE_THRESHOLD_SECS. Failed polls leave `last_activity` alone, so this is
+    /// what catches a long-poll that errors forever while `healthCheck()` — a
+    /// separate short request — keeps reporting the channel as reachable.
+    pub fn isPollingStale(now: i64, last: i64) bool {
+        return (now - last) > STALE_THRESHOLD_SECS;
     }
 
     fn requestPollingStop(state: PollingState) void {
@@ -380,7 +392,6 @@ pub const ChannelManager = struct {
     /// Monitoring loop: check health, restart failed channels with backoff.
     /// Blocks until shutdown.
     pub fn supervisionLoop(self: *ChannelManager, state: *daemon.DaemonState) void {
-        const STALE_THRESHOLD_SECS: i64 = 600;
         const WATCH_INTERVAL_SECS: u64 = 10;
 
         while (!daemon.isShutdownRequested()) {
@@ -424,7 +435,7 @@ pub const ChannelManager = struct {
                 const polling_state = entry.polling_state orelse continue;
                 const now = std_compat.time.timestamp();
                 const last = pollingLastActivity(polling_state);
-                const stale = (now - last) > STALE_THRESHOLD_SECS;
+                const stale = isPollingStale(now, last);
 
                 const probe_ok = entry.channel.healthCheck();
 
@@ -490,6 +501,30 @@ pub const ChannelManager = struct {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "isPollingStale flags a polling thread past the threshold" {
+    // Regression #972: the Telegram/Matrix channels went silent after an idle
+    // night. Every poll failure refreshed last_activity, so `now - last` stayed
+    // near zero and the supervisor never restarted the dead polling thread.
+    const start: i64 = 1_700_000_000;
+
+    try std.testing.expect(!ChannelManager.isPollingStale(start, start));
+    try std.testing.expect(!ChannelManager.isPollingStale(start + STALE_THRESHOLD_SECS, start));
+    try std.testing.expect(ChannelManager.isPollingStale(start + STALE_THRESHOLD_SECS + 1, start));
+}
+
+test "isPollingStale sees a loop state left untouched by failing polls" {
+    // Regression #972: a polling loop that only ever fails must age out. The
+    // failure path no longer writes last_activity, so the timestamp stays at the
+    // last successful poll and crosses the threshold.
+    var loop_state = channel_loop.TelegramLoopState.init();
+    const last_success: i64 = 1_700_000_000;
+    loop_state.last_activity.store(last_success, .release);
+
+    const observed = loop_state.last_activity.load(.acquire);
+    try std.testing.expectEqual(last_success, observed);
+    try std.testing.expect(ChannelManager.isPollingStale(last_success + 601, observed));
+}
 
 test "PollingState has telegram signal weixin matrix and max variants" {
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=
