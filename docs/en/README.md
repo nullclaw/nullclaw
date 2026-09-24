@@ -60,6 +60,11 @@ Focus on:
 Focus on:
 
 - [External Channel Plugins](./external-channels.md)
+- [MCP Integration](./mcp.md)
+- [Subagents](./subagents.md)
+- [Skills](./skills.md)
+- [Voice](./voice.md)
+- [Hardware & Peripherals](./hardware.md)
 - [Configuration](./configuration.md)
 - [Usage and Operations](./usage.md)
 - [Architecture](./architecture.md)
@@ -85,6 +90,11 @@ Focus on:
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
 - [External Channel Plugins](./external-channels.md)
+- [MCP Integration](./mcp.md)
+- [Subagents](./subagents.md)
+- [Skills](./skills.md)
+- [Voice](./voice.md)
+- [Hardware & Peripherals](./hardware.md)
 - [Commands](./commands.md)
 - [Development](./development.md)
 

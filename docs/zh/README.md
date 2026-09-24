@@ -85,6 +85,11 @@
 - [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
 - [外部渠道插件](./external-channels.md)
+- [MCP 集成](./mcp.md)
+- [子 Agent](./subagents.md)
+- [技能包](./skills.md)
+- [语音](./voice.md)
+- [硬件与外设](./hardware.md)
 - [命令参考](./commands.md)
 - [开发指南](./development.md)
 
