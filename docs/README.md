@@ -20,6 +20,11 @@ JK:- Gateway API: [`en/gateway-api.md`](./en/gateway-api.md) / [`zh/gateway-api.
 KS:
 ## Topical Docs
 
+- MCP integration: [`en/mcp.md`](./en/mcp.md) / [`zh/mcp.md`](./zh/mcp.md)
+- Subagents: [`en/subagents.md`](./en/subagents.md) / [`zh/subagents.md`](./zh/subagents.md)
+- Skills: [`en/skills.md`](./en/skills.md) / [`zh/skills.md`](./zh/skills.md)
+- Voice: [`en/voice.md`](./en/voice.md) / [`zh/voice.md`](./zh/voice.md)
+- Hardware & peripherals: [`en/hardware.md`](./en/hardware.md) / [`zh/hardware.md`](./zh/hardware.md)
 - External channel plugins: [`en/external-channels.md`](./en/external-channels.md) / [`zh/external-channels.md`](./zh/external-channels.md)
 - Ops runbooks:
   - [`en/ops/dingtalk-ops-readiness.md`](./en/ops/dingtalk-ops-readiness.md)

@@ -86,6 +86,11 @@ QV:- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to 
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
 - [External Channel Plugins](./external-channels.md)
+- [MCP Integration](./mcp.md)
+- [Subagents](./subagents.md)
+- [Skills](./skills.md)
+- [Voice](./voice.md)
+- [Hardware & Peripherals](./hardware.md)
 - [Commands](./commands.md)
 - [Development](./development.md)
 
