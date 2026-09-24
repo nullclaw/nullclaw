@@ -196,39 +196,7 @@ pub const PushoverTool = struct {
     }
 };
 
-const PushoverEnvGuard = struct {
-    allocator: std.mem.Allocator,
-    token: ?[]const u8,
-    user_key: ?[]const u8,
-
-    fn init(allocator: std.mem.Allocator) !PushoverEnvGuard {
-        var guard = PushoverEnvGuard{
-            .allocator = allocator,
-            .token = platform.getEnvOrNull(allocator, "PUSHOVER_TOKEN"),
-            .user_key = platform.getEnvOrNull(allocator, "PUSHOVER_USER_KEY"),
-        };
-        errdefer guard.deinit();
-        errdefer guard.restore() catch {};
-
-        try platform.setProcessEnv(allocator, "PUSHOVER_TOKEN", null);
-        try platform.setProcessEnv(allocator, "PUSHOVER_USER_KEY", null);
-        return guard;
-    }
-
-    fn restore(self: *const PushoverEnvGuard) !void {
-        try platform.setProcessEnv(self.allocator, "PUSHOVER_TOKEN", self.token);
-        try platform.setProcessEnv(self.allocator, "PUSHOVER_USER_KEY", self.user_key);
-    }
-
-    fn deinit(self: *PushoverEnvGuard) void {
-        if (self.token) |value| self.allocator.free(value);
-        if (self.user_key) |value| self.allocator.free(value);
-    }
-};
-
-fn restorePushoverEnvOrPanic(guard: *const PushoverEnvGuard) void {
-    guard.restore() catch @panic("failed to restore Pushover environment");
-}
+const pushover_env_vars = [_][]const u8{ "PUSHOVER_TOKEN", "PUSHOVER_USER_KEY" };
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -289,9 +257,8 @@ test "pushover priority 5 rejected" {
 }
 
 test "pushover priority 2 accepted (credential error expected)" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -310,9 +277,8 @@ test "pushover priority 2 accepted (credential error expected)" {
 }
 
 test "pushover priority -2 accepted (credential error expected)" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -358,9 +324,8 @@ test "pushover schema has priority and sound" {
 }
 
 test "getCredentials reads token and user_key from .env file" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -382,9 +347,8 @@ test "getCredentials reads token and user_key from .env file" {
 }
 
 test "getCredentials reads exported and quoted values" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -406,9 +370,8 @@ test "getCredentials reads exported and quoted values" {
 }
 
 test "getCredentials missing token returns error" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -423,9 +386,8 @@ test "getCredentials missing token returns error" {
 }
 
 test "getCredentials missing user_key returns error" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -440,9 +402,8 @@ test "getCredentials missing user_key returns error" {
 }
 
 test "getCredentials missing .env returns error" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -455,9 +416,8 @@ test "getCredentials missing .env returns error" {
 }
 
 test "getCredentials prefers process environment over .env file" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     try platform.setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
     try platform.setProcessEnv(std.testing.allocator, "PUSHOVER_USER_KEY", "env-user-key");
@@ -482,9 +442,8 @@ test "getCredentials prefers process environment over .env file" {
 }
 
 test "getCredentials fills missing environment value from .env file" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     try platform.setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
 
@@ -508,9 +467,8 @@ test "getCredentials fills missing environment value from .env file" {
 }
 
 test "getCredentials later .env entries override earlier ones" {
-    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    var env_guard = try platform.TestEnvGuard.captureAndClear(std.testing.allocator, &pushover_env_vars);
     defer env_guard.deinit();
-    defer restorePushoverEnvOrPanic(&env_guard);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();

@@ -6471,17 +6471,9 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
 }
 
 test "hasStartupProviderCredentials accepts gemini oauth env token" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
-    defer std.testing.allocator.free(env_name);
-    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
-    defer std.testing.allocator.free(env_value);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
-    defer _ = c.unsetenv(env_name.ptr);
+    var env_guard = try yc.platform.TestEnvGuard.capture(std.testing.allocator, &.{"GEMINI_OAUTH_TOKEN"});
+    defer env_guard.deinit();
+    try yc.platform.setProcessEnv(std.testing.allocator, "GEMINI_OAUTH_TOKEN", "ya29.test-oauth-token");
 
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
@@ -6525,7 +6517,20 @@ test "hasStartupProviderCredentials rejects blank configured key" {
 }
 
 test "hasStartupProviderCredentials rejects missing provider and fallback credentials" {
-    // Regression: channel startup must still fail fast when neither the primary provider nor fallbacks can authenticate.
+    // Regression: channel startup must still fail fast when neither the primary
+    // provider nor fallbacks can authenticate. This test is non-hermetic against
+    // env vars leaking from the developer shell — production code's env-var
+    // fallback (api_key.zig) is intentional, so the test must explicitly
+    // save/unset/restore those vars to hold its "no credentials" premise.
+    const env_vars = [_][]const u8{
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "NULLCLAW_API_KEY",
+        "API_KEY",
+    };
+    var env_guard = try yc.platform.TestEnvGuard.captureAndClear(std.testing.allocator, &env_vars);
+    defer env_guard.deinit();
+
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",

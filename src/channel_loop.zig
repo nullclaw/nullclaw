@@ -2297,10 +2297,23 @@ pub fn runMatrixLoop(
 ) void {
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
+    const state_dir: ?[]u8 = matrix.MatrixChannel.stateDirFromConfigPath(allocator, config.config_path) catch |err| blk: {
+        log.warn("Matrix cursor persistence disabled: {}", .{err});
+        break :blk null;
+    };
+    defer if (state_dir) |dir| allocator.free(dir);
+    if (state_dir) |dir| mx_ptr.loadPersistedNextBatch(dir);
+
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = mx_ptr.pollMessages(allocator) catch |err| {
+            if (err == error.MatrixSyncPositionExpired) {
+                if (state_dir) |dir| mx_ptr.discardPersistedNextBatch(dir);
+                log.warn("Matrix sync position expired; restarting from a fresh snapshot", .{});
+                loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+                continue;
+            }
             log.warn("Matrix poll error: {}", .{err});
             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
             std_compat.thread.sleep(5 * std.time.ns_per_s);
@@ -2381,6 +2394,11 @@ pub fn runMatrixLoop(
             }
             allocator.free(messages);
         }
+
+        // Regression: committing during parse can skip unprocessed events if
+        // the process exits between receiving and dispatching a /sync batch.
+        // Commit only after every message in the batch has been handled.
+        if (state_dir) |dir| mx_ptr.commitNextBatch(dir);
 
         evict_counter += 1;
         if (evict_counter >= 100) {

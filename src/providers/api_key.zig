@@ -489,17 +489,9 @@ test "resolveApiKeyFromConfig falls through to env for missing provider" {
 }
 
 test "resolveApiKeyFromConfig falls through to env when provider entry omits api key" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const api_key_z = try std.testing.allocator.dupeZ(u8, "OPENROUTER_API_KEY");
-    defer std.testing.allocator.free(api_key_z);
-    const api_value_z = try std.testing.allocator.dupeZ(u8, "env-openrouter-key");
-    defer std.testing.allocator.free(api_value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(api_key_z.ptr, api_value_z.ptr, 1));
-    defer _ = c.unsetenv(api_key_z.ptr);
+    var env_guard = try platform.TestEnvGuard.capture(std.testing.allocator, &.{"OPENROUTER_API_KEY"});
+    defer env_guard.deinit();
+    try platform.setProcessEnv(std.testing.allocator, "OPENROUTER_API_KEY", "env-openrouter-key");
 
     const entries = [_]config_mod.ProviderEntry{
         .{ .name = "openrouter" },
@@ -621,24 +613,13 @@ test "writeQwenCredentialsJson preserves qwen oauth fields" {
 }
 
 test "resolveApiKey qwen-portal prefers oauth env over dashscope key" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const oauth_key_z = try std.testing.allocator.dupeZ(u8, "QWEN_OAUTH_TOKEN");
-    defer std.testing.allocator.free(oauth_key_z);
-    const oauth_value_z = try std.testing.allocator.dupeZ(u8, "oauth-token");
-    defer std.testing.allocator.free(oauth_value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(oauth_key_z.ptr, oauth_value_z.ptr, 1));
-    defer _ = c.unsetenv(oauth_key_z.ptr);
-
-    const api_key_z = try std.testing.allocator.dupeZ(u8, "DASHSCOPE_API_KEY");
-    defer std.testing.allocator.free(api_key_z);
-    const api_value_z = try std.testing.allocator.dupeZ(u8, "dashscope-key");
-    defer std.testing.allocator.free(api_value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(api_key_z.ptr, api_value_z.ptr, 1));
-    defer _ = c.unsetenv(api_key_z.ptr);
+    var env_guard = try platform.TestEnvGuard.capture(
+        std.testing.allocator,
+        &.{ "QWEN_OAUTH_TOKEN", "DASHSCOPE_API_KEY" },
+    );
+    defer env_guard.deinit();
+    try platform.setProcessEnv(std.testing.allocator, "QWEN_OAUTH_TOKEN", "oauth-token");
+    try platform.setProcessEnv(std.testing.allocator, "DASHSCOPE_API_KEY", "dashscope-key");
 
     const result = try resolveApiKey(std.testing.allocator, "qwen-portal", null);
     defer if (result) |value| std.testing.allocator.free(value);
