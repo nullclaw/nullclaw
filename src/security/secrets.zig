@@ -310,7 +310,7 @@ pub const SecretStore = struct {
         const path = self.keyPath();
 
         // Try to read existing key
-        if (fs_compat.openPath(path, .{})) |file| {
+        if (fs_compat.openPath(path, .{ .allow_directory = false, .follow_symlinks = false })) |file| {
             defer file.close();
             var key = try self.readKeyFromFile(file);
 
@@ -327,7 +327,10 @@ pub const SecretStore = struct {
             // Generate new key
             var key: [KEY_LEN]u8 = undefined;
             std_compat.crypto.random.bytes(&key);
-            try self.writeKeyToPath(path, key);
+            self.writeKeyToPath(path, key) catch |err| switch (err) {
+                error.PathAlreadyExists => return self.loadKeyFromPath(path),
+                else => |e| return e,
+            };
 
             return key;
         }
@@ -343,22 +346,26 @@ pub const SecretStore = struct {
     fn readKeyFromFile(self: *const SecretStore, file: std_compat.fs.File) ![KEY_LEN]u8 {
         _ = self;
         var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined; // some slack for whitespace
-        const bytes_read = file.readAll(&hex_buf) catch return error.KeyReadFailed;
+        // no-follow handles are asynchronous on Windows in Zig 0.16, so they
+        // must be read positionally rather than through readStreaming.
+        const bytes_read = file.readAllPositional(&hex_buf) catch return error.KeyReadFailed;
         const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
         var key: [KEY_LEN]u8 = undefined;
-        _ = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        const decoded = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        if (decoded.len != KEY_LEN) return error.KeyCorrupt;
         return key;
     }
 
     fn loadKeyFromPath(self: *const SecretStore, path: []const u8) ![KEY_LEN]u8 {
         _ = self;
-        const file = fs_compat.openPath(path, .{}) catch return error.KeyReadFailed;
+        const file = fs_compat.openPath(path, .{ .allow_directory = false, .follow_symlinks = false }) catch return error.KeyReadFailed;
         defer file.close();
         var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined;
-        const bytes_read = file.readAll(&hex_buf) catch return error.KeyReadFailed;
+        const bytes_read = file.readAllPositional(&hex_buf) catch return error.KeyReadFailed;
         const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
         var key: [KEY_LEN]u8 = undefined;
-        _ = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        const decoded = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        if (decoded.len != KEY_LEN) return error.KeyCorrupt;
         return key;
     }
 
@@ -368,20 +375,11 @@ pub const SecretStore = struct {
         _ = hexEncode(&key, &hex_buf);
 
         if (std_compat.fs.path.dirname(path)) |parent| {
-            fs_compat.makePath(parent) catch |err| {
-                log.err("failed to create parent dir {s}: {}", .{ parent, err });
-            };
+            fs_compat.makePath(parent) catch return error.KeyWriteFailed;
         }
 
-        const file = fs_compat.createPath(path, .{}) catch return error.KeyWriteFailed;
-        defer file.close();
-        file.writeAll(&hex_buf) catch return error.KeyWriteFailed;
-
-        if (@import("builtin").os.tag != .windows) {
-            file.chmod(0o600) catch |err| {
-                log.err("failed to set 0600 permissions on {s}: {}", .{ path, err });
-            };
-        }
+        const result = fs_compat.writeFileAtomicSecureNoReplace(path, &hex_buf) catch return error.KeyWriteFailed;
+        if (result == .already_exists) return error.PathAlreadyExists;
     }
 };
 
@@ -551,6 +549,93 @@ test "secret store same dir interop" {
     try std.testing.expectEqualStrings("cross-store-secret", decrypted);
 }
 
+test "secret store concurrent first use publishes one complete key" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const WorkerResult = struct {
+        encrypted: ?[]u8 = null,
+        err: ?anyerror = null,
+    };
+    const Worker = struct {
+        fn run(
+            secret_store: *const SecretStore,
+            ready: *std.atomic.Value(u32),
+            go: *std.atomic.Value(bool),
+            plaintext: []const u8,
+            result: *WorkerResult,
+        ) void {
+            _ = ready.fetchAdd(1, .release);
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            result.encrypted = secret_store.encryptSecret(std.heap.page_allocator, plaintext) catch |err| {
+                result.err = err;
+                return;
+            };
+        }
+    };
+
+    var ready = std.atomic.Value(u32).init(0);
+    var go = std.atomic.Value(bool).init(false);
+    var results: [2]WorkerResult = .{ .{}, .{} };
+    const first = try std.Thread.spawn(.{}, Worker.run, .{
+        &store,
+        &ready,
+        &go,
+        "worker-a",
+        &results[0],
+    });
+    var second: ?std.Thread = null;
+    var threads_joined = false;
+    errdefer if (!threads_joined) {
+        go.store(true, .release);
+        if (second) |thread| thread.join();
+        first.join();
+        for (results) |result| {
+            if (result.encrypted) |encrypted| std.heap.page_allocator.free(encrypted);
+        }
+    };
+    second = try std.Thread.spawn(.{}, Worker.run, .{
+        &store,
+        &ready,
+        &go,
+        "worker-b",
+        &results[1],
+    });
+    while (ready.load(.acquire) != @as(u32, @intCast(results.len))) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    first.join();
+    second.?.join();
+    threads_joined = true;
+    defer {
+        for (results) |result| {
+            if (result.encrypted) |encrypted| std.heap.page_allocator.free(encrypted);
+        }
+    }
+
+    try std.testing.expect(results[0].err == null);
+    try std.testing.expect(results[1].err == null);
+    const encrypted_a = results[0].encrypted orelse return error.TestUnexpectedResult;
+    const encrypted_b = results[1].encrypted orelse return error.TestUnexpectedResult;
+
+    const installed_store = SecretStore.init(tmp_path, true);
+    const decrypted_a = try installed_store.decryptSecret(std.testing.allocator, encrypted_a);
+    defer std.testing.allocator.free(decrypted_a);
+    try std.testing.expectEqualStrings("worker-a", decrypted_a);
+    const decrypted_b = try installed_store.decryptSecret(std.testing.allocator, encrypted_b);
+    defer std.testing.allocator.free(decrypted_b);
+    try std.testing.expectEqualStrings("worker-b", decrypted_b);
+
+    const key_file = try fs_compat.openPath(installed_store.keyPath(), .{});
+    defer key_file.close();
+    var key_buf: [KEY_LEN * 2 + 1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, KEY_LEN * 2), try key_file.readAll(&key_buf));
+}
+
 test "secret store decrypts data encrypted before key rotation" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -648,6 +733,52 @@ test "secret store key file created on first encrypt" {
     const bytes_read = try file.readAll(&buf);
     // Key is hex-encoded 32 bytes = 64 hex chars
     try std.testing.expectEqual(@as(usize, KEY_LEN * 2), bytes_read);
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        const metadata = try file.stat();
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), metadata.mode & 0o777);
+    }
+}
+
+test "secret store refuses symlink key path" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const victim = [_]u8{'0'} ** (KEY_LEN * 2);
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "victim-key", .data = &victim });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).symLink("victim-key", ".secret_key", .{});
+
+    const store = SecretStore.init(tmp_path, true);
+    try std.testing.expectError(
+        error.KeyReadFailed,
+        store.encryptSecret(std.testing.allocator, "must-not-follow"),
+    );
+
+    const unchanged = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "victim-key", 128);
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualStrings(&victim, unchanged);
+}
+
+test "secret store rejects truncated even-length key" {
+    // Regression: hexDecode accepts shorter even-length input, so key readers
+    // must reject it instead of using an uninitialized key suffix.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const truncated_key = [_]u8{'0'} ** (KEY_LEN * 2 - 2);
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = ".secret_key",
+        .data = &truncated_key,
+    });
+
+    const store = SecretStore.init(tmp_path, true);
+    try std.testing.expectError(
+        error.KeyCorrupt,
+        store.encryptSecret(std.testing.allocator, "must-not-encrypt"),
+    );
 }
 
 test "secret store tampered ciphertext detected" {

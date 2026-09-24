@@ -168,6 +168,10 @@ pub const File = struct {
         return filled;
     }
 
+    pub fn readAllPositional(self: File, buffer: []u8) std.Io.File.ReadPositionalError!usize {
+        return self.toInner().readPositionalAll(shared.io(), buffer, 0);
+    }
+
     pub fn writeAll(self: File, bytes: []const u8) std.Io.File.Writer.Error!void {
         try self.toInner().writeStreamingAll(shared.io(), bytes);
     }
@@ -232,7 +236,13 @@ pub const Dir = struct {
     }
 
     pub fn openFile(self: Dir, sub_path: []const u8, options: OpenFileOptions) std.Io.File.OpenError!File {
-        return File.wrap(try self.toInner().openFile(shared.io(), sub_path, options));
+        var file = File.wrap(try self.toInner().openFile(shared.io(), sub_path, options));
+        // Zig 0.16 opens Windows no-follow handles asynchronously but reports
+        // them as blocking, causing positional I/O to take the wrong path.
+        if (builtin.os.tag == .windows and !options.follow_symlinks) {
+            file.flags.nonblocking = true;
+        }
+        return file;
     }
 
     pub fn createFile(self: Dir, sub_path: []const u8, options: CreateFileOptions) std.Io.File.OpenError!File {
@@ -275,6 +285,10 @@ pub const Dir = struct {
 
     pub fn rename(self: Dir, old_sub_path: []const u8, new_sub_path: []const u8) std.Io.Dir.RenameError!void {
         try self.toInner().rename(old_sub_path, self.toInner(), new_sub_path, shared.io());
+    }
+
+    pub fn renamePreserve(self: Dir, old_sub_path: []const u8, new_sub_path: []const u8) std.Io.Dir.RenamePreserveError!void {
+        try self.toInner().renamePreserve(old_sub_path, self.toInner(), new_sub_path, shared.io());
     }
 
     pub fn readLink(self: Dir, sub_path: []const u8, buffer: []u8) std.Io.Dir.ReadLinkError![]const u8 {
@@ -363,7 +377,13 @@ pub fn openDirAbsolute(absolute_path: []const u8, options: Dir.OpenDirOptions) s
 }
 
 pub fn openFileAbsolute(absolute_path: []const u8, options: Dir.OpenFileOptions) std.Io.File.OpenError!File {
-    return File.wrap(try std.Io.Dir.openFileAbsolute(shared.io(), absolute_path, options));
+    var file = File.wrap(try std.Io.Dir.openFileAbsolute(shared.io(), absolute_path, options));
+    // Keep this in sync with Dir.openFile: the Zig 0.16 Windows backend uses
+    // an asynchronous handle whenever symlink following is disabled.
+    if (builtin.os.tag == .windows and !options.follow_symlinks) {
+        file.flags.nonblocking = true;
+    }
+    return file;
 }
 
 pub fn accessAbsolute(absolute_path: []const u8, options: Dir.AccessOptions) std.Io.Dir.AccessError!void {

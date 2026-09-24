@@ -30,12 +30,12 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/pair` | POST | `X-Pairing-Code` | Exchange one-time pairing code for bearer token (loopback-only when gateway is publicly bound) |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message payload: `{"message":"..."}` |
 | `/media/transcribe` | POST | `Authorization: Bearer <token>` | Transcribe base64 audio payloads through configured STT provider |
-| `/cron` | GET | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | List live scheduler jobs from the running daemon |
-| `/cron/add` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Add or schedule a live cron job |
-| `/cron/remove` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Remove a live cron job by `id` |
-| `/cron/pause` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Pause a live cron job by `id` |
-| `/cron/resume` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Resume a live cron job by `id` |
-| `/cron/update` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Partially update a live cron job |
+| `/cron` | GET | Cron-scoped bearer or full gateway bearer when auth is required | List live scheduler jobs from the running daemon |
+| `/cron/add` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Add or schedule a live cron job |
+| `/cron/remove` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Remove a live cron job by `id` |
+| `/cron/pause` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Pause a live cron job by `id` |
+| `/cron/resume` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Resume a live cron job by `id` |
+| `/cron/update` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Partially update a live cron job |
 | `/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` matching `channels.telegram.accounts.<id>.webhook_secret` | Telegram inbound webhook |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
@@ -342,10 +342,11 @@ Include `contextId` in the message to group tasks into a conversation. All messa
 
 1. Keep `gateway.require_pairing = true`.
 2. Keep gateway on loopback (`127.0.0.1`) and expose externally through tunnel/proxy.
-3. If you intentionally use a non-loopback bind, generic endpoints (`/webhook`, `/cron/*`, `/a2a`, `/media/transcribe`) still require a stored bearer token even when interactive pairing is disabled; preconfigure `gateway.paired_tokens` if you are not using `/pair`.
+3. If you intentionally use a non-loopback bind, generic endpoints (`/webhook`, `/a2a`, `/media/transcribe`) still require a full gateway bearer token even when interactive pairing is disabled; preconfigure `gateway.paired_tokens` if you are not using `/pair`. `/cron/*` also accepts its dedicated cron-scoped bearer.
 4. On non-loopback binds, `/pair` only accepts loopback clients. Do initial pairing locally or preconfigure `gateway.paired_tokens` before exposing the port.
 5. Treat bearer tokens as secrets; do not commit or log them.
 6. Treat Max webhook secrets the same way: randomize them per account and do not reuse one secret across multiple bots.
+7. When cron authentication is required, the gateway creates a bearer scoped only to `/cron/*` at startup, retains its hash, and writes the encrypted credential to `paired_token` in the config directory with mode `0600`. The schedule/cron tool reads this file for control-plane requests. The token rotates on every gateway restart and cannot authorize webhook, A2A, media, or other admin routes. It is still a bearer credential, not an IP-bound proof of local origin, so protect the config directory from disclosure. Anonymous loopback gateways with `require_pairing = false` do not create it.
 
 ## Next Steps
 
