@@ -14,7 +14,9 @@ pub const CACHE_TTL_SECS: i64 = 24 * 60 * 60;
 pub const CLOCK_SKEW_SECS: i64 = 5 * 60;
 const FETCH_TIMEOUT_SECS = "10";
 const MAX_OPENID_BYTES: usize = 64 * 1024;
-const MAX_KEYS_BYTES: usize = 512 * 1024;
+const MAX_KEYS_BYTES: usize = 2 * 1024 * 1024;
+const KEY_REFRESH_COOLDOWN_SECS: i64 = 5 * 60;
+const STALE_KEY_GRACE_SECS: i64 = 60 * 60;
 
 pub const VerifyError = error{
     MissingKeyId,
@@ -69,7 +71,14 @@ pub const JwksKey = struct {
 pub const KeyCache = struct {
     mutex: std_compat.sync.Mutex = .{},
     fetched_at: i64 = 0,
+    last_refresh_attempt: i64 = 0,
     keys: std.ArrayListUnmanaged(JwksKey) = .empty,
+
+    const RefreshDecision = enum {
+        use_cached,
+        refresh,
+        reject,
+    };
 
     pub fn deinit(self: *KeyCache, allocator: Allocator) void {
         self.mutex.lock();
@@ -118,17 +127,40 @@ pub const KeyCache = struct {
     }
 
     fn ensureFreshLocked(self: *KeyCache, allocator: Allocator, key_id: []const u8, now_sec: i64) VerifyError!void {
-        const is_fresh = self.keys.items.len > 0 and (now_sec - self.fetched_at) < CACHE_TTL_SECS;
-        if (is_fresh and self.findKeyLocked(key_id) != null) return;
+        switch (self.refreshDecisionLocked(key_id, now_sec)) {
+            .use_cached => return,
+            .refresh => {},
+            .reject => return error.OpenIdKeysInvalid,
+        }
 
         const had_cached_keys = self.keys.items.len > 0;
+        self.last_refresh_attempt = now_sec;
         self.refreshLocked(allocator, now_sec) catch |err| {
-            if (had_cached_keys and self.findKeyLocked(key_id) != null) {
+            if (had_cached_keys and
+                self.findKeyLocked(key_id) != null and
+                timestampWithin(now_sec, self.fetched_at, CACHE_TTL_SECS + STALE_KEY_GRACE_SECS))
+            {
                 log.warn("Bot Framework key refresh failed, using cached keys: {}", .{err});
                 return;
             }
             return err;
         };
+    }
+
+    fn refreshDecisionLocked(self: *const KeyCache, key_id: []const u8, now_sec: i64) RefreshDecision {
+        const has_key = self.findKeyLocked(key_id) != null;
+        const is_fresh = self.keys.items.len > 0 and timestampWithin(now_sec, self.fetched_at, CACHE_TTL_SECS);
+        if (is_fresh and has_key) return .use_cached;
+
+        if (timestampWithin(now_sec, self.last_refresh_attempt, KEY_REFRESH_COOLDOWN_SECS)) {
+            const within_stale_grace = timestampWithin(
+                now_sec,
+                self.fetched_at,
+                CACHE_TTL_SECS + STALE_KEY_GRACE_SECS,
+            );
+            return if (has_key and within_stale_grace) .use_cached else .reject;
+        }
+        return .refresh;
     }
 
     fn refreshLocked(self: *KeyCache, allocator: Allocator, now_sec: i64) VerifyError!void {
@@ -154,6 +186,7 @@ pub const KeyCache = struct {
         self.clearLocked(allocator);
         self.keys = new_keys;
         self.fetched_at = now_sec;
+        self.last_refresh_attempt = now_sec;
     }
 
     fn clearLocked(self: *KeyCache, allocator: Allocator) void {
@@ -161,6 +194,7 @@ pub const KeyCache = struct {
         self.keys.deinit(allocator);
         self.keys = .empty;
         self.fetched_at = 0;
+        self.last_refresh_attempt = 0;
     }
 
     fn findKeyLocked(self: *const KeyCache, key_id: []const u8) ?JwksKey {
@@ -172,14 +206,25 @@ pub const KeyCache = struct {
 
     pub fn seedFixtureForTest(self: *KeyCache, allocator: Allocator) !void {
         if (!builtin.is_test) unreachable;
+        return self.seedFixtureForTestAt(allocator, std_compat.time.timestamp());
+    }
+
+    fn seedFixtureForTestAt(self: *KeyCache, allocator: Allocator, fetched_at: i64) !void {
+        if (!builtin.is_test) unreachable;
         self.mutex.lock();
         defer self.mutex.unlock();
 
         self.clearLocked(allocator);
         self.keys = try parseJwksKeys(allocator, TEST_JWKS_JSON);
-        self.fetched_at = 1_800_000_000;
+        self.fetched_at = fetched_at;
     }
 };
+
+fn timestampWithin(now_sec: i64, timestamp_sec: i64, window_sec: i64) bool {
+    if (timestamp_sec == 0) return false;
+    if (now_sec < timestamp_sec) return false;
+    return now_sec - timestamp_sec < window_sec;
+}
 
 pub fn fixtureTokenForTest() []const u8 {
     if (!builtin.is_test) unreachable;
@@ -278,7 +323,10 @@ fn parseOpenIdMetadata(allocator: Allocator, json_bytes: []const u8) VerifyError
 }
 
 fn parseJwksKeys(allocator: Allocator, json_bytes: []const u8) VerifyError!std.ArrayListUnmanaged(JwksKey) {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return error.OpenIdKeysInvalid;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.OpenIdKeysInvalid,
+    };
     defer parsed.deinit();
 
     const obj = switch (parsed.value) {
@@ -318,8 +366,11 @@ fn parseJwksKeys(allocator: Allocator, json_bytes: []const u8) VerifyError!std.A
             allocator.free(endorsements);
         }
 
+        const kid_owned = try allocator.dupe(u8, kid);
+        errdefer allocator.free(kid_owned);
+
         try keys.append(allocator, .{
-            .kid = try allocator.dupe(u8, kid),
+            .kid = kid_owned,
             .x5t = x5t,
             .cert_der = cert_der,
             .endorsements = endorsements,
@@ -423,7 +474,7 @@ fn parseJwtClaims(allocator: Allocator, json_bytes: []const u8) VerifyError!JwtC
     };
 
     const iss = jsonObjectString(obj, "iss") orelse return error.MissingRequiredClaim;
-    const service_url = jsonObjectString(obj, "serviceUrl") orelse return error.MissingRequiredClaim;
+    const service_url = jsonObjectString(obj, "serviceurl") orelse jsonObjectString(obj, "serviceUrl") orelse return error.MissingRequiredClaim;
     const nbf = jsonObjectInt(obj, "nbf") orelse return error.MissingRequiredClaim;
     const exp = jsonObjectInt(obj, "exp") orelse return error.MissingRequiredClaim;
     const aud_value = obj.get("aud") orelse return error.MissingRequiredClaim;
@@ -626,6 +677,67 @@ test "verifyConnectorTokenAt rejects expired token" {
     );
 }
 
+test "Bot Framework JWKS fetch cap is two mebibytes" {
+    // Regression: the previous expression claimed 2 MiB but evaluated to 1 MiB,
+    // leaving too little headroom above Microsoft's live JWKS response.
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), MAX_KEYS_BYTES);
+}
+
+test "KeyCache throttles repeated refreshes for unknown key ids" {
+    // Regression: arbitrary unknown kid values could each force a metadata and
+    // JWKS download while the global key-cache mutex remained locked.
+    var cache = KeyCache{};
+    defer cache.deinit(std.testing.allocator);
+    try seedTestKey(&cache, std.testing.allocator);
+
+    const now_sec: i64 = 1_800_000_100;
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.use_cached,
+        cache.refreshDecisionLocked("test-kid", now_sec),
+    );
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.refresh,
+        cache.refreshDecisionLocked("unknown-kid", now_sec),
+    );
+
+    cache.last_refresh_attempt = now_sec;
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.reject,
+        cache.refreshDecisionLocked("unknown-kid", now_sec + 1),
+    );
+
+    cache.fetched_at = now_sec - CACHE_TTL_SECS - 1;
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.use_cached,
+        cache.refreshDecisionLocked("test-kid", now_sec + 1),
+    );
+
+    cache.fetched_at = now_sec - CACHE_TTL_SECS - STALE_KEY_GRACE_SECS;
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.reject,
+        cache.refreshDecisionLocked("test-kid", now_sec + 1),
+    );
+
+    cache.last_refresh_attempt = now_sec - KEY_REFRESH_COOLDOWN_SECS;
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.refresh,
+        cache.refreshDecisionLocked("unknown-kid", now_sec),
+    );
+
+    cache.fetched_at = now_sec + 1;
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.refresh,
+        cache.refreshDecisionLocked("test-kid", now_sec),
+    );
+
+    var empty_cache = KeyCache{ .last_refresh_attempt = now_sec };
+    defer empty_cache.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        KeyCache.RefreshDecision.reject,
+        empty_cache.refreshDecisionLocked("unknown-kid", now_sec + 1),
+    );
+}
+
 test "parseJwtClaims rejects floating numeric dates" {
     try std.testing.expectError(
         error.MissingRequiredClaim,
@@ -636,8 +748,58 @@ test "parseJwtClaims rejects floating numeric dates" {
     );
 }
 
+test "parseJwtClaims accepts lowercase serviceurl claim" {
+    // Bot Framework connector tokens emit the service URL as the lowercase
+    // claim "serviceurl" (AuthenticationConstants.ServiceUrlClaim), not camelCase.
+    var claims = try parseJwtClaims(
+        std.testing.allocator,
+        "{\"iss\":\"https://api.botframework.com\",\"aud\":\"test-app-id\",\"serviceurl\":\"https://smba.trafficmanager.net/amer/\",\"nbf\":1700000000,\"exp\":1900000000}",
+    );
+    defer claims.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://smba.trafficmanager.net/amer/", claims.service_url);
+}
+
+test "parseJwtClaims still accepts camelCase serviceUrl claim" {
+    // Backward compatibility: the camelCase spelling continues to parse.
+    var claims = try parseJwtClaims(
+        std.testing.allocator,
+        "{\"iss\":\"https://api.botframework.com\",\"aud\":\"test-app-id\",\"serviceUrl\":\"https://smba.trafficmanager.net/amer/\",\"nbf\":1700000000,\"exp\":1900000000}",
+    );
+    defer claims.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://smba.trafficmanager.net/amer/", claims.service_url);
+}
+
+test "parseJwtClaims prefers canonical lowercase serviceurl claim" {
+    // Regression: when both signed spellings are present, the SDK-defined
+    // lowercase serviceurl claim must take precedence over the legacy fallback.
+    var claims = try parseJwtClaims(
+        std.testing.allocator,
+        "{\"iss\":\"https://api.botframework.com\",\"aud\":\"test-app-id\",\"serviceurl\":\"https://canonical.example.com/\",\"serviceUrl\":\"https://legacy.example.com/\",\"nbf\":1700000000,\"exp\":1900000000}",
+    );
+    defer claims.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://canonical.example.com/", claims.service_url);
+}
+
+fn parseJwksKeysAllocationTest(allocator: Allocator) !void {
+    var keys = try parseJwksKeys(allocator, TEST_JWKS_JSON);
+    defer {
+        for (keys.items) |*key| key.deinit(allocator);
+        keys.deinit(allocator);
+    }
+}
+
+test "parseJwksKeys frees partial key on out-of-memory" {
+    // Regression: an allocation failure while growing the key list must free
+    // the already-owned kid, certificate, thumbprint, and endorsements.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseJwksKeysAllocationTest,
+        .{},
+    );
+}
+
 fn seedTestKey(cache: *KeyCache, allocator: Allocator) !void {
-    try cache.seedFixtureForTest(allocator);
+    try cache.seedFixtureForTestAt(allocator, 1_800_000_000);
 }
 
 const TEST_JWT =
