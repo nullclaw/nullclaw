@@ -384,7 +384,6 @@ pub const WsClient = struct {
         const opcode: Opcode = @enumFromInt(hdr[0] & 0x0F);
         const is_masked = (hdr[1] & 0x80) != 0;
         var payload_len: u64 = hdr[1] & 0x7F;
-
         if (payload_len == 126) {
             var ext: [2]u8 = undefined;
             try self.readExact(&ext);
