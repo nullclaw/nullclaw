@@ -90,6 +90,9 @@
     "backend": "markdown",
     "database_path": "",
     "auto_save": true,
+    "auto_recall": true,
+    "recall_limit": 5,
+    "max_context_bytes": 4000,
     "citations": "auto",
 
     "search": {
