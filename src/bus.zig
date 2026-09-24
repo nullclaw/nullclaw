@@ -252,11 +252,12 @@ fn dupeOutboundChoices(
         allocator.free(duped);
     }
     while (i < normalized.len) : (i += 1) {
-        duped[i] = .{
-            .id = try allocator.dupe(u8, normalized[i].id),
-            .label = try allocator.dupe(u8, normalized[i].label),
-            .submit_text = try allocator.dupe(u8, normalized[i].submit_text),
-        };
+        duped[i] = try outbound.Choice.initOwned(
+            allocator,
+            normalized[i].id,
+            normalized[i].label,
+            normalized[i].submit_text,
+        );
     }
     return duped;
 }

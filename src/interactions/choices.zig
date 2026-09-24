@@ -21,12 +21,44 @@ pub const ChoiceOption = struct {
     label: []const u8,
     submit_text: []const u8,
 
+    pub fn initOwned(
+        allocator: std.mem.Allocator,
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    ) !ChoiceOption {
+        const id_copy = try allocator.dupe(u8, id);
+        errdefer allocator.free(id_copy);
+        const label_copy = try allocator.dupe(u8, label);
+        errdefer allocator.free(label_copy);
+
+        return .{
+            .id = id_copy,
+            .label = label_copy,
+            .submit_text = try allocator.dupe(u8, submit_text),
+        };
+    }
+
     pub fn deinit(self: *const ChoiceOption, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.label);
         allocator.free(self.submit_text);
     }
 };
+
+fn initOwnedChoiceOptionAllocationTest(allocator: std.mem.Allocator) !void {
+    const option = try ChoiceOption.initOwned(allocator, "approve", "Approve", "approve request");
+    defer option.deinit(allocator);
+}
+
+// Regression: a failure while copying a later field must release earlier fields.
+test "interaction choice initOwned frees partial allocations on out-of-memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        initOwnedChoiceOptionAllocationTest,
+        .{},
+    );
+}
 
 pub const ChoicesDirective = struct {
     version: u8 = 1,

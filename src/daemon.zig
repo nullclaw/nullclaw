@@ -1154,11 +1154,12 @@ fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !A
             allocator.free(duped);
         }
         while (i < choices.options.len) : (i += 1) {
-            duped[i] = .{
-                .id = try allocator.dupe(u8, choices.options[i].id),
-                .label = try allocator.dupe(u8, choices.options[i].label),
-                .submit_text = try allocator.dupe(u8, choices.options[i].submit_text),
-            };
+            duped[i] = try outbound.Choice.initOwned(
+                allocator,
+                choices.options[i].id,
+                choices.options[i].label,
+                choices.options[i].submit_text,
+            );
         }
         break :blk duped;
     } else try allocator.alloc(outbound.Choice, 0);

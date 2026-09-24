@@ -672,10 +672,16 @@ pub const MaxChannel = struct {
         }
 
         for (choices, 0..) |choice, i| {
+            const owned = try interaction_choices.ChoiceOption.initOwned(
+                interaction_allocator,
+                choice.id,
+                choice.label,
+                choice.submit_text,
+            );
             options[i] = .{
-                .id = try interaction_allocator.dupe(u8, choice.id),
-                .label = try interaction_allocator.dupe(u8, choice.label),
-                .submit_text = try interaction_allocator.dupe(u8, choice.submit_text),
+                .id = owned.id,
+                .label = owned.label,
+                .submit_text = owned.submit_text,
             };
             built += 1;
         }

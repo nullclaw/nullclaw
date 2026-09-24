@@ -69,6 +69,12 @@ pub const DeliveryOutbox = struct {
             if (self.last_error) |last_error| allocator.free(last_error);
         }
 
+        fn replaceLastError(self: *Job, allocator: Allocator, err_name: []const u8) !void {
+            const replacement = try allocator.dupe(u8, err_name);
+            if (self.last_error) |last_error| allocator.free(last_error);
+            self.last_error = replacement;
+        }
+
         fn cloneForClaim(self: *const Job, allocator: Allocator) !ClaimedJob {
             const channel = try allocator.dupe(u8, self.channel);
             errdefer allocator.free(channel);
@@ -104,11 +110,12 @@ pub const DeliveryOutbox = struct {
                     allocator.free(duped);
                 }
                 while (i < self.choices.len) : (i += 1) {
-                    duped[i] = .{
-                        .id = try allocator.dupe(u8, self.choices[i].id),
-                        .label = try allocator.dupe(u8, self.choices[i].label),
-                        .submit_text = try allocator.dupe(u8, self.choices[i].submit_text),
-                    };
+                    duped[i] = try outbound.Choice.initOwned(
+                        allocator,
+                        self.choices[i].id,
+                        self.choices[i].label,
+                        self.choices[i].submit_text,
+                    );
                 }
                 break :blk duped;
             } else &[_]outbound.Choice{};
@@ -255,10 +262,9 @@ pub const DeliveryOutbox = struct {
 
         const index = self.findJobIndexLocked(id) orelse return error.JobNotFound;
         var job = &self.jobs.items[index];
+        try job.replaceLastError(self.allocator, err_name);
         job.in_flight = false;
         job.attempts += 1;
-        if (job.last_error) |last_error| self.allocator.free(last_error);
-        job.last_error = try self.allocator.dupe(u8, err_name);
         job.next_attempt_ns = now_ns + retryBackoffNs(job.attempts);
         try self.saveLocked();
     }
@@ -305,11 +311,12 @@ pub const DeliveryOutbox = struct {
                 self.allocator.free(duped);
             }
             while (i < msg.choices.len) : (i += 1) {
-                duped[i] = .{
-                    .id = try self.allocator.dupe(u8, msg.choices[i].id),
-                    .label = try self.allocator.dupe(u8, msg.choices[i].label),
-                    .submit_text = try self.allocator.dupe(u8, msg.choices[i].submit_text),
-                };
+                duped[i] = try outbound.Choice.initOwned(
+                    self.allocator,
+                    msg.choices[i].id,
+                    msg.choices[i].label,
+                    msg.choices[i].submit_text,
+                );
             }
             break :blk duped;
         } else &[_]outbound.Choice{};
@@ -541,11 +548,7 @@ fn parseChoices(allocator: Allocator, value: ?std.json.Value) ![]const outbound.
         const id = jsonString(entry.object.get("id")) orelse continue;
         const label = jsonString(entry.object.get("label")) orelse continue;
         const submit_text = jsonString(entry.object.get("submit_text")) orelse continue;
-        duped[count] = .{
-            .id = try allocator.dupe(u8, id),
-            .label = try allocator.dupe(u8, label),
-            .submit_text = try allocator.dupe(u8, submit_text),
-        };
+        duped[count] = try outbound.Choice.initOwned(allocator, id, label, submit_text);
         count += 1;
     }
 
@@ -559,6 +562,24 @@ fn parseChoices(allocator: Allocator, value: ?std.json.Value) ![]const outbound.
     @memcpy(trimmed, duped[0..count]);
     allocator.free(duped);
     return trimmed;
+}
+
+fn replaceLastErrorAllocationTest(allocator: Allocator) !void {
+    var job: DeliveryOutbox.Job = undefined;
+    job.last_error = try allocator.dupe(u8, "old error");
+    defer if (job.last_error) |last_error| allocator.free(last_error);
+
+    try job.replaceLastError(allocator, "new error");
+    try std.testing.expectEqualStrings("new error", job.last_error.?);
+}
+
+// Regression: allocation failure must leave the previous owned error valid.
+test "delivery outbox replaceLastError survives out-of-memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        replaceLastErrorAllocationTest,
+        .{},
+    );
 }
 
 test "delivery outbox persists and reloads final message" {
