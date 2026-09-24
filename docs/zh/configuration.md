@@ -709,6 +709,9 @@ Max 说明：
 
 - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
 - `auto_save`: 开启后会自动持久化会话记忆。
+- `auto_recall`（默认：`true`）：设为 `false` 时跳过对入站消息的自动记忆注入。`auto_save` 的存储和 `memory_recall` 工具的按需召回不受影响。
+- `recall_limit`（默认：`5`）：每条消息最多注入的记忆条数。
+- `max_context_bytes`（默认：`4000`）：注入记忆块的字节预算。单条记忆会被截断到预算的一半；按 UTF-8 字节计数。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 
 **注意**：`markdown_only` 内存配置文件会自动启用混合检索和时间衰减（半衰期 30 天），以实现最佳的相关性评分。这确保了对纯 markdown 文件的时间感知能力。
