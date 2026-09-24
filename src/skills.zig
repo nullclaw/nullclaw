@@ -714,6 +714,21 @@ fn checkBinaryExists(allocator: std.mem.Allocator, bin_name: []const u8) bool {
 /// Scan workspace_dir/skills/ for direct skill directories and one level of
 /// category subdirectories, loading each discovered entry as a Skill.
 /// Returns owned slice; caller must free with freeSkills().
+/// True when a skills-directory entry names a directory, following a symlink
+/// to its target. Skill directories may be symlinks so a single canonical
+/// copy (e.g. a shared skills repo) can serve many agents and hosts — each
+/// placing a link inside its own workspace (upstream #995). Broken or
+/// non-directory targets resolve to false and are skipped. This covers only
+/// user-placed entries: the archive audit still rejects symlink entries
+/// inside web-installed skill archives.
+fn entryResolvesToDirectory(parent_path: []const u8, name: []const u8) bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ parent_path, name }) catch return false;
+    var d = fs_compat.openDirPath(path, .{}) catch return false;
+    d.close();
+    return true;
+}
+
 pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8, observer: ?observability.Observer) ![]Skill {
     const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
     defer allocator.free(skills_dir_path);
@@ -734,7 +749,12 @@ pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8, obser
 
     var it = dir_mut.iterate();
     while (try it.next()) |entry| {
-        if (entry.kind != .directory) continue;
+        const is_skill_dir = switch (entry.kind) {
+            .directory => true,
+            .sym_link => entryResolvesToDirectory(skills_dir_path, entry.name),
+            else => false,
+        };
+        if (!is_skill_dir) continue;
 
         const sub_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, entry.name });
         defer allocator.free(sub_path);
@@ -769,7 +789,12 @@ fn scanCategoryDir(
 
     var cat_it = cat_dir_mut.iterate();
     while (try cat_it.next()) |entry| {
-        if (entry.kind != .directory) continue;
+        const is_skill_dir = switch (entry.kind) {
+            .directory => true,
+            .sym_link => entryResolvesToDirectory(category_path, entry.name),
+            else => false,
+        };
+        if (!is_skill_dir) continue;
 
         const nested_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ category_path, entry.name });
         defer allocator.free(nested_path);
@@ -3434,6 +3459,54 @@ test "listSkills discovers skills in subdirectories" {
     }
     try std.testing.expect(found_alpha);
     try std.testing.expect(found_beta);
+}
+
+test "listSkills follows symlinked skill directories" {
+    // Regression (upstream #995): a symlinked skill directory was skipped by
+    // the kind != .directory filter, so a skill shared from a canonical repo
+    // (one symlink per agent) was invisible to `nullclaw skills list`.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // symlink creation needs privileges
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wrap = @import("compat").fs.Dir.wrap(tmp.dir);
+
+    // Canonical skill kept outside the workspace skills dir (e.g. a shared repo).
+    try wrap.makePath("canonical-repo/git-helper");
+    {
+        const f = try wrap.createFile("canonical-repo/git-helper/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"git-helper\", \"version\": \"1.0.0\", \"description\": \"Shared skill\", \"author\": \"repo\"}");
+    }
+
+    // Workspace: one real skill (control) + one symlinked skill + one broken link.
+    try wrap.makePath("skills/local-only");
+    {
+        const f = try wrap.createFile("skills/local-only/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"local-only\", \"version\": \"1.0.0\", \"description\": \"Local skill\", \"author\": \"dev\"}");
+    }
+    const base = try wrap.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const canonical = try std.fmt.allocPrint(allocator, "{s}/canonical-repo/git-helper", .{base});
+    defer allocator.free(canonical);
+    try wrap.symLink(canonical, "skills/git-helper", .{});
+    try wrap.symLink("/nonexistent-skill-target", "skills/broken-link", .{});
+
+    const skills = try listSkills(allocator, base, null);
+    defer freeSkills(allocator, skills);
+
+    try std.testing.expectEqual(@as(usize, 2), skills.len);
+    var found_shared = false;
+    var found_local = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "git-helper")) found_shared = true;
+        if (std.mem.eql(u8, s.name, "local-only")) found_local = true;
+        try std.testing.expect(!std.mem.eql(u8, s.name, "broken-link"));
+    }
+    try std.testing.expect(found_shared);
+    try std.testing.expect(found_local);
 }
 
 test "listSkills discovers skills nested inside a category directory" {
