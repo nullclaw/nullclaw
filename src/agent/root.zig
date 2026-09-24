@@ -41,6 +41,10 @@ pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const memory_loader = @import("memory_loader.zig");
 pub const commands = @import("commands.zig");
+pub const result_compress = @import("result_compress.zig");
+pub const loop_guard = @import("loop_guard.zig");
+pub const parallel_tools_mod = @import("parallel_tools.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
@@ -345,6 +349,9 @@ pub const Agent = struct {
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
+    parallel_tools: bool = false,
+    local_loop: config_types.LocalLoopConfig = .{},
+    turn_loop_guard: loop_guard.LoopGuard = .{ .config = .{} },
 
     /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
     /// Empty = no filtering; all tool specs are sent as-is.
@@ -628,6 +635,13 @@ pub const Agent = struct {
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .default_queue_mode = cfg.agent.default_queue_mode,
             .queue_mode = cfg.agent.default_queue_mode,
+            .parallel_tools = cfg.agent.parallel_tools,
+            .local_loop = cfg.agent.local_loop,
+            .turn_loop_guard = loop_guard.LoopGuard.init(.{
+                .warn_at = cfg.agent.local_loop.identical_call_warn,
+                .veto_at = cfg.agent.local_loop.identical_call_veto,
+                .force_reply_after_vetoes = cfg.agent.local_loop.identical_call_force_reply,
+            }),
             .tools_config = cfg.tools,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .default_exec_security = resolved_exec_security,
@@ -644,6 +658,7 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         if (self.bootstrap) |bp| bp.deinit();
+        self.turn_loop_guard.deinit(self.allocator);
         if (self.redactor) |r| {
             r.deinit();
             self.allocator.destroy(r);
@@ -1942,6 +1957,7 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
+        self.turn_loop_guard.reset();
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
@@ -2716,90 +2732,38 @@ pub const Agent = struct {
                 log.info("tool-call batch session=0x{x} count={d}", .{ session_hash, parsed_calls.len });
             }
 
-            for (parsed_calls, 0..) |call, idx| {
-                if (self.isInterruptRequested()) {
-                    self.freeResponseFields(&response);
-                    return self.interruptedReply();
-                }
-
-                if (self.log_tool_calls) {
-                    log.info(
-                        "tool-call start session=0x{x} index={d} name={s} id={s}",
-                        .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
-                    );
-                }
-
-                const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
-                self.observer.recordEvent(&tool_start_event);
-                if (self.progress_callback) |cb| {
-                    if (self.progress_ctx) |pctx| cb(pctx, .{ .text = call.name });
-                }
-
-                const tool_timer = std_compat.time.milliTimestamp();
-                const result = blk: {
-                    if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
-                        break :blk ToolExecutionResult{
-                            .name = call.name,
-                            .output = cached_result.output,
-                            .success = cached_result.success,
-                            .tool_call_id = call.tool_call_id,
-                        };
-                    }
-                    const executed_result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
-                        ToolExecutionResult{
-                            .name = call.name,
-                            .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
-                            .success = true,
-                            .tool_call_id = call.tool_call_id,
-                        }
-                    else
-                        self.executeTool(arena, call);
-                    rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
-                    break :blk executed_result;
-                };
-                const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
-
-                if (self.log_tool_calls) {
-                    log.info(
-                        "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
-                        .{ session_hash, idx + 1, call.name, result.success, tool_duration },
-                    );
-                }
-
-                var tool_args_buf: [1024]u8 = undefined;
-                var tool_detail_buf: [1024]u8 = undefined;
-                const tool_args = if (self.log_llm_io) blk: {
-                    const safe_args = self.diagnosticText(arena, call.arguments_json);
-                    break :blk toolArgsObserverDetail(&tool_args_buf, safe_args);
-                } else null;
-                const tool_detail = if (self.log_llm_io) blk: {
-                    const safe_output = self.safeToolDiagnosticText(arena, result.output);
-                    break :blk toolResultObserverDetail(&tool_detail_buf, safe_output);
-                } else if (!result.success) blk: {
-                    break :blk self.safeToolDiagnosticText(arena, result.output);
-                } else null;
-                const tool_event = ObserverEvent{ .tool_call = .{
-                    .tool = call.name,
-                    .duration_ms = tool_duration,
-                    .success = result.success,
-                    .args = tool_args,
-                    .detail = tool_detail,
-                } };
-                self.observer.recordEvent(&tool_event);
-
-                try results_buf.append(self.allocator, result);
+            var loop_guard_notice: ?[]const u8 = null;
+            if (try self.executeToolCallBatch(
+                arena,
+                parsed_calls,
+                &seen_tool_call_results,
+                batch_updates_tools_md,
+                session_hash,
+                &results_buf,
+                &loop_guard_notice,
+                &response,
+            )) |forced_reply| {
+                return forced_reply;
             }
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
             const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
             const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
             const redacted_results = if (self.redactor) |r| try r.redact(arena, scrubbed_results) else scrubbed_results;
+            const reflection_body = if (loop_guard_notice) |notice|
+                try std.fmt.allocPrint(
+                    arena,
+                    "{s}\n\n{s}",
+                    .{ notice, redacted_results },
+                )
+            else
+                redacted_results;
             const with_reflection = try std.fmt.allocPrint(
                 arena,
                 "{s}\n\nReflect on the tool results above and decide your next steps. " ++
                     "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
                     "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
-                .{redacted_results},
+                .{reflection_body},
             );
             try self.history.append(self.allocator, .{
                 .role = .user,
@@ -3076,7 +3040,461 @@ pub const Agent = struct {
             std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
     }
 
-    fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+    const loop_guard_warn_notice =
+        "Notice: you already executed an identical tool call in this turn; try a different tool or approach.";
+    const loop_guard_force_reply =
+        "[Loop guard] Repeated identical tool calls detected. Stopping to avoid a runaway loop.";
+
+    fn toolResultCompressOptions(self: *const Agent, is_error: bool) result_compress.CompressOptions {
+        const ll = self.local_loop;
+        const max_chars = if (ll.enabled and ll.max_result_chars == result_compress.DEFAULT_MAX_RESULT_CHARS)
+            result_compress.LOCAL_LOOP_MAX_RESULT_CHARS
+        else
+            ll.max_result_chars;
+        return .{
+            .max_chars = max_chars,
+            .max_tail_lines = ll.max_result_tail_lines,
+            .is_error = is_error,
+        };
+    }
+
+    fn compressToolResultForHistory(
+        self: *const Agent,
+        arena: std.mem.Allocator,
+        raw: ToolExecutionResult,
+    ) !ToolExecutionResult {
+        const compress_opts = self.toolResultCompressOptions(!raw.success);
+        const compressed = result_compress.compressToolOutput(arena, raw.output, compress_opts) catch raw.output;
+        return .{
+            .name = raw.name,
+            .output = compressed,
+            .success = raw.success,
+            .tool_call_id = raw.tool_call_id,
+        };
+    }
+
+    fn recordToolCallObserver(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        call: ParsedToolCall,
+        result: ToolExecutionResult,
+        tool_duration: u64,
+    ) void {
+        var tool_args_buf: [1024]u8 = undefined;
+        var tool_detail_buf: [1024]u8 = undefined;
+        const tool_args = if (self.log_llm_io) blk: {
+            const safe_args = self.diagnosticText(arena, call.arguments_json);
+            break :blk toolArgsObserverDetail(&tool_args_buf, safe_args);
+        } else null;
+        const tool_detail = if (self.log_llm_io) blk: {
+            const safe_output = self.safeToolDiagnosticText(arena, result.output);
+            break :blk toolResultObserverDetail(&tool_detail_buf, safe_output);
+        } else if (!result.success) blk: {
+            break :blk self.safeToolDiagnosticText(arena, result.output);
+        } else null;
+        const tool_event = ObserverEvent{ .tool_call = .{
+            .tool = call.name,
+            .duration_ms = tool_duration,
+            .success = result.success,
+            .args = tool_args,
+            .detail = tool_detail,
+        } };
+        self.observer.recordEvent(&tool_event);
+    }
+
+    fn resolveRawToolCallResult(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        call: ParsedToolCall,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        batch_updates_tools_md: bool,
+        guard_action: loop_guard.LoopGuardAction,
+        veto_count: u32,
+    ) ToolExecutionResult {
+        if (cachedToolCallResultInTurn(seen_tool_call_results, call)) |cached_result| {
+            return .{
+                .name = call.name,
+                .output = cached_result.output,
+                .success = cached_result.success,
+                .tool_call_id = call.tool_call_id,
+            };
+        }
+        if (guard_action == .veto or guard_action == .force_reply) {
+            const skipped = std.fmt.allocPrint(
+                arena,
+                "Skipped: identical tool call repeated {d} times",
+                .{veto_count},
+            ) catch "Skipped: identical tool call repeated too many times";
+            const skipped_result = ToolExecutionResult{
+                .name = call.name,
+                .output = skipped,
+                .success = false,
+                .tool_call_id = call.tool_call_id,
+            };
+            rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, call, skipped_result);
+            return skipped_result;
+        }
+        const executed_result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+            ToolExecutionResult{
+                .name = call.name,
+                .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
+                .success = true,
+                .tool_call_id = call.tool_call_id,
+            }
+        else
+            self.executeTool(arena, call);
+        rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, call, executed_result);
+        return executed_result;
+    }
+
+    fn resolveToolCallWithoutExecute(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        call: ParsedToolCall,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        batch_updates_tools_md: bool,
+        guard_action: loop_guard.LoopGuardAction,
+        veto_count: u32,
+    ) ?ToolExecutionResult {
+        if (cachedToolCallResultInTurn(seen_tool_call_results, call)) |cached_result| {
+            return .{
+                .name = call.name,
+                .output = cached_result.output,
+                .success = cached_result.success,
+                .tool_call_id = call.tool_call_id,
+            };
+        }
+        if (guard_action == .veto or guard_action == .force_reply) {
+            const skipped = std.fmt.allocPrint(
+                arena,
+                "Skipped: identical tool call repeated {d} times",
+                .{veto_count},
+            ) catch "Skipped: identical tool call repeated too many times";
+            const skipped_result = ToolExecutionResult{
+                .name = call.name,
+                .output = skipped,
+                .success = false,
+                .tool_call_id = call.tool_call_id,
+            };
+            rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, call, skipped_result);
+            return skipped_result;
+        }
+        if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call)) {
+            const skipped_result = ToolExecutionResult{
+                .name = call.name,
+                .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
+                .success = true,
+                .tool_call_id = call.tool_call_id,
+            };
+            rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, call, skipped_result);
+            return skipped_result;
+        }
+        return null;
+    }
+
+    fn appendCompressedToolResultForHistory(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+        raw_result: ToolExecutionResult,
+    ) !void {
+        const history_result = try self.compressToolResultForHistory(arena, raw_result);
+        try results_buf.append(self.allocator, history_result);
+    }
+
+    fn executeToolCallBatch(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        parsed_calls: []const ParsedToolCall,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        batch_updates_tools_md: bool,
+        session_hash: u64,
+        results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+        loop_guard_notice: *?[]const u8,
+        response: *ChatResponse,
+    ) !?[]const u8 {
+        if (parallel_tools_mod.shouldRunParallelReadOnlyBatch(self.parallel_tools, parsed_calls)) {
+            return try self.executeParallelReadOnlyToolBatch(
+                arena,
+                parsed_calls,
+                seen_tool_call_results,
+                batch_updates_tools_md,
+                session_hash,
+                results_buf,
+                loop_guard_notice,
+                response,
+            );
+        }
+        return try self.executeSequentialToolBatch(
+            arena,
+            parsed_calls,
+            seen_tool_call_results,
+            batch_updates_tools_md,
+            session_hash,
+            results_buf,
+            loop_guard_notice,
+            response,
+        );
+    }
+
+    fn executeSequentialToolBatch(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        parsed_calls: []const ParsedToolCall,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        batch_updates_tools_md: bool,
+        session_hash: u64,
+        results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+        loop_guard_notice: *?[]const u8,
+        response: *ChatResponse,
+    ) !?[]const u8 {
+        for (parsed_calls, 0..) |call, idx| {
+            if (try self.executeOneToolCallInBatch(
+                arena,
+                call,
+                idx,
+                seen_tool_call_results,
+                batch_updates_tools_md,
+                session_hash,
+                results_buf,
+                loop_guard_notice,
+                response,
+            )) |forced_reply| {
+                return forced_reply;
+            }
+        }
+        return null;
+    }
+
+    const ParallelReadOnlyWorker = struct {
+        agent: *Agent,
+        exec_mutex: *std_compat.sync.Mutex,
+        parent_arena: std.mem.Allocator,
+        call: ParsedToolCall,
+        result: ToolExecutionResult = undefined,
+        duration_ms: u64 = 0,
+        err: ?anyerror = null,
+
+        fn run(ctx: *ParallelReadOnlyWorker) void {
+            var thread_arena = std.heap.ArenaAllocator.init(ctx.agent.allocator);
+            defer thread_arena.deinit();
+            const tool_timer = std_compat.time.milliTimestamp();
+            ctx.exec_mutex.lock();
+            const blocked = ctx.agent.checkToolPolicyGate(ctx.call);
+            ctx.exec_mutex.unlock();
+            if (blocked) |policy_result| {
+                ctx.result = policy_result;
+                ctx.duration_ms = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
+                return;
+            }
+            const raw = ctx.agent.executeToolBody(thread_arena.allocator(), ctx.call);
+            ctx.duration_ms = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
+            const output_copy = ctx.parent_arena.dupe(u8, raw.output) catch {
+                ctx.err = error.OutOfMemory;
+                return;
+            };
+            ctx.result = .{
+                .name = ctx.call.name,
+                .output = output_copy,
+                .success = raw.success,
+                .tool_call_id = ctx.call.tool_call_id,
+            };
+        }
+    };
+
+    const ParallelBatchSlot = struct {
+        call: ParsedToolCall,
+        raw_result: ?ToolExecutionResult = null,
+        duration_ms: u64 = 0,
+    };
+
+    fn executeParallelReadOnlyToolBatch(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        parsed_calls: []const ParsedToolCall,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        batch_updates_tools_md: bool,
+        session_hash: u64,
+        results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+        loop_guard_notice: *?[]const u8,
+        response: *ChatResponse,
+    ) !?[]const u8 {
+        var slots = try arena.alloc(ParallelBatchSlot, parsed_calls.len);
+        for (slots) |*slot| slot.* = .{ .call = undefined };
+
+        var pending_indices: std.ArrayListUnmanaged(usize) = .empty;
+        defer pending_indices.deinit(arena);
+        try pending_indices.ensureTotalCapacity(arena, parsed_calls.len);
+
+        const veto_count = self.turn_loop_guard.config.veto_at;
+
+        for (parsed_calls, 0..) |call, idx| {
+            if (self.isInterruptRequested()) {
+                self.freeResponseFields(response);
+                return try self.interruptedReply();
+            }
+
+            slots[idx].call = call;
+
+            if (self.log_tool_calls) {
+                log.info(
+                    "tool-call start session=0x{x} index={d} name={s} id={s}",
+                    .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
+                );
+            }
+
+            const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
+            self.observer.recordEvent(&tool_start_event);
+            if (self.progress_callback) |cb| {
+                if (self.progress_ctx) |pctx| cb(pctx, .{ .text = call.name });
+            }
+
+            const guard_action = try self.turn_loop_guard.record(self.allocator, call.name, call.arguments_json);
+            if (guard_action == .force_reply) {
+                self.freeResponseFields(response);
+                return try self.allocator.dupe(u8, loop_guard_force_reply);
+            }
+            if (guard_action == .warn and loop_guard_notice.* == null) {
+                loop_guard_notice.* = loop_guard_warn_notice;
+            }
+
+            if (self.resolveToolCallWithoutExecute(
+                arena,
+                call,
+                seen_tool_call_results,
+                batch_updates_tools_md,
+                guard_action,
+                veto_count,
+            )) |resolved| {
+                slots[idx].raw_result = resolved;
+                continue;
+            }
+
+            try pending_indices.append(arena, idx);
+        }
+
+        if (pending_indices.items.len > 0) {
+            var exec_mutex = std_compat.sync.Mutex{};
+            const max_parallel = @max(1, self.local_loop.max_parallel_readonly);
+            var cursor: usize = 0;
+            while (cursor < pending_indices.items.len) {
+                const chunk_end = @min(cursor + max_parallel, pending_indices.items.len);
+                const chunk_len = chunk_end - cursor;
+
+                if (chunk_len == 1) {
+                    const slot_idx = pending_indices.items[cursor];
+                    const call = slots[slot_idx].call;
+                    const tool_timer = std_compat.time.milliTimestamp();
+                    const raw = self.executeTool(arena, call);
+                    rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, call, raw);
+                    slots[slot_idx].raw_result = raw;
+                    slots[slot_idx].duration_ms = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
+                } else {
+                    var workers = try arena.alloc(ParallelReadOnlyWorker, chunk_len);
+                    var threads = try arena.alloc(std.Thread, chunk_len);
+                    for (0..chunk_len) |offset| {
+                        const slot_idx = pending_indices.items[cursor + offset];
+                        workers[offset] = .{
+                            .agent = self,
+                            .exec_mutex = &exec_mutex,
+                            .parent_arena = arena,
+                            .call = slots[slot_idx].call,
+                        };
+                        threads[offset] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, ParallelReadOnlyWorker.run, .{&workers[offset]});
+                    }
+                    for (0..chunk_len) |offset| {
+                        threads[offset].join();
+                        if (workers[offset].err) |err| return err;
+                        const slot_idx = pending_indices.items[cursor + offset];
+                        rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, workers[offset].call, workers[offset].result);
+                        slots[slot_idx].raw_result = workers[offset].result;
+                        slots[slot_idx].duration_ms = workers[offset].duration_ms;
+                    }
+                }
+                cursor = chunk_end;
+            }
+        }
+
+        for (slots, 0..) |slot, idx| {
+            const raw_result = slot.raw_result orelse return error.MissingParallelToolResult;
+            if (self.log_tool_calls) {
+                log.info(
+                    "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
+                    .{ session_hash, idx + 1, slot.call.name, raw_result.success, slot.duration_ms },
+                );
+            }
+            self.recordToolCallObserver(arena, slot.call, raw_result, slot.duration_ms);
+            try self.appendCompressedToolResultForHistory(arena, results_buf, raw_result);
+        }
+
+        return null;
+    }
+
+    fn executeOneToolCallInBatch(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        call: ParsedToolCall,
+        idx: usize,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        batch_updates_tools_md: bool,
+        session_hash: u64,
+        results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+        loop_guard_notice: *?[]const u8,
+        response: *ChatResponse,
+    ) !?[]const u8 {
+        if (self.isInterruptRequested()) {
+            self.freeResponseFields(response);
+            return try self.interruptedReply();
+        }
+
+        if (self.log_tool_calls) {
+            log.info(
+                "tool-call start session=0x{x} index={d} name={s} id={s}",
+                .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
+            );
+        }
+
+        const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
+        self.observer.recordEvent(&tool_start_event);
+        if (self.progress_callback) |cb| {
+            if (self.progress_ctx) |pctx| cb(pctx, .{ .text = call.name });
+        }
+
+        const guard_action = try self.turn_loop_guard.record(self.allocator, call.name, call.arguments_json);
+        if (guard_action == .force_reply) {
+            self.freeResponseFields(response);
+            return try self.allocator.dupe(u8, loop_guard_force_reply);
+        }
+        if (guard_action == .warn and loop_guard_notice.* == null) {
+            loop_guard_notice.* = loop_guard_warn_notice;
+        }
+
+        const tool_timer = std_compat.time.milliTimestamp();
+        const veto_count = self.turn_loop_guard.config.veto_at;
+        const raw_result = self.resolveRawToolCallResult(
+            arena,
+            call,
+            seen_tool_call_results,
+            batch_updates_tools_md,
+            guard_action,
+            veto_count,
+        );
+        const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
+
+        if (self.log_tool_calls) {
+            log.info(
+                "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
+                .{ session_hash, idx + 1, call.name, raw_result.success, tool_duration },
+            );
+        }
+
+        self.recordToolCallObserver(arena, call, raw_result, tool_duration);
+        const history_result = try self.compressToolResultForHistory(arena, raw_result);
+        try results_buf.append(self.allocator, history_result);
+        return null;
+    }
+
+    fn checkToolPolicyGate(self: *Agent, call: ParsedToolCall) ?ToolExecutionResult {
         if (self.isInterruptRequested()) {
             return .{
                 .name = call.name,
@@ -3086,7 +3504,6 @@ pub const Agent = struct {
             };
         }
 
-        // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
             if (!pol.canAct()) {
                 return .{
@@ -3106,7 +3523,15 @@ pub const Agent = struct {
                 };
             }
         }
+        return null;
+    }
 
+    fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+        if (self.checkToolPolicyGate(call)) |blocked| return blocked;
+        return self.executeToolBody(tool_allocator, call);
+    }
+
+    fn executeToolBody(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
 
         for (self.tools) |t| {
@@ -10947,6 +11372,817 @@ test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("*", "anything"));
     try std.testing.expect(Agent.globMatch("shell", "shell"));
     try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
+}
+
+test "toolResultCompressOptions uses 400 char cap when local_loop enabled" {
+    var agent = try makeTestAgent(std.testing.allocator);
+    defer agent.deinit();
+    agent.local_loop.enabled = true;
+    const opts = agent.toolResultCompressOptions(false);
+    try std.testing.expectEqual(result_compress.LOCAL_LOOP_MAX_RESULT_CHARS, opts.max_chars);
+}
+
+test "toolResultCompressOptions honors explicit max_result_chars override" {
+    var agent = try makeTestAgent(std.testing.allocator);
+    defer agent.deinit();
+    agent.local_loop.enabled = true;
+    agent.local_loop.max_result_chars = 900;
+    const opts = agent.toolResultCompressOptions(false);
+    try std.testing.expectEqual(@as(u32, 900), opts.max_chars);
+}
+
+test "Agent turn compresses verbose tool output in history when local_loop enabled" {
+    const VerboseTool = struct {
+        const Self = @This();
+        pub const tool_name = "verbose_probe";
+        pub const tool_description = "Returns a large tool output";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "x" ** 10_000),
+            };
+        }
+    };
+
+    const StepProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-verbose"),
+                    .name = try allocator.dupe(u8, "verbose_probe"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "Running verbose tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "verbose-step-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StepProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StepProvider.chatWithSystem,
+        .chat = StepProvider.chat,
+        .supportsNativeTools = StepProvider.supportsNativeTools,
+        .getName = StepProvider.getName,
+        .deinit = StepProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = VerboseTool{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .local_loop = .{ .enabled = true },
+    };
+    defer agent.deinit();
+
+    const reply = try agent.turn("run verbose tool");
+    defer allocator.free(reply);
+
+    var found_compressed_history = false;
+    for (agent.history.items) |msg| {
+        if (msg.role != .user) continue;
+        if (std.mem.indexOf(u8, msg.content, "… [truncated]") != null) {
+            found_compressed_history = true;
+            try std.testing.expect(msg.content.len < 2000);
+        }
+    }
+    try std.testing.expect(found_compressed_history);
+}
+
+test "Agent loop guard prepends warn notice on third identical call in batch" {
+    const CountingTool = struct {
+        const Self = @This();
+        exec_count: usize = 0,
+        pub const tool_name = "count_probe";
+        pub const tool_description = "Counts executions";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, args: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.exec_count += 1;
+            const path_val = args.get("path") orelse return .{ .success = false, .output = try allocator.dupe(u8, "missing path") };
+            const path = switch (path_val) {
+                .string => |s| s,
+                else => return .{ .success = false, .output = try allocator.dupe(u8, "bad path") },
+            };
+            return .{
+                .success = true,
+                .output = try std.fmt.allocPrint(allocator, "read {s}", .{path}),
+            };
+        }
+    };
+
+    const MultiCallProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 3);
+                for (tool_calls, 0..) |*tc, i| {
+                    tc.* = .{
+                        .id = try std.fmt.allocPrint(allocator, "call-{d}", .{i}),
+                        .name = try allocator.dupe(u8, "count_probe"),
+                        .arguments = try allocator.dupe(u8, "{\"path\":\"same.txt\"}"),
+                    };
+                }
+                return .{
+                    .content = try allocator.dupe(u8, "triple call"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "multi-call-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = MultiCallProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = MultiCallProvider.chatWithSystem,
+        .chat = MultiCallProvider.chat,
+        .supportsNativeTools = MultiCallProvider.supportsNativeTools,
+        .getName = MultiCallProvider.getName,
+        .deinit = MultiCallProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = CountingTool{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .turn_loop_guard = loop_guard.LoopGuard.init(.{ .warn_at = 3, .veto_at = 5 }),
+    };
+    defer agent.deinit();
+
+    const reply = try agent.turn("repeat reads");
+    defer allocator.free(reply);
+    var found_notice = false;
+    for (agent.history.items) |msg| {
+        if (msg.role == .user and std.mem.indexOf(u8, msg.content, "identical tool call") != null) {
+            found_notice = true;
+        }
+    }
+    try std.testing.expect(found_notice);
+    try std.testing.expectEqual(@as(usize, 3), tool_impl.exec_count);
+}
+
+test "Agent loop guard vetoes fifth identical call in batch" {
+    const CountingTool = struct {
+        const Self = @This();
+        exec_count: usize = 0,
+        pub const tool_name = "count_probe";
+        pub const tool_description = "Counts executions";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, args: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.exec_count += 1;
+            const path_val = args.get("path") orelse return .{ .success = false, .output = try allocator.dupe(u8, "missing path") };
+            const path = switch (path_val) {
+                .string => |s| s,
+                else => return .{ .success = false, .output = try allocator.dupe(u8, "bad path") },
+            };
+            return .{
+                .success = true,
+                .output = try std.fmt.allocPrint(allocator, "read {s}", .{path}),
+            };
+        }
+    };
+
+    const MultiCallProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 5);
+                for (tool_calls, 0..) |*tc, i| {
+                    tc.* = .{
+                        .id = try std.fmt.allocPrint(allocator, "call-{d}", .{i}),
+                        .name = try allocator.dupe(u8, "count_probe"),
+                        .arguments = try allocator.dupe(u8, "{\"path\":\"same.txt\"}"),
+                    };
+                }
+                return .{
+                    .content = try allocator.dupe(u8, "quintuple call"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "multi-call-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = MultiCallProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = MultiCallProvider.chatWithSystem,
+        .chat = MultiCallProvider.chat,
+        .supportsNativeTools = MultiCallProvider.supportsNativeTools,
+        .getName = MultiCallProvider.getName,
+        .deinit = MultiCallProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = CountingTool{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .turn_loop_guard = loop_guard.LoopGuard.init(.{ .warn_at = 3, .veto_at = 5 }),
+    };
+    defer agent.deinit();
+
+    const reply = try agent.turn("repeat reads");
+    defer allocator.free(reply);
+    try std.testing.expectEqual(@as(usize, 4), tool_impl.exec_count);
+    var found_skip = false;
+    for (agent.history.items) |msg| {
+        if (msg.role == .user and std.mem.indexOf(u8, msg.content, "Skipped: identical tool call repeated") != null) {
+            found_skip = true;
+        }
+    }
+    try std.testing.expect(found_skip);
+}
+
+test "parallel_tools executes all read-only calls in one batch" {
+    const FileReadStub = struct {
+        const Self = @This();
+        exec_count: usize = 0,
+        pub const tool_name = "file_read";
+        pub const tool_description = "Stub file read";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, args: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.exec_count += 1;
+            const path_val = args.get("path") orelse return .{ .success = false, .output = try allocator.dupe(u8, "missing path") };
+            const path = switch (path_val) {
+                .string => |s| s,
+                else => return .{ .success = false, .output = try allocator.dupe(u8, "bad path") },
+            };
+            return .{
+                .success = true,
+                .output = try std.fmt.allocPrint(allocator, "contents of {s}", .{path}),
+            };
+        }
+    };
+
+    const DualReadProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-a"),
+                    .name = try allocator.dupe(u8, "file_read"),
+                    .arguments = try allocator.dupe(u8, "{\"path\":\"a.txt\"}"),
+                };
+                tool_calls[1] = .{
+                    .id = try allocator.dupe(u8, "call-b"),
+                    .name = try allocator.dupe(u8, "file_read"),
+                    .arguments = try allocator.dupe(u8, "{\"path\":\"b.txt\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "read two files"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "dual-read-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = DualReadProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = DualReadProvider.chatWithSystem,
+        .chat = DualReadProvider.chat,
+        .supportsNativeTools = DualReadProvider.supportsNativeTools,
+        .getName = DualReadProvider.getName,
+        .deinit = DualReadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = FileReadStub{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .parallel_tools = true,
+    };
+    defer agent.deinit();
+
+    const reply = try agent.turn("read files");
+    defer allocator.free(reply);
+    try std.testing.expectEqual(@as(usize, 2), tool_impl.exec_count);
+}
+
+test "parallel_tools overlaps read-only tool execution up to max_parallel_readonly" {
+    const SyncFileReadStub = struct {
+        const Self = @This();
+        exec_count: usize = 0,
+        entered: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        pub const tool_name = "file_read";
+        pub const tool_description = "Synchronized stub file read";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, args: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.exec_count += 1;
+            const n = self.entered.fetchAdd(1, .monotonic) + 1;
+            if (n == 4) self.release.store(true, .release);
+            while (!self.release.load(.acquire)) {}
+
+            const path_val = args.get("path") orelse return .{ .success = false, .output = try allocator.dupe(u8, "missing path") };
+            const path = switch (path_val) {
+                .string => |s| s,
+                else => return .{ .success = false, .output = try allocator.dupe(u8, "bad path") },
+            };
+            return .{
+                .success = true,
+                .output = try std.fmt.allocPrint(allocator, "contents of {s}", .{path}),
+            };
+        }
+    };
+
+    const QuadReadProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 4);
+                for (tool_calls, 0..) |*tc, i| {
+                    tc.* = .{
+                        .id = try std.fmt.allocPrint(allocator, "call-{d}", .{i}),
+                        .name = try allocator.dupe(u8, "file_read"),
+                        .arguments = try std.fmt.allocPrint(allocator, "{{\"path\":\"file-{d}.txt\"}}", .{i}),
+                    };
+                }
+                return .{
+                    .content = try allocator.dupe(u8, "read four files"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "quad-read-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = QuadReadProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = QuadReadProvider.chatWithSystem,
+        .chat = QuadReadProvider.chat,
+        .supportsNativeTools = QuadReadProvider.supportsNativeTools,
+        .getName = QuadReadProvider.getName,
+        .deinit = QuadReadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = SyncFileReadStub{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .parallel_tools = true,
+        .local_loop = .{ .max_parallel_readonly = 4 },
+    };
+    defer agent.deinit();
+
+    const reply = try agent.turn("read four files in parallel");
+    defer allocator.free(reply);
+    try std.testing.expectEqual(@as(usize, 4), tool_impl.exec_count);
+    try std.testing.expectEqual(@as(u32, 4), tool_impl.entered.load(.monotonic));
+}
+
+test "parallel_tools preserves tool result order for multi-read batch" {
+    const FileReadStub = struct {
+        const Self = @This();
+        exec_count: usize = 0,
+        pub const tool_name = "file_read";
+        pub const tool_description = "Stub file read";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, args: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.exec_count += 1;
+            const path_val = args.get("path") orelse return .{ .success = false, .output = try allocator.dupe(u8, "missing path") };
+            const path = switch (path_val) {
+                .string => |s| s,
+                else => return .{ .success = false, .output = try allocator.dupe(u8, "bad path") },
+            };
+            return .{
+                .success = true,
+                .output = try std.fmt.allocPrint(allocator, "ORDER:{s}", .{path}),
+            };
+        }
+    };
+
+    const OrderedReadProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 3);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-a"),
+                    .name = try allocator.dupe(u8, "file_read"),
+                    .arguments = try allocator.dupe(u8, "{\"path\":\"alpha\"}"),
+                };
+                tool_calls[1] = .{
+                    .id = try allocator.dupe(u8, "call-b"),
+                    .name = try allocator.dupe(u8, "file_read"),
+                    .arguments = try allocator.dupe(u8, "{\"path\":\"beta\"}"),
+                };
+                tool_calls[2] = .{
+                    .id = try allocator.dupe(u8, "call-c"),
+                    .name = try allocator.dupe(u8, "file_read"),
+                    .arguments = try allocator.dupe(u8, "{\"path\":\"gamma\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "ordered reads"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "ordered-read-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = OrderedReadProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = OrderedReadProvider.chatWithSystem,
+        .chat = OrderedReadProvider.chat,
+        .supportsNativeTools = OrderedReadProvider.supportsNativeTools,
+        .getName = OrderedReadProvider.getName,
+        .deinit = OrderedReadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = FileReadStub{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .parallel_tools = true,
+        .local_loop = .{ .max_parallel_readonly = 2 },
+    };
+    defer agent.deinit();
+
+    const reply = try agent.turn("ordered parallel reads");
+    defer allocator.free(reply);
+    try std.testing.expectEqual(@as(usize, 3), tool_impl.exec_count);
+
+    var history_blob: []const u8 = "";
+    for (agent.history.items) |msg| {
+        if (msg.role == .user) history_blob = msg.content;
+    }
+    const alpha_first = std.mem.indexOf(u8, history_blob, "ORDER:alpha") orelse return error.TestExpectedFail;
+    const beta_first = std.mem.indexOf(u8, history_blob, "ORDER:beta") orelse return error.TestExpectedFail;
+    const gamma_first = std.mem.indexOf(u8, history_blob, "ORDER:gamma") orelse return error.TestExpectedFail;
+    try std.testing.expect(alpha_first < beta_first);
+    try std.testing.expect(beta_first < gamma_first);
 }
 
 test "loop honors max_tool_iterations limit" {

@@ -986,6 +986,36 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 - `tailscale.auth_key` is optional. Use it when the machine should auto-run `tailscale up` before starting `serve`/`funnel`.
 - Tunnel secrets such as `cloudflare.token`, `ngrok.auth_token`, and `tailscale.auth_key` are encrypted at rest when `secrets.encrypt = true`.
 
+### `agent`
+
+Loop and context hygiene settings for long tool-heavy runs (especially local models).
+
+- `parallel_tools` (default: `false`): when `true`, and every tool call in one assistant batch is a read-only allowlisted tool (`file_read`, `memory_recall`, `web_fetch`, etc.), NullClaw may execute those calls concurrently up to `agent.local_loop.max_parallel_readonly`. Mixed batches or write-capable tools still run sequentially.
+- `local_loop`: optional limits for compression, loop detection, and parallel read batches.
+
+```json
+{
+  "agent": {
+    "parallel_tools": true,
+    "local_loop": {
+      "enabled": false,
+      "max_result_chars": 8192,
+      "max_result_tail_lines": 12,
+      "identical_call_warn": 3,
+      "identical_call_veto": 5,
+      "identical_call_force_reply": 3,
+      "max_parallel_readonly": 4
+    }
+  }
+}
+```
+
+Notes:
+
+- `local_loop.enabled = true` tightens the default tool-result history cap to 400 characters (unless `max_result_chars` is set explicitly).
+- Identical tool calls within one turn fingerprint `name + arguments_json`. Warn/veto/force-reply thresholds apply per turn.
+- Defaults preserve existing behavior when `local_loop` is omitted.
+
 ### `autonomy`
 
 - `level`: start with `supervised`.

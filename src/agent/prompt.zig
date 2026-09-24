@@ -282,8 +282,9 @@ pub fn workspacePromptFingerprint(
     return hasher.final();
 }
 
-/// Build the full system prompt from workspace identity files, tools, and runtime context.
-pub fn buildSystemPrompt(
+/// Build the byte-stable prefix of the system prompt (no wall-clock sections).
+/// Used for KV-cache reuse in local-loop mode; cloud mode concatenates with `buildVariableTail`.
+pub fn buildStablePrefix(
     allocator: std.mem.Allocator,
     ctx: PromptContext,
 ) ![]const u8 {
@@ -292,6 +293,56 @@ pub fn buildSystemPrompt(
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
     const w = &buf_writer.writer;
 
+    try appendStablePrefixSections(allocator, w, ctx);
+
+    buf = buf_writer.toArrayList();
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Build the variable tail appended after the stable prefix (datetime and other per-turn data).
+pub fn buildVariableTail(
+    allocator: std.mem.Allocator,
+    ctx: PromptContext,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+
+    try appendVariableTailSections(w, ctx);
+
+    buf = buf_writer.toArrayList();
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Wyhash fingerprint of the stable prefix bytes for cache-invalidation tests.
+pub fn stablePrefixHash(allocator: std.mem.Allocator, ctx: PromptContext) !u64 {
+    const stable = try buildStablePrefix(allocator, ctx);
+    defer allocator.free(stable);
+    return std.hash.Wyhash.hash(0, stable);
+}
+
+/// Build the full system prompt from workspace identity files, tools, and runtime context.
+pub fn buildSystemPrompt(
+    allocator: std.mem.Allocator,
+    ctx: PromptContext,
+) ![]const u8 {
+    const stable = try buildStablePrefix(allocator, ctx);
+    errdefer allocator.free(stable);
+    const tail = try buildVariableTail(allocator, ctx);
+    errdefer allocator.free(tail);
+
+    const combined = try std.mem.concat(allocator, u8, &.{ stable, tail });
+    allocator.free(stable);
+    allocator.free(tail);
+    return combined;
+}
+
+fn appendStablePrefixSections(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    ctx: PromptContext,
+) !void {
     // Identity section — inject workspace MD files
     try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider, ctx.identity_config);
 
@@ -419,9 +470,6 @@ pub fn buildSystemPrompt(
     // Workspace section
     try w.print("## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
 
-    // DateTime section
-    try appendDateTimeSection(w, ctx.timezone);
-
     // Runtime section
     try w.print("## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
         @tagName(builtin.os.tag),
@@ -430,9 +478,10 @@ pub fn buildSystemPrompt(
 
     // Tool use protocol and available tools
     try writeToolInstructionsSection(w, ctx.tools, ctx);
+}
 
-    buf = buf_writer.toArrayList();
-    return try buf.toOwnedSlice(allocator);
+fn appendVariableTailSections(w: anytype, ctx: PromptContext) !void {
+    try appendDateTimeSection(w, ctx.timezone);
 }
 
 fn buildIdentitySection(
@@ -2543,7 +2592,57 @@ test "installSkill end-to-end appears in buildSystemPrompt" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "source/SKILL.md</location>") != null);
 }
 
-test "buildSystemPrompt datetime appears before runtime" {
+test "buildStablePrefix excludes current date and time section" {
+    const allocator = std.testing.allocator;
+    const stable = try buildStablePrefix(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(stable);
+
+    try std.testing.expect(std.mem.indexOf(u8, stable, "## Current Date & Time") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "## Runtime") != null);
+}
+
+test "buildVariableTail includes current date and time section" {
+    const allocator = std.testing.allocator;
+    const tail = try buildVariableTail(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .timezone = "UTC",
+    });
+    defer allocator.free(tail);
+
+    try std.testing.expect(std.mem.indexOf(u8, tail, "## Current Date & Time") != null);
+}
+
+test "buildSystemPrompt includes current date and time section" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
+}
+
+test "stablePrefixHash is identical for repeated builds with same context" {
+    const allocator = std.testing.allocator;
+    const ctx: PromptContext = .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    };
+    const h1 = try stablePrefixHash(allocator, ctx);
+    const h2 = try stablePrefixHash(allocator, ctx);
+    try std.testing.expectEqual(h1, h2);
+}
+
+test "buildSystemPrompt datetime tail appears after runtime for cache-friendly split" {
     const allocator = std.testing.allocator;
     const prompt = try buildSystemPrompt(allocator, .{
         .workspace_dir = "/tmp/nonexistent",
@@ -2554,5 +2653,6 @@ test "buildSystemPrompt datetime appears before runtime" {
 
     const dt_pos = std.mem.indexOf(u8, prompt, "## Current Date & Time") orelse return error.SectionNotFound;
     const rt_pos = std.mem.indexOf(u8, prompt, "## Runtime") orelse return error.SectionNotFound;
-    try std.testing.expect(dt_pos < rt_pos);
+    // Datetime lives in the variable tail appended after the stable prefix (runtime + tools).
+    try std.testing.expect(dt_pos > rt_pos);
 }

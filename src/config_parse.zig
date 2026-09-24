@@ -1796,6 +1796,44 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 self.agent.default_queue_mode = types.QueueMode.fromSlice(v.string) orelse
                     return error.InvalidDefaultQueueMode;
             }
+            if (ag.object.get("local_loop")) |ll_val| {
+                if (ll_val == .object) {
+                    const ll = ll_val.object;
+                    if (ll.get("enabled")) |v| {
+                        if (v == .bool) self.agent.local_loop.enabled = v.bool;
+                    }
+                    if (ll.get("max_result_chars")) |v| {
+                        if (v == .integer and v.integer > 0) {
+                            self.agent.local_loop.max_result_chars = @intCast(v.integer);
+                        }
+                    }
+                    if (ll.get("max_result_tail_lines")) |v| {
+                        if (v == .integer and v.integer > 0) {
+                            self.agent.local_loop.max_result_tail_lines = @intCast(v.integer);
+                        }
+                    }
+                    if (ll.get("identical_call_warn")) |v| {
+                        if (v == .integer and v.integer > 0) {
+                            self.agent.local_loop.identical_call_warn = @intCast(v.integer);
+                        }
+                    }
+                    if (ll.get("identical_call_veto")) |v| {
+                        if (v == .integer and v.integer > 0) {
+                            self.agent.local_loop.identical_call_veto = @intCast(v.integer);
+                        }
+                    }
+                    if (ll.get("identical_call_force_reply")) |v| {
+                        if (v == .integer and v.integer > 0) {
+                            self.agent.local_loop.identical_call_force_reply = @intCast(v.integer);
+                        }
+                    }
+                    if (ll.get("max_parallel_readonly")) |v| {
+                        if (v == .integer and v.integer > 0) {
+                            self.agent.local_loop.max_parallel_readonly = @intCast(v.integer);
+                        }
+                    }
+                }
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {
