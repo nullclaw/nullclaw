@@ -6962,6 +6962,95 @@ test "slash /approve executes pending bash command" {
     try std.testing.expect(agent.pending_exec_command == null);
 }
 
+// Regression for #900: a medium/high-risk command in supervised mode must
+// pause for /approve, not fail outright -- whether reached via the LLM's
+// automatic tool call (execBlockMessage) or /bash (runShellCommand).
+test "execBlockMessage requires approval for medium-risk command in supervised mode" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 100);
+    defer tracker.deinit();
+
+    const allowed = [_][]const u8{"touch"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .block_medium_risk_commands = false,
+        .workspace_dir = "/tmp",
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.policy = &policy;
+
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(allocator);
+    try args.put(allocator, "command", .{ .string = "touch test.txt" });
+
+    const msg = agent.execBlockMessage(args) orelse
+        return error.TestExpectedApprovalMessage;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "approval required") != null);
+    try std.testing.expect(agent.pending_exec_command != null);
+    try std.testing.expectEqualStrings("touch test.txt", agent.pending_exec_command.?);
+}
+
+test "slash /approve re-runs a medium-risk bash command instead of re-blocking it" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 100);
+    defer tracker.deinit();
+
+    const allowed = [_][]const u8{"touch"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .block_medium_risk_commands = false,
+        .workspace_dir = ".",
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
+    shell_impl.* = .{ .workspace_dir = ".", .policy = &policy };
+    const shell_tool = shell_impl.tool();
+    defer shell_tool.deinit(allocator);
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{shell_tool},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const pending_resp = (try agent.handleSlashCommand("/bash touch nullclaw-900-test.txt")).?;
+    defer allocator.free(pending_resp);
+    try std.testing.expect(std.mem.indexOf(u8, pending_resp, "approval required") != null);
+    try std.testing.expect(agent.pending_exec_command != null);
+
+    const approve_resp = (try agent.handleSlashCommand("/approve allow-once")).?;
+    defer allocator.free(approve_resp);
+    // Before the fix this stayed "Command requires approval" forever, since
+    // shell.zig always validated with approved=false.
+    try std.testing.expect(std.mem.indexOf(u8, approve_resp, "approval required") == null);
+    try std.testing.expect(agent.pending_exec_command == null);
+
+    std_compat.fs.cwd().deleteFile("nullclaw-900-test.txt") catch {};
+}
+
 test "slash /restart clears runtime command settings" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
