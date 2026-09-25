@@ -86,6 +86,19 @@ pub fn threadMemorySessionId() ?[]const u8 {
     return tls_memory_session_id;
 }
 
+/// Never settable from tool arguments -- those come from the LLM.
+threadlocal var tls_approved_exec_command: ?[]const u8 = null;
+
+pub fn setThreadApprovedExecCommand(command: ?[]const u8) ?[]const u8 {
+    const previous = tls_approved_exec_command;
+    tls_approved_exec_command = command;
+    return previous;
+}
+
+pub fn threadApprovedExecCommand() ?[]const u8 {
+    return tls_approved_exec_command;
+}
+
 // Sub-modules
 pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");

@@ -181,9 +181,9 @@ pub const ShellTool = struct {
             return ToolResult.fail("Missing 'command' parameter");
         const command = normalizeCommandInput(command_input);
 
-        // Validate command against security policy
         if (self.policy) |pol| {
-            _ = pol.validateCommandExecution(command, false) catch |err| {
+            const approved = if (root.threadApprovedExecCommand()) |c| std.mem.eql(u8, c, command) else false;
+            _ = pol.validateCommandExecution(command, approved) catch |err| {
                 return switch (err) {
                     error.CommandNotAllowed => blk: {
                         const summary = command_summary.summarizeBlockedCommand(command);
