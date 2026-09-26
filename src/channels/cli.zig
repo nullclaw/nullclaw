@@ -1,8 +1,249 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
+const cli_line_editor = @import("cli_line_editor.zig");
+
+const ESCAPE_SEQUENCE_TIMEOUT_MS: i32 = 50;
+const DEFAULT_TERMINAL_COLUMNS: usize = 80;
+
+fn supportsRawMode() bool {
+    return comptime builtin.os.tag != .windows and builtin.os.tag != .wasi;
+}
+
+const CliRawMode = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    struct {
+        fn enable(_: std_compat.fs.File.Handle) !CliRawMode {
+            return error.NotSupported;
+        }
+
+        fn disable(_: *CliRawMode) void {}
+
+        fn waitForEscapeContinuation(_: std_compat.fs.File.Handle) bool {
+            return false;
+        }
+
+        fn terminalColumns(_: std_compat.fs.File.Handle) usize {
+            return DEFAULT_TERMINAL_COLUMNS;
+        }
+
+        fn suspendProcess(_: *CliRawMode) !void {
+            return error.NotSupported;
+        }
+
+        fn quitProcess(_: *CliRawMode) !void {
+            return error.NotSupported;
+        }
+    }
+else
+    struct {
+        const enable_action: std.posix.TCSA = .NOW;
+        const disable_action: std.posix.TCSA = .DRAIN;
+
+        fd: std.posix.fd_t,
+        original: std.posix.termios,
+
+        fn makeRaw(original: std.posix.termios) std.posix.termios {
+            var raw = original;
+            raw.iflag.IXON = false;
+            raw.iflag.IXOFF = false;
+            raw.lflag.ICANON = false;
+            raw.lflag.ECHO = false;
+            raw.lflag.ISIG = false;
+            raw.lflag.IEXTEN = false;
+            raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+            raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+            return raw;
+        }
+
+        fn enable(fd: std.posix.fd_t) !CliRawMode {
+            const original = try std.posix.tcgetattr(fd);
+            try std.posix.tcsetattr(fd, enable_action, makeRaw(original));
+            return .{ .fd = fd, .original = original };
+        }
+
+        fn disable(self: *CliRawMode) void {
+            std.posix.tcsetattr(self.fd, disable_action, self.original) catch {};
+        }
+
+        fn waitForEscapeContinuation(fd: std.posix.fd_t) bool {
+            // Keep timing at this thin OS boundary. Parser reset/reprocessing is
+            // covered deterministically in cli_line_editor tests; a real PTY
+            // timing test would violate the repository's no-flaky-tests rule.
+            var poll_fds = [_]std.posix.pollfd{
+                .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(&poll_fds, ESCAPE_SEQUENCE_TIMEOUT_MS) catch return false;
+            if (ready == 0) return false;
+            return (poll_fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0;
+        }
+
+        fn terminalColumns(fd: std.posix.fd_t) usize {
+            var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+            const rc = std.posix.system.ioctl(
+                fd,
+                @intCast(std.posix.T.IOCGWINSZ),
+                @intFromPtr(&size),
+            );
+            if (std.posix.errno(rc) != .SUCCESS or size.col == 0) return DEFAULT_TERMINAL_COLUMNS;
+            return size.col;
+        }
+
+        fn forwardSignal(self: *CliRawMode, signal: std.posix.SIG) !void {
+            const fd = self.fd;
+            self.disable();
+            std.posix.raise(signal) catch |err| {
+                self.* = try enable(fd);
+                return err;
+            };
+            self.* = try enable(fd);
+        }
+
+        fn suspendProcess(self: *CliRawMode) !void {
+            return self.forwardSignal(.TSTP);
+        }
+
+        fn quitProcess(self: *CliRawMode) !void {
+            return self.forwardSignal(.QUIT);
+        }
+    };
+
+/// Read a canonical line without printing a prompt. Overlong input is drained
+/// through its newline so the next read starts at a real line boundary.
+pub fn readCanonicalLine(stdin: std_compat.fs.File, line_buf: []u8) !?[]const u8 {
+    var pos: usize = 0;
+    var overflowed = false;
+    while (true) {
+        var byte_buf: [1]u8 = undefined;
+        const n = try stdin.read(&byte_buf);
+        if (n == 0) {
+            if (overflowed) return error.LineTooLong;
+            return if (pos == 0) null else line_buf[0..pos];
+        }
+        if (byte_buf[0] == '\n') {
+            if (overflowed) return error.LineTooLong;
+            if (pos > 0 and line_buf[pos - 1] == '\r') pos -= 1;
+            return line_buf[0..pos];
+        }
+        if (pos < line_buf.len) {
+            line_buf[pos] = byte_buf[0];
+            pos += 1;
+        } else {
+            overflowed = true;
+        }
+    }
+}
+
+fn readPromptedCanonicalLine(
+    stdin: std_compat.fs.File,
+    writer: *std.Io.Writer,
+    prompt: []const u8,
+    line_buf: []u8,
+) !?[]const u8 {
+    try writer.writeAll(prompt);
+    try writer.flush();
+    return readCanonicalLine(stdin, line_buf);
+}
+
+/// Read one interactive CLI line. POSIX TTYs use the allocation-free editor;
+/// Windows, WASI, redirected input, and redirected output keep canonical I/O.
+pub fn readInteractiveLine(
+    stdin: std_compat.fs.File,
+    stdout: std_compat.fs.File,
+    writer: *std.Io.Writer,
+    prompt: []const u8,
+    history: []const []const u8,
+    line_buf: []u8,
+) !?[]const u8 {
+    if (!supportsRawMode() or !stdin.isTty() or !stdout.isTty()) {
+        return readPromptedCanonicalLine(stdin, writer, prompt, line_buf);
+    }
+
+    var raw = CliRawMode.enable(stdin.handle) catch {
+        return readPromptedCanonicalLine(stdin, writer, prompt, line_buf);
+    };
+    defer raw.disable();
+    const terminal_columns = CliRawMode.terminalColumns(stdout.handle);
+
+    try cli_line_editor.renderPrompt(writer, prompt);
+    try writer.flush();
+
+    var editor = cli_line_editor.LineEditor.init(history);
+    while (true) {
+        if (editor.hasPendingEscape() and !CliRawMode.waitForEscapeContinuation(stdin.handle)) {
+            editor.cancelPendingEscape();
+            continue;
+        }
+
+        var byte_buf: [1]u8 = undefined;
+        const n = try stdin.read(&byte_buf);
+        if (n == 0) {
+            try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.line().len, terminal_columns);
+            try writer.writeAll("\r\n");
+            try writer.flush();
+            return null;
+        }
+
+        switch (byte_buf[0]) {
+            '\r', '\n' => {
+                editor.cancelPendingInput();
+                try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.line().len, terminal_columns);
+                try writer.writeAll("\r\n");
+                try writer.flush();
+                if (editor.hasOverflowed()) return error.LineTooLong;
+                const line = editor.line();
+                if (line.len > line_buf.len) return error.LineTooLong;
+                @memcpy(line_buf[0..line.len], line);
+                return line_buf[0..line.len];
+            },
+            0x03 => {
+                editor.cancelPendingInput();
+                try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.line().len, terminal_columns);
+                try writer.writeAll("^C\r\n");
+                try writer.flush();
+                return error.Interrupted;
+            },
+            0x04 => {
+                editor.cancelPendingInput();
+                if (editor.line().len == 0) {
+                    try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), 0, terminal_columns);
+                    try writer.writeAll("\r\n");
+                    try writer.flush();
+                    return null;
+                }
+                if (editor.feedInput(0x04) == .changed) {
+                    try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.cursor(), terminal_columns);
+                    try writer.flush();
+                }
+            },
+            0x1a => {
+                editor.cancelPendingInput();
+                try raw.suspendProcess();
+                try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.cursor(), terminal_columns);
+                try writer.flush();
+            },
+            0x1c => {
+                editor.cancelPendingInput();
+                try raw.quitProcess();
+                try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.cursor(), terminal_columns);
+                try writer.flush();
+            },
+            else => switch (editor.feedInput(byte_buf[0])) {
+                .changed => {
+                    try cli_line_editor.renderLineRefresh(writer, prompt, editor.line(), editor.cursor(), terminal_columns);
+                    try writer.flush();
+                },
+                .full => {
+                    try writer.writeAll("\x07");
+                    try writer.flush();
+                },
+                .pending, .unchanged => {},
+            },
+        }
+    }
+}
 
 /// CLI channel — reads from stdin, writes to stdout.
 /// Simplest channel implementation; used for local interactive testing.
@@ -26,16 +267,9 @@ pub const CliChannel = struct {
         try w.flush();
     }
 
+    /// Retained for source compatibility with the public CLI channel API.
     pub fn readLine(_: *CliChannel, buf: []u8) !?[]const u8 {
-        const stdin = std_compat.fs.File.stdin();
-        var pos: usize = 0;
-        while (pos < buf.len) {
-            const n = stdin.read(buf[pos .. pos + 1]) catch return null;
-            if (n == 0) return null; // EOF
-            if (buf[pos] == '\n') break;
-            pos += 1;
-        }
-        return buf[0..pos];
+        return readCanonicalLine(std_compat.fs.File.stdin(), buf);
     }
 
     pub fn isQuitCommand(line: []const u8) bool {
@@ -198,6 +432,92 @@ pub fn defaultHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "cli canonical reader trims CRLF and preserves partial EOF" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.writeFile(.{ .sub_path = "input", .data = "first\r\nlast" });
+
+    const file = try dir.openFile("input", .{});
+    defer file.close();
+    var line_buf: [32]u8 = undefined;
+
+    const first = (try readCanonicalLine(file, &line_buf)).?;
+    try std.testing.expectEqualStrings("first", first);
+    const last = (try readCanonicalLine(file, &line_buf)).?;
+    try std.testing.expectEqualStrings("last", last);
+    try std.testing.expect((try readCanonicalLine(file, &line_buf)) == null);
+}
+
+test "cli canonical reader drains an overlong line" {
+    // Regression: #865 follow-up — an oversized paste must not poison the next prompt.
+    var input: [cli_line_editor.MAX_LINE_BYTES + 7]u8 = undefined;
+    @memset(input[0 .. cli_line_editor.MAX_LINE_BYTES + 1], 'a');
+    input[cli_line_editor.MAX_LINE_BYTES + 1] = '\n';
+    @memcpy(input[cli_line_editor.MAX_LINE_BYTES + 2 ..], "next\n");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.writeFile(.{ .sub_path = "input", .data = &input });
+
+    const file = try dir.openFile("input", .{});
+    defer file.close();
+    var line_buf: [cli_line_editor.MAX_LINE_BYTES]u8 = undefined;
+
+    try std.testing.expectError(error.LineTooLong, readCanonicalLine(file, &line_buf));
+    const next = (try readCanonicalLine(file, &line_buf)).?;
+    try std.testing.expectEqualStrings("next", next);
+}
+
+test "cli interactive reader uses canonical fallback for non-TTY input" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.writeFile(.{ .sub_path = "input", .data = "hello\n" });
+
+    const file = try dir.openFile("input", .{});
+    defer file.close();
+    var output_buf: [32]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_buf);
+    var line_buf: [32]u8 = undefined;
+
+    const line = (try readInteractiveLine(file, file, &writer, "> ", &.{}, &line_buf)).?;
+    try std.testing.expectEqualStrings("hello", line);
+    try std.testing.expectEqualStrings("> ", writer.buffered());
+}
+
+test "cli raw termios preserves queued input and disables line discipline" {
+    // Regression: TCSA.FLUSH discarded typeahead and multi-line paste before debounce.
+    if (comptime supportsRawMode()) {
+        var original = std.mem.zeroes(std.posix.termios);
+        original.iflag.IXON = true;
+        original.iflag.IXOFF = true;
+        original.lflag.ICANON = true;
+        original.lflag.ECHO = true;
+        original.lflag.ISIG = true;
+        original.lflag.IEXTEN = true;
+
+        const raw = CliRawMode.makeRaw(original);
+        try std.testing.expect(!raw.iflag.IXON);
+        try std.testing.expect(!raw.iflag.IXOFF);
+        try std.testing.expect(!raw.lflag.ICANON);
+        try std.testing.expect(!raw.lflag.ECHO);
+        try std.testing.expect(!raw.lflag.ISIG);
+        try std.testing.expect(!raw.lflag.IEXTEN);
+        try std.testing.expectEqual(std.posix.TCSA.NOW, CliRawMode.enable_action);
+        try std.testing.expectEqual(std.posix.TCSA.DRAIN, CliRawMode.disable_action);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "cli channel retains public readLine API" {
+    comptime {
+        _ = CliChannel.readLine;
+    }
+}
 
 test "cli quit commands" {
     try std.testing.expect(CliChannel.isQuitCommand("exit"));
