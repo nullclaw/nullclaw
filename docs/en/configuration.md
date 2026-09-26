@@ -871,7 +871,7 @@ Direct message bindings use `peer.kind = "direct"` with user IDs:
 Parameters:
 - `token` (required) - Bot token from Discord Developer Portal
 - `intents` (default: 37377) - Gateway intents bitmask
-- `allow_bots` (default: false) - Allow messages from other bots
+- `allow_bots` (default: false) - Allow messages from other bots. Messages posted by the bot itself are always ignored, even when this is enabled
 - `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages. `["*"]` explicitly allows all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond
 - `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
