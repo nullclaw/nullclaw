@@ -113,6 +113,12 @@ pub fn containsToolCallMarkup(text: []const u8) bool {
         std.mem.indexOf(u8, text, "[/tool_call]") != null;
 }
 
+fn freeParsedToolCall(allocator: std.mem.Allocator, call: ParsedToolCall) void {
+    allocator.free(call.name);
+    allocator.free(call.arguments_json);
+    if (call.tool_call_id) |id| allocator.free(id);
+}
+
 /// Parse tool calls from an LLM response using XML-style `<tool_call>` tags.
 ///
 /// Expected format:
@@ -138,10 +144,7 @@ pub fn parseXmlToolCalls(
 
     var calls: std.ArrayListUnmanaged(ParsedToolCall) = .empty;
     errdefer {
-        for (calls.items) |call| {
-            allocator.free(call.name);
-            allocator.free(call.arguments_json);
-        }
+        for (calls.items) |call| freeParsedToolCall(allocator, call);
         calls.deinit(allocator);
     }
 
@@ -260,6 +263,7 @@ pub fn parseXmlToolCalls(
             }
 
             if (parsed_call) |call| {
+                errdefer freeParsedToolCall(allocator, call);
                 try calls.append(allocator, call);
             }
 
@@ -273,6 +277,7 @@ pub fn parseXmlToolCalls(
             if (inner_unclosed.len > 0) {
                 if (inner_unclosed[0] == '{' and inner_unclosed[inner_unclosed.len - 1] == '}') {
                     if (parseToolCallJson(allocator, inner_unclosed)) |call| {
+                        errdefer freeParsedToolCall(allocator, call);
                         const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
                         if (before.len > 0) try text_parts.append(allocator, before);
                         try calls.append(allocator, call);
@@ -285,6 +290,7 @@ pub fn parseXmlToolCalls(
 
                 if (!recovered) {
                     if (parseNamePrefixedJsonCall(allocator, inner_unclosed)) |call| {
+                        errdefer freeParsedToolCall(allocator, call);
                         const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
                         if (before.len > 0) try text_parts.append(allocator, before);
                         try calls.append(allocator, call);
@@ -1831,6 +1837,32 @@ test "parseToolCalls rejects literal colon tool name" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
+fn parseXmlToolCallsForAllocationTest(allocator: std.mem.Allocator, response: []const u8) !void {
+    const result = try parseXmlToolCalls(allocator, response);
+    allocator.free(result.text);
+    for (result.calls) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+        if (call.tool_call_id) |id| allocator.free(id);
+    }
+    allocator.free(result.calls);
+}
+
+test "parseXmlToolCalls frees parsed calls when an allocation fails" {
+    const response =
+        \\Let me check the disk layout first.
+        \\<tool_call>
+        \\{"name":"shell","arguments":{"command":"df -h"}}
+        \\</tool_call>
+        \\Then I will summarise.
+    ;
+    // Regression: a call that parsed successfully leaked its name and arguments
+    // when a later allocation in the same parse failed (appending to the call
+    // list, or assembling the remaining text), because only already-appended
+    // calls were freed on the error path.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseXmlToolCallsForAllocationTest, .{response});
 }
 
 test "parseToolCalls malformed xml-like arg_key payload is skipped" {
