@@ -1,6 +1,6 @@
 //! ClickHouse-backed persistent memory via HTTP API (port 8123).
 //!
-//! No C dependency — pure Zig HTTP via std.http.Client.
+//! Uses the shared HTTP transport (stdlib normally, curl fallback on Android).
 //! Writes are append-only with server-generated Snowflake ordering keys, and
 //! reads collapse to the latest row per logical key via argMax. This keeps
 //! ordering independent from client clock skew while ReplacingMergeTree(version)
@@ -398,7 +398,7 @@ const ClickHouseMemoryImpl = struct {
             header_count += 1;
         }
 
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = query,
@@ -463,7 +463,7 @@ const ClickHouseMemoryImpl = struct {
             header_count += 1;
         }
 
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = query,
