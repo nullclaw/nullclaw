@@ -103,14 +103,14 @@ pub fn scout(allocator: std.mem.Allocator, query: []const u8) !std.ArrayList(Ski
     );
     defer allocator.free(url);
 
-    // Fetch from GitHub API using std.http.Client
+    // Fetch through the shared proxy-aware client (curl fallback on Android).
     var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    const result = client.client.fetch(.{
+    const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
         .extra_headers = &.{
