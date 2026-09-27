@@ -134,7 +134,7 @@ pub const QdrantVectorStore = struct {
             header_count += 1;
         }
 
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = url },
             .method = method,
             .payload = payload,
@@ -400,7 +400,7 @@ pub const QdrantVectorStore = struct {
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
 
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = url },
             .method = .GET,
             .response_writer = &aw.writer,

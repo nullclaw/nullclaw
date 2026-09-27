@@ -295,7 +295,7 @@ pub const WhatsAppChannel = struct {
         var client = try http_util.ProxyHttpClient.init(self.allocator);
         defer client.deinit();
 
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,

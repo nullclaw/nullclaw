@@ -114,7 +114,7 @@ pub const OllamaEmbedding = struct {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
 
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,
