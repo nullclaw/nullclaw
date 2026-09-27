@@ -334,6 +334,16 @@ pub const DiscordChannel = struct {
         return std.mem.eql(u8, author_id, bot_user_id);
     }
 
+    /// Check whether a message author is this bot itself.
+    ///
+    /// See handleMessageCreate filter 0 for why this check is unconditional on
+    /// `allow_bots`: the bot's own messages must never re-enter the agent loop.
+    fn isSelfAuthored(self: *const DiscordChannel, author_id: []const u8) bool {
+        const bot_user_id = self.bot_user_id orelse return false;
+        if (bot_user_id.len == 0) return false;
+        return std.mem.eql(u8, author_id, bot_user_id);
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to a Discord channel via REST API.
@@ -1288,6 +1298,15 @@ pub const DiscordChannel = struct {
             else => false,
         } else false;
 
+        // Filter 0: never self-feed. Our own messages must not re-enter the agent
+        // loop, whatever allow_bots says — a reply that opens with our own
+        // @-mention otherwise satisfies require_mention and is fed back to the
+        // agent, which answers itself indefinitely.
+        if (self.isSelfAuthored(author_id)) {
+            log.debug("Discord MESSAGE_CREATE: ignoring self-authored message", .{});
+            return;
+        }
+
         // Filter 1: bot author
         if (author_is_bot and !self.allow_bots) {
             return;
@@ -1881,6 +1900,92 @@ test "discord handleMessageCreate wildcard allow_from permits inbound message" {
 
     const msg_json =
         \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), event_bus.inboundDepth());
+    var msg = event_bus.consumeInbound().?;
+    defer msg.deinit(alloc);
+}
+
+// Regression: a bot that opened its own replies with "@<its own id>" (the style
+// several current models default to) fed itself back through require_mention and
+// answered itself forever, because allow_bots=true let its own message through.
+test "discord handleMessageCreate drops self-authored message even when allow_bots is enabled" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_bots = true,
+        .allow_from = &.{"*"},
+        .require_mention = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-self");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"<@bot-self> standing by","author":{"id":"bot-self","username":"self","bot":true}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate keeps messages from other bots when allow_bots is enabled" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_bots = true,
+        .allow_from = &.{"*"},
+        .require_mention = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-self");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"<@bot-self> ping","author":{"id":"bot-peer","username":"peer","bot":true}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), event_bus.inboundDepth());
+    var msg = event_bus.consumeInbound().?;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("bot-peer", msg.sender_id);
+}
+
+test "discord handleMessageCreate admits bot messages until READY resolves our own user id" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_bots = true,
+        .allow_from = &.{"*"},
+    });
+    ch.setBus(&event_bus);
+
+    // No READY yet: bot_user_id is null, so there is no self identity to match.
+    try std.testing.expect(ch.bot_user_id == null);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"bot-peer","username":"peer","bot":true}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();
