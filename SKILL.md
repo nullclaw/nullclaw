@@ -1,0 +1,2 @@
+# Renamed Skill
+Uses assets.

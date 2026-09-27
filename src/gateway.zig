@@ -5600,12 +5600,13 @@ const A2aStreamingWorker = struct {
     stream: std_compat.net.Stream,
     registry: *a2a.TaskRegistry,
     session_mgr: *session_mod.SessionManager,
+    principal: a2a.Principal,
 
     fn run(self: *@This()) void {
         defer self.stream.close();
         defer self.allocator.free(self.body);
         defer self.allocator.destroy(self);
-        a2a.handleStreamingRpc(self.allocator, self.body, &self.stream, self.registry, self.session_mgr);
+        a2a.handleStreamingRpc(self.allocator, self.body, &self.stream, self.registry, self.session_mgr, self.principal);
     }
 };
 
@@ -5615,6 +5616,7 @@ fn spawnA2aStreamingWorker(
     stream: std_compat.net.Stream,
     registry: *a2a.TaskRegistry,
     session_mgr: *session_mod.SessionManager,
+    principal: a2a.Principal,
 ) !void {
     const worker = try allocator.create(A2aStreamingWorker);
     errdefer allocator.destroy(worker);
@@ -5628,6 +5630,7 @@ fn spawnA2aStreamingWorker(
         .stream = stream,
         .registry = registry,
         .session_mgr = session_mgr,
+        .principal = principal,
     };
 
     const thread = try std.Thread.spawn(
@@ -6102,10 +6105,13 @@ pub fn run(
                             null;
 
                         if (a2a_session_mgr) |sm| {
+                            // Caller principal (issue #974): fingerprint of the
+                            // validated bearer; scopes tasks and context sessions.
+                            const a2a_principal = a2a.principalFromBearer(bearer);
                             if (a2a.isStreamingMethod(b)) {
                                 // SSE streaming runs in its own worker so the main accept
                                 // loop can continue serving tasks/cancel and new requests.
-                                if (spawnA2aStreamingWorker(allocator, b, conn.stream, &a2a_registry, sm)) {
+                                if (spawnA2aStreamingWorker(allocator, b, conn.stream, &a2a_registry, sm, a2a_principal)) {
                                     close_conn = false;
                                     response_status = "";
                                     response_body = "";
@@ -6114,7 +6120,7 @@ pub fn run(
                                     response_body = "{\"error\":\"stream setup failed\"}";
                                 }
                             } else {
-                                const resp = a2a.handleJsonRpc(req_allocator, b, &a2a_registry, sm);
+                                const resp = a2a.handleJsonRpc(req_allocator, b, &a2a_registry, sm, a2a_principal);
                                 response_status = resp.status;
                                 response_body = resp.body;
                             }
