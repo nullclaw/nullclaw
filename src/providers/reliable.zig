@@ -369,6 +369,7 @@ pub const ReliableProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -604,6 +605,11 @@ pub const ReliableProvider = struct {
             if (entry.provider.supportsStreaming()) return true;
         }
         return false;
+    }
+
+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.supportsStreamingNativeTools();
     }
 
     fn streamChatImpl(
