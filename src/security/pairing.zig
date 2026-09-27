@@ -17,9 +17,15 @@ pub const DEFAULT_TOKEN_TTL_SECS: u32 = 2_592_000;
 /// in config files. When a new token is generated, the plaintext is returned
 /// to the client once, and only the hash is retained.
 pub const PairingGuard = struct {
+    const TokenScope = enum {
+        all,
+        cron,
+    };
+
     const TokenRecord = struct {
         expires_at: ?i64,
         configured: bool,
+        scope: TokenScope,
     };
 
     /// Whether pairing is required at all.
@@ -49,10 +55,10 @@ pub const PairingGuard = struct {
         for (existing_tokens) |t| {
             if (isTokenHash(t)) {
                 const duped = try allocator.dupe(u8, t);
-                try tokens.put(duped, .{ .expires_at = null, .configured = true });
+                try tokens.put(duped, .{ .expires_at = null, .configured = true, .scope = .all });
             } else {
                 const hashed = try hashTokenAlloc(allocator, t);
-                try tokens.put(hashed, .{ .expires_at = null, .configured = true });
+                try tokens.put(hashed, .{ .expires_at = null, .configured = true, .scope = .all });
             }
         }
 
@@ -188,6 +194,7 @@ pub const PairingGuard = struct {
                 try self.paired_tokens.put(hashed, .{
                     .expires_at = tokenExpiresAt(self.token_ttl_secs),
                     .configured = false,
+                    .scope = .all,
                 });
 
                 // Consume pairing code
@@ -210,21 +217,45 @@ pub const PairingGuard = struct {
     pub fn isAuthenticated(self: *const PairingGuard, token: []const u8) bool {
         if (!self.require_pairing_flag) return true;
 
-        return self.matchesStoredToken(token);
+        return self.matchesToken(token, false, false);
     }
 
     /// Check whether a bearer token matches one of the stored token hashes,
     /// regardless of whether interactive pairing is enabled.
     pub fn matchesStoredToken(self: *const PairingGuard, token: []const u8) bool {
-        return self.matchesToken(token, false);
+        return self.matchesToken(token, false, false);
     }
 
     /// Check whether a bearer token matches a token loaded from config.
     pub fn matchesConfiguredToken(self: *const PairingGuard, token: []const u8) bool {
-        return self.matchesToken(token, true);
+        return self.matchesToken(token, true, false);
     }
 
-    fn matchesToken(self: *const PairingGuard, token: []const u8, configured_only: bool) bool {
+    /// Check a bearer for the cron control plane. Full gateway tokens and the
+    /// dedicated cron token are both accepted here; cron-scoped tokens are
+    /// deliberately rejected by every other authentication method.
+    pub fn isCronAuthenticated(self: *const PairingGuard, token: []const u8) bool {
+        return self.matchesToken(token, false, true);
+    }
+
+    /// Issue a process-lifetime token restricted to the cron control plane.
+    /// The caller receives the plaintext once and must persist it securely for
+    /// the local cron client; this guard retains only its SHA-256 hash.
+    pub fn issueCronToken(self: *PairingGuard) ![]const u8 {
+        const token = generateToken();
+        const token_owned = try self.allocator.dupe(u8, &token);
+        errdefer self.allocator.free(token_owned);
+        const hashed = try hashTokenAlloc(self.allocator, &token);
+        errdefer self.allocator.free(hashed);
+        try self.paired_tokens.put(hashed, .{
+            .expires_at = null,
+            .configured = false,
+            .scope = .cron,
+        });
+        return token_owned;
+    }
+
+    fn matchesToken(self: *const PairingGuard, token: []const u8, configured_only: bool, allow_cron_scope: bool) bool {
         var hash_buf: [64]u8 = undefined;
         const hashed = hashToken(token, &hash_buf);
         const now = std_compat.time.timestamp();
@@ -235,7 +266,8 @@ pub const PairingGuard = struct {
             if (!isTokenRecordActive(entry.value_ptr.*, now)) continue;
             const token_matches = constantTimeEq(hashed, entry.key_ptr.*);
             const source_matches = !configured_only or entry.value_ptr.configured;
-            found |= @as(u8, @intFromBool(token_matches and source_matches));
+            const scope_matches = entry.value_ptr.scope == .all or allow_cron_scope;
+            found |= @as(u8, @intFromBool(token_matches and source_matches and scope_matches));
         }
         return found != 0;
     }
@@ -269,7 +301,7 @@ pub const PairingGuard = struct {
         const now = std_compat.time.timestamp();
         var it = self.paired_tokens.valueIterator();
         while (it.next()) |record| {
-            if (isTokenRecordActive(record.*, now)) count += 1;
+            if (record.scope == .all and isTokenRecordActive(record.*, now)) count += 1;
         }
         return count;
     }
@@ -890,6 +922,47 @@ test "attemptPair succeeds with valid one-time code" {
         },
         else => try std.testing.expect(false),
     }
+}
+
+test "cron token is scoped and does not consume interactive pairing" {
+    // Regression: issue #839 needs a cron-scoped scheduler credential without
+    // persisting or broadening an interactive full-gateway bearer token.
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    const pairing_code = try std.testing.allocator.dupe(u8, guard.pairingCode().?);
+    defer std.testing.allocator.free(pairing_code);
+
+    const cron_token = try guard.issueCronToken();
+    defer std.testing.allocator.free(cron_token);
+    try std.testing.expect(guard.isCronAuthenticated(cron_token));
+    try std.testing.expect(!guard.isAuthenticated(cron_token));
+    try std.testing.expect(!guard.matchesStoredToken(cron_token));
+    try std.testing.expectEqual(@as(usize, 0), guard.tokenCount());
+
+    const result = guard.attemptPair(pairing_code);
+    switch (result) {
+        .paired => |interactive_token| {
+            defer std.testing.allocator.free(interactive_token);
+            try std.testing.expect(guard.isAuthenticated(interactive_token));
+            try std.testing.expect(guard.isCronAuthenticated(interactive_token));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn issueCronTokenAllocationTest(allocator: std.mem.Allocator) !void {
+    var guard = try PairingGuard.init(allocator, true, &.{});
+    defer guard.deinit();
+    const token = try guard.issueCronToken();
+    defer allocator.free(token);
+}
+
+test "issueCronToken frees partial allocations on out-of-memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        issueCronTokenAllocationTest,
+        .{},
+    );
 }
 
 test "attemptPair reports already_paired when no code is available" {

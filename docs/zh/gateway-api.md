@@ -16,12 +16,12 @@
 | `/pair` | POST | `X-Pairing-Code` | 用一次性配对码换取 bearer token（网关公开绑定时仅允许 loopback 客户端） |
 | `/webhook` | POST | `Authorization: Bearer <token>` | 发送消息：`{"message":"..."}` |
 | `/media/transcribe` | POST | `Authorization: Bearer <token>` | 通过已配置的 STT provider 转写 base64 音频负载 |
-| `/cron` | GET | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 查看运行中 daemon 的实时 scheduler 任务 |
-| `/cron/add` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 新增实时 cron 任务 |
-| `/cron/remove` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 删除实时 cron 任务 |
-| `/cron/pause` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 暂停实时 cron 任务 |
-| `/cron/resume` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 恢复实时 cron 任务 |
-| `/cron/update` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 部分更新实时 cron 任务 |
+| `/cron` | GET | 需要鉴权时可使用 cron-scoped bearer 或完整权限的 gateway bearer | 查看运行中 daemon 的实时 scheduler 任务 |
+| `/cron/add` | POST | 需要鉴权时可使用 cron-scoped bearer 或完整权限的 gateway bearer | 新增实时 cron 任务 |
+| `/cron/remove` | POST | 需要鉴权时可使用 cron-scoped bearer 或完整权限的 gateway bearer | 按 `id` 删除实时 cron 任务 |
+| `/cron/pause` | POST | 需要鉴权时可使用 cron-scoped bearer 或完整权限的 gateway bearer | 按 `id` 暂停实时 cron 任务 |
+| `/cron/resume` | POST | 需要鉴权时可使用 cron-scoped bearer 或完整权限的 gateway bearer | 按 `id` 恢复实时 cron 任务 |
+| `/cron/update` | POST | 需要鉴权时可使用 cron-scoped bearer 或完整权限的 gateway bearer | 部分更新实时 cron 任务 |
 | `/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` 必须匹配 `channels.telegram.accounts.<id>.webhook_secret` | Telegram 入站 webhook |
 | `/whatsapp` | GET | Query 参数 | Meta Webhook 验证 |
 | `/whatsapp` | POST | Meta 签名 | WhatsApp 入站消息 |
@@ -318,10 +318,11 @@ curl -X POST \
 
 1. 保持 `gateway.require_pairing = true`。
 2. 网关优先绑定 `127.0.0.1`，外网访问通过 tunnel/反向代理。
-3. 如果你刻意绑定到非 loopback 地址，通用端点（`/webhook`、`/cron/*`、`/a2a`、`/media/transcribe`）即使关闭了交互式 pairing，也仍然要求已存储的 bearer token；如果不使用 `/pair`，请预先配置 `gateway.paired_tokens`。
+3. 如果你刻意绑定到非 loopback 地址，通用端点（`/webhook`、`/a2a`、`/media/transcribe`）即使关闭了交互式 pairing，也仍然要求完整权限的 gateway bearer token；如果不使用 `/pair`，请预先配置 `gateway.paired_tokens`。`/cron/*` 也接受专用的 cron-scoped bearer。
 4. 如果是非 loopback 绑定，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `gateway.paired_tokens`。
 5. token 视为密钥，不写入公开仓库或日志。
 6. Max webhook secret 同理：每个账号使用独立随机值，不跨 bot 复用。
+7. 需要 cron 鉴权时，gateway 会在启动时创建一个仅限 `/cron/*` 使用的 bearer token，仅保留其哈希，并把加密后的凭据以 `0600` 权限写入配置目录下的 `paired_token`。schedule/cron 工具通过该文件认证控制请求。token 会在每次 gateway 重启时轮换，不能用于 webhook、A2A、媒体或其他管理路由。它仍然是 bearer 凭据，并非绑定 IP 的本机来源证明，因此必须防止配置目录泄露。`require_pairing = false` 的匿名 loopback gateway 不会创建此凭据。
 
 ## 下一步
 

@@ -339,9 +339,7 @@ pub fn writeCredentialsJson(allocator: std.mem.Allocator, creds: GeminiCliCreden
 
     try buf.append(allocator, '}');
 
-    const file = std_compat.fs.createFileAbsolute(path, .{ .permissions = std_compat.fs.permissionsFromMode(0o600) }) catch return error.FileWriteError;
-    defer file.close();
-    try file.writeAll(buf.items);
+    fs_compat.writeFileAtomicSecure(path, buf.items) catch return error.FileWriteError;
 }
 
 /// Try to load Gemini CLI OAuth credentials from ~/.gemini/oauth_creds.json.
@@ -1942,9 +1940,7 @@ test "writeCredentialsJson produces valid JSON" {
     if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
         const stat = try fs_compat.stat(file);
         const mode = stat.mode & 0o777;
-        // Respect process umask: require owner rw and forbid executable bits.
-        try std.testing.expect((mode & 0o600) == 0o600);
-        try std.testing.expect((mode & 0o111) == 0);
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), mode);
     }
 }
 
