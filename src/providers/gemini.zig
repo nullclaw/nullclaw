@@ -779,6 +779,8 @@ pub const GeminiProvider = struct {
 
         argv_buf[argc] = "curl";
         argc += 1;
+        argv_buf[argc] = "-q";
+        argc += 1;
         argv_buf[argc] = "-s";
         argc += 1;
         argv_buf[argc] = "--no-buffer";
@@ -804,16 +806,8 @@ pub const GeminiProvider = struct {
         argv_buf[argc] = "POST";
         argc += 1;
 
-        // Add proxy from environment if set
-        const proxy = http_util.getProxyFromEnv(allocator) catch null;
-        defer if (proxy) |p| allocator.free(p);
-
-        if (proxy) |p| {
-            argv_buf[argc] = "--proxy";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
+        var curl_config = try http_util.prepareProtectedCurlConfigFromEnvironment(allocator, url);
+        defer curl_config.deinit();
 
         const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
         defer if (resolve_entry) |entry| allocator.free(entry);
@@ -842,7 +836,9 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "@-";
         argc += 1;
-        argv_buf[argc] = url;
+        argv_buf[argc] = "--config";
+        argc += 1;
+        argv_buf[argc] = curl_config.path();
         argc += 1;
 
         var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
