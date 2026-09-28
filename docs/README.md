@@ -20,6 +20,7 @@ JK:- Gateway API: [`en/gateway-api.md`](./en/gateway-api.md) / [`zh/gateway-api.
 KS:
 ## Topical Docs
 
+- Skills: [`en/skills.md`](./en/skills.md) / [`zh/skills.md`](./zh/skills.md)
 - External channel plugins: [`en/external-channels.md`](./en/external-channels.md) / [`zh/external-channels.md`](./zh/external-channels.md)
 - Ops runbooks:
   - [`en/ops/dingtalk-ops-readiness.md`](./en/ops/dingtalk-ops-readiness.md)

@@ -86,6 +86,7 @@ QV:- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to 
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
 - [External Channel Plugins](./external-channels.md)
+- [Skills](./skills.md)
 - [Commands](./commands.md)
 - [Development](./development.md)
 
