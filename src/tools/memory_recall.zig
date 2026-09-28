@@ -66,6 +66,17 @@ pub const MemoryRecallTool = struct {
         return false;
     }
 
+    fn isHiddenFromRecall(key: []const u8, content: []const u8) bool {
+        if (mem_root.isInternalMemoryEntryKeyOrContent(key, content)) return true;
+        // Hygiene copies of old turns. Showing them makes the model answer
+        // history instead of the message that is in front of it.
+        if (std.mem.startsWith(u8, key, "archive:conversation:")) return true;
+        if (mem_root.extractMarkdownMemoryKey(content)) |extracted| {
+            if (std.mem.startsWith(u8, extracted, "archive:conversation:")) return true;
+        }
+        return false;
+    }
+
     fn appendMissingEntries(
         allocator: std.mem.Allocator,
         dest: *std.ArrayList(MemoryEntry),
@@ -74,6 +85,7 @@ pub const MemoryRecallTool = struct {
     ) !void {
         for (entries) |entry| {
             if (dest.items.len >= limit) break;
+            if (isHiddenFromRecall(entry.key, entry.content)) continue;
             if (containsEntryKey(dest.items, entry.key)) continue;
 
             const cloned_category: mem_root.MemoryCategory = switch (entry.category) {
@@ -105,6 +117,7 @@ pub const MemoryRecallTool = struct {
     ) !void {
         for (candidates) |candidate| {
             if (dest.items.len >= limit) break;
+            if (isHiddenFromRecall(candidate.key, candidate.snippet)) continue;
             if (containsCandidateKey(dest.items, candidate.key)) continue;
 
             const cloned_category: mem_root.MemoryCategory = switch (candidate.category) {
@@ -233,7 +246,7 @@ pub const MemoryRecallTool = struct {
     fn countVisibleEntries(entries: []const MemoryEntry) usize {
         var count: usize = 0;
         for (entries) |entry| {
-            if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (isHiddenFromRecall(entry.key, entry.content)) continue;
             count += 1;
         }
         return count;
@@ -242,7 +255,7 @@ pub const MemoryRecallTool = struct {
     fn countVisibleCandidates(candidates: []const mem_root.RetrievalCandidate) usize {
         var count: usize = 0;
         for (candidates) |cand| {
-            if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            if (isHiddenFromRecall(cand.key, cand.snippet)) continue;
             count += 1;
         }
         return count;
@@ -261,7 +274,7 @@ pub const MemoryRecallTool = struct {
         var shown_idx: usize = 0;
         for (entries, 0..) |entry, i| {
             _ = i;
-            if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (isHiddenFromRecall(entry.key, entry.content)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
@@ -295,7 +308,7 @@ pub const MemoryRecallTool = struct {
         var shown_idx: usize = 0;
         for (candidates, 0..) |cand, i| {
             _ = i;
-            if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            if (isHiddenFromRecall(cand.key, cand.snippet)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
@@ -379,6 +392,35 @@ test "memory_recall with custom limit" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
+}
+
+test "memory_recall hides archived conversation shards" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Regression: NullClawBot answered live Discord requests as if they were
+    // February archive chunks because memory_recall returned those shards.
+    try mem.store(
+        "archive:conversation:autosave_user_1700000000000000000:chunk:0",
+        "needle archived transcript from an old turn",
+        .{ .custom = "archive" },
+        null,
+    );
+    try mem.store("live_fact", "needle the user actually stored", .core, null);
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\": \"needle\", \"limit\": 1}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "live_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "archive:conversation:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "archived transcript") == null);
 }
 
 test "memory_recall filters internal bootstrap keys" {
