@@ -67,7 +67,7 @@ NullClaw supports multiple IRC accounts simultaneously. You can connect to both 
           "host": "irc.libera.chat",
           "port": 6697,
           "nick": "my-agent",
-          "channel": "#my-channel",
+        "channels": ["#my-channel"],
           "tls": true,
           "allow_from": ["my-username"]
         },

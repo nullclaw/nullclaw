@@ -431,7 +431,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
           "host": "irc.libera.chat",
           "port": 6697,
           "nick": "nullclaw",
-          "channel": "#nullclaw",
+          "channels": ["#nullclaw"],
           "tls": true,
           "allow_from": ["user1"]
         },

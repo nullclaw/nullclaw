@@ -1777,6 +1777,15 @@ fn slackSessionKey(
     return std.fmt.bufPrint(buf, "slack:{s}:channel:{s}", .{ account_id, channel_id }) catch "slack:unknown";
 }
 
+const RoutedSessionKey = struct {
+    key: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: RoutedSessionKey, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.key);
+    }
+};
+
 fn slackSessionKeyRouted(
     allocator: std.mem.Allocator,
     fallback_buf: []u8,
@@ -1785,7 +1794,7 @@ fn slackSessionKeyRouted(
     channel_id: []const u8,
     is_dm: bool,
     cfg_opt: ?*const Config,
-) []const u8 {
+) RoutedSessionKey {
     const fallback = slackSessionKey(fallback_buf, account_id, sender_id, channel_id, is_dm);
     return resolveRouteSessionKey(
         allocator,
@@ -1964,7 +1973,7 @@ fn whatsappSessionKeyRouted(
     body: []const u8,
     cfg_opt: ?*const Config,
     account_id: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     const sender = jsonStringField(body, "from") orelse "unknown";
     const group_id = jsonStringField(body, "group_jid") orelse jsonStringField(body, "group_id");
     const peer_id = if (group_id) |gid|
@@ -1973,17 +1982,14 @@ fn whatsappSessionKeyRouted(
         sender;
     const peer_kind: agent_routing.ChatType = if (group_id != null) .group else .direct;
 
-    if (cfg_opt) |cfg| {
-        const route = agent_routing.resolveRouteWithSession(allocator, .{
-            .channel = "whatsapp",
-            .account_id = account_id,
-            .peer = .{ .kind = peer_kind, .id = peer_id },
-        }, cfg.agent_bindings, cfg.agents, cfg.session) catch return whatsappSessionKey(fallback_buf, body);
-        allocator.free(route.main_session_key);
-        return route.session_key;
-    }
-
-    return whatsappSessionKey(fallback_buf, body);
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "whatsapp",
+        account_id,
+        .{ .kind = peer_kind, .id = peer_id },
+        whatsappSessionKey(fallback_buf, body),
+    );
 }
 
 fn resolveRouteSessionKey(
@@ -1993,17 +1999,17 @@ fn resolveRouteSessionKey(
     account_id: []const u8,
     peer: agent_routing.PeerRef,
     fallback: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     if (cfg_opt) |cfg| {
         const route = agent_routing.resolveRouteWithSession(allocator, .{
             .channel = channel,
             .account_id = account_id,
             .peer = peer,
-        }, cfg.agent_bindings, cfg.agents, cfg.session) catch return fallback;
+        }, cfg.agent_bindings, cfg.agents, cfg.session) catch return .{ .key = fallback };
         allocator.free(route.main_session_key);
-        return route.session_key;
+        return .{ .key = route.session_key, .owned = true };
     }
-    return fallback;
+    return .{ .key = fallback };
 }
 
 fn qqPeerRefFromInbound(inbound: *const bus_mod.InboundMessage) ?agent_routing.PeerRef {
@@ -2034,7 +2040,7 @@ fn qqSessionKeyRouted(
     allocator: std.mem.Allocator,
     inbound: *const bus_mod.InboundMessage,
     cfg_opt: ?*const Config,
-) ?[]const u8 {
+) ?RoutedSessionKey {
     const cfg = cfg_opt orelse return null;
     const account_id = if (inbound.metadata_json) |json|
         (jsonStringField(json, "account_id") orelse "default")
@@ -2048,7 +2054,7 @@ fn qqSessionKeyRouted(
         .peer = peer,
     }, cfg.agent_bindings, cfg.agents, cfg.session) catch return null;
     allocator.free(route.main_session_key);
-    return route.session_key;
+    return .{ .key = route.session_key, .owned = true };
 }
 
 fn teamsPeerRef(
@@ -2079,7 +2085,7 @@ fn teamsSessionKeyRouted(
     tenant_id: []const u8,
     conversation_id: []const u8,
     from_id: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     const fallback = std.fmt.bufPrint(fallback_buf, "teams:{s}:{s}", .{ tenant_id, conversation_id }) catch "teams:default";
     const peer_info = teamsPeerRef(body, from_id, conversation_id);
     return resolveRouteSessionKey(
@@ -2237,23 +2243,27 @@ fn lineSenderAllowed(allow_from: []const []const u8, evt: channels.line.LineEven
     return channels.isAllowed(allow_from, user_id);
 }
 
+fn tencentSenderAllowed(allow_from: []const []const u8, sender: []const u8) bool {
+    return channels.isAllowedExactScoped("wechat/wecom channel", allow_from, sender);
+}
+
 fn telegramSessionKeyRouted(
     allocator: std.mem.Allocator,
     fallback_buf: []u8,
     body: []const u8,
     cfg_opt: ?*const Config,
     account_id: []const u8,
-) []const u8 {
-    const target = telegramWebhookTarget(allocator, body) orelse return "telegram:0";
+) RoutedSessionKey {
+    const target = telegramWebhookTarget(allocator, body) orelse return .{ .key = "telegram:0" };
     const fallback = telegramFallbackSessionKey(fallback_buf, target.chat_id, target.message_thread_id);
     var peer_buf: [64]u8 = undefined;
-    const peer_id = std.fmt.bufPrint(&peer_buf, "{d}", .{target.chat_id}) catch return fallback;
+    const peer_id = std.fmt.bufPrint(&peer_buf, "{d}", .{target.chat_id}) catch return .{ .key = fallback };
     const peer_kind: agent_routing.ChatType = if (target.is_group) .group else .direct;
 
     if (cfg_opt) |cfg| {
         if (target.is_group and target.message_thread_id != null) {
             const thread_id = target.message_thread_id.?;
-            const topic_peer_id = std.fmt.allocPrint(allocator, "{s}:thread:{d}", .{ peer_id, thread_id }) catch return fallback;
+            const topic_peer_id = std.fmt.allocPrint(allocator, "{s}:thread:{d}", .{ peer_id, thread_id }) catch return .{ .key = fallback };
             defer allocator.free(topic_peer_id);
 
             const route = agent_routing.resolveRouteWithSession(allocator, .{
@@ -2261,9 +2271,9 @@ fn telegramSessionKeyRouted(
                 .account_id = account_id,
                 .peer = .{ .kind = peer_kind, .id = topic_peer_id },
                 .parent_peer = .{ .kind = peer_kind, .id = peer_id },
-            }, cfg.agent_bindings, cfg.agents, cfg.session) catch return fallback;
+            }, cfg.agent_bindings, cfg.agents, cfg.session) catch return .{ .key = fallback };
             allocator.free(route.main_session_key);
-            return route.session_key;
+            return .{ .key = route.session_key, .owned = true };
         }
     }
 
@@ -2440,15 +2450,15 @@ fn lineSessionKeyRouted(
     evt: channels.line.LineEvent,
     cfg_opt: ?*const Config,
     account_id: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     const fallback = lineSessionKey(fallback_buf, evt);
     const src_type = evt.source_type orelse "";
     const peer_kind: agent_routing.ChatType = if (std.mem.eql(u8, src_type, "group") or std.mem.eql(u8, src_type, "room")) .group else .direct;
     var peer_buf: [160]u8 = undefined;
     const peer_id = if (std.mem.eql(u8, src_type, "group"))
-        std.fmt.bufPrint(&peer_buf, "group:{s}", .{evt.group_id orelse evt.user_id orelse "unknown"}) catch return fallback
+        std.fmt.bufPrint(&peer_buf, "group:{s}", .{evt.group_id orelse evt.user_id orelse "unknown"}) catch return .{ .key = fallback }
     else if (std.mem.eql(u8, src_type, "room"))
-        std.fmt.bufPrint(&peer_buf, "room:{s}", .{evt.room_id orelse evt.user_id orelse "unknown"}) catch return fallback
+        std.fmt.bufPrint(&peer_buf, "room:{s}", .{evt.room_id orelse evt.user_id orelse "unknown"}) catch return .{ .key = fallback }
     else
         evt.user_id orelse "unknown";
     return resolveRouteSessionKey(
@@ -2471,7 +2481,7 @@ fn larkSessionKeyRouted(
     msg: channels.lark.ParsedLarkMessage,
     cfg_opt: ?*const Config,
     account_id: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     const fallback = larkSessionKey(fallback_buf, msg);
     const peer_kind: agent_routing.ChatType = if (msg.is_group) .group else .direct;
     return resolveRouteSessionKey(
@@ -2498,7 +2508,7 @@ fn wechatSessionKeyRouted(
     sender: []const u8,
     cfg_opt: ?*const Config,
     account_id: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     const fallback = wechatSessionKey(fallback_buf, sender);
     return resolveRouteSessionKey(
         allocator,
@@ -2516,7 +2526,7 @@ fn wecomSessionKeyRouted(
     sender: []const u8,
     cfg_opt: ?*const Config,
     account_id: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     const fallback = wecomSessionKey(fallback_buf, sender);
     return resolveRouteSessionKey(
         allocator,
@@ -2543,7 +2553,7 @@ fn maxSessionKeyRouted(
     is_group: bool,
     cfg_opt: ?*const Config,
     account_id: []const u8,
-) []const u8 {
+) RoutedSessionKey {
     const fallback = maxSessionKey(fallback_buf, account_id, sender, reply_target, is_group);
     const peer_id = if (is_group) reply_target else sender;
     return resolveRouteSessionKey(
@@ -3663,13 +3673,17 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     }) catch null;
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
+                const routed_key = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
+                defer routed_key.deinit(ctx.req_allocator);
+                const sk = routed_key.key;
                 _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, chat_target, msg_text.?, sk, meta);
                 ctx.response_body = "{\"status\":\"ok\"}";
             } else if (ctx.session_mgr_opt) |sm| {
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
+                const routed_key = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
+                defer routed_key.deinit(ctx.req_allocator);
+                const sk = routed_key.key;
                 const conversation_context: ?ConversationContext = simpleConversationContext(
                     "telegram",
                     tg_account_id,
@@ -3808,7 +3822,9 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
         if (msg_text) |mt| {
             var wa_key_buf: [256]u8 = undefined;
             const wa_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-            const wa_session_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, body, wa_cfg_opt, wa_account_id);
+            const routed_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, body, wa_cfg_opt, wa_account_id);
+            defer routed_key.deinit(ctx.req_allocator);
+            const wa_session_key = routed_key.key;
             const wa_sender_id = wa_sender orelse "unknown";
             const wa_chat_target = whatsappReplyTarget(body);
             const wa_peer_kind = if (wa_is_group) "group" else "direct";
@@ -3872,7 +3888,9 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
         if (msg_text) |mt| {
             var wa_key_buf: [256]u8 = undefined;
             const wa_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-            const wa_session_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, b, wa_cfg_opt, wa_account_id);
+            const routed_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, b, wa_cfg_opt, wa_account_id);
+            defer routed_key.deinit(ctx.req_allocator);
+            const wa_session_key = routed_key.key;
             const wa_sender_ns = wa_sender orelse "unknown";
             const wa_chat_target_ns = whatsappReplyTarget(b);
             const wa_peer_kind = if (wa_is_group) "group" else "direct";
@@ -4051,7 +4069,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                 const interactive_target = slackInteractiveTarget(selection.target, callback_channel_val.string);
 
                 var key_buf: [256]u8 = undefined;
-                const session_key = slackSessionKeyRouted(
+                const routed_key = slackSessionKeyRouted(
                     ctx.req_allocator,
                     &key_buf,
                     slack_cfg.account_id,
@@ -4060,6 +4078,8 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                     interactive_target.is_dm,
                     ctx.config_opt,
                 );
+                defer routed_key.deinit(ctx.req_allocator);
+                const session_key = routed_key.key;
 
                 if (ctx.state.event_bus) |eb| {
                     var meta_buf: [384]u8 = undefined;
@@ -4214,7 +4234,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 
     var key_buf: [256]u8 = undefined;
-    const sk = slackSessionKeyRouted(
+    const routed_key = slackSessionKeyRouted(
         ctx.req_allocator,
         &key_buf,
         slack_cfg.account_id,
@@ -4223,6 +4243,8 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         is_dm,
         ctx.config_opt,
     );
+    defer routed_key.deinit(ctx.req_allocator);
+    const sk = routed_key.key;
 
     if (ctx.state.event_bus) |eb| {
         var meta_buf: [384]u8 = undefined;
@@ -4359,7 +4381,9 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
             if (evt.message_text) |text| {
                 var kb: [128]u8 = undefined;
                 const line_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-                const sk = lineSessionKeyRouted(ctx.req_allocator, &kb, evt, line_cfg_opt, line_account_id);
+                const routed_key = lineSessionKeyRouted(ctx.req_allocator, &kb, evt, line_cfg_opt, line_account_id);
+                defer routed_key.deinit(ctx.req_allocator);
+                const sk = routed_key.key;
                 const uid = evt.user_id orelse "unknown";
                 const line_target = lineReplyTarget(evt);
                 if (evt.reply_token) |rt| {
@@ -4497,7 +4521,9 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     for (messages) |msg| {
         var kb: [128]u8 = undefined;
         const lark_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-        const sk = larkSessionKeyRouted(ctx.req_allocator, &kb, msg, lark_cfg_opt, lark_account_id);
+        const routed_key = larkSessionKeyRouted(ctx.req_allocator, &kb, msg, lark_cfg_opt, lark_account_id);
+        defer routed_key.deinit(ctx.req_allocator);
+        const sk = routed_key.key;
 
         if (ctx.state.event_bus) |eb| {
             var meta_buf: [320]u8 = undefined;
@@ -4729,20 +4755,22 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
     };
     defer inbound.deinit(ctx.req_allocator);
 
-    if (wechat_allow_from.len > 0 and !channels.isAllowed(wechat_allow_from, inbound.from_user)) {
+    if (!tencentSenderAllowed(wechat_allow_from, inbound.from_user)) {
         setPlainTextResponse(ctx, "success");
         return;
     }
 
     if (ctx.state.event_bus) |eb| {
         var key_buf: [128]u8 = undefined;
-        const session_key = wechatSessionKeyRouted(
+        const routed_key = wechatSessionKeyRouted(
             ctx.req_allocator,
             &key_buf,
             inbound.from_user,
             ctx.config_opt,
             wechat_account_id,
         );
+        defer routed_key.deinit(ctx.req_allocator);
+        const session_key = routed_key.key;
         var meta_buf: [320]u8 = undefined;
         const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"direct\",\"peer_id\":\"{s}\"}}", .{
             wechat_account_id,
@@ -4755,13 +4783,15 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
 
     if (ctx.session_mgr_opt) |sm| {
         var key_buf: [128]u8 = undefined;
-        const session_key = wechatSessionKeyRouted(
+        const routed_key = wechatSessionKeyRouted(
             ctx.req_allocator,
             &key_buf,
             inbound.from_user,
             ctx.config_opt,
             wechat_account_id,
         );
+        defer routed_key.deinit(ctx.req_allocator);
+        const session_key = routed_key.key;
         const reply: ?[]const u8 = sm.processInboundMessage(session_key, inbound.content, null) catch null;
         if (reply) |r| {
             defer ctx.root_allocator.free(r);
@@ -4932,19 +4962,21 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
     };
     defer inbound.deinit(ctx.req_allocator);
 
-    if (wecom_allow_from.len > 0 and !channels.isAllowed(wecom_allow_from, inbound.sender)) {
+    if (!tencentSenderAllowed(wecom_allow_from, inbound.sender)) {
         ctx.response_body = "{\"status\":\"unauthorized\"}";
         return;
     }
 
     var key_buf: [128]u8 = undefined;
-    const session_key = wecomSessionKeyRouted(
+    const routed_key = wecomSessionKeyRouted(
         ctx.req_allocator,
         &key_buf,
         inbound.sender,
         ctx.config_opt,
         wecom_account_id,
     );
+    defer routed_key.deinit(ctx.req_allocator);
+    const session_key = routed_key.key;
 
     if (ctx.state.event_bus) |eb| {
         var meta_buf: [320]u8 = undefined;
@@ -5066,9 +5098,9 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
 
         if (ctx.session_mgr_opt) |sm| {
-            const routed_session_key: ?[]const u8 = qqSessionKeyRouted(ctx.req_allocator, &inbound, ctx.config_opt);
-            defer if (routed_session_key) |owned| ctx.req_allocator.free(owned);
-            const session_key = routed_session_key orelse inbound.session_key;
+            const routed_key = qqSessionKeyRouted(ctx.req_allocator, &inbound, ctx.config_opt);
+            defer if (routed_key) |key| key.deinit(ctx.req_allocator);
+            const session_key = if (routed_key) |key| key.key else inbound.session_key;
             const peer = qqPeerRefFromInbound(&inbound);
             const meta = inbound.metadata_json;
             const account_id = if (meta) |json| jsonStringField(json, "account_id") else null;
@@ -5164,7 +5196,7 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
         const reply_target = inbound.reply_target orelse inbound.sender;
         const peer_id = if (inbound.is_group) reply_target else inbound.sender;
         var kb: [192]u8 = undefined;
-        const sk = maxSessionKeyRouted(
+        const routed_key = maxSessionKeyRouted(
             ctx.req_allocator,
             &kb,
             inbound.sender,
@@ -5173,6 +5205,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.config_opt,
             max_cfg.account_id,
         );
+        defer routed_key.deinit(ctx.req_allocator);
+        const sk = routed_key.key;
         const peer_kind: []const u8 = if (inbound.is_group) "group" else "direct";
 
         if (ctx.state.event_bus) |eb| {
@@ -5394,7 +5428,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
 
     const peer_info = teamsPeerRef(body, from_id, conversation_id);
     var key_buf: [256]u8 = undefined;
-    const sk = teamsSessionKeyRouted(
+    const routed_key = teamsSessionKeyRouted(
         ctx.req_allocator,
         &key_buf,
         config,
@@ -5404,6 +5438,8 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         conversation_id,
         from_id,
     );
+    defer routed_key.deinit(ctx.req_allocator);
+    const sk = routed_key.key;
 
     // Build chat_id as "serviceUrl|conversationId" for outbound routing
     var chat_buf: [512]u8 = undefined;
@@ -8186,6 +8222,7 @@ test "handleWeChatWebhookRoute accepts secure encrypted callback" {
             .callback_token = token,
             .encoding_aes_key = encoding_aes_key,
             .app_id = app_id,
+            .allow_from = &.{"o_user123"},
         },
     };
     var cfg = Config{
@@ -8197,6 +8234,9 @@ test "handleWeChatWebhookRoute accepts secure encrypted callback" {
 
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+    state.event_bus = &event_bus;
 
     var ctx = WebhookHandlerContext{
         .root_allocator = std.testing.allocator,
@@ -8213,6 +8253,22 @@ test "handleWeChatWebhookRoute accepts secure encrypted callback" {
     try std.testing.expectEqualStrings("200 OK", ctx.response_status);
     try std.testing.expectEqualStrings(CONTENT_TYPE_TEXT, ctx.response_content_type);
     try std.testing.expectEqualStrings("success", ctx.response_body);
+
+    const allowed_message = event_bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer allowed_message.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("o_user123", allowed_message.sender_id);
+
+    const blocked_wechat_accounts = [_]config_types.WeChatConfig{.{
+        .account_id = "main",
+        .callback_token = token,
+        .encoding_aes_key = encoding_aes_key,
+        .app_id = app_id,
+    }};
+    cfg.channels.wechat = &blocked_wechat_accounts;
+    ctx.client_identifier = "empty-allowlist-client";
+    handleWeChatWebhookRoute(&ctx);
+    // Regression: a valid signature authenticates the webhook, not the sender.
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
 }
 
 test "handleWeChatWebhookRoute rejects stale signed callbacks" {
@@ -8389,6 +8445,14 @@ test "lineSenderAllowed denies empty allow_from and permits wildcard" {
     try std.testing.expect(lineSenderAllowed(&.{"*"}, evt));
     try std.testing.expect(lineSenderAllowed(&.{"U123"}, evt));
     try std.testing.expect(!lineSenderAllowed(&.{"U999"}, evt));
+}
+
+test "tencentSenderAllowed denies empty allow_from and permits explicit access" {
+    try std.testing.expect(!tencentSenderAllowed(&.{}, "user-1"));
+    try std.testing.expect(tencentSenderAllowed(&.{"user-1"}, "user-1"));
+    try std.testing.expect(tencentSenderAllowed(&.{"*"}, "user-1"));
+    try std.testing.expect(!tencentSenderAllowed(&.{"user-2"}, "user-1"));
+    try std.testing.expect(!tencentSenderAllowed(&.{"User-1"}, "user-1"));
 }
 
 test "line webhook caches reply token only after sender allowlist passes" {
@@ -8605,12 +8669,48 @@ test "whatsappSenderAllowed matches with and without plus prefix" {
     try std.testing.expect(whatsappSenderAllowed("+15550001111", false, null, &allow_without_plus, &.{}, &.{}, "allowlist"));
 }
 
+test "resolveRouteSessionKey exposes ownership for cleanup" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "wechat-agent",
+            .match = .{
+                .channel = "wechat",
+                .account_id = "wechat-main",
+                .peer = .{ .kind = .direct, .id = "openid_123" },
+            },
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+
+    // Regression: routed webhook session keys used to leak on every configured request.
+    const routed_key = resolveRouteSessionKey(
+        allocator,
+        &cfg,
+        "wechat",
+        "wechat-main",
+        .{ .kind = .direct, .id = "openid_123" },
+        "wechat:openid_123",
+    );
+    defer routed_key.deinit(allocator);
+
+    try std.testing.expect(routed_key.owned);
+    try std.testing.expectEqualStrings("agent:wechat-agent:wechat:direct:openid_123", routed_key.key);
+}
+
 test "whatsappSessionKeyRouted falls back without config" {
     const allocator = std.testing.allocator;
     const body = "{\"from\":\"15550001111\",\"text\":{\"body\":\"hi\"}}";
     var key_buf: [256]u8 = undefined;
-    const key = whatsappSessionKeyRouted(allocator, &key_buf, body, null, "default");
-    try std.testing.expectEqualStrings("whatsapp:15550001111", key);
+    const routed_key = whatsappSessionKeyRouted(allocator, &key_buf, body, null, "default");
+    defer routed_key.deinit(allocator);
+    try std.testing.expect(!routed_key.owned);
+    try std.testing.expectEqualStrings("whatsapp:15550001111", routed_key.key);
 }
 
 test "whatsappSessionKeyRouted uses route engine when config exists" {
@@ -8637,8 +8737,9 @@ test "whatsappSessionKeyRouted uses route engine when config exists" {
         },
     };
 
-    const key = whatsappSessionKeyRouted(allocator, &key_buf, body, &cfg, "wa-prod");
-    try std.testing.expectEqualStrings("agent:wa-agent:whatsapp:group:1203630@g.us", key);
+    const routed_key = whatsappSessionKeyRouted(allocator, &key_buf, body, &cfg, "wa-prod");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:wa-agent:whatsapp:group:1203630@g.us", routed_key.key);
 }
 
 test "whatsappSessionKeyRouted uses nested context.group_jid for group routing" {
@@ -8665,8 +8766,9 @@ test "whatsappSessionKeyRouted uses nested context.group_jid for group routing" 
         },
     };
 
-    const key = whatsappSessionKeyRouted(allocator, &key_buf, body, &cfg, "wa-main");
-    try std.testing.expectEqualStrings("agent:wa-context-agent:whatsapp:group:1203631@g.us", key);
+    const routed_key = whatsappSessionKeyRouted(allocator, &key_buf, body, &cfg, "wa-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:wa-context-agent:whatsapp:group:1203631@g.us", routed_key.key);
 }
 
 test "telegramSessionKeyRouted uses group peer for group chats" {
@@ -8695,8 +8797,9 @@ test "telegramSessionKeyRouted uses group peer for group chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
-    try std.testing.expectEqualStrings("agent:tg-group-agent:telegram:group:-10012345", key);
+    const routed_key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:tg-group-agent:telegram:group:-10012345", routed_key.key);
 }
 
 test "telegramSessionKeyRouted uses direct peer for private chats" {
@@ -8725,8 +8828,9 @@ test "telegramSessionKeyRouted uses direct peer for private chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
-    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", key);
+    const routed_key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", routed_key.key);
 }
 
 test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
@@ -8758,8 +8862,9 @@ test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
-    try std.testing.expectEqualStrings("agent:tg-dm-agent:direct:4242", key);
+    const routed_key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:direct:4242", routed_key.key);
 }
 
 test "telegramSessionKeyRouted uses topic peer before group fallback" {
@@ -8796,8 +8901,9 @@ test "telegramSessionKeyRouted uses topic peer before group fallback" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
-    try std.testing.expectEqualStrings("agent:tg-topic-agent:telegram:group:-10012345:thread:42", key);
+    const routed_key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:tg-topic-agent:telegram:group:-10012345:thread:42", routed_key.key);
 }
 
 test "lineSessionKeyRouted uses group id for group events" {
@@ -8829,8 +8935,9 @@ test "lineSessionKeyRouted uses group id for group events" {
         },
     };
 
-    const key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
-    try std.testing.expectEqualStrings("agent:line-group-agent:line:group:group:G222", key);
+    const routed_key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:line-group-agent:line:group:group:G222", routed_key.key);
 }
 
 test "lineSessionKeyRouted falls back to user session key without config" {
@@ -8841,8 +8948,9 @@ test "lineSessionKeyRouted falls back to user session key without config" {
         .user_id = "U777",
     };
 
-    const key = lineSessionKeyRouted(allocator, &key_buf, evt, null, "default");
-    try std.testing.expectEqualStrings("line:U777", key);
+    const routed_key = lineSessionKeyRouted(allocator, &key_buf, evt, null, "default");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("line:U777", routed_key.key);
 }
 
 test "lineSessionKeyRouted uses room-prefixed peer id for room events" {
@@ -8874,8 +8982,9 @@ test "lineSessionKeyRouted uses room-prefixed peer id for room events" {
         },
     };
 
-    const key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
-    try std.testing.expectEqualStrings("agent:line-room-agent:line:group:room:R333", key);
+    const routed_key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:line-room-agent:line:group:room:R333", routed_key.key);
 }
 
 test "lineReplyTarget resolves conversation target for group events" {
@@ -8936,8 +9045,9 @@ test "larkSessionKeyRouted uses route engine when config exists" {
         },
     };
 
-    const key = larkSessionKeyRouted(allocator, &key_buf, msg, &cfg, "lark-main");
-    try std.testing.expectEqualStrings("agent:lark-group-agent:lark:group:ou_abc123", key);
+    const routed_key = larkSessionKeyRouted(allocator, &key_buf, msg, &cfg, "lark-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:lark-group-agent:lark:group:ou_abc123", routed_key.key);
 }
 
 test "wecomSessionKeyRouted uses route engine when config exists" {
@@ -8962,8 +9072,9 @@ test "wecomSessionKeyRouted uses route engine when config exists" {
         },
     };
 
-    const key = wecomSessionKeyRouted(allocator, &key_buf, "zhangsan", &cfg, "wecom-main");
-    try std.testing.expectEqualStrings("agent:wecom-dm-agent:wecom:direct:zhangsan", key);
+    const routed_key = wecomSessionKeyRouted(allocator, &key_buf, "zhangsan", &cfg, "wecom-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:wecom-dm-agent:wecom:direct:zhangsan", routed_key.key);
 }
 
 test "wechatSessionKeyRouted uses route engine when config exists" {
@@ -8988,8 +9099,9 @@ test "wechatSessionKeyRouted uses route engine when config exists" {
         },
     };
 
-    const key = wechatSessionKeyRouted(allocator, &key_buf, "openid_123", &cfg, "wechat-main");
-    try std.testing.expectEqualStrings("agent:wechat-dm-agent:wechat:direct:openid_123", key);
+    const routed_key = wechatSessionKeyRouted(allocator, &key_buf, "openid_123", &cfg, "wechat-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:wechat-dm-agent:wechat:direct:openid_123", routed_key.key);
 }
 
 test "maxSessionKeyRouted uses sender identity for direct chats" {
@@ -9014,8 +9126,9 @@ test "maxSessionKeyRouted uses sender identity for direct chats" {
         },
     };
 
-    const key = maxSessionKeyRouted(allocator, &key_buf, "alice", "dialog-123", false, &cfg, "max-main");
-    try std.testing.expectEqualStrings("agent:max-direct-agent:max:direct:alice", key);
+    const routed_key = maxSessionKeyRouted(allocator, &key_buf, "alice", "dialog-123", false, &cfg, "max-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:max-direct-agent:max:direct:alice", routed_key.key);
 }
 
 test "maxSessionKeyRouted uses chat target for group chats" {
@@ -9040,8 +9153,9 @@ test "maxSessionKeyRouted uses chat target for group chats" {
         },
     };
 
-    const key = maxSessionKeyRouted(allocator, &key_buf, "alice", "chat-777", true, &cfg, "max-main");
-    try std.testing.expectEqualStrings("agent:max-group-agent:max:group:chat-777", key);
+    const routed_key = maxSessionKeyRouted(allocator, &key_buf, "alice", "chat-777", true, &cfg, "max-main");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:max-group-agent:max:group:chat-777", routed_key.key);
 }
 
 test "qqSessionKeyRouted uses sender identity for direct chats" {
@@ -9077,8 +9191,9 @@ test "qqSessionKeyRouted uses sender identity for direct chats" {
     );
     defer inbound.deinit(allocator);
 
-    const key = qqSessionKeyRouted(allocator, &inbound, &cfg) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("agent:qq-direct-agent:qq:direct:openid-user", key);
+    const routed_key = qqSessionKeyRouted(allocator, &inbound, &cfg) orelse return error.TestUnexpectedResult;
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:qq-direct-agent:qq:direct:openid-user", routed_key.key);
 }
 
 test "teamsSessionKeyRouted uses sender identity for personal chats" {
@@ -9106,8 +9221,9 @@ test "teamsSessionKeyRouted uses sender identity for personal chats" {
     const body =
         \\{"type":"message","text":"hi","conversation":{"id":"conv-1","conversationType":"personal"},"from":{"id":"user-42"}}
     ;
-    const key = teamsSessionKeyRouted(allocator, &key_buf, &cfg, body, "teams-main", "tenant-1", "conv-1", "user-42");
-    try std.testing.expectEqualStrings("agent:teams-direct-agent:teams:direct:user-42", key);
+    const routed_key = teamsSessionKeyRouted(allocator, &key_buf, &cfg, body, "teams-main", "tenant-1", "conv-1", "user-42");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:teams-direct-agent:teams:direct:user-42", routed_key.key);
 }
 
 test "teamsSessionKeyRouted uses conversation id for channel chats" {
@@ -9135,8 +9251,9 @@ test "teamsSessionKeyRouted uses conversation id for channel chats" {
     const body =
         \\{"type":"message","text":"hi","conversation":{"id":"conv-chan","conversationType":"channel"},"from":{"id":"user-42"}}
     ;
-    const key = teamsSessionKeyRouted(allocator, &key_buf, &cfg, body, "teams-main", "tenant-1", "conv-chan", "user-42");
-    try std.testing.expectEqualStrings("agent:teams-channel-agent:teams:channel:conv-chan", key);
+    const routed_key = teamsSessionKeyRouted(allocator, &key_buf, &cfg, body, "teams-main", "tenant-1", "conv-chan", "user-42");
+    defer routed_key.deinit(allocator);
+    try std.testing.expectEqualStrings("agent:teams-channel-agent:teams:channel:conv-chan", routed_key.key);
 }
 
 fn buildTeamsWebhookRequest(
