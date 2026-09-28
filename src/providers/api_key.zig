@@ -327,6 +327,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "evolink", .{ "EVOLINK_API_KEY", "", "" } },
         .{ "edenai", .{ "EDENAI_API_KEY", "", "" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
+        .{ "tsubasa", .{ "TSUBASA_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "xiaomi", .{ "MIMO_API_KEY", "", "" } },
@@ -391,6 +392,18 @@ test "NVIDIA_API_KEY env resolves nvidia credential" {
 test "astrai env candidate is ASTRAI_API_KEY" {
     const candidates = providerEnvCandidates("astrai");
     try std.testing.expectEqualStrings("ASTRAI_API_KEY", candidates[0]);
+}
+
+test "Tsubasa resolves its own key without falling back to OpenAI credentials" {
+    const allocator = std.testing.allocator;
+    var guard = try platform.TestEnvGuard.captureAndClear(allocator, &.{ "TSUBASA_API_KEY", "OPENAI_API_KEY", "NULLCLAW_API_KEY", "API_KEY" });
+    defer guard.deinit();
+    try platform.setProcessEnv(allocator, "OPENAI_API_KEY", "unrelated-test-key");
+    try std.testing.expect(try resolveApiKey(allocator, "tsubasa", null) == null);
+    try platform.setProcessEnv(allocator, "TSUBASA_API_KEY", "test-key");
+    const key = (try resolveApiKey(allocator, "tsubasa", null)).?;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("test-key", key);
 }
 
 test "vertex env candidate is VERTEX_API_KEY" {
