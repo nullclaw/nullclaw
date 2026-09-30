@@ -326,6 +326,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "atlas-cloud", .{ "ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY", "ATLAS_API_KEY" } },
         .{ "evolink", .{ "EVOLINK_API_KEY", "", "" } },
         .{ "edenai", .{ "EDENAI_API_KEY", "", "" } },
+        .{ "cheaperinference", .{ "CHEAPER_INFERENCE_API_KEY", "CHEAPERINFERENCE_API_KEY", "" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
@@ -433,6 +434,13 @@ test "edenai env candidate is EDENAI_API_KEY across aliases" {
     try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("edenai")[0]);
     try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden-ai")[0]);
     try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden_ai")[0]);
+}
+
+test "cheaperinference env candidates across aliases" {
+    try std.testing.expectEqualStrings("CHEAPER_INFERENCE_API_KEY", providerEnvCandidates("cheaperinference")[0]);
+    try std.testing.expectEqualStrings("CHEAPERINFERENCE_API_KEY", providerEnvCandidates("cheaperinference")[1]);
+    try std.testing.expectEqualStrings("CHEAPER_INFERENCE_API_KEY", providerEnvCandidates("cheaper-inference")[0]);
+    try std.testing.expectEqualStrings("CHEAPER_INFERENCE_API_KEY", providerEnvCandidates("cheaper_inference")[0]);
 }
 
 test "azure aliases share Azure env candidate" {
