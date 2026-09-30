@@ -18,6 +18,9 @@
       "edenai": {
         "api_key": "YOUR_EDENAI_API_KEY"
       },
+      "cheaperinference": {
+        "api_key": "YOUR_CHEAPER_INFERENCE_API_KEY"
+      },
       "azure": {
         "api_key": "YOUR_AZURE_OPENAI_API_KEY",
         "base_url": "https://your-resource.openai.azure.com"

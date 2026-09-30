@@ -11,6 +11,7 @@ pub fn canonicalProviderName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "xiaomi-mimo") or std.mem.eql(u8, name, "mimo")) return "xiaomi";
     if (std.mem.eql(u8, name, "atlas") or std.mem.eql(u8, name, "atlascloud")) return "atlas-cloud";
     if (std.mem.eql(u8, name, "eden-ai") or std.mem.eql(u8, name, "eden_ai")) return "edenai";
+    if (std.mem.eql(u8, name, "cheaper-inference") or std.mem.eql(u8, name, "cheaper_inference")) return "cheaperinference";
     return name;
 }
 
@@ -25,6 +26,7 @@ pub fn canonicalProviderNameIgnoreCase(name: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(name, "xiaomi-mimo") or std.ascii.eqlIgnoreCase(name, "mimo")) return "xiaomi";
     if (std.ascii.eqlIgnoreCase(name, "atlas") or std.ascii.eqlIgnoreCase(name, "atlascloud")) return "atlas-cloud";
     if (std.ascii.eqlIgnoreCase(name, "eden-ai") or std.ascii.eqlIgnoreCase(name, "eden_ai")) return "edenai";
+    if (std.ascii.eqlIgnoreCase(name, "cheaper-inference") or std.ascii.eqlIgnoreCase(name, "cheaper_inference")) return "cheaperinference";
     return name;
 }
 
@@ -53,6 +55,8 @@ test "canonicalProviderName handles supported aliases" {
     try std.testing.expectEqualStrings("atlas-cloud", canonicalProviderName("atlascloud"));
     try std.testing.expectEqualStrings("edenai", canonicalProviderName("eden-ai"));
     try std.testing.expectEqualStrings("edenai", canonicalProviderName("eden_ai"));
+    try std.testing.expectEqualStrings("cheaperinference", canonicalProviderName("cheaper-inference"));
+    try std.testing.expectEqualStrings("cheaperinference", canonicalProviderName("cheaper_inference"));
 }
 
 test "providerNamesMatch handles aliases without broadening custom providers" {
@@ -61,6 +65,7 @@ test "providerNamesMatch handles aliases without broadening custom providers" {
     try std.testing.expect(providerNamesMatch("xiaomi", "mimo"));
     try std.testing.expect(providerNamesMatch("atlas-cloud", "atlascloud"));
     try std.testing.expect(providerNamesMatch("edenai", "eden-ai"));
+    try std.testing.expect(providerNamesMatch("cheaperinference", "cheaper-inference"));
     try std.testing.expect(!providerNamesMatch("custom:https://Example.com/v1", "custom:https://example.com/v1"));
 }
 
@@ -69,5 +74,6 @@ test "providerNamesMatchIgnoreCase preserves case-insensitive matching" {
     try std.testing.expect(providerNamesMatchIgnoreCase("xiaomi", "MIMO"));
     try std.testing.expect(providerNamesMatchIgnoreCase("Atlas-Cloud", "ATLAS"));
     try std.testing.expect(providerNamesMatchIgnoreCase("EdenAI", "EDEN-AI"));
+    try std.testing.expect(providerNamesMatchIgnoreCase("CheaperInference", "CHEAPER-INFERENCE"));
     try std.testing.expect(providerNamesMatchIgnoreCase("CustomGW", "customgw"));
 }
