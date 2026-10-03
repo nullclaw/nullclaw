@@ -257,7 +257,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn printVersion() void {
     var buf: [256]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&buf);
     bw.interface.print("nullclaw {s}\n", .{yc.version.string}) catch return;
     bw.interface.flush() catch return;
 }
@@ -2391,7 +2391,7 @@ fn writeMemoryExportJsonlStdout(
     options: MemoryExportOptions,
 ) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     try writeMemoryExportJsonlStream(allocator, &bw.interface, mem, options);
     try bw.interface.flush();
 }

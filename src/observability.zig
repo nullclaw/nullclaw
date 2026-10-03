@@ -340,7 +340,7 @@ pub const VerboseObserver = struct {
     fn verboseRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
         _ = traceIdForEvent(event);
         var buf: [4096]u8 = undefined;
-        var bw = std_compat.fs.File.stderr().writer(&buf);
+        var bw = std_compat.fs.File.stderr().writerStreaming(&buf);
         const stderr = &bw.interface;
         switch (event.*) {
             .llm_request => |e| {
