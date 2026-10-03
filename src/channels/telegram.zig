@@ -503,11 +503,12 @@ fn buildChoicesDirectiveFromPayload(
         if (choice.label.len == 0 or choice.label.len > interaction_choices.MAX_LABEL_LEN) return error.InvalidChoices;
         if (choice.submit_text.len == 0 or choice.submit_text.len > interaction_choices.MAX_SUBMIT_TEXT_LEN) return error.InvalidChoices;
 
-        options[i] = .{
-            .id = try allocator.dupe(u8, choice.id),
-            .label = try allocator.dupe(u8, choice.label),
-            .submit_text = try allocator.dupe(u8, choice.submit_text),
-        };
+        options[i] = try interaction_choices.ChoiceOption.initOwned(
+            allocator,
+            choice.id,
+            choice.label,
+            choice.submit_text,
+        );
         built += 1;
     }
 
@@ -574,11 +575,12 @@ pub fn buildOwnedOutboundPayloadFromLegacy(
 
     if (choices_enabled) {
         for (parsed_choices.choices.?.options, 0..) |choice, i| {
-            choices[i] = .{
-                .id = try allocator.dupe(u8, choice.id),
-                .label = try allocator.dupe(u8, choice.label),
-                .submit_text = try allocator.dupe(u8, choice.submit_text),
-            };
+            choices[i] = try root.Channel.OutboundChoice.initOwned(
+                allocator,
+                choice.id,
+                choice.label,
+                choice.submit_text,
+            );
             built_choices += 1;
         }
     }
@@ -1369,17 +1371,16 @@ pub const TelegramChannel = struct {
             self.allocator.free(options);
         }
         for (directive.options, 0..) |opt, i| {
-            const id_copy = try self.allocator.dupe(u8, opt.id);
-            errdefer self.allocator.free(id_copy);
-            const label_copy = try self.allocator.dupe(u8, opt.label);
-            errdefer self.allocator.free(label_copy);
-            const submit_copy = try self.allocator.dupe(u8, opt.submit_text);
-            errdefer self.allocator.free(submit_copy);
-
+            const owned = try interaction_choices.ChoiceOption.initOwned(
+                self.allocator,
+                opt.id,
+                opt.label,
+                opt.submit_text,
+            );
             options[i] = .{
-                .id = id_copy,
-                .label = label_copy,
-                .submit_text = submit_copy,
+                .id = owned.id,
+                .label = owned.label,
+                .submit_text = owned.submit_text,
             };
             built += 1;
         }
@@ -5403,11 +5404,7 @@ test "telegram buildInlineKeyboardJson respects directive columns" {
     const labels = [_][]const u8{ "A", "B", "C" };
     const submits = [_][]const u8{ "A", "B", "C" };
     for (ids, 0..) |id, i| {
-        opts[i] = .{
-            .id = try allocator.dupe(u8, id),
-            .label = try allocator.dupe(u8, labels[i]),
-            .submit_text = try allocator.dupe(u8, submits[i]),
-        };
+        opts[i] = try interaction_choices.ChoiceOption.initOwned(allocator, id, labels[i], submits[i]);
         built += 1;
     }
 
