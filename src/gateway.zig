@@ -5899,7 +5899,7 @@ pub fn run(
     defer if (local_agent_runtime_opt) |*runtime| runtime.deinit(allocator);
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();

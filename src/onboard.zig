@@ -1130,7 +1130,7 @@ pub fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
 /// Non-interactive setup: generates a sensible default config.
 pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, model: ?[]const u8, memory_backend: ?[]const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.writeAll(BANNER);
     try stdout.writeAll("  Quick Setup -- generating config with sensible defaults...\n\n");
@@ -1246,7 +1246,7 @@ fn saveConfigWithOnboardErrorMessage(cfg: *const Config, out: *std.Io.Writer) !v
 /// Reconfigure channels and allowlists only (preserves existing config).
 pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const stdout = &bw.interface;
     var input_buf: [512]u8 = undefined;
     resetStdinLineReader();
@@ -2303,7 +2303,7 @@ fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const out = &bw.interface;
     resetStdinLineReader();
     try out.writeAll(BANNER);
@@ -2745,7 +2745,7 @@ fn fetchModelsRefreshCatalog(allocator: std.mem.Allocator, url: []const u8) ![]u
 /// Saves results to models_cache.json in the config directory.
 pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const out = &bw.interface;
     try out.writeAll("Refreshing model catalog...\n");
     try out.flush();

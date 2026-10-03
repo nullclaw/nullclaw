@@ -261,7 +261,7 @@ fn stopServiceForRestart(allocator: std.mem.Allocator) !void {
 
 fn serviceStatus(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const w = &bw.interface;
 
     if (comptime builtin.os.tag == .macos) {

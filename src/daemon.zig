@@ -1619,7 +1619,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var tunnel = startConfiguredTunnel(allocator, config, host, port, &state);
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("nullclaw gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });

@@ -1172,9 +1172,9 @@ test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
 }
 
 test "piped agent stdout appends the reply instead of overwriting offset zero" {
-    // Regression: a streamed "pong" plus the trailing newline was printed with
-    // positional writers. On macOS, pwrite to a pipe starts at offset 0, so the
-    // newline replaced the first byte and the command printed "\nong".
+    // Regression: streamed chunks and the trailing newline must stay in order
+    // when stdout is a pipe. Redirected regular files are covered separately
+    // by the compat.fs interleaved-writer regression.
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     var fds: [2]std.posix.fd_t = undefined;

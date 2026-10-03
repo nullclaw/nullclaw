@@ -358,7 +358,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
 fn serveStdio(allocator: std.mem.Allocator, server: *Server) !void {
     var out_buffer: [64 * 1024]u8 = undefined;
-    var stdout = std_compat.fs.File.stdout().writer(&out_buffer);
+    var stdout = std_compat.fs.File.stdout().writerStreaming(&out_buffer);
     const out = &stdout.interface;
 
     var pending: std.ArrayListUnmanaged(u8) = .empty;
@@ -431,7 +431,7 @@ fn parseOptions(args: []const []const u8) !ParseOptionsResult {
 
 fn printOptionError(err: anyerror) !void {
     var buffer: [512]u8 = undefined;
-    var writer = std_compat.fs.File.stderr().writer(&buffer);
+    var writer = std_compat.fs.File.stderr().writerStreaming(&buffer);
     const message = switch (err) {
         error.MissingProvider => "Missing value for --provider",
         error.MissingModel => "Missing value for --model",
@@ -448,7 +448,7 @@ fn printOptionError(err: anyerror) !void {
 
 fn printUsage(file: std_compat.fs.File) !void {
     var buffer: [2048]u8 = undefined;
-    var writer = file.writer(&buffer);
+    var writer = file.writerStreaming(&buffer);
     try writer.interface.writeAll(
         \\Usage: nullclaw acp [--provider PROVIDER] [--model MODEL] [--temperature TEMP] [--agent NAME] [--skill NAME]
         \\
@@ -461,7 +461,7 @@ fn printUsage(file: std_compat.fs.File) !void {
 
 fn printVersion(file: std_compat.fs.File) !void {
     var buffer: [256]u8 = undefined;
-    var writer = file.writer(&buffer);
+    var writer = file.writerStreaming(&buffer);
     try writer.interface.print("nullclaw acp {s}\n", .{build_options.version});
     try writer.interface.flush();
 }

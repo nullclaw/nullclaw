@@ -218,7 +218,7 @@ fn probeCliProvider(
 
 fn writeProbeResult(result: ProbeResult) !void {
     var stdout_buf: [2048]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const out = &bw.interface;
 
     try out.writeAll("{\"provider\":");

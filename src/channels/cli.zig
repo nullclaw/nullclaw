@@ -20,7 +20,7 @@ pub const CliChannel = struct {
 
     pub fn sendMessage(_: *CliChannel, _: []const u8, message: []const u8) !void {
         var out_buf: [4096]u8 = undefined;
-        var bw = std_compat.fs.File.stdout().writer(&out_buf);
+        var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
         const w = &bw.interface;
         try w.print("{s}\n", .{message});
         try w.flush();

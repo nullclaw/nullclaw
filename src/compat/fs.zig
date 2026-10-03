@@ -147,8 +147,8 @@ pub const File = struct {
         return self.toInner().writer(shared.io(), buffer);
     }
 
-    /// Append-only writer. Stdout and pipes are not seekable; the positional
-    /// writer pwrites at offset 0 and on macOS that overwrites earlier bytes.
+    /// Write at the descriptor's current position, including redirected output.
+    /// Unlike a positional writer, independent writers share that position.
     pub fn writerStreaming(self: File, buffer: []u8) Writer {
         return self.toInner().writerStreaming(shared.io(), buffer);
     }
@@ -562,4 +562,27 @@ fn resolveArg0FallbackAllocForTest(allocator: Allocator, arg0: []const u8, env_p
     }
 
     return error.FileNotFound;
+}
+
+// Regression: #1006. Independently constructed output writers must share the
+// descriptor position when stdout/stderr is redirected to a regular file.
+test "streaming writers preserve interleaved redirected output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try Dir.wrap(tmp.dir).createFile("output.txt", .{ .read = true });
+    defer file.close();
+    var outer_buf: [16]u8 = undefined;
+    var outer = file.writerStreaming(&outer_buf);
+    try outer.interface.writeAll("prefix:");
+    try outer.interface.flush();
+    var inner_buf: [16]u8 = undefined;
+    var inner = file.writerStreaming(&inner_buf);
+    try inner.interface.writeAll("pong");
+    try inner.interface.flush();
+    try outer.interface.writeByte('\n');
+    try outer.interface.flush();
+    try file.seekTo(0);
+    var got: [32]u8 = undefined;
+    const count = try file.read(&got);
+    try std.testing.expectEqualStrings("prefix:pong\n", got[0..count]);
 }
