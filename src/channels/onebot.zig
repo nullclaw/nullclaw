@@ -196,6 +196,8 @@ pub const OneBotChannel = struct {
     dedup: DedupRing,
     running: Atomic(bool),
     connected: Atomic(bool),
+    lifecycle_mu: std_compat.sync.Mutex = .{},
+    gateway_socket_mu: std_compat.sync.Mutex = .{},
     ws_fd: Atomic(SocketFd),
     gateway_thread: ?std.Thread,
 
@@ -404,6 +406,8 @@ pub const OneBotChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *OneBotChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
@@ -414,14 +418,13 @@ pub const OneBotChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *OneBotChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.running.store(false, .release);
         self.connected.store(false, .release);
 
-        // Unblock a blocking read without stealing final ownership from WsClient.deinit().
-        const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).shutdown(.recv) catch {};
-        }
+        // Interrupt reads and writes; the gateway worker retains final close ownership.
+        self.shutdownActiveGatewaySocket();
 
         if (self.gateway_thread) |t| {
             t.join();
@@ -474,6 +477,35 @@ pub const OneBotChannel = struct {
         self.connected.store(false, .release);
     }
 
+    fn shutdownActiveGatewaySocket(self: *OneBotChannel) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+    }
+
+    fn closeOwnedGatewaySocket(self: *OneBotChannel, ws: *websocket.WsClient) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        ws.deinit();
+    }
+
+    fn closeOwnedGatewayStream(self: *OneBotChannel, stream: std_compat.net.Stream) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        stream.close();
+    }
+
+    fn publishGatewaySocket(self: *OneBotChannel, fd: SocketFd) bool {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        self.ws_fd.store(fd, .release);
+        if (self.running.load(.acquire)) return true;
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        return false;
+    }
+
     fn runGatewayOnce(self: *OneBotChannel) !void {
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [512]u8 = undefined;
@@ -488,17 +520,23 @@ pub const OneBotChannel = struct {
             break :blk headers_buf[0..1];
         } else &.{};
 
-        var ws = if (parts.secure)
-            try websocket.WsClient.connect(self.allocator, parts.host, parts.port, parts.path, headers)
+        const stream = try websocket.WsClient.connectTcp(self.allocator, parts.host, parts.port);
+        if (!self.publishGatewaySocket(stream.handle)) {
+            self.closeOwnedGatewayStream(stream);
+            return error.ConnectionClosed;
+        }
+        var ws = (if (parts.secure)
+            websocket.WsClient.connectFromStream(self.allocator, stream, parts.host, parts.path, headers)
         else
-            try websocket.WsClient.connectPlain(self.allocator, parts.host, parts.port, parts.path, headers);
+            websocket.WsClient.connectPlainFromStream(self.allocator, stream, parts.host, parts.path, headers)) catch |err| {
+            self.closeOwnedGatewayStream(stream);
+            return err;
+        };
         defer {
             self.connected.store(false, .release);
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
+            self.closeOwnedGatewaySocket(&ws);
         }
 
-        self.ws_fd.store(ws.stream.handle, .release);
         self.connected.store(true, .release);
 
         while (self.running.load(.acquire)) {
@@ -1212,4 +1250,21 @@ test "OneBotChannel create + healthCheck + stop leaks zero bytes" {
     const ch = ch_struct.channel();
     _ = ch.healthCheck();
     ch.stop();
+}
+
+// Regression: stop can run while TCP connect is returning; a late socket must
+// never enter a blocking handshake, and the worker must remain its sole owner.
+test "onebot late socket after stop is interrupted and closed by owner" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void) return error.SkipZigTest;
+    const sockets = try websocket.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[1]);
+    var ch = OneBotChannel.init(std.testing.allocator, .{});
+    ch.running.store(true, .release);
+    OneBotChannel.vtableStop(&ch);
+    try std.testing.expect(!ch.publishGatewaySocket(sockets[0]));
+    try std.testing.expectEqual(invalid_socket, ch.ws_fd.load(.acquire));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
+    ch.closeOwnedGatewayStream(.{ .handle = sockets[0] });
 }

@@ -832,9 +832,14 @@ pub const QQChannel = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_requested: bool = false,
     gateway_thread: ?std.Thread = null,
+    lifecycle_mu: std_compat.sync.Mutex = .{},
     heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     force_heartbeat: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    gateway_socket_mu: std_compat.sync.Mutex = .{},
     ws_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(invalid_socket),
+    gateway_attempt_started_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    last_gateway_activity_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    hello_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     token_mu: std_compat.sync.Mutex = .{},
 
     // ── Access token state ──
@@ -843,6 +848,8 @@ pub const QQChannel = struct {
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
+    const GATEWAY_CONNECT_GRACE_MS: i64 = 30 * std.time.ms_per_s;
+    const GATEWAY_STALE_GRACE_MS: i64 = 90 * std.time.ms_per_s;
 
     pub fn init(allocator: std.mem.Allocator, config: config_types.QQConfig) QQChannel {
         return .{
@@ -864,11 +871,55 @@ pub const QQChannel = struct {
 
     pub fn healthCheck(self: *QQChannel) bool {
         if (self.config.receive_mode == .websocket) {
-            return self.running.load(.acquire) and self.ws_fd.load(.acquire) != invalid_socket;
+            return self.websocketHealthyAt(std_compat.time.milliTimestamp());
         }
         const result = fetchAccessToken(self.allocator, self.config.app_id, self.config.app_secret) catch return false;
         self.allocator.free(result.token);
         return true;
+    }
+
+    fn websocketHealthyAt(self: *QQChannel, now_ms: i64) bool {
+        if (!self.running.load(.acquire) or self.ws_fd.load(.acquire) == invalid_socket) return false;
+
+        const started_ms = self.gateway_attempt_started_ms.load(.acquire);
+        if (!self.hello_received.load(.acquire)) {
+            if (started_ms == 0 or now_ms <= started_ms) return true;
+            return (now_ms - started_ms) <= GATEWAY_CONNECT_GRACE_MS;
+        }
+
+        const last_activity_ms = self.last_gateway_activity_ms.load(.acquire);
+        if (last_activity_ms == 0 or now_ms <= last_activity_ms) return true;
+        const heartbeat_window_ms: i64 = @as(i64, self.heartbeat_interval_ms.load(.acquire)) * 3;
+        return (now_ms - last_activity_ms) <= @max(heartbeat_window_ms, GATEWAY_STALE_GRACE_MS);
+    }
+
+    fn shutdownActiveGatewaySocket(self: *QQChannel) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+    }
+
+    fn closeOwnedGatewaySocket(self: *QQChannel, ws: *websocket.WsClient) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        ws.deinit();
+    }
+
+    fn closeOwnedGatewayStream(self: *QQChannel, stream: std_compat.net.Stream) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        stream.close();
+    }
+
+    fn publishGatewaySocket(self: *QQChannel, fd: std.posix.socket_t) bool {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        self.ws_fd.store(fd, .release);
+        if (self.running.load(.acquire)) return true;
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        return false;
     }
 
     /// Set the event bus for publishing inbound messages.
@@ -1525,26 +1576,31 @@ pub const QQChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *QQChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
+        if (self.running.load(.acquire)) return;
+        self.running.store(true, .release);
         if (self.config.receive_mode == .webhook) {
             log.info("QQ channel in webhook receive_mode; websocket listener not started", .{});
-            self.running.store(true, .release);
             return;
         }
-        self.running.store(true, .release);
         self.heartbeat_stop.store(false, .release);
         log.info("QQ channel starting (sandbox={s}, app_id={s})", .{ if (self.config.sandbox) "true" else "false", self.config.app_id });
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self});
+        self.gateway_thread = std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self}) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
     }
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *QQChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.running.store(false, .release);
         self.heartbeat_stop.store(true, .release);
-        // Close socket to unblock blocking read
-        const fd = self.ws_fd.load(.acquire);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).close();
-        }
+        // shutdown() interrupts blocked reads and heartbeat writes; WsClient keeps
+        // final close ownership in the gateway thread.
+        self.shutdownActiveGatewaySocket();
         if (self.gateway_thread) |t| {
             t.join();
             self.gateway_thread = null;
@@ -1624,6 +1680,7 @@ pub const QQChannel = struct {
     /// Single connection attempt: connect WS, HELLO, IDENTIFY, read loop.
     fn runGatewayOnce(self: *QQChannel) !void {
         self.reconnect_requested = false;
+        self.hello_received.store(false, .release);
         // Fresh IDENTIFY session: do not carry sequence from a previous connection.
         self.has_sequence.store(false, .release);
         self.sequence.store(0, .release);
@@ -1649,24 +1706,34 @@ pub const QQChannel = struct {
         const path = parseGatewayPath(gw_url);
         log.info("Connecting to gateway: host={s} port={d} path={s}", .{ host, port, path });
 
-        var ws = try websocket.WsClient.connect(self.allocator, host, port, path, &.{});
+        const ws_stream = try websocket.WsClient.connectTcp(self.allocator, host, port);
 
-        // Store fd for interrupt-on-stop
-        self.ws_fd.store(ws.stream.handle, .release);
+        // Publish before TLS/WebSocket handshake so stop can interrupt blocked I/O.
+        self.gateway_attempt_started_ms.store(std_compat.time.milliTimestamp(), .release);
+        if (!self.publishGatewaySocket(ws_stream.handle)) {
+            self.closeOwnedGatewayStream(ws_stream);
+            return error.ConnectionClosed;
+        }
+        var ws = websocket.WsClient.connectFromStream(self.allocator, ws_stream, host, path, &.{}) catch |err| {
+            self.closeOwnedGatewayStream(ws_stream);
+            return err;
+        };
 
         // Start heartbeat thread
         self.heartbeat_stop.store(false, .release);
         self.force_heartbeat.store(false, .release);
         self.heartbeat_interval_ms.store(0, .release);
         const hbt = std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, heartbeatLoop, .{ self, &ws }) catch |err| {
-            ws.deinit();
+            self.closeOwnedGatewaySocket(&ws);
             return err;
         };
         defer {
             self.heartbeat_stop.store(true, .release);
+            // The writer may be blocked in TLS flush after a remote close. Shutdown
+            // must happen before join; WsClient.deinit performs the final close.
+            self.shutdownActiveGatewaySocket();
             hbt.join();
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
+            self.closeOwnedGatewaySocket(&ws);
         }
 
         log.info("WebSocket connected, waiting for HELLO...", .{});
@@ -1681,6 +1748,8 @@ pub const QQChannel = struct {
             log.info("ERROR: No heartbeat_interval in HELLO", .{});
             return error.InvalidHello;
         }
+        self.last_gateway_activity_ms.store(std_compat.time.milliTimestamp(), .release);
+        self.hello_received.store(true, .release);
 
         // Send IDENTIFY
         var identify_buf: [2048]u8 = undefined;
@@ -1691,6 +1760,7 @@ pub const QQChannel = struct {
         // Read READY (dispatch with t=READY)
         const ready_text = try ws.readTextMessage() orelse return error.ConnectionClosed;
         defer self.allocator.free(ready_text);
+        self.last_gateway_activity_ms.store(std_compat.time.milliTimestamp(), .release);
         log.info("Received READY frame", .{});
         try self.handleGatewayEvent(ready_text);
 
@@ -1715,6 +1785,7 @@ pub const QQChannel = struct {
                 break;
             };
             defer self.allocator.free(text);
+            self.last_gateway_activity_ms.store(std_compat.time.milliTimestamp(), .release);
 
             log.debug("Gateway event received: len={d}", .{text.len});
 
@@ -2195,6 +2266,49 @@ test "qq healthCheck websocket requires running socket" {
         42;
     ch.ws_fd.store(fake_socket, .release);
     try std.testing.expect(ch.healthCheck());
+}
+
+test "qq health check rejects a stalled pre-hello gateway" {
+    var ch = QQChannel.init(std.testing.allocator, .{ .receive_mode = .websocket });
+    ch.running.store(true, .release);
+    ch.gateway_attempt_started_ms.store(1_000_000, .release);
+
+    const fake_socket: std.posix.socket_t = if (builtin.os.tag == .windows)
+        @ptrFromInt(1)
+    else
+        42;
+    ch.ws_fd.store(fake_socket, .release);
+
+    // Regression: a valid fd before HELLO must not report healthy forever.
+    try std.testing.expect(ch.websocketHealthyAt(1_029_999));
+    try std.testing.expect(!ch.websocketHealthyAt(1_030_001));
+    ch.hello_received.store(true, .release);
+    ch.heartbeat_interval_ms.store(40_000, .release);
+    ch.last_gateway_activity_ms.store(1_000_000, .release);
+    try std.testing.expect(ch.websocketHealthyAt(1_119_999));
+    try std.testing.expect(!ch.websocketHealthyAt(1_120_001));
+}
+
+test "qq shutdown active gateway socket clears fd and closes peer" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        var ch = QQChannel.init(std.testing.allocator, .{ .receive_mode = .websocket });
+        ch.ws_fd.store(sockets[0], .release);
+
+        // Regression: reconnect cleanup must unblock a heartbeat writer before join.
+        ch.shutdownActiveGatewaySocket();
+
+        try std.testing.expectEqual(invalid_socket, ch.ws_fd.load(.acquire));
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
+    }
 }
 
 test "qq QQChannel vtable compiles" {
