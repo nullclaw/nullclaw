@@ -378,7 +378,12 @@ pub const DiscordChannel = struct {
             .channel_id = key_copy,
         };
 
-        task.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, typingLoop, .{task});
+        // typingLoop performs full HTTPS requests (http.Client + TLS) every
+        // interval, which needs far more headroom than the auxiliary-loop
+        // stack. std.crypto.tls.Client.init alone does large inline memcpys
+        // that overflow a 512KB stack and crash the whole process. Use the
+        // heavy runtime stack for this thread.
+        task.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, typingLoop, .{task});
         errdefer {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();

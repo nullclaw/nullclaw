@@ -988,9 +988,10 @@ pub const MaxChannel = struct {
             self.allocator.free(key_copy);
         }
 
+        // Credentialed typing requests enter std.http/TLS on native targets (#1002).
         if (comptime !builtin.is_test) {
             task.thread = try std.Thread.spawn(
-                .{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE },
+                .{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE },
                 typingLoop,
                 .{task},
             );
