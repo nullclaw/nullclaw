@@ -1,2 +1,2 @@
-# Root skill
-Installed from root markdown.
+# Renamed Skill
+Uses assets.
