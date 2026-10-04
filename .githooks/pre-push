@@ -2,6 +2,13 @@
 # pre-push: run the full test suite before pushing.
 # Activate: git config core.hooksPath .githooks
 
+# `git push` from a *worktree* exports GIT_DIR (a normal clone does not — see
+# #1020). Tests that spawn `git` against fixture repositories of their own then
+# inherit it and operate on *this* repository instead, which fails 10 of them
+# spuriously. Clear the inherited state so the suite behaves the same however
+# the push was launched.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX
+
 echo "Running tests..."
 zig build test --summary all 2>&1
 if [ $? -ne 0 ]; then
