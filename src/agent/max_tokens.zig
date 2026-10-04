@@ -19,6 +19,8 @@ const MaxTokensEntry = struct {
 
 // High-signal model defaults used in onboarding/catalog flows.
 const MODEL_MAX_TOKENS = [_]MaxTokensEntry{
+    .{ .key = "tsubasa-fast", .tokens = 8_192 },
+    .{ .key = "tsubasa-pro", .tokens = 8_192 },
     .{ .key = "gpt-4", .tokens = 4_096 },
     .{ .key = "gpt-4-32k", .tokens = 4_096 },
     .{ .key = "claude-opus-4-6", .tokens = 8192 },
@@ -211,6 +213,8 @@ test "resolveMaxTokens honors explicit override first" {
 }
 
 test "lookupModelMaxTokens resolves model and nested provider refs" {
+    try std.testing.expectEqual(@as(?u32, 8_192), lookupModelMaxTokens("tsubasa/tsubasa-fast"));
+    try std.testing.expectEqual(@as(?u32, 8_192), lookupModelMaxTokens("tsubasa/tsubasa-pro"));
     try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4"));
     try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4-32k"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4.1-mini"));

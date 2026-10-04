@@ -131,6 +131,24 @@ nullclaw onboard --interactive
 - `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
 - `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
 
+#### Tsubasa
+
+Tsubasa 使用 `https://api.tsubasa.sh/v1` 和 `TSUBASA_API_KEY`。主模型可设为
+`tsubasa/tsubasa-fast` 或 `tsubasa/tsubasa-pro`。两者的上下文窗口均为 32,768
+token，输出上限分别为 8,192 和 16,384 token。NullClaw 使用 32,768 token 的
+上下文窗口，并为两个模型默认设置 8,192 个输出 token，为 agent 提示词留出空间。
+
+```json
+{
+  "models": { "providers": { "tsubasa": { "api_mode": "chat_completions" } } },
+  "agents": { "defaults": { "model": { "primary": "tsubasa/tsubasa-fast" } } }
+}
+```
+
+本地回退列表包含这两个模型 ID。此集成使用 Chat Completions，禁用 Responses 回退，
+且不声明支持原生工具调用。详见
+[Tsubasa 文档](https://tsubasa.sh/docs)。
+
 ### `agents.defaults.model.primary`
 
 - 设置默认模型路由，通常是 `provider/vendor/model`。

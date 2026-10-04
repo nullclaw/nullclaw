@@ -103,6 +103,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "opencode-zen", .url = "https://opencode.ai/zen/v1", .display = "OpenCode Zen" },
     .{ .name = "astrai", .url = "https://as-trai.com/v1", .display = "Astrai" },
     .{ .name = "poe", .url = "https://api.poe.com/v1", .display = "Poe" },
+    .{ .name = "tsubasa", .url = "https://api.tsubasa.sh/v1", .display = "Tsubasa", .no_responses_fallback = true, .native_tools = false },
 
     // ── China Providers — general ─────────────────────────────────────────
     .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
@@ -982,6 +983,27 @@ test "fromConfig configures Evolink compatible provider" {
     try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", h.compatible.base_url);
     try std.testing.expectEqualStrings("evolink", h.compatible.name);
     try std.testing.expect(h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig configures Tsubasa chat completions without Responses or native tools" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "tsubasa", "test-key", null, true, null, null, false, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqualStrings("tsubasa", h.provider().getName());
+    try std.testing.expect(!h.provider().supportsNativeTools());
+    try std.testing.expect(!h.compatible.supports_responses_fallback);
+    const url = try h.compatible.chatCompletionsUrl(alloc);
+    defer alloc.free(url);
+    try std.testing.expectEqualStrings("https://api.tsubasa.sh/v1/chat/completions", url);
+    const auth = (try h.compatible.authHeaderValue(alloc)).?;
+    defer if (auth.needs_free) alloc.free(auth.value);
+    try std.testing.expectEqualStrings("authorization", auth.name);
+    try std.testing.expectEqualStrings("Bearer test-key", auth.value);
+
+    var unauthenticated = ProviderHolder.fromConfig(alloc, "tsubasa", null, null, true, null, null, false, null);
+    defer unauthenticated.deinit();
+    try std.testing.expect(try unauthenticated.compatible.authHeaderValue(alloc) == null);
 }
 
 test "fromConfig applies thinking_param flag for GLM" {

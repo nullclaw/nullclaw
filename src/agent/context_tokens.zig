@@ -19,6 +19,8 @@ const ContextWindowEntry = struct {
 
 // Model-specific defaults for high-signal IDs used by onboarding/catalog flows.
 const MODEL_WINDOWS = [_]ContextWindowEntry{
+    .{ .key = "tsubasa-fast", .tokens = 32_768 },
+    .{ .key = "tsubasa-pro", .tokens = 32_768 },
     .{ .key = "gpt-4", .tokens = 8_192 },
     .{ .key = "gpt-4-32k", .tokens = 32_768 },
     .{ .key = "claude-opus-4-6", .tokens = 200_000 },
@@ -201,6 +203,8 @@ test "resolveContextTokens honors explicit override first" {
 }
 
 test "lookupContextTokens resolves known model ids" {
+    try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("tsubasa/tsubasa-fast"));
+    try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("tsubasa/tsubasa-pro"));
     try std.testing.expectEqual(@as(?u64, 8_192), lookupContextTokens("openai/gpt-4"));
     try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("openai/gpt-4-32k"));
     try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4.1-mini"));

@@ -146,6 +146,25 @@ Common per-provider fields:
 - `max_streaming_prompt_bytes`: skip streaming above this estimated prompt size.
 - `chat_template_enable_thinking_param`: for custom OpenAI-compatible vLLM/Qwen endpoints, map `reasoning_effort` to `chat_template_kwargs.enable_thinking`.
 
+#### Tsubasa
+
+Tsubasa uses `https://api.tsubasa.sh/v1` and `TSUBASA_API_KEY`. Select
+`tsubasa/tsubasa-fast` or `tsubasa/tsubasa-pro` as the primary model. Both have a
+32,768-token context window; their output limits are 8,192 and 16,384 tokens,
+respectively. NullClaw uses the 32,768-token context window and defaults to
+8,192 output tokens for both models to leave room for the agent prompt.
+
+```json
+{
+  "models": { "providers": { "tsubasa": { "api_mode": "chat_completions" } } },
+  "agents": { "defaults": { "model": { "primary": "tsubasa/tsubasa-fast" } } }
+}
+```
+
+The local fallback list contains both model IDs. This integration uses Chat
+Completions, disables Responses fallback, and does not advertise native tool
+calling. See [Tsubasa documentation](https://tsubasa.sh/docs).
+
 ### `agents.defaults.model.primary`
 
 - Sets default model route, typically `provider/vendor/model`.
