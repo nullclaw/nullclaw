@@ -561,10 +561,11 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
 /// provider's log-only precedent.
 fn logProviderHttpError(allocator: std.mem.Allocator, url: []const u8, status_code: u16, body: []const u8) void {
     if (builtin.is_test) return;
-    const sanitized = root.sanitizeApiError(allocator, body) catch null;
-    defer if (sanitized) |s| allocator.free(s);
-    const preview = sanitized orelse "<provider error body unavailable>";
-    log.err("provider http error: status={d} url={s} body={s}", .{ status_code, url, preview });
+    // The URL carries credentials in the query string (Gemini `?key=`), so the
+    // line is built by a redacting formatter rather than logged verbatim.
+    const line = root.providerHttpErrorMessage(allocator, url, status_code, body) catch return;
+    defer allocator.free(line);
+    log.err("{s}", .{line});
 }
 
 /// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
