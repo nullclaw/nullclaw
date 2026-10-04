@@ -9,6 +9,7 @@
 //!   - perplexity
 //!   - exa
 //!   - jina
+//!   - serply
 //!
 //! Provider selection:
 //! 1) `provider = "auto"` (default): tries a built-in chain.
@@ -33,7 +34,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Upper bound for provider chain size (primary + fallbacks + auto expansions).
 const MAX_PROVIDER_CHAIN: usize = 16;
 const WEB_SEARCH_SETUP_HINT =
-    "web_search is not configured with a reliable provider. Configure http_request.search_base_url for SearXNG or set one of BRAVE_API_KEY, FIRECRAWL_API_KEY, TAVILY_API_KEY, PERPLEXITY_API_KEY, EXA_API_KEY, JINA_API_KEY, or WEB_SEARCH_API_KEY. DuckDuckGo is best-effort only.";
+    "web_search is not configured with a reliable provider. Configure http_request.search_base_url for SearXNG or set one of BRAVE_API_KEY, FIRECRAWL_API_KEY, TAVILY_API_KEY, PERPLEXITY_API_KEY, EXA_API_KEY, JINA_API_KEY, SERPLY_API_KEY, or WEB_SEARCH_API_KEY. DuckDuckGo is best-effort only.";
 
 const SearchProvider = enum {
     auto,
@@ -45,6 +46,7 @@ const SearchProvider = enum {
     perplexity,
     exa,
     jina,
+    serply,
 };
 
 const ProviderSearchError = search_common.ProviderSearchError;
@@ -67,7 +69,7 @@ pub const WebSearchTool = struct {
     pub const tool_name = "web_search";
     pub const tool_description = "Search the internet for real-time information, recipes, news, or technical documentation that might not be in your local knowledge base. Use this whenever the user asks for information from the web or the internet.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"},"provider":{"type":"string","description":"Optional provider override (auto,searxng,duckduckgo,ddg,brave,firecrawl,tavily,perplexity,exa,jina)"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"},"provider":{"type":"string","description":"Optional provider override (auto,searxng,duckduckgo,ddg,brave,firecrawl,tavily,perplexity,exa,jina,serply)"}},"required":["query"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -91,7 +93,7 @@ pub const WebSearchTool = struct {
 
         var chain_buf: [MAX_PROVIDER_CHAIN]SearchProvider = undefined;
         const chain = buildProviderChain(self, provider_raw, &chain_buf) catch |err| switch (err) {
-            error.InvalidProvider => return ToolResult.fail("Invalid web_search provider. Supported: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina."),
+            error.InvalidProvider => return ToolResult.fail("Invalid web_search provider. Supported: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina, serply."),
             else => return err,
         };
 
@@ -141,6 +143,7 @@ fn parseProvider(raw: []const u8) ?SearchProvider {
     if (std.ascii.eqlIgnoreCase(trimmed, "perplexity")) return .perplexity;
     if (std.ascii.eqlIgnoreCase(trimmed, "exa")) return .exa;
     if (std.ascii.eqlIgnoreCase(trimmed, "jina")) return .jina;
+    if (std.ascii.eqlIgnoreCase(trimmed, "serply")) return .serply;
     return null;
 }
 
@@ -155,6 +158,7 @@ fn providerName(provider: SearchProvider) []const u8 {
         .perplexity => "perplexity",
         .exa => "exa",
         .jina => "jina",
+        .serply => "serply",
     };
 }
 
@@ -245,6 +249,7 @@ fn buildProviderChain(
         appendProviderUnique(chain_buf, &len, .perplexity);
         appendProviderUnique(chain_buf, &len, .exa);
         appendProviderUnique(chain_buf, &len, .jina);
+        appendProviderUnique(chain_buf, &len, .serply);
         appendProviderUnique(chain_buf, &len, .duckduckgo);
     } else {
         appendProviderUnique(chain_buf, &len, primary);
@@ -304,6 +309,11 @@ fn executeWithProvider(
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "JINA_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
             defer allocator.free(api_key);
             return search_providers.jina.execute(allocator, query, api_key, self.timeout_secs);
+        },
+        .serply => {
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{"SERPLY_API_KEY"}) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
+            return search_providers.serply.execute(allocator, query, count, api_key, self.timeout_secs);
         },
     }
 }
@@ -375,6 +385,7 @@ const search_api_key_env_vars = [_][]const u8{
     "PERPLEXITY_API_KEY",
     "EXA_API_KEY",
     "JINA_API_KEY",
+    "SERPLY_API_KEY",
     "WEB_SEARCH_API_KEY",
 };
 
@@ -488,6 +499,7 @@ test "parseProvider accepts aliases" {
     try testing.expectEqual(SearchProvider.duckduckgo, parseProvider("ddg").?);
     try testing.expectEqual(SearchProvider.duckduckgo, parseProvider("duckduckgo").?);
     try testing.expectEqual(SearchProvider.brave, parseProvider("BRAVE").?);
+    try testing.expectEqual(SearchProvider.serply, parseProvider("Serply").?);
     try testing.expect(parseProvider("google") == null);
 }
 

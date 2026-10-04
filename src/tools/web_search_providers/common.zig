@@ -280,7 +280,7 @@ pub fn formatResultsArray(
         };
 
         const title = extractString(obj, "title") orelse "(no title)";
-        const url = extractString(obj, "url") orelse "(no url)";
+        const url = extractString(obj, "url") orelse extractString(obj, "link") orelse "(no url)";
         const desc = blk: {
             if (extractString(obj, preferred_desc_key)) |d| break :blk d;
             if (secondary_desc_key) |key| {
