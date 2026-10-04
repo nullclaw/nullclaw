@@ -2182,6 +2182,229 @@ test "secure curl transport preserves method body content type status and header
     try expectSecureCurlTransport(.HEAD, null, null, false, false);
 }
 
+// ── Transport integrity ──────────────────────────────────────────────────────
+//
+// Regression coverage for the silent response corruption reported in
+// nullclaw#1018: on aarch64-linux-android the agent returns scrambled or empty
+// text with exit 0, so nothing fails loudly.
+//
+// `ProxyHttpClient.fetch` routes *every* Android request through
+// `fetchWithCurl`, while other platforms keep using std.http — so the adapter
+// is Android-only. The curl executor underneath it is shared, which is why these
+// assertions run on every host platform: a regression in request or response
+// handling flags CI on Linux, macOS and Windows even though only Android
+// selects the adapter in production.
+
+const CURL_INTEGRITY_BUFFER_BYTES: usize = 256 * 1024;
+
+const CurlIntegrityServerCtx = struct {
+    server: *std_compat.net.Server,
+    response_payload: []const u8,
+    expected_request_body: []const u8,
+    saw_exact_request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// Case-insensitive `Content-Length` lookup for a raw header block.
+fn testContentLength(head: []const u8) ?usize {
+    const needle = "content-length:";
+    var i: usize = 0;
+    while (i + needle.len <= head.len) : (i += 1) {
+        if (!std.ascii.eqlIgnoreCase(head[i .. i + needle.len], needle)) continue;
+        var j = i + needle.len;
+        while (j < head.len and (head[j] == ' ' or head[j] == '\t')) j += 1;
+        var value: usize = 0;
+        var saw_digit = false;
+        while (j < head.len and head[j] >= '0' and head[j] <= '9') : (j += 1) {
+            value = value * 10 + (head[j] - '0');
+            saw_digit = true;
+        }
+        return if (saw_digit) value else null;
+    }
+    return null;
+}
+
+/// Read one request, assert the body arrived intact, then return a payload
+/// large enough to cross the 8 KiB read boundary that short fixtures never reach.
+fn serveCurlIntegrityTest(ctx: *CurlIntegrityServerCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+
+    const buf = std.heap.page_allocator.alloc(u8, CURL_INTEGRITY_BUFFER_BYTES) catch return;
+    defer std.heap.page_allocator.free(buf);
+
+    var filled: usize = 0;
+    var body_end: ?usize = null;
+    while (filled < buf.len) {
+        if (body_end) |end| if (filled >= end) break;
+        const n = conn.stream.read(buf[filled..]) catch break;
+        if (n == 0) break;
+        filled += n;
+        if (body_end == null) {
+            if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n")) |head_end| {
+                const content_length = testContentLength(buf[0..head_end]) orelse 0;
+                body_end = head_end + 4 + content_length;
+            }
+        }
+    }
+
+    const request = buf[0..filled];
+    ctx.saw_request.store(true, .release);
+    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |head_end| {
+        if (body_end) |end| {
+            if (end <= request.len and
+                std.mem.eql(u8, request[head_end + 4 .. end], ctx.expected_request_body))
+            {
+                ctx.saw_exact_request.store(true, .release);
+            }
+        }
+    }
+
+    var head_buf: [256]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: application/octet-stream\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n",
+        .{ctx.response_payload.len},
+    ) catch return;
+    conn.stream.writeAll(head) catch return;
+    conn.stream.writeAll(ctx.response_payload) catch {};
+}
+
+/// Deterministic, position-sensitive filler: any dropped, duplicated or
+/// reordered run changes the slice, so equality is a strict integrity check.
+fn fillMarkerPattern(buf: []u8, seed: u8) void {
+    for (buf, 0..) |*byte, i| {
+        byte.* = @truncate(@as(u16, @intCast(i % 256)) *% 31 +% @as(u16, seed));
+    }
+}
+
+/// Round-trip `response_payload` through the curl executor and assert it comes
+/// back byte-identical. When `request_body` is non-empty it is asserted on the
+/// server side too, so both directions are covered.
+fn expectCurlIntegrity(
+    allocator: std.mem.Allocator,
+    response_payload: []const u8,
+    request_body: []const u8,
+    via_android_adapter: bool,
+) !void {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = CurlIntegrityServerCtx{
+        .server = &server,
+        .response_payload = response_payload,
+        .expected_request_body = request_body,
+    };
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/integrity", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    var thread = try std.Thread.spawn(.{}, serveCurlIntegrityTest, .{&ctx});
+
+    if (via_android_adapter) {
+        var client = try ProxyHttpClient.init(allocator);
+        defer client.deinit();
+        var body_writer: std.Io.Writer.Allocating = .init(allocator);
+        defer body_writer.deinit();
+
+        const method: std.http.Method = if (request_body.len > 0) .POST else .GET;
+        const result = client.fetchWithCurl(.{
+            .location = .{ .url = url },
+            .method = method,
+            .payload = if (request_body.len > 0) request_body else null,
+            .response_writer = &body_writer.writer,
+        }) catch |err| {
+            if (!ctx.saw_request.load(.acquire)) unblockCredentialedCurlFallbackServer(&server);
+            thread.join();
+            return err;
+        };
+        thread.join();
+        try std.testing.expectEqual(std.http.Status.ok, result.status);
+        try std.testing.expectEqualSlices(u8, response_payload, body_writer.writer.buffered());
+    } else {
+        const response = secureCurlRequestWithStatusAndHeaders(allocator, .{
+            .method = if (request_body.len > 0) .POST else .GET,
+            .url = url,
+            .body = if (request_body.len > 0) request_body else null,
+            .headers = &.{},
+            .max_time = "10",
+        }) catch |err| {
+            if (!ctx.saw_request.load(.acquire)) unblockCredentialedCurlFallbackServer(&server);
+            thread.join();
+            return err;
+        };
+        defer allocator.free(response.headers);
+        defer allocator.free(response.body);
+        thread.join();
+        try std.testing.expectEqual(@as(u16, 200), response.status_code);
+        try std.testing.expectEqualSlices(u8, response_payload, response.body);
+    }
+
+    try std.testing.expect(ctx.saw_request.load(.acquire));
+    try std.testing.expect(ctx.saw_exact_request.load(.acquire));
+}
+
+test "curl transport round-trips payloads byte-exactly across the 8 KiB boundary" {
+    // Regression: nullclaw#1018 — silent corruption. Short fixtures (12 B) never
+    // crossed the read boundary, so a truncating reader still passed.
+    const allocator = std.testing.allocator;
+
+    for ([_]usize{ 4 * 1024, 8 * 1024, 64 * 1024 }) |size| {
+        const payload = try allocator.alloc(u8, size);
+        defer allocator.free(payload);
+        fillMarkerPattern(payload, @intCast(size / 1024));
+        try expectCurlIntegrity(allocator, payload, "", false);
+    }
+}
+
+test "curl transport preserves a large request body byte-exactly" {
+    // Regression: nullclaw#1018 — why a mangled request reads as scrambled output:
+    // the model answers a prompt it never received.
+    const allocator = std.testing.allocator;
+
+    const request_body = try allocator.alloc(u8, 48 * 1024);
+    defer allocator.free(request_body);
+    fillMarkerPattern(request_body, 7);
+
+    const response_payload = try allocator.alloc(u8, 32 * 1024);
+    defer allocator.free(response_payload);
+    fillMarkerPattern(response_payload, 11);
+
+    try expectCurlIntegrity(allocator, response_payload, request_body, false);
+}
+
+test "android curl adapter returns the response body byte-exactly" {
+    // The adapter is what `ProxyHttpClient.fetch` selects on Android
+    // (http_util.zig); until now nothing round-tripped a body through it.
+    const allocator = std.testing.allocator;
+
+    const response_payload = try allocator.alloc(u8, 48 * 1024);
+    defer allocator.free(response_payload);
+    fillMarkerPattern(response_payload, 3);
+
+    try expectCurlIntegrity(allocator, response_payload, "", true);
+}
+
+test "curl transport stays byte-exact across repeated calls" {
+    // Regression: nullclaw#1018 — corruption was intermittent, the signature of
+    // state leaking between transfers rather than a constant misparse.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const payload = try allocator.alloc(u8, 12 * 1024);
+    defer allocator.free(payload);
+
+    for (0..5) |round| {
+        fillMarkerPattern(payload, @intCast(round + 1));
+        try expectCurlIntegrity(allocator, payload, "", false);
+    }
+}
+
 fn unblockCredentialedCurlFallbackServer(server: *std_compat.net.Server) void {
     var conn = std_compat.net.tcpConnectToAddress(server.listen_address) catch return;
     conn.close();
