@@ -55,6 +55,18 @@ The container stores its persistent state under `/nullclaw-data`:
 
 The bundled starter config already uses the current schema (`agents.defaults.model.primary` plus `models.providers`), so `latest` should boot cleanly before you customize provider credentials.
 
+### Existing volumes
+
+A named volume keeps the ownership it was first populated with. If yours was created by an image where `/nullclaw-data` was owned by root, the container still fails with `AccessDenied` after the image is fixed. Repair it once, as root:
+
+```bash
+docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
+  --entrypoint sh ghcr.io/nullclaw/nullclaw:latest \
+  -c 'chown -R 65534:65534 /nullclaw-data'
+```
+
+Bind mounts are not covered by that command: they carry the host directory's ownership, so the directory you mount must be writable by uid `65534`.
+
 ### Quick one-off commands
 
 ```bash
