@@ -125,7 +125,7 @@ Example (production-safe: content-bearing flags off):
 ### `models.providers`
 
 - Defines LLM provider connection parameters and API keys.
-- Common providers: `openrouter`, `openai`, `anthropic`, `groq`, `nearai`, `atlas-cloud`, `evolink`, `edenai`.
+- Common providers: `openrouter`, `openai`, `anthropic`, `groq`, `nearai`, `atlas-cloud`, `evolink`, `edenai`, `cheaperinference`.
 
 Example:
 
@@ -137,6 +137,7 @@ Example:
       "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
       "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
       "edenai": { "api_key": "YOUR_EDENAI_API_KEY" },
+      "cheaperinference": { "api_key": "YOUR_CHEAPER_INFERENCE_API_KEY" },
       "evolink": { "api_key": "YOUR_EVOLINK_API_KEY" },
       "anthropic": { "api_key": "sk-ant-..." },
       "openai": { "api_key": "sk-..." }
