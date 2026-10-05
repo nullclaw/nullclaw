@@ -1,14 +1,27 @@
 # Hardware & Peripherals
 
-NullClaw can discover, flash, and interact with microcontroller boards over USB.
+NullClaw can discover and interact with microcontroller boards over USB. Only
+discovery is implemented in the CLI today — see [Not yet
+implemented](#not-yet-implemented) below.
 
 ## CLI Commands
 
 ```bash
 nullclaw hardware scan             # Discover connected boards
-nullclaw hardware flash <path>     # Flash firmware to a board
-nullclaw hardware monitor          # Monitor USB hotplug events (Linux)
 ```
+
+### Not yet implemented
+
+Two subcommands are accepted but are placeholders. They print a message and do
+not perform the action:
+
+| Command | Current behavior | Source |
+|---------|------------------|--------|
+| `nullclaw hardware flash <path>` | Prints the firmware path, then `Flash not yet implemented.` | `src/main.zig` `runHardware` |
+| `nullclaw hardware monitor` | Prints `Monitor not yet implemented.` and exits. Does **not** invoke `udevadm` and does not watch for hotplug events. | `src/main.zig` `runHardware` |
+
+Do not script against either command; neither performs I/O. Use `arduino-cli` or
+`probe-rs` directly for flashing (see [Peripheral Drivers](#peripheral-drivers)).
 
 ## Configuration
 
@@ -75,14 +88,24 @@ Direct sysfs interface (`/sys/class/gpio/`). No flash support — GPIO read/writ
 
 ## Agent Tools
 
-When hardware is enabled, the agent gains access to:
+When `hardware.boards` is configured, `allTools` registers:
 
 | Tool | Description |
 |------|-------------|
-| `hardware_info` | List discovered boards and capabilities |
+| `hardware_board_info` | List discovered boards and capabilities |
 | `hardware_memory` | Read board memory/registers |
 | `i2c` | I2C bus read/write operations |
-| `spi` | SPI bus read/write operations |
+
+The SPI bus driver exists as `src/tools/spi.zig` and is importable, but it is
+**not** registered by `allTools` and is therefore not available to the agent.
+Treat `spi` as a library capability, not a shipped tool.
+
+Note the tool name is `hardware_board_info`, not `hardware_info` — the
+implementation file is `src/tools/hardware_info.zig`, which is a common source
+of confusion.
+
+The bare `hardware` CLI subcommand and the peripheral drivers are standalone
+implementations; they are not gated on the agent tool registration above.
 
 ## Security
 
@@ -93,7 +116,10 @@ Serial port access is restricted to known device paths:
 
 ## Hotplug Monitoring (Linux)
 
-`nullclaw hardware monitor` uses `udevadm` to watch for USB device events in real time. Events include device add, remove, and change with VID/PID identification.
+Not implemented. `nullclaw hardware monitor` is a placeholder that prints a
+message and exits — it does not invoke `udevadm`, subscribe to netlink events,
+or emit device add/remove/change notifications. Watch USB hotplug externally
+(e.g. a `udev` rule or `udevadm monitor`) if you need that.
 
 ## Related
 

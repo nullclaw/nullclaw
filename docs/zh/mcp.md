@@ -66,9 +66,30 @@ NullClaw 支持 [Model Context Protocol](https://modelcontextprotocol.io/)，通
 ```
 
 - `always`：匹配该模式的工具始终包含。
-- `dynamic`：仅当用户消息包含关键词时才包含。
+- `dynamic`：当用户消息包含该组关键词之一时包含（不区分大小写的 ASCII 子串匹配）。
 
-若未配置任何 `tool_filter_groups`，本轮包含全部工具。非 MCP 工具始终包含。`always` 分组在每一轮包含匹配的 MCP 工具。`dynamic` 分组仅当用户消息包含该组关键词之一时包含匹配的 MCP 工具。
+若未配置任何 `tool_filter_groups`，本轮包含全部工具。
+
+### 两条工具暴露路径的行为不同
+
+这是最容易让人意外的地方：`always` 与 `dynamic` 的行为**并不一致**，
+因为它们作用在不同阶段。
+
+| | 原生工具 schema | 文本 prompt |
+|---|---|---|
+| 非 MCP（内置）工具 | 始终包含 | 始终包含 |
+| `always` 分组匹配项 | 始终包含 | 始终包含 |
+| `dynamic` 分组匹配项 | 关键词命中时包含 | **永不包含** |
+
+- 在**原生工具 schema** 路径上，`dynamic` 分组会针对当轮用户消息做关键词匹配
+  （`filterToolSpecsForTurn`），命中时该工具会出现在 provider 的工具列表中。
+- 在**文本 prompt** 路径上，过滤器（`filterToolsForPromptText`）只接受内置
+  工具和 `always` 分组工具。无论关键词是否命中，`dynamic` 工具都不会被写入
+  prompt 文本。
+
+实际影响：如果你的 provider 不支持原生工具 schema，`dynamic` 分组会静默失效。
+在依赖 `dynamic` 来压缩庞大的 MCP 工具面之前，请先用支持原生 schema 的
+后端验证。
 
 ## 相关页面
 

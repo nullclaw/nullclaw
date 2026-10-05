@@ -85,12 +85,32 @@ Use `agent.tool_filter_groups` to control which MCP tools are included per turn:
 ```
 
 - `always`: Tools matching the pattern are always included.
-- `dynamic`: Tools are included only when the user message contains a keyword.
+- `dynamic`: Tools are included when the user message contains one of the group's
+  keywords (case-insensitive ASCII substring match).
 
 When no `tool_filter_groups` are configured, every tool is included.
-Non-MCP tools are always included. `always` groups include matching MCP tools
-on every turn. `dynamic` groups include matching MCP tools only when the user
-message contains one of the group's keywords.
+
+### The two tool-exposure paths differ
+
+This is the part most likely to surprise you: `always` and `dynamic` do **not**
+behave identically, because they are applied at two different stages.
+
+| | Native tool schemas | Text prompt |
+|---|---|---|
+| Non-MCP (built-in) tools | always | always |
+| `always` group matches | always | always |
+| `dynamic` group matches | when a keyword is present | **never** |
+
+- On the **native tool-schema** path, `dynamic` groups are keyword-matched
+  against the current user message (`filterToolSpecsForTurn`), so a matching
+  tool appears in the provider's tool list for that turn.
+- On the **text-prompt** path, the filter (`filterToolsForPromptText`)
+  deliberately admits only built-ins and `always`-group tools. `dynamic` tools
+  are never written into the prompt text, regardless of keywords.
+
+Practical consequence: if your provider does not support native tool schemas,
+`dynamic` groups silently do nothing. Verify with a backend that supports them
+before relying on `dynamic` to keep a large MCP surface out of the context.
 
 ## Related
 

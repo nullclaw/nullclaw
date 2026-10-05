@@ -1,14 +1,25 @@
 # 硬件与外设（Hardware & Peripherals）
 
-NullClaw 可以发现、烧录和操控通过 USB 连接的微控制器开发板。
+NullClaw 可以发现和操控通过 USB 连接的微控制器开发板。CLI 目前只实现了发现，
+其余见下方[尚未实现](#尚未实现)。
 
 ## CLI 命令
 
 ```bash
 nullclaw hardware scan             # 发现已连接的开发板
-nullclaw hardware flash <path>     # 烧录固件
-nullclaw hardware monitor          # 监控 USB 热插拔事件（Linux）
 ```
+
+### 尚未实现
+
+以下两个子命令可以被接受，但只是占位实现：它们只打印一条消息，并不会真正执行动作。
+
+| 命令 | 当前行为 | 源码 |
+|------|----------|------|
+| `nullclaw hardware flash <path>` | 打印固件路径，然后输出 `Flash not yet implemented.` | `src/main.zig` `runHardware` |
+| `nullclaw hardware monitor` | 输出 `Monitor not yet implemented.` 后退出。**不会**调用 `udevadm`，也不会监听热插拔事件。 | `src/main.zig` `runHardware` |
+
+不要基于这两个命令编写脚本，它们都不执行 I/O。烧录请直接使用 `arduino-cli`
+或 `probe-rs`（见[外设驱动](#外设驱动)）。
 
 ## 配置
 
@@ -47,7 +58,21 @@ nullclaw hardware monitor          # 监控 USB 热插拔事件（Linux）
 
 ## Agent 工具
 
-启用硬件后，agent 可使用 `hardware_info`、`hardware_memory`、`i2c`、`spi` 工具。
+配置 `hardware.boards` 后，`allTools` 会注册：
+
+| 工具 | 说明 |
+|------|------|
+| `hardware_board_info` | 列出已发现的开发板及其能力 |
+| `hardware_memory` | 读取板载内存/寄存器 |
+| `i2c` | I2C 总线读写操作 |
+
+SPI 总线驱动存在于 `src/tools/spi.zig` 且可被导入，但**未**被 `allTools`
+注册，因此 agent 无法使用。请将 `spi` 视为库能力，而非已发布的工具。
+
+注意工具名是 `hardware_board_info`，而不是 `hardware_info` —— 实现文件名为
+`src/tools/hardware_info.zig`，这是常见的混淆来源。
+
+裸 `hardware` CLI 子命令与外设驱动是独立实现，不受上述 agent 工具注册的限制。
 
 ## 相关页面
 
