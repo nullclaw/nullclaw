@@ -236,6 +236,74 @@ pub fn sanitizeApiError(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return truncated;
 }
 
+// ─── URL redaction for error logs ───────────────────────────────────────────
+
+/// Reduce a request URL to `scheme://host[:port]/path` for logging.
+///
+/// Drops userinfo, the query string and the fragment — credentials travel in
+/// those parts, and Gemini puts the API key in `?key=...`, so logging a raw
+/// URL in an error path leaks it. The endpoint itself stays identifiable.
+pub fn safeEndpointForLog(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse
+        return allocator.dupe(u8, "<unparseable-url>");
+    if (scheme_end == 0) return allocator.dupe(u8, "<unparseable-url>");
+
+    const scheme = url[0..scheme_end];
+    const rest = url[scheme_end + 3 ..];
+
+    // The authority runs to the first path, query or fragment delimiter.
+    const authority_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const authority = rest[0..authority_end];
+
+    // Strip `user:password@`.
+    const at = std.mem.lastIndexOfScalar(u8, authority, '@');
+    const host_port = if (at) |idx| authority[idx + 1 ..] else authority;
+
+    // The path stops at the query or the fragment.
+    const tail = rest[authority_end..];
+    const path_end = std.mem.indexOfAny(u8, tail, "?#") orelse tail.len;
+
+    return std.fmt.allocPrint(allocator, "{s}://{s}{s}", .{ scheme, host_port, tail[0..path_end] });
+}
+
+/// The exact `provider http error` line, formatted without writing to the log
+/// so tests can assert on the final fields.
+pub fn providerHttpErrorMessage(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    status_code: u16,
+    body: []const u8,
+) ![]u8 {
+    const endpoint = try safeEndpointForLog(allocator, url);
+    defer allocator.free(endpoint);
+
+    const sanitized = sanitizeApiError(allocator, body) catch null;
+    defer if (sanitized) |s| allocator.free(s);
+    const preview = sanitized orelse "<provider error body unavailable>";
+
+    return std.fmt.allocPrint(allocator, "provider http error: status={d} url={s} body={s}", .{
+        status_code, endpoint, preview,
+    });
+}
+
+/// The exact `compatible` provider error line, with the same guarantees.
+pub fn compatibleApiErrorMessage(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    err_name: []const u8,
+    url: []const u8,
+    body: []const u8,
+) ![]u8 {
+    const endpoint = try safeEndpointForLog(allocator, url);
+    defer allocator.free(endpoint);
+
+    const sanitized = sanitizeApiError(allocator, body) catch null;
+    defer if (sanitized) |s| allocator.free(s);
+    const preview = sanitized orelse "<api error body unavailable>";
+
+    return std.fmt.allocPrint(allocator, "{s} {s}: {s} {s}", .{ provider_name, err_name, endpoint, preview });
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -456,4 +524,88 @@ test "eqlLowercase matches case-insensitively" {
     try std.testing.expect(eqlLowercase("api_key", "api_key"));
     try std.testing.expect(eqlLowercase("Api_Key", "api_key"));
     try std.testing.expect(!eqlLowercase("api_keys", "api_key")); // different length — won't match
+}
+
+// ── URL redaction for error logs ─────────────────────────────────────────────
+//
+// Regression coverage for the credential leak: `logProviderHttpError` used to
+// write the request URL verbatim, and Gemini puts the API key in the query
+// string (`...:generateContent?key=<key>`), so any non-2xx logged the key.
+
+const FAKE_GEMINI_KEY = "AIzaSyFAKE-TEST-KEY-0123456789";
+
+test "safeEndpointForLog strips Gemini API key from the query string" {
+    const allocator = std.testing.allocator;
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" ++ FAKE_GEMINI_KEY;
+
+    const out = try safeEndpointForLog(allocator, url);
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        out,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, FAKE_GEMINI_KEY) == null);
+}
+
+test "safeEndpointForLog drops userinfo, query and fragment but keeps host and path" {
+    const allocator = std.testing.allocator;
+
+    const with_userinfo = try safeEndpointForLog(allocator, "https://user:pass@example.internal:8443/v1/chat?token=abc#frag");
+    defer allocator.free(with_userinfo);
+    try std.testing.expectEqualStrings("https://example.internal:8443/v1/chat", with_userinfo);
+    try std.testing.expect(std.mem.indexOf(u8, with_userinfo, "pass") == null);
+
+    const bare = try safeEndpointForLog(allocator, "https://api.example.com");
+    defer allocator.free(bare);
+    try std.testing.expectEqualStrings("https://api.example.com", bare);
+}
+
+test "safeEndpointForLog survives unparseable input" {
+    const allocator = std.testing.allocator;
+    const out = try safeEndpointForLog(allocator, "not a url");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not a url") == null);
+}
+
+test "provider http error message keeps diagnostics but never the key" {
+    const allocator = std.testing.allocator;
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={s}",
+        .{FAKE_GEMINI_KEY},
+    );
+    defer allocator.free(url);
+
+    const line = try providerHttpErrorMessage(allocator, url, 429, "{\"error\":{\"message\":\"quota exceeded\"}}");
+    defer allocator.free(line);
+
+    // The key must not appear anywhere in the final log fields…
+    try std.testing.expect(std.mem.indexOf(u8, line, FAKE_GEMINI_KEY) == null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "key=") == null);
+    // …while status, endpoint identity and body survive.
+    try std.testing.expect(std.mem.indexOf(u8, line, "status=429") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, ":generateContent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "quota exceeded") != null);
+}
+
+test "compatible api error message drops URL credentials" {
+    const allocator = std.testing.allocator;
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://user:pass@example.internal/v1/chat/completions?api_key={s}",
+        .{FAKE_GEMINI_KEY},
+    );
+    defer allocator.free(url);
+
+    const line = try compatibleApiErrorMessage(allocator, "my-custom", "HttpError", url, "upstream said no");
+    defer allocator.free(line);
+
+    try std.testing.expect(std.mem.indexOf(u8, line, FAKE_GEMINI_KEY) == null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "pass") == null);
+    // Provider name, error identity, endpoint and body all stay legible.
+    try std.testing.expect(std.mem.indexOf(u8, line, "my-custom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "HttpError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "https://example.internal/v1/chat/completions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "upstream said no") != null);
 }

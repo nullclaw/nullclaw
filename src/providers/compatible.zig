@@ -31,11 +31,17 @@ fn logCompatibleApiError(
     // effects under zig test so unrelated suites do not fail on expected errors.
     if (builtin.is_test) return;
 
-    const sanitized = root.sanitizeApiError(allocator, resp_body) catch null;
-    defer if (sanitized) |body| allocator.free(body);
-
-    const preview = sanitized orelse "<api error body unavailable>";
-    log.err("{s} {s}: {s} {s}", .{ provider_name, @errorName(err), url, preview });
+    // Same redaction as the provider path: `url` may carry userinfo or
+    // credential-bearing query parameters.
+    const line = root.compatibleApiErrorMessage(
+        allocator,
+        provider_name,
+        @errorName(err),
+        url,
+        resp_body,
+    ) catch return;
+    defer allocator.free(line);
+    log.err("{s}", .{line});
 }
 
 fn returnLoggedCompatibleApiError(
