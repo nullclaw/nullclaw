@@ -1441,6 +1441,8 @@ test "bounded connect propagates a worker failure" {
 }
 
 test "bounded connect abandons at the deadline and the worker releases a late result" {
+    // std.posix.read (the close probe below) is unsupported on Windows.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const cell = try allocator.create(WsClient.ConnectCell);
     cell.* = .{ .host = try allocator.dupe(u8, "example.test") };
