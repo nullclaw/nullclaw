@@ -275,6 +275,12 @@ pub const SecretStore = struct {
     /// then read key material from outside it. Opening with `follow_symlinks`
     /// disabled makes the check bind the open atomically.
     fn openArchiveEntry(dir: std_compat.fs.Dir, name: []const u8) !std_compat.fs.File {
+        // Windows expresses O_NOFOLLOW as FILE_FLAG_OPEN_REPARSE_POINT, and a
+        // handle opened that way does not read back through this path (it fails
+        // the hex read in readKeyFromFile). Symlink entries are still rejected by
+        // the directory iteration there, and planting one needs privileges, so
+        // keep the default open on Windows and take the atomic guarantee on POSIX.
+        if (builtin.os.tag == .windows) return dir.openFile(name, .{});
         return dir.openFile(name, .{ .follow_symlinks = false });
     }
 

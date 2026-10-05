@@ -113,6 +113,10 @@ pub fn renamePath(old_path: []const u8, new_path: []const u8) !void {
 /// without directory fsync (Windows) return an error the caller treats as
 /// "durability unavailable" rather than failing the operation.
 pub fn syncDirPath(path: []const u8) !void {
+    // Directory fsync is a POSIX concept. Windows has no equivalent, and opening
+    // a directory as a file handle there is not a supported read/flush target, so
+    // skip rather than perform an unsupported syscall.
+    if (builtin.os.tag == .windows) return;
     const dir_file = try openPath(path, .{ .mode = .read_only, .allow_directory = true });
     defer dir_file.close();
     try dir_file.sync();
