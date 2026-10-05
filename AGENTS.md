@@ -25,7 +25,22 @@ Key extension points:
 - `src/runtime.zig` (`RuntimeAdapter`) — execution environments
 - `src/peripherals.zig` (`Peripheral`) — hardware boards (Arduino, STM32, RPi)
 
-Current scale: **245 source files, ~204K lines of code, 5,640+ tests**.
+Current scale: **293 source files, ~290K lines of code, 7,499 tests**.
+
+These figures drift, so derive them rather than hand-editing (last verified
+against `main` at `5f1cade0`):
+
+```bash
+git ls-files 'src/**/*.zig' 'src/*.zig' | wc -l                       # 293 source files
+git ls-files 'src/**/*.zig' 'src/*.zig' | xargs cat | wc -l            # ~290K lines
+zig build test --summary all                                           # 7,499 tests
+grep -cE '\.\{ \.name = "' src/providers/factory.zig                    # 110 compatible providers
+grep -rhoE 'pub const tool_name = "[a-z0-9_]+"' src/tools/ | wc -l     # 40 registered tools
+```
+
+Channel implementations are one struct per channel under `src/channels/`,
+excluding the `*_ingress`, `*_api`, `*_presenter`, `outbox`, `dispatch`, and
+`external_protocol` helpers: 24.
 
 Build and test:
 
@@ -46,6 +61,8 @@ These codebase realities should drive every design decision:
 
 2. **Binary size and memory are hard product constraints**
    - `zig build -Doptimize=ReleaseSmall` is the release target. Every dependency and abstraction has a size cost.
+   - The stated goal is a sub-1 MB ReleaseSmall binary. **This is not currently met**: a host build measures ~4.66 MB (4,889,528 bytes, aarch64-macOS, verified 2026-10-05). Treat the target as an open gap, not a met constraint, and do not quote a sub-1 MB figure in user-facing docs until it holds.
+   - Verify before quoting a size: `zig build -Doptimize=ReleaseSmall && ls -l zig-out/bin/nullclaw`. Size is target-specific.
    - Avoid adding libc calls, runtime allocations, or large data tables without justification.
    - `MaxRSS` during `zig build test` must stay well under 50 MB.
 
@@ -61,7 +78,7 @@ These codebase realities should drive every design decision:
    - SQLite: linked via `/opt/homebrew/opt/sqlite/{lib,include}` on the compile step, not the module.
    - `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
 
-5. **All 5,640+ tests must pass at zero leaks**
+5. **All 7,499 tests must pass at zero leaks**
    - The test suite uses `std.testing.allocator` (leak-detecting GPA). Every allocation must be freed.
    - `Config.load()` allocates — always wrap in `std.heap.ArenaAllocator` in tests and production.
    - `ChaCha20Poly1305.decrypt` can segfault on tag failure with heap-allocated output on macOS with older Zig toolchains — use a stack buffer then `allocator.dupe()`.
@@ -132,9 +149,9 @@ src/
   peripherals.zig       hardware peripherals (Arduino, STM32/Nucleo, RPi)
   security/             policy, pairing, secrets, sandbox backends
   memory/               SQLite + markdown backends, embeddings, vector search
-  providers/            50+ AI provider implementations (9 core + 41 compatible services)
-  channels/             17 channel implementations
-  tools/                30+ tool implementations
+  providers/            10 core provider implementations + 110 OpenAI-compatible registry entries
+  channels/             24 channel implementations
+  tools/                40 registered tool implementations
   agent/                agent loop, context, planner
 ```
 

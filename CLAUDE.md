@@ -11,8 +11,8 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 ```bash
 # Requires exactly Zig 0.16.0 (verify: zig version)
 zig build                           # dev build
-zig build -Doptimize=ReleaseSmall   # release build (target: <1 MB binary)
-zig build test --summary all        # run all 5,300+ tests (must pass with 0 leaks)
+zig build -Doptimize=ReleaseSmall   # release build (currently ~4.66 MB; sub-1 MB is an open goal)
+zig build test --summary all        # run all 7,499 tests (must pass with 0 leaks)
 zig fmt src/                        # format all source files
 zig fmt --check src/                # check formatting (used by pre-commit hook)
 ```
@@ -45,7 +45,7 @@ git config core.hooksPath .githooks
 
 ## Project Overview
 
-NullClaw is an autonomous AI assistant runtime written in Zig 0.16.0. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
+NullClaw is an autonomous AI assistant runtime written in Zig 0.16.0. Hard constraints: ~1 MB peak RSS, <2 ms startup, and a small ReleaseSmall binary (a host build currently measures ~4.66 MB — the sub-1 MB goal is not yet met). Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
 
 ## Architecture
 
