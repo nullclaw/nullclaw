@@ -8,11 +8,14 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 
 ## Build & Test Commands
 
+Quick reference. The normative version, including the validation matrix, is
+`AGENTS.md` §1 and §8.
+
 ```bash
 # Requires exactly Zig 0.16.0 (verify: zig version)
 zig build                           # dev build
-zig build -Doptimize=ReleaseSmall   # release build (target: <1 MB binary)
-zig build test --summary all        # run all 5,300+ tests (must pass with 0 leaks)
+zig build -Doptimize=ReleaseSmall   # release build
+zig build test --summary all        # full suite (must pass with 0 leaks)
 zig fmt src/                        # format all source files
 zig fmt --check src/                # check formatting (used by pre-commit hook)
 ```
@@ -34,18 +37,14 @@ Engine tokens: `base`/`minimal` (enables `none`, `markdown`, `memory`, `api`), `
 
 ## Git Hooks
 
-Activate once per clone:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-- **pre-commit**: blocks if `zig fmt --check src/` fails
-- **pre-push**: blocks if `zig build test --summary all` fails
+Activate once per clone with `git config core.hooksPath .githooks`. What each
+hook runs is documented in `AGENTS.md` §8.2.
 
 ## Project Overview
 
-NullClaw is an autonomous AI assistant runtime written in Zig 0.16.0. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
+NullClaw is an autonomous AI assistant runtime written in Zig 0.16.0. The
+project snapshot, hard constraints, and dependency policy live in `AGENTS.md`
+§1 — they are maintained there, not here.
 
 ## Architecture
 
@@ -108,13 +107,15 @@ Key config sections: `models.providers` (API keys/endpoints), `agents` (named ag
 
 ## Zig 0.16.0 API Gotchas
 
-- `std.io.getStdOut()` does NOT exist. Use `std.fs.File.stdout()`.
-- HTTP client: `std.http.Client.fetch()` with `std.Io.Writer.Allocating`.
-- Child processes: `std.process.Child.init(argv, allocator)`, `.Pipe` (capitalized).
-- `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
-- `ChaCha20Poly1305.decrypt`: use stack buffer then `allocator.dupe()` (heap buffer segfaults on macOS).
-- `SQLITE_TRANSIENT` in auto-translated C code: use `SQLITE_STATIC` (null) instead.
-- When unsure about API, search `src/` for existing usage rather than guessing.
+Maintained in **`AGENTS.md` §2.4** (API baseline: `std.io.getStdOut()`,
+HTTP client, child processes, stdout, SQLite linkage, `ArrayListUnmanaged`) and
+**`AGENTS.md` §10** (anti-patterns: `SQLITE_TRANSIENT`, `ChaCha20Poly1305`
+decrypt buffers, `ArrayListUnmanaged.writer`).
+
+They are not repeated here on purpose. Two files restating the same rules is how
+the Zig pin drifted to `0.15.2` in one place while the build used `0.16.0`.
+
+When unsure about an API, search `src/` for existing usage rather than guessing.
 
 ## Search Zig Source
 
@@ -122,9 +123,9 @@ Run `zig env` to locate Zig source directories. `.std_dir` points to the standar
 
 ## Testing Conventions
 
-- All tests use `std.testing.allocator` (leak-detecting GPA). Every allocation must be freed with `defer`.
-- Use `builtin.is_test` guards to skip side effects (spawning processes, opening browsers, real hardware I/O). Return mock data instead (e.g., `return "test-refreshed-token"`).
-- Tests must be deterministic and reproducible across macOS and Linux.
+The normative rules are `AGENTS.md` §3.6 (determinism) and §8.1 (test coverage
+mandate). Repository-specific conventions, which are not in AGENTS.md:
+
 - Vendored SQLite hashes are validated at build time.
 - Use `std.testing.tmpDir(.{})` with `defer tmp.cleanup()` for file-based test fixtures.
 - Contract tests in `src/memory/engines/contract_test.zig` verify all memory backends satisfy the same vtable invariants. Follow this pattern when adding new backends.
