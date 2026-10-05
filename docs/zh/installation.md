@@ -51,6 +51,18 @@ NullClaw 当前提供官方 OCI 镜像：`ghcr.io/nullclaw/nullclaw`。
 
 镜像内自带的初始配置已经使用当前配置结构（`agents.defaults.model.primary` 和 `models.providers`），因此在你填入 provider 凭证之前，`latest` 也应能正常启动。
 
+### 已有数据卷
+
+命名数据卷会保留首次填充时的属主。如果该卷是由 `/nullclaw-data` 属主为 root 的旧镜像创建的，即使镜像已经修复，容器仍会报 `AccessDenied`。以 root 身份执行一次修复：
+
+```bash
+docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
+  --entrypoint sh ghcr.io/nullclaw/nullclaw:latest \
+  -c 'chown -R 65534:65534 /nullclaw-data'
+```
+
+绑定挂载（bind mount）不受该命令影响：它们继承宿主目录的属主，因此被挂载的目录必须对 uid `65534` 可写。
+
 ### 单次命令
 
 ```bash
