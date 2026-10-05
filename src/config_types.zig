@@ -1690,7 +1690,7 @@ pub const HttpRequestConfig = struct {
     search_base_url: ?[]const u8 = null,
     /// Search provider for web_search.
     /// Supported: auto, searxng, duckduckgo (ddg), brave, firecrawl,
-    /// tavily, perplexity, exa, jina.
+    /// tavily, perplexity, exa, jina, serply.
     search_provider: []const u8 = "auto",
     /// Optional fallback provider chain used when the primary provider fails.
     search_fallback_providers: []const []const u8 = &.{},
@@ -1717,7 +1717,8 @@ pub const HttpRequestConfig = struct {
             std.ascii.eqlIgnoreCase(trimmed, "tavily") or
             std.ascii.eqlIgnoreCase(trimmed, "perplexity") or
             std.ascii.eqlIgnoreCase(trimmed, "exa") or
-            std.ascii.eqlIgnoreCase(trimmed, "jina");
+            std.ascii.eqlIgnoreCase(trimmed, "jina") or
+            std.ascii.eqlIgnoreCase(trimmed, "serply");
     }
 
     pub fn isValidSearchFallbackProviderName(raw: []const u8) bool {
@@ -2243,6 +2244,7 @@ test "HttpRequestConfig search provider validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("perplexity"));
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("exa"));
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("jina"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("serply"));
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("BRAVE"));
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("DDG"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchProviderName("google"));
