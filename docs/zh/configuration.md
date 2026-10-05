@@ -382,6 +382,41 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 - 裸模型名的故障转移顺序：先尝试主要提供方，再依次尝试每个列出的 `fallback_provider`。
 - 像 `openai/gpt-4o` 这样的显式 `provider/model` 备用项会直接路由到对应 provider，不会再走通用 provider 扇出链路。
 - `api_keys`: (可选) 用于在速率限制 (429) 错误时轮换的额外 API 密钥列表。
+
+### `scheduler`
+
+- 配置运行定时任务的 cron 调度器。
+- `enabled`：定时任务调度的总开关（默认值：`true`）。
+- `max_tasks`：调度器可跟踪的任务数量上限（默认值：`64`）。
+- `max_concurrent`：会被解析并由 `nullclaw cron status` 展示，但**当前并未生效** —— cron 调度器同一时刻只运行一个任务（见下方说明）。
+- `agent_timeout_secs`：单个 cron **agent** 任务的硬性墙钟时间上限，单位为秒（默认值：`0`，即**不设超时**）。
+
+示例：
+
+```json
+{
+  "scheduler": {
+    "enabled": true,
+    "max_tasks": 64,
+    "max_concurrent": 4,
+    "agent_timeout_secs": 900
+  }
+}
+```
+
+#### `agent_timeout_secs` 为何重要
+
+定时任务在**单个调度线程上串行执行**。到期的任务会被启动并等待结束，调度器才会去看下一个任务，因此一个永远不退出的任务会把其余所有定时任务（包括心跳）一起拖延同样长的时间。在默认值 `0` 下没有截止时间：调度器会无限期等待该任务的输出到达 EOF。
+
+凡是运行定时 agent 任务的主机，都应设置一个非零值：
+
+- 取值应明显高于最慢的正常任务，同时远小于任务之间的间隔。例如 2 小时的 cron 配上 15 分钟上限，既留足余量，又能限制卡死时长。
+- 该上限只作用于 **agent 类型**任务。shell 类型的 cron 任务另有 60 秒的独立上限，不受此值影响。
+- 该值与其余 `scheduler` 配置一样，只在 daemon 启动时读取一次。系统不支持 SIGHUP 重载 —— **修改后需要重启 daemon 才会生效**。
+- 超时触发时，任务子进程会被杀掉，本次运行记为错误，随后下一次触发即可正常进行。
+
+已知限制：kill 只会作用于该任务的直接子进程，不会作用于其后代进程。如果某个孙进程继承了任务的输出管道，调度器仍可能在超时之后继续等待。
+
 ### `identity`（AIEOS v1.1）
 
 如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：

@@ -446,6 +446,41 @@ Notes:
 - Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
 - Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
 - `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
+
+### `scheduler`
+
+- Configures the cron scheduler that runs scheduled jobs.
+- `enabled`: Master switch for cron scheduling (default: `true`).
+- `max_tasks`: Maximum number of jobs the scheduler tracks (default: `64`).
+- `max_concurrent`: Parsed and reported by `nullclaw cron status`, but **not currently enforced** — the cron scheduler runs one job at a time (see the note below).
+- `agent_timeout_secs`: Hard wall-clock limit, in seconds, on a single cron **agent** job (default: `0` = **no timeout**).
+
+Example:
+
+```json
+{
+  "scheduler": {
+    "enabled": true,
+    "max_tasks": 64,
+    "max_concurrent": 4,
+    "agent_timeout_secs": 900
+  }
+}
+```
+
+#### Why `agent_timeout_secs` matters
+
+Cron jobs are dispatched **serially on a single scheduler thread**. A due job is spawned and awaited before the scheduler looks at the next one, so a job that never exits delays every other scheduled job — including heartbeats — for as long as it hangs. With the default of `0` there is no deadline: the scheduler waits indefinitely for the job's output to reach EOF.
+
+Set a non-zero value on any host that runs scheduled agent jobs:
+
+- Pick a value comfortably above your slowest healthy job, and well below the interval between jobs. A 2-hour cron with a 15-minute cap leaves ample headroom while bounding a stall.
+- The timeout covers **agent-type jobs only**. Shell-type cron jobs are already capped separately at 60 seconds and ignore this value.
+- The limit is read once at daemon startup, alongside the rest of `scheduler`. There is no SIGHUP reload — **restart the daemon for a change to take effect**.
+- On expiry the job's child process is killed and the run is recorded as an error, so the next tick proceeds normally.
+
+Known limitation: the kill is delivered to the job's direct child process only, not to its descendants. A grandchild that inherits the job's output pipe can keep the scheduler waiting past the timeout.
+
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.

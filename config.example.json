@@ -229,6 +229,13 @@
     ]
   },
 
+  "scheduler": {
+    "enabled": true,
+    "max_tasks": 64,
+    "max_concurrent": 4,
+    "agent_timeout_secs": 900
+  },
+
   "autonomy": {
     "level": "supervised",
     "workspace_only": true,
