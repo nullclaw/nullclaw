@@ -1,0 +1,51 @@
+# Regression gate for the published container image.
+#
+# #1017: the image shipped with /nullclaw-data owned by root, so the gateway
+# exited with `AccessDenied` for uid 65534. Nothing built the image on a PR —
+# the only publish path is a tag-triggered release — so nothing caught it, and
+# ghcr's `latest` stayed broken from 2026-05-29 until #1023 landed.
+#
+# Layer 1 of #1036: run only when a Docker-related path changes. Layer 2 (a
+# gate before publish_docker) is tracked separately.
+#
+# This lives in this repo rather than in nullclaw/nullbuilder on purpose: the
+# `paths:` filter can only see this repo's pull requests, and everything under
+# test (Dockerfile, compose file, the HOME test script) is defined here.
+# nullbuilder holds the generic zig ci/nightly/release workflows and no
+# container assets of its own.
+name: Docker
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - docker-compose.yml
+      - .github/scripts/test-docker-home.sh
+      - .github/workflows/docker.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: build and verify image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate compose file
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Build image
+        run: docker build -t nullclaw:ci .
+
+      # The script asserts uid 65534, HOME==NULLCLAW_HOME, and that a file can
+      # be created inside HOME — for the bare image and for a fresh named volume.
+      - name: Verify HOME is writable as uid 65534
+        run: sh .github/scripts/test-docker-home.sh nullclaw:ci
