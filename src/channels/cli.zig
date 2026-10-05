@@ -165,13 +165,18 @@ pub fn readInteractiveLine(
         return readPromptedCanonicalLine(stdin, writer, prompt, line_buf);
     };
     defer raw.disable();
-    const terminal_columns = CliRawMode.terminalColumns(stdout.handle);
 
     try cli_line_editor.renderPrompt(writer, prompt);
     try writer.flush();
 
     var editor = cli_line_editor.LineEditor.init(history);
     while (true) {
+        // Sampled every iteration rather than once per prompt: shrinking the
+        // terminal mid-edit must not leave renderLineRefresh computing the
+        // one-row viewport against a stale width. One ioctl per keystroke is
+        // far cheaper than a mis-wrapped line.
+        const terminal_columns = CliRawMode.terminalColumns(stdout.handle);
+
         if (editor.hasPendingEscape() and !CliRawMode.waitForEscapeContinuation(stdin.handle)) {
             editor.cancelPendingEscape();
             continue;

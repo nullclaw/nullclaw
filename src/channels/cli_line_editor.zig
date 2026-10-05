@@ -342,12 +342,23 @@ pub const LineEditor = struct {
         self.cancelPendingInput();
         self.overflowed = false;
 
+        // History entries can be multiline (debounce-coalesced input). Dropping
+        // the newline bytes would glue the parts together, so remember the break
+        // and emit one space when more text follows: the separator survives
+        // without introducing a leading or trailing space.
+        var pending_separator = false;
+
         var index: usize = 0;
         while (index < text.len) {
             const byte = text[index];
             if (byte < 0x80) {
                 index += 1;
+                if (byte == '\n' or byte == '\r') {
+                    pending_separator = true;
+                    continue;
+                }
                 if ((byte < 0x20 and byte != '\t') or byte == 0x7f) continue;
+                self.flushPendingSeparator(&pending_separator);
                 if (!self.appendHistoryScalar(text[index - 1 .. index])) break;
                 continue;
             }
@@ -362,10 +373,23 @@ pub const LineEditor = struct {
                 index += 1;
                 continue;
             };
+            self.flushPendingSeparator(&pending_separator);
             if (!self.appendHistoryScalar(scalar)) break;
             index += scalar_len;
         }
         self.cursor_pos = self.len;
+    }
+
+    /// Emit the deferred multiline separator, if one is pending. Suppressed at
+    /// the start of the line and directly after an existing space or tab, so a
+    /// recalled entry never gains a leading or doubled separator.
+    fn flushPendingSeparator(self: *LineEditor, pending_separator: *bool) void {
+        if (!pending_separator.*) return;
+        pending_separator.* = false;
+        if (self.len == 0) return;
+        const previous = self.buf[self.len - 1];
+        if (previous == ' ' or previous == '\t') return;
+        _ = self.appendHistoryScalar(" ");
     }
 
     fn appendHistoryScalar(self: *LineEditor, scalar: []const u8) bool {
@@ -702,4 +726,35 @@ test "cli line editor keeps long and UTF-8 input in one-row viewport" {
         "\r\x1b[2K> \r\x1b[2K> abcde\r> abc\r\x1b[2K> a中b\r> a中",
         writer.buffered(),
     );
+}
+
+test "cli line editor keeps a separator when recalling multiline history" {
+    // Regression: replaceLine dropped newline bytes, so a coalesced multiline
+    // entry came back as one glued string ("echo oneecho two").
+    const history = [_][]const u8{"echo one\necho two"};
+    var editor = LineEditor.init(history[0..]);
+
+    feedTerminalSequence(&editor, "\x1b[A");
+    try std.testing.expectEqualStrings("echo one echo two", editor.line());
+    try std.testing.expectEqual(editor.line().len, editor.cursor());
+}
+
+test "cli line editor collapses CR/CRLF and drops edge separators" {
+    const history = [_][]const u8{ "\r\nindented", "trailing newline\n" };
+    var editor = LineEditor.init(history[0..]);
+
+    // History walks newest first.
+    feedTerminalSequence(&editor, "\x1b[A");
+    try std.testing.expectEqualStrings("trailing newline", editor.line());
+
+    feedTerminalSequence(&editor, "\x1b[A");
+    try std.testing.expectEqualStrings("indented", editor.line());
+}
+
+test "cli line editor leaves single-line history entries unchanged" {
+    const history = [_][]const u8{"plain entry"};
+    var editor = LineEditor.init(history[0..]);
+
+    feedTerminalSequence(&editor, "\x1b[A");
+    try std.testing.expectEqualStrings("plain entry", editor.line());
 }
