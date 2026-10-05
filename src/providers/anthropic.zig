@@ -583,6 +583,30 @@ fn buildStreamingChatRequestBody(
     return try buf.toOwnedSlice(allocator);
 }
 
+/// Models that support Anthropic's adaptive thinking (`output_config.effort`)
+/// instead of a manual `thinking.budget_tokens`.
+///
+/// Add a generation here rather than extending an exact-match comparison at
+/// each call site. A dated snapshot of a listed model (`<id>-YYYYMMDD`) inherits
+/// its capability; anything else falls back to the manual budget.
+const adaptive_thinking_models = [_][]const u8{
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+};
+
+/// Whether `model` should be sent adaptive thinking rather than a budget.
+fn supportsAdaptiveThinking(model: []const u8) bool {
+    for (adaptive_thinking_models) |entry| {
+        if (std.mem.eql(u8, model, entry)) return true;
+        // Dated alias: `<entry>-<suffix>`, but not a longer number that merely
+        // starts with the entry (`claude-sonnet-4-60` must not match).
+        if (model.len > entry.len and
+            model[entry.len] == '-' and
+            std.mem.startsWith(u8, model, entry)) return true;
+    }
+    return false;
+}
+
 fn appendAnthropicGenerationConfig(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -607,7 +631,7 @@ fn appendAnthropicGenerationConfig(
     else
         "high";
 
-    if (std.mem.eql(u8, model, "claude-opus-4-6") or std.mem.eql(u8, model, "claude-sonnet-4-6")) {
+    if (supportsAdaptiveThinking(model)) {
         try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"");
         try buf.appendSlice(allocator, normalized_effort);
         try buf.appendSlice(allocator, "\"}");
@@ -1058,6 +1082,23 @@ test "buildChatRequestBody uses adaptive thinking for Claude 4.6" {
     try std.testing.expectEqualStrings("high", obj.get("output_config").?.object.get("effort").?.string);
     try std.testing.expect(obj.get("temperature") == null);
     try std.testing.expect(obj.get("thinking").?.object.get("budget_tokens") == null);
+}
+
+test "supportsAdaptiveThinking is table-driven across generations and aliases" {
+    // Listed generations keep today's behaviour.
+    try std.testing.expect(supportsAdaptiveThinking("claude-opus-4-6"));
+    try std.testing.expect(supportsAdaptiveThinking("claude-sonnet-4-6"));
+
+    // A dated snapshot of a listed model inherits its capability.
+    try std.testing.expect(supportsAdaptiveThinking("claude-sonnet-4-6-20260101"));
+
+    // Everything else keeps the manual budget path.
+    try std.testing.expect(!supportsAdaptiveThinking("claude-opus-4-5-20250514"));
+    try std.testing.expect(!supportsAdaptiveThinking("claude-3-5-sonnet-20241022"));
+
+    // A longer number that merely starts with a listed id must not match.
+    try std.testing.expect(!supportsAdaptiveThinking("claude-sonnet-4-60"));
+    try std.testing.expect(!supportsAdaptiveThinking(""));
 }
 
 test "buildChatRequestBody omits thinking config when reasoning_effort is none" {
