@@ -10,7 +10,7 @@ Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](ht
 
 <p align="center">
   <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>
-  <strong>678 KB binary. ~1 MB RAM. Boots in <2 ms. Runs on anything with a CPU.</strong>
+  <strong>~4.7 MB ReleaseSmall binary. ~1 MB RAM. Boots in &lt;2 ms. Runs on anything with a CPU.</strong>
 </p>
 
 <p align="center">
@@ -26,16 +26,16 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
 
 ```
-678 KB binary · <2 ms startup · 5,300+ tests · 50+ providers · 19 channels · Pluggable everything
+~4.7 MB binary · &lt;2 ms startup · 7,499 tests · 120 providers · 24 channels · Pluggable everything
 ```
 
 ### Features
 
-- **Impossibly Small:** 678 KB static binary — no runtime, no VM, no framework overhead.
+- **Small:** ~4.7 MB ReleaseSmall binary — no runtime, no VM, no framework overhead.
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 50+ providers, 19 channels, 35+ tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 120 providers, 24 channels, 40 tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
 ### Why nullclaw
 
@@ -53,9 +53,9 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **Language** | TypeScript | Python | Go | Rust | **Zig** |
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
-| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **5,300+** |
-| **Source Files** | ~400+ | — | — | ~120 | **~230** |
+| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **~4.7 MB** |
+| **Tests** | — | — | — | 1,017 | **7,499** |
+| **Source Files** | ~400+ | — | — | ~120 | **~293** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
 > Measured with `/usr/bin/time -l` on ReleaseSmall builds. nullclaw is a static binary with zero runtime dependencies.
@@ -269,7 +269,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
-| **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, NEAR AI Cloud, Atlas Cloud, Evolink, Eden AI, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **AI Models** | `Provider` | 120 providers — 10 core implementations (Anthropic, OpenAI, Gemini, Vertex AI, Ollama, OpenRouter, plus the Claude/Codex/Gemini CLI variants) plus 110 OpenAI-compatible registry entries (Venice, NEAR AI Cloud, Atlas Cloud, Evolink, Eden AI, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and more) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, memory_store, memory_recall, memory_forget, memory_list, browser_open, screenshot, composio, http_request, web_fetch, web_search, delegate, schedule, hardware_info, hardware_memory, pushover, message, spawn, git, image, i2c, spi, and more | Any capability |
@@ -857,8 +857,8 @@ Build and tests are pinned to **Zig 0.16.0**.
 
 ```bash
 zig build                          # Dev build
-zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 5,300+ tests
+zig build -Doptimize=ReleaseSmall  # Release build (~4.7 MB)
+zig build test --summary all       # 7,499 tests
 ```
 
 ### Channel Flow Coverage
@@ -875,10 +875,10 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 
 ```
 Language:     Zig 0.16.0
-Source files: ~250
+Source files: 293
 Lines of code: ~249,000
-Tests:        5,300+
-Binary:       678 KB (ReleaseSmall)
+Tests:        7,499
+Binary:       ~4.7 MB (ReleaseSmall)
 Peak RSS:     ~1 MB
 Startup:      <2 ms (Apple Silicon)
 Dependencies: 0 (besides libc + optional SQLite)
