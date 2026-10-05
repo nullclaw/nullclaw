@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const std_compat = @import("compat");
+const thread_stacks = @import("thread_stacks.zig");
 
 const log = std.log.scoped(.websocket);
 
@@ -98,19 +99,31 @@ pub const WsClient = struct {
         return connectFromStream(allocator, stream, host, path, extra_headers);
     }
 
+    /// Upper bound on DNS resolution + TCP establishment.
+    ///
+    /// Neither stage has a descriptor to shut down yet, so the `stop` path cannot
+    /// interrupt them: a blackholed peer sits on kernel SYN retries for minutes and
+    /// a wedged resolver has no deadline of ours at all. Running the phase on a
+    /// worker lets the caller return at this deadline instead (see `connectBounded`).
+    pub const CONNECT_TIMEOUT_MS: i64 = 15_000;
+
+    /// Poll granularity for the bounded wait. Address space, not RSS.
+    const CONNECT_POLL_NS: u64 = 10 * std.time.ns_per_ms;
+
     /// Perform DNS resolution + TCP connect only. Returns the connected TCP stream.
     /// On failure the function cleans up; on success the caller owns the stream.
     ///
     /// Pair with `connectFromStream` when the fd must be stored before TLS init so
     /// a concurrent thread can interrupt a stalled handshake via `stream.shutdown`.
+    ///
+    /// Both stages are bounded by `CONNECT_TIMEOUT_MS` and give up with
+    /// `error.ConnectTimeout` rather than holding the caller indefinitely.
     pub fn connectTcp(
         allocator: std.mem.Allocator,
         host: []const u8,
         port: u16,
     ) !std_compat.net.Stream {
-        const addr_list = try std_compat.net.getAddressList(allocator, host, port);
-        defer addr_list.deinit();
-        return connectToResolvedAddresses(std_compat.net.tcpConnectToAddress, addr_list.addrs);
+        return connectBounded(allocator, host, port, CONNECT_TIMEOUT_MS);
     }
 
     /// Complete TLS init + WebSocket handshake on an already-established TCP stream.
@@ -272,6 +285,120 @@ pub const WsClient = struct {
         }
 
         return error.ConnectFailed;
+    }
+
+    /// DNS resolution + TCP connect, unbounded. Worker body for `connectBounded`.
+    fn resolveAndConnect(allocator: std.mem.Allocator, host: []const u8, port: u16) !std_compat.net.Stream {
+        const addr_list = try std_compat.net.getAddressList(allocator, host, port);
+        defer addr_list.deinit();
+        return connectToResolvedAddresses(std_compat.net.tcpConnectToAddress, addr_list.addrs);
+    }
+
+    /// Hand-off cell between the connect worker and its caller. Exactly one side
+    /// ever releases it: the caller when it observes `finished`, the worker when
+    /// it observes `abandoned`.
+    const ConnectCell = struct {
+        mutex: std_compat.sync.Mutex = .{},
+        /// Owned here so a worker outliving the caller cannot read freed memory.
+        host: []u8,
+        stream: ?std_compat.net.Stream = null,
+        err: ?anyerror = null,
+        finished: bool = false,
+        abandoned: bool = false,
+    };
+
+    fn destroyConnectCell(allocator: std.mem.Allocator, cell: *ConnectCell) void {
+        allocator.free(cell.host);
+        allocator.destroy(cell);
+    }
+
+    /// Worker half: publish the outcome, or clean up on the caller's behalf when
+    /// the caller already returned at the deadline.
+    fn publishConnectOutcome(
+        allocator: std.mem.Allocator,
+        cell: *ConnectCell,
+        stream: ?std_compat.net.Stream,
+        err: ?anyerror,
+    ) void {
+        cell.mutex.lock();
+        const abandoned = cell.abandoned;
+        if (!abandoned) {
+            cell.stream = stream;
+            cell.err = err;
+            cell.finished = true;
+        }
+        cell.mutex.unlock();
+
+        if (abandoned) {
+            // The caller gave up: this stream and this cell are ours to release.
+            if (stream) |owned| owned.close();
+            destroyConnectCell(allocator, cell);
+        }
+    }
+
+    fn resolveAndConnectWorker(allocator: std.mem.Allocator, port: u16, cell: *ConnectCell) void {
+        if (resolveAndConnect(allocator, cell.host, port)) |stream| {
+            publishConnectOutcome(allocator, cell, stream, null);
+        } else |err| {
+            publishConnectOutcome(allocator, cell, null, err);
+        }
+    }
+
+    /// Caller half: wait for the worker until `timeout_ms` elapses.
+    fn awaitConnectOutcome(cell: *ConnectCell, allocator: std.mem.Allocator, timeout_ms: i64) !std_compat.net.Stream {
+        const deadline = std_compat.time.milliTimestamp() + timeout_ms;
+        while (true) {
+            cell.mutex.lock();
+            if (cell.finished) {
+                const stream = cell.stream;
+                const err = cell.err;
+                cell.mutex.unlock();
+                destroyConnectCell(allocator, cell);
+                if (stream) |owned| return owned;
+                return err orelse error.ConnectFailed;
+            }
+            if (std_compat.time.milliTimestamp() >= deadline) {
+                cell.abandoned = true;
+                cell.mutex.unlock();
+                return error.ConnectTimeout;
+            }
+            cell.mutex.unlock();
+            std_compat.thread.sleep(CONNECT_POLL_NS);
+        }
+    }
+
+    /// DNS + TCP establishment bounded by `timeout_ms`.
+    ///
+    /// The resolve/connect pair runs on a worker so the caller is never held
+    /// past the deadline; a stream the worker produces afterwards is closed by
+    /// the worker itself.
+    fn connectBounded(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        timeout_ms: i64,
+    ) !std_compat.net.Stream {
+        const owned_host = try allocator.dupe(u8, host);
+        const cell = allocator.create(ConnectCell) catch |err| {
+            allocator.free(owned_host);
+            return err;
+        };
+        cell.* = .{ .host = owned_host };
+
+        const thread = std.Thread.spawn(
+            .{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE },
+            resolveAndConnectWorker,
+            .{ allocator, port, cell },
+        ) catch {
+            // No worker available: fall back to the unbounded path rather than
+            // failing an otherwise valid connection outright.
+            destroyConnectCell(allocator, cell);
+            return resolveAndConnect(allocator, host, port);
+        };
+        // A worker outliving the deadline releases the cell itself.
+        thread.detach();
+
+        return awaitConnectOutcome(cell, allocator, timeout_ms);
     }
 
     fn performHandshake(
@@ -1291,6 +1418,57 @@ test "ws connect returns ConnectFailed when all resolved addresses fail" {
 
     try std.testing.expectError(error.ConnectFailed, WsClient.connectToResolvedAddresses(fakeConnectAlwaysFails, &addresses));
     try std.testing.expectEqual(@as(usize, 2), test_connect_attempts_len);
+}
+
+test "bounded connect hands the worker's stream to the caller" {
+    const allocator = std.testing.allocator;
+    const cell = try allocator.create(WsClient.ConnectCell);
+    cell.* = .{ .host = try allocator.dupe(u8, "example.test") };
+
+    WsClient.publishConnectOutcome(allocator, cell, .{ .handle = fakeTestStreamHandle() }, null);
+    const stream = try WsClient.awaitConnectOutcome(cell, allocator, 5_000);
+    try std.testing.expectEqual(fakeTestStreamHandle(), stream.handle);
+    // awaitConnectOutcome released the cell; std.testing.allocator verifies it.
+}
+
+test "bounded connect propagates a worker failure" {
+    const allocator = std.testing.allocator;
+    const cell = try allocator.create(WsClient.ConnectCell);
+    cell.* = .{ .host = try allocator.dupe(u8, "example.test") };
+
+    WsClient.publishConnectOutcome(allocator, cell, null, error.ConnectFailed);
+    try std.testing.expectError(error.ConnectFailed, WsClient.awaitConnectOutcome(cell, allocator, 5_000));
+}
+
+test "bounded connect abandons at the deadline and the worker releases a late result" {
+    // std.posix.read (the close probe below) is unsupported on Windows.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const cell = try allocator.create(WsClient.ConnectCell);
+    cell.* = .{ .host = try allocator.dupe(u8, "example.test") };
+
+    try std.testing.expectError(error.ConnectTimeout, WsClient.awaitConnectOutcome(cell, allocator, 0));
+
+    cell.mutex.lock();
+    const abandoned = cell.abandoned;
+    cell.mutex.unlock();
+    try std.testing.expect(abandoned);
+
+    // A stream produced after the caller gave up must be closed by the worker
+    // half, which then releases the cell too. Queue a byte first so a leaked fd
+    // fails the assertion instead of blocking on the read.
+    const sockets = try createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[1]);
+    const peer = std_compat.net.Stream{ .handle = sockets[1] };
+    try peer.writeAll("x");
+
+    WsClient.publishConnectOutcome(allocator, cell, .{ .handle = sockets[0] }, null);
+
+    var probe: [1]u8 = undefined;
+    // The worker must have closed sockets[0], so this read cannot return the
+    // byte queued above. std.posix.read maps EBADF to error.Unexpected
+    // ("use after free"), hence the expected error rather than BadFileDescriptor.
+    try std.testing.expectError(error.Unexpected, std.posix.read(sockets[0], &probe));
 }
 
 test "ws CA bundle loading matches target ABI policy" {
