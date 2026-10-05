@@ -106,6 +106,22 @@ pub fn renamePath(old_path: []const u8, new_path: []const u8) !void {
     return try std_compat.fs.cwd().rename(old_path, new_path);
 }
 
+/// fsync a directory so that a rename published into it survives a crash.
+///
+/// A rename changes a *directory entry*, not file contents: syncing the renamed
+/// file alone does not make its new name durable. Best effort — platforms
+/// without directory fsync (Windows) return an error the caller treats as
+/// "durability unavailable" rather than failing the operation.
+pub fn syncDirPath(path: []const u8) !void {
+    // Directory fsync is a POSIX concept. Windows has no equivalent, and opening
+    // a directory as a file handle there is not a supported read/flush target, so
+    // skip rather than perform an unsupported syscall.
+    if (builtin.os.tag == .windows) return;
+    const dir_file = try openPath(path, .{ .mode = .read_only, .allow_directory = true });
+    defer dir_file.close();
+    try dir_file.sync();
+}
+
 pub fn deletePath(path: []const u8) !void {
     if (std.fs.path.isAbsolute(path)) {
         return try std_compat.fs.deleteFileAbsolute(path);

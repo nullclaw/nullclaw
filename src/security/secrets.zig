@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
@@ -152,6 +153,11 @@ pub const SecretStore = struct {
                 error.FileNotFound => return,
                 else => return error.KeyRotateFailed,
             };
+            // The archive entry is what makes the previous key recoverable, so
+            // publish that directory entry durably. Best effort: platforms
+            // without directory fsync report an error we only log.
+            const key_dir = std_compat.fs.path.dirname(prev_path) orelse ".";
+            fs_compat.syncDirPath(key_dir) catch |err| log.debug("archive directory sync unavailable: {}", .{err});
             return;
         }
     }
@@ -165,6 +171,8 @@ pub const SecretStore = struct {
         var prev_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
         const prev_path = self.prevKeyPath(&prev_buf) catch return error.KeyRotateFailed;
         fs_compat.renamePath(path, prev_path) catch return error.KeyRotateFailed;
+        const key_dir = std_compat.fs.path.dirname(path) orelse ".";
+        fs_compat.syncDirPath(key_dir) catch |err| log.debug("key rotation directory sync unavailable: {}", .{err});
 
         var new_key: [KEY_LEN]u8 = undefined;
         std_compat.crypto.random.bytes(&new_key);
@@ -259,6 +267,23 @@ pub const SecretStore = struct {
         return try allocator.dupe(u8, decrypted);
     }
 
+    /// Open an archived key entry without following symlinks.
+    ///
+    /// The directory iteration already rejects symlink entries, but the check and
+    /// the open are separate steps: anything able to write into the archive
+    /// directory can substitute a symlink in between, and an ordinary open would
+    /// then read key material from outside it. Opening with `follow_symlinks`
+    /// disabled makes the check bind the open atomically.
+    fn openArchiveEntry(dir: std_compat.fs.Dir, name: []const u8) !std_compat.fs.File {
+        // Windows expresses O_NOFOLLOW as FILE_FLAG_OPEN_REPARSE_POINT, and a
+        // handle opened that way does not read back through this path (it fails
+        // the hex read in readKeyFromFile). Symlink entries are still rejected by
+        // the directory iteration there, and planting one needs privileges, so
+        // keep the default open on Windows and take the atomic guarantee on POSIX.
+        if (builtin.os.tag == .windows) return dir.openFile(name, .{});
+        return dir.openFile(name, .{ .follow_symlinks = false });
+    }
+
     fn decryptWithArchivedKeys(
         self: *const SecretStore,
         nonce: [NONCE_LEN]u8,
@@ -280,7 +305,7 @@ pub const SecretStore = struct {
             if (entry.kind != .file) continue;
             if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
 
-            const file = dir.openFile(entry.name, .{}) catch continue;
+            const file = openArchiveEntry(dir, entry.name) catch continue;
             defer file.close();
 
             const archived_key = self.readKeyFromFile(file) catch continue;
@@ -1021,4 +1046,78 @@ test "ChaCha20Poly1305.decrypt tag failure returns DecryptionFailed not segfault
     tampered3[0] ^= 0xFF;
     var pt_buf3: [64]u8 = undefined;
     try std.testing.expectError(error.DecryptionFailed, decrypt(key, nonce, tampered3[0..ct.len], &pt_buf3));
+}
+
+test "archived key entries open without following symlinks" {
+    // Windows symlink creation requires privileges.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    // Readable stand-in for key material living outside the archive directory.
+    const victim = try std_compat.fs.Dir.wrap(tmp_dir.dir).createFile("victim", .{});
+    defer victim.close();
+    try victim.writeAll("victim-key-material");
+
+    // Plant the archive name itself as a symlink to it. The iteration check that
+    // rejects symlink entries and the open are separate steps, so this is exactly
+    // what the open has to refuse on its own.
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).symLink("victim", ".secret_key.prev.1", .{});
+
+    // Control: a plain open does read through the link, so the target is valid
+    // and a passing refusal below is meaningful rather than vacuous.
+    var plain_dir = try fs_compat.openDirPath(tmp_path, .{});
+    defer plain_dir.close();
+    const control = try plain_dir.openFile(".secret_key.prev.1", .{});
+    control.close();
+
+    // The archive open must not.
+    var archive_dir = try fs_compat.openDirPath(tmp_path, .{});
+    defer archive_dir.close();
+    if (SecretStore.openArchiveEntry(archive_dir, ".secret_key.prev.1")) |file| {
+        file.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "key rotation publishes an archive entry and its directory syncs" {
+    // Directory fsync is a POSIX concept; skip where it is unsupported.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const encrypted = try store.encryptSecret(allocator, "rotation-secret");
+    defer allocator.free(encrypted);
+
+    // First rotation retires the key to `.prev`; the second publishes the
+    // archived, timestamped entry whose directory rename must be durable.
+    try store.rotateKey(allocator);
+    try store.rotateKey(allocator);
+
+    var dir = try fs_compat.openDirPath(tmp_path, .{ .iterate = true });
+    defer dir.close();
+    var iter = dir.iterate();
+    var saw_archive_entry = false;
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, entry.name, ".secret_key.prev.") != null) saw_archive_entry = true;
+    }
+    try std.testing.expect(saw_archive_entry);
+
+    // The published entry's directory syncs cleanly.
+    try fs_compat.syncDirPath(tmp_path);
+
+    // Rotation must not cost us the ability to decrypt older ciphertext.
+    const decrypted = try store.decryptSecret(allocator, encrypted);
+    defer allocator.free(decrypted);
+    try std.testing.expectEqualStrings("rotation-secret", decrypted);
 }
