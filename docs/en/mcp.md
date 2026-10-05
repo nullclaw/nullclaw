@@ -1,0 +1,119 @@
+# MCP (Model Context Protocol)
+
+NullClaw supports the [Model Context Protocol](https://modelcontextprotocol.io/) to extend agent capabilities with external tools and services.
+
+## Transports
+
+- **stdio**: Launch MCP servers as child processes. Best for local tools and npm packages.
+- **http**: Connect to remote MCP servers over HTTPS (or localhost HTTP). Supports custom headers and timeouts.
+
+## Configuration
+
+Add MCP servers to `~/.nullclaw/config.json` under `mcp_servers`:
+
+```json
+{
+  "mcp_servers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://mcp.example.com/rpc",
+      "timeout_ms": 10000,
+      "headers": {
+        "Authorization": "Bearer token-here"
+      }
+    }
+  }
+}
+```
+
+### Config Fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `transport` | string | `stdio` | `stdio` or `http` |
+| `command` | string | — | Executable for stdio transport |
+| `args` | array | `[]` | Command arguments |
+| `env` | object | `{}` | Environment overrides: string → string map (`{"KEY": "value"}`) |
+| `url` | string | — | HTTP endpoint URL (required for http transport) |
+| `timeout_ms` | number | `10000` | Per-request timeout in milliseconds |
+| `headers` | object | `{}` | Custom HTTP headers: string → string map |
+
+## How It Works
+
+On startup, nullclaw:
+
+1. Connects to each configured MCP server (stdio: spawns process; http: connects to endpoint)
+2. Performs the MCP `initialize` handshake
+3. Discovers available tools via `tools/list`
+4. Wraps each tool with prefix `mcp_<server>_<tool>` (e.g., `mcp_filesystem_read_file`)
+5. Exposes them to the agent alongside built-in tools
+
+Tool discovery happens once at startup — there is no hot-reload. Restart nullclaw to pick up new MCP tools.
+
+## Security
+
+- **HTTP URLs**: Must be HTTPS for remote hosts. Plain HTTP is allowed only for localhost and private IPs (127.0.0.1, 10.x, 192.168.x, 172.16-31.x, ::1, fd00::/8, Tailscale 100.64-127.x).
+- **Headers**: Validated to prevent injection — no CR/LF allowed in values.
+- **Timeouts**: Enforced per-request (default 10s). Adjust `timeout_ms` for slow tools.
+- **Failures**: Individual server connection errors are logged and skipped. The agent continues with remaining tools.
+
+## Tool Filtering
+
+Use `agent.tool_filter_groups` to control which MCP tools are included per turn:
+
+```json
+{
+  "agent": {
+    "tool_filter_groups": [
+      {
+        "mode": "always",
+        "tools": ["mcp_filesystem_*"]
+      },
+      {
+        "mode": "dynamic",
+        "tools": ["mcp_jira_*"],
+        "keywords": ["ticket", "jira", "issue"]
+      }
+    ]
+  }
+}
+```
+
+- `always`: Tools matching the pattern are always included.
+- `dynamic`: Tools are included when the user message contains one of the group's
+  keywords (case-insensitive ASCII substring match).
+
+When no `tool_filter_groups` are configured, every tool is included.
+
+### The two tool-exposure paths differ
+
+This is the part most likely to surprise you: `always` and `dynamic` do **not**
+behave identically, because they are applied at two different stages.
+
+| | Native tool schemas | Text prompt |
+|---|---|---|
+| Non-MCP (built-in) tools | always | always |
+| `always` group matches | always | always |
+| `dynamic` group matches | when a keyword is present | **never** |
+
+- On the **native tool-schema** path, `dynamic` groups are keyword-matched
+  against the current user message (`filterToolSpecsForTurn`), so a matching
+  tool appears in the provider's tool list for that turn.
+- On the **text-prompt** path, the filter (`filterToolsForPromptText`)
+  deliberately admits only built-ins and `always`-group tools. `dynamic` tools
+  are never written into the prompt text, regardless of keywords.
+
+Practical consequence: if your provider does not support native tool schemas,
+`dynamic` groups silently do nothing. Verify with a backend that supports them
+before relying on `dynamic` to keep a large MCP surface out of the context.
+
+## Related
+
+- [Configuration](./configuration.md) — Full config reference
+- [Architecture](./architecture.md) — Subsystem overview
+- [Security](./security.md) — Security model

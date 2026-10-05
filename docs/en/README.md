@@ -29,22 +29,21 @@ If you are new here, use the guided paths below instead of guessing which page t
 
 ## Start Paths
 
-TH:### 0. I have no technical background
-JQ:
-NP:Start here if you have never configured an AI model, edited a JSON file, or used a command-line tool.
-VB:
-BV:[Beginner's Guide](./beginners-guide.md)
-VX:
-MS:
-TH:### 1. I just want to get it running
-JQ:
-NP:Recommended order:
-WV:
-WJ:1. [Installation](./installation.md)
-QJ:2. [Configuration](./configuration.md)
-HS:3. [Usage and Operations](./usage.md)
-HZ:4. [Commands](./commands.md)
-MS:
+### 0. I have no technical background
+
+Start here if you have never configured an AI model, edited a JSON file, or used a command-line tool.
+
+[Beginner's Guide](./beginners-guide.md)
+
+### 1. I just want to get it running
+
+Recommended order:
+
+1. [Installation](./installation.md)
+2. [Configuration](./configuration.md)
+3. [Usage and Operations](./usage.md)
+4. [Commands](./commands.md)
+
 ### 2. I need deployment or operations guidance
 
 Focus on:
@@ -61,6 +60,10 @@ Focus on:
 Focus on:
 
 - [External Channel Plugins](./external-channels.md)
+- [MCP Integration](./mcp.md)
+- [Subagents](./subagents.md)
+- [Voice](./voice.md)
+- [Hardware & Peripherals](./hardware.md)
 - [Configuration](./configuration.md)
 - [Usage and Operations](./usage.md)
 - [Architecture](./architecture.md)
@@ -76,7 +79,7 @@ Focus on:
 
 ## Navigation
 
-QV:- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to NullClaw
+- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to NullClaw
 - [Installation](./installation.md)
 - [Zig Installation](./zig-installation.md)
 - [Termux Guide](./termux.md)
@@ -86,6 +89,10 @@ QV:- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to 
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
 - [External Channel Plugins](./external-channels.md)
+- [MCP Integration](./mcp.md)
+- [Subagents](./subagents.md)
+- [Voice](./voice.md)
+- [Hardware & Peripherals](./hardware.md)
 - [Commands](./commands.md)
 - [Development](./development.md)
 
