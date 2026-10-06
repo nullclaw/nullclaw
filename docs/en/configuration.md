@@ -999,7 +999,7 @@ Loop and context hygiene settings for long tool-heavy runs (especially local mod
     "parallel_tools": true,
     "local_loop": {
       "enabled": false,
-      "max_result_chars": 8192,
+      "max_result_chars": 0,
       "max_result_tail_lines": 12,
       "identical_call_warn": 3,
       "identical_call_veto": 5,
@@ -1012,7 +1012,7 @@ Loop and context hygiene settings for long tool-heavy runs (especially local mod
 
 Notes:
 
-- `local_loop.enabled = true` tightens the default tool-result history cap to 400 characters (unless `max_result_chars` is set explicitly).
+- `max_result_chars: 0` means **unset**. With `local_loop.enabled = true` an unset value applies the 400-character tightening cap; any other value is used as-is, so an explicit `8192` stays `8192`.
 - Identical tool calls within one turn fingerprint `name + arguments_json`. Warn/veto/force-reply thresholds apply per turn.
 - Defaults preserve existing behavior when `local_loop` is omitted.
 

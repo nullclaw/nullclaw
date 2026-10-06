@@ -1804,31 +1804,39 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     if (ll.get("max_result_chars")) |v| {
                         if (v == .integer and v.integer > 0) {
+                            // Bounded before the cast: a positive value wider than
+                            // u32 used to reach @intCast unchecked and trap.
+                            if (v.integer > std.math.maxInt(u32)) return error.InvalidLocalLoopConfig;
                             self.agent.local_loop.max_result_chars = @intCast(v.integer);
                         }
                     }
                     if (ll.get("max_result_tail_lines")) |v| {
                         if (v == .integer and v.integer > 0) {
+                            if (v.integer > std.math.maxInt(u32)) return error.InvalidLocalLoopConfig;
                             self.agent.local_loop.max_result_tail_lines = @intCast(v.integer);
                         }
                     }
                     if (ll.get("identical_call_warn")) |v| {
                         if (v == .integer and v.integer > 0) {
+                            if (v.integer > std.math.maxInt(u32)) return error.InvalidLocalLoopConfig;
                             self.agent.local_loop.identical_call_warn = @intCast(v.integer);
                         }
                     }
                     if (ll.get("identical_call_veto")) |v| {
                         if (v == .integer and v.integer > 0) {
+                            if (v.integer > std.math.maxInt(u32)) return error.InvalidLocalLoopConfig;
                             self.agent.local_loop.identical_call_veto = @intCast(v.integer);
                         }
                     }
                     if (ll.get("identical_call_force_reply")) |v| {
                         if (v == .integer and v.integer > 0) {
+                            if (v.integer > std.math.maxInt(u32)) return error.InvalidLocalLoopConfig;
                             self.agent.local_loop.identical_call_force_reply = @intCast(v.integer);
                         }
                     }
                     if (ll.get("max_parallel_readonly")) |v| {
                         if (v == .integer and v.integer > 0) {
+                            if (v.integer > std.math.maxInt(u32)) return error.InvalidLocalLoopConfig;
                             self.agent.local_loop.max_parallel_readonly = @intCast(v.integer);
                         }
                     }

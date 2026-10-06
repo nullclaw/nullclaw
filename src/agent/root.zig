@@ -3054,8 +3054,20 @@ pub const Agent = struct {
 
     fn toolResultCompressOptions(self: *const Agent, is_error: bool) result_compress.CompressOptions {
         const ll = self.local_loop;
-        const max_chars = if (ll.enabled and ll.max_result_chars == result_compress.DEFAULT_MAX_RESULT_CHARS)
-            result_compress.LOCAL_LOOP_MAX_RESULT_CHARS
+        // `max_result_chars` uses 0 as its "unset" sentinel, so an explicit
+        // value is always honoured -- including 8192, which used to collide
+        // with the default and be silently replaced by the tightening cap.
+        //
+        // The sentinel is resolved per mode so it is safe on its own: the
+        // tightening cap applies only when the feature is on, and otherwise the
+        // general default does. Resolving it here rather than in the struct
+        // default keeps this correct whether or not history compression is
+        // itself gated on `enabled`.
+        const max_chars = if (ll.max_result_chars == 0)
+            (if (ll.enabled)
+                result_compress.LOCAL_LOOP_MAX_RESULT_CHARS
+            else
+                result_compress.DEFAULT_MAX_RESULT_CHARS)
         else
             ll.max_result_chars;
         return .{
@@ -13725,4 +13737,33 @@ test "compressToolResultForHistory compresses only when local_loop is enabled" {
         .success = true,
     });
     try std.testing.expect(out.output.len < raw.len);
+}
+
+test "explicit max_result_chars is honoured, not replaced by the local-loop cap" {
+    // Regression (review on #987): the field defaulted to 8192, the same value
+    // the docs use in their example, so setting it explicitly to 8192 was
+    // indistinguishable from leaving it unset and was silently replaced by the
+    // 400-character tightening cap, contradicting the documented behaviour.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.local_loop.enabled = true;
+    cfg.agent.local_loop.max_result_chars = 8192;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    // Explicit 8192 wins over the 400 tightening cap.
+    try std.testing.expectEqual(@as(u32, 8192), agent.toolResultCompressOptions(false).max_chars);
+
+    // Unset (0) resolves to the tightening cap when enabled.
+    cfg.agent.local_loop.max_result_chars = 0;
+    var agent2 = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent2.deinit();
+    try std.testing.expectEqual(@as(u32, 400), agent2.toolResultCompressOptions(false).max_chars);
 }

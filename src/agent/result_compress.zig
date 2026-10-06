@@ -61,6 +61,12 @@ pub fn compressToolOutput(allocator: std.mem.Allocator, raw: []const u8, opts: C
         return try std.fmt.allocPrint(allocator, "{s}{s}", .{ clipped, suffix });
     }
     const body_len = opts.max_chars -| suffix.len;
+    if (body_len == 0) {
+        // The budget cannot hold even the truncation marker. Honour the cap
+        // literally instead of emitting a marker that exceeds it: a
+        // `max_chars` of 1 used to return the whole 16-byte marker.
+        return try allocator.dupe(u8, util.truncateUtf8(joined, opts.max_chars));
+    }
     const body = util.truncateUtf8(clipped, body_len);
     return try std.fmt.allocPrint(allocator, "{s}{s}", .{ body, suffix });
 }
@@ -92,9 +98,11 @@ fn extractErrorSignature(text: []const u8) ?[]const u8 {
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        const lower_buf = stackLowerAscii(trimmed);
         for (ERROR_MARKERS) |marker| {
-            if (std.mem.indexOf(u8, lower_buf, marker) != null) {
+            // Case-insensitive scan with no intermediate buffer. The previous
+            // helper lowercased into a stack array and returned a slice of it,
+            // so this loop searched a dead stack frame.
+            if (containsAsciiIgnoreCase(trimmed, marker)) {
                 const cap = @min(trimmed.len, 180);
                 return trimmed[0..cap];
             }
@@ -103,13 +111,16 @@ fn extractErrorSignature(text: []const u8) ?[]const u8 {
     return null;
 }
 
-fn stackLowerAscii(input: []const u8) []const u8 {
-    const cap = @min(input.len, 256);
-    var buf: [256]u8 = undefined;
-    for (input[0..cap], 0..) |c, i| {
-        buf[i] = std.ascii.toLower(c);
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+        } else return true;
     }
-    return buf[0..cap];
+    return false;
 }
 
 test "compressToolOutput empty input returns empty string" {
@@ -205,4 +216,35 @@ test "compressToolOutput hard caps at max_chars with truncated marker" {
     try std.testing.expect(out.len <= 400);
     try std.testing.expect(std.mem.indexOf(u8, out, "… [truncated]") != null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "compressToolOutput never exceeds a budget smaller than the truncation marker" {
+    // Regression (review on #987): the marker is longer than a tiny budget, and
+    // the old code emitted it anyway -- max_chars = 1 returned the whole
+    // 16-byte "\n… [truncated]". The cap is now literal at that size.
+    const raw = "x" ** 5_000;
+    var budget: u32 = 0;
+    while (budget <= 16) : (budget += 1) {
+        const out = try compressToolOutput(std.testing.allocator, raw, .{
+            .max_chars = budget,
+            .max_tail_lines = 12,
+        });
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(out.len <= budget);
+    }
+}
+
+test "error signature detection is case-insensitive without a stack buffer" {
+    // The helper this replaced lowercased into a stack array and returned a
+    // slice of it, so the search ran over a dead frame. Results must be
+    // unchanged now that the scan is done in place.
+    const mixed = "  TrAcEbAcK (most recent call last):";
+    const sig = extractErrorSignature(mixed).?;
+    try std.testing.expectEqualStrings(std.mem.trim(u8, mixed, " \t\r"), sig);
+
+    const upper = "ASSERTIONERROR: boom";
+    try std.testing.expect(extractErrorSignature(upper) != null);
+
+    // A line with no marker yields nothing.
+    try std.testing.expect(extractErrorSignature("just a normal log line") == null);
 }
