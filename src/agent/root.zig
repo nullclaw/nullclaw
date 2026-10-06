@@ -637,11 +637,18 @@ pub const Agent = struct {
             .queue_mode = cfg.agent.default_queue_mode,
             .parallel_tools = cfg.agent.parallel_tools,
             .local_loop = cfg.agent.local_loop,
-            .turn_loop_guard = loop_guard.LoopGuard.init(.{
-                .warn_at = cfg.agent.local_loop.identical_call_warn,
-                .veto_at = cfg.agent.local_loop.identical_call_veto,
-                .force_reply_after_vetoes = cfg.agent.local_loop.identical_call_force_reply,
-            }),
+            // The loop guard belongs to the local_loop feature. Arm it only
+            // when that feature is on: with the defaults it would otherwise
+            // warn at 3 identical calls and veto at 5 for every user who never
+            // enabled it, changing normal behaviour silently.
+            .turn_loop_guard = if (cfg.agent.local_loop.enabled)
+                loop_guard.LoopGuard.init(.{
+                    .warn_at = cfg.agent.local_loop.identical_call_warn,
+                    .veto_at = cfg.agent.local_loop.identical_call_veto,
+                    .force_reply_after_vetoes = cfg.agent.local_loop.identical_call_force_reply,
+                })
+            else
+                loop_guard.LoopGuard.disabled(),
             .tools_config = cfg.tools,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .default_exec_security = resolved_exec_security,
@@ -3063,6 +3070,14 @@ pub const Agent = struct {
         arena: std.mem.Allocator,
         raw: ToolExecutionResult,
     ) !ToolExecutionResult {
+        // History compression is the `local_loop` feature. When it is off, tool
+        // results must reach history verbatim. Previously `enabled` only chose
+        // between two caps, so compression ran for everyone: with stock
+        // defaults a short `file_read` was reduced to its last 12 non-empty
+        // lines with indentation and blank lines stripped, contradicting the
+        // documented promise that omitted/disabled local_loop leaves normal
+        // tool output alone.
+        if (!self.local_loop.enabled) return raw;
         const compress_opts = self.toolResultCompressOptions(!raw.success);
         const compressed = result_compress.compressToolOutput(arena, raw.output, compress_opts) catch raw.output;
         return .{
@@ -13450,4 +13465,63 @@ test "Agent: redactor scrubs PII in system prompt" {
     // System prompt content must reach provider with email redacted.
     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+}
+
+test "compressToolResultForHistory is identity when local_loop is disabled" {
+    // Regression (review on #987): the gate only chose between two caps, so
+    // compression ran for every user regardless of `enabled`. With the shipped
+    // defaults a short file_read was reduced to its last 12 non-empty lines
+    // with indentation and blank lines stripped.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.local_loop.enabled = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    const raw = "fn main() void {\n    const x = 1;\n\n    return;\n}\n";
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const out = try agent.compressToolResultForHistory(arena.allocator(), .{
+        .name = "file_read",
+        .output = raw,
+        .success = true,
+    });
+    // Verbatim: same pointer, in fact -- no copy, no trimming.
+    try std.testing.expectEqualStrings(raw, out.output);
+    try std.testing.expect(std.mem.indexOf(u8, out.output, "    const x = 1;") != null);
+}
+
+test "compressToolResultForHistory compresses only when local_loop is enabled" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.local_loop.enabled = true;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    // Comfortably over the enabled cap (400), so the lossy path is exercised.
+    const raw = "x" ** 2_000;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const out = try agent.compressToolResultForHistory(arena.allocator(), .{
+        .name = "shell",
+        .output = raw,
+        .success = true,
+    });
+    try std.testing.expect(out.output.len < raw.len);
 }
