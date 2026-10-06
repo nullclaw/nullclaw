@@ -3269,13 +3269,24 @@ pub const Agent = struct {
     const ParallelReadOnlyWorker = struct {
         agent: *Agent,
         exec_mutex: *std_compat.sync.Mutex,
-        parent_arena: std.mem.Allocator,
         call: ParsedToolCall,
+        /// Arena owned by this worker, holding `result.output`.
+        ///
+        /// Workers must never allocate from shared state: `ArenaAllocator` is
+        /// not thread-safe, and having every worker `dupe` into the turn arena
+        /// concurrently raced on its free list. Each worker gets its own arena
+        /// instead, and the collector moves the result into the turn arena on
+        /// the joining thread.
+        ///
+        /// Initialised as the first statement of `run` so the collector can
+        /// deinit it on every path, including an early return.
+        result_arena: std.heap.ArenaAllocator = undefined,
         result: ToolExecutionResult = undefined,
         duration_ms: u64 = 0,
         err: ?anyerror = null,
 
         fn run(ctx: *ParallelReadOnlyWorker) void {
+            ctx.result_arena = std.heap.ArenaAllocator.init(ctx.agent.allocator);
             var thread_arena = std.heap.ArenaAllocator.init(ctx.agent.allocator);
             defer thread_arena.deinit();
             const tool_timer = std_compat.time.milliTimestamp();
@@ -3283,13 +3294,16 @@ pub const Agent = struct {
             const blocked = ctx.agent.checkToolPolicyGate(ctx.call);
             ctx.exec_mutex.unlock();
             if (blocked) |policy_result| {
+                // The gate returns static string literals; nothing to own.
                 ctx.result = policy_result;
                 ctx.duration_ms = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
                 return;
             }
             const raw = ctx.agent.executeToolBody(thread_arena.allocator(), ctx.call);
             ctx.duration_ms = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
-            const output_copy = ctx.parent_arena.dupe(u8, raw.output) catch {
+            // Copy out of `thread_arena`, which dies with this function, into
+            // this worker's own arena -- never the shared turn arena.
+            const output_copy = ctx.result_arena.allocator().dupe(u8, raw.output) catch {
                 ctx.err = error.OutOfMemory;
                 return;
             };
@@ -3392,24 +3406,86 @@ pub const Agent = struct {
                 } else {
                     var workers = try arena.alloc(ParallelReadOnlyWorker, chunk_len);
                     var threads = try arena.alloc(std.Thread, chunk_len);
+
+                    // `std.Thread.spawn` is fallible. A failure part-way through
+                    // the loop leaves the earlier threads running while the
+                    // function unwinds, and unwinding frees `arena` -- which
+                    // holds their contexts. Count what actually started and
+                    // join those before propagating.
+                    //
+                    // NOTE: no unit test covers this branch. Reaching it needs
+                    // `std.Thread.spawn` to fail mid-loop, and there is no seam
+                    // to inject that failure -- the spawn is direct. The join
+                    // loop below, which handles the other unwind path, is
+                    // reachable only on worker OOM for the same reason. Both are
+                    // covered by inspection; the happy path and the ownership
+                    // move are covered by the parallel_tools tests, which run
+                    // under the leak-detecting test allocator.
+                    var started: usize = 0;
+                    var all_joined = false;
+                    errdefer {
+                        if (!all_joined) {
+                            for (0..started) |i| {
+                                threads[i].join();
+                                workers[i].result_arena.deinit();
+                            }
+                        }
+                    }
+
                     for (0..chunk_len) |offset| {
                         const slot_idx = pending_indices.items[cursor + offset];
                         workers[offset] = .{
                             .agent = self,
                             .exec_mutex = &exec_mutex,
-                            .parent_arena = arena,
                             .call = slots[slot_idx].call,
                         };
-                        threads[offset] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, ParallelReadOnlyWorker.run, .{&workers[offset]});
+                        // These workers execute real allowlisted tools, which can
+                        // reach HTTPS -- `memory_recall` runs native embedding
+                        // requests and initialises TLS on the worker. The
+                        // coordination budget is sized for short-lived helpers
+                        // and aborts during TLS init; #1002 fixed the same class
+                        // of failure for typing workers by moving to the heavy
+                        // budget, and the deepest permitted tool path needs it
+                        // here for the same reason.
+                        threads[offset] = try std.Thread.spawn(
+                            .{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE },
+                            ParallelReadOnlyWorker.run,
+                            .{&workers[offset]},
+                        );
+                        started += 1;
                     }
+
+                    // Join every started thread before touching any result, so
+                    // no early return can leave a worker running. The previous
+                    // form returned on the first worker error while the
+                    // remaining threads were still live.
+                    for (0..chunk_len) |offset| threads[offset].join();
+                    all_joined = true;
+
+                    var first_err: ?anyerror = null;
                     for (0..chunk_len) |offset| {
-                        threads[offset].join();
-                        if (workers[offset].err) |err| return err;
+                        // The worker's arena is consumed on this thread only,
+                        // after the join above.
+                        defer workers[offset].result_arena.deinit();
+                        if (workers[offset].err) |err| {
+                            if (first_err == null) first_err = err;
+                            continue;
+                        }
                         const slot_idx = pending_indices.items[cursor + offset];
-                        rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, workers[offset].call, workers[offset].result);
-                        slots[slot_idx].raw_result = workers[offset].result;
+                        // Move the result into the turn arena here, on the
+                        // joining thread. This is the only place the turn arena
+                        // is written for parallel work.
+                        const moved = arena.dupe(u8, workers[offset].result.output) catch |err| {
+                            if (first_err == null) first_err = err;
+                            continue;
+                        };
+                        var result = workers[offset].result;
+                        result.output = moved;
+                        rememberToolCallResultInTurn(self.allocator, seen_tool_call_results, workers[offset].call, result);
+                        slots[slot_idx].raw_result = result;
                         slots[slot_idx].duration_ms = workers[offset].duration_ms;
                     }
+                    if (first_err) |err| return err;
                 }
                 cursor = chunk_end;
             }
@@ -13450,4 +13526,130 @@ test "Agent: redactor scrubs PII in system prompt" {
     // System prompt content must reach provider with email redacted.
     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+}
+
+test "parallel_tools survives repeated batches without cross-worker corruption" {
+    // Canary for the worker-arena change (review on #987). Every worker used to
+    // `dupe` its result into the shared turn arena, which is not thread-safe:
+    // concurrent workers raced on the same free list. Workers now own their
+    // results and the collector moves them on the joining thread, so no shared
+    // state is written concurrently. Repeated batches give a re-introduced
+    // shared write a chance to show up.
+    const StressReadStub = struct {
+        const Self = @This();
+        exec_count: usize = 0,
+        pub const tool_name = "file_read";
+        pub const tool_description = "Stub file read";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, args: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.exec_count += 1;
+            const path_val = args.get("path") orelse return .{ .success = false, .output = try allocator.dupe(u8, "missing path") };
+            const path = switch (path_val) {
+                .string => |s| s,
+                else => return .{ .success = false, .output = try allocator.dupe(u8, "bad path") },
+            };
+            return .{
+                .success = true,
+                .output = try std.fmt.allocPrint(allocator, "contents of {s}", .{path}),
+            };
+        }
+    };
+
+    const AlwaysTwoReadsProvider = struct {
+        const Self = @This();
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-a"),
+                .name = try allocator.dupe(u8, "file_read"),
+                .arguments = try allocator.dupe(u8, "{\"path\":\"a.txt\"}"),
+            };
+            tool_calls[1] = .{
+                .id = try allocator.dupe(u8, "call-b"),
+                .name = try allocator.dupe(u8, "file_read"),
+                .arguments = try allocator.dupe(u8, "{\"path\":\"b.txt\"}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "read two files"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "always-two-reads-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = AlwaysTwoReadsProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = AlwaysTwoReadsProvider.chatWithSystem,
+        .chat = AlwaysTwoReadsProvider.chat,
+        .supportsNativeTools = AlwaysTwoReadsProvider.supportsNativeTools,
+        .getName = AlwaysTwoReadsProvider.getName,
+        .deinit = AlwaysTwoReadsProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var tool_impl = StressReadStub{};
+    var tool_list = [_]Tool{tool_impl.tool()};
+    // Agent.deinit frees tool_specs, so it must be heap-allocated.
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .parallel_tools = true,
+    };
+    defer agent.deinit();
+
+    const batches = 20;
+    var i: usize = 0;
+    while (i < batches) : (i += 1) {
+        const reply = try agent.turn("read files");
+        allocator.free(reply);
+    }
+
+    // Two read-only calls per batch, every batch, with no cross-worker damage
+    // and -- via the leak-detecting allocator -- no mis-owned result.
+    try std.testing.expectEqual(@as(usize, batches * 2), tool_impl.exec_count);
 }
