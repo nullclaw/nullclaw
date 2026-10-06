@@ -346,6 +346,8 @@ pub fn curlStream(
 
     argv_buf[argc] = "curl";
     argc += 1;
+    argv_buf[argc] = "-q";
+    argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
     argv_buf[argc] = "--no-buffer";
@@ -372,16 +374,8 @@ pub fn curlStream(
     argv_buf[argc] = "POST";
     argc += 1;
 
-    // Add proxy from environment if set
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    var curl_config = try http_util.prepareProtectedCurlConfigFromEnvironment(allocator, url);
+    defer curl_config.deinit();
 
     const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
     defer if (resolve_entry) |entry| allocator.free(entry);
@@ -416,7 +410,9 @@ pub fn curlStream(
     argc += 1;
     argv_buf[argc] = "@-";
     argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = "--config";
+    argc += 1;
+    argv_buf[argc] = curl_config.path();
     argc += 1;
 
     if (log_enabled) {
@@ -737,25 +733,21 @@ pub fn curlStreamAnthropic(
 
     argv_buf[argc] = "curl";
     argc += 1;
+    argv_buf[argc] = "-q";
+    argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
     argv_buf[argc] = "--no-buffer";
+    argc += 1;
+    argv_buf[argc] = curlFailFastArg(allocator);
     argc += 1;
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";
     argc += 1;
 
-    // Add proxy from environment if set
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    var curl_config = try http_util.prepareProtectedCurlConfigFromEnvironment(allocator, url);
+    defer curl_config.deinit();
 
     const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
     defer if (resolve_entry) |entry| allocator.free(entry);
@@ -784,7 +776,9 @@ pub fn curlStreamAnthropic(
     argc += 1;
     argv_buf[argc] = "@-";
     argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = "--config";
+    argc += 1;
+    argv_buf[argc] = curl_config.path();
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
@@ -897,8 +891,15 @@ pub fn curlStreamAnthropic(
         },
     }
 
+    try validateAnthropicStreamOutcome(accumulated.items.len, saw_done);
     callback(ctx, root.StreamChunk.finalChunk());
     return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+}
+
+fn validateAnthropicStreamOutcome(accumulated_len: usize, saw_done: bool) !void {
+    if (!root.shouldRecoverPartialStream(accumulated_len, saw_done)) {
+        return error.CurlFailed;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1157,6 +1158,14 @@ test "parseAnthropicSseLine data with unknown event returns skip" {
     const json = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}";
     const result = try parseAnthropicSseLine(std.testing.allocator, json, "message_start");
     try std.testing.expect(result == .skip);
+}
+
+test "Anthropic stream rejects response without SSE progress" {
+    // Regression: #767 JSON API errors and event:error have neither text
+    // deltas nor message_stop and must trigger the non-streaming fallback.
+    try std.testing.expectError(error.CurlFailed, validateAnthropicStreamOutcome(0, false));
+    try validateAnthropicStreamOutcome(0, true);
+    try validateAnthropicStreamOutcome(1, false);
 }
 
 test "extractAnthropicDelta correct JSON returns text" {

@@ -95,26 +95,8 @@ fn credentialFilePath(allocator: std.mem.Allocator) ![]u8 {
     return credentialFilePathFromConfigDir(allocator, config_dir);
 }
 
-fn writeCredentialsFileAtomic(allocator: std.mem.Allocator, file_path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{file_path});
-    defer allocator.free(tmp_path);
-
-    const tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{}) catch return error.CredentialWriteFailed;
-    tmp_file.writeAll(contents) catch {
-        tmp_file.close();
-        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
-        return error.CredentialWriteFailed;
-    };
-
-    if (@import("builtin").os.tag != .windows) {
-        tmp_file.chmod(0o600) catch {};
-    }
-    tmp_file.close();
-
-    std_compat.fs.renameAbsolute(tmp_path, file_path) catch {
-        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
-        return error.CredentialWriteFailed;
-    };
+fn writeCredentialsFileAtomic(file_path: []const u8, contents: []const u8) !void {
+    fs_compat.writeFileAtomicSecure(file_path, contents) catch return error.CredentialWriteFailed;
 }
 
 /// Save a credential for the given provider to auth.json in the config directory.
@@ -196,7 +178,7 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     }
     try buf.append(allocator, '}');
 
-    try writeCredentialsFileAtomic(allocator, file_path, buf.items);
+    try writeCredentialsFileAtomic(file_path, buf.items);
 }
 
 /// Load a credential for the given provider from auth.json in the config directory.
@@ -380,7 +362,7 @@ pub fn refreshAccessToken(
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    const result = try client.client.fetch(.{
+    const result = try client.fetch(.{
         .location = .{ .url = token_url },
         .method = .POST,
         .payload = payload,
@@ -466,7 +448,7 @@ pub fn deleteCredential(allocator: std.mem.Allocator, provider: []const u8) !boo
     }
     try buf.append(allocator, '}');
 
-    try writeCredentialsFileAtomic(allocator, file_path, buf.items);
+    try writeCredentialsFileAtomic(file_path, buf.items);
 
     return true;
 }
@@ -506,7 +488,7 @@ pub fn startDeviceCodeFlow(
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    const result = try client.client.fetch(.{
+    const result = try client.fetch(.{
         .location = .{ .url = device_auth_url },
         .method = .POST,
         .payload = payload,
@@ -599,7 +581,7 @@ pub fn pollDeviceCode(
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        const result = client.client.fetch(.{
+        const result = client.fetch(.{
             .location = .{ .url = token_url },
             .method = .POST,
             .payload = payload,

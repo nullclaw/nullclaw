@@ -93,6 +93,7 @@ pub const WebChannel = struct {
 
     // Relay state
     relay_client_mu: std_compat.sync.Mutex = .{},
+    relay_socket_mu: std_compat.sync.Mutex = .{},
     relay_client: ?*ws_client.WsClient = null,
     relay_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     relay_socket_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
@@ -1219,7 +1220,8 @@ pub const WebChannel = struct {
         }
 
         self.relay_connected.store(false, .release);
-        self.relay_socket_fd.store(invalid_socket, .release);
+        // Keep tracking the owned socket until stop: an outbound writer can still
+        // be blocked after the reader exits and needs shutdown(.both) to wake it.
         if (self.running.load(.acquire)) {
             self.running.store(false, .release);
             log.warn("Web relay disconnected", .{});
@@ -1271,20 +1273,11 @@ pub const WebChannel = struct {
         self.running.store(false, .release);
         self.relay_connected.store(false, .release);
 
-        self.relay_client_mu.lock();
-        const ws_ptr = self.relay_client;
-        self.relay_client_mu.unlock();
-        if (ws_ptr) |ws| {
-            ws.writeClose();
-        }
-
-        // Unblock blocking read when relay does not answer close.
-        // Use shutdown (not close) so WsClient.deinit() performs the final close once.
-        const fd = self.relay_socket_fd.load(.acquire);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).shutdown(.recv) catch {};
-            self.relay_socket_fd.store(invalid_socket, .release);
-        }
+        // Interrupt I/O before acquiring relay_client_mu, which a blocked sender
+        // may hold. The separate socket mutex serializes shutdown with final close.
+        self.relay_socket_mu.lock();
+        ws_client.shutdownTrackedSocket(&self.relay_socket_fd, invalid_socket, .both);
+        self.relay_socket_mu.unlock();
 
         if (self.relay_thread) |t| {
             t.join();
@@ -1296,6 +1289,8 @@ pub const WebChannel = struct {
         self.relay_client = null;
         self.relay_client_mu.unlock();
         if (client) |ws| {
+            self.relay_socket_mu.lock();
+            defer self.relay_socket_mu.unlock();
             ws.deinit();
             self.allocator.destroy(ws);
         }
@@ -2557,4 +2552,23 @@ test "WebChannel create + healthCheck + stop leaks zero bytes" {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+// Regression: relay shutdown must not send on a potentially blocked transport
+// before interrupting it; a peer sees EOF without an intervening close frame.
+test "WebChannel relay stop interrupts transport before any close write" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void) return error.SkipZigTest;
+    const sockets = try ws_client.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[1]);
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    const ws = try std.testing.allocator.create(ws_client.WsClient);
+    ws.* = .{ .allocator = std.testing.allocator, .stream = .{ .handle = sockets[0] }, .tls = null, .write_mu = .{} };
+    ch.relay_client = ws;
+    ch.relay_socket_fd.store(sockets[0], .release);
+    ch.running.store(true, .release);
+    ch.stopRelayTransport();
+    try std.testing.expect(ch.relay_client == null);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
 }

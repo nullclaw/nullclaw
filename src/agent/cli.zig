@@ -169,11 +169,7 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     // In tests, stdout is used by Zig's test runner protocol (`--listen`).
     if (builtin.is_test) return;
 
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const wr = &bw.interface;
-    wr.print("{s}", .{event.text}) catch {};
-    wr.flush() catch {};
+    writeStdoutAppend(std_compat.fs.File.stdout(), event.text);
 }
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
@@ -483,7 +479,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
 
     var out_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&out_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
     const w = &bw.interface;
 
     const message_arg = parsed_args.message_arg;
@@ -824,18 +820,23 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 break :blk queued;
             }
 
-            try w.print("> ", .{});
-            try w.flush();
-
-            // Read a line from stdin byte-by-byte
-            var pos: usize = 0;
-            while (pos < line_buf.len) {
-                const n = stdin.read(line_buf[pos .. pos + 1]) catch return;
-                if (n == 0) return; // EOF (Ctrl+D)
-                if (line_buf[pos] == '\n') break;
-                pos += 1;
-            }
-            break :blk line_buf[0..pos];
+            const read_line = cli_mod.readInteractiveLine(
+                stdin,
+                std_compat.fs.File.stdout(),
+                w,
+                "> ",
+                repl_history.items,
+                &line_buf,
+            ) catch |err| switch (err) {
+                error.Interrupted => continue,
+                error.LineTooLong => {
+                    try w.print("Input is too long (maximum {d} bytes).\n", .{line_buf.len});
+                    try w.flush();
+                    continue;
+                },
+                else => return err,
+            };
+            break :blk read_line orelse return;
         };
 
         if (line.len == 0) continue;
@@ -849,7 +850,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         // Append the effective turn input after debounce coalescing.
-        repl_history.append(allocator, allocator.dupe(u8, debounced_input.current) catch continue) catch {};
+        rememberReplInput(allocator, &repl_history, debounced_input.current);
 
         // Re-evaluate sink in case reasoning_mode was changed by a previous slash command
         const repl_raw_sink = streaming.Sink{
@@ -904,6 +905,26 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 }
 
+fn appendReplHistory(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged([]const u8),
+    line: []const u8,
+) !void {
+    const entry = try allocator.dupe(u8, line);
+    errdefer allocator.free(entry);
+    try history.append(allocator, entry);
+}
+
+fn rememberReplInput(
+    allocator: std.mem.Allocator,
+    history: *std.ArrayListUnmanaged([]const u8),
+    line: []const u8,
+) void {
+    // History is optional state: allocation failure must not discard a user
+    // turn that is already ready for provider execution.
+    appendReplHistory(allocator, history, line) catch {};
+}
+
 fn collectCliDebouncedInput(
     allocator: std.mem.Allocator,
     stdin: std_compat.fs.File,
@@ -949,7 +970,7 @@ fn collectCliDebouncedInput(
         const events = std.posix.poll(&poll_fds, poll_timeout) catch 0;
         if (events > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
             var extra_line_buf: [4096]u8 = undefined;
-            const extra_line = readCliLine(stdin, &extra_line_buf) orelse break;
+            const extra_line = (cli_mod.readCanonicalLine(stdin, &extra_line_buf) catch break) orelse break;
             if (extra_line.len > 0) {
                 try debouncer.push(try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", extra_line, "cli:repl"), inbound_debounce.nowMs(), &ready);
             }
@@ -962,17 +983,6 @@ fn collectCliDebouncedInput(
         return .{ .current = try allocator.dupe(u8, first_line) };
     }
     return try buildCliDebouncedInput(allocator, ready.items);
-}
-
-fn readCliLine(stdin: std_compat.fs.File, buf: []u8) ?[]const u8 {
-    var pos: usize = 0;
-    while (pos < buf.len) {
-        const n = stdin.read(buf[pos .. pos + 1]) catch return null;
-        if (n == 0) return null;
-        if (buf[pos] == '\n') break;
-        pos += 1;
-    }
-    return buf[0..pos];
 }
 
 const CliDebouncedInput = struct {
@@ -1007,6 +1017,34 @@ fn buildCliDebouncedInput(
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn noopSinkEvent(_: *anyopaque, _: streaming.Event) void {}
+
+fn appendReplHistoryAllocationTest(allocator: std.mem.Allocator) !void {
+    var history: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (history.items) |entry| allocator.free(entry);
+        history.deinit(allocator);
+    }
+    try appendReplHistory(allocator, &history, "hello");
+    try std.testing.expectEqual(@as(usize, 1), history.items.len);
+    try std.testing.expectEqualStrings("hello", history.items[0]);
+}
+
+test "appendReplHistory frees duplicated entry when append runs out of memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        appendReplHistoryAllocationTest,
+        .{},
+    );
+}
+
+test "REPL history allocation failure does not gate user input" {
+    var no_memory: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_memory);
+    var history: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    rememberReplInput(fixed.allocator(), &history, "still deliver this turn");
+    try std.testing.expectEqual(@as(usize, 0), history.items.len);
+}
 
 test "cliStreamCallback handles empty delta" {
     var sink_ctx: u8 = 0;
@@ -1173,6 +1211,39 @@ test "activeCliProvider uses returned holder storage for named agents" {
 test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
     try std.testing.expect(shouldPrintTurnResponse(true, false));
     try std.testing.expect(shouldPrintTurnResponse(false, false));
+}
+
+test "piped agent stdout appends the reply instead of overwriting offset zero" {
+    // Regression: streamed chunks and the trailing newline must stay in order
+    // when stdout is a pipe. Redirected regular files are covered separately
+    // by the compat.fs interleaved-writer regression.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var fds: [2]std.posix.fd_t = undefined;
+    switch (std.c.errno(std.c.pipe(&fds))) {
+        .SUCCESS => {},
+        else => return error.PipeFailed,
+    }
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const out = std_compat.fs.File{
+        .handle = fds[1],
+        .flags = .{ .nonblocking = false },
+    };
+
+    writeStdoutAppend(out, "pong");
+    writeStdoutAppend(out, "\n");
+
+    var got: [8]u8 = undefined;
+    const n = try std.posix.read(fds[0], &got);
+    try std.testing.expectEqualStrings("pong\n", got[0..n]);
+}
+
+fn writeStdoutAppend(file: std_compat.fs.File, text: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var bw = file.writerStreaming(&buf);
+    bw.interface.print("{s}", .{text}) catch {};
+    bw.interface.flush() catch {};
 }
 
 test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {

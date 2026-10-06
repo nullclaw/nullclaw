@@ -672,10 +672,16 @@ pub const MaxChannel = struct {
         }
 
         for (choices, 0..) |choice, i| {
+            const owned = try interaction_choices.ChoiceOption.initOwned(
+                interaction_allocator,
+                choice.id,
+                choice.label,
+                choice.submit_text,
+            );
             options[i] = .{
-                .id = try interaction_allocator.dupe(u8, choice.id),
-                .label = try interaction_allocator.dupe(u8, choice.label),
-                .submit_text = try interaction_allocator.dupe(u8, choice.submit_text),
+                .id = owned.id,
+                .label = owned.label,
+                .submit_text = owned.submit_text,
             };
             built += 1;
         }
@@ -988,9 +994,10 @@ pub const MaxChannel = struct {
             self.allocator.free(key_copy);
         }
 
+        // Credentialed typing requests enter std.http/TLS on native targets (#1002).
         if (comptime !builtin.is_test) {
             task.thread = try std.Thread.spawn(
-                .{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE },
+                .{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE },
                 typingLoop,
                 .{task},
             );

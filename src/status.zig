@@ -195,7 +195,7 @@ pub fn run(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     }
 
     var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&buf);
     const w = &bw.interface;
 
     var cfg = Config.load(allocator) catch {

@@ -368,11 +368,15 @@ fn curlPostFromFile(
 ) ![]u8 {
     const data_arg = try std.fmt.allocPrint(allocator, "@{s}", .{file_path});
     defer allocator.free(data_arg);
+    var curl_config = try http_util.prepareProtectedCurlConfig(allocator, url, null);
+    defer curl_config.deinit();
 
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-q";
     argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
@@ -403,7 +407,9 @@ fn curlPostFromFile(
     argc += 1;
     argv_buf[argc] = data_arg;
     argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = "--config";
+    argc += 1;
+    argv_buf[argc] = curl_config.path();
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
