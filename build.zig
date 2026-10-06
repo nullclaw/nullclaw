@@ -361,7 +361,9 @@ fn ensureAndroidBuildEnvironment(b: *std.Build) void {
     } else {
         std.log.err("Install the Android NDK, generate a libc/sysroot file for the target, and pass it with --libc.", .{});
     }
-    std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
+    std.log.err("The file must set include_dir, sys_include_dir, lib_dir, gcc_dir, and crt_dir. gcc_dir is required even though the NDK has no GCC.", .{});
+    std.log.err("Prefer cross-compiling with --libc and shipping the binary. A native Termux build currently fails linking options.zig with AccessDenied.", .{});
+    std.log.err("See docs/en/termux.md for a working NDK-to-libc recipe.", .{});
     std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.16.0.", .{});
     std.process.exit(1);
 }

@@ -116,7 +116,52 @@ zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /path
 - `arm-linux-androideabi.24` 搭配 `-Dcpu=baseline+v7a`
 - `x86_64-linux-android.24`
 
-按设备架构选择目标即可。完整的 `--libc` 文件生成示例可参考 [`.github/workflows/release.yml`](../../.github/workflows/release.yml)。
+按设备架构选择目标即可。
+
+### 从 Android NDK 生成 `--libc` 文件
+
+把 libc 文件指向 NDK sysroot。有两个容易踩坑的细节：
+
+- **`gcc_dir` 是必填项。** Zig 的 libc 格式会无条件解析该字段；漏写它会在编译
+  C 依赖时报 `missing field: gcc_dir`，看起来像 Zig 的 bug，其实是文件缺字段。
+- **NDK 把架构相关头文件拆开存放。** `asm/` 位于 `usr/include/<triple>/`，
+  而 Zig 期望一棵扁平的 include 目录树，因此任何包含 `linux/types.h` 的编译
+  都会报 `asm/types.h file not found`。请把两个目录合并到临时目录 —— 不要
+  原地修改 NDK。
+
+```bash
+NDK=/path/to/android-ndk
+SYSROOT=$(ls -d "$NDK"/toolchains/llvm/prebuilt/*/sysroot)
+API=24                       # 与你要支持的最低 API 级别保持一致
+MS=/tmp/android-sysroot
+rm -rf "$MS"; mkdir -p "$MS"/usr
+cp -R "$SYSROOT"/usr/include "$MS"/usr/include
+cp -Rn "$SYSROOT"/usr/include/aarch64-linux-android/* "$MS"/usr/include/
+
+LIB="$SYSROOT"/usr/lib/aarch64-linux-android/$API
+cat > /tmp/android-libc.txt <<EOF
+include_dir=$MS/usr/include
+sys_include_dir=$MS/usr/include
+lib_dir=$LIB
+gcc_dir=$LIB
+crt_dir=$LIB
+crt_objects=crtbegin_so.o crtend_so.o
+crtbegin_file=crtbegin_so.o
+crtend_file=crtend_so.o
+zig_lib_dir=
+kernel32_lib_dir=
+msvc_lib_dir=
+EOF
+
+zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /tmp/android-libc.txt
+```
+
+若目标不是 aarch64，请相应修改 `cp -Rn` 一行中的 triple。产物是一个 `pie`
+可执行文件；**只**需要把二进制文件部署到设备上。
+
+相比在 Termux 内直接构建，更推荐这种方式。目前在 Termux 内原生构建会在链接
+编译器自身的 `options.zig` 时因 `AccessDenied` 失败，因此交叉编译后仅部署
+二进制是当前唯一可行的路径。
 
 ## 实用建议
 
