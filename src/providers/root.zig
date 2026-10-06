@@ -415,6 +415,10 @@ pub const Provider = struct {
         supports_streaming: ?*const fn (ptr: *anyopaque) bool = null,
         /// Optional: returns true if streaming responses can return native tool calls.
         supports_streaming_native_tools: ?*const fn (ptr: *anyopaque) bool = null,
+        /// Model-aware variant. A router or failover wrapper resolves the
+        /// request to a different provider than its default, so the boolean
+        /// answer is not the same as the one for the requested model.
+        supports_streaming_native_tools_for_model: ?*const fn (ptr: *anyopaque, model: []const u8) bool = null,
         /// Optional: returns true if provider supports vision/image input. Default: false.
         supports_vision: ?*const fn (ptr: *anyopaque) bool = null,
         /// Optional: returns true if provider supports vision for a specific model.
@@ -494,6 +498,15 @@ pub const Provider = struct {
         return self.supportsVision();
     }
 
+    /// Returns true if streaming native tools are supported for a specific model.
+    /// Falls back to the model-independent answer, mirroring
+    /// supportsVisionForModel.
+    pub fn supportsStreamingNativeToolsForModel(self: Provider, model: []const u8) bool {
+        if (self.vtable.supports_streaming_native_tools_for_model) |f| return f(self.ptr, model);
+        if (self.vtable.supports_streaming_native_tools) |f| return f(self.ptr);
+        return false;
+    }
+
     /// Chat with native tool support. Falls back to regular chat() if not implemented.
     pub fn chatWithTools(self: Provider, allocator: std.mem.Allocator, req: ChatRequest) !ChatResponse {
         if (self.vtable.chat_with_tools) |f| return f(self.ptr, allocator, req);
@@ -529,6 +542,7 @@ pub fn assertProviderInterface(comptime T: type) void {
     _ = vt.supportsNativeTools;
     _ = vt.supports_vision;
     _ = vt.supports_streaming_native_tools;
+    _ = vt.supports_streaming_native_tools_for_model;
     _ = vt.getName;
     _ = vt.deinit;
 }

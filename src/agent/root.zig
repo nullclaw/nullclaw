@@ -2022,8 +2022,11 @@ pub const Agent = struct {
             defer prompt_tools_arena.deinit();
             const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
             const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+            // Ask about the model this turn will actually use, not the
+            // configured default: a router or failover wrapper can route the
+            // request to a provider that cannot recover native tool calls.
             const prompt_native_tools_enabled = if (prompt_is_streaming)
-                self.provider.supportsStreamingNativeTools()
+                self.provider.supportsStreamingNativeToolsForModel(turn_model_name)
             else
                 self.provider.supportsNativeTools();
 
@@ -2204,7 +2207,7 @@ pub const Agent = struct {
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = if (is_streaming)
-                self.provider.supportsStreamingNativeTools()
+                self.provider.supportsStreamingNativeToolsForModel(turn_model_name)
             else
                 self.provider.supportsNativeTools();
             const include_reasoning = self.reasoning_mode != .off;

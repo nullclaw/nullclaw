@@ -46,6 +46,16 @@ const ToolCallSlot = struct {
     id: ?[]u8 = null,
     name: ?[]u8 = null,
     arguments: std.ArrayListUnmanaged(u8) = .empty,
+    /// Set when an `arguments` key was seen, even when its value was the empty
+    /// string. Without this, "no argument deltas arrived" is indistinguishable
+    /// from "the call legitimately takes no arguments", and the former used to
+    /// be completed by substituting `{}` -- turning a truncated stream into an
+    /// executable call.
+    saw_arguments: bool = false,
+
+    fn isComplete(self: *const ToolCallSlot) bool {
+        return self.saw_arguments and self.name != null and self.name.?.len > 0;
+    }
 
     fn deinit(self: *ToolCallSlot, allocator: std.mem.Allocator) void {
         if (self.id) |id| allocator.free(id);
@@ -92,43 +102,56 @@ const ToolCallAccumulator = struct {
         const choices = parsed.value.object.get("choices") orelse return;
         if (choices != .array) return;
 
-        for (choices.array.items) |choice| {
-            if (choice != .object) continue;
-            const delta = choice.object.get("delta") orelse continue;
-            if (delta != .object) continue;
-            const tool_calls = delta.object.get("tool_calls") orelse continue;
-            if (tool_calls != .array) continue;
+        // Text is taken from choices[0] (see the text path below), so the
+        // accumulator must read the same choice. Visiting every choice keyed
+        // slots only by tool-call index merged two choices' index-0 calls:
+        // argument strings were concatenated into `{"path":"a"}{"path":"b"}`,
+        // combining one choice's id with another choice's function name.
+        if (choices.array.items.len == 0) return;
+        const choice = choices.array.items[0];
+        if (choice != .object) return;
+        const delta = choice.object.get("delta") orelse return;
+        if (delta != .object) return;
+        const tool_calls = delta.object.get("tool_calls") orelse return;
+        if (tool_calls != .array) return;
 
-            for (tool_calls.array.items, 0..) |tool_call, fallback_index| {
-                if (tool_call != .object) continue;
-                const index = if (tool_call.object.get("index")) |idx|
-                    switch (idx) {
-                        .integer => |n| @as(usize, @intCast(@max(0, n))),
-                        else => fallback_index,
-                    }
-                else
-                    fallback_index;
-
-                const slot = try self.ensureSlot(allocator, index);
-
-                if (tool_call.object.get("id")) |id_val| {
-                    if (id_val == .string and id_val.string.len > 0 and slot.id == null) {
-                        slot.id = try allocator.dupe(u8, id_val.string);
-                    }
+        for (tool_calls.array.items, 0..) |tool_call, fallback_index| {
+            if (tool_call != .object) continue;
+            const index = if (tool_call.object.get("index")) |idx|
+                switch (idx) {
+                    .integer => |n| @as(usize, @intCast(@max(0, n))),
+                    else => fallback_index,
                 }
+            else
+                fallback_index;
 
-                const function = tool_call.object.get("function") orelse continue;
-                if (function != .object) continue;
+            const slot = try self.ensureSlot(allocator, index);
 
-                if (function.object.get("name")) |name_val| {
-                    if (name_val == .string and name_val.string.len > 0) {
-                        if (slot.name) |old| allocator.free(old);
-                        slot.name = try allocator.dupe(u8, name_val.string);
-                    }
+            if (tool_call.object.get("id")) |id_val| {
+                if (id_val == .string and id_val.string.len > 0 and slot.id == null) {
+                    slot.id = try allocator.dupe(u8, id_val.string);
                 }
+            }
 
-                if (function.object.get("arguments")) |args_val| {
-                    if (args_val == .string and args_val.string.len > 0) {
+            const function = tool_call.object.get("function") orelse continue;
+            if (function != .object) continue;
+
+            if (function.object.get("name")) |name_val| {
+                if (name_val == .string and name_val.string.len > 0) {
+                    // Duplicate first, then release the old value: freeing
+                    // before the fallible dupe left the slot pointing at
+                    // released storage when the allocation failed, and the
+                    // deferred cleanup then freed it again.
+                    const replacement = try allocator.dupe(u8, name_val.string);
+                    if (slot.name) |old| allocator.free(old);
+                    slot.name = replacement;
+                }
+            }
+
+            if (function.object.get("arguments")) |args_val| {
+                if (args_val == .string) {
+                    slot.saw_arguments = true;
+                    if (args_val.string.len > 0) {
                         try slot.arguments.appendSlice(allocator, args_val.string);
                     }
                 }
@@ -139,8 +162,12 @@ const ToolCallAccumulator = struct {
     fn toOwnedToolCalls(self: *ToolCallAccumulator, allocator: std.mem.Allocator) ![]const root.ToolCall {
         self.sortSlotsByIndex();
 
+        // A call is usable only when its name arrived *and* its argument
+        // deltas did. A name without arguments means the stream was cut
+        // mid-call, and executing that would run a tool with invented input.
         var valid_count: usize = 0;
         for (self.slots.items) |slot| {
+            if (!slot.isComplete()) continue;
             if (slot.name) |name| {
                 if (name.len > 0) valid_count += 1;
             }
@@ -159,6 +186,7 @@ const ToolCallAccumulator = struct {
         }
 
         for (self.slots.items) |slot| {
+            if (!slot.isComplete()) continue;
             const name = slot.name orelse continue;
             if (name.len == 0) continue;
 
@@ -172,10 +200,7 @@ const ToolCallAccumulator = struct {
                 const owned_name = try allocator.dupe(u8, name);
                 errdefer allocator.free(owned_name);
 
-                const arguments = if (slot.arguments.items.len > 0)
-                    try allocator.dupe(u8, slot.arguments.items)
-                else
-                    try allocator.dupe(u8, "{}");
+                const arguments = try allocator.dupe(u8, slot.arguments.items);
                 errdefer allocator.free(arguments);
 
                 break :blk .{
@@ -196,6 +221,10 @@ fn finalizeStreamResultWithToolCalls(
     accumulated: []const u8,
     stream_usage: ?root.TokenUsage,
     tool_call_accumulator: *ToolCallAccumulator,
+    /// Whether the stream ran to a clean completion. Recovery paths (curl
+    /// timeout, nonzero exit, read error) pass false: the text they salvage is
+    /// worth keeping, but a tool call cut mid-flight must never be executed.
+    tool_calls_trusted: bool,
 ) !root.StreamChatResult {
     var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
     errdefer {
@@ -210,7 +239,9 @@ fn finalizeStreamResultWithToolCalls(
         if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
     }
 
-    result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
+    if (tool_calls_trusted) {
+        result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
+    }
     return result;
 }
 
@@ -771,7 +802,7 @@ pub fn curlStream(
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
+            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
         }
         return error.CurlWaitError;
     };
@@ -784,7 +815,7 @@ pub fn curlStream(
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
             }
             return error.CurlFailed;
         },
@@ -793,7 +824,7 @@ pub fn curlStream(
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
             }
             return error.CurlFailed;
         },
@@ -802,7 +833,7 @@ pub fn curlStream(
     // Signal stream completion only after curl exits successfully.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator);
+    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1333,7 +1364,7 @@ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
         \\{"choices":[{"delta":{"content":"ignored","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
     );
 
-    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator);
+    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true);
     defer {
         if (result.content) |content| allocator.free(content);
         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
@@ -1361,7 +1392,7 @@ test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
     );
 
-    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator);
+    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true);
     defer {
         if (result.content) |content| allocator.free(content);
         if (result.reasoning_content) |reasoning| allocator.free(reasoning);

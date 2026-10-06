@@ -159,6 +159,7 @@ pub const RouterProvider = struct {
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
         .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
+        .supports_streaming_native_tools_for_model = supportsStreamingNativeToolsForModelImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -247,12 +248,22 @@ pub const RouterProvider = struct {
         return self.providers[provider_idx].supportsStreaming();
     }
 
-    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
+    fn supportsStreamingNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
         const self: *RouterProvider = @ptrCast(@alignCast(ptr));
-        const resolved = self.resolve(self.default_model);
+        // Resolve the model the request will actually use. streamChatImpl
+        // resolves the requested model, so consulting default_model here could
+        // enable native schemas for an OpenAI default while the call is routed
+        // to an Anthropic implementation that cannot recover native calls.
+        if (model.len == 0) return supportsStreamingNativeToolsImpl(ptr);
+        const resolved = self.resolve(model);
         const provider_idx = resolved[0];
         if (provider_idx >= self.providers.len) return false;
         return self.providers[provider_idx].supportsStreamingNativeTools();
+    }
+
+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        return supportsStreamingNativeToolsForModelImpl(ptr, self.default_model);
     }
 
     fn streamChatImpl(
