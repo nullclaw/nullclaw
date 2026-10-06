@@ -374,6 +374,25 @@ pub const ToolFilterGroup = struct {
     keywords: []const []const u8 = &.{},
 };
 
+pub const LocalLoopConfig = struct {
+    /// When true, apply tighter history compression defaults (Phase 1 adds constrained decode).
+    enabled: bool = false,
+    /// Cap on a tool result's characters in history.
+    ///
+    /// `0` means "unset", and when `enabled` is true an unset value applies the
+    /// local-loop default instead. The sentinel has to be a value no operator
+    /// would set, because `max_result_chars` previously defaulted to 8192 --
+    /// identical to the documented example -- so setting it explicitly to 8192
+    /// was indistinguishable from leaving it alone and was silently overridden
+    /// by the tightening cap, contradicting the documented behaviour.
+    max_result_chars: u32 = 0,
+    max_result_tail_lines: u32 = 12,
+    identical_call_warn: u32 = 3,
+    identical_call_veto: u32 = 5,
+    identical_call_force_reply: u32 = 3,
+    max_parallel_readonly: u32 = 4,
+};
+
 pub const QueueMode = enum {
     off,
     serial,
@@ -441,6 +460,8 @@ pub const AgentConfig = struct {
     auto_disable_vision_on_error: bool = true,
     /// Redact PII in outbound provider messages for the root agent.
     enable_pii_redaction: bool = true,
+    /// Loop hygiene knobs for long local agent runs (Phase 0).
+    local_loop: LocalLoopConfig = .{},
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;

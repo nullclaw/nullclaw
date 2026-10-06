@@ -1365,6 +1365,7 @@ pub const Config = struct {
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
             .enable_pii_redaction = self.agent.enable_pii_redaction,
+            .local_loop = self.agent.local_loop,
         }, ",\n");
 
         // Channels
@@ -2729,6 +2730,15 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.message_timeout_secs = 60;
     cfg.agent.timezone = "UTC+08:00";
     cfg.agent.enable_pii_redaction = false;
+    cfg.agent.local_loop = .{
+        .enabled = true,
+        .max_result_chars = 512,
+        .max_result_tail_lines = 6,
+        .identical_call_warn = 2,
+        .identical_call_veto = 4,
+        .identical_call_force_reply = 2,
+        .max_parallel_readonly = 3,
+    };
 
     cfg.memory.search.provider = "openai";
     cfg.memory.search.model = "text-embedding-3-small";
@@ -2865,6 +2875,13 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expectEqual(@as(u32, 1500), loaded.messages.inbound.debounce_ms);
     try std.testing.expect(loaded.agent.parallel_tools);
+    try std.testing.expect(loaded.agent.local_loop.enabled);
+    try std.testing.expectEqual(@as(u32, 512), loaded.agent.local_loop.max_result_chars);
+    try std.testing.expectEqual(@as(u32, 6), loaded.agent.local_loop.max_result_tail_lines);
+    try std.testing.expectEqual(@as(u32, 2), loaded.agent.local_loop.identical_call_warn);
+    try std.testing.expectEqual(@as(u32, 4), loaded.agent.local_loop.identical_call_veto);
+    try std.testing.expectEqual(@as(u32, 2), loaded.agent.local_loop.identical_call_force_reply);
+    try std.testing.expectEqual(@as(u32, 3), loaded.agent.local_loop.max_parallel_readonly);
     try std.testing.expect(!loaded.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
     try std.testing.expect(!loaded.agent.enable_pii_redaction);
@@ -8256,4 +8273,35 @@ test "Config parseJson rejects truncated JSON" {
     };
     const result = cfg.parseJson(malformed_json);
     try std.testing.expect(std.meta.isError(result));
+}
+
+test "local_loop numeric fields reject values wider than u32" {
+    // Regression (review on #987): these were @intCast unchecked, so a positive
+    // value larger than u32 trapped in a safety build instead of reporting a
+    // configuration error.
+    const allocator = std.testing.allocator;
+    // Wider than u32 but still representable as i64, so it reaches the
+    // bounds check rather than being dropped by the tokenizer.
+    const too_big = "5000000000";
+
+    for ([_][]const u8{
+        "max_result_chars",
+        "max_result_tail_lines",
+        "identical_call_warn",
+        "identical_call_veto",
+        "identical_call_force_reply",
+        "max_parallel_readonly",
+    }) |field| {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        defer cfg.deinit();
+        const json = try std.fmt.allocPrint(allocator, "{{\"agent\":{{\"local_loop\":{{\"{s}\": {s}}}}}}}", .{ field, too_big });
+        defer allocator.free(json);
+        try std.testing.expectError(error.InvalidLocalLoopConfig, cfg.parseJson(json));
+    }
+
+    // In-range values still parse.
+    var ok = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    defer ok.deinit();
+    try ok.parseJson("{\"agent\":{\"local_loop\":{\"max_result_chars\": 4096}}}");
+    try std.testing.expectEqual(@as(u32, 4096), ok.agent.local_loop.max_result_chars);
 }
