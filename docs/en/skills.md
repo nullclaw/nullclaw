@@ -13,13 +13,21 @@ nullclaw skills info <name>       # Show skill metadata
 
 ## Skill Structure
 
-Skills live in `~/.nullclaw/workspace/skills/<name>/` and must contain a manifest:
+Skills live in `~/.nullclaw/workspace/skills/<name>/` and must contain a manifest.
+
+`loadSkill` reads the first manifest it finds, in this order:
+
+1. `SKILL.toml` — **preferred**
+2. `skill.json` — legacy JSON manifest
+3. `SKILL.md` — fallback; if no manifest is present, the skill loads as
+   markdown-only using `SKILL.md` as its instructions
 
 ```
 skills/
   my-skill/
-    SKILL.md          # YAML frontmatter + description (preferred)
-    skill.json        # or JSON manifest
+    SKILL.toml        # preferred manifest
+    skill.json        # legacy alternative
+    SKILL.md          # instructions, and manifest fallback
     build.zig         # optional Zig build (enhanced compatibility scoring)
     root.zig          # optional Zig entry point
 ```
@@ -65,7 +73,14 @@ rejects symlink entries inside archives.
 
 ## SkillForge (Auto-Discovery)
 
-SkillForge can automatically discover and evaluate skills from GitHub.
+SkillForge is a library module (`src/skillforge.zig`) that can discover and
+evaluate skills from GitHub.
+
+**The `skillforge` block below is not read by `Config`, and nothing in the
+runtime schedules it.** It is shown to document the module's capabilities, not
+as an active configuration recipe — setting it has no effect today. Discovery
+runs only over the `workspace/skills/` directory described above. Wiring this up
+as real configuration would be a schema change.
 
 ```json
 {

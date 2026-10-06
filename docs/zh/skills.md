@@ -13,10 +13,18 @@ nullclaw skills info <name>       # 查看技能元数据
 
 ## 技能结构
 
-技能位于 `~/.nullclaw/workspace/skills/<name>/`，需包含 manifest：
+技能位于 `~/.nullclaw/workspace/skills/<name>/`，需包含 manifest。
 
-- `SKILL.md` — YAML frontmatter + 描述（推荐）
-- `skill.json` — JSON manifest
+`loadSkill` 按以下顺序读取第一个找到的 manifest：
+
+1. `SKILL.toml` — **推荐**
+2. `skill.json` — 旧版 JSON manifest
+3. `SKILL.md` — 回退项；若不存在任何 manifest，则作为纯 markdown 技能加载，
+   并以 `SKILL.md` 作为其说明文件
+
+- `SKILL.toml` — 推荐的 manifest
+- `skill.json` — 旧版替代方案
+- `SKILL.md` — 说明文件，同时作为 manifest 回退项
 - `build.zig` / `root.zig` — 可选 Zig 构建文件
 
 ### 跨 agent、跨主机共享技能（符号链接）
@@ -34,6 +42,13 @@ ln -s /srv/git/my-skills/git-helper ~/.nullclaw/workspace/skills/git-helper
 安装包安装的技能不受影响 —— 安装包安全审计仍然拒绝包内的符号链接条目。
 
 ## SkillForge（自动发现）
+
+SkillForge 是一个库模块（`src/skillforge.zig`），可从 GitHub 发现并评估技能。
+
+**下面的 `skillforge` 配置块不会被 `Config` 解析，运行时也不会调度它。**
+此处仅用于说明该模块的能力，并非可直接生效的配置示例 —— 设置它目前不会有任何
+效果。发现流程只扫描上文所述的 `workspace/skills/` 目录。若要将其接入为真实
+配置，需要改动配置 schema。
 
 ```json
 {
