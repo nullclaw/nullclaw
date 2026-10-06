@@ -2,9 +2,40 @@
 # pre-push: run the full test suite before pushing.
 # Activate: git config core.hooksPath .githooks
 
+# `git push` from a *worktree* exports GIT_DIR (a normal clone does not — see
+# #1020). Tests that spawn `git` against fixture repositories of their own then
+# inherit it and operate on *this* repository instead, which fails 10 of them
+# spuriously. Clear the inherited state so the suite behaves the same however
+# the push was launched.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX
+
 echo "Running tests..."
 zig build test --summary all 2>&1
 if [ $? -ne 0 ]; then
     echo "Tests failed. Fix before pushing."
+    exit 1
+fi
+
+# Untracked files left behind by the test run.
+#
+# The suite can drop fixtures into the working tree. They are harmless while
+# they sit there, but the next `git add -A` commits them silently, which is how
+# #1012 and #1019 each ended up carrying workspace-audit and skills test
+# fixtures plus a stub README that replaced the real one.
+#
+# Scope is deliberately limited to *untracked* entries ("??"). Modified tracked
+# files are almost always work in progress, and blocking a push on those would
+# make this hook hostile; the residue problem is specifically about files that
+# appear from nowhere and get swept up by an add-everything commit.
+#
+# Requires the `unset` above: with GIT_DIR still exported from a worktree push,
+# `git status` reports on the wrong repository and this check is meaningless.
+untracked=$(git status --porcelain 2>/dev/null | grep '^??' || true)
+if [ -n "$untracked" ]; then
+    echo "Tests left untracked files in the working tree:"
+    echo "$untracked"
+    echo ""
+    echo "These would be committed by a later 'git add -A'. Remove them, or add"
+    echo "them to .gitignore if they are expected, then push again."
     exit 1
 fi
