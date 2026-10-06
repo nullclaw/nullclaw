@@ -3112,3 +3112,42 @@ test "a2a principal: cancel of another caller's working task never interrupts" {
     defer still.deinit(testing.allocator);
     try testing.expect(still.state == .working);
 }
+
+test "a2a principal: resubscribe to another caller's task is not found" {
+    // Regression (review on #1012): asked for explicitly. Resubscribe is the
+    // second route to a task's output, so it needs the same scoping as list
+    // and cancel. The handler takes a live socket rather than the JSON body
+    // the other handlers use, so this drives it over a socketpair rather than
+    // leaving the route untested.
+    const socket_pair = @import("websocket.zig").createTestSocketPair() catch
+        return error.SkipZigTest;
+    const peer = socket_pair[1];
+    defer std.Io.Threaded.closeFd(peer);
+
+    var stream = std_compat.net.Stream{ .handle = socket_pair[0] };
+    defer stream.close();
+
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    var alice_task = try registry.createTask(testing.allocator, "alice work", null, alice);
+    defer alice_task.deinit(testing.allocator);
+    try mutateStoredTask(&registry, alice_task.id, .working, null, 10);
+
+    const bob = principalFromBearer("token-bob");
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bob","method":"tasks/resubscribe","params":{"id":"task-1"}}
+    ;
+    // No session manager: resubscribe only streams stored output, so there is
+    // no interruption path to assert on here.
+    handleResubscribeStreaming(testing.allocator, body, &stream, "req-bob", &registry, bob);
+
+    // The error goes to the SSE stream, not a JSON body.
+    var buf: [1024]u8 = undefined;
+    const n = try std.posix.read(peer, &buf);
+    try testing.expect(n > 0);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "Task not found") != null);
+    // Crucially it is the not-found error, not a 200 stream header.
+    std.debug.print("\nRESUB<<{s}>>\n", .{buf[0..n]});
+}
