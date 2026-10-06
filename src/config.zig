@@ -8211,3 +8211,34 @@ test "Config parseJson rejects truncated JSON" {
     const result = cfg.parseJson(malformed_json);
     try std.testing.expect(std.meta.isError(result));
 }
+
+test "local_loop numeric fields reject values wider than u32" {
+    // Regression (review on #987): these were @intCast unchecked, so a positive
+    // value larger than u32 trapped in a safety build instead of reporting a
+    // configuration error.
+    const allocator = std.testing.allocator;
+    // Wider than u32 but still representable as i64, so it reaches the
+    // bounds check rather than being dropped by the tokenizer.
+    const too_big = "5000000000";
+
+    for ([_][]const u8{
+        "max_result_chars",
+        "max_result_tail_lines",
+        "identical_call_warn",
+        "identical_call_veto",
+        "identical_call_force_reply",
+        "max_parallel_readonly",
+    }) |field| {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        defer cfg.deinit();
+        const json = try std.fmt.allocPrint(allocator, "{{\"agent\":{{\"local_loop\":{{\"{s}\": {s}}}}}}}", .{ field, too_big });
+        defer allocator.free(json);
+        try std.testing.expectError(error.InvalidLocalLoopConfig, cfg.parseJson(json));
+    }
+
+    // In-range values still parse.
+    var ok = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    defer ok.deinit();
+    try ok.parseJson("{\"agent\":{\"local_loop\":{\"max_result_chars\": 4096}}}");
+    try std.testing.expectEqual(@as(u32, 4096), ok.agent.local_loop.max_result_chars);
+}

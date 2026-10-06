@@ -810,7 +810,7 @@ Max 说明：
     "parallel_tools": true,
     "local_loop": {
       "enabled": false,
-      "max_result_chars": 8192,
+      "max_result_chars": 0,
       "max_result_tail_lines": 12,
       "identical_call_warn": 3,
       "identical_call_veto": 5,
@@ -823,7 +823,7 @@ Max 说明：
 
 说明：
 
-- `local_loop.enabled = true` 时，工具结果写入历史的默认字符上限收紧为 400（除非显式设置了 `max_result_chars`）。
+- `max_result_chars: 0` 表示**未设置**。当 `local_loop.enabled = true` 时，未设置会采用 400 字符的收紧上限；其它任何值都会按原值使用，因此显式写 `8192` 就保持 `8192`。
 - 同一 turn 内相同 `name + arguments_json` 的工具调用会指纹识别；warn/veto/force-reply 阈值按 turn 计算。
 - 省略 `local_loop` 时默认行为与现有配置兼容。
 
