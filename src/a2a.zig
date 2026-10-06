@@ -51,12 +51,44 @@ pub const TaskState = enum {
     }
 };
 
+// ── Caller Principal ────────────────────────────────────────────
+
+/// Caller identity for the /a2a route: SHA-256 fingerprint of the bearer
+/// token (issue #974). Tasks and context sessions are scoped by principal so
+/// callers sharing a gateway cannot read each other's task history or join
+/// each other's sessions. Null tokens (permissive gateways with no paired
+/// tokens) fingerprint the empty string — all such callers share one bucket,
+/// which matches the pre-isolation behavior for unauthenticated routes.
+/// The raw token is never stored or logged.
+pub const Principal = [32]u8;
+
+pub fn principalFromBearer(token: ?[]const u8) Principal {
+    var digest: Principal = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token orelse "", &digest, .{});
+    return digest;
+}
+
+fn principalMatches(a: Principal, b: Principal) bool {
+    return std.mem.eql(u8, &a, &b);
+}
+
+/// Stable 16-hex-char prefix used in session keys.
+fn principalHex16(buf: *[16]u8, principal: Principal) []const u8 {
+    const hex = "0123456789abcdef";
+    for (0..8) |i| {
+        buf[i * 2] = hex[principal[i] >> 4];
+        buf[i * 2 + 1] = hex[principal[i] & 0x0F];
+    }
+    return buf[0..16];
+}
+
 // ── Task Record ─────────────────────────────────────────────────
 
 pub const TaskRecord = struct {
     id: []u8,
     context_id: []u8,
     session_key: []u8,
+    principal: Principal,
     state: TaskState,
     created_at: i64,
     updated_at: i64,
@@ -68,6 +100,7 @@ pub const TaskSnapshot = struct {
     id: []u8,
     context_id: []u8,
     session_key: []u8,
+    principal: Principal,
     state: TaskState,
     created_at: i64,
     updated_at: i64,
@@ -146,7 +179,13 @@ pub const TaskRegistry = struct {
         self.tasks.deinit(self.allocator);
     }
 
-    pub fn createTask(self: *TaskRegistry, allocator: std.mem.Allocator, user_text: []const u8, context_id: ?[]const u8) !TaskSnapshot {
+    pub fn createTask(
+        self: *TaskRegistry,
+        allocator: std.mem.Allocator,
+        user_text: []const u8,
+        context_id: ?[]const u8,
+        principal: Principal,
+    ) !TaskSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -170,7 +209,15 @@ pub const TaskRegistry = struct {
             try std.fmt.allocPrint(self.allocator, "ctx-{d}", .{id_num});
         errdefer self.allocator.free(owned_context_id);
 
-        const session_key = try std.fmt.allocPrint(self.allocator, "a2a:{s}", .{owned_context_id});
+        // Session keys are scoped by the caller principal (issue #974): a
+        // caller-supplied contextId must not select another caller's
+        // conversation state.
+        var principal_hex: [16]u8 = undefined;
+        const session_key = try std.fmt.allocPrint(
+            self.allocator,
+            "a2a:{s}:{s}",
+            .{ principalHex16(&principal_hex, principal), owned_context_id },
+        );
         errdefer self.allocator.free(session_key);
 
         const owned_text = try self.allocator.dupe(u8, user_text);
@@ -188,6 +235,7 @@ pub const TaskRegistry = struct {
             .id = task_id,
             .context_id = owned_context_id,
             .session_key = session_key,
+            .principal = principal,
             .state = .submitted,
             .created_at = now,
             .updated_at = now,
@@ -269,13 +317,39 @@ pub const TaskRegistry = struct {
 
     /// List tasks with optional filtering. Returns owned task snapshots sorted by recency.
     /// Caller must free the returned slice with `deinitTaskSnapshots`.
+    /// A page of task snapshots plus the caller's total matching set.
+    ///
+    /// `total` counts everything that matched the filters *before* the page was
+    /// truncated, so a caller can tell a short page from an empty one. Counting
+    /// only what was emitted made `totalSize` describe the page rather than the
+    /// caller's own task set.
+    pub const TaskListPage = struct {
+        tasks: []TaskSnapshot,
+        total: usize,
+
+        pub fn deinit(self: *TaskListPage, allocator: std.mem.Allocator) void {
+            for (self.tasks) |*task| task.deinit(allocator);
+            if (self.tasks.len > 0) allocator.free(self.tasks);
+            self.* = .{ .tasks = &.{}, .total = 0 };
+        }
+    };
+
+    /// List tasks for a caller.
+    ///
+    /// `filter_principal` is applied here, before sorting and truncation, rather
+    /// than by the caller after the fact. Truncating the global list first meant
+    /// a caller's own tasks could be pushed out of the page by tasks they cannot
+    /// even see: with one older task owned by A and one newer task owned by B,
+    /// A's `pageSize: 1` returned an empty page while A's task was present and
+    /// readable by ID.
     pub fn listTasks(
         self: *TaskRegistry,
         allocator: std.mem.Allocator,
         filter_state: ?TaskState,
         filter_context_id: ?[]const u8,
+        filter_principal: ?Principal,
         max_results: usize,
-    ) ![]TaskSnapshot {
+    ) !TaskListPage {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -294,8 +368,14 @@ pub const TaskRegistry = struct {
             if (filter_context_id) |ctx| {
                 if (!std.mem.eql(u8, task.context_id, ctx)) continue;
             }
+            if (filter_principal) |p| {
+                if (!principalMatches(task.principal, p)) continue;
+            }
             try result.append(allocator, try self.snapshotLocked(allocator, task));
         }
+
+        // Scoped total, computed before the page is cut.
+        const total = result.items.len;
 
         sortTaskSnapshotsByRecency(result.items);
         if (result.items.len > max_results) {
@@ -305,7 +385,7 @@ pub const TaskRegistry = struct {
             }
             result.items.len = max_results;
         }
-        return result.toOwnedSlice(allocator);
+        return .{ .tasks = try result.toOwnedSlice(allocator), .total = total };
     }
 
     /// Evict the least-recently-updated terminal task. Must be called with mutex held.
@@ -363,6 +443,7 @@ pub const TaskRegistry = struct {
             .id = id,
             .context_id = context_id,
             .session_key = session_key,
+            .principal = task.principal,
             .state = task.state,
             .created_at = task.created_at,
             .updated_at = task.updated_at,
@@ -445,6 +526,7 @@ pub fn handleJsonRpc(
     body: []const u8,
     registry: *TaskRegistry,
     session_mgr: anytype,
+    principal: Principal,
 ) A2aResponse {
     const method = extractJsonRpcMethod(body) orelse {
         const err_body = buildJsonRpcError(allocator, "null", -32600, "Missing method") catch
@@ -460,13 +542,13 @@ pub fn handleJsonRpc(
         std.mem.eql(u8, method, "SendMessage") or
         std.mem.eql(u8, method, "SendStreamingMessage"))
     {
-        return handleSendMessage(allocator, body, request_id, registry, session_mgr);
+        return handleSendMessage(allocator, body, request_id, registry, session_mgr, principal);
     } else if (std.mem.eql(u8, method, "tasks/get") or std.mem.eql(u8, method, "GetTask")) {
-        return handleGetTask(allocator, body, request_id, registry);
+        return handleGetTask(allocator, body, request_id, registry, principal);
     } else if (std.mem.eql(u8, method, "tasks/cancel") or std.mem.eql(u8, method, "CancelTask")) {
-        return handleCancelTask(allocator, body, request_id, registry, session_mgr);
+        return handleCancelTask(allocator, body, request_id, registry, session_mgr, principal);
     } else if (std.mem.eql(u8, method, "tasks/list") or std.mem.eql(u8, method, "ListTasks")) {
-        return handleListTasks(allocator, body, request_id, registry);
+        return handleListTasks(allocator, body, request_id, registry, principal);
     } else if (std.mem.startsWith(u8, method, "tasks/pushNotificationConfig/") or
         std.mem.eql(u8, method, "CreateTaskPushNotificationConfig") or
         std.mem.eql(u8, method, "GetTaskPushNotificationConfig") or
@@ -600,13 +682,14 @@ pub fn handleStreamingRpc(
     stream: *std_compat.net.Stream,
     registry: *TaskRegistry,
     session_mgr: anytype,
+    principal: Principal,
 ) void {
     const request_id = extractJsonRpcId(body) orelse "null";
 
     // Handle tasks/resubscribe: resume SSE for an existing task.
     const method = extractJsonRpcMethod(body) orelse "message/stream";
     if (std.mem.eql(u8, method, "tasks/resubscribe") or std.mem.eql(u8, method, "SubscribeToTask")) {
-        handleResubscribeStreaming(allocator, body, stream, request_id, registry);
+        handleResubscribeStreaming(allocator, body, stream, request_id, registry, principal);
         return;
     }
 
@@ -624,7 +707,7 @@ pub fn handleStreamingRpc(
 
     const context_id = extractMessageContextId(body);
 
-    var task = registry.createTask(allocator, text, context_id) catch {
+    var task = registry.createTask(allocator, text, context_id, principal) catch {
         writeSseError(allocator, stream, request_id, -32603, "Failed to create task");
         return;
     };
@@ -704,6 +787,7 @@ fn handleResubscribeStreaming(
     stream: *std_compat.net.Stream,
     request_id: []const u8,
     registry: *TaskRegistry,
+    principal: Principal,
 ) void {
     const task_id = extractParamsId(body) orelse {
         writeSseError(allocator, stream, request_id, -32602, "Missing task id");
@@ -719,6 +803,12 @@ fn handleResubscribeStreaming(
         writeSseError(allocator, stream, request_id, -32001, "Task not found");
         return;
     };
+
+    // Principal check (issue #974): same not-found as an unknown id.
+    if (!principalMatches(snapshot.principal, principal)) {
+        writeSseError(allocator, stream, request_id, -32001, "Task not found");
+        return;
+    }
 
     // Write SSE headers.
     stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
@@ -756,6 +846,7 @@ fn handleSendMessage(
     request_id: []const u8,
     registry: *TaskRegistry,
     session_mgr: anytype,
+    principal: Principal,
 ) A2aResponse {
     const text = (extractMessageContent(allocator, body) catch null) orelse {
         const err_body = buildJsonRpcError(allocator, request_id, -32602, "Missing message text") catch
@@ -791,7 +882,7 @@ fn handleSendMessage(
         return .{ .body = err_body };
     }
 
-    var task = registry.createTask(allocator, text, context_id) catch {
+    var task = registry.createTask(allocator, text, context_id, principal) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to create task") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -842,6 +933,7 @@ fn handleGetTask(
     body: []const u8,
     request_id: []const u8,
     registry: *TaskRegistry,
+    principal: Principal,
 ) A2aResponse {
     const task_id = extractParamsId(body) orelse {
         const err_body = buildJsonRpcError(allocator, request_id, -32602, "Missing task id") catch
@@ -868,6 +960,14 @@ fn handleGetTask(
         return .{ .body = err_body };
     };
 
+    // Principal check (issue #974): another caller's task is indistinguishable
+    // from an unknown id — no existence oracle.
+    if (!principalMatches(task_snapshot.principal, principal)) {
+        const err_body = buildJsonRpcError(allocator, request_id, -32001, "Task not found") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    }
+
     const task_json = buildTaskJson(allocator, &task_snapshot, history_length) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to build response") catch
             return errorResponse();
@@ -888,6 +988,7 @@ fn handleCancelTask(
     request_id: []const u8,
     registry: *TaskRegistry,
     session_mgr: anytype,
+    principal: Principal,
 ) A2aResponse {
     const task_id = extractParamsId(body) orelse {
         const err_body = buildJsonRpcError(allocator, request_id, -32602, "Missing task id") catch
@@ -902,6 +1003,14 @@ fn handleCancelTask(
             return errorResponse();
         return .{ .body = err_body };
     };
+
+    // Principal check (issue #974) BEFORE interruption or cancel: another
+    // caller's task must be indistinguishable from an unknown id.
+    if (!principalMatches(task.principal, principal)) {
+        const err_body = buildJsonRpcError(allocator, request_id, -32001, "Task not found") catch
+            return errorResponse();
+        return .{ .body = err_body };
+    }
 
     if (isTerminalState(task.state)) {
         const err_body = buildJsonRpcError(allocator, request_id, -32002, "Task already in terminal state") catch
@@ -947,6 +1056,7 @@ fn handleListTasks(
     body: []const u8,
     request_id: []const u8,
     registry: *TaskRegistry,
+    principal: Principal,
 ) A2aResponse {
     // Parse optional filters from params.
     const params_section = extractParamsObject(body) orelse "{}";
@@ -991,12 +1101,17 @@ fn handleListTasks(
         break :blk @intCast(val);
     };
 
-    const tasks = registry.listTasks(allocator, filter_state, filter_context_id, page_size) catch {
+    // Principal filter (issue #974): a caller only ever sees its own tasks.
+    // Applied inside listTasks, before the page is cut -- filtering after the
+    // global list was already truncated let another principal's newer tasks
+    // push this caller's own tasks out of the page entirely.
+    var page = registry.listTasks(allocator, filter_state, filter_context_id, principal, page_size) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to list tasks") catch
             return errorResponse();
         return .{ .body = err_body };
     };
-    defer deinitTaskSnapshots(allocator, tasks);
+    defer page.deinit(allocator);
+    const tasks = page.tasks;
 
     // Build result JSON: {"tasks":[...], "nextPageToken":"", "pageSize":N, "totalSize":N}
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1004,17 +1119,20 @@ fn handleListTasks(
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
     const w = &buf_writer.writer;
 
+    var emitted: usize = 0;
     w.writeAll("{\"tasks\":[") catch return errorResponse();
-    for (tasks, 0..) |*task, i| {
-        if (i > 0) w.writeByte(',') catch return errorResponse();
+    for (tasks) |*task| {
+        if (emitted > 0) w.writeByte(',') catch return errorResponse();
         const task_json = buildTaskJson(allocator, task, history_length) catch return errorResponse();
         defer allocator.free(task_json);
         w.writeAll(task_json) catch return errorResponse();
+        emitted += 1;
     }
     w.writeAll("],\"nextPageToken\":\"\",\"pageSize\":") catch return errorResponse();
     w.print("{d}", .{page_size}) catch return errorResponse();
     w.writeAll(",\"totalSize\":") catch return errorResponse();
-    w.print("{d}", .{registry.taskCount()}) catch return errorResponse();
+    // Scoped total, not this page's count.
+    w.print("{d}", .{page.total}) catch return errorResponse();
     w.writeByte('}') catch return errorResponse();
 
     buf = buf_writer.toArrayList();
@@ -1642,6 +1760,8 @@ const testing = std.testing;
 const MockSessionManager = struct {
     response: []const u8 = "mock response",
     interrupt_tool: ?[]const u8 = null,
+    /// Counts interruption requests so a test can assert one never happened.
+    interrupt_calls: usize = 0,
     allocator: std.mem.Allocator = testing.allocator,
     inbound_calls: usize = 0,
     inbound_streaming_calls: usize = 0,
@@ -1681,6 +1801,9 @@ const MockSessionManager = struct {
             s.active_tool = null;
         }
     } {
+        // Counted so a test can assert that a foreign caller's cancel never
+        // reaches the interruption branch.
+        self.interrupt_calls += 1;
         return .{
             .requested = self.interrupt_tool != null,
             .active_tool = if (self.interrupt_tool) |tool|
@@ -1746,12 +1869,15 @@ test "TaskRegistry createTask and getTaskSnapshot" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "hello world", null);
+    var task = try registry.createTask(testing.allocator, "hello world", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
 
     try testing.expectEqualStrings("task-1", task.id);
     try testing.expectEqualStrings("ctx-1", task.context_id);
-    try testing.expectEqualStrings("a2a:ctx-1", task.session_key);
+    var key_hex: [16]u8 = undefined;
+    const expected_key = try std.fmt.allocPrint(testing.allocator, "a2a:{s}:ctx-1", .{principalHex16(&key_hex, task.principal)});
+    defer testing.allocator.free(expected_key);
+    try testing.expectEqualStrings(expected_key, task.session_key);
     try testing.expectEqualStrings("hello world", task.user_text);
     try testing.expect(task.state == .submitted);
     try testing.expectEqual(@as(usize, 0), task.agent_text.len);
@@ -1772,13 +1898,13 @@ test "TaskRegistry returns TaskRegistryFull when capped by active tasks" {
 
     var i: usize = 0;
     while (i < MAX_TASKS) : (i += 1) {
-        var task = try registry.createTask(testing.allocator, "x", null);
+        var task = try registry.createTask(testing.allocator, "x", null, principalFromBearer(null));
         try testing.expect(registry.setTaskState(task.id, .working));
         task.deinit(testing.allocator);
     }
 
     try testing.expectEqual(MAX_TASKS, registry.taskCount());
-    try testing.expectError(error.TaskRegistryFull, registry.createTask(testing.allocator, "overflow", null));
+    try testing.expectError(error.TaskRegistryFull, registry.createTask(testing.allocator, "overflow", null, principalFromBearer(null)));
 }
 
 test "TaskRegistry evicts oldest completed tasks by recency" {
@@ -1787,12 +1913,12 @@ test "TaskRegistry evicts oldest completed tasks by recency" {
 
     var i: usize = 0;
     while (i < MAX_TASKS) : (i += 1) {
-        var task = try registry.createTask(testing.allocator, "filler", null);
+        var task = try registry.createTask(testing.allocator, "filler", null, principalFromBearer(null));
         try mutateStoredTask(&registry, task.id, .completed, null, @as(i64, @intCast(i)));
         task.deinit(testing.allocator);
     }
 
-    var newest = try registry.createTask(testing.allocator, "new task", null);
+    var newest = try registry.createTask(testing.allocator, "new task", null, principalFromBearer(null));
     defer newest.deinit(testing.allocator);
 
     try testing.expectEqual(MAX_TASKS, registry.taskCount());
@@ -1867,7 +1993,7 @@ test "handleJsonRpc dispatches message/send with string id" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"Hello agent"}]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -1886,7 +2012,7 @@ test "handleJsonRpc dispatches message/send" {
     const body =
         \\{"jsonrpc":"2.0","id":42,"method":"message/send","params":{"message":{"messageId":"msg-2","role":"user","parts":[{"type":"text","text":"Hello via message/send"}]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -1895,11 +2021,132 @@ test "handleJsonRpc dispatches message/send" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "mock response") != null);
 }
 
+// ── Regression tests for #974: principal isolation on /a2a ─────────────────
+
+test "a2a principal: tasks/get by another caller returns not-found" {
+    // Regression (#974): Bob, sharing the gateway with Alice under a different
+    // bearer, must not read Alice's task history. A foreign task id is
+    // indistinguishable from an unknown one — no existence oracle.
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    var alice_task = try registry.createTask(testing.allocator, "alice secret input", null, alice);
+    defer alice_task.deinit(testing.allocator);
+    var completed = (try registry.finalizeTask(testing.allocator, alice_task.id, .completed, "alice secret output")).?;
+    defer completed.deinit(testing.allocator);
+
+    var mock = MockSessionManager{};
+    const bob = principalFromBearer("token-bob");
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bob","method":"tasks/get","params":{"id":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, bob);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32001") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Task not found") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "alice secret") == null);
+}
+
+test "a2a principal: tasks/cancel by another caller returns not-found and does not cancel" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    var alice_task = try registry.createTask(testing.allocator, "alice work", null, alice);
+    defer alice_task.deinit(testing.allocator);
+
+    var mock = MockSessionManager{};
+    const bob = principalFromBearer("token-bob");
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bob","method":"tasks/cancel","params":{"id":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, bob);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "-32001") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Task not found") != null);
+
+    // Alice's task survives untouched.
+    var still = (try registry.getTaskSnapshot(testing.allocator, "task-1")).?;
+    defer still.deinit(testing.allocator);
+    try testing.expect(still.state == .submitted or still.state == .working);
+}
+
+test "a2a principal: tasks/list hides other principals' tasks" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    const bob = principalFromBearer("token-bob");
+    var alice_task = try registry.createTask(testing.allocator, "alice task", null, alice);
+    defer alice_task.deinit(testing.allocator);
+    var bob_task = try registry.createTask(testing.allocator, "bob task", null, bob);
+    defer bob_task.deinit(testing.allocator);
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bob","method":"tasks/list","params":{}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, bob);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"task-2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"task-1\"") == null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"totalSize\":1") != null);
+}
+
+test "a2a principal: session keys are scoped per principal for identical context ids" {
+    // Regression (#974): Bob supplying Alice's contextId must not select
+    // Alice's conversation state; the session key embeds the caller
+    // principal.
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    const bob = principalFromBearer("token-bob");
+    var alice_task = try registry.createTask(testing.allocator, "a", "ctx-shared", alice);
+    defer alice_task.deinit(testing.allocator);
+    var bob_task = try registry.createTask(testing.allocator, "b", "ctx-shared", bob);
+    defer bob_task.deinit(testing.allocator);
+
+    try testing.expect(!std.mem.eql(u8, alice_task.session_key, bob_task.session_key));
+}
+
+test "a2a principal: same bearer keeps sharing tasks and sessions" {
+    // Compatibility: a deployment whose callers share one token (or a
+    // permissive gateway with no token at all) behaves exactly as before.
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const p1 = principalFromBearer("token-alice");
+    const p2 = principalFromBearer("token-alice");
+    var t1 = try registry.createTask(testing.allocator, "a", "ctx-1", p1);
+    defer t1.deinit(testing.allocator);
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-2","method":"tasks/get","params":{"id":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, p2);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"result\"") != null);
+
+    var t2 = try registry.createTask(testing.allocator, "b", "ctx-1", p2);
+    defer t2.deinit(testing.allocator);
+    try testing.expectEqualStrings(t1.session_key, t2.session_key);
+
+    // Permissive gateways (no bearer) fingerprint the empty string: stable,
+    // and shared by all such callers.
+    try testing.expect(principalMatches(principalFromBearer(null), principalFromBearer("")));
+}
+
 test "handleJsonRpc dispatches tasks/get" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "test input", null);
+    var task = try registry.createTask(testing.allocator, "test input", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "test output")).?;
     defer completed.deinit(testing.allocator);
@@ -1908,7 +2155,7 @@ test "handleJsonRpc dispatches tasks/get" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-2","method":"tasks/get","params":{"id":"task-1"}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -1926,7 +2173,7 @@ test "handleJsonRpc returns error for unknown method" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-3","method":"unknown/method","params":{}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -1942,7 +2189,7 @@ test "handleJsonRpc returns error for missing method" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-4","params":{}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -1954,7 +2201,7 @@ test "buildTaskJson escapes special characters" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "hello \"world\"", null);
+    var task = try registry.createTask(testing.allocator, "hello \"world\"", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "line1\nline2\ttab")).?;
     defer completed.deinit(testing.allocator);
@@ -2031,7 +2278,7 @@ test "handleJsonRpc dispatches tasks/cancel" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "cancel me", null);
+    var task = try registry.createTask(testing.allocator, "cancel me", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     try testing.expect(registry.setTaskState(task.id, .working));
 
@@ -2039,7 +2286,7 @@ test "handleJsonRpc dispatches tasks/cancel" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-5","method":"tasks/cancel","params":{"id":"task-1"}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -2054,7 +2301,7 @@ test "handleJsonRpc cancel returns error for completed task" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "done", null);
+    var task = try registry.createTask(testing.allocator, "done", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "done")).?;
     defer completed.deinit(testing.allocator);
@@ -2063,7 +2310,7 @@ test "handleJsonRpc cancel returns error for completed task" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-6","method":"tasks/cancel","params":{"id":"task-1"}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2079,7 +2326,7 @@ test "handleJsonRpc tasks/get returns error for nonexistent task" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-7","method":"tasks/get","params":{"id":"task-nonexistent"}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2095,7 +2342,7 @@ test "handleJsonRpc returns error for removed tasks/send method" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-8","method":"tasks/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"Legacy test"}]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2111,7 +2358,7 @@ test "handleJsonRpc returns error for push notification config methods" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-pn","method":"tasks/pushNotificationConfig/set","params":{"taskId":"task-1"}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2127,7 +2374,7 @@ test "handleJsonRpc returns error for GetExtendedAgentCard" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-ec","method":"GetExtendedAgentCard","params":{}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2139,7 +2386,7 @@ test "buildTaskJson omits artifacts and history when agent_text is empty" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "test input", null);
+    var task = try registry.createTask(testing.allocator, "test input", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
 
     const json = try buildTaskJson(testing.allocator, &task, null);
@@ -2157,7 +2404,7 @@ test "buildTaskJson includes contextId artifactId messageId and message kind" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "test", "conversation-1");
+    var task = try registry.createTask(testing.allocator, "test", "conversation-1", principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "reply")).?;
     defer completed.deinit(testing.allocator);
@@ -2215,11 +2462,11 @@ test "multiple tasks get unique IDs" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var t1 = try registry.createTask(testing.allocator, "first", null);
+    var t1 = try registry.createTask(testing.allocator, "first", null, principalFromBearer(null));
     defer t1.deinit(testing.allocator);
-    var t2 = try registry.createTask(testing.allocator, "second", null);
+    var t2 = try registry.createTask(testing.allocator, "second", null, principalFromBearer(null));
     defer t2.deinit(testing.allocator);
-    var t3 = try registry.createTask(testing.allocator, "third", null);
+    var t3 = try registry.createTask(testing.allocator, "third", null, principalFromBearer(null));
     defer t3.deinit(testing.allocator);
 
     try testing.expectEqualStrings("task-1", t1.id);
@@ -2232,9 +2479,9 @@ test "handleJsonRpc dispatches tasks/list" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var t1 = try registry.createTask(testing.allocator, "first", null);
+    var t1 = try registry.createTask(testing.allocator, "first", null, principalFromBearer(null));
     defer t1.deinit(testing.allocator);
-    var t2 = try registry.createTask(testing.allocator, "second", "shared-context");
+    var t2 = try registry.createTask(testing.allocator, "second", "shared-context", principalFromBearer(null));
     defer t2.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, t1.id, .completed, "reply1")).?;
     defer completed.deinit(testing.allocator);
@@ -2244,7 +2491,7 @@ test "handleJsonRpc dispatches tasks/list" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-list","method":"tasks/list","params":{}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -2258,9 +2505,9 @@ test "handleListTasks filters by state" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var t1 = try registry.createTask(testing.allocator, "first", null);
+    var t1 = try registry.createTask(testing.allocator, "first", null, principalFromBearer(null));
     defer t1.deinit(testing.allocator);
-    var t2 = try registry.createTask(testing.allocator, "second", null);
+    var t2 = try registry.createTask(testing.allocator, "second", null, principalFromBearer(null));
     defer t2.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, t1.id, .completed, "done")).?;
     defer completed.deinit(testing.allocator);
@@ -2269,7 +2516,7 @@ test "handleListTasks filters by state" {
         \\{"jsonrpc":"2.0","id":"req-f","method":"tasks/list","params":{"state":"completed"}}
     ;
     var mock = MockSessionManager{};
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -2281,7 +2528,7 @@ test "handleListTasks accepts input-required filter" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "needs input", null);
+    var task = try registry.createTask(testing.allocator, "needs input", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     try mutateStoredTask(&registry, task.id, .input_required, null, 50);
 
@@ -2289,7 +2536,7 @@ test "handleListTasks accepts input-required filter" {
         \\{"jsonrpc":"2.0","id":"req-ir","method":"tasks/list","params":{"state":"input-required"}}
     ;
     var mock = MockSessionManager{};
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"input-required\"") != null);
@@ -2300,11 +2547,12 @@ test "listTasks returns empty slice when no tasks match" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "hello", null);
+    var task = try registry.createTask(testing.allocator, "hello", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
 
-    const tasks = try registry.listTasks(testing.allocator, .canceled, null, 50);
-    defer deinitTaskSnapshots(testing.allocator, tasks);
+    var page = try registry.listTasks(testing.allocator, .canceled, null, null, 50);
+    defer page.deinit(testing.allocator);
+    const tasks = page.tasks;
 
     try testing.expectEqual(@as(usize, 0), tasks.len);
 }
@@ -2334,19 +2582,20 @@ test "listTasks respects max_results and recency order" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var t1 = try registry.createTask(testing.allocator, "a", null);
+    var t1 = try registry.createTask(testing.allocator, "a", null, principalFromBearer(null));
     defer t1.deinit(testing.allocator);
-    var t2 = try registry.createTask(testing.allocator, "b", null);
+    var t2 = try registry.createTask(testing.allocator, "b", null, principalFromBearer(null));
     defer t2.deinit(testing.allocator);
-    var t3 = try registry.createTask(testing.allocator, "c", null);
+    var t3 = try registry.createTask(testing.allocator, "c", null, principalFromBearer(null));
     defer t3.deinit(testing.allocator);
 
     try mutateStoredTask(&registry, t1.id, .submitted, null, 10);
     try mutateStoredTask(&registry, t2.id, .submitted, null, 30);
     try mutateStoredTask(&registry, t3.id, .submitted, null, 20);
 
-    const tasks = try registry.listTasks(testing.allocator, null, null, 2);
-    defer deinitTaskSnapshots(testing.allocator, tasks);
+    var page = try registry.listTasks(testing.allocator, null, null, null, 2);
+    defer page.deinit(testing.allocator);
+    const tasks = page.tasks;
 
     try testing.expectEqual(@as(usize, 2), tasks.len);
     try testing.expectEqualStrings("task-2", tasks[0].id);
@@ -2361,26 +2610,30 @@ test "handleJsonRpc reuses provided contextId for follow-up turns" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-ctx","method":"message/send","params":{"message":{"messageId":"msg-1","contextId":"conversation-9","role":"user","parts":[{"type":"text","text":"Hello via context"}]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     var task = try getTaskSnapshotOrFail(&registry, "task-1");
     defer task.deinit(testing.allocator);
     try testing.expectEqualStrings("conversation-9", task.context_id);
-    try testing.expectEqualStrings("a2a:conversation-9", task.session_key);
+    var key_hex9: [16]u8 = undefined;
+    const expected_key9 = try std.fmt.allocPrint(testing.allocator, "a2a:{s}:conversation-9", .{principalHex16(&key_hex9, task.principal)});
+    defer testing.allocator.free(expected_key9);
+    try testing.expectEqualStrings(expected_key9, task.session_key);
 }
 
 test "listTasks filters by provided context id" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var first = try registry.createTask(testing.allocator, "first", "conversation-a");
+    var first = try registry.createTask(testing.allocator, "first", "conversation-a", principalFromBearer(null));
     defer first.deinit(testing.allocator);
-    var second = try registry.createTask(testing.allocator, "second", "conversation-b");
+    var second = try registry.createTask(testing.allocator, "second", "conversation-b", principalFromBearer(null));
     defer second.deinit(testing.allocator);
 
-    const tasks = try registry.listTasks(testing.allocator, null, "conversation-b", 10);
-    defer deinitTaskSnapshots(testing.allocator, tasks);
+    var page = try registry.listTasks(testing.allocator, null, "conversation-b", null, 10);
+    defer page.deinit(testing.allocator);
+    const tasks = page.tasks;
 
     try testing.expectEqual(@as(usize, 1), tasks.len);
     try testing.expectEqualStrings("conversation-b", tasks[0].context_id);
@@ -2390,7 +2643,7 @@ test "finalizeTask preserves canceled state and setTaskState does not revive it"
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "cancel race", null);
+    var task = try registry.createTask(testing.allocator, "cancel race", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     try testing.expect(registry.setTaskState(task.id, .working));
 
@@ -2415,7 +2668,7 @@ test "handleListTasks filters by rejected state" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "bad request", null);
+    var task = try registry.createTask(testing.allocator, "bad request", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     try mutateStoredTask(&registry, task.id, .rejected, null, 50);
 
@@ -2423,7 +2676,7 @@ test "handleListTasks filters by rejected state" {
         \\{"jsonrpc":"2.0","id":"req-rej","method":"tasks/list","params":{"state":"rejected"}}
     ;
     var mock = MockSessionManager{};
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"rejected\"") != null);
@@ -2433,7 +2686,7 @@ test "handleListTasks filters by auth-required state" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "needs auth", null);
+    var task = try registry.createTask(testing.allocator, "needs auth", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     try mutateStoredTask(&registry, task.id, .auth_required, null, 50);
 
@@ -2441,7 +2694,7 @@ test "handleListTasks filters by auth-required state" {
         \\{"jsonrpc":"2.0","id":"req-ar","method":"tasks/list","params":{"state":"auth-required"}}
     ;
     var mock = MockSessionManager{};
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"auth-required\"") != null);
@@ -2451,7 +2704,7 @@ test "handleListTasks accepts status filter alias" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "done", null);
+    var task = try registry.createTask(testing.allocator, "done", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "ok")).?;
     defer completed.deinit(testing.allocator);
@@ -2460,7 +2713,7 @@ test "handleListTasks accepts status filter alias" {
         \\{"jsonrpc":"2.0","id":"req-status","method":"ListTasks","params":{"status":"completed"}}
     ;
     var mock = MockSessionManager{};
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -2475,7 +2728,7 @@ test "handleListTasks rejects invalid status filter" {
         \\{"jsonrpc":"2.0","id":"req-bad-status","method":"ListTasks","params":{"status":"not-a-state"}}
     ;
     var mock = MockSessionManager{};
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2491,7 +2744,7 @@ test "handleSendMessage rejects missing messageId" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-no-mid","method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"No messageId"}]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2507,7 +2760,7 @@ test "handleSendMessage rejects incompatible acceptedOutputModes" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-modes","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]},"configuration":{"acceptedOutputModes":["image/png"]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2523,7 +2776,7 @@ test "handleSendMessage accepts text/plain in acceptedOutputModes" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-ok","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]},"configuration":{"acceptedOutputModes":["text/plain","image/png"]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -2540,7 +2793,7 @@ test "handleSendMessage completes without artifact when inbound routing skips" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-skip","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     // Regression: A2A must honor queue_mode routing and accept injected/dropped
@@ -2559,7 +2812,7 @@ test "handleSendMessage rejects negative historyLength" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-bad-history","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]},"configuration":{"historyLength":-1}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2571,7 +2824,7 @@ test "handleGetTask respects historyLength parameter" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "input", null);
+    var task = try registry.createTask(testing.allocator, "input", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "output")).?;
     defer completed.deinit(testing.allocator);
@@ -2582,7 +2835,7 @@ test "handleGetTask respects historyLength parameter" {
     const body_0 =
         \\{"jsonrpc":"2.0","id":"req-h0","method":"tasks/get","params":{"id":"task-1","historyLength":0}}
     ;
-    const resp_0 = handleJsonRpc(testing.allocator, body_0, &registry, &mock);
+    const resp_0 = handleJsonRpc(testing.allocator, body_0, &registry, &mock, principalFromBearer(null));
     defer if (resp_0.allocated) testing.allocator.free(resp_0.body);
     try testing.expect(std.mem.indexOf(u8, resp_0.body, "\"history\"") == null);
     try testing.expect(std.mem.indexOf(u8, resp_0.body, "\"artifacts\"") != null);
@@ -2591,7 +2844,7 @@ test "handleGetTask respects historyLength parameter" {
     const body_1 =
         \\{"jsonrpc":"2.0","id":"req-h1","method":"tasks/get","params":{"id":"task-1","historyLength":1}}
     ;
-    const resp_1 = handleJsonRpc(testing.allocator, body_1, &registry, &mock);
+    const resp_1 = handleJsonRpc(testing.allocator, body_1, &registry, &mock, principalFromBearer(null));
     defer if (resp_1.allocated) testing.allocator.free(resp_1.body);
     try testing.expect(std.mem.indexOf(u8, resp_1.body, "\"history\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp_1.body, "\"role\":\"agent\"") != null);
@@ -2601,7 +2854,7 @@ test "handleGetTask respects historyLength parameter" {
     const body_full =
         \\{"jsonrpc":"2.0","id":"req-hf","method":"tasks/get","params":{"id":"task-1"}}
     ;
-    const resp_full = handleJsonRpc(testing.allocator, body_full, &registry, &mock);
+    const resp_full = handleJsonRpc(testing.allocator, body_full, &registry, &mock, principalFromBearer(null));
     defer if (resp_full.allocated) testing.allocator.free(resp_full.body);
     try testing.expect(std.mem.indexOf(u8, resp_full.body, "\"role\":\"user\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp_full.body, "\"role\":\"agent\"") != null);
@@ -2611,13 +2864,13 @@ test "handleGetTask rejects negative historyLength" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "input", null);
+    var task = try registry.createTask(testing.allocator, "input", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var mock = MockSessionManager{};
     const body =
         \\{"jsonrpc":"2.0","id":"req-neg","method":"tasks/get","params":{"id":"task-1","historyLength":-1}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2633,7 +2886,7 @@ test "handleListTasks rejects negative historyLength" {
         \\{"jsonrpc":"2.0","id":"req-list-neg","method":"ListTasks","params":{"historyLength":-1}}
     ;
     var mock = MockSessionManager{};
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2645,7 +2898,7 @@ test "buildTaskJson historyLength limits history output" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "test", null);
+    var task = try registry.createTask(testing.allocator, "test", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     var completed = (try registry.finalizeTask(testing.allocator, task.id, .completed, "reply")).?;
     defer completed.deinit(testing.allocator);
@@ -2674,7 +2927,7 @@ test "handleCancelTask rejects rejected task" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var task = try registry.createTask(testing.allocator, "already rejected", null);
+    var task = try registry.createTask(testing.allocator, "already rejected", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
     try mutateStoredTask(&registry, task.id, .rejected, null, 50);
 
@@ -2682,7 +2935,7 @@ test "handleCancelTask rejects rejected task" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-cancel-rejected","method":"tasks/cancel","params":{"id":"task-1"}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2719,7 +2972,7 @@ test "handleJsonRpc dispatches SendMessage alias" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-alias","method":"SendMessage","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"Hello alias"}]}}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -2735,7 +2988,7 @@ test "handleJsonRpc returns error for CreateTaskPushNotificationConfig alias" {
     const body =
         \\{"jsonrpc":"2.0","id":"req-pn-alias","method":"CreateTaskPushNotificationConfig","params":{"taskId":"task-1"}}
     ;
-    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, principalFromBearer(null));
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
@@ -2773,4 +3026,128 @@ test "buildProgressHintEvent escapes special chars in tool name" {
     defer testing.allocator.free(data);
 
     try testing.expect(std.mem.indexOf(u8, data, "tool\\\"with\\\"quotes") != null);
+}
+
+test "listTasks applies the principal filter before truncating the page" {
+    // Regression (review on #1012): the page was cut from the global list and
+    // the principal filter applied afterwards, so another principal's newer
+    // tasks could push this caller's own task out of the page. A owns one
+    // older task, B one newer; A asking for pageSize 1 used to get nothing.
+    const owner_a = principalFromBearer("alice-session-key-0001");
+    const owner_b = principalFromBearer("bob-session-key-0002");
+
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task_a = try registry.createTask(testing.allocator, "a", null, owner_a);
+    defer task_a.deinit(testing.allocator);
+    var task_b = try registry.createTask(testing.allocator, "b", null, owner_b);
+    defer task_b.deinit(testing.allocator);
+
+    // B's task is the more recent one, so it sorts first.
+    try mutateStoredTask(&registry, task_a.id, .submitted, null, 10);
+    try mutateStoredTask(&registry, task_b.id, .submitted, null, 30);
+
+    var page = try registry.listTasks(testing.allocator, null, null, owner_a, 1);
+    defer page.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), page.tasks.len);
+    try testing.expectEqualStrings(task_a.id, page.tasks[0].id);
+    // The scoped total is the caller's own set, not the page length.
+    try testing.expectEqual(@as(usize, 1), page.total);
+}
+
+test "listTasks scoped total counts the whole matching set, not the page" {
+    // The same defect from the other side: totalSize described the current
+    // page, so a caller could not tell a short page from a filtered one.
+    const owner = principalFromBearer("alice-session-key-0001");
+
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var i: usize = 0;
+    var owned: [5]TaskSnapshot = undefined;
+    while (i < 5) : (i += 1) {
+        owned[i] = try registry.createTask(testing.allocator, "x", null, owner);
+        try mutateStoredTask(&registry, owned[i].id, .submitted, null, @intCast(10 + i));
+    }
+    for (&owned) |*t| t.deinit(testing.allocator);
+
+    var page = try registry.listTasks(testing.allocator, null, null, owner, 2);
+    defer page.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), page.tasks.len);
+    try testing.expectEqual(@as(usize, 5), page.total);
+}
+
+test "a2a principal: cancel of another caller's working task never interrupts" {
+    // Regression (review on #1012): the principal check runs before
+    // interruption and cancel, so a foreign caller's task must be
+    // indistinguishable from an unknown id -- and must not reach the
+    // interruption branch. The existing cancel test used a submitted task,
+    // which never enters that branch at all.
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    var alice_task = try registry.createTask(testing.allocator, "alice work", null, alice);
+    defer alice_task.deinit(testing.allocator);
+    // Make it working so the interruption branch is reachable.
+    try mutateStoredTask(&registry, alice_task.id, .working, null, 10);
+
+    var mock = MockSessionManager{};
+    const bob = principalFromBearer("token-bob");
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bob","method":"tasks/cancel","params":{"id":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, bob);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Task not found") != null);
+    // The whole point: no interruption was requested for a task Bob cannot see.
+    try testing.expectEqual(@as(usize, 0), mock.interrupt_calls);
+
+    // And Alice's task is still running, not canceled.
+    var still = (try registry.getTaskSnapshot(testing.allocator, "task-1")).?;
+    defer still.deinit(testing.allocator);
+    try testing.expect(still.state == .working);
+}
+
+test "a2a principal: resubscribe to another caller's task is not found" {
+    // Regression (review on #1012): asked for explicitly. Resubscribe is the
+    // second route to a task's output, so it needs the same scoping as list
+    // and cancel. The handler takes a live socket rather than the JSON body
+    // the other handlers use, so this drives it over a socketpair rather than
+    // leaving the route untested.
+    const socket_pair = @import("websocket.zig").createTestSocketPair() catch
+        return error.SkipZigTest;
+    const peer = socket_pair[1];
+    defer std.Io.Threaded.closeFd(peer);
+
+    var stream = std_compat.net.Stream{ .handle = socket_pair[0] };
+    defer stream.close();
+
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    var alice_task = try registry.createTask(testing.allocator, "alice work", null, alice);
+    defer alice_task.deinit(testing.allocator);
+    try mutateStoredTask(&registry, alice_task.id, .working, null, 10);
+
+    const bob = principalFromBearer("token-bob");
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bob","method":"tasks/resubscribe","params":{"id":"task-1"}}
+    ;
+    // No session manager: resubscribe only streams stored output, so there is
+    // no interruption path to assert on here.
+    handleResubscribeStreaming(testing.allocator, body, &stream, "req-bob", &registry, bob);
+
+    // The error goes to the SSE stream, not a JSON body.
+    var buf: [1024]u8 = undefined;
+    const n = try std.posix.read(peer, &buf);
+    try testing.expect(n > 0);
+    try testing.expect(std.mem.indexOf(u8, buf[0..n], "Task not found") != null);
+    // Crucially it is the not-found error, not a 200 stream header.
+    std.debug.print("\nRESUB<<{s}>>\n", .{buf[0..n]});
 }

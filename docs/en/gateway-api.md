@@ -163,6 +163,16 @@ Notes:
 
 ## A2A (Agent-to-Agent Protocol)
 
+### Caller isolation (bearer = principal)
+
+Tasks and context sessions on `/a2a` are scoped by the **caller principal**: the SHA-256 fingerprint of the request's bearer token (issue #974). `tasks/get`, `tasks/cancel`, and `tasks/resubscribe` for another caller's task return the same `Task not found` error as an unknown id — there is no existence oracle — and `tasks/list` only returns the caller's own tasks. Context session keys embed the principal, so supplying another caller's `contextId` starts a fresh session instead of joining their conversation.
+
+Consequences:
+
+- **One bearer per principal** is the trust model. Callers sharing a token (including permissive gateways with no paired tokens) deliberately share one bucket — treat a shared token as a single principal.
+- The raw token is never stored or logged; only its fingerprint keys the isolation.
+
+
 NullClaw implements [Google's A2A protocol v0.3.0](https://github.com/google/A2A) over JSON-RPC 2.0, enabling interoperability with any A2A-compatible agent or client.
 
 ### Configuration

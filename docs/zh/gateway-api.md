@@ -149,6 +149,16 @@ Teams webhook 说明：
 
 ## A2A（Agent-to-Agent 协议）
 
+### 调用方隔离（bearer = 主体）
+
+`/a2a` 上的任务与上下文会话按**调用方主体**（请求 bearer token 的 SHA-256 指纹，issue #974）隔离。对其他调用方的任务调用 `tasks/get`、`tasks/cancel`、`tasks/resubscribe` 时，返回与未知 id 相同的 `Task not found` 错误（不泄露任务是否存在）；`tasks/list` 只返回调用方自己的任务。上下文会话键包含主体信息，因此提交其他调用方的 `contextId` 会开启全新会话，而不是加入对方的对话。
+
+注意：
+
+- 信任模型为**每个主体一个 bearer token**。共享同一 token 的调用方（包括未配置 paired token 的宽松网关）会共享同一个隔离桶 —— 共享 token 即视为同一主体。
+- 原始 token 不会被存储或记录；隔离仅使用其指纹。
+
+
 NullClaw 实现了 [Google A2A 协议 v0.3.0](https://github.com/google/A2A)，基于 JSON-RPC 2.0，支持与任何兼容 A2A 的代理或客户端互操作。
 
 ### 配置
