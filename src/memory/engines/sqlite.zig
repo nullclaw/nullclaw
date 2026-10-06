@@ -1168,13 +1168,23 @@ pub const SqliteMemory = struct {
 
         if (fts_query.items.len == 0) return allocator.alloc(MemoryEntry, 0);
 
-        const sql =
+        // Session predicate is in SQL so LIMIT cannot be filled by other
+        // sessions' rows (global archive shards were crowding out the live session).
+        const sql_all =
             "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
             "WHERE memories_fts MATCH ?1 " ++
             "ORDER BY score " ++
             "LIMIT ?2";
+        const sql_scoped =
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
+            "FROM memories_fts f " ++
+            "JOIN memories m ON m.rowid = f.rowid " ++
+            "WHERE memories_fts MATCH ?1 AND m.session_id = ?2 " ++
+            "ORDER BY score " ++
+            "LIMIT ?3";
+        const sql = if (session_id != null) sql_scoped else sql_all;
 
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
@@ -1185,7 +1195,12 @@ pub const SqliteMemory = struct {
         try fts_query.append(allocator, 0);
         const fts_z = fts_query.items[0 .. fts_query.items.len - 1];
         _ = c.sqlite3_bind_text(stmt, 1, fts_z.ptr, @intCast(fts_z.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(limit));
+        } else {
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+        }
 
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
@@ -1227,7 +1242,7 @@ pub const SqliteMemory = struct {
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
 
-        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE ");
+        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE (");
 
         for (keywords.items, 0..) |_, i| {
             if (i > 0) try sql_buf.appendSlice(allocator, " OR ");
@@ -1237,9 +1252,16 @@ pub const SqliteMemory = struct {
             try appendInt(&sql_buf, allocator, i * 2 + 2);
             try sql_buf.appendSlice(allocator, " ESCAPE '\\')");
         }
+        try sql_buf.appendSlice(allocator, ")");
 
+        var next_param: usize = keywords.items.len * 2 + 1;
+        if (session_id != null) {
+            try sql_buf.appendSlice(allocator, " AND session_id = ?");
+            try appendInt(&sql_buf, allocator, next_param);
+            next_param += 1;
+        }
         try sql_buf.appendSlice(allocator, " ORDER BY updated_at DESC LIMIT ?");
-        try appendInt(&sql_buf, allocator, keywords.items.len * 2 + 1);
+        try appendInt(&sql_buf, allocator, next_param);
         try sql_buf.append(allocator, 0);
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -1259,7 +1281,12 @@ pub const SqliteMemory = struct {
             _ = c.sqlite3_bind_text(stmt, @intCast(i * 2 + 1), like.ptr, @intCast(like.len), SQLITE_STATIC);
             _ = c.sqlite3_bind_text(stmt, @intCast(i * 2 + 2), like.ptr, @intCast(like.len), SQLITE_STATIC);
         }
-        _ = c.sqlite3_bind_int64(stmt, @intCast(keywords.items.len * 2 + 1), @intCast(limit));
+        var bind_index: c_int = @intCast(keywords.items.len * 2 + 1);
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, bind_index, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+            bind_index += 1;
+        }
+        _ = c.sqlite3_bind_int64(stmt, bind_index, @intCast(limit));
 
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
@@ -2130,6 +2157,32 @@ test "sqlite recall with session_id filters correctly" {
     try std.testing.expectEqualStrings("k1", results[0].key);
     try std.testing.expect(results[0].session_id != null);
     try std.testing.expectEqualStrings("sess-a", results[0].session_id.?);
+}
+
+test "sqlite recall session filter is applied before the result limit" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Regression: LIMIT ran before the session filter, so higher-ranked global
+    // archive shards hid the only memory that belonged to the live session.
+    try m.store("scoped", "needle", .core, "sess-a");
+    var idx: usize = 0;
+    while (idx < 8) : (idx += 1) {
+        var key_buf: [96]u8 = undefined;
+        const key = try std.fmt.bufPrint(
+            &key_buf,
+            "archive:conversation:autosave_user_1700000000000000000:chunk:{d}",
+            .{idx},
+        );
+        try m.store(key, "needle needle needle needle needle needle", .{ .custom = "archive" }, null);
+    }
+
+    const results = try m.recall(std.testing.allocator, "needle", 1, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("scoped", results[0].key);
 }
 
 test "sqlite recall with null session_id returns all" {

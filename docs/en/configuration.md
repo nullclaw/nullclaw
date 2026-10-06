@@ -1020,6 +1020,11 @@ Common issues:
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
 - `auto_save`: persists conversation memory automatically.
+- `auto_recall` (default: `true`): when `false`, skips automatic memory injection into inbound messages. Storage via `auto_save` and on-demand recall via the `memory_recall` tool keep working.
+- `recall_limit` (default: `5`): maximum memory entries injected per message.
+- `max_context_bytes` (default: `4000`): total byte budget for the injected memory block, counting the header, keys, separators, and trailing newline. A single entry is truncated to half the budget; counts UTF-8 bytes. An entry that would push the block past the budget is dropped rather than written and trimmed afterwards.
+- `recall_limit` and `max_context_bytes` must be non-negative; a negative value is a configuration error rather than a crash. A value too large for the JSON parser to represent is ignored.
+- Archived conversation shards (hygiene copies of old turns) are excluded from automatic injection. Because hygiene deletes the original entry after preserving the archive, the `memory_recall` tool exposes `include_archived` (default `false`) so historical turns can still be retrieved explicitly.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
 
 **Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
