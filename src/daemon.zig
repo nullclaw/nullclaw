@@ -1154,11 +1154,12 @@ fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !A
             allocator.free(duped);
         }
         while (i < choices.options.len) : (i += 1) {
-            duped[i] = .{
-                .id = try allocator.dupe(u8, choices.options[i].id),
-                .label = try allocator.dupe(u8, choices.options[i].label),
-                .submit_text = try allocator.dupe(u8, choices.options[i].submit_text),
-            };
+            duped[i] = try outbound.Choice.initOwned(
+                allocator,
+                choices.options[i].id,
+                choices.options[i].label,
+                choices.options[i].submit_text,
+            );
         }
         break :blk duped;
     } else try allocator.alloc(outbound.Choice, 0);
@@ -1619,7 +1620,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var tunnel = startConfiguredTunnel(allocator, config, host, port, &state);
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("nullclaw gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });

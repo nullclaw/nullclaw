@@ -643,7 +643,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Output success as JSON to stdout
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     try bw.interface.writeAll("{\"status\":\"ok\"}\n");
     try bw.interface.flush();
 }

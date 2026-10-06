@@ -78,7 +78,15 @@ nullclaw onboard --interactive
 - OTEL spans 会在回合完成、agent 结束等自然运行边界触发 flush；更长运行流程仍保留批量 flush 作为兜底。
 - `diagnostics.otel.endpoint` 连接远程 collector 时应优先使用 `https://...`；`http://...` 仅适用于 localhost、私有网络 collector，或 `host.docker.internal`、`host.containers.internal`、`otel` 这类容器本地目标。
 
-示例：
+日志开关（默认均为 `false`）。这些 `info` 级别日志输出到 stderr —— `nullclaw agent` 或 `nullclaw gateway` 前台运行时直接打到终端；写入文件则由服务包装器或你自己的重定向负责：服务模式写入 `~/.nullclaw/logs/daemon.stderr.log`（launchd 服务配置会提供该文件），而 `gateway` 命令本身不会把这些日志路由到守护进程日志文件：
+
+- `log_tool_calls`：记录每次工具调用的名称、状态和耗时。工具参数只有在 `log_llm_io` 同时开启时才会记录。
+- `log_message_receipts`：记录收到用户消息的事件 —— 仅元数据（渠道、会话哈希、大小），不含内容。
+- `log_message_payloads`：记录入站/出站用户可见消息的内容预览 —— UTF-8 安全、上限 4,096 字节，超出时标记 `[log preview truncated]`。仅用于本地调试 —— 可能包含敏感文本。
+- `log_llm_io`：记录聊天调用提供方请求/响应的脱敏、截断预览，包括回复与推理（reasoning）内容的预览。仅用于本地调试 —— 可能包含敏感文本；生产环境请保持关闭。
+- `token_usage_ledger_enabled`（默认 `true`）以及 `token_usage_ledger_window_hours` / `token_usage_ledger_max_bytes` / `token_usage_ledger_max_lines`：将每次响应的 token 计数持久化到 config.json 附近的 JSONL 台账。仅记录 token 数量（提供方/模型/prompt/completion/total），绝不记录消息文本。
+
+示例（生产安全配置：涉及内容的开关均关闭）：
 
 ```json
 {
@@ -86,8 +94,8 @@ nullclaw onboard --interactive
     "backend": "otel",
     "log_tool_calls": true,
     "log_message_receipts": true,
-    "log_message_payloads": true,
-    "log_llm_io": true,
+    "log_message_payloads": false,
+    "log_llm_io": false,
     "otel": {
       "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
@@ -125,11 +133,60 @@ nullclaw onboard --interactive
 常见的 provider 级字段：
 
 - `api_key`：该 provider 条目的凭据。
-- `base_url`：用于自定义或自托管 OpenAI 兼容端点的地址覆盖。
+- `base_url`：provider 专用的 API 端点覆盖。所需的路径格式取决于 provider；
+  OpenAI 兼容 provider 通常需要以 `/v1` 结尾的 base，而原生 Anthropic provider 不需要。
 - `api_mode`：为兼容 provider 选择 `chat_completions` 或 `responses`。
 - `user_agent`：可选的 `User-Agent` 请求头覆盖。
 - `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
 - `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
+
+#### 原生 Anthropic provider
+
+NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API，无需经过 OpenRouter 或代理。
+
+认证方式：
+
+- **Anthropic Console API Key** 通过 `x-api-key` 请求头发送。请将密钥写入
+  `models.providers.anthropic.api_key`，或设置 `ANTHROPIC_API_KEY`。
+- **Claude 订阅 setup token**（以 `sk-ant-oat01-` 开头）通过 Bearer 认证发送。
+  先运行 `claude setup-token` 生成长期令牌，再将其写入
+  `models.providers.anthropic.api_key`，或设置 `ANTHROPIC_OAUTH_TOKEN`。
+  NullClaw 不会读取 Claude Code 的凭据存储，也不会刷新该令牌。请参阅
+  [Claude Code 认证指南](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)。
+
+该 provider 支持文本流式输出、URL 和 base64 图片输入，以及非流式请求中的原生工具调用。
+设置 `reasoning_effort`（或使用 `/think`）可在支持该功能的模型上启用 Anthropic
+扩展思考。NullClaw 对 Claude Opus/Sonnet 4.6 使用自适应思考，对支持该功能的旧模型
+使用手动预算；Anthropic 针对具体模型的限制仍然适用。
+
+示例（直接使用 Anthropic API Key）：
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": { "api_key": "sk-ant-api03-..." }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-sonnet-4-6" }
+    }
+  }
+}
+```
+
+说明：
+
+- 在 `agents.defaults.model.primary` 中，为 Anthropic 模型 ID 添加
+  `anthropic/` provider 前缀，例如 `anthropic/claude-sonnet-4-6`。如果 agent
+  条目单独设置了 `"provider": "anthropic"`，则使用不带前缀的模型 ID。
+  可通过 `nullclaw --list-models --provider anthropic` 浏览 NullClaw 收录的
+  Anthropic 模型 ID；该命令不会检查你的 Anthropic 账户实际启用了哪些模型。
+- `base_url` 字段是可选的，默认值为 `https://api.anthropic.com`。
+  对于 Anthropic 兼容的代理或网关，请将其设为 `/v1/messages` 之前的 API root
+  （不要包含末尾的 `/v1`）；NullClaw 会自行追加该路径。远程端点必须使用 HTTPS；
+  只有本地或私有网络主机才允许使用普通 HTTP。
 
 ### `agents.defaults.model.primary`
 
@@ -461,16 +518,17 @@ WeChat 示例：
 ```json
 {
   "channels": {
-    "wechat": [
-      {
-        "account_id": "main",
-        "callback_token": "wechat-callback-token",
-        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
-        "app_id": "wx1234567890abcdef",
-        "app_secret": "wechat-app-secret",
-        "allow_from": ["openid_123"]
+    "wechat": {
+      "accounts": {
+        "main": {
+          "callback_token": "wechat-callback-token",
+          "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+          "app_id": "wx1234567890abcdef",
+          "app_secret": "wechat-app-secret",
+          "allow_from": ["openid_123"]
+        }
       }
-    ]
+    }
   }
 }
 ```
@@ -482,15 +540,68 @@ WeChat 说明：
 - `callback_token` 是签名校验必填项。
 - `encoding_aes_key` 是可选项；当 WeChat 回调配置为 `encrypt_type=aes` 时必须提供。
 - `app_id` 和 `app_secret` 只有在需要通过 WeChat custom message API 主动发送消息时才需要。
-- `allow_from` 应显式列出可信 OpenID，不要依赖空 allowlist 来实现隐私隔离。
+- 空 `allow_from` 会拒绝入站消息；请显式列出可信 OpenID，仅在有意开放账号时使用 `"*"`。
 - 如果当前二进制未编译 WeChat channel，请使用 `-Dchannels=wechat`（或 `-Dchannels=all`）重新构建。
+
+#### Weixin — 微信 iLink Bot（扫码登录）
+
+`weixin` channel 通过二维码授权微信 iLink bot。这与上方使用签名 webhook 的
+`wechat` 公众号 channel 不同。
+
+首先，扫码登录获取 token：
+
+```bash
+nullclaw auth login weixin
+```
+
+此命令会在终端渲染二维码。使用微信扫码并在手机上确认授权后，命令会把生成的
+`token` 保存到配置文件；如果服务返回了非默认主机，也会保存对应的 `base_url`。
+
+登录后，编辑该命令更新的 Weixin 账号条目，显式设置 `allow_from`。新配置会使用
+下方所示的内联条目；已有的 `accounts` 对象会保留原布局。如果登录命令提供了
+`--proxy`，该代理会保存到同一账号，并继续用于运行时 API 请求。
+
+```json
+{
+  "channels": {
+    "weixin": {
+      "account_id": "default",
+      "token": "<扫码登录获取的 bot token>",
+      "base_url": "https://ilinkai.weixin.qq.com/",
+      "proxy": null,
+      "allow_from": ["<你的微信用户 ID>"]
+    }
+  }
+}
+```
+
+Weixin channel 字段：
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `account_id` | `"default"` | routing 和 session key 使用的内部账号标识 |
+| `token` | `""` | 从 `nullclaw auth login weixin` 获取的 bot token（必填） |
+| `base_url` | `https://ilinkai.weixin.qq.com/` | 不含 query/fragment 的绝对 HTTPS iLink API URL（地区重定向后可能变化） |
+| `proxy` | `null` | 运行时 API 请求使用的可选 `http://`、`https://` 或 `socks5://` 代理 URL |
+| `allow_from` | `[]` | 允许向 bot 发消息的精确微信用户 ID 列表；请显式配置 |
+
+说明：
+
+- 在 `allow_from` 列出可信用户 ID（或明确使用通配符 `"*"`）之前，不会接受任何入站消息。
+- `nullclaw auth status weixin` 只报告是否配置了非空 token，不会探测远端 iLink session。
+- 使用 `nullclaw auth logout weixin` 删除已配置的 token。
+- 需要代理时，使用 `nullclaw auth login weixin --proxy http://localhost:7890`；
+  该命令会保存代理，供登录流程和运行时 API 请求共同使用。
+- 如果二进制未编译 weixin channel，请使用 `-Dchannels=weixin`（或 `-Dchannels=all`）重新构建。
+- `nullclaw gateway` 会启动并监管已配置的 `weixin` 轮询循环。
+- 当前 adapter 把入站会话视为私聊并发送文本回复；尚未实现群聊 routing 和媒体/文件投递。
 
 规则说明：
 
 - 对基于 allowlist 的渠道，空 `allow_from` 会拒绝入站消息；如果要做私有机器人，请显式填写 ID/OpenID。
 - `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
 - Telegram webhook 必须配置 `channels.telegram.accounts.<id>.webhook_secret`，并要求 Telegram 的 `X-Telegram-Bot-Api-Secret-Token` header 匹配。
-- Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams[].webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
+- Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams.accounts.<id>.webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：
 
@@ -673,32 +784,33 @@ Max 示例：
 ```json
 {
   "channels": {
-    "max": [
-      {
-        "account_id": "main",
-        "bot_token": "MAX_BOT_TOKEN",
-        "allow_from": ["YOUR_MAX_USER_ID"],
-        "group_allow_from": ["YOUR_MAX_USER_ID"],
-        "group_policy": "allowlist",
-        "mode": "webhook",
-        "webhook_url": "https://bot.example.com/max?account_id=main",
-        "webhook_secret": "replace-with-random-secret",
-        "require_mention": true,
-        "streaming": true,
-        "interactive": {
-          "enabled": true,
-          "ttl_secs": 900,
-          "owner_only": true
+    "max": {
+      "accounts": {
+        "main": {
+          "bot_token": "MAX_BOT_TOKEN",
+          "allow_from": ["YOUR_MAX_USER_ID"],
+          "group_allow_from": ["YOUR_MAX_USER_ID"],
+          "group_policy": "allowlist",
+          "mode": "webhook",
+          "webhook_url": "https://bot.example.com/max?account_id=main",
+          "webhook_secret": "replace-with-random-secret",
+          "require_mention": true,
+          "streaming": true,
+          "interactive": {
+            "enabled": true,
+            "ttl_secs": 900,
+            "owner_only": true
+          }
         }
       }
-    ]
+    }
   }
 }
 ```
 
 Max 说明：
 
-- `channels.max` 是账号条目数组；`account_id` 用于区分多个 Max bot。
+- `channels.max.accounts` 是账号条目对象；每个对象 key 就是用于区分多个 Max bot 的 `account_id`。
 - 生产环境推荐 `mode = "webhook"`。Max 文档将 long polling 定位为开发/测试用途，webhook 是推荐的生产路径。
 - `webhook_url` 必须使用 HTTPS。
 - 多账号 webhook 场景下，每个账号应使用独立的 `webhook_secret` 或在 webhook URL 中使用独立的 `account_id` query，例如 `/max?account_id=main`。
@@ -720,8 +832,9 @@ Max 说明：
   - `host = "127.0.0.1"`
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
-- 如果绑定到非 loopback 地址，像 `/webhook`、`/cron/*`、`/a2a`、`/media/transcribe` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求已存储的 bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。
+- 如果绑定到非 loopback 地址，像 `/webhook`、`/a2a`、`/media/transcribe` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求完整权限的 gateway bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。`/cron/*` 也接受下文所述的独立 cron-scoped 凭据。
 - 如果绑定到非 loopback 地址，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `paired_tokens`。
+- 需要 cron 鉴权时，gateway 会在启动时创建一个仅限 `/cron/*` 使用的 bearer token。gateway 只保留其哈希，并把加密后的凭据以 `0600` 权限写入配置目录下的 `paired_token`，因此启用了 `require_pairing` 或公开绑定时，schedule/cron 工具也能完成认证，包括配置了预设 pairing token 的情况。该凭据会在每次 gateway 重启时轮换，不属于交互式 `/pair` token。与其他 bearer 凭据一样，它不绑定客户端 IP；必须防止配置目录泄露。`require_pairing = false` 的匿名 loopback gateway 不会创建此凭据。
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|

@@ -78,14 +78,14 @@ fn parse_command(arg: []const u8) ?Command {
 
 fn print_out(comptime fmt: []const u8, args: anytype) !void {
     var buf: [2048]u8 = undefined;
-    var out = std_compat.fs.File.stdout().writer(&buf);
+    var out = std_compat.fs.File.stdout().writerStreaming(&buf);
     try out.interface.print(fmt, args);
     try out.interface.flush();
 }
 
 fn print_err(comptime fmt: []const u8, args: anytype) !void {
     var buf: [2048]u8 = undefined;
-    var out = std_compat.fs.File.stderr().writer(&buf);
+    var out = std_compat.fs.File.stderr().writerStreaming(&buf);
     try out.interface.print(fmt, args);
     try out.interface.flush();
 }

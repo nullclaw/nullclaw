@@ -19,7 +19,7 @@ const TokenUsage = root.TokenUsage;
 /// Supports:
 /// - x-api-key authentication (standard API keys)
 /// - Bearer token authentication (setup/OAuth tokens starting with sk-ant-oat01-)
-/// - Custom base URLs for proxies/self-hosted endpoints
+/// - Custom base URLs for Anthropic-compatible proxies and gateways
 pub const AnthropicProvider = struct {
     credential: ?[]const u8,
     base_url: []const u8,
@@ -28,6 +28,8 @@ pub const AnthropicProvider = struct {
     const DEFAULT_BASE_URL = "https://api.anthropic.com";
     const API_VERSION = "2023-06-01";
     const DEFAULT_MAX_TOKENS: u32 = config_types.DEFAULT_MODEL_MAX_TOKENS;
+    const OAUTH_BETA_HEADER = "anthropic-beta: oauth-2025-04-20";
+    const OAUTH_USER_AGENT_HEADER = "User-Agent: claude-cli/2.1.2 (external, cli)";
 
     pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8, base_url: ?[]const u8) AnthropicProvider {
         const url = if (base_url) |u| trimTrailingSlash(u) else DEFAULT_BASE_URL;
@@ -62,6 +64,19 @@ pub const AnthropicProvider = struct {
     /// Build the messages endpoint URL.
     pub fn messagesUrl(self: AnthropicProvider, allocator: std.mem.Allocator) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{s}/v1/messages", .{self.base_url});
+    }
+
+    fn formatMessagesUrl(self: AnthropicProvider, buffer: []u8, is_oauth: bool) ![]const u8 {
+        const path: []const u8 = if (is_oauth) "/v1/messages?beta=true" else "/v1/messages";
+        return std.fmt.bufPrint(buffer, "{s}{s}", .{ self.base_url, path });
+    }
+
+    fn appendOAuthHeaders(headers_buf: *[4][]const u8, hdr_count: *usize, is_oauth: bool) void {
+        if (!is_oauth) return;
+        headers_buf[hdr_count.*] = OAUTH_BETA_HEADER;
+        hdr_count.* += 1;
+        headers_buf[hdr_count.*] = OAUTH_USER_AGENT_HEADER;
+        hdr_count.* += 1;
     }
 
     /// Build a simple chat request JSON body.
@@ -266,10 +281,7 @@ pub const AnthropicProvider = struct {
 
         // URL: stack-allocated (base_url + path is bounded)
         var url_buf: [2048]u8 = undefined;
-        const url = if (is_oauth)
-            std.fmt.bufPrint(&url_buf, "{s}/v1/messages?beta=true", .{self.base_url}) catch return error.AnthropicApiError
-        else
-            std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.base_url}) catch return error.AnthropicApiError;
+        const url = self.formatMessagesUrl(&url_buf, is_oauth) catch return error.AnthropicApiError;
 
         const body = try buildSimpleRequestBody(allocator, system_prompt, message, model, temperature);
         defer allocator.free(body);
@@ -290,12 +302,7 @@ pub const AnthropicProvider = struct {
         hdr_count += 1;
         headers_buf[hdr_count] = version_hdr;
         hdr_count += 1;
-        if (is_oauth) {
-            headers_buf[hdr_count] = "anthropic-beta: oauth-2025-04-20";
-            hdr_count += 1;
-            headers_buf[hdr_count] = "User-Agent: claude-cli/2.1.2 (external, cli)";
-            hdr_count += 1;
-        }
+        appendOAuthHeaders(&headers_buf, &hdr_count, is_oauth);
 
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..hdr_count], 0) catch |err| return root.preserveCurlTransportError(err, error.AnthropicApiError);
         defer allocator.free(resp_body);
@@ -316,10 +323,7 @@ pub const AnthropicProvider = struct {
 
         // URL: stack-allocated (base_url + path is bounded)
         var url_buf: [2048]u8 = undefined;
-        const url = if (is_oauth)
-            std.fmt.bufPrint(&url_buf, "{s}/v1/messages?beta=true", .{self.base_url}) catch return error.AnthropicApiError
-        else
-            std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.base_url}) catch return error.AnthropicApiError;
+        const url = self.formatMessagesUrl(&url_buf, is_oauth) catch return error.AnthropicApiError;
 
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
@@ -340,12 +344,7 @@ pub const AnthropicProvider = struct {
         hdr_count += 1;
         headers_buf[hdr_count] = version_hdr;
         hdr_count += 1;
-        if (is_oauth) {
-            headers_buf[hdr_count] = "anthropic-beta: oauth-2025-04-20";
-            hdr_count += 1;
-            headers_buf[hdr_count] = "User-Agent: claude-cli/2.1.2 (external, cli)";
-            hdr_count += 1;
-        }
+        appendOAuthHeaders(&headers_buf, &hdr_count, is_oauth);
 
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..hdr_count], request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.AnthropicApiError);
         defer allocator.free(resp_body);
@@ -382,15 +381,15 @@ pub const AnthropicProvider = struct {
     ) anyerror!root.StreamChatResult {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
         const credential = self.credential orelse return error.CredentialsNotSet;
+        const is_oauth = isSetupToken(credential);
 
         var url_buf: [2048]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.base_url}) catch return error.AnthropicApiError;
+        const url = self.formatMessagesUrl(&url_buf, is_oauth) catch return error.AnthropicApiError;
 
         const body = try buildStreamingChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         // Build auth header directly on stack
-        const is_oauth = isSetupToken(credential);
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = if (is_oauth)
             std.fmt.bufPrint(&auth_hdr_buf, "authorization: Bearer {s}", .{credential}) catch return error.AnthropicApiError
@@ -407,10 +406,7 @@ pub const AnthropicProvider = struct {
         hdr_count += 1;
         headers_buf[hdr_count] = version_hdr;
         hdr_count += 1;
-        if (isSetupToken(credential)) {
-            headers_buf[hdr_count] = "anthropic-beta: oauth-2025-04-20";
-            hdr_count += 1;
-        }
+        appendOAuthHeaders(&headers_buf, &hdr_count, is_oauth);
 
         return sse.curlStreamAnthropic(allocator, url, body, headers_buf[0..hdr_count], callback, callback_ctx) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
@@ -509,10 +505,7 @@ fn buildChatRequestBody(
         try buf.append(allocator, '}');
     }
 
-    try buf.appendSlice(allocator, "],\"temperature\":");
-    var temp_buf: [16]u8 = undefined;
-    const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.AnthropicApiError;
-    try buf.appendSlice(allocator, temp_str);
+    try buf.append(allocator, ']');
 
     if (request.tools) |tools| {
         if (tools.len > 0) {
@@ -520,7 +513,7 @@ fn buildChatRequestBody(
             try root.convertToolsAnthropic(&buf, allocator, tools);
         }
     }
-    try appendAnthropicThinkingConfig(&buf, allocator, max_tokens, request.reasoning_effort);
+    try appendAnthropicGenerationConfig(&buf, allocator, model, max_tokens, temperature, request.reasoning_effort);
 
     try buf.append(allocator, '}');
     return try buf.toOwnedSlice(allocator);
@@ -576,10 +569,7 @@ fn buildStreamingChatRequestBody(
         try buf.append(allocator, '}');
     }
 
-    try buf.appendSlice(allocator, "],\"temperature\":");
-    var temp_buf: [16]u8 = undefined;
-    const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.AnthropicApiError;
-    try buf.appendSlice(allocator, temp_str);
+    try buf.append(allocator, ']');
 
     if (request.tools) |tools| {
         if (tools.len > 0) {
@@ -587,29 +577,55 @@ fn buildStreamingChatRequestBody(
             try root.convertToolsAnthropic(&buf, allocator, tools);
         }
     }
-    try appendAnthropicThinkingConfig(&buf, allocator, max_tokens, request.reasoning_effort);
+    try appendAnthropicGenerationConfig(&buf, allocator, model, max_tokens, temperature, request.reasoning_effort);
 
     try buf.appendSlice(allocator, ",\"stream\":true}");
     return try buf.toOwnedSlice(allocator);
 }
 
-fn appendAnthropicThinkingConfig(
+fn appendAnthropicGenerationConfig(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
+    model: []const u8,
     max_tokens: u32,
+    temperature: f64,
     reasoning_effort: ?[]const u8,
 ) !void {
-    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse return;
-    if (std.ascii.eqlIgnoreCase(effort, "none")) return;
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort);
+    if (effort == null or std.ascii.eqlIgnoreCase(effort.?, "none")) {
+        try buf.appendSlice(allocator, ",\"temperature\":");
+        var temp_buf: [16]u8 = undefined;
+        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.AnthropicApiError;
+        try buf.appendSlice(allocator, temp_str);
+        return;
+    }
 
-    // Anthropic extended thinking requires a budget. Keep a conservative floor
-    // and never exceed output budget.
-    const budget: u32 = if (std.ascii.eqlIgnoreCase(effort, "low"))
-        @min(max_tokens, 1024)
-    else if (std.ascii.eqlIgnoreCase(effort, "medium"))
-        @min(max_tokens, 4096)
+    const normalized_effort: []const u8 = if (std.ascii.eqlIgnoreCase(effort.?, "low"))
+        "low"
+    else if (std.ascii.eqlIgnoreCase(effort.?, "medium"))
+        "medium"
     else
-        @min(max_tokens, 8192);
+        "high";
+
+    if (std.mem.eql(u8, model, "claude-opus-4-6") or std.mem.eql(u8, model, "claude-sonnet-4-6")) {
+        try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"");
+        try buf.appendSlice(allocator, normalized_effort);
+        try buf.appendSlice(allocator, "\"}");
+        return;
+    }
+
+    const MIN_THINKING_BUDGET: u32 = 1024;
+    if (max_tokens <= MIN_THINKING_BUDGET) return error.AnthropicThinkingBudgetTooSmall;
+
+    // Manual extended thinking requires at least 1,024 tokens and a budget
+    // strictly smaller than max_tokens.
+    const requested_budget: u32 = if (std.mem.eql(u8, normalized_effort, "low"))
+        MIN_THINKING_BUDGET
+    else if (std.mem.eql(u8, normalized_effort, "medium"))
+        4096
+    else
+        8192;
+    const budget = @min(requested_budget, max_tokens - 1);
 
     try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":");
     var budget_buf: [16]u8 = undefined;
@@ -671,6 +687,30 @@ test "messages url with custom base" {
     const url = try p.messagesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://proxy.example.com/v1/messages", url);
+}
+
+test "OAuth request metadata matches blocking and streaming paths" {
+    // Regression: setup-token streaming must use the same beta URL and headers
+    // as blocking requests, otherwise authentication can fail as an empty stream.
+    const p = AnthropicProvider.init(std.testing.allocator, null, null);
+    var url_buf: [256]u8 = undefined;
+    const oauth_url = try p.formatMessagesUrl(&url_buf, true);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages?beta=true", oauth_url);
+
+    var headers: [4][]const u8 = undefined;
+    headers[0] = "authorization: Bearer token";
+    headers[1] = "anthropic-version: 2023-06-01";
+    var header_count: usize = 2;
+    AnthropicProvider.appendOAuthHeaders(&headers, &header_count, true);
+    try std.testing.expectEqual(@as(usize, 4), header_count);
+    try std.testing.expectEqualStrings(AnthropicProvider.OAUTH_BETA_HEADER, headers[2]);
+    try std.testing.expectEqualStrings(AnthropicProvider.OAUTH_USER_AGENT_HEADER, headers[3]);
+
+    const api_key_url = try p.formatMessagesUrl(&url_buf, false);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", api_key_url);
+    header_count = 2;
+    AnthropicProvider.appendOAuthHeaders(&headers, &header_count, false);
+    try std.testing.expectEqual(@as(usize, 2), header_count);
 }
 
 test "auth header for regular key" {
@@ -885,7 +925,7 @@ test "parseNativeResponse multiple tool calls" {
 
 test "parseNativeResponse model field extracted" {
     const body =
-        \\{"content":[{"type":"text","text":"Hi"}],"model":"claude-sonnet-4-20250514"}
+        \\{"content":[{"type":"text","text":"Hi"}],"model":"claude-sonnet-4-6"}
     ;
     const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
     defer {
@@ -893,7 +933,7 @@ test "parseNativeResponse model field extracted" {
         std.testing.allocator.free(response.tool_calls);
         std.testing.allocator.free(response.model);
     }
-    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", response.model);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", response.model);
 }
 
 test "parseNativeResponse trims whitespace text" {
@@ -998,7 +1038,7 @@ test "buildChatRequestBody defaults max_tokens to runtime fallback" {
     try std.testing.expectEqual(@as(i64, config_types.DEFAULT_MODEL_MAX_TOKENS), max_tokens.integer);
 }
 
-test "buildChatRequestBody emits thinking config when reasoning_effort is set" {
+test "buildChatRequestBody uses adaptive thinking for Claude 4.6" {
     const allocator = std.testing.allocator;
     const msgs = [_]ChatMessage{
         .{ .role = .user, .content = "hello" },
@@ -1008,11 +1048,16 @@ test "buildChatRequestBody emits thinking config when reasoning_effort is set" {
         .reasoning_effort = "high",
     };
 
-    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    const body = try buildChatRequestBody(allocator, req, "claude-sonnet-4-6", 0.7);
     defer allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"budget_tokens\":") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("adaptive", obj.get("thinking").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("high", obj.get("output_config").?.object.get("effort").?.string);
+    try std.testing.expect(obj.get("temperature") == null);
+    try std.testing.expect(obj.get("thinking").?.object.get("budget_tokens") == null);
 }
 
 test "buildChatRequestBody omits thinking config when reasoning_effort is none" {
@@ -1028,7 +1073,80 @@ test "buildChatRequestBody omits thinking config when reasoning_effort is none" 
     const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
     defer allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("thinking") == null);
+    try std.testing.expectEqual(@as(f64, 0.7), parsed.value.object.get("temperature").?.float);
+}
+
+test "buildChatRequestBody keeps manual thinking budget below max tokens" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{.{ .role = .user, .content = "hello" }};
+    const req = ChatRequest{
+        .messages = &msgs,
+        .max_tokens = 8192,
+        .reasoning_effort = "high",
+    };
+
+    const body = try buildChatRequestBody(allocator, req, "claude-haiku-4-5", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("enabled", obj.get("thinking").?.object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 8191), obj.get("thinking").?.object.get("budget_tokens").?.integer);
+    try std.testing.expect(obj.get("temperature") == null);
+}
+
+test "buildChatRequestBody uses minimum valid manual thinking budget" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{.{ .role = .user, .content = "hello" }};
+    const req = ChatRequest{
+        .messages = &msgs,
+        .max_tokens = 1025,
+        .reasoning_effort = "low",
+    };
+
+    const body = try buildChatRequestBody(allocator, req, "claude-haiku-4-5", 0.7);
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1024), parsed.value.object.get("thinking").?.object.get("budget_tokens").?.integer);
+}
+
+test "buildChatRequestBody rejects max tokens too small for manual thinking" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{.{ .role = .user, .content = "hello" }};
+    const req = ChatRequest{
+        .messages = &msgs,
+        .max_tokens = 1024,
+        .reasoning_effort = "low",
+    };
+
+    try std.testing.expectError(
+        error.AnthropicThinkingBudgetTooSmall,
+        buildChatRequestBody(allocator, req, "claude-haiku-4-5", 0.7),
+    );
+}
+
+test "buildStreamingChatRequestBody uses adaptive thinking without temperature" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{.{ .role = .user, .content = "hello" }};
+    const req = ChatRequest{
+        .messages = &msgs,
+        .reasoning_effort = "medium",
+    };
+
+    const body = try buildStreamingChatRequestBody(allocator, req, "claude-opus-4-6", 0.7);
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("adaptive", obj.get("thinking").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("medium", obj.get("output_config").?.object.get("effort").?.string);
+    try std.testing.expect(obj.get("temperature") == null);
+    try std.testing.expect(obj.get("stream").?.bool);
 }
 
 test "buildStreamingChatRequestBody contains same messages as non-streaming" {

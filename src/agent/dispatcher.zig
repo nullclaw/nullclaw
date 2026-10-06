@@ -113,6 +113,12 @@ pub fn containsToolCallMarkup(text: []const u8) bool {
         std.mem.indexOf(u8, text, "[/tool_call]") != null;
 }
 
+fn freeParsedToolCall(allocator: std.mem.Allocator, call: ParsedToolCall) void {
+    allocator.free(call.name);
+    allocator.free(call.arguments_json);
+    if (call.tool_call_id) |id| allocator.free(id);
+}
+
 /// Parse tool calls from an LLM response using XML-style `<tool_call>` tags.
 ///
 /// Expected format:
@@ -138,10 +144,7 @@ pub fn parseXmlToolCalls(
 
     var calls: std.ArrayListUnmanaged(ParsedToolCall) = .empty;
     errdefer {
-        for (calls.items) |call| {
-            allocator.free(call.name);
-            allocator.free(call.arguments_json);
-        }
+        for (calls.items) |call| freeParsedToolCall(allocator, call);
         calls.deinit(allocator);
     }
 
@@ -260,6 +263,7 @@ pub fn parseXmlToolCalls(
             }
 
             if (parsed_call) |call| {
+                errdefer freeParsedToolCall(allocator, call);
                 try calls.append(allocator, call);
             }
 
@@ -273,6 +277,7 @@ pub fn parseXmlToolCalls(
             if (inner_unclosed.len > 0) {
                 if (inner_unclosed[0] == '{' and inner_unclosed[inner_unclosed.len - 1] == '}') {
                     if (parseToolCallJson(allocator, inner_unclosed)) |call| {
+                        errdefer freeParsedToolCall(allocator, call);
                         const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
                         if (before.len > 0) try text_parts.append(allocator, before);
                         try calls.append(allocator, call);
@@ -285,6 +290,7 @@ pub fn parseXmlToolCalls(
 
                 if (!recovered) {
                     if (parseNamePrefixedJsonCall(allocator, inner_unclosed)) |call| {
+                        errdefer freeParsedToolCall(allocator, call);
                         const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
                         if (before.len > 0) try text_parts.append(allocator, before);
                         try calls.append(allocator, call);
@@ -379,10 +385,16 @@ pub fn parseStructuredToolCalls(
     for (tool_calls) |tc| {
         if (tc.name.len == 0) continue;
 
+        const name = try allocator.dupe(u8, tc.name);
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, tc.arguments);
+        errdefer allocator.free(arguments_json);
+        const tool_call_id = if (tc.id.len > 0) try allocator.dupe(u8, tc.id) else null;
+        errdefer if (tool_call_id) |id| allocator.free(id);
         try calls.append(allocator, .{
-            .name = try allocator.dupe(u8, tc.name),
-            .arguments_json = try allocator.dupe(u8, tc.arguments),
-            .tool_call_id = if (tc.id.len > 0) try allocator.dupe(u8, tc.id) else null,
+            .name = name,
+            .arguments_json = arguments_json,
+            .tool_call_id = tool_call_id,
         });
     }
 
@@ -472,6 +484,7 @@ pub fn parseNativeToolCalls(
         .null => try allocator.dupe(u8, ""),
         else => try allocator.dupe(u8, ""),
     } else try allocator.dupe(u8, "");
+    errdefer allocator.free(text);
 
     // Extract tool_calls array
     const tool_calls_val = obj.get("tool_calls") orelse return .{
@@ -530,10 +543,16 @@ pub fn parseNativeToolCalls(
             else => null,
         } else null;
 
+        const name = try allocator.dupe(u8, name_str);
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, args_str);
+        errdefer allocator.free(arguments_json);
+        const tool_call_id = if (tc_id) |id| try allocator.dupe(u8, id) else null;
+        errdefer if (tool_call_id) |id| allocator.free(id);
         try calls.append(allocator, .{
-            .name = try allocator.dupe(u8, name_str),
-            .arguments_json = try allocator.dupe(u8, args_str),
-            .tool_call_id = if (tc_id) |id| try allocator.dupe(u8, id) else null,
+            .name = name,
+            .arguments_json = arguments_json,
+            .tool_call_id = tool_call_id,
         });
     }
 
@@ -1833,6 +1852,32 @@ test "parseToolCalls rejects literal colon tool name" {
     try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }
 
+fn parseXmlToolCallsForAllocationTest(allocator: std.mem.Allocator, response: []const u8) !void {
+    const result = try parseXmlToolCalls(allocator, response);
+    allocator.free(result.text);
+    for (result.calls) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+        if (call.tool_call_id) |id| allocator.free(id);
+    }
+    allocator.free(result.calls);
+}
+
+test "parseXmlToolCalls frees parsed calls when an allocation fails" {
+    const response =
+        \\Let me check the disk layout first.
+        \\<tool_call>
+        \\{"name":"shell","arguments":{"command":"df -h"}}
+        \\</tool_call>
+        \\Then I will summarise.
+    ;
+    // Regression: a call that parsed successfully leaked its name and arguments
+    // when a later allocation in the same parse failed (appending to the call
+    // list, or assembling the remaining text), because only already-appended
+    // calls were freed on the error path.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseXmlToolCallsForAllocationTest, .{response});
+}
+
 test "parseToolCalls malformed xml-like arg_key payload is skipped" {
     const allocator = std.testing.allocator;
     const response =
@@ -3119,4 +3164,29 @@ test "buildAssistantHistoryWithToolCalls escapes special chars in name" {
     defer parsed.deinit();
     const name = parsed.value.object.get("name").?.string;
     try std.testing.expectEqualStrings("shell\"injection", name);
+}
+
+fn parseNativeToolCallsForAllocationTest(allocator: std.mem.Allocator) !void {
+    const result = try parseNativeToolCalls(allocator, "{\"content\":\"text\",\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}");
+    defer allocator.free(result.text);
+    defer allocator.free(result.calls);
+    for (result.calls) |call| freeParsedToolCall(allocator, call);
+}
+fn parseStructuredToolCallsForAllocationTest(allocator: std.mem.Allocator) !void {
+    const calls = try parseStructuredToolCalls(allocator, &.{.{ .id = "call_1", .name = "shell", .arguments = "{}" }});
+    defer allocator.free(calls);
+    for (calls) |call| freeParsedToolCall(allocator, call);
+}
+test "dispatcher native parsing frees all allocations on failure" {
+    // Regression: PR #1011's ownership fix also applies to native calls.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseNativeToolCallsForAllocationTest, .{});
+}
+test "dispatcher structured parsing frees all allocations on failure" {
+    // Regression: PR #1011's ownership fix also applies to structured calls.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseStructuredToolCallsForAllocationTest, .{});
+}
+test "dispatcher unclosed XML recovery frees all allocations on failure" {
+    // Regression: exercise both additional ownership-transfer sites in #1011.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseXmlToolCallsForAllocationTest, .{"before <tool_call>{\"name\":\"shell\",\"arguments\":{}}"});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseXmlToolCallsForAllocationTest, .{"before <tool_call>shell{}"});
 }

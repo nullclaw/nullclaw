@@ -93,7 +93,15 @@ The example below is enough to run local CLI mode (replace API key):
 - OTEL spans are flushed at natural runtime boundaries such as turn completion and agent shutdown, with batch flushing still used as a fallback for longer-running flows.
 - `diagnostics.otel.endpoint` should use `https://...` for remote collectors. Plain `http://...` is accepted only for localhost/private collectors or container-local targets such as `host.docker.internal`, `host.containers.internal`, or single-label service names like `otel`.
 
-Example:
+Logging flags (all default `false`). The `info`-level lines go to stderr: the terminal when `nullclaw agent` or `nullclaw gateway` runs in the foreground. Getting them into a file is up to the service wrapper or your own redirection — service mode writes `~/.nullclaw/logs/daemon.stderr.log` (the launchd service config supplies it), while the `gateway` command itself does not route them to a daemon log file:
+
+- `log_tool_calls`: log each tool call with name, status, and duration. Tool arguments are included only when `log_llm_io` is also enabled.
+- `log_message_receipts`: log when a user message is received — metadata only (channel, session hash, size), never content.
+- `log_message_payloads`: log a content preview of inbound/outbound user-visible messages — UTF-8-safe and capped at 4,096 bytes, marked `[log preview truncated]` when longer. Local debugging only — can include sensitive text.
+- `log_llm_io`: log redacted, truncated previews of provider request/response content around chat calls, including response and reasoning previews. Local debugging only — can include sensitive text; keep off in production.
+- `token_usage_ledger_enabled` (default `true`) plus `token_usage_ledger_window_hours` / `token_usage_ledger_max_bytes` / `token_usage_ledger_max_lines`: persist per-response token counters to a JSONL ledger near `config.json`. Token counts only — provider/model/prompt/completion/total — never message text.
+
+Example (production-safe: content-bearing flags off):
 
 ```json
 {
@@ -101,8 +109,8 @@ Example:
     "backend": "otel",
     "log_tool_calls": true,
     "log_message_receipts": true,
-    "log_message_payloads": true,
-    "log_llm_io": true,
+    "log_message_payloads": false,
+    "log_llm_io": false,
     "otel": {
       "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
@@ -140,11 +148,65 @@ Example:
 Common per-provider fields:
 
 - `api_key`: credential for that provider entry.
-- `base_url`: override for custom or self-hosted OpenAI-compatible endpoints.
+- `base_url`: provider-specific API endpoint override. The expected path shape
+  depends on the provider; OpenAI-compatible providers usually expect a `/v1`
+  base, while the native Anthropic provider does not.
 - `api_mode`: select `chat_completions` or `responses` for compatible providers.
 - `user_agent`: optional `User-Agent` header override.
 - `max_streaming_prompt_bytes`: skip streaming above this estimated prompt size.
 - `chat_template_enable_thinking_param`: for custom OpenAI-compatible vLLM/Qwen endpoints, map `reasoning_effort` to `chat_template_kwargs.enable_thinking`.
+
+#### Native Anthropic provider
+
+NullClaw has a dedicated Anthropic provider that connects directly to the Anthropic API
+— no OpenRouter or proxy is required.
+
+Authentication options:
+
+- **Anthropic Console API keys** are sent in the `x-api-key` header. Put the key
+  in `models.providers.anthropic.api_key` or set `ANTHROPIC_API_KEY`.
+- **Claude subscription setup tokens** beginning with `sk-ant-oat01-` are sent
+  with Bearer authentication. Generate a long-lived token with `claude setup-token`,
+  then put it in `models.providers.anthropic.api_key` or set
+  `ANTHROPIC_OAUTH_TOKEN`. NullClaw does not read Claude Code's credential store
+  or refresh the token. See the [Claude Code authentication guide](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token).
+
+The provider supports text streaming, URL and base64 image inputs, and native
+tool calls on non-streaming requests. Setting `reasoning_effort` (or using
+`/think`) enables Anthropic extended thinking on models that support it.
+NullClaw uses adaptive thinking for Claude Opus/Sonnet 4.6 and a manual budget
+for older supported models; model-specific Anthropic restrictions still apply.
+
+Example (direct Anthropic API key):
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": { "api_key": "sk-ant-api03-..." }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-sonnet-4-6" }
+    }
+  }
+}
+```
+
+Notes:
+
+- In `agents.defaults.model.primary`, prefix the Anthropic model ID with
+  `anthropic/`, for example `anthropic/claude-sonnet-4-6`. When an agent entry
+  has a separate `"provider": "anthropic"` field, use the bare model ID instead.
+  Browse NullClaw's cataloged Anthropic model IDs with
+  `nullclaw --list-models --provider anthropic`; this command does not inspect
+  the models enabled for your Anthropic account.
+- The `base_url` field is optional and defaults to `https://api.anthropic.com`.
+  For an Anthropic-compatible proxy or gateway, set it to the API root before
+  `/v1/messages` (do not include the final `/v1`); NullClaw appends that path.
+  Remote endpoints must use HTTPS. Plain HTTP is accepted only for local or
+  private-network hosts.
 
 ### `agents.defaults.model.primary`
 
@@ -521,16 +583,17 @@ WeChat example:
 ```json
 {
   "channels": {
-    "wechat": [
-      {
-        "account_id": "main",
-        "callback_token": "wechat-callback-token",
-        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
-        "app_id": "wx1234567890abcdef",
-        "app_secret": "wechat-app-secret",
-        "allow_from": ["openid_123"]
+    "wechat": {
+      "accounts": {
+        "main": {
+          "callback_token": "wechat-callback-token",
+          "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+          "app_id": "wx1234567890abcdef",
+          "app_secret": "wechat-app-secret",
+          "allow_from": ["openid_123"]
+        }
       }
-    ]
+    }
   }
 }
 ```
@@ -542,8 +605,67 @@ WeChat notes:
 - `callback_token` is required for signature verification.
 - `encoding_aes_key` is optional but required when your WeChat callback is configured for `encrypt_type=aes`.
 - `app_id` and `app_secret` are optional unless you want outbound active-message delivery through the WeChat custom message API.
-- `allow_from` should list trusted OpenIDs. Keep it explicit; do not rely on an empty allowlist for privacy.
+- An empty `allow_from` denies inbound messages; list trusted OpenIDs explicitly, or use `"*"` only for an intentionally open account.
 - Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
+
+#### Weixin — WeChat iLink Bot (QR Code Login)
+
+The `weixin` channel authorizes a WeChat iLink bot by QR code. This is separate
+from the `wechat` Official Account channel above, which uses signed webhooks.
+
+First, log in and obtain a token:
+
+```bash
+nullclaw auth login weixin
+```
+
+This renders a QR code in the terminal. Scan it with WeChat and confirm the
+authorization on your phone. The command saves the resulting `token` and, when
+the service returns a non-default host, its `base_url` to your config.
+
+After login, edit the Weixin account entry updated by the command to set an
+explicit `allow_from` list. On a new config this is the inline entry shown
+below; an existing `accounts` object keeps its layout. When supplied, the login
+command's `--proxy` value is saved in the same account and reused for runtime
+API requests.
+
+```json
+{
+  "channels": {
+    "weixin": {
+      "account_id": "default",
+      "token": "<bot-token-from-qr-login>",
+      "base_url": "https://ilinkai.weixin.qq.com/",
+      "proxy": null,
+      "allow_from": ["<your-wechat-user-id>"]
+    }
+  }
+}
+```
+
+Weixin channel fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `account_id` | `"default"` | Internal account identifier used by routing and session keys |
+| `token` | `""` | Bot token from `nullclaw auth login weixin` (required) |
+| `base_url` | `https://ilinkai.weixin.qq.com/` | Absolute HTTPS iLink API URL without query/fragment (may change after region redirect) |
+| `proxy` | `null` | Optional `http://`, `https://`, or `socks5://` proxy URL for runtime API requests |
+| `allow_from` | `[]` | Exact WeChat user IDs allowed to message the bot; configure this explicitly |
+
+Notes:
+
+- No inbound messages are accepted until `allow_from` lists trusted user IDs
+  (or the intentional wildcard `"*"`).
+- `nullclaw auth status weixin` reports whether a non-empty token is configured;
+  it does not probe the remote iLink session.
+- Use `nullclaw auth logout weixin` to remove the configured token.
+- Use `nullclaw auth login weixin --proxy http://localhost:7890` when a proxy is
+  required; the command persists it for both login and runtime API requests.
+- Build with `-Dchannels=weixin` (or `-Dchannels=all`) if your binary was compiled without it.
+- `nullclaw gateway` starts and supervises the configured `weixin` polling loop.
+- The current adapter treats inbound conversations as direct messages and sends
+  text replies; group routing and media/file delivery are not implemented.
 
 Telegram forum topics:
 
@@ -736,39 +858,40 @@ Rules:
 - Empty `allow_from` denies inbound messages on allowlist-based channels. Set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
 - Telegram webhooks require `channels.telegram.accounts.<id>.webhook_secret` and Telegram's `X-Telegram-Bot-Api-Secret-Token` header to match.
-- Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams[].webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
+- Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams.accounts.<id>.webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
 
 ```json
 {
   "channels": {
-    "max": [
-      {
-        "account_id": "main",
-        "bot_token": "MAX_BOT_TOKEN",
-        "allow_from": ["YOUR_MAX_USER_ID"],
-        "group_allow_from": ["YOUR_MAX_USER_ID"],
-        "group_policy": "allowlist",
-        "mode": "webhook",
-        "webhook_url": "https://bot.example.com/max?account_id=main",
-        "webhook_secret": "replace-with-random-secret",
-        "require_mention": true,
-        "streaming": true,
-        "interactive": {
-          "enabled": true,
-          "ttl_secs": 900,
-          "owner_only": true
+    "max": {
+      "accounts": {
+        "main": {
+          "bot_token": "MAX_BOT_TOKEN",
+          "allow_from": ["YOUR_MAX_USER_ID"],
+          "group_allow_from": ["YOUR_MAX_USER_ID"],
+          "group_policy": "allowlist",
+          "mode": "webhook",
+          "webhook_url": "https://bot.example.com/max?account_id=main",
+          "webhook_secret": "replace-with-random-secret",
+          "require_mention": true,
+          "streaming": true,
+          "interactive": {
+            "enabled": true,
+            "ttl_secs": 900,
+            "owner_only": true
+          }
         }
       }
-    ]
+    }
   }
 }
 ```
 
 Max notes:
 
-- `channels.max` is an array of account entries; `account_id` distinguishes multiple Max bots.
+- `channels.max.accounts` is an object of account entries; each object key is the `account_id` that distinguishes multiple Max bots.
 - Prefer `mode = "webhook"` for production. Max documents long polling as suitable for development/testing, while webhooks are the recommended production path.
 - `webhook_url` must be HTTPS.
 - For multi-account webhook setups, give each account either a unique `webhook_secret` or a unique `account_id` query in the webhook URL, for example `/max?account_id=main`.
@@ -872,7 +995,7 @@ Direct message bindings use `peer.kind = "direct"` with user IDs:
 Parameters:
 - `token` (required) - Bot token from Discord Developer Portal
 - `intents` (default: 37377) - Gateway intents bitmask
-- `allow_bots` (default: false) - Allow messages from other bots
+- `allow_bots` (default: false) - Allow messages from other bots. Messages posted by the bot itself are always ignored, even when this is enabled
 - `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages. `["*"]` explicitly allows all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond
 - `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
@@ -909,8 +1032,10 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
-On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, `/a2a`, and `/media/transcribe` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
+On non-loopback binds, generic gateway endpoints such as `/webhook`, `/a2a`, and `/media/transcribe` still require a full gateway bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`. `/cron/*` also accepts the separate cron-scoped credential described below.
 On non-loopback binds, `/pair` only accepts loopback clients; do the initial pairing locally or preconfigure `paired_tokens` before exposing the gateway.
+
+When cron authentication is required, the gateway creates a bearer token scoped only to `/cron/*` at startup. It retains only the token hash and writes the encrypted credential to `paired_token` in the config directory with mode `0600`, allowing the schedule/cron tool to authenticate when `require_pairing = true` or the gateway is publicly bound, including configurations with preconfigured pairing tokens. The credential is rotated on every gateway restart and is not an interactive `/pair` token. Like any bearer credential, it is not bound to a client IP; protect the config directory from disclosure. An anonymous loopback gateway with `require_pairing = false` does not create this credential.
 
 | Field | Default | Description |
 |-------|---------|-------------|
