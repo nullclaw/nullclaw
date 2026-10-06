@@ -1919,10 +1919,23 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v == .bool) self.memory.auto_recall = v.bool;
             }
             if (mem.object.get("recall_limit")) |v| {
-                if (v == .integer) self.memory.recall_limit = @intCast(v.integer);
+                if (v == .integer) {
+                    // The tokenizer yields i64 and the field is usize, so the
+                    // only value that cannot survive the @intCast is a
+                    // negative one. Reject it as a configuration error rather
+                    // than trapping and aborting the process. Note the bound
+                    // must be compared against 0 in i64 space: comparing an
+                    // i64 against an unsigned limit coerces the i64 to usize
+                    // and wraps negatives into huge values.
+                    if (v.integer < 0) return error.InvalidMemoryRecallConfig;
+                    self.memory.recall_limit = @intCast(v.integer);
+                }
             }
             if (mem.object.get("max_context_bytes")) |v| {
-                if (v == .integer) self.memory.max_context_bytes = @intCast(v.integer);
+                if (v == .integer) {
+                    if (v.integer < 0) return error.InvalidMemoryRecallConfig;
+                    self.memory.max_context_bytes = @intCast(v.integer);
+                }
             }
             if (mem.object.get("citations")) |v| {
                 if (v == .string) self.memory.citations = try self.allocator.dupe(u8, v.string);

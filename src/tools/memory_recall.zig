@@ -18,11 +18,21 @@ pub const MemoryRecallTool = struct {
     pub const tool_name = "memory_recall";
     pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"session_id":{"type":"string","description":"Optional session scope. Omit to search the current session plus global memory; pass an empty string to search only the current thread session."}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"session_id":{"type":"string","description":"Optional session scope. Omit to search the current session plus global memory; pass an empty string to search only the current thread session."},"include_archived":{"type":"boolean","description":"Include archived conversation shards (hygiene copies of old turns). Off by default; turn on to search historical turns whose originals were removed by hygiene."}},"required":["query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
     const GLOBAL_RECALL_CANDIDATE_LIMIT: usize = 64;
+    /// Archived conversation shards are dropped after the engine has already
+    /// applied its result limit, so a fetch sized exactly to `limit` can be
+    /// filled entirely by archives. Fetching a wider window and filtering
+    /// afterwards leaves live results room. Output is still capped at `limit`.
+    const CANDIDATE_OVERSAMPLE: usize = 8;
+
+    fn fetchWindow(limit: usize) usize {
+        const widened = std.math.mul(usize, limit, CANDIDATE_OVERSAMPLE) catch return GLOBAL_RECALL_CANDIDATE_LIMIT;
+        return @max(limit, @min(widened, GLOBAL_RECALL_CANDIDATE_LIMIT));
+    }
 
     const SessionSelection = struct {
         explicit_scope: bool,
@@ -66,10 +76,19 @@ pub const MemoryRecallTool = struct {
         return false;
     }
 
-    fn isHiddenFromRecall(key: []const u8, content: []const u8) bool {
+    /// Whether a row is hidden from recall.
+    ///
+    /// Internal bookkeeping is always hidden. Archive shards -- hygiene copies
+    /// of old turns -- are hidden by default because showing them makes the
+    /// model answer history instead of the message in front of it. They are
+    /// *not* always redundant: hygiene removes the original conversation entry
+    /// after preserving the archive, so the shard can be the only surviving
+    /// copy of old information. An explicit `include_archived` query therefore
+    /// opts back in, which is the deliberate policy: automatic injection stays
+    /// clean, and explicit historical retrieval stays possible.
+    fn isHiddenFromRecall(key: []const u8, content: []const u8, include_archived: bool) bool {
         if (mem_root.isInternalMemoryEntryKeyOrContent(key, content)) return true;
-        // Hygiene copies of old turns. Showing them makes the model answer
-        // history instead of the message that is in front of it.
+        if (include_archived) return false;
         if (std.mem.startsWith(u8, key, "archive:conversation:")) return true;
         if (mem_root.extractMarkdownMemoryKey(content)) |extracted| {
             if (std.mem.startsWith(u8, extracted, "archive:conversation:")) return true;
@@ -82,10 +101,11 @@ pub const MemoryRecallTool = struct {
         dest: *std.ArrayList(MemoryEntry),
         entries: []const MemoryEntry,
         limit: usize,
+        include_archived: bool,
     ) !void {
         for (entries) |entry| {
             if (dest.items.len >= limit) break;
-            if (isHiddenFromRecall(entry.key, entry.content)) continue;
+            if (isHiddenFromRecall(entry.key, entry.content, include_archived)) continue;
             if (containsEntryKey(dest.items, entry.key)) continue;
 
             const cloned_category: mem_root.MemoryCategory = switch (entry.category) {
@@ -114,10 +134,11 @@ pub const MemoryRecallTool = struct {
         dest: *std.ArrayList(mem_root.RetrievalCandidate),
         candidates: []const mem_root.RetrievalCandidate,
         limit: usize,
+        include_archived: bool,
     ) !void {
         for (candidates) |candidate| {
             if (dest.items.len >= limit) break;
-            if (isHiddenFromRecall(candidate.key, candidate.snippet)) continue;
+            if (isHiddenFromRecall(candidate.key, candidate.snippet, include_archived)) continue;
             if (containsCandidateKey(dest.items, candidate.key)) continue;
 
             const cloned_category: mem_root.MemoryCategory = switch (candidate.category) {
@@ -164,6 +185,7 @@ pub const MemoryRecallTool = struct {
             return ToolResult.fail("Missing 'query' parameter");
         if (query.len == 0) return ToolResult.fail("'query' must not be empty");
 
+        const include_archived = root.getBool(args, "include_archived") orelse false;
         const limit_raw = root.getInt(args, "limit") orelse 5;
         const limit: usize = if (limit_raw > 0 and limit_raw <= 100) @intCast(limit_raw) else 5;
         const selection = resolveSessionSelection(args);
@@ -176,7 +198,7 @@ pub const MemoryRecallTool = struct {
         // Use retrieval engine (hybrid pipeline) when MemoryRuntime is available,
         // fall back to raw mem.recall() otherwise.
         if (self.mem_rt) |rt| {
-            const primary_candidates = rt.search(allocator, query, limit, selection.preferred_session_id) catch |err| {
+            const primary_candidates = rt.search(allocator, query, fetchWindow(limit), selection.preferred_session_id) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to search memories for '{s}': {s}", .{ query, @errorName(err) });
                 return ToolResult{ .success = false, .output = msg };
             };
@@ -187,7 +209,7 @@ pub const MemoryRecallTool = struct {
                 for (merged_candidates.items) |*candidate| candidate.deinit(allocator);
                 merged_candidates.deinit(allocator);
             }
-            try appendMissingCandidates(allocator, &merged_candidates, primary_candidates, limit);
+            try appendMissingCandidates(allocator, &merged_candidates, primary_candidates, limit, include_archived);
 
             if (!selection.explicit_scope and selection.preferred_session_id != null and merged_candidates.items.len < limit) {
                 var global_entries = m.recall(allocator, query, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch |err| {
@@ -199,19 +221,19 @@ pub const MemoryRecallTool = struct {
                 const global_count = partitionGlobalEntries(global_entries);
                 const global_candidates = try mem_root.retrieval.entriesToCandidates(allocator, global_entries[0..global_count]);
                 defer mem_root.retrieval.freeCandidates(allocator, global_candidates);
-                try appendMissingCandidates(allocator, &merged_candidates, global_candidates, limit);
+                try appendMissingCandidates(allocator, &merged_candidates, global_candidates, limit, include_archived);
             }
 
-            const visible_candidates = countVisibleCandidates(merged_candidates.items);
+            const visible_candidates = countVisibleCandidates(merged_candidates.items, include_archived);
             if (visible_candidates == 0) {
                 const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
                 return ToolResult{ .success = true, .output = msg };
             }
 
-            return formatCandidates(allocator, merged_candidates.items, visible_candidates);
+            return formatCandidates(allocator, merged_candidates.items, visible_candidates, include_archived);
         }
 
-        const primary_entries = m.recall(allocator, query, limit, selection.preferred_session_id) catch |err| {
+        const primary_entries = m.recall(allocator, query, fetchWindow(limit), selection.preferred_session_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };
@@ -222,7 +244,7 @@ pub const MemoryRecallTool = struct {
             for (merged_entries.items) |*entry| entry.deinit(allocator);
             merged_entries.deinit(allocator);
         }
-        try appendMissingEntries(allocator, &merged_entries, primary_entries, limit);
+        try appendMissingEntries(allocator, &merged_entries, primary_entries, limit, include_archived);
 
         if (!selection.explicit_scope and selection.preferred_session_id != null and merged_entries.items.len < limit) {
             var global_entries = m.recall(allocator, query, GLOBAL_RECALL_CANDIDATE_LIMIT, null) catch |err| {
@@ -231,37 +253,37 @@ pub const MemoryRecallTool = struct {
             };
             defer mem_root.freeEntries(allocator, global_entries);
             const global_count = partitionGlobalEntries(global_entries);
-            try appendMissingEntries(allocator, &merged_entries, global_entries[0..global_count], limit);
+            try appendMissingEntries(allocator, &merged_entries, global_entries[0..global_count], limit, include_archived);
         }
 
-        const visible_entries = countVisibleEntries(merged_entries.items);
+        const visible_entries = countVisibleEntries(merged_entries.items, include_archived);
         if (visible_entries == 0) {
             const msg = try std.fmt.allocPrint(allocator, "No memories found matching: {s}", .{query});
             return ToolResult{ .success = true, .output = msg };
         }
 
-        return formatEntries(allocator, merged_entries.items, visible_entries);
+        return formatEntries(allocator, merged_entries.items, visible_entries, include_archived);
     }
 
-    fn countVisibleEntries(entries: []const MemoryEntry) usize {
+    fn countVisibleEntries(entries: []const MemoryEntry, include_archived: bool) usize {
         var count: usize = 0;
         for (entries) |entry| {
-            if (isHiddenFromRecall(entry.key, entry.content)) continue;
+            if (isHiddenFromRecall(entry.key, entry.content, include_archived)) continue;
             count += 1;
         }
         return count;
     }
 
-    fn countVisibleCandidates(candidates: []const mem_root.RetrievalCandidate) usize {
+    fn countVisibleCandidates(candidates: []const mem_root.RetrievalCandidate, include_archived: bool) usize {
         var count: usize = 0;
         for (candidates) |cand| {
-            if (isHiddenFromRecall(cand.key, cand.snippet)) continue;
+            if (isHiddenFromRecall(cand.key, cand.snippet, include_archived)) continue;
             count += 1;
         }
         return count;
     }
 
-    fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize) !ToolResult {
+    fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize, include_archived: bool) !ToolResult {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
@@ -274,7 +296,7 @@ pub const MemoryRecallTool = struct {
         var shown_idx: usize = 0;
         for (entries, 0..) |entry, i| {
             _ = i;
-            if (isHiddenFromRecall(entry.key, entry.content)) continue;
+            if (isHiddenFromRecall(entry.key, entry.content, include_archived)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
@@ -295,6 +317,7 @@ pub const MemoryRecallTool = struct {
         allocator: std.mem.Allocator,
         candidates: []const mem_root.RetrievalCandidate,
         visible_count: usize,
+        include_archived: bool,
     ) !ToolResult {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -308,7 +331,7 @@ pub const MemoryRecallTool = struct {
         var shown_idx: usize = 0;
         for (candidates, 0..) |cand, i| {
             _ = i;
-            if (isHiddenFromRecall(cand.key, cand.snippet)) continue;
+            if (isHiddenFromRecall(cand.key, cand.snippet, include_archived)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
@@ -547,4 +570,79 @@ test "memory_recall respects explicit session scope" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "pickup.sister") == null);
+}
+
+test "memory_recall returns a live result when a higher-ranked archive fills the window" {
+    // Regression (review on #1005): the tool fetched exactly `limit`
+    // candidates and then dropped archives, so a top-ranked archive could
+    // consume the whole window. With limit=1 and one archive ranked above the
+    // live fact, the answer was "no memories found" even though the fact
+    // existed.
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Several archive shards, all matching, so they rank with the live fact.
+    var idx: usize = 0;
+    while (idx < 4) : (idx += 1) {
+        var key_buf: [80]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "archive:conversation:autosave:chunk:{d}", .{idx});
+        try mem.store(key, "needle archived transcript", .{ .custom = "archive" }, null);
+    }
+    try mem.store("live_fact_needle", "needle live fact body", .core, null);
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"needle\",\"limit\":1}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.output.len > 0);
+    const out = result.output;
+    // The live fact is reachable even though archives outrank it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "live_fact_needle") != null);
+    // And archives stay hidden.
+    try std.testing.expect(std.mem.indexOf(u8, out, "archive:conversation:") == null);
+}
+
+test "memory_recall include_archived opts back into historical turns" {
+    // Deliberate policy (review on #1005): hygiene deletes the original
+    // conversation entry after preserving the archive shard, so the shard can
+    // be the only surviving copy of old information. Archives stay out of
+    // recall by default, but an explicit query must be able to reach them.
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "archive:conversation:autosave_user_1700000000000000000:chunk:0",
+        "needle the old turn that was archived",
+        .{ .custom = "archive" },
+        null,
+    );
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+
+    // Default: hidden.
+    {
+        const parsed = try root.parseTestArgs("{\"query\":\"needle\"}");
+        defer parsed.deinit();
+        const r = try t.execute(allocator, parsed.value.object);
+        defer if (r.output.len > 0) allocator.free(r.output);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "archive:conversation:") == null);
+    }
+
+    // Opted in: reachable.
+    {
+        const parsed = try root.parseTestArgs("{\"query\":\"needle\",\"include_archived\":true}");
+        defer parsed.deinit();
+        const r = try t.execute(allocator, parsed.value.object);
+        defer if (r.output.len > 0) allocator.free(r.output);
+        try std.testing.expect(r.output.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "archive:conversation:") != null);
+    }
 }

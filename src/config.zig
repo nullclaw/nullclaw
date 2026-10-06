@@ -8221,3 +8221,33 @@ test "Config parseJson rejects truncated JSON" {
     const result = cfg.parseJson(malformed_json);
     try std.testing.expect(std.meta.isError(result));
 }
+
+test "memory recall config rejects out-of-range numbers" {
+    // Regression (review on #1005): `memory.recall_limit` and
+    // `memory.max_context_bytes` were `@intCast`ed unchecked, so a negative
+    // value or one wider than usize aborted the process at parse time
+    // instead of reporting a configuration error.
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    defer cfg.deinit();
+
+    try std.testing.expectError(
+        error.InvalidMemoryRecallConfig,
+        cfg.parseJson("{\"memory\":{\"recall_limit\":-1}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidMemoryRecallConfig,
+        cfg.parseJson("{\"memory\":{\"max_context_bytes\":-1}}"),
+    );
+
+    // A zero limit is meaningful (disables injection) and must be accepted.
+    try cfg.parseJson("{\"memory\":{\"recall_limit\":0,\"max_context_bytes\":0}}");
+    try std.testing.expectEqual(@as(usize, 0), cfg.memory.recall_limit);
+    try std.testing.expectEqual(@as(usize, 0), cfg.memory.max_context_bytes);
+
+    // Note on "overflow": the tokenizer yields i64 and both fields are usize,
+    // so a negative is the only input that cannot survive the @intCast. A
+    // literal too large for i64 (e.g. 1e30) never becomes an integer token at
+    // all, so the field is silently ignored rather than rejected. Tightening
+    // that is a JSON-parser change and is out of scope for this fix.
+}

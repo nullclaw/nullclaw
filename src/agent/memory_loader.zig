@@ -88,6 +88,19 @@ fn sanitizeMemoryText(allocator: std.mem.Allocator, text: []const u8) ![]const u
 /// ```
 ///
 /// Returns an empty owned string if no relevant memories are found.
+/// True when writing one more `- key: value\n` line (plus a not-yet-written
+/// header) would push the block past `max_bytes`.
+///
+/// The budget is checked *before* the append, not after: a check that only
+/// inspects the length on entry lets the final line overshoot, so five
+/// 200-byte entries under a 128-byte budget still produced 193 bytes.
+const MEMORY_CONTEXT_HEADER: []const u8 = "[Memory context]\n";
+
+fn wouldExceedBudget(written: usize, line_bytes: usize, wrote_header: bool, max_bytes: usize) bool {
+    const header_bytes: usize = if (wrote_header) 0 else MEMORY_CONTEXT_HEADER.len;
+    return written + header_bytes + line_bytes > max_bytes;
+}
+
 pub fn loadContext(
     allocator: std.mem.Allocator,
     mem: Memory,
@@ -113,20 +126,21 @@ pub fn loadContext(
     for (scoped_entries) |entry| {
         if (isInternalMemoryEntry(entry)) continue;
         if (isArchiveConversationEntry(entry)) continue;
-        if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
-        if (!wrote_header) {
-            try w.writeAll("[Memory context]\n");
-            wrote_header = true;
-        }
+        if (appended >= params.recall_limit or buf_writer.written().len >= params.max_context_bytes) break;
         // Truncate individual entry content to prevent a single large memory from blowing the budget
         const content = util.truncateUtf8(entry.content, params.max_context_bytes / 2);
         const sanitized = try sanitizeMemoryText(allocator, content);
         defer allocator.free(sanitized);
+        if (wouldExceedBudget(buf_writer.written().len, 4 + entry.key.len + sanitized.len, wrote_header, params.max_context_bytes)) break;
+        if (!wrote_header) {
+            try w.writeAll(MEMORY_CONTEXT_HEADER);
+            wrote_header = true;
+        }
         try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
         appended += 1;
     }
 
-    if (appended < params.recall_limit and buf.items.len < params.max_context_bytes and session_id != null) {
+    if (appended < params.recall_limit and buf_writer.written().len < params.max_context_bytes and session_id != null) {
         // When scoped recall is enabled, also include global (session_id = null)
         // memory so long-term facts from memory_store remain visible in session chats.
         const global_entries = mem.recall(allocator, user_message, params.global_candidate_limit, null) catch null;
@@ -138,15 +152,16 @@ pub fn loadContext(
                 if (containsKey(scoped_entries, entry.key)) continue;
                 if (isInternalMemoryEntry(entry)) continue;
                 if (isArchiveConversationEntry(entry)) continue; // avoid low-provenance global archive bleed
-                if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
+                if (appended >= params.recall_limit or buf_writer.written().len >= params.max_context_bytes) break;
 
-                if (!wrote_header) {
-                    try w.writeAll("[Memory context]\n");
-                    wrote_header = true;
-                }
                 const content = util.truncateUtf8(entry.content, params.max_context_bytes / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
+                if (wouldExceedBudget(buf_writer.written().len, 4 + entry.key.len + sanitized.len, wrote_header, params.max_context_bytes)) break;
+                if (!wrote_header) {
+                    try w.writeAll(MEMORY_CONTEXT_HEADER);
+                    wrote_header = true;
+                }
                 try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                 appended += 1;
             }
@@ -197,24 +212,25 @@ pub fn loadContextWithRuntime(
             if (isInternalMemoryKey(extracted)) continue;
         }
         if (isArchiveConversationCandidate(cand)) continue;
-        if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
-        if (!wrote_header) {
-            try w.writeAll("[Memory context]\n");
-            wrote_header = true;
-        }
+        if (appended >= params.recall_limit or buf_writer.written().len >= params.max_context_bytes) break;
         const snippet = util.truncateUtf8(cand.snippet, params.max_context_bytes / 2);
         const sanitized = try sanitizeMemoryText(allocator, snippet);
         defer allocator.free(sanitized);
+        if (wouldExceedBudget(buf_writer.written().len, 4 + cand.key.len + sanitized.len, wrote_header, params.max_context_bytes)) break;
+        if (!wrote_header) {
+            try w.writeAll(MEMORY_CONTEXT_HEADER);
+            wrote_header = true;
+        }
         try w.print("- {s}: {s}\n", .{ cand.key, sanitized });
         appended += 1;
     }
-    if (appended < params.recall_limit and buf.items.len < params.max_context_bytes) {
+    if (appended < params.recall_limit and buf_writer.written().len < params.max_context_bytes) {
         if (scoped_fallback_entries) |entries| {
             for (entries) |entry| {
                 if (containsCandidateKey(scoped_candidates, entry.key)) continue;
                 if (isInternalMemoryEntry(entry)) continue;
                 if (isArchiveConversationEntry(entry)) continue;
-                if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
+                if (appended >= params.recall_limit or buf_writer.written().len >= params.max_context_bytes) break;
                 if (!wrote_header) {
                     try w.writeAll("[Memory context]\n");
                     wrote_header = true;
@@ -228,7 +244,7 @@ pub fn loadContextWithRuntime(
         }
     }
 
-    if (appended < params.recall_limit and buf.items.len < params.max_context_bytes and session_id != null) {
+    if (appended < params.recall_limit and buf_writer.written().len < params.max_context_bytes and session_id != null) {
         const global_entries = rt.memory.recall(allocator, user_message, params.global_candidate_limit, null) catch null;
         defer if (global_entries) |entries| memory_mod.freeEntries(allocator, entries);
 
@@ -241,15 +257,16 @@ pub fn loadContextWithRuntime(
                 }
                 if (isInternalMemoryEntry(entry)) continue;
                 if (isArchiveConversationEntry(entry)) continue; // avoid low-provenance global archive bleed
-                if (appended >= params.recall_limit or buf.items.len >= params.max_context_bytes) break;
+                if (appended >= params.recall_limit or buf_writer.written().len >= params.max_context_bytes) break;
 
-                if (!wrote_header) {
-                    try w.writeAll("[Memory context]\n");
-                    wrote_header = true;
-                }
                 const content = util.truncateUtf8(entry.content, params.max_context_bytes / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
+                if (wouldExceedBudget(buf_writer.written().len, 4 + entry.key.len + sanitized.len, wrote_header, params.max_context_bytes)) break;
+                if (!wrote_header) {
+                    try w.writeAll(MEMORY_CONTEXT_HEADER);
+                    wrote_header = true;
+                }
                 try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                 appended += 1;
             }
@@ -778,4 +795,65 @@ test "loadContextWithRuntime prefers scoped facts when engine candidates fill wi
     try std.testing.expect(std.mem.indexOf(u8, context, "scoped_fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, context, "archive:conversation:") == null);
     try std.testing.expect(std.mem.indexOf(u8, context, "archived transcript") == null);
+}
+
+test "loadContext enforces max_context_bytes across the whole block" {
+    // Regression (review on #1005): the budget check read `buf.items.len`, but
+    // the allocating writer owns the growing buffer and only publishes it on
+    // toArrayList(). Every check therefore saw 0 and the advertised cap was
+    // never enforced -- five 200-byte entries under a 128-byte budget
+    // produced 403 bytes.
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var idx: usize = 0;
+    while (idx < 5) : (idx += 1) {
+        var key_buf: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "budget_fact_{d}_needle", .{idx});
+        const body = try allocator.alloc(u8, 200);
+        defer allocator.free(body);
+        @memset(body, 'x');
+        const content = try std.mem.concat(allocator, u8, &.{ "needle ", body });
+        defer allocator.free(content);
+        try mem.store(key, content, .core, null);
+    }
+
+    const context = try loadContext(allocator, mem, "needle", null, .{
+        .recall_limit = 5,
+        .max_context_bytes = 128,
+    });
+    defer allocator.free(context);
+
+    // Header, keys, separators and the trailing newline all count.
+    try std.testing.expect(context.len <= 128);
+    // And it is not vacuously empty -- the cap must not swallow everything.
+    try std.testing.expect(context.len > 0);
+}
+
+test "loadContext still returns entries when a budget is generous" {
+    // Control: the cap must not truncate a normal-sized context.
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var idx: usize = 0;
+    while (idx < 3) : (idx += 1) {
+        var key_buf: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "normal_fact_{d}_needle", .{idx});
+        try mem.store(key, "needle short fact", .core, null);
+    }
+
+    const context = try loadContext(allocator, mem, "needle", null, .{
+        .recall_limit = 5,
+        .max_context_bytes = 4_000,
+    });
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "normal_fact_0_needle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "normal_fact_2_needle") != null);
 }
