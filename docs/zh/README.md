@@ -86,6 +86,7 @@ BP:- [新手入门指南](./beginners-guide.md)  ← 第一次接触 NullClaw，
 - [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
 - [外部渠道插件](./external-channels.md)
+- [技能包](./skills.md)
 - [命令参考](./commands.md)
 - [开发指南](./development.md)
 

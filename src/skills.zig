@@ -714,6 +714,21 @@ fn checkBinaryExists(allocator: std.mem.Allocator, bin_name: []const u8) bool {
 /// Scan workspace_dir/skills/ for direct skill directories and one level of
 /// category subdirectories, loading each discovered entry as a Skill.
 /// Returns owned slice; caller must free with freeSkills().
+/// True when a skills-directory entry names a directory, following a symlink
+/// to its target. Skill directories may be symlinks so a single canonical
+/// copy (e.g. a shared skills repo) can serve many agents and hosts — each
+/// placing a link inside its own workspace (upstream #995). Broken or
+/// non-directory targets resolve to false and are skipped. This covers only
+/// user-placed entries: the archive audit still rejects symlink entries
+/// inside web-installed skill archives.
+fn entryResolvesToDirectory(parent_path: []const u8, name: []const u8) bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ parent_path, name }) catch return false;
+    var d = fs_compat.openDirPath(path, .{}) catch return false;
+    d.close();
+    return true;
+}
+
 pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8, observer: ?observability.Observer) ![]Skill {
     const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
     defer allocator.free(skills_dir_path);
@@ -734,7 +749,12 @@ pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8, obser
 
     var it = dir_mut.iterate();
     while (try it.next()) |entry| {
-        if (entry.kind != .directory) continue;
+        const is_skill_dir = switch (entry.kind) {
+            .directory => true,
+            .sym_link => entryResolvesToDirectory(skills_dir_path, entry.name),
+            else => false,
+        };
+        if (!is_skill_dir) continue;
 
         const sub_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, entry.name });
         defer allocator.free(sub_path);
@@ -769,7 +789,12 @@ fn scanCategoryDir(
 
     var cat_it = cat_dir_mut.iterate();
     while (try cat_it.next()) |entry| {
-        if (entry.kind != .directory) continue;
+        const is_skill_dir = switch (entry.kind) {
+            .directory => true,
+            .sym_link => entryResolvesToDirectory(category_path, entry.name),
+            else => false,
+        };
+        if (!is_skill_dir) continue;
 
         const nested_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ category_path, entry.name });
         defer allocator.free(nested_path);
@@ -2696,16 +2721,84 @@ fn copyFilePath(src: []const u8, dst: []const u8) !void {
 // ── Removal ─────────────────────────────────────────────────────
 
 /// Remove a skill by name from either a direct or one-level category directory.
+/// True when any component strictly between `root_path` and `relative_path`
+/// is a symlink. Walks one level at a time so a category link
+/// (`skills/category -> ../canonical`) is caught before anything under it is
+/// touched. `relative_path` must be relative to `root_path`.
+fn hasSymlinkAncestor(root_path: []const u8, relative_path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, relative_path, '/');
+    // Consume everything but the final component: the leaf is handled by the
+    // caller, which unlinks it rather than following it.
+    var pending: ?[]const u8 = null;
+    while (it.next()) |part| {
+        if (pending) |p| {
+            if (directoryEntryIsSymlink(root_path, p)) return true;
+        }
+        pending = part;
+    }
+    return false;
+}
+
+/// True when `name` inside `parent_path` is a symlink. Returns false when the
+/// entry is absent, is not a symlink, or cannot be inspected.
+fn directoryEntryIsSymlink(parent_path: []const u8, name: []const u8) bool {
+    var d = fs_compat.openDirPath(parent_path, .{}) catch return false;
+    defer d.close();
+
+    var it = d.iterate();
+    while (it.next() catch null) |entry| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+        return entry.kind == .sym_link;
+    }
+    return false;
+}
+
+/// Remove a discovered skill without following symlinks.
+///
+/// A skill entry that is itself a symlink is unlinked, which removes it from
+/// this workspace and leaves the canonical target intact. Removal through a
+/// symlinked *ancestor* is refused outright: there is no way to delete a file
+/// under `skills/category -> ../canonical` without also destroying the
+/// canonical copy, which every other workspace sharing that repo depends on.
+fn removeSkillPathWithoutFollowing(skills_dir: []const u8, skill_path: []const u8) !void {
+    if (std.mem.startsWith(u8, skill_path, skills_dir)) {
+        const rel = std.mem.trimStart(u8, skill_path[skills_dir.len..], "/");
+        if (hasSymlinkAncestor(skills_dir, rel)) return error.SkillRemovalThroughSymlink;
+    }
+
+    if (directoryEntryIsSymlink(parentDirOf(skill_path), baseNameOf(skill_path))) {
+        // Unlink only. Recursing here would delete the canonical copy.
+        try std_compat.fs.deleteFileAbsolute(skill_path);
+        return;
+    }
+
+    try std_compat.fs.deleteTreeAbsolute(skill_path);
+}
+
+fn parentDirOf(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
+        if (idx == 0) return "/";
+        return path[0..idx];
+    }
+    return ".";
+}
+
+fn baseNameOf(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| return path[idx + 1 ..];
+    return path;
+}
+
 pub fn removeSkill(allocator: std.mem.Allocator, name: []const u8, workspace_dir: []const u8) !void {
     try validateSkillName(name);
 
-    const skill_path = try std.fmt.allocPrint(allocator, "{s}/skills/{s}", .{ workspace_dir, name });
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
+    defer allocator.free(skills_dir);
+
+    const skill_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir, name });
     defer allocator.free(skill_path);
 
     if (pathExists(skill_path)) {
-        std_compat.fs.deleteTreeAbsolute(skill_path) catch |err| {
-            return err;
-        };
+        try removeSkillPathWithoutFollowing(skills_dir, skill_path);
         return;
     }
 
@@ -2714,9 +2807,7 @@ pub fn removeSkill(allocator: std.mem.Allocator, name: []const u8, workspace_dir
 
     for (skills) |skill| {
         if (!std.mem.eql(u8, skill.name, name)) continue;
-        std_compat.fs.deleteTreeAbsolute(skill.path) catch |err| {
-            return err;
-        };
+        try removeSkillPathWithoutFollowing(skills_dir, skill.path);
         return;
     }
 
@@ -3434,6 +3525,54 @@ test "listSkills discovers skills in subdirectories" {
     }
     try std.testing.expect(found_alpha);
     try std.testing.expect(found_beta);
+}
+
+test "listSkills follows symlinked skill directories" {
+    // Regression (upstream #995): a symlinked skill directory was skipped by
+    // the kind != .directory filter, so a skill shared from a canonical repo
+    // (one symlink per agent) was invisible to `nullclaw skills list`.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // symlink creation needs privileges
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wrap = @import("compat").fs.Dir.wrap(tmp.dir);
+
+    // Canonical skill kept outside the workspace skills dir (e.g. a shared repo).
+    try wrap.makePath("canonical-repo/git-helper");
+    {
+        const f = try wrap.createFile("canonical-repo/git-helper/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"git-helper\", \"version\": \"1.0.0\", \"description\": \"Shared skill\", \"author\": \"repo\"}");
+    }
+
+    // Workspace: one real skill (control) + one symlinked skill + one broken link.
+    try wrap.makePath("skills/local-only");
+    {
+        const f = try wrap.createFile("skills/local-only/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"local-only\", \"version\": \"1.0.0\", \"description\": \"Local skill\", \"author\": \"dev\"}");
+    }
+    const base = try wrap.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const canonical = try std.fmt.allocPrint(allocator, "{s}/canonical-repo/git-helper", .{base});
+    defer allocator.free(canonical);
+    try wrap.symLink(canonical, "skills/git-helper", .{});
+    try wrap.symLink("/nonexistent-skill-target", "skills/broken-link", .{});
+
+    const skills = try listSkills(allocator, base, null);
+    defer freeSkills(allocator, skills);
+
+    try std.testing.expectEqual(@as(usize, 2), skills.len);
+    var found_shared = false;
+    var found_local = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "git-helper")) found_shared = true;
+        if (std.mem.eql(u8, s.name, "local-only")) found_local = true;
+        try std.testing.expect(!std.mem.eql(u8, s.name, "broken-link"));
+    }
+    try std.testing.expect(found_shared);
+    try std.testing.expect(found_local);
 }
 
 test "listSkills discovers skills nested inside a category directory" {
@@ -6206,4 +6345,122 @@ test "loadSkill SKILL.md frontmatter requires_bins ignores comments" {
     try std.testing.expectEqual(@as(usize, 2), skill.requires_bins.len);
     try std.testing.expectEqualStrings("docker", skill.requires_bins[0]);
     try std.testing.expectEqualStrings("git", skill.requires_bins[1]);
+}
+
+test "removeSkill refuses removal through a symlinked category" {
+    // Regression (review on #1003): `skills/category -> ../canonical` made
+    // listSkills discover `shared` at skills/category/shared. removeSkill then
+    // called deleteTreeAbsolute on that path, which follows the category link
+    // and recursively deleted canonical/shared — destroying the copy every
+    // other workspace sharing that repo depends on.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // symlink creation needs privileges
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wrap = @import("compat").fs.Dir.wrap(tmp.dir);
+
+    try wrap.makePath("canonical-repo/shared");
+    {
+        const f = try wrap.createFile("canonical-repo/shared/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"shared\", \"version\": \"1.0.0\", \"description\": \"Shared skill\", \"author\": \"repo\"}");
+    }
+    try wrap.makePath("skills");
+    try wrap.symLink("../canonical-repo", "skills/category", .{});
+
+    // Discovered through the symlinked category, so the direct path misses.
+    const ws = try wrap.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+    const listed = try listSkills(allocator, ws, null);
+    defer freeSkills(allocator, listed);
+    var found = false;
+    for (listed) |s| {
+        if (std.mem.eql(u8, s.name, "shared")) found = true;
+    }
+    try std.testing.expect(found);
+
+    // Removal must be refused, not performed through the link.
+    try std.testing.expectError(
+        error.SkillRemovalThroughSymlink,
+        removeSkill(allocator, "shared", ws),
+    );
+
+    // The canonical copy must survive untouched.
+    var canon = try wrap.openDir("canonical-repo/shared", .{});
+    defer canon.close();
+    var it = canon.iterate();
+    var survived = false;
+    while (try it.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, "skill.json")) survived = true;
+    }
+    try std.testing.expect(survived);
+}
+
+test "removeSkill unlinks a directly symlinked skill and keeps the canonical copy" {
+    // Counterpart to the category case: a leaf symlink is safe to unlink.
+    // Unlinking removes the skill from this workspace and must not recurse
+    // into the target.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wrap = @import("compat").fs.Dir.wrap(tmp.dir);
+
+    try wrap.makePath("canonical-repo/direct");
+    {
+        const f = try wrap.createFile("canonical-repo/direct/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"direct\", \"version\": \"1.0.0\", \"description\": \"Direct\", \"author\": \"repo\"}");
+    }
+    try wrap.makePath("skills");
+    try wrap.symLink("../canonical-repo/direct", "skills/direct", .{});
+
+    const ws = try wrap.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+    try removeSkill(allocator, "direct", ws);
+
+    // The link is gone from the workspace...
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/skills", .{ws});
+    defer allocator.free(skills_dir);
+    const direct_path = try std.fmt.allocPrint(allocator, "{s}/direct", .{skills_dir});
+    defer allocator.free(direct_path);
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(direct_path, .{}));
+
+    // ...and the canonical copy is intact.
+    var canon = try wrap.openDir("canonical-repo/direct", .{});
+    defer canon.close();
+    var it = canon.iterate();
+    var survived = false;
+    while (try it.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, "skill.json")) survived = true;
+    }
+    try std.testing.expect(survived);
+}
+
+test "removeSkill still deletes a plain local skill" {
+    // Control: the normal case must be unaffected by the symlink guard.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wrap = @import("compat").fs.Dir.wrap(tmp.dir);
+
+    try wrap.makePath("skills/local");
+    {
+        const f = try wrap.createFile("skills/local/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"local\", \"version\": \"1.0.0\", \"description\": \"Local\", \"author\": \"x\"}");
+    }
+
+    const ws = try wrap.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+    try removeSkill(allocator, "local", ws);
+
+    var d = try wrap.openDir("skills", .{});
+    defer d.close();
+    var it = d.iterate();
+    while (try it.next()) |entry| {
+        try std.testing.expect(!std.mem.eql(u8, entry.name, "local"));
+    }
 }
