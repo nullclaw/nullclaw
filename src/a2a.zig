@@ -317,13 +317,39 @@ pub const TaskRegistry = struct {
 
     /// List tasks with optional filtering. Returns owned task snapshots sorted by recency.
     /// Caller must free the returned slice with `deinitTaskSnapshots`.
+    /// A page of task snapshots plus the caller's total matching set.
+    ///
+    /// `total` counts everything that matched the filters *before* the page was
+    /// truncated, so a caller can tell a short page from an empty one. Counting
+    /// only what was emitted made `totalSize` describe the page rather than the
+    /// caller's own task set.
+    pub const TaskListPage = struct {
+        tasks: []TaskSnapshot,
+        total: usize,
+
+        pub fn deinit(self: *TaskListPage, allocator: std.mem.Allocator) void {
+            for (self.tasks) |*task| task.deinit(allocator);
+            if (self.tasks.len > 0) allocator.free(self.tasks);
+            self.* = .{ .tasks = &.{}, .total = 0 };
+        }
+    };
+
+    /// List tasks for a caller.
+    ///
+    /// `filter_principal` is applied here, before sorting and truncation, rather
+    /// than by the caller after the fact. Truncating the global list first meant
+    /// a caller's own tasks could be pushed out of the page by tasks they cannot
+    /// even see: with one older task owned by A and one newer task owned by B,
+    /// A's `pageSize: 1` returned an empty page while A's task was present and
+    /// readable by ID.
     pub fn listTasks(
         self: *TaskRegistry,
         allocator: std.mem.Allocator,
         filter_state: ?TaskState,
         filter_context_id: ?[]const u8,
+        filter_principal: ?Principal,
         max_results: usize,
-    ) ![]TaskSnapshot {
+    ) !TaskListPage {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -342,8 +368,14 @@ pub const TaskRegistry = struct {
             if (filter_context_id) |ctx| {
                 if (!std.mem.eql(u8, task.context_id, ctx)) continue;
             }
+            if (filter_principal) |p| {
+                if (!principalMatches(task.principal, p)) continue;
+            }
             try result.append(allocator, try self.snapshotLocked(allocator, task));
         }
+
+        // Scoped total, computed before the page is cut.
+        const total = result.items.len;
 
         sortTaskSnapshotsByRecency(result.items);
         if (result.items.len > max_results) {
@@ -353,7 +385,7 @@ pub const TaskRegistry = struct {
             }
             result.items.len = max_results;
         }
-        return result.toOwnedSlice(allocator);
+        return .{ .tasks = try result.toOwnedSlice(allocator), .total = total };
     }
 
     /// Evict the least-recently-updated terminal task. Must be called with mutex held.
@@ -1069,16 +1101,17 @@ fn handleListTasks(
         break :blk @intCast(val);
     };
 
-    const tasks = registry.listTasks(allocator, filter_state, filter_context_id, page_size) catch {
+    // Principal filter (issue #974): a caller only ever sees its own tasks.
+    // Applied inside listTasks, before the page is cut -- filtering after the
+    // global list was already truncated let another principal's newer tasks
+    // push this caller's own tasks out of the page entirely.
+    var page = registry.listTasks(allocator, filter_state, filter_context_id, principal, page_size) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to list tasks") catch
             return errorResponse();
         return .{ .body = err_body };
     };
-    defer deinitTaskSnapshots(allocator, tasks);
-
-    // Principal filter (issue #974): a caller only ever sees its own tasks.
-    // Snapshots stay owned by the slice for the uniform defer below; foreign
-    // entries are simply not emitted.
+    defer page.deinit(allocator);
+    const tasks = page.tasks;
 
     // Build result JSON: {"tasks":[...], "nextPageToken":"", "pageSize":N, "totalSize":N}
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1089,7 +1122,6 @@ fn handleListTasks(
     var emitted: usize = 0;
     w.writeAll("{\"tasks\":[") catch return errorResponse();
     for (tasks) |*task| {
-        if (!principalMatches(task.principal, principal)) continue;
         if (emitted > 0) w.writeByte(',') catch return errorResponse();
         const task_json = buildTaskJson(allocator, task, history_length) catch return errorResponse();
         defer allocator.free(task_json);
@@ -1099,7 +1131,8 @@ fn handleListTasks(
     w.writeAll("],\"nextPageToken\":\"\",\"pageSize\":") catch return errorResponse();
     w.print("{d}", .{page_size}) catch return errorResponse();
     w.writeAll(",\"totalSize\":") catch return errorResponse();
-    w.print("{d}", .{emitted}) catch return errorResponse();
+    // Scoped total, not this page's count.
+    w.print("{d}", .{page.total}) catch return errorResponse();
     w.writeByte('}') catch return errorResponse();
 
     buf = buf_writer.toArrayList();
@@ -1727,6 +1760,8 @@ const testing = std.testing;
 const MockSessionManager = struct {
     response: []const u8 = "mock response",
     interrupt_tool: ?[]const u8 = null,
+    /// Counts interruption requests so a test can assert one never happened.
+    interrupt_calls: usize = 0,
     allocator: std.mem.Allocator = testing.allocator,
     inbound_calls: usize = 0,
     inbound_streaming_calls: usize = 0,
@@ -1766,6 +1801,9 @@ const MockSessionManager = struct {
             s.active_tool = null;
         }
     } {
+        // Counted so a test can assert that a foreign caller's cancel never
+        // reaches the interruption branch.
+        self.interrupt_calls += 1;
         return .{
             .requested = self.interrupt_tool != null,
             .active_tool = if (self.interrupt_tool) |tool|
@@ -2512,8 +2550,9 @@ test "listTasks returns empty slice when no tasks match" {
     var task = try registry.createTask(testing.allocator, "hello", null, principalFromBearer(null));
     defer task.deinit(testing.allocator);
 
-    const tasks = try registry.listTasks(testing.allocator, .canceled, null, 50);
-    defer deinitTaskSnapshots(testing.allocator, tasks);
+    var page = try registry.listTasks(testing.allocator, .canceled, null, null, 50);
+    defer page.deinit(testing.allocator);
+    const tasks = page.tasks;
 
     try testing.expectEqual(@as(usize, 0), tasks.len);
 }
@@ -2554,8 +2593,9 @@ test "listTasks respects max_results and recency order" {
     try mutateStoredTask(&registry, t2.id, .submitted, null, 30);
     try mutateStoredTask(&registry, t3.id, .submitted, null, 20);
 
-    const tasks = try registry.listTasks(testing.allocator, null, null, 2);
-    defer deinitTaskSnapshots(testing.allocator, tasks);
+    var page = try registry.listTasks(testing.allocator, null, null, null, 2);
+    defer page.deinit(testing.allocator);
+    const tasks = page.tasks;
 
     try testing.expectEqual(@as(usize, 2), tasks.len);
     try testing.expectEqualStrings("task-2", tasks[0].id);
@@ -2591,8 +2631,9 @@ test "listTasks filters by provided context id" {
     var second = try registry.createTask(testing.allocator, "second", "conversation-b", principalFromBearer(null));
     defer second.deinit(testing.allocator);
 
-    const tasks = try registry.listTasks(testing.allocator, null, "conversation-b", 10);
-    defer deinitTaskSnapshots(testing.allocator, tasks);
+    var page = try registry.listTasks(testing.allocator, null, "conversation-b", null, 10);
+    defer page.deinit(testing.allocator);
+    const tasks = page.tasks;
 
     try testing.expectEqual(@as(usize, 1), tasks.len);
     try testing.expectEqualStrings("conversation-b", tasks[0].context_id);
@@ -2985,4 +3026,89 @@ test "buildProgressHintEvent escapes special chars in tool name" {
     defer testing.allocator.free(data);
 
     try testing.expect(std.mem.indexOf(u8, data, "tool\\\"with\\\"quotes") != null);
+}
+
+test "listTasks applies the principal filter before truncating the page" {
+    // Regression (review on #1012): the page was cut from the global list and
+    // the principal filter applied afterwards, so another principal's newer
+    // tasks could push this caller's own task out of the page. A owns one
+    // older task, B one newer; A asking for pageSize 1 used to get nothing.
+    const owner_a = principalFromBearer("alice-session-key-0001");
+    const owner_b = principalFromBearer("bob-session-key-0002");
+
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var task_a = try registry.createTask(testing.allocator, "a", null, owner_a);
+    defer task_a.deinit(testing.allocator);
+    var task_b = try registry.createTask(testing.allocator, "b", null, owner_b);
+    defer task_b.deinit(testing.allocator);
+
+    // B's task is the more recent one, so it sorts first.
+    try mutateStoredTask(&registry, task_a.id, .submitted, null, 10);
+    try mutateStoredTask(&registry, task_b.id, .submitted, null, 30);
+
+    var page = try registry.listTasks(testing.allocator, null, null, owner_a, 1);
+    defer page.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), page.tasks.len);
+    try testing.expectEqualStrings(task_a.id, page.tasks[0].id);
+    // The scoped total is the caller's own set, not the page length.
+    try testing.expectEqual(@as(usize, 1), page.total);
+}
+
+test "listTasks scoped total counts the whole matching set, not the page" {
+    // The same defect from the other side: totalSize described the current
+    // page, so a caller could not tell a short page from a filtered one.
+    const owner = principalFromBearer("alice-session-key-0001");
+
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var i: usize = 0;
+    var owned: [5]TaskSnapshot = undefined;
+    while (i < 5) : (i += 1) {
+        owned[i] = try registry.createTask(testing.allocator, "x", null, owner);
+        try mutateStoredTask(&registry, owned[i].id, .submitted, null, @intCast(10 + i));
+    }
+    for (&owned) |*t| t.deinit(testing.allocator);
+
+    var page = try registry.listTasks(testing.allocator, null, null, owner, 2);
+    defer page.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), page.tasks.len);
+    try testing.expectEqual(@as(usize, 5), page.total);
+}
+
+test "a2a principal: cancel of another caller's working task never interrupts" {
+    // Regression (review on #1012): the principal check runs before
+    // interruption and cancel, so a foreign caller's task must be
+    // indistinguishable from an unknown id -- and must not reach the
+    // interruption branch. The existing cancel test used a submitted task,
+    // which never enters that branch at all.
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alice = principalFromBearer("token-alice");
+    var alice_task = try registry.createTask(testing.allocator, "alice work", null, alice);
+    defer alice_task.deinit(testing.allocator);
+    // Make it working so the interruption branch is reachable.
+    try mutateStoredTask(&registry, alice_task.id, .working, null, 10);
+
+    var mock = MockSessionManager{};
+    const bob = principalFromBearer("token-bob");
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-bob","method":"tasks/cancel","params":{"id":"task-1"}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock, bob);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Task not found") != null);
+    // The whole point: no interruption was requested for a task Bob cannot see.
+    try testing.expectEqual(@as(usize, 0), mock.interrupt_calls);
+
+    // And Alice's task is still running, not canceled.
+    var still = (try registry.getTaskSnapshot(testing.allocator, "task-1")).?;
+    defer still.deinit(testing.allocator);
+    try testing.expect(still.state == .working);
 }

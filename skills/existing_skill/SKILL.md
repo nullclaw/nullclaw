@@ -1,2 +1,0 @@
-# Existing Skill
-Already installed.
