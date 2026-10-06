@@ -125,7 +125,47 @@ Common targets:
 - `x86_64-linux-android.24`
 
 Use the target that matches the device architecture.
-For a complete example of generating the `--libc` file from the Android NDK, see [`.github/workflows/release.yml`](../../.github/workflows/release.yml).
+
+### Generating the `--libc` file from the Android NDK
+
+Point the libc file at the NDK sysroot. Two details are easy to get wrong:
+
+- **`gcc_dir` is required.** Zig's libc format parses it unconditionally; omitting it fails with `missing field: gcc_dir` from inside a C dependency, which reads like a Zig bug rather than a missing field in your file.
+- **The NDK splits arch headers.** `asm/` lives under `usr/include/<triple>/`, but Zig expects one flat include tree, so compiling anything that includes `linux/types.h` fails with `asm/types.h file not found`. Merge the two directories into a staging tree — do not modify the NDK in place.
+
+```bash
+NDK=/path/to/android-ndk
+SYSROOT=$(ls -d "$NDK"/toolchains/llvm/prebuilt/*/sysroot)
+API=24                       # match the minimum API level you target
+MS=/tmp/android-sysroot
+rm -rf "$MS"; mkdir -p "$MS/usr"
+cp -R "$SYSROOT"/usr/include "$MS"/usr/include
+cp -Rn "$SYSROOT"/usr/include/aarch64-linux-android/* "$MS"/usr/include/
+
+LIB="$SYSROOT"/usr/lib/aarch64-linux-android/$API
+cat > /tmp/android-libc.txt <<EOF
+include_dir=$MS/usr/include
+sys_include_dir=$MS/usr/include
+lib_dir=$LIB
+gcc_dir=$LIB
+crt_dir=$LIB
+crt_objects=crtbegin_so.o crtend_so.o
+crtbegin_file=crtbegin_so.o
+crtend_file=crtend_so.o
+zig_lib_dir=
+kernel32_lib_dir=
+msvc_lib_dir=
+EOF
+
+zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /tmp/android-libc.txt
+```
+
+Adjust the triple in the `cp -Rn` line if you are not building for aarch64. The
+resulting binary is a `pie` executable; ship **only** the binary to the device.
+
+Prefer this to building inside Termux. A native Termux build currently fails
+while linking the compiler's own `options.zig` with `AccessDenied`, so
+cross-compiling and shipping the binary is the supported path today.
 
 ## Practical Advice
 
