@@ -26,6 +26,13 @@ pub fn compressToolOutput(allocator: std.mem.Allocator, raw: []const u8, opts: C
     const normalized = std.mem.trim(u8, raw, " \t\r\n");
     if (normalized.len == 0) return try allocator.dupe(u8, "");
 
+    // Below the budget there is nothing to shrink, so return the content as it
+    // arrived. Running it through `extractTail` anyway stripped leading
+    // indentation and dropped blank lines, which mangles file and source output
+    // that was never near the limit. Compression must be lossless until it has
+    // to be lossy.
+    if (normalized.len <= opts.max_chars) return try allocator.dupe(u8, normalized);
+
     var parts: std.ArrayListUnmanaged([]const u8) = .empty;
     defer parts.deinit(allocator);
 
@@ -140,14 +147,36 @@ test "compressToolOutput keeps last tail lines and omits earlier lines" {
         \\line 18
         \\line 19
     ;
+    // max_chars must be genuinely exceeded: tail extraction is a lossy
+    // operation and now only runs when the content does not already fit.
     const out = try compressToolOutput(std.testing.allocator, raw, .{
         .max_tail_lines = 3,
-        .max_chars = 8192,
+        .max_chars = 100,
     });
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "… [omitted") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "line 19") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "line 0") == null);
+}
+
+test "compressToolOutput preserves content that already fits the budget" {
+    // Regression (review on #987): extractTail ran unconditionally, so output
+    // below max_chars still lost its indentation and blank lines and was
+    // reduced to the last max_tail_lines non-empty lines. A short file_read
+    // came back mangled even though nothing needed shrinking.
+    const raw = "fn main() void {\n    const x = 1;\n\n    if (x == 1) {\n        return;\n    }\n}\n";
+    const out = try compressToolOutput(std.testing.allocator, raw, .{
+        .max_tail_lines = 2,
+        .max_chars = 8192,
+    });
+    defer std.testing.allocator.free(out);
+
+    // Verbatim, minus the surrounding whitespace trim: indentation intact,
+    // blank line kept, every line present, no omission marker.
+    try std.testing.expectEqualStrings(std.mem.trim(u8, raw, " \t\r\n"), out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    const x = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    if (x == 1) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\u{2026} [omitted") == null);
 }
 
 test "compressToolOutput prepends error signature for failed tools" {

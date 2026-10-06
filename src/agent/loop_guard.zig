@@ -25,6 +25,22 @@ pub const LoopGuard = struct {
         return .{ .config = config };
     }
 
+    /// A guard that never fires.
+    ///
+    /// The loop guard is part of the `local_loop` feature, so it must be inert
+    /// when that feature is off. Thresholds are set to the maximum so no call
+    /// count can reach them; the alternatives -- not storing a guard, or
+    /// checking `enabled` at every consultation -- either widen the struct with
+    /// an optional or scatter the same condition across the call sites.
+    pub fn disabled() LoopGuard {
+        const never = std.math.maxInt(u32);
+        return .{ .config = .{
+            .warn_at = never,
+            .veto_at = never,
+            .force_reply_after_vetoes = never,
+        } };
+    }
+
     pub fn deinit(self: *LoopGuard, allocator: std.mem.Allocator) void {
         self.counts.deinit(allocator);
     }
@@ -105,4 +121,20 @@ test "loop guard resets consecutive vetoes when fingerprint changes before veto 
     _ = try guard.record(std.testing.allocator, "file_read", "{\"path\":\"a\"}");
     _ = try guard.record(std.testing.allocator, "file_read", "{\"path\":\"b\"}");
     try std.testing.expectEqual(@as(u32, 0), guard.consecutive_vetoes);
+}
+
+test "disabled guard never fires regardless of repetition" {
+    // Regression (review on #987): the guard was armed from the local_loop
+    // config unconditionally, so with the shipped defaults it warned at 3
+    // identical calls and vetoed at 5 for every user who never enabled the
+    // feature. `disabled()` is what the agent now installs when local_loop is
+    // off.
+    var guard = LoopGuard.disabled();
+    defer guard.deinit(std.testing.allocator);
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        const action = try guard.record(std.testing.allocator, "shell", "{\"command\":\"ls\"}");
+        try std.testing.expectEqual(LoopGuardAction.ok, action);
+    }
 }
