@@ -559,6 +559,13 @@ pub const GatewayState = struct {
     }
 };
 
+/// Upper bound on how long an inbound bus publish may wait for queue space
+/// before the gateway gives up and the webhook handler answers with an error
+/// so the platform retries. Without this bound the single-threaded accept
+/// loop can block forever on a full queue while agent workers finish long
+/// turns — every other webhook (and health check) stalls behind it.
+const INBOUND_PUBLISH_TIMEOUT_MS: u32 = 2_000;
+
 /// Publish an inbound message to the event bus. Returns true on success.
 fn publishToBus(
     eb: *bus_mod.Bus,
@@ -580,7 +587,9 @@ fn publishToBus(
         &.{},
         metadata_json,
     ) catch return false;
-    eb.publishInbound(msg) catch {
+    // Bounded wait: never wedge the accept loop on a full inbound queue.
+    eb.publishInboundTimeout(msg, INBOUND_PUBLISH_TIMEOUT_MS) catch |err| {
+        log.warn("inbound bus publish for {s} failed ({}): queue saturated or closed", .{ channel, err });
         msg.deinit(allocator);
         return false;
     };
@@ -10538,6 +10547,37 @@ test "handleReady recovered component shows healthy" {
     defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
     try std.testing.expectEqualStrings("200 OK", resp.http_status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"healthy\":true") != null);
+}
+
+test "publishToBus returns false on full inbound bus instead of blocking forever" {
+    // Regression: with the unbounded publishInbound, a full queue (agent
+    // workers busy on long turns) blocked the gateway accept loop forever —
+    // every webhook and health check stalled behind it. publishToBus must
+    // give up after INBOUND_PUBLISH_TIMEOUT_MS and return false instead.
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    // Close BEFORE draining: consumeInbound blocks on not_empty while the
+    // bus is open, so an open-bus drain loop would wedge once the queue
+    // empties (the same unbounded-block trap this test guards against on
+    // the publish side).
+    defer {
+        eb.close();
+        while (eb.consumeInbound()) |m| m.deinit(alloc);
+    }
+
+    // Saturate the inbound queue to capacity.
+    var i: usize = 0;
+    while (i < bus_mod.QUEUE_CAPACITY) : (i += 1) {
+        try eb.publishInbound(try bus_mod.makeInboundFull(alloc, "telegram", "s", "c", "x", "k", &.{}, null));
+    }
+
+    const started = std_compat.time.milliTimestamp();
+    const ok = publishToBus(&eb, alloc, "telegram", "s", "c", "late", "k", null);
+    const elapsed = std_compat.time.milliTimestamp() - started;
+    try std.testing.expect(!ok);
+    // It waited for the bounded window (±slack), not forever.
+    try std.testing.expect(elapsed >= @as(i64, INBOUND_PUBLISH_TIMEOUT_MS) - 200);
+    try std.testing.expect(elapsed < @as(i64, INBOUND_PUBLISH_TIMEOUT_MS) + 2_000);
 }
 
 test "publishToBus creates inbound message on bus" {
