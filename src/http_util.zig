@@ -1026,6 +1026,49 @@ fn fetchCurlMaxRedirects(options: std.http.Client.FetchOptions) ?u16 {
     return @intFromEnum(redirect_behavior);
 }
 
+// ── CA bundle override (NULLCLAW_CA_BUNDLE) ──────────────────────────────
+// Minimal rootfs environments (Android app sandboxes, distroless/scratch
+// containers) have no system CA paths, so std.http's lazy root rescan fails
+// and every HTTPS call errors. An explicit bundle path via env var is the
+// standard escape hatch; unset = untouched, host default applies.
+
+/// Load a CA bundle from a pem/bundle file path. Env-independent core
+/// (unit-testable without process env mutation).
+pub fn loadCaBundleFromPath(allocator: Allocator, io: std.Io, path: []const u8) !std.crypto.Certificate.Bundle {
+    var bundle = std.crypto.Certificate.Bundle.empty;
+    errdefer bundle.deinit(allocator);
+    try bundle.addCertsFromFilePathAbsolute(allocator, io, std.Io.Timestamp.now(io, .real), path);
+    return bundle;
+}
+
+/// Populate a std.http.Client's CA bundle from the `NULLCLAW_CA_BUNDLE` env
+/// override (file path). When unset the client is left untouched (lazy
+/// system rescan, host default). On load failure falls back with a warning
+/// rather than breaking the transport.
+fn applyEnvCaBundleOverride(client: *std.http.Client) void {
+    const env_io = std_compat.io();
+    const path = std_compat.process.getEnvVarOwned(client.allocator, "NULLCLAW_CA_BUNDLE") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return,
+        else => return,
+    };
+    defer client.allocator.free(path);
+
+    const bundle = loadCaBundleFromPath(client.allocator, env_io, path) catch |err| {
+        log.warn("NULLCLAW_CA_BUNDLE='{s}' load failed ({}); falling back to lazy system rescan", .{ path, err });
+        return;
+    };
+
+    client.ca_bundle_lock.lockUncancelable(env_io);
+    defer client.ca_bundle_lock.unlock(env_io);
+
+    client.ca_bundle.deinit(client.allocator);
+    client.ca_bundle = bundle;
+    // Zig 0.16 lazy-CA contract: `now == null` means "rescan system roots on
+    // next HTTPS". Setting it disables that rescan so the env bundle is used.
+    client.now = std.Io.Timestamp.now(env_io, .real);
+    log.info("HTTPS CA bundle loaded from NULLCLAW_CA_BUNDLE='{s}'", .{path});
+}
+
 pub const ProxyHttpClient = struct {
     proxy_arena: std.heap.ArenaAllocator,
     client: std.http.Client,
@@ -1037,6 +1080,7 @@ pub const ProxyHttpClient = struct {
         var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
         errdefer client.deinit();
 
+        applyEnvCaBundleOverride(&client);
         try initClientDefaultProxies(&client, proxy_arena.allocator());
 
         return .{
@@ -2632,4 +2676,14 @@ test "initClientDefaultProxiesFromEnvMap parses proxy settings" {
     try std.testing.expectEqual(@as(u16, 8443), client.https_proxy.?.port);
     try std.testing.expect(client.http_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-http.example")));
     try std.testing.expect(client.https_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-https.example")));
+}
+
+test "loadCaBundleFromPath loads real certs from a system bundle" {
+    // Validated against a real pem so minimal-rootfs deployments (Android
+    // asset, distroless container bundle) can trust the path before use.
+    const real_pem = "/etc/ssl/certs/ca-certificates.crt";
+    std.Io.Dir.cwd().access(std.testing.io, real_pem, .{}) catch return error.SkipTest; // not all hosts
+    var bundle = try loadCaBundleFromPath(std.testing.allocator, std.testing.io, real_pem);
+    defer bundle.deinit(std.testing.allocator);
+    try std.testing.expect(bundle.map.count() > 0);
 }
