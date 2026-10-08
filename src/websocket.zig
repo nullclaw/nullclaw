@@ -22,6 +22,27 @@ pub const Opcode = enum(u4) {
     _,
 };
 
+/// Diagnostic record of the most recent close frame seen on a connection.
+pub const CloseInfo = struct {
+    /// True once a close frame has been observed on this connection.
+    seen: bool = false,
+    /// RFC 6455 close code. Only meaningful when `seen` is true.
+    code: u16 = 0,
+    /// Reason phrase, truncated to a bounded length on capture.
+    reason: [128]u8 = undefined,
+    reason_len: usize = 0,
+
+    pub fn reasonSlice(self: CloseInfo) []const u8 {
+        return self.reason[0..self.reason_len];
+    }
+
+    /// True when the peer vanished without ever sending a close frame.
+    /// That is a TCP-level EOF/reset, not a WebSocket shutdown.
+    pub fn wasAbrupt(self: CloseInfo) bool {
+        return !self.seen;
+    }
+};
+
 /// A parsed WebSocket frame.
 /// `payload.len > 0` → heap-allocated; free with allocator.free(frame.payload).
 /// `payload.len == 0` → empty static slice; do NOT free.
@@ -73,6 +94,12 @@ pub const WsClient = struct {
     stream: std_compat.net.Stream,
     tls: ?*TlsState,
     write_mu: std_compat.sync.Mutex,
+
+    /// Diagnostic: last close frame observed on this connection.
+    /// `.seen` is false when the peer disconnected without a close frame
+    /// (bare EOF/reset). `.code` is the RFC 6455 status code; `.reason` is
+    /// the (possibly empty) UTF-8 reason phrase, truncated on capture.
+    last_close: CloseInfo = .{},
 
     pub const Message = struct {
         opcode: Opcode,
@@ -438,6 +465,15 @@ pub const WsClient = struct {
                 return Frame{ .opcode = .ping, .fin = true, .payload = payload };
             },
             .close => {
+                // Record the close code/reason before the payload is freed. This is
+                // the only place a close frame is observable: `readFrame` returns
+                // null for `.close`, so callers would otherwise see a bare EOF and
+                // lose the reason entirely.
+                self.recordCloseFrame(payload);
+                log.info("WS close: code={d} reason=\"{s}\"", .{
+                    self.last_close.code,
+                    self.last_close.reasonSlice(),
+                });
                 if (plen > 0) self.allocator.free(payload);
                 return null;
             },
@@ -528,6 +564,11 @@ pub const WsClient = struct {
 
     /// Read a complete text message, aggregating continuation frames.
     /// Returns heap-allocated string (caller frees) or null on graceful close.
+    ///
+    /// Diagnostics: a `.close` frame is recorded into `self.last_close` so the
+    /// caller can distinguish a real WebSocket shutdown (code + reason) from a
+    /// bare EOF. `last_close.wasAbrupt()` is true when the peer disconnected
+    /// without a close frame at all.
     pub fn readTextMessage(self: *WsClient) !?[]u8 {
         var message: std.ArrayListUnmanaged(u8) = .empty;
         errdefer message.deinit(self.allocator);
@@ -535,6 +576,12 @@ pub const WsClient = struct {
         while (true) {
             const maybe_frame = try self.readFrame();
             if (maybe_frame == null) {
+                // EOF without a preceding close frame: the transport was torn down
+                // rather than the WebSocket being closed. A clean close records
+                // `last_close` in `readFrame`; this path means we never saw one.
+                if (!self.last_close.seen) {
+                    log.warn("WS EOF without a close frame (transport teardown)", .{});
+                }
                 message.deinit(self.allocator);
                 return null;
             }
@@ -553,11 +600,31 @@ pub const WsClient = struct {
                         return slice;
                     }
                 },
+                .close => {
+                    self.recordCloseFrame(frame.payload);
+                    message.deinit(self.allocator);
+                    return null;
+                },
                 .ping => {}, // auto-handled inside readFrame
                 .binary => {}, // Discord uses text only
                 else => {},
             }
         }
+    }
+
+    /// Parse and store a close frame payload: 2-byte big-endian code + UTF-8 reason.
+    /// Malformed/empty payloads are still recorded (code 0) so the fact that a close
+    /// frame arrived is never lost.
+    fn recordCloseFrame(self: *WsClient, payload: []const u8) void {
+        var info = CloseInfo{ .seen = true };
+        if (payload.len >= 2) {
+            info.code = std.mem.readInt(u16, payload[0..2], .big);
+            const reason = payload[2..];
+            const n = @min(reason.len, info.reason.len);
+            @memcpy(info.reason[0..n], reason[0..n]);
+            info.reason_len = n;
+        }
+        self.last_close = info;
     }
 
     /// Read a complete text or binary message, aggregating continuation frames.
