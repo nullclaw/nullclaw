@@ -217,6 +217,7 @@ pub const OpenAiProvider = struct {
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
     };
 
     fn streamChatImpl(
@@ -259,6 +260,10 @@ pub const OpenAiProvider = struct {
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsStreamingNativeToolsImpl(_: *anyopaque) bool {
         return true;
     }
 
@@ -528,6 +533,14 @@ test "supportsNativeTools returns true" {
     var p = OpenAiProvider.init(std.testing.allocator, "key", null, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "supportsStreamingNativeTools returns true" {
+    var p = OpenAiProvider.init(std.testing.allocator, "key", null, null);
+    const prov = p.provider();
+    try std.testing.expect(prov.supportsStreaming());
+    try std.testing.expect(prov.supportsNativeTools());
+    try std.testing.expect(prov.supportsStreamingNativeTools());
 }
 
 test "parseTextResponse multiple choices returns first" {

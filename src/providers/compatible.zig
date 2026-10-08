@@ -1144,6 +1144,7 @@ pub const OpenAiCompatibleProvider = struct {
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
     };
 
     fn buildSingleTurnMessages(
@@ -1301,6 +1302,11 @@ pub const OpenAiCompatibleProvider = struct {
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         return !self.disable_streaming and self.api_mode != .responses;
+    }
+
+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools and supportsStreamingImpl(ptr);
     }
 
     fn chatWithSystemImpl(
@@ -2279,6 +2285,27 @@ test "supportsNativeTools returns true for compatible" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "supportsStreamingNativeTools follows native tools and streaming" {
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
+    var prov = p.provider();
+    try std.testing.expect(prov.supportsNativeTools());
+    try std.testing.expect(prov.supportsStreaming());
+    try std.testing.expect(prov.supportsStreamingNativeTools());
+
+    p.native_tools = false;
+    prov = p.provider();
+    try std.testing.expect(!prov.supportsNativeTools());
+    try std.testing.expect(prov.supportsStreaming());
+    try std.testing.expect(!prov.supportsStreamingNativeTools());
+
+    p.native_tools = true;
+    p.disable_streaming = true;
+    prov = p.provider();
+    try std.testing.expect(prov.supportsNativeTools());
+    try std.testing.expect(!prov.supportsStreaming());
+    try std.testing.expect(!prov.supportsStreamingNativeTools());
 }
 
 test "capNonStreamingMaxTokens caps request max_tokens above provider limit" {

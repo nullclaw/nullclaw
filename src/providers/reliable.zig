@@ -369,6 +369,8 @@ pub const ReliableProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
+        .supports_streaming_native_tools_for_model = supportsStreamingNativeToolsForModelImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -604,6 +606,24 @@ pub const ReliableProvider = struct {
             if (entry.provider.supportsStreaming()) return true;
         }
         return false;
+    }
+
+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.supportsStreamingNativeTools();
+    }
+
+    /// Mirrors the provider selection in streamChatImpl. An explicit target is
+    /// served by that provider, not by `inner`, so answering from `inner` alone
+    /// enabled native schemas for a call that would be routed elsewhere. For
+    /// the non-explicit case streamChatImpl uses `inner` (vision selection needs
+    /// the request, which is not available here), so `inner` is the right
+    /// answer.
+    fn supportsStreamingNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const target = self.resolveProviderTarget(model);
+        if (target.explicit) return target.provider.supportsStreamingNativeTools();
+        return self.inner.supportsStreamingNativeTools();
     }
 
     fn streamChatImpl(

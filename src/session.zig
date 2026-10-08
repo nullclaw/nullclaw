@@ -482,7 +482,7 @@ pub const SessionManager = struct {
         };
 
         log.info("vision probe: querying model '{s}' for image support", .{probe_model_ref});
-        const resp = self.provider.chat(allocator, probe_req, probe_model_ref, 0.0) catch |err| {
+        var resp = self.provider.chat(allocator, probe_req, probe_model_ref, 0.0) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 log.info("vision probe: model '{s}' does not support vision", .{probe_model_ref});
                 self.vision_capable = false;
@@ -491,8 +491,11 @@ pub const SessionManager = struct {
             }
             return;
         };
-        if (resp.content) |c| allocator.free(c);
-        if (resp.reasoning_content) |c| allocator.free(c);
+        // Regression: freeing only content and reasoning_content leaked the
+        // probe response's provider, model and tool_calls — the ReliableProvider
+        // wrapper annotates provider/model and OpenRouter sets model, so every
+        // completed startup probe leaked until process exit.
+        providers.freeChatResponse(allocator, &resp);
         log.info("vision probe: model '{s}' confirmed vision support", .{probe_model_ref});
         self.vision_capable = true;
     }
@@ -2295,6 +2298,10 @@ const MockProvider = struct {
     chat_calls: usize = 0,
     supports_vision: bool = true,
     vision_model: ?[]const u8 = null,
+    /// When true, the returned response carries allocated provider/model fields,
+    /// mirroring what ReliableProvider and OpenRouter produce. Used to guard the
+    /// probeVision response-freeing regression.
+    annotate: bool = false,
     last_chat_model_len: usize = 0,
     last_chat_model_buf: [128]u8 = undefined,
     last_request_timeout_secs: u64 = 0,
@@ -2338,7 +2345,12 @@ const MockProvider = struct {
         @memcpy(self.last_chat_model_buf[0..self.last_chat_model_len], request.model[0..self.last_chat_model_len]);
         self.last_request_timeout_secs = request.timeout_secs;
         if (self.chat_error) |err| return err;
-        return .{ .content = try allocator.dupe(u8, self.response) };
+        var resp = providers.ChatResponse{ .content = try allocator.dupe(u8, self.response) };
+        if (self.annotate) {
+            resp.provider = try allocator.dupe(u8, "mock");
+            resp.model = try allocator.dupe(u8, request.model);
+        }
+        return resp;
     }
 
     fn mockSupportsNativeTools(_: *anyopaque) bool {
@@ -2850,6 +2862,25 @@ test "probeVision uses vision route model ref and gateway timeout" {
     try testing.expectEqual(@as(usize, 1), mock.chat_calls);
     try testing.expectEqualStrings("openrouter/openai/gpt-4.1", mock.lastChatModel());
     try testing.expectEqual(@as(u64, 77), mock.last_request_timeout_secs);
+}
+
+test "probeVision frees provider and model on the probe response" {
+    // Regression: probeVision freed only content and reasoning_content, so a
+    // probe response annotated with provider/model (ReliableProvider sets both,
+    // OpenRouter sets model) leaked. testing.allocator fails this test if the
+    // response is not fully released.
+    var mock = MockProvider{
+        .response = "ok",
+        .annotate = true,
+        .vision_model = "vision-model",
+    };
+    var cfg = testConfig();
+    cfg.default_model = "vision-model";
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+
+    sm.probeVision(testing.allocator);
+    try testing.expectEqual(@as(?bool, true), sm.vision_capable);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
 }
 
 fn testBuildClaimToken(
