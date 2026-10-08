@@ -1,5 +1,6 @@
 {
   "default_temperature": 0.7,
+  "reasoning_mode": "off",
 
   "models": {
     "providers": {

@@ -209,6 +209,11 @@ pub const Config = struct {
     legacy_default_model_detected: bool = false,
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
+    /// How reasoning/thinking text is surfaced to the user: `off` discards it,
+    /// `on` appends it after the turn, `stream` passes it through live. Same
+    /// values and meaning as the `/reasoning` command; kept as a string so the
+    /// safe "off" default survives an unrecognized value.
+    reasoning_mode: []const u8 = "off",
 
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
@@ -1015,6 +1020,9 @@ pub const Config = struct {
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
+        }
+        if (!std.mem.eql(u8, self.reasoning_mode, "off")) {
+            try w.print("  \"reasoning_mode\": \"{s}\",\n", .{self.reasoning_mode});
         }
 
         // models.providers
@@ -2098,6 +2106,39 @@ test "json parse reads reliability fallback providers and model fallbacks" {
         "openrouter/anthropic/claude-sonnet-4",
         cfg.reliability.model_fallbacks[0].fallbacks[0],
     );
+}
+
+test "json parse reasoning_mode accepts on and stream, defaults off, ignores invalid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try std.testing.expectEqualStrings("off", cfg.reasoning_mode);
+
+    try cfg.parseJson("{\"reasoning_mode\": \"on\"}");
+    try std.testing.expectEqualStrings("on", cfg.reasoning_mode);
+
+    var cfg2 = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg2.parseJson("{\"reasoning_mode\": \"stream\"}");
+    try std.testing.expectEqualStrings("stream", cfg2.reasoning_mode);
+
+    // A typo must not change behaviour: the value stays at the safe default.
+    var cfg3 = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg3.parseJson("{\"reasoning_mode\": \"thorough\"}");
+    try std.testing.expectEqualStrings("off", cfg3.reasoning_mode);
 }
 
 test "validation rejects zero port" {

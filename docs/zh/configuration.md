@@ -193,6 +193,20 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 - 设置默认模型路由，通常是 `provider/vendor/model`。
 - 示例：`openrouter/anthropic/claude-sonnet-4`
 
+### `reasoning_mode`
+
+- 控制模型的推理/思考文本如何呈现给用户：`off`（默认）丢弃，`on` 在回合结束后附加到回复中，`stream` 在流式输出时实时透传。取值与 `/reasoning` 命令相同。
+- 设为 `on` 或 `stream` 时，若某个回合只返回推理内容而没有最终正文（推理模型耗尽了全部补全预算），会将其呈现出来，而不是报告为“空响应”。
+- 无法识别的取值会被忽略，设置保持安全的 `off` 默认值。
+
+示例：
+
+```json
+{
+  "reasoning_mode": "on"
+}
+```
+
 ### `agent.default_queue_mode`
 
 - 设置新建会话的入站队列模式。可选值为 `off`、`serial`、`latest` 和 `debounce`，默认值为 `off`。
