@@ -281,6 +281,28 @@ pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
     return saw_done or accumulated_len > 0;
 }
 
+/// Free every owned field of a `ChatResponse` and reset it. Use this when the
+/// whole response is being discarded (capability probes, throw-away calls).
+/// Contrast with `freeStreamUnusedChatResponseFields`, which deliberately
+/// leaves `content` and `model` for the streaming caller to keep.
+pub fn freeChatResponse(allocator: std.mem.Allocator, response: *ChatResponse) void {
+    if (response.content) |content| {
+        if (content.len > 0) allocator.free(content);
+    }
+    for (response.tool_calls) |tc| {
+        if (tc.id.len > 0) allocator.free(tc.id);
+        if (tc.name.len > 0) allocator.free(tc.name);
+        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+    }
+    if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
+    if (response.provider.len > 0) allocator.free(response.provider);
+    if (response.model.len > 0) allocator.free(response.model);
+    if (response.reasoning_content) |rc| {
+        if (rc.len > 0) allocator.free(rc);
+    }
+    response.* = .{};
+}
+
 pub fn freeStreamUnusedChatResponseFields(allocator: std.mem.Allocator, response: *ChatResponse) void {
     for (response.tool_calls) |tc| {
         if (tc.id.len > 0) allocator.free(tc.id);
