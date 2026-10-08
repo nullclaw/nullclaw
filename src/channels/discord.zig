@@ -64,6 +64,9 @@ pub const DiscordChannel = struct {
     heartbeat_interval_ms: Atomic(u64) = Atomic(u64).init(0),
     heartbeat_stop: Atomic(bool) = Atomic(bool).init(false),
     last_gateway_activity_ms: Atomic(i64) = Atomic(i64).init(0),
+    /// Cumulative gateway connect attempts since process start. Reported with each
+    /// disconnect so a reconnect storm stays visible in the log.
+    gateway_reconnects_total: Atomic(u64) = Atomic(u64).init(0),
     session_id: ?[]u8 = null,
     resume_gateway_url: ?[]u8 = null,
     bot_user_id: ?[]u8 = null,
@@ -948,6 +951,7 @@ pub const DiscordChannel = struct {
         // full stale-gateway grace window instead of inheriting the old dead socket's
         // last activity timestamp.
         self.prepareGatewayAttemptAt(std_compat.time.milliTimestamp());
+        _ = self.gateway_reconnects_total.fetchAdd(1, .acq_rel);
 
         // Determine host
         const default_host = "gateway.discord.gg";
@@ -1017,6 +1021,12 @@ pub const DiscordChannel = struct {
 
         // IDENTIFY or RESUME
         const attempting_resume = self.session_id != null;
+        log.info("Discord gateway connected: heartbeat_interval={d}ms resume={} reconnect_total={d}", .{
+            @as(i64, @intCast(self.heartbeat_interval_ms.load(.acquire))),
+            attempting_resume,
+            self.gateway_reconnects_total.load(.acquire),
+        });
+
         if (attempting_resume) {
             try self.sendResumePayload(&ws);
         } else {
@@ -1032,6 +1042,19 @@ pub const DiscordChannel = struct {
                 break;
             };
             const text = maybe_text orelse {
+                // Surface the disconnect reason. A clean WebSocket close carries a
+                // code + reason (recorded by the WS layer into `last_close`); a bare
+                // EOF means the transport was torn down without one.
+                const ci = ws.last_close;
+                if (ci.wasAbrupt()) {
+                    log.info("Discord gateway closed: EOF without close frame after {d} reconnects", .{
+                        self.gateway_reconnects_total.load(.acquire),
+                    });
+                } else {
+                    log.info("Discord gateway closed: code={d} reason=\"{s}\" after {d} reconnects", .{
+                        ci.code, ci.reasonSlice(), self.gateway_reconnects_total.load(.acquire),
+                    });
+                }
                 if (shouldBackoffAfterGatewayClose(attempting_resume, self.running.load(.acquire))) return error.ShouldReconnect;
                 break;
             };
@@ -1046,55 +1069,106 @@ pub const DiscordChannel = struct {
 
     // ── Heartbeat thread ─────────────────────────────────────────────
 
+    /// Advance a heartbeat deadline to the next beat on a fixed grid.
+    ///
+    /// Beats are scheduled on `first + k*interval` rather than `now + interval`
+    /// so small scheduling delays do not accumulate into drift. If the grid has
+    /// fallen at least a full interval behind `now_ms` (e.g. the process was
+    /// suspended), resync to `now_ms + interval_ms` rather than firing a burst of
+    /// catch-up heartbeats.
+    fn nextHeartbeatDeadline(prev_next_ms: i64, now_ms: i64, interval_ms: i64) i64 {
+        const grid_next = prev_next_ms + interval_ms;
+        if (grid_next <= now_ms) return now_ms + interval_ms;
+        return grid_next;
+    }
+
     fn heartbeatLoop(self: *DiscordChannel, ws: *websocket.WsClient) void {
-        // Wait for interval to be set
+        // Wait for the interval to be published by handleHello.
         while (!self.heartbeat_stop.load(.acquire) and self.heartbeat_interval_ms.load(.acquire) == 0) {
             std_compat.thread.sleep(10 * std.time.ns_per_ms);
         }
+
+        // Timing is derived from the wall clock, never from accumulated sleeps.
+        // Counting `sleep(100ms)` drifts badly on macOS: the OS coalesces timer
+        // wakeups (especially for a background launchd daemon), so each "100ms"
+        // sleep can take longer and the deadline is never reached. Discord then
+        // reaps the session as a zombie and the client reconnects in a tight loop.
+        // A wall-clock deadline is immune to that drift.
+        var next_ms: i64 = std_compat.time.milliTimestamp() +
+            @as(i64, @intCast(self.heartbeat_interval_ms.load(.acquire)));
+
         while (!self.heartbeat_stop.load(.acquire)) {
-            const interval_ms = self.heartbeat_interval_ms.load(.acquire);
-            var elapsed: u64 = 0;
-            while (elapsed < interval_ms) {
-                if (self.heartbeat_stop.load(.acquire)) return;
-                std_compat.thread.sleep(100 * std.time.ns_per_ms);
-                elapsed += 100;
+            const interval_ms: i64 = @intCast(self.heartbeat_interval_ms.load(.acquire));
+            if (interval_ms <= 0) {
+                std_compat.thread.sleep(10 * std.time.ns_per_ms);
+                continue;
             }
-            if (self.heartbeat_stop.load(.acquire)) return;
+
+            const now_ms = std_compat.time.milliTimestamp();
+            if (now_ms < next_ms) {
+                // Sleep in small slices so a stop request is honoured promptly,
+                // but never past the deadline.
+                const slice_ms: u64 = @intCast(@min(next_ms - now_ms, 100));
+                std_compat.thread.sleep(slice_ms * std.time.ns_per_ms);
+                continue;
+            }
 
             const seq = self.sequence.load(.acquire);
             var hb_buf: [64]u8 = undefined;
-            const hb_json = buildHeartbeatJson(&hb_buf, seq) catch continue;
-            ws.writeText(hb_json) catch |err| {
-                log.warn("Discord heartbeat failed: {}", .{err});
+            const hb_json = buildHeartbeatJson(&hb_buf, seq) catch |err| {
+                log.warn("Discord heartbeat build failed: {}", .{err});
+                next_ms = nextHeartbeatDeadline(next_ms, now_ms, interval_ms);
+                continue;
             };
+            ws.writeText(hb_json) catch |err| {
+                log.warn("Discord heartbeat write failed: {}", .{err});
+            };
+            next_ms = nextHeartbeatDeadline(next_ms, now_ms, interval_ms);
         }
     }
 
     // ── Message handlers ─────────────────────────────────────────────
 
-    /// Parse HELLO payload and store heartbeat interval.
+    /// Parse HELLO payload and store the heartbeat interval.
+    ///
+    /// A missing or non-positive interval leaves `heartbeat_interval_ms` at 0,
+    /// which stalls the heartbeat thread — so those cases are warned about
+    /// explicitly rather than silently ignored. The negotiated value itself is
+    /// reported once per connect by the caller.
     fn handleHello(self: *DiscordChannel, _: *websocket.WsClient, text: []const u8) !void {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, text, .{});
         defer parsed.deinit();
 
         const root_val = parsed.value;
         if (root_val != .object) return;
-        const d_val = root_val.object.get("d") orelse return;
+        const d_val = root_val.object.get("d") orelse {
+            log.warn("Discord HELLO: missing 'd' — heartbeat interval unset, heartbeat thread will idle", .{});
+            return;
+        };
         switch (d_val) {
             .object => |d_obj| {
-                const hb_val = d_obj.get("heartbeat_interval") orelse return;
+                const hb_val = d_obj.get("heartbeat_interval") orelse {
+                    log.warn("Discord HELLO: no heartbeat_interval field — heartbeats will not be sent", .{});
+                    return;
+                };
                 switch (hb_val) {
                     .integer => |ms| {
                         if (ms > 0) {
                             self.heartbeat_interval_ms.store(@intCast(ms), .release);
+                        } else {
+                            log.warn("Discord HELLO: heartbeat_interval={d} (non-positive) — heartbeats will not be sent", .{@as(i64, @intCast(ms))});
                         }
                     },
                     .float => |ms| {
                         if (ms > 0) {
                             self.heartbeat_interval_ms.store(@intFromFloat(ms), .release);
+                        } else {
+                            log.warn("Discord HELLO: heartbeat_interval={d} (non-positive) — heartbeats will not be sent", .{@as(i64, @intFromFloat(ms))});
                         }
                     },
-                    else => {},
+                    else => |other| {
+                        log.warn("Discord HELLO: heartbeat_interval has unexpected type {s} — heartbeats will not be sent", .{@tagName(other)});
+                    },
                 }
             },
             else => {},
@@ -1821,6 +1895,28 @@ test "discord buildHeartbeatJson with sequence" {
     var buf: [64]u8 = undefined;
     const json = try DiscordChannel.buildHeartbeatJson(&buf, 42);
     try std.testing.expectEqualStrings("{\"op\":1,\"d\":42}", json);
+}
+
+test "discord heartbeat deadline stays on grid under small delays" {
+    // Regression: heartbeat scheduling used to advance as `now + interval`, so
+    // any per-beat scheduling delay accumulated. On macOS the OS coalesces timer
+    // wakeups (especially for a background daemon), which pushed the beat past
+    // Discord's zombie timeout and caused a reconnect loop. The deadline must
+    // stay aligned to the original grid regardless of small delays.
+    const interval: i64 = 41_250;
+    // Exactly on time.
+    try std.testing.expectEqual(@as(i64, 82_500), DiscordChannel.nextHeartbeatDeadline(41_250, 41_250, interval));
+    // Slightly late (coalesced wakeup): grid preserved, deadline does not slide.
+    try std.testing.expectEqual(@as(i64, 82_500), DiscordChannel.nextHeartbeatDeadline(41_250, 41_600, interval));
+    // Checked early: deadline unchanged.
+    try std.testing.expectEqual(@as(i64, 82_500), DiscordChannel.nextHeartbeatDeadline(41_250, 1_000, interval));
+}
+
+test "discord heartbeat deadline resyncs after a long stall" {
+    // A stall past the next grid point must resync to one interval from now
+    // rather than firing a burst of catch-up heartbeats.
+    const interval: i64 = 41_250;
+    try std.testing.expectEqual(@as(i64, 100_000 + interval), DiscordChannel.nextHeartbeatDeadline(41_250, 100_000, interval));
 }
 
 test "discord buildResumeJson" {
