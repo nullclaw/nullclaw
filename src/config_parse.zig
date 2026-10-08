@@ -275,6 +275,14 @@ fn jsonNonEmptyString(value: std.json.Value) ?[]const u8 {
     return value.string;
 }
 
+/// `reasoning_mode` accepts exactly the `/reasoning` command's values. Kept as
+/// a string in Config so an unknown value falls back to "off".
+fn isValidReasoningMode(raw: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(raw, "off") or
+        std.ascii.eqlIgnoreCase(raw, "on") or
+        std.ascii.eqlIgnoreCase(raw, "stream");
+}
+
 fn setWorkspaceAuditTriageRef(
     allocator: std.mem.Allocator,
     triage: *types.WorkspaceAuditTriageConfig,
@@ -1147,6 +1155,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             {
                 self.reasoning_effort = try self.allocator.dupe(u8, v.string);
             }
+        }
+    }
+    // An unrecognized value is ignored so a typo keeps the safe "off" default
+    // instead of silently changing what reaches the user.
+    if (root.get("reasoning_mode")) |v| {
+        if (v == .string and isValidReasoningMode(v.string)) {
+            self.reasoning_mode = try self.allocator.dupe(u8, v.string);
         }
     }
 

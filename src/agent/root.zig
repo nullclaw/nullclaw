@@ -121,6 +121,15 @@ pub const Agent = struct {
         }
     };
 
+    /// Map the `reasoning_mode` config string onto ReasoningMode. An unknown
+    /// value falls back to `.off` so a typo never starts leaking thinking traces
+    /// into user-facing replies.
+    fn parseConfigReasoningMode(raw: []const u8) ReasoningMode {
+        if (std.ascii.eqlIgnoreCase(raw, "on")) return .on;
+        if (std.ascii.eqlIgnoreCase(raw, "stream")) return .stream;
+        return .off;
+    }
+
     const UsageMode = enum {
         off,
         tokens,
@@ -619,6 +628,7 @@ pub const Agent = struct {
             .max_tokens = resolved_max_tokens,
             .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
+            .reasoning_mode = parseConfigReasoningMode(cfg.reasoning_mode),
             .status_show_emojis = cfg.agent.status_show_emojis,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
@@ -2553,16 +2563,30 @@ pub const Agent = struct {
                 const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
 
                 if (trimmed_display_text.len == 0) {
-                    self.freeResponseFields(&response);
-                    if (empty_response_retry_count < 1 and
-                        iteration + 1 < self.max_tool_iterations)
-                    {
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n") });
-                        self.trimHistory();
-                        empty_response_retry_count += 1;
-                        continue;
+                    // Regression: reasoning models (Qwen3 reasoning variants, GLM, R1…)
+                    // can spend the whole completion budget on reasoning tokens and return
+                    // finish_reason=length with content:null. The provider accepts that as a
+                    // valid response (reasoning_content is populated), but this gate only
+                    // inspected content, so the turn died with NoResponseContent and the user
+                    // saw "Model returned an empty response" even though the model answered.
+                    // When reasoning_mode is on or stream that reasoning is user-visible
+                    // output, so the turn is not empty.
+                    const reasoning_visible = self.reasoning_mode != .off and
+                        response.reasoning_content != null and
+                        response.reasoning_content.?.len > 0;
+
+                    if (!reasoning_visible) {
+                        self.freeResponseFields(&response);
+                        if (empty_response_retry_count < 1 and
+                            iteration + 1 < self.max_tool_iterations)
+                        {
+                            try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n") });
+                            self.trimHistory();
+                            empty_response_retry_count += 1;
+                            continue;
+                        }
+                        return error.NoResponseContent;
                     }
-                    return error.NoResponseContent;
                 }
 
                 // Guardrail: if the model promises "I'll try/check now" but emits no
@@ -6656,6 +6680,141 @@ test "slash /reasoning updates reasoning mode" {
     defer allocator.free(response);
 
     try std.testing.expect(agent.reasoning_mode == .stream);
+}
+
+test "parseConfigReasoningMode maps known values and defaults unknown to off" {
+    try std.testing.expect(Agent.parseConfigReasoningMode("off") == .off);
+    try std.testing.expect(Agent.parseConfigReasoningMode("on") == .on);
+    try std.testing.expect(Agent.parseConfigReasoningMode("stream") == .stream);
+    try std.testing.expect(Agent.parseConfigReasoningMode("ON") == .on);
+    try std.testing.expect(Agent.parseConfigReasoningMode("") == .off);
+    try std.testing.expect(Agent.parseConfigReasoningMode("thorough") == .off);
+}
+
+test "reasoning-only response errors when reasoning_mode is off" {
+    const ReasoningOnlyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        // Mirrors a reasoning model that hits finish_reason=length with content null
+        // but reasoning_content populated.
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = null,
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+                .reasoning_content = try allocator.dupe(u8, "deliberating about the answer"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reasoning-only-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ReasoningOnlyProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReasoningOnlyProvider.chatWithSystem,
+        .chat = ReasoningOnlyProvider.chat,
+        .supportsNativeTools = ReasoningOnlyProvider.supportsNativeTools,
+        .getName = ReasoningOnlyProvider.getName,
+        .deinit = ReasoningOnlyProvider.deinitFn,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .reasoning_mode = .off,
+    };
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("hello"));
+}
+
+test "reasoning-only response is surfaced when reasoning_mode is on" {
+    const ReasoningOnlyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = null,
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+                .reasoning_content = try allocator.dupe(u8, "deliberating about the answer"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reasoning-only-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ReasoningOnlyProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReasoningOnlyProvider.chatWithSystem,
+        .chat = ReasoningOnlyProvider.chat,
+        .supportsNativeTools = ReasoningOnlyProvider.supportsNativeTools,
+        .getName = ReasoningOnlyProvider.getName,
+        .deinit = ReasoningOnlyProvider.deinitFn,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .reasoning_mode = .on,
+    };
+    defer agent.deinit();
+
+    const reply = try agent.turn("hello");
+    defer allocator.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "deliberating about the answer") != null);
 }
 
 test "slash /exec updates runtime exec settings" {

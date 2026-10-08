@@ -213,6 +213,20 @@ Notes:
 - Sets default model route, typically `provider/vendor/model`.
 - Example: `openrouter/anthropic/claude-sonnet-4`
 
+### `reasoning_mode`
+
+- Controls how a model's reasoning/thinking text reaches the user: `off` (default) discards it, `on` appends it to the reply after the turn, `stream` passes it through live while streaming. Same values as the `/reasoning` command.
+- When set to `on` or `stream`, a turn that returns reasoning but no final content (a reasoning model that spends its whole completion budget thinking) is surfaced instead of being reported as an empty response.
+- An unrecognized value is ignored so the setting stays at the safe `off` default.
+
+Example:
+
+```json
+{
+  "reasoning_mode": "on"
+}
+```
+
 ### `agent.default_queue_mode`
 
 - Sets the inbound queue mode for newly created sessions. Accepted values are `off`, `serial`, `latest`, and `debounce`; the default is `off`.
