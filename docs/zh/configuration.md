@@ -1009,7 +1009,8 @@ nullclaw agent -m "使用 mcp_parallel_web_search 查找 Zig 0.16.0 的官方发
 nullclaw agent -m "使用 mcp_parallel_web_fetch 读取 https://ziglang.org/download/0.16.0/release-notes.html 并总结主要变化。"
 ```
 
-`mcp list` 和 `mcp info` 仅检查配置，不会连接服务或发现工具。agent 启动时发现
+`mcp list` 仅检查配置。`mcp info` 会连接服务并发现工具，预期返回 `"tool_count": 2`；
+若为 `null`，说明发现失败，请检查端点、超时和网络连接。agent 启动时发现
 `web_search` 和 `web_fetch`，分别注册为 `mcp_parallel_web_search` 和
 `mcp_parallel_web_fetch`。需要支持工具调用的模型来选择调用；请检查输出中的来源 URL
 和摘录。此集成不会改变内置搜索工具或其默认提供商。

@@ -30,8 +30,9 @@ nullclaw mcp list
 nullclaw mcp info parallel --json
 ```
 
-These commands inspect configuration; they do not connect or discover tools.
-Start an agent to connect and use the tools:
+`mcp list` inspects configuration. `mcp info` connects and discovers tools;
+expect `"tool_count": 2`. A `null` count means discovery failed, so check the
+endpoint, timeout, and network access. Start an agent to use the tools:
 
 ```bash
 nullclaw agent -m "Use mcp_parallel_web_search to find the official Zig 0.16.0 release notes and summarize the results with source URLs."
