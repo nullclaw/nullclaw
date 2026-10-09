@@ -1,0 +1,12 @@
+{
+  "mcp_servers": {
+    "parallel": {
+      "transport": "http",
+      "url": "https://search.parallel.ai/mcp",
+      "timeout_ms": 30000,
+      "headers": {
+        "User-Agent": "nullclaw-parallel-search"
+      }
+    }
+  }
+}

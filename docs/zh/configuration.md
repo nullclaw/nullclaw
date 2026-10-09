@@ -989,6 +989,37 @@ nullclaw gateway
 - 要加固默认边界：继续看 [安全机制](./security.md)，确认 pairing、sandbox 与 allowlist 设置。
 - 要对接 webhook 或长期运行网关：继续看 [Gateway API](./gateway-api.md) 和 [命令参考](./commands.md)。
 
+### Parallel Search MCP
+
+如需无需 Parallel API 密钥的可选网页搜索和页面提取，请将
+[示例配置](../../examples/parallel-search/config.json)中的 `parallel` 服务合并到
+现有配置顶层的 `mcp_servers` 对象中；如果该对象不存在，请创建它。保留现有模型、
+其他 MCP 服务和安全设置，不要用这个配置片段替换整个配置文件。示例使用原生 HTTP
+MCP、每次请求 30 秒超时和项目 `User-Agent`，无需本地桥接程序或额外软件包。
+保存后重启 agent 或 gateway。尚未配置模型时，请先运行 `nullclaw onboard`。
+
+安装步骤见[安装指南](./installation.md)。从源码安装时，使用固定的
+[Zig 0.16.0 工具链](./zig-installation.md)，在仓库根目录运行 `zig build`，
+生成的程序位于 `zig-out/bin/nullclaw`。以下命令假定程序已加入 `PATH`。
+
+```bash
+nullclaw mcp list
+nullclaw mcp info parallel --json
+nullclaw agent -m "使用 mcp_parallel_web_search 查找 Zig 0.16.0 的官方发布说明，并附上来源 URL。"
+nullclaw agent -m "使用 mcp_parallel_web_fetch 读取 https://ziglang.org/download/0.16.0/release-notes.html 并总结主要变化。"
+```
+
+`mcp list` 和 `mcp info` 仅检查配置，不会连接服务或发现工具。agent 启动时发现
+`web_search` 和 `web_fetch`，分别注册为 `mcp_parallel_web_search` 和
+`mcp_parallel_web_fetch`。需要支持工具调用的模型来选择调用；请检查输出中的来源 URL
+和摘录。此集成不会改变内置搜索工具或其默认提供商。
+
+匿名端点适合轻量使用，免费但有速率限制。搜索查询和提取的 URL 会发送到 Parallel，
+配置不发送认证标头。如工具未出现，请检查启动时的 MCP 连接或发现错误，确认能够通过
+HTTPS 访问 `search.parallel.ai`。请求超时时可增大 `timeout_ms`；遇到速率限制时，
+按服务返回的重试时间等待。完整英文说明见[示例指南](../../examples/parallel-search/README.md)。
+
+
 ## 相关页面
 
 - [安装指南](./installation.md)
