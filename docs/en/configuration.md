@@ -1128,6 +1128,19 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 - `sandbox.backend = "auto"`: auto-selects an available sandbox backend.
 - `audit.enabled = true`: recommended for traceability.
 
+### Parallel Search MCP
+
+For optional web search and page extraction without a Parallel API key, merge
+the `parallel` server from [the runnable example](../../examples/parallel-search/config.json)
+into your existing top-level `mcp_servers` object. The example uses native HTTP
+MCP, a 30-second request timeout, and a project `User-Agent`; no bridge is needed.
+Keep your existing model and other settings, then restart the agent or gateway.
+
+[Setup and usage](../../examples/parallel-search/README.md) includes agent prompts
+for `mcp_parallel_web_search` and `mcp_parallel_web_fetch`. The anonymous endpoint
+is free for light use and subject to rate limits. Queries and fetched URLs are
+sent to Parallel. Built-in search defaults stay unchanged.
+
 ### Advanced: Web Search + Full Shell (high risk)
 
 Use only in controlled environments:
