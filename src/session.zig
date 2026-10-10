@@ -131,6 +131,23 @@ fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
     return total;
 }
 
+/// Most recent `max_history_messages` stored entries.
+///
+/// `persistTurn` appends user+assistant every turn and never prunes the stored
+/// session, so a long-lived session accumulates rows without bound. Restoring
+/// the entire store re-inflated the per-request context on every session
+/// (re)creation (restart or cache eviction), silently defeating
+/// `max_history_messages` — compaction/trim only bound the in-memory history.
+/// Bound the restored window to the same limit `trimHistory` enforces.
+fn recentHistoryWindow(
+    entries: []const memory_mod.MessageEntry,
+    max_history_messages: u32,
+) []const memory_mod.MessageEntry {
+    const max: usize = if (max_history_messages == 0) 1 else max_history_messages;
+    if (entries.len <= max) return entries;
+    return entries[entries.len - max ..];
+}
+
 fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
     for (entries) |entry| {
         if (memory_mod.isRuntimeCommandRole(entry.role)) {
@@ -1483,18 +1500,21 @@ pub const SessionManager = struct {
         key_owned_by_session = true;
         session_initialized = true;
 
-        // Restore persisted conversation history from session store
+        // Restore persisted conversation history from session store.
+        // Bound the restored window so a long-lived session cannot re-inflate the
+        // per-request context beyond max_history_messages on restore.
         if (selected_session_store) |store| {
             const maybe_entries = store.loadMessages(self.allocator, session_key) catch null;
             if (maybe_entries) |entries| {
                 defer memory_mod.freeMessages(self.allocator, entries);
-                if (entries.len > 0) {
-                    restorePersistedSessionState(session, entries);
+                const restored = recentHistoryWindow(entries, session.agent.max_history_messages);
+                if (restored.len > 0) {
+                    restorePersistedSessionState(session, restored);
                 }
                 if (try store.loadUsage(session_key)) |total_tokens| {
                     session.agent.total_tokens = total_tokens;
-                } else if (entries.len > 0) {
-                    session.agent.total_tokens = estimateRestoredSessionTokens(entries);
+                } else if (restored.len > 0) {
+                    session.agent.total_tokens = estimateRestoredSessionTokens(restored);
                 }
             }
         }
@@ -4779,6 +4799,53 @@ test "restored session token reconstruction ignores usage footer decorations" {
 
     const restored_session = try sm.getOrCreate(session_key);
     try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+}
+
+test "restored session history is bounded to max_history_messages" {
+    // Regression: persistTurn appends user+assistant every turn without pruning
+    // the stored session, so restoring a long-lived session reloaded the entire
+    // history and the next request was built from all of it. The restored window
+    // must be bounded to max_history_messages (restart / cache-eviction path).
+    var mock = MockProvider{ .response = "reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-restore-bound";
+    const session = try sm.getOrCreate(session_key);
+    const max: usize = @intCast(session.agent.max_history_messages);
+    try testing.expect(max > 0);
+
+    // Seed the persisted session with more turns than the restore window allows.
+    const store = sqlite_mem.sessionStore();
+    const seed_turns = max + 25;
+    var i: usize = 0;
+    while (i < seed_turns) : (i += 1) {
+        try store.saveMessage(session_key, "user", "hello");
+        try store.saveMessage(session_key, "assistant", "reply");
+    }
+
+    // Force a restore by evicting the live session, then re-acquiring it.
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expect(restored.agent.history.items.len > 0);
+    try testing.expect(restored.agent.history.items.len <= max);
 }
 
 test "persisted session falls back to rendered response when degraded turn has no final assistant history entry" {
