@@ -105,6 +105,98 @@ fn buildThreadStatusRequestBody(
     return try body_list.toOwnedSlice(allocator);
 }
 
+/// Slack targets are `channel_id` or `channel_id:thread_ts`; a reaction is
+/// keyed by channel only, so the thread suffix is dropped.
+fn slackChannelIdOf(target: []const u8) ?[]const u8 {
+    if (target.len == 0) return null;
+    const idx = std.mem.indexOfScalar(u8, target, ':') orelse return target;
+    if (idx == 0) return null;
+    return target[0..idx];
+}
+
+/// The API calls one lifecycle transition needs. Slack adds reactions instead
+/// of replacing them, so the state being left behind has to be removed
+/// explicitly; a state that reuses the emoji already on the message needs no
+/// call at all.
+pub const ReactionPlan = struct {
+    removals: [2]?[]const u8 = .{ null, null },
+    removals_len: u8 = 0,
+    add: ?[]const u8 = null,
+};
+
+const superseded_none = [_]root.Channel.TaskReaction{};
+const superseded_accepted = [_]root.Channel.TaskReaction{.accepted};
+const superseded_running = [_]root.Channel.TaskReaction{ .accepted, .running };
+
+fn supersededReactions(reaction: root.Channel.TaskReaction) []const root.Channel.TaskReaction {
+    return switch (reaction) {
+        .accepted => &superseded_none,
+        .running => &superseded_accepted,
+        .done, .failed => &superseded_running,
+    };
+}
+
+fn reactionEmoji(
+    emojis: config_types.SlackReactionEmojisConfig,
+    reaction: root.Channel.TaskReaction,
+) ?[]const u8 {
+    const name = switch (reaction) {
+        .accepted => emojis.accepted,
+        .running => emojis.running,
+        .done => emojis.done,
+        .failed => emojis.failed,
+    };
+    return if (name.len == 0) null else name;
+}
+
+/// Pure so the transition table is testable without a network.
+pub fn planTaskReaction(
+    emojis: config_types.SlackReactionEmojisConfig,
+    reaction: root.Channel.TaskReaction,
+) ReactionPlan {
+    var plan = ReactionPlan{};
+    const add = reactionEmoji(emojis, reaction);
+    for (supersededReactions(reaction)) |previous| {
+        const emoji = reactionEmoji(emojis, previous) orelse continue;
+        if (add) |next| {
+            if (std.mem.eql(u8, next, emoji)) continue;
+        }
+        var seen = false;
+        for (plan.removals[0..plan.removals_len]) |existing| {
+            if (existing) |already| {
+                if (std.mem.eql(u8, already, emoji)) seen = true;
+            }
+        }
+        if (seen) continue;
+        plan.removals[plan.removals_len] = emoji;
+        plan.removals_len += 1;
+    }
+    plan.add = add;
+    return plan;
+}
+
+fn buildReactionRequestBody(
+    allocator: std.mem.Allocator,
+    channel_id: []const u8,
+    ts: []const u8,
+    emoji: []const u8,
+) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+    try bw.writeAll("{\"channel\":");
+    try root.appendJsonStringW(bw, channel_id);
+    try bw.writeAll(",\"timestamp\":");
+    try root.appendJsonStringW(bw, ts);
+    try bw.writeAll(",\"name\":");
+    try root.appendJsonStringW(bw, emoji);
+    try bw.writeByte('}');
+    body_list = body_writer.toArrayList();
+    return try body_list.toOwnedSlice(allocator);
+}
+
 /// Slack channel — socket/http event pipeline for inbound, chat.postMessage for outbound.
 pub const SlackChannel = struct {
     allocator: std.mem.Allocator,
@@ -121,6 +213,12 @@ pub const SlackChannel = struct {
     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
     thread_ts: ?[]const u8 = null,
     reply_to_mode: config_types.SlackReplyToMode = .off,
+    /// Show task lifecycle on the triggering message via reactions.add/remove.
+    status_reactions_enabled: bool = false,
+    reaction_emojis: config_types.SlackReactionEmojisConfig = .{},
+    /// Set once the API proves this app can never react (`missing_scope` and
+    /// friends); later turns skip the calls entirely.
+    reactions_disabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -219,7 +317,76 @@ pub const SlackChannel = struct {
         ch.signing_secret = cfg.signing_secret;
         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
         ch.reply_to_mode = cfg.reply_to_mode;
+        ch.status_reactions_enabled = cfg.status_reactions;
+        ch.reaction_emojis = cfg.reaction_emojis;
         return ch;
+    }
+
+    /// React to the message that triggered a task, mirroring the Telegram
+    /// lifecycle. Best-effort: a failure is logged, never propagated.
+    pub fn setTaskReaction(
+        self: *SlackChannel,
+        target: []const u8,
+        message_id: ?[]const u8,
+        reaction: root.Channel.TaskReaction,
+    ) void {
+        if (!self.status_reactions_enabled) return;
+        if (self.reactions_disabled.load(.acquire)) return;
+        const ts = message_id orelse return;
+        const channel_id = slackChannelIdOf(target) orelse return;
+        if (ts.len == 0) return;
+
+        const plan = planTaskReaction(self.reaction_emojis, reaction);
+        for (plan.removals[0..plan.removals_len]) |removal| {
+            if (removal) |emoji| self.callReactionApi("reactions.remove", channel_id, ts, emoji);
+        }
+        if (plan.add) |emoji| self.callReactionApi("reactions.add", channel_id, ts, emoji);
+    }
+
+    fn callReactionApi(
+        self: *SlackChannel,
+        endpoint: []const u8,
+        channel_id: []const u8,
+        ts: []const u8,
+        emoji: []const u8,
+    ) void {
+        if (builtin.is_test) return;
+
+        const body = buildReactionRequestBody(self.allocator, channel_id, ts, emoji) catch return;
+        defer self.allocator.free(body);
+
+        const url = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ API_BASE, endpoint }) catch return;
+        defer self.allocator.free(url);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return;
+        const auth_header = auth_writer.buffered();
+
+        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
+            log.debug("Slack {s} failed: {}", .{ endpoint, err });
+            return;
+        };
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const info = slackApiErrorInfo(parsed.value.object) orelse return;
+        const code = info.code;
+        // The reaction is already in the wanted state.
+        if (std.mem.eql(u8, code, "already_reacted") or std.mem.eql(u8, code, "no_reaction")) return;
+        if (isAuthFailureCode(code)) {
+            if (!self.reactions_disabled.swap(true, .acq_rel)) {
+                log.warn(
+                    "Slack status reactions unavailable for this app ({s}); disabling them for {s}",
+                    .{ code, self.account_id },
+                );
+            }
+            return;
+        }
+        logSlackApiError(endpoint, channel_id, info);
     }
 
     /// Set the thread timestamp for threaded replies.
@@ -1399,6 +1566,11 @@ pub const SlackChannel = struct {
         try self.stopTyping(recipient);
     }
 
+    fn vtableSetTaskReaction(ptr: *anyopaque, update: root.Channel.TaskReactionUpdate) anyerror!void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        self.setTaskReaction(update.target, update.message_id, update.reaction);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
@@ -1408,6 +1580,7 @@ pub const SlackChannel = struct {
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .setTaskReaction = &vtableSetTaskReaction,
     };
 
     pub fn channel(self: *SlackChannel) root.Channel {
@@ -2249,6 +2422,98 @@ test "slack channel interface returns slack name" {
     var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
     const iface = ch.channel();
     try std.testing.expectEqualStrings("slack", iface.name());
+}
+
+test "slack reaction plan clears the state it supersedes" {
+    const emojis = config_types.SlackReactionEmojisConfig{};
+
+    const accepted = planTaskReaction(emojis, .accepted);
+    try std.testing.expectEqual(@as(u8, 0), accepted.removals_len);
+    try std.testing.expectEqualStrings("eyes", accepted.add.?);
+
+    const running = planTaskReaction(emojis, .running);
+    try std.testing.expectEqual(@as(u8, 1), running.removals_len);
+    try std.testing.expectEqualStrings("eyes", running.removals[0].?);
+    try std.testing.expectEqualStrings("hourglass_flowing_sand", running.add.?);
+
+    const done = planTaskReaction(emojis, .done);
+    try std.testing.expectEqual(@as(u8, 2), done.removals_len);
+    try std.testing.expectEqualStrings("eyes", done.removals[0].?);
+    try std.testing.expectEqualStrings("hourglass_flowing_sand", done.removals[1].?);
+    try std.testing.expectEqualStrings("white_check_mark", done.add.?);
+
+    const failed = planTaskReaction(emojis, .failed);
+    try std.testing.expectEqual(@as(u8, 2), failed.removals_len);
+    try std.testing.expectEqualStrings("x", failed.add.?);
+}
+
+test "slack reaction plan reuses an emoji two states share" {
+    const emojis = config_types.SlackReactionEmojisConfig{
+        .accepted = "hourglass_flowing_sand",
+        .running = "hourglass_flowing_sand",
+        .done = "",
+        .failed = "warning",
+    };
+
+    // Same emoji as the state being left, so the reaction stays put.
+    const running = planTaskReaction(emojis, .running);
+    try std.testing.expectEqual(@as(u8, 0), running.removals_len);
+    try std.testing.expectEqualStrings("hourglass_flowing_sand", running.add.?);
+
+    // Empty string clears the state instead of setting one.
+    const done = planTaskReaction(emojis, .done);
+    try std.testing.expectEqual(@as(u8, 1), done.removals_len);
+    try std.testing.expectEqualStrings("hourglass_flowing_sand", done.removals[0].?);
+    try std.testing.expect(done.add == null);
+
+    const failed = planTaskReaction(emojis, .failed);
+    try std.testing.expectEqual(@as(u8, 1), failed.removals_len);
+    try std.testing.expectEqualStrings("warning", failed.add.?);
+}
+
+test "slack reaction plan with every emoji empty is a no-op" {
+    const emojis = config_types.SlackReactionEmojisConfig{
+        .accepted = "",
+        .running = "",
+        .done = "",
+        .failed = "",
+    };
+    const done = planTaskReaction(emojis, .done);
+    try std.testing.expectEqual(@as(u8, 0), done.removals_len);
+    try std.testing.expect(done.add == null);
+}
+
+test "slackChannelIdOf drops the thread suffix" {
+    try std.testing.expectEqualStrings("C123", slackChannelIdOf("C123:1700000000.000000").?);
+    try std.testing.expectEqualStrings("C123", slackChannelIdOf("C123").?);
+    try std.testing.expect(slackChannelIdOf("") == null);
+    try std.testing.expect(slackChannelIdOf(":1700000000.000000") == null);
+}
+
+test "slack setTaskReaction is inert until status_reactions is on" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{ .bot_token = "tok" });
+    ch.setTaskReaction("C123:1700000000.000000", "1700000000.000001", .accepted);
+
+    ch.status_reactions_enabled = true;
+    ch.setTaskReaction("C123:1700000000.000000", "1700000000.000001", .accepted);
+    ch.setTaskReaction("C123:1700000000.000000", null, .running);
+    ch.setTaskReaction("", "1700000000.000001", .failed);
+
+    ch.reactions_disabled.store(true, .release);
+    ch.setTaskReaction("C123:1700000000.000000", "1700000000.000001", .done);
+}
+
+test "slack vtable exposes the task reaction hook" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "tok",
+        .status_reactions = true,
+    });
+    const channel = ch.channel();
+    try channel.setTaskReaction(.{
+        .target = "C123:1700000000.000000",
+        .message_id = "1700000000.000001",
+        .reaction = .running,
+    });
 }
 
 test "slack channel api base constant" {

@@ -124,6 +124,19 @@ pub const Channel = struct {
         message_id: []const u8,
         emoji: ?[]const u8 = null,
     };
+    /// Task lifecycle states a channel can show as a reaction on the message
+    /// that triggered the task.
+    pub const TaskReaction = enum {
+        accepted,
+        running,
+        done,
+        failed,
+    };
+    pub const TaskReactionUpdate = struct {
+        target: []const u8,
+        message_id: []const u8,
+        reaction: TaskReaction,
+    };
 
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
@@ -131,6 +144,9 @@ pub const Channel = struct {
         return error.NotSupported;
     }
     fn defaultMarkRead(_: *anyopaque, _: MessageRef) anyerror!void {
+        return error.NotSupported;
+    }
+    fn defaultSetTaskReaction(_: *anyopaque, _: TaskReactionUpdate) anyerror!void {
         return error.NotSupported;
     }
     fn defaultSupportsStreamingOutbound(_: *anyopaque) bool {
@@ -185,6 +201,8 @@ pub const Channel = struct {
         setReaction: *const fn (ptr: *anyopaque, update: ReactionUpdate) anyerror!void = &defaultSetReaction,
         /// Mark the referenced message as read.
         markRead: *const fn (ptr: *anyopaque, message_ref: MessageRef) anyerror!void = &defaultMarkRead,
+        /// Show a task lifecycle state as a reaction on the triggering message.
+        setTaskReaction: *const fn (ptr: *anyopaque, update: TaskReactionUpdate) anyerror!void = &defaultSetTaskReaction,
         /// Whether the channel can consume `.chunk` staged outbound events.
         supportsStreamingOutbound: *const fn (ptr: *anyopaque) bool = &defaultSupportsStreamingOutbound,
         /// Whether the channel can create, edit, and delete host-managed draft messages.
@@ -264,6 +282,10 @@ pub const Channel = struct {
 
     pub fn markRead(self: Channel, message_ref: MessageRef) !void {
         return self.vtable.markRead(self.ptr, message_ref);
+    }
+
+    pub fn setTaskReaction(self: Channel, update: TaskReactionUpdate) !void {
+        return self.vtable.setTaskReaction(self.ptr, update);
     }
 
     pub fn supportsStreamingOutbound(self: Channel) bool {
@@ -1057,6 +1079,11 @@ test "Channel message operations default to not supported" {
         .target = "chat-1",
         .message_id = "m-1",
         .emoji = ":+1:",
+    }));
+    try std.testing.expectError(error.NotSupported, channel.setTaskReaction(.{
+        .target = "chat-1",
+        .message_id = "m-1",
+        .reaction = .accepted,
     }));
     try std.testing.expectError(error.NotSupported, channel.editMessage(.{
         .target = "chat-1",

@@ -7091,6 +7091,49 @@ test "parse slack accounts" {
     allocator.free(cfg.channels.slack);
 }
 
+test "parse slack status reactions default to off" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(!cfg.channels.slack[0].status_reactions);
+    try std.testing.expectEqualStrings("eyes", cfg.channels.slack[0].reaction_emojis.accepted);
+    try std.testing.expectEqualStrings("hourglass_flowing_sand", cfg.channels.slack[0].reaction_emojis.running);
+    try std.testing.expectEqualStrings("white_check_mark", cfg.channels.slack[0].reaction_emojis.done);
+    try std.testing.expectEqualStrings("x", cfg.channels.slack[0].reaction_emojis.failed);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
+test "parse slack status reactions from config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "status_reactions": true, "reaction_emojis": {"accepted": "hourglass_flowing_sand", "running": "hourglass_flowing_sand", "done": "", "failed": "warning"}}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    const sc = cfg.channels.slack[0];
+    try std.testing.expect(sc.status_reactions);
+    try std.testing.expectEqualStrings("hourglass_flowing_sand", sc.reaction_emojis.accepted);
+    try std.testing.expectEqualStrings("hourglass_flowing_sand", sc.reaction_emojis.running);
+    try std.testing.expectEqualStrings("", sc.reaction_emojis.done);
+    try std.testing.expectEqualStrings("warning", sc.reaction_emojis.failed);
+    allocator.free(sc.account_id);
+    allocator.free(sc.bot_token);
+    allocator.free(sc.allow_from);
+    allocator.free(sc.reaction_emojis.accepted);
+    allocator.free(sc.reaction_emojis.running);
+    allocator.free(sc.reaction_emojis.done);
+    allocator.free(sc.reaction_emojis.failed);
+    allocator.free(cfg.channels.slack);
+}
+
 test "parse irc accounts" {
     const allocator = std.testing.allocator;
     const json =

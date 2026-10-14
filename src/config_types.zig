@@ -661,6 +661,16 @@ pub const SlackReplyToMode = enum {
     all,
 };
 
+/// Slack reaction names, e.g. `eyes`, `hourglass_flowing_sand`,
+/// `white_check_mark`, `x`. Slack has no emoji-picker equivalent for bots, so
+/// these are short names rather than the emoji themselves.
+pub const SlackReactionEmojisConfig = struct {
+    accepted: []const u8 = "eyes",
+    running: []const u8 = "hourglass_flowing_sand",
+    done: []const u8 = "white_check_mark",
+    failed: []const u8 = "x",
+};
+
 pub const SlackConfig = struct {
     account_id: []const u8 = "default",
     mode: SlackReceiveMode = .socket,
@@ -673,6 +683,12 @@ pub const SlackConfig = struct {
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
     reply_to_mode: SlackReplyToMode = .off,
+    /// Show task lifecycle on the triggering user message via Slack reactions.
+    /// Needs the `reactions:write` scope.
+    status_reactions: bool = false,
+    /// Per-state reaction overrides. Empty string clears the reaction for that
+    /// state; two states that share a name cost no extra API call.
+    reaction_emojis: SlackReactionEmojisConfig = .{},
 };
 
 pub const TeamsConfig = struct {

@@ -139,12 +139,10 @@ const ParsedTelegramTarget = struct {
     message_thread_id: ?i64 = null,
 };
 
-pub const TaskReaction = enum {
-    accepted,
-    running,
-    done,
-    failed,
-};
+/// Shared with `Channel.TaskReaction`: the lifecycle states a channel can
+/// show as a reaction, so the daemon can drive any channel that implements
+/// `Channel.setTaskReaction`.
+pub const TaskReaction = root.Channel.TaskReaction;
 
 fn parseTelegramTarget(target: []const u8) ParsedTelegramTarget {
     const separators = [_][]const u8{ THREAD_TARGET_SEPARATOR, TOPIC_TARGET_SEPARATOR };

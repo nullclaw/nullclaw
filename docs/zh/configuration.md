@@ -818,6 +818,54 @@ Max 说明：
 - `require_mention = true` 仅影响群聊。私聊和 `bot_started` deep link 不受影响。
 - Max inline button 在 nullclaw 中是一次性的：有效点击后原始键盘会被清除，避免过期按钮。
 
+### Slack
+
+Slack 示例：
+
+```json
+{
+  "channels": {
+    "slack": {
+      "accounts": {
+        "default": {
+          "bot_token": "xoxb-YOUR_BOT_TOKEN",
+          "status_reactions": true,
+          "reaction_emojis": {
+            "accepted": "hourglass_flowing_sand",
+            "running": "hourglass_flowing_sand",
+            "done": "",
+            "failed": "warning"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+参数说明：
+
+- `status_reactions`（默认 `false`）——在触发消息上用 reaction 显示任务状态：`accepted`、`running`，最后是 `done` 或 `failed`。需要 `reactions:write` 权限
+- `reaction_emojis`（默认 `eyes`、`hourglass_flowing_sand`、`white_check_mark`、`x`）——按状态覆盖 `accepted`、`running`、`done`、`failed`。Slack 用短名而非 emoji 本身；空字符串表示该状态不加 reaction（并移除已有的）
+
+#### Slack 状态 reaction
+
+`status_reactions = true` 时，nullclaw 用 `reactions.add` 在触发消息上加 reaction，随任务推进在 `accepted`、`running`、`done`/`failed` 之间切换，并在该状态的短名为空时用 `reactions.remove` 移除。Slack 的 reaction 是累加而非替换，因此会显式移除上一个状态。
+
+把 `accepted` 和 `running` 设为同一个短名，可以让每轮只产生一次 reaction 请求：
+
+```json
+"status_reactions": true,
+"reaction_emojis": {
+  "accepted": "hourglass_flowing_sand",
+  "running": "hourglass_flowing_sand",
+  "done": "",
+  "failed": "warning"
+}
+```
+
+若应用没有 `reactions:write`，Slack 返回 `missing_scope`，nullclaw 只记录一次并停止对该账号尝试。
+
 ### `memory`
 
 - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
