@@ -230,6 +230,24 @@ Example:
 }
 ```
 
+### `agent.reasoning_mode`
+
+- Sets the reasoning display mode for newly created sessions. Accepted values are `off`, `on`, and `stream`; the default is `off`.
+- `off` hides reasoning content, `on` prints a `Reasoning:` quote block above the final reply, and `stream` prints reasoning live while the model produces it.
+- `/reasoning <off|on|stream>` overrides the mode for the current session. `/restart` and `/debug reset` restore this configured default instead of always resetting to `off`.
+- Sessions are evicted after `agent.session_idle_timeout_secs`, so setting this avoids re-running `/reasoning on` after every idle eviction.
+- Changes apply to sessions created after a restart.
+
+Example:
+
+```json
+{
+  "agent": {
+    "reasoning_mode": "stream"
+  }
+}
+```
+
 ### `workspace_audit.llm_triage`
 
 - Selects the provider/model used by `nullclaw workspace audit --llm-triage external`.

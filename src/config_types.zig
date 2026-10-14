@@ -403,6 +403,33 @@ pub const QueueMode = enum {
     }
 };
 
+/// Reasoning display mode (`/reasoning`). Shared by the config layer and the
+/// agent runtime so `agent.reasoning_mode` needs no conversion on apply.
+pub const ReasoningMode = enum {
+    off,
+    on,
+    stream,
+
+    pub fn toSlice(self: ReasoningMode) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .on => "on",
+            .stream => "stream",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?ReasoningMode {
+        return if (std.ascii.eqlIgnoreCase(s, "off"))
+            .off
+        else if (std.ascii.eqlIgnoreCase(s, "on"))
+            .on
+        else if (std.ascii.eqlIgnoreCase(s, "stream"))
+            .stream
+        else
+            null;
+    }
+};
+
 pub const AgentConfig = struct {
     /// When true (default), history is auto-compacted once it crosses the
     /// token / message thresholds. Set to false to skip proactive LLM
@@ -413,6 +440,10 @@ pub const AgentConfig = struct {
     max_history_messages: u32 = 100,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
+    /// Default reasoning display mode for newly created sessions.
+    /// `/reasoning <off|on|stream>` overrides it per session; `/restart` and
+    /// `/debug reset` restore this default instead of hard-coding `off`.
+    reasoning_mode: ReasoningMode = .off,
     default_queue_mode: QueueMode = .off,
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.

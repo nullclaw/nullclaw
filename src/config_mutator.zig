@@ -124,6 +124,7 @@ pub fn pathRequiresRestart(path: []const u8) bool {
     if (std.mem.startsWith(u8, path, "runtime.")) return true;
     if (std.mem.eql(u8, path, "memory.backend") or std.mem.eql(u8, path, "memory.profile")) return true;
     if (std.mem.eql(u8, path, "agent.default_queue_mode")) return true;
+    if (std.mem.eql(u8, path, "agent.reasoning_mode")) return true;
     return false;
 }
 

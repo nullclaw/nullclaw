@@ -3451,7 +3451,7 @@ fn parseDurationSeconds(raw: []const u8) ?u64 {
 fn resetRuntimeCommandState(self: anytype) void {
     self.reasoning_effort = null;
     self.verbose_level = .off;
-    self.reasoning_mode = .off;
+    self.reasoning_mode = self.default_reasoning_mode;
     self.usage_mode = .off;
     self.exec_host = .gateway;
     self.exec_security = self.default_exec_security;

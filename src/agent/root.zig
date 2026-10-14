@@ -107,19 +107,9 @@ pub const Agent = struct {
         }
     };
 
-    const ReasoningMode = enum {
-        off,
-        on,
-        stream,
-
-        pub fn toSlice(self: ReasoningMode) []const u8 {
-            return switch (self) {
-                .off => "off",
-                .on => "on",
-                .stream => "stream",
-            };
-        }
-    };
+    /// Reasoning display mode. Shared with the config layer so the configured
+    /// `agent.reasoning_mode` default applies without conversion.
+    const ReasoningMode = config_types.ReasoningMode;
 
     const UsageMode = enum {
         off,
@@ -306,6 +296,8 @@ pub const Agent = struct {
     reasoning_effort: ?[]const u8 = null,
     verbose_level: VerboseLevel = .off,
     reasoning_mode: ReasoningMode = .off,
+    /// Configured default restored by `/restart` and `/debug reset`.
+    default_reasoning_mode: ReasoningMode = .off,
     usage_mode: UsageMode = .off,
     exec_host: ExecHost = .gateway,
     default_exec_security: ExecSecurity = .allowlist,
@@ -619,6 +611,8 @@ pub const Agent = struct {
             .max_tokens = resolved_max_tokens,
             .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
+            .reasoning_mode = cfg.agent.reasoning_mode,
+            .default_reasoning_mode = cfg.agent.reasoning_mode,
             .status_show_emojis = cfg.agent.status_show_emojis,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
@@ -5342,6 +5336,36 @@ test "Agent.fromConfig applies default_queue_mode" {
 
     try std.testing.expectEqual(Agent.QueueMode.latest, agent.default_queue_mode);
     try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
+}
+
+test "Agent.fromConfig applies agent.reasoning_mode and resets to it" {
+    // Regression: reasoning_mode used to start at .off with no config default,
+    // so idle session eviction forced users to re-run /reasoning on.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.reasoning_mode = .stream;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.reasoning_mode);
+    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.default_reasoning_mode);
+
+    // Per-session override still wins.
+    const override = (try agent.handleSlashCommand("/reasoning on")).?;
+    defer allocator.free(override);
+    try std.testing.expectEqual(Agent.ReasoningMode.on, agent.reasoning_mode);
+
+    // Reset restores the configured default instead of hard-coded .off.
+    const reset = (try agent.handleSlashCommand("/debug reset")).?;
+    defer allocator.free(reset);
+    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.reasoning_mode);
 }
 
 test "slash /new clears history" {

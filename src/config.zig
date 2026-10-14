@@ -1354,6 +1354,7 @@ pub const Config = struct {
             .max_history_messages = self.agent.max_history_messages,
             .parallel_tools = self.agent.parallel_tools,
             .tool_dispatcher = self.agent.tool_dispatcher,
+            .reasoning_mode = self.agent.reasoning_mode,
             .default_queue_mode = self.agent.default_queue_mode,
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
             .compaction_keep_recent = self.agent.compaction_keep_recent,
@@ -6774,6 +6775,77 @@ test "agent.default_queue_mode rejects invalid values" {
         error.InvalidDefaultQueueMode,
         cfg.parseJson("{\"agent\":{\"default_queue_mode\":42}}"),
     );
+}
+
+test "parse agent.reasoning_mode" {
+    // Regression: the configured default must be parsed before Agent creation.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson("{\"agent\":{\"reasoning_mode\":\"stream\"}}");
+    try std.testing.expectEqual(config_types.ReasoningMode.stream, cfg.agent.reasoning_mode);
+    try cfg.parseJson("{\"agent\":{\"reasoning_mode\":\"ON\"}}");
+    try std.testing.expectEqual(config_types.ReasoningMode.on, cfg.agent.reasoning_mode);
+}
+
+test "agent.reasoning_mode defaults to off" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson("{}");
+    try std.testing.expectEqual(config_types.ReasoningMode.off, cfg.agent.reasoning_mode);
+}
+
+test "agent.reasoning_mode rejects invalid values" {
+    // A typo must not silently fall back to off and hide reasoning again.
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(
+        error.InvalidReasoningMode,
+        cfg.parseJson("{\"agent\":{\"reasoning_mode\":\"verbose\"}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidReasoningMode,
+        cfg.parseJson("{\"agent\":{\"reasoning_mode\":42}}"),
+    );
+}
+
+test "Config.save preserves agent.reasoning_mode" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.agent.reasoning_mode = .stream;
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 256 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"reasoning_mode\": \"stream\"") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expectEqual(config_types.ReasoningMode.stream, loaded.agent.reasoning_mode);
 }
 
 test "save roundtrip preserves heartbeat dispatch settings" {

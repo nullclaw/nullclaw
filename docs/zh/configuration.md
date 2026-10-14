@@ -210,6 +210,24 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 }
 ```
 
+### `agent.reasoning_mode`
+
+- 设置新建会话的推理展示模式。可选值为 `off`、`on` 和 `stream`，默认值为 `off`。
+- `off` 不展示推理内容；`on` 会在最终回复上方输出 `Reasoning:` 引用块；`stream` 会在模型生成时实时输出推理内容。
+- `/reasoning <off|on|stream>` 可以覆盖当前会话的模式。`/restart` 和 `/debug reset` 会恢复这里配置的默认值，而不是一律重置为 `off`。
+- 会话会在 `agent.session_idle_timeout_secs` 空闲后被回收，因此配置默认值可以避免每次回收后都要重新执行 `/reasoning on`。
+- 修改后需要重启，新的会话才会使用新的默认值。
+
+示例：
+
+```json
+{
+  "agent": {
+    "reasoning_mode": "stream"
+  }
+}
+```
+
 ### `workspace_audit.llm_triage`
 
 - 选择 `nullclaw workspace audit --llm-triage external` 使用的 provider/model。
