@@ -3630,3 +3630,81 @@ test "markError records AddressInUse for gateway component" {
     try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
     try std.testing.expectEqualStrings("AddressInUse", state.components[0].?.last_error.?);
 }
+
+/// Produce the InboundMessage a single-command Slack `/name /stop` publishes.
+fn produceSlashStopMessage(allocator: std.mem.Allocator) !bus_mod.InboundMessage {
+    const slack_mod = channels_mod.slack;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = slack_mod.SlackChannel.init(allocator, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.slash_command_enabled = true;
+    ch.slash_command_name = "nullclaw";
+    ch.setBus(&eb);
+
+    const payload_json =
+        \\{"command":"/nullclaw","text":"/stop","user_id":"U1","channel_id":"C1","team_id":"T1","response_url":"https://example.invalid/hook"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    ch.handleSlashCommand(parsed.value.object);
+
+    return eb.consumeInbound() orelse error.TestExpectedEqual;
+}
+
+test "Slack slash /stop reaches the agent stop command handler" {
+    // A Slack `/stop` is handled by the agent's slash command layer like any
+    // other typed control command. This test consumes the message the channel
+    // actually publishes and drives the session handler with it; the mock
+    // provider errors if an LLM turn is attempted, proving the text is treated
+    // as a control command. It covers an idle session only: interrupting a
+    // turn that is already running is the separate /stop fix in #1068.
+    const allocator = std.testing.allocator;
+    const providers_mod = @import("providers/root.zig");
+    const session_mod = @import("session.zig");
+
+    const MockProvider = struct {
+        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return a.dupe(u8, "ok");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
+            return error.ShouldNotChat;
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "slash-mock";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var provider_state: u8 = 0;
+    const provider_vtable = providers_mod.Provider.VTable{
+        .chatWithSystem = MockProvider.chatWithSystem,
+        .chat = MockProvider.chat,
+        .supportsNativeTools = MockProvider.supportsNativeTools,
+        .getName = MockProvider.getName,
+        .deinit = MockProvider.deinitFn,
+    };
+    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "test/mock-model",
+        .allocator = allocator,
+    };
+    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
+    defer sm.deinit();
+
+    var msg = try produceSlashStopMessage(allocator);
+    defer msg.deinit(allocator);
+
+    const reply = try sm.handleLocalSlashCommand(msg.session_key, msg.content, null) orelse return error.TestExpectedEqual;
+    defer allocator.free(reply);
+    try std.testing.expectEqualStrings("No active background task to stop.", reply);
+}

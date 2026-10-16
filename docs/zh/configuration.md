@@ -543,6 +543,46 @@ WeChat 说明：
 - 空 `allow_from` 会拒绝入站消息；请显式列出可信 OpenID，仅在有意开放账号时使用 `"*"`。
 - 如果当前二进制未编译 WeChat channel，请使用 `-Dchannels=wechat`（或 `-Dchannels=all`）重新构建。
 
+#### Slack 斜杠命令
+
+只有应用注册了斜杠命令，Slack 才会投递它，且 Slack 界面每次注册只支持一个命令。在 Slack 账号上设置 `slash_command.enabled = true`，并在 Slack 应用里注册同名命令：
+
+```json
+{
+  "channels": {
+    "slack": {
+      "accounts": {
+        "main": {
+          "bot_token": "xoxb-YOUR_BOT_TOKEN",
+          "app_token": "xapp-YOUR_APP_TOKEN",
+          "slash_command": { "enabled": true, "name": "nullclaw" }
+        }
+      }
+    }
+  }
+}
+```
+
+`name` 是不带前导 `/` 的命令名（默认 `nullclaw`），匹配不区分大小写。Socket Mode 下应用配置里的请求 URL 会被忽略，因为 Slack 通过 WebSocket 投递 payload。
+
+输入 `/nullclaw <消息>` 后，命令之后的文本会像用户在该频道里直接输入一样被处理，因此 `/nullclaw /stop` 会执行与手动输入 `/stop` 相同的停止命令。斜杠命令是对应用的显式调用，因此被视为一次 mention：`allow_from` 以及 DM/群组 allowlist 检查依然生效，但 `group_policy = mention_only` 不会拦截它。若不希望所有被允许的成员都能在 mention_only 房间里驱动 agent，请收紧 `allow_from`（或群组 allowlist）。空命令会返回一条简短用法提示；未授权发送者会收到一条短暂的 ephemeral 拒绝；与配置的 `name` 不匹配的命令名会被记录日志并以 ephemeral 提示回应，而不是被静默丢弃。
+
+在应用 manifest 的 `features` 下添加（Socket Mode）：
+
+```json
+"features": {
+  "slash_commands": [
+    {
+      "command": "/nullclaw",
+      "description": "Send a message to nullclaw",
+      "should_escape": false
+    }
+  ]
+}
+```
+
+并在 `oauth_config.scopes.bot` 中加入 `commands` scope。
+
 #### Weixin — 微信 iLink Bot（扫码登录）
 
 `weixin` channel 通过二维码授权微信 iLink bot。这与上方使用签名 webhook 的

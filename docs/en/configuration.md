@@ -608,6 +608,59 @@ WeChat notes:
 - An empty `allow_from` denies inbound messages; list trusted OpenIDs explicitly, or use `"*"` only for an intentionally open account.
 - Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
 
+#### Slack slash command
+
+Slack only delivers a slash command when the app registers it, and Slack's UI
+supports one command per registration. Set `slash_command.enabled = true` on the
+Slack account and register the same name in your Slack app:
+
+```json
+{
+  "channels": {
+    "slack": {
+      "accounts": {
+        "main": {
+          "bot_token": "xoxb-YOUR_BOT_TOKEN",
+          "app_token": "xapp-YOUR_APP_TOKEN",
+          "slash_command": { "enabled": true, "name": "nullclaw" }
+        }
+      }
+    }
+  }
+}
+```
+
+`name` is the command without the leading `/` (default `nullclaw`); the match is
+case-insensitive. In Socket Mode the command's request URL in the app config is
+ignored, because Slack sends the payload over the WebSocket.
+
+Type `/nullclaw <message>` and the text after the command is handled exactly as
+if the user had typed it in that channel, so `/nullclaw /stop` runs the same
+stop command as a typed `/stop`. The command is an explicit invocation of the
+app, so it is treated as a mention: the `allow_from` and DM/group allowlist gates
+still apply, but `group_policy = mention_only` does not block it. Restrict
+`allow_from` (or the group allowlist) if you do not want every admitted member to
+be able to drive the agent from a mention-only room. An empty command shows a
+short usage reply; an unauthorized sender gets a short ephemeral refusal, and a
+command name that does not match the configured `name` is logged and answered
+with an ephemeral notice instead of being silently dropped.
+
+Add to the app manifest under `features` (Socket Mode):
+
+```json
+"features": {
+  "slash_commands": [
+    {
+      "command": "/nullclaw",
+      "description": "Send a message to nullclaw",
+      "should_escape": false
+    }
+  ]
+}
+```
+
+and add the `commands` scope to `oauth_config.scopes.bot`.
+
 #### Weixin — WeChat iLink Bot (QR Code Login)
 
 The `weixin` channel authorizes a WeChat iLink bot by QR code. This is separate

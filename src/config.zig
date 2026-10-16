@@ -8257,3 +8257,34 @@ test "Config parseJson rejects truncated JSON" {
     const result = cfg.parseJson(malformed_json);
     try std.testing.expect(std.meta.isError(result));
 }
+
+test "parse slack slash command config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "slash_command": {"enabled": true, "name": "openclaw"}}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(cfg.channels.slack[0].slash_command.enabled);
+    try std.testing.expectEqualStrings("openclaw", cfg.channels.slack[0].slash_command.name);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].slash_command.name);
+    allocator.free(cfg.channels.slack);
+}
+
+test "slack slash command defaults to disabled with name nullclaw" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(!cfg.channels.slack[0].slash_command.enabled);
+    try std.testing.expectEqualStrings("nullclaw", cfg.channels.slack[0].slash_command.name);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack);
+}
