@@ -77,6 +77,18 @@ fn finalizeGeminiStreamResult(
     };
 }
 
+/// Finalize a Gemini stream that was cut after partial output: keep the salvaged
+/// text, but flag it truncated so the agent refuses tool calls parsed from it.
+fn finalizeRecoveredGeminiStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    stream_usage: root.TokenUsage,
+) !root.StreamChatResult {
+    var result = try finalizeGeminiStreamResult(allocator, accumulated, stream_usage);
+    result.truncated = true;
+    return result;
+}
+
 fn parseUsageMetadataValue(v: std.json.Value) ?root.TokenUsage {
     if (v != .object) return null;
     const usage_obj = v.object;
@@ -650,6 +662,12 @@ pub const GeminiProvider = struct {
         if (root_obj.get("candidates")) |candidates| {
             if (candidates == .array and candidates.array.items.len > 0) {
                 const candidate = candidates.array.items[0].object;
+                // A MAX_TOKENS finishReason means the candidate was cut off; a
+                // tool call parsed from the partial text must not be executed.
+                const truncated = if (candidate.get("finishReason")) |fr|
+                    (fr == .string and std.mem.eql(u8, fr.string, "MAX_TOKENS"))
+                else
+                    false;
                 if (candidate.get("content")) |content| {
                     if (content == .object) {
                         if (content.object.get("parts")) |parts| {
@@ -678,6 +696,7 @@ pub const GeminiProvider = struct {
                                 .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
                                 .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
                                 .usage = usage,
+                                .truncated = truncated,
                             };
                         }
                     }
@@ -937,7 +956,7 @@ pub const GeminiProvider = struct {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamGemini proceeding despite wait failure after partial stream output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
             }
             return error.CurlWaitError;
         };
@@ -946,7 +965,7 @@ pub const GeminiProvider = struct {
                 if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                     log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
                     callback(ctx, root.StreamChunk.finalChunk());
-                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                    return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
                 }
                 return error.CurlFailed;
             },
@@ -954,7 +973,7 @@ pub const GeminiProvider = struct {
                 if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                     log.warn("curlStreamGemini abnormal termination after partial stream output; returning accumulated output", .{});
                     callback(ctx, root.StreamChunk.finalChunk());
-                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                    return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
                 }
                 return error.CurlFailed;
             },
@@ -1316,6 +1335,26 @@ test "parseChatResponse extracts usageMetadata token counts" {
     try std.testing.expectEqual(@as(u32, 46), response.usage.total_tokens);
 }
 
+test "parseChatResponse flags finishReason=MAX_TOKENS as truncated" {
+    const body =
+        \\{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"partial"}]}}]}
+    ;
+    const response = try GeminiProvider.parseChatResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(response.content.?);
+    // Regression: Gemini/Vertex non-streaming responses never carried the
+    // truncated flag, so partial tool calls executed.
+    try std.testing.expect(response.truncated);
+}
+
+test "parseChatResponse leaves truncated false on a STOP finish" {
+    const body =
+        \\{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"done"}]}}]}
+    ;
+    const response = try GeminiProvider.parseChatResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(response.content.?);
+    try std.testing.expect(!response.truncated);
+}
+
 test "extractGeminiUsageMetadata derives missing total from prompt and completion" {
     const json =
         \\{"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":5}}
@@ -1525,6 +1564,18 @@ test "parseGeminiSseLine invalid json returns error" {
         error.InvalidSseJson,
         GeminiProvider.parseGeminiSseLine(std.testing.allocator, "data: not-json"),
     );
+}
+
+test "finalizeRecoveredGeminiStreamResult flags a cut stream as truncated" {
+    const result = try finalizeRecoveredGeminiStreamResult(
+        std.testing.allocator,
+        "partial answer <tool_call>{\"name\":\"shell\"}</tool_call>",
+        .{},
+    );
+    defer if (result.content) |content| std.testing.allocator.free(content);
+
+    try std.testing.expect(result.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "partial answer") != null);
 }
 
 test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {

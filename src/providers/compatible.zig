@@ -724,6 +724,25 @@ pub const OpenAiCompatibleProvider = struct {
         return usage;
     }
 
+    /// True when the Responses API response was cut short. Unlike chat
+    /// completions there is no `finish_reason`; the API sets `status` to
+    /// "incomplete" (with `incomplete_details.reason` == "max_output_tokens" or
+    /// "content_filter"). Tool calls salvaged from such a response are partial
+    /// and must not be executed, so the agent's truncated guard can fire.
+    fn responsesReportsIncomplete(root_obj: std.json.ObjectMap) bool {
+        if (root_obj.get("status")) |status| {
+            if (status == .string and std.mem.eql(u8, status.string, "incomplete")) return true;
+        }
+        if (root_obj.get("incomplete_details")) |details| {
+            if (details == .object) {
+                if (details.object.get("reason")) |reason| {
+                    if (reason == .string and std.mem.eql(u8, reason.string, "max_output_tokens")) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     pub fn parseResponsesResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
@@ -772,6 +791,7 @@ pub const OpenAiCompatibleProvider = struct {
             .usage = extractResponsesUsage(root_obj),
             .model = model_str,
             .reasoning_content = reasoning,
+            .truncated = responsesReportsIncomplete(root_obj),
         };
     }
 
@@ -1008,6 +1028,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (choices == .array and choices.array.items.len > 0) {
                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
                 const msg_obj = msg.object;
+                const truncated = root.choiceReportsLengthFinish(choices.array.items[0]);
 
                 var content: ?[]const u8 = null;
                 errdefer if (content) |c| if (c.len > 0) allocator.free(c);
@@ -1119,6 +1140,7 @@ pub const OpenAiCompatibleProvider = struct {
                     .usage = usage,
                     .model = model_str,
                     .reasoning_content = reasoning_content,
+                    .truncated = truncated,
                 };
             }
         }
@@ -1907,6 +1929,37 @@ test "parseNativeResponse reads reasoning_details field" {
     try std.testing.expectEqualStrings("plan\nstep by step", result.reasoning_content.?);
 }
 
+test "parseNativeResponse flags finish_reason=length as truncated" {
+    const body =
+        \\{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"<tool_call>{\"name\":\"shell\"}</tool_call>"}}],"model":"k2"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.truncated);
+}
+
+test "parseNativeResponse leaves truncated false on a natural stop" {
+    const body =
+        \\{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"model":"k2"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+    }
+    try std.testing.expect(!result.truncated);
+}
+
 test "parseNativeResponse supports content array text parts" {
     const body =
         \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}],"model":"kimi-k2.5"}
@@ -2674,6 +2727,41 @@ test "parseResponsesResponse extracts function call text and reasoning summary" 
     try std.testing.expectEqual(@as(u32, 15), result.usage.total_tokens);
     try std.testing.expectEqualStrings("gpt-5.4", result.model);
     try std.testing.expectEqualStrings("thinking summary", result.reasoning_content.?);
+}
+
+test "parseResponsesResponse flags status=incomplete as truncated" {
+    const body =
+        \\{"model":"gpt-5.4","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{}"}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |text| std.testing.allocator.free(text);
+        for (result.tool_calls) |tc| {
+            std.testing.allocator.free(tc.id);
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |text| std.testing.allocator.free(text);
+    }
+    // Regression: the Responses API path never inspected status/incomplete_details,
+    // so a max_output_tokens cut reached the agent as a complete response.
+    try std.testing.expect(result.truncated);
+}
+
+test "parseResponsesResponse leaves truncated false on a completed response" {
+    const body =
+        \\{"model":"gpt-5.4","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |text| std.testing.allocator.free(text);
+        std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |text| std.testing.allocator.free(text);
+    }
+    try std.testing.expect(!result.truncated);
 }
 
 test "parseResponsesResponse maps generic error envelope" {

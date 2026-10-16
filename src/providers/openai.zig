@@ -134,6 +134,7 @@ pub const OpenAiProvider = struct {
             if (choices == .array and choices.array.items.len > 0) {
                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
                 const msg_obj = msg.object;
+                const truncated = root.choiceReportsLengthFinish(choices.array.items[0]);
 
                 var content: ?[]const u8 = null;
                 var reasoning_content: ?[]const u8 = null;
@@ -193,6 +194,7 @@ pub const OpenAiProvider = struct {
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,
+                    .truncated = truncated,
                 };
             }
         }
@@ -611,6 +613,32 @@ test "parseNativeResponse tool_calls null does not crash" {
     }
     try std.testing.expect(response.tool_calls.len == 0);
     try std.testing.expectEqualStrings("pong", response.content.?);
+}
+
+test "parseNativeResponse flags finish_reason=length as truncated" {
+    const body =
+        \\{"choices":[{"finish_reason":"length","message":{"content":"<tool_call>{\"name\":\"shell\"}</tool_call>"}}],"model":"gpt-4o"}
+    ;
+    const response = try OpenAiProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c| std.testing.allocator.free(c);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(response.truncated);
+}
+
+test "parseNativeResponse leaves truncated false on a natural stop" {
+    const body =
+        \\{"choices":[{"finish_reason":"stop","message":{"content":"hello"}}],"model":"gpt-4o"}
+    ;
+    const response = try OpenAiProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c| std.testing.allocator.free(c);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(!response.truncated);
 }
 
 test "buildRequestBody includes temperature zero" {

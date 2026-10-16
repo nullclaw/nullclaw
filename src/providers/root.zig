@@ -205,6 +205,11 @@ pub const ChatResponse = struct {
     model: []const u8 = "",
     /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
     reasoning_content: ?[]const u8 = null,
+    /// True when the provider response ended before a natural stop: a cut
+    /// stream (abnormal termination, timeout) or a max_tokens hit
+    /// (`finish_reason == "length"`). Tool calls salvaged from such a response
+    /// must never be executed.
+    truncated: bool = false,
 
     /// True when the LLM wants to invoke at least one tool.
     pub fn hasToolCalls(self: ChatResponse) bool {
@@ -274,10 +279,23 @@ pub const StreamChatResult = struct {
     reasoning_content: ?[]const u8 = null,
     usage: TokenUsage = .{},
     model: []const u8 = "",
+    /// See `ChatResponse.truncated`.
+    truncated: bool = false,
 };
 
 pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
     return saw_done or accumulated_len > 0;
+}
+
+/// True when an OpenAI-style `choices[]` entry ended because the model hit its
+/// token budget (`finish_reason == "length"`) rather than stopping naturally. A
+/// response that stopped this way is a truncated prefix, so any tool call
+/// salvaged from its text must not be executed. Shared by the OpenAI,
+/// OpenRouter, and OpenAI-compatible non-streaming parsers.
+pub fn choiceReportsLengthFinish(choice: std.json.Value) bool {
+    if (choice != .object) return false;
+    const finish_reason = choice.object.get("finish_reason") orelse return false;
+    return finish_reason == .string and std.mem.eql(u8, finish_reason.string, "length");
 }
 
 pub fn freeStreamUnusedChatResponseFields(allocator: std.mem.Allocator, response: *ChatResponse) void {
@@ -316,6 +334,10 @@ pub fn emitChatResponseAsStream(
         .reasoning_content = reasoning_content,
         .usage = response.usage,
         .model = response.model,
+        // Propagate the cut/max_tokens flag: every non-streaming fallback
+        // (api_mode == .responses, large-prompt skip, curl fallback) returns
+        // through here, and dropping it let truncated tool calls execute.
+        .truncated = response.truncated,
     };
 }
 
@@ -902,6 +924,30 @@ test "emitChatResponseAsStream frees unused chat response fields" {
     try std.testing.expectEqualStrings("hello", result.content.?);
     try std.testing.expectEqualStrings("private reasoning", result.reasoning_content.?);
     try std.testing.expectEqualStrings("test-model", result.model);
+}
+
+test "emitChatResponseAsStream propagates the truncated flag" {
+    const allocator = std.testing.allocator;
+
+    var response = ChatResponse{
+        .content = try allocator.dupe(u8, "partial answer"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .truncated = true,
+    };
+
+    const CallbackCtx = struct {
+        fn onChunk(_: *anyopaque, _: StreamChunk) void {}
+    };
+    var ctx: u8 = 0;
+    const result = emitChatResponseAsStream(allocator, &response, CallbackCtx.onChunk, @ptrCast(&ctx));
+    defer if (result.content) |content| allocator.free(content);
+    defer if (result.model.len > 0) allocator.free(result.model);
+
+    // Regression: every non-streaming fallback returns through this function;
+    // dropping the flag left the agent unable to tell the calls came from a cut
+    // response, so it executed them.
+    try std.testing.expect(result.truncated);
+    try std.testing.expectEqualStrings("partial answer", result.content.?);
 }
 
 test "Provider.streamChat fallback emits single chunk and final" {

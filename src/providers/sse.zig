@@ -41,6 +41,72 @@ fn finalizeStreamResult(
     };
 }
 
+/// Finalize a stream that was cut after partial output (wait failure, nonzero
+/// exit, abnormal termination): keep the salvaged text, but flag it truncated so
+/// the agent refuses tool calls parsed out of the partial response.
+fn finalizeRecoveredStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    stream_usage: ?root.TokenUsage,
+) !root.StreamChatResult {
+    var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
+    result.truncated = true;
+    return result;
+}
+
+fn isJsonWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// Return the payload after the `data:` prefix of an SSE line, or null when the
+/// line is not a `data:` line. Mirrors parseSseLine's prefix handling.
+fn sseDataPayload(line: []const u8) ?[]const u8 {
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+    const prefix = "data:";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    return if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
+        trimmed[prefix.len + 1 ..]
+    else
+        trimmed[prefix.len..];
+}
+
+/// True when an SSE line's choice carries `finish_reason: "length"`, i.e. the
+/// model stopped because it hit its token budget. The accumulated text is a
+/// truncated prefix, so any tool-call markup in it must not be executed.
+///
+/// Scans the payload textually instead of JSON-parsing it: a full parse needs
+/// an allocator, and a fixed-size parse arena silently fails on a large data
+/// line (a big final delta can carry the finish_reason), so a max_tokens cut
+/// was never flagged. The field is only matched at a JSON value position
+/// (after `{` or `,`) so a quoted mention inside a content string is ignored.
+fn sseLineReportsLengthFinish(line: []const u8) bool {
+    const data = sseDataPayload(line) orelse return false;
+    if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) return false;
+
+    const key = "\"finish_reason\"";
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, data, search_from, key)) |key_start| {
+        search_from = key_start + 1;
+
+        // Reject a mention that is a value, not a key: the byte before the key
+        // must open an object (`{`) or separate a member (`,`).
+        var prev = key_start;
+        while (prev > 0 and isJsonWhitespace(data[prev - 1])) prev -= 1;
+        if (prev != 0 and data[prev - 1] != '{' and data[prev - 1] != ',') continue;
+
+        var i = key_start + key.len;
+        while (i < data.len and isJsonWhitespace(data[i])) i += 1;
+        if (i >= data.len or data[i] != ':') continue;
+        i += 1;
+        while (i < data.len and isJsonWhitespace(data[i])) i += 1;
+        if (i >= data.len or data[i] != '"') continue;
+        const value_start = i + 1;
+        const value_end = std.mem.indexOfScalarPos(u8, data, value_start, '"') orelse continue;
+        if (std.mem.eql(u8, data[value_start..value_end], "length")) return true;
+    }
+    return false;
+}
+
 fn parseCurlVersionComponent(component: []const u8) ?u32 {
     var end: usize = 0;
     while (end < component.len and std.ascii.isDigit(component[end])) : (end += 1) {}
@@ -459,6 +525,7 @@ pub fn curlStream(
     const stdout_file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
     var saw_done = false;
+    var saw_length_finish = false;
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
     var in_reasoning = false;
@@ -512,6 +579,7 @@ pub fn curlStream(
                 if (log_enabled) {
                     debug_log.info("parsing SSE line: len={d}", .{line_buf.items.len});
                 }
+                if (!saw_length_finish and sseLineReportsLengthFinish(line_buf.items)) saw_length_finish = true;
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
                     continue;
@@ -577,7 +645,7 @@ pub fn curlStream(
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+            return finalizeRecoveredStreamResult(allocator, accumulated.items, stream_usage);
         }
         return error.CurlWaitError;
     };
@@ -590,7 +658,7 @@ pub fn curlStream(
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeRecoveredStreamResult(allocator, accumulated.items, stream_usage);
             }
             return error.CurlFailed;
         },
@@ -599,7 +667,7 @@ pub fn curlStream(
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeRecoveredStreamResult(allocator, accumulated.items, stream_usage);
             }
             return error.CurlFailed;
         },
@@ -608,7 +676,12 @@ pub fn curlStream(
     // Signal stream completion only after curl exits successfully.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+    var final_result = try finalizeStreamResult(allocator, accumulated.items, stream_usage);
+    // A `finish_reason: "length"` on an otherwise clean stream still means the
+    // text is a truncated prefix: propagate it so tool calls parsed from it are
+    // not executed.
+    final_result.truncated = saw_length_finish;
+    return final_result;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -868,7 +941,7 @@ pub fn curlStreamAnthropic(
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
             log.warn("curlStreamAnthropic proceeding despite wait failure after partial stream output", .{});
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+            return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
         }
         return error.CurlWaitError;
     };
@@ -877,7 +950,7 @@ pub fn curlStreamAnthropic(
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
             }
             return error.CurlFailed;
         },
@@ -885,7 +958,7 @@ pub fn curlStreamAnthropic(
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic abnormal termination after partial stream output; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
             }
             return error.CurlFailed;
         },
@@ -1265,4 +1338,55 @@ test "extractStreamUsage returns null for null usage field" {
         \\{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}],"usage":null}
     ;
     try std.testing.expect(extractStreamUsage(json) == null);
+}
+
+test "finalizeRecoveredStreamResult flags a cut stream as truncated" {
+    const result = try finalizeRecoveredStreamResult(
+        std.testing.allocator,
+        "partial answer <tool_call>{\"name\":\"shell\"}</tool_call>",
+        null,
+    );
+    defer {
+        if (result.content) |content| std.testing.allocator.free(content);
+        if (result.reasoning_content) |reasoning| std.testing.allocator.free(reasoning);
+    }
+
+    // The recovery paths keep the salvaged text but must flag it truncated so
+    // the agent does not execute tool calls parsed from the cut.
+    try std.testing.expect(result.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "partial answer") != null);
+}
+
+test "sseLineReportsLengthFinish detects a max_tokens finish" {
+    try std.testing.expect(sseLineReportsLengthFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"length"}]}
+    ));
+    try std.testing.expect(!sseLineReportsLengthFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+    ));
+    try std.testing.expect(!sseLineReportsLengthFinish("data: [DONE]"));
+    try std.testing.expect(!sseLineReportsLengthFinish(": keep-alive"));
+}
+
+test "sseLineReportsLengthFinish finds finish_reason past 16 KB" {
+    // Regression: a fixed 16 KB parse arena silently failed on a larger data
+    // line (a big final delta can carry the finish_reason), so a max_tokens cut
+    // was never flagged and truncated tool calls ran.
+    const prefix = "data: {\"choices\":[{\"delta\":{\"content\":\"";
+    const suffix = "\"},\"finish_reason\":\"length\"}]}";
+    const fill = 20 * 1024;
+    var buf: [prefix.len + fill + suffix.len]u8 = undefined;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memset(buf[prefix.len .. prefix.len + fill], 'x');
+    @memcpy(buf[prefix.len + fill ..], suffix);
+    const line = buf[0 .. prefix.len + fill + suffix.len];
+
+    try std.testing.expect(line.len > 16 * 1024);
+    try std.testing.expect(sseLineReportsLengthFinish(line));
+
+    // A quoted mention of the field inside content must not be mistaken for the
+    // real finish_reason.
+    try std.testing.expect(!sseLineReportsLengthFinish(
+        \\data: {"choices":[{"delta":{"content":"say \"finish_reason\":\"length\" now"}}]}
+    ));
 }

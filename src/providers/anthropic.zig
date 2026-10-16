@@ -239,12 +239,21 @@ pub const AnthropicProvider = struct {
 
         const model_str = if (root_obj.get("model")) |m| (if (m == .string) m.string else "") else "";
 
+        // A max_tokens stop means the response is a truncated prefix: any
+        // tool_use block (or <tool_call> text salvaged downstream) is partial and
+        // must not be executed, so the agent's truncated guard can fire.
+        const truncated = if (root_obj.get("stop_reason")) |sr|
+            (sr == .string and std.mem.eql(u8, sr.string, "max_tokens"))
+        else
+            false;
+
         return .{
             .content = if (text_parts.items.len > 0) try text_parts.toOwnedSlice(allocator) else null,
             .reasoning_content = if (thinking_parts.items.len > 0) try thinking_parts.toOwnedSlice(allocator) else null,
             .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
             .usage = usage,
             .model = try allocator.dupe(u8, model_str),
+            .truncated = truncated,
         };
     }
 
@@ -808,6 +817,40 @@ test "parseNativeResponse with text and tool_use" {
     try std.testing.expect(response.usage.prompt_tokens == 10);
     try std.testing.expect(response.usage.completion_tokens == 20);
     try std.testing.expect(response.usage.total_tokens == 30);
+}
+
+test "parseNativeResponse flags stop_reason=max_tokens as truncated" {
+    const body =
+        \\{"content":[{"type":"tool_use","id":"call_1","name":"shell","input":{"cmd":"ls"}}],"stop_reason":"max_tokens","model":"claude-3-opus"}
+    ;
+    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c| std.testing.allocator.free(c);
+        for (response.tool_calls) |tc| {
+            std.testing.allocator.free(tc.id);
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    // Regression: a non-streaming Anthropic max_tokens cut never set the flag,
+    // so partial tool_use calls reached the agent and executed.
+    try std.testing.expect(response.truncated);
+    try std.testing.expectEqual(@as(usize, 1), response.tool_calls.len);
+}
+
+test "parseNativeResponse leaves truncated false on end_turn" {
+    const body =
+        \\{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","model":"claude-3-opus"}
+    ;
+    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c| std.testing.allocator.free(c);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(!response.truncated);
 }
 
 test "supportsNativeTools returns true" {

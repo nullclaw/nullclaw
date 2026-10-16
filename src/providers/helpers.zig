@@ -175,6 +175,29 @@ pub fn isReasoningModel(model: []const u8) bool {
         std.mem.startsWith(u8, model, "codex-mini");
 }
 
+/// True when a reasoning effort was requested and is not the explicit "none".
+/// Drives the request cap field: a reasoning endpoint takes
+/// `max_completion_tokens`, a plain one `max_tokens`.
+pub fn reasoningEffortActive(reasoning_effort: ?[]const u8) bool {
+    const raw = reasoning_effort orelse return false;
+    return raw.len > 0 and !std.ascii.eqlIgnoreCase(raw, "none");
+}
+
+/// True when a model name marks an OpenAI-compatible *reasoning* endpoint even
+/// though `isReasoningModel` (which only knows OpenAI's own ids) does not
+/// recognise it. Such gateways take the cap as `max_completion_tokens` and
+/// ignore `max_tokens`, so the field must not depend on `reasoning_effort`
+/// being set: a `k2`/`-reasoner`/`-thinking` model with no effort configured
+/// would otherwise send a cap the gateway drops and run to its hard ceiling.
+pub fn isReasoningEndpointModel(model: []const u8) bool {
+    if (isReasoningModel(model)) return true;
+    const needles = [_][]const u8{ "reason", "think", "k2" };
+    for (needles) |needle| {
+        if (std.ascii.indexOfIgnoreCase(model, needle) != null) return true;
+    }
+    return false;
+}
+
 /// Append model-specific generation controls to a JSON request body buffer:
 /// - non-reasoning: `temperature` + optional `max_tokens`
 /// - reasoning + reasoning_effort=="none": `temperature` + `max_completion_tokens`
@@ -192,14 +215,25 @@ pub fn appendGenerationFields(
     reasoning_effort: ?[]const u8,
 ) !void {
     if (!isReasoningModel(model)) {
-        // Non-reasoning model: temperature + max_tokens
+        // Non-reasoning model: temperature + a token cap. When a reasoning
+        // effort was requested, or the model name marks a reasoning endpoint we
+        // do not recognise (K2, DeepSeek-R1, ...), the gateway ignores
+        // `max_tokens` and honours only `max_completion_tokens`, so the cap must
+        // go out under that field or a degenerate loop runs to the gateway's
+        // hard ceiling (OpenClaw's `maxTokensField` default for
+        // OpenAI-compatible endpoints).
         try buf.appendSlice(allocator, ",\"temperature\":");
         var temp_buf: [16]u8 = undefined;
         const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
         try buf.appendSlice(allocator, temp_str);
 
         if (max_tokens) |max_tok| {
-            try buf.appendSlice(allocator, ",\"max_tokens\":");
+            const completion_field = reasoningEffortActive(reasoning_effort) or
+                isReasoningEndpointModel(model);
+            try buf.appendSlice(allocator, if (completion_field)
+                ",\"max_completion_tokens\":"
+            else
+                ",\"max_tokens\":");
             var max_buf: [16]u8 = undefined;
             const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
             try buf.appendSlice(allocator, max_str);
@@ -783,6 +817,33 @@ test "appendGenerationFields normalizes xhigh reasoning effort for gpt-5" {
     try std.testing.expectEqualStrings("high", obj.get("reasoning_effort").?.string);
     try std.testing.expect(obj.get("temperature") == null);
     try std.testing.expectEqual(@as(i64, 2048), obj.get("max_completion_tokens").?.integer);
+}
+
+test "appendGenerationFields uses max_completion_tokens for an active reasoning effort" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    // Regression: pre-fix a `k2` request with a reasoning effort emitted the
+    // cap as `max_tokens`, which such gateways ignore, so it never applied.
+    try appendGenerationFields(&buf, std.testing.allocator, "k2", 0.7, 8192, "high");
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_completion_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_tokens\":") == null);
+}
+
+test "appendGenerationFields keeps max_tokens for a plain model without an effort" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendGenerationFields(&buf, std.testing.allocator, "llama-3.3-70b", 0.7, 8192, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_tokens\":8192") != null);
+}
+
+test "appendGenerationFields caps a reasoning endpoint even without an effort" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    // Regression: pre-fix a `k2` endpoint with no reasoning effort sent the cap
+    // as `max_tokens`, which the gateway ignores, so the cap never applied.
+    try appendGenerationFields(&buf, std.testing.allocator, "k2", 0.7, 8192, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_completion_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_tokens\":") == null);
 }
 
 test "appendGeminiThinkingConfig uses thinkingLevel for gemini-3 flash" {

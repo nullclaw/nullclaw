@@ -129,6 +129,7 @@ pub const OpenRouterProvider = struct {
             if (choices == .array and choices.array.items.len > 0) {
                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
                 const msg_obj = msg.object;
+                const truncated = root.choiceReportsLengthFinish(choices.array.items[0]);
 
                 var content: ?[]const u8 = null;
                 var reasoning_content: ?[]const u8 = null;
@@ -217,6 +218,7 @@ pub const OpenRouterProvider = struct {
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,
+                    .truncated = truncated,
                 };
             }
         }
@@ -1077,4 +1079,34 @@ test "parseNativeResponse tool_calls null does not crash" {
     }
     try std.testing.expectEqualStrings("pong", response.content.?);
     try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
+}
+
+test "parseNativeResponse flags finish_reason=length as truncated" {
+    const body =
+        \\{"choices":[{"finish_reason":"length","message":{"content":"<tool_call>{\"name\":\"shell\"}</tool_call>"}}],"model":"kimi-k2"}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expect(response.truncated);
+}
+
+test "parseNativeResponse leaves truncated false on a natural stop" {
+    const body =
+        \\{"choices":[{"finish_reason":"stop","message":{"content":"hello"}}],"model":"kimi-k2"}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expect(!response.truncated);
 }

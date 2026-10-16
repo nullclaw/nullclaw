@@ -122,6 +122,15 @@ Example (production-safe: content-bearing flags off):
 }
 ```
 
+### `max_tokens`
+
+Caps the output tokens requested on each provider call. Sibling of `default_temperature`.
+
+- Unset: nullclaw resolves a per-model default (8192 for most models; 32,768 for `k2p5`, `kimi-coding` and `kimi-k2*`; 4,096 for legacy `gpt-4` and the `nvidia`, `byteplus` and `doubao` providers).
+- Set: overrides that default.
+
+On an OpenAI-compatible reasoning endpoint — a reasoning model (`o1`/`o3`/`o4-mini`/`gpt-5*`/`codex-mini`) or a model whose name marks one (`k2`, `-reasoner`, `-thinking`) — the cap is sent as `max_completion_tokens`; a plain endpoint uses `max_tokens`. Those gateways ignore `max_tokens`, so the cap must use the field they honour, or a degenerate loop runs to the hard output ceiling.
+
 ### `models.providers`
 
 - Defines LLM provider connection parameters and API keys.

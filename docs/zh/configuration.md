@@ -107,6 +107,15 @@ nullclaw onboard --interactive
 }
 ```
 
+### `max_tokens`
+
+限制每次 provider 调用请求的输出 token 数。与 `default_temperature` 同级。
+
+- 未设置：nullclaw 按模型解析默认值（大多数模型为 8192；`k2p5`、`kimi-coding`、`kimi-k2*` 为 32,768；旧版 `gpt-4` 以及 `nvidia`、`byteplus`、`doubao` provider 为 4,096）。
+- 设置：覆盖该默认值。
+
+在 OpenAI 兼容的推理端点上（推理模型 `o1`/`o3`/`o4-mini`/`gpt-5*`/`codex-mini`，或名称标示推理端点的模型，如 `k2`、`-reasoner`、`-thinking`），上限以 `max_completion_tokens` 发送；普通端点使用 `max_tokens`。这类网关会忽略 `max_tokens`，因此上限必须使用它们认可的字段，否则退化循环会一路跑到硬性输出上限。
+
 ### `models.providers`
 
 - 定义各 LLM provider 的连接参数与 API Key。
