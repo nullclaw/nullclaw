@@ -1588,6 +1588,12 @@ fn startConfiguredTunnel(
 /// shutdown is requested (Ctrl+C signal or explicit request).
 /// `host` and `port` are CLI-parsed values that override `config.gateway`.
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
+    // Make logging non-blocking before any channel/turn thread starts: a turn
+    // holds its Session.mutex for the whole turn, so a wedged stderr write
+    // (full docker json-file log pipe, stalled log driver) must not be able to
+    // park every logging thread on the process-global log lock. See logging.zig.
+    @import("logging.zig").start();
+
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.
     try onboard.scaffoldWorkspaceForConfig(allocator, config, &onboard.ProjectContext{});

@@ -2722,8 +2722,12 @@ pub const Agent = struct {
                     return self.interruptedReply();
                 }
 
+                // Per-call logging stays at debug: on the turn's hot path an
+                // info-level write holds the process-global stderr lock, and a
+                // large batch (or a blocked log sink) then parks the whole
+                // session in futex_do_wait.
                 if (self.log_tool_calls) {
-                    log.info(
+                    log.debug(
                         "tool-call start session=0x{x} index={d} name={s} id={s}",
                         .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
                     );
@@ -2760,7 +2764,7 @@ pub const Agent = struct {
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
-                    log.info(
+                    log.debug(
                         "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
                         .{ session_hash, idx + 1, call.name, result.success, tool_duration },
                     );

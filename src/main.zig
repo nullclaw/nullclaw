@@ -6,6 +6,13 @@ const yc = @import("nullclaw");
 const control_plane = yc.control_plane;
 const util = yc.util;
 
+/// Route logging through the gateway's non-blocking logger (see logging.zig).
+/// Until the gateway calls `logging.start()` this forwards to the default
+/// logger, so short-lived CLI commands and tests are unaffected.
+pub const std_options: std.Options = .{
+    .logFn = yc.logging.logFn,
+};
+
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     _ = error_return_trace;
     _ = ret_addr;
