@@ -10,6 +10,7 @@ const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
 const session_mod = @import("session.zig");
+const agent_mod = @import("agent/root.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const providers = @import("providers/root.zig");
@@ -749,7 +750,9 @@ fn handleTelegramInteractiveCallback(
     message_id: i64,
     is_group: bool,
     message_sender_id: []const u8,
+    heartbeat: ?*Atomic(i64),
 ) bool {
+    if (heartbeat) |h| bumpProgress(h);
     // Mirror processTelegramMessage: keep callback-query processing visible
     // during slow model calls from interactive Telegram buttons.
     const typing_target = sender;
@@ -780,7 +783,8 @@ fn handleTelegramInteractiveCallback(
             return true;
         }
 
-        const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+        const progress_sink: ?agent_mod.ProgressSink = if (heartbeat) |h| progressHeartbeatSink(h) else null;
+        const model_reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, null, progress_sink) catch |err| {
             log.err("failed to process telegram callback interaction: {}", .{err});
             response_owned = true;
             break :blk allocator.dupe(u8, defaultAgentErrorMessage(err)) catch return true;
@@ -945,7 +949,9 @@ fn processTelegramMessage(
     reply_to_id: ?i64,
     message_sender_id: []const u8,
     replace_message: bool,
+    heartbeat: ?*Atomic(i64),
 ) void {
+    if (heartbeat) |h| bumpProgress(h);
     const typing_target = sender;
     const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
     defer {
@@ -980,13 +986,15 @@ fn processTelegramMessage(
         .tg_ptr = tg_ptr,
         .chat_id = sender,
         .draft_id = draft_turn_id,
+        .heartbeat = heartbeat,
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
 
     if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
-    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
+    const progress_sink: ?agent_mod.ProgressSink = if (heartbeat) |h| progressHeartbeatSink(h) else null;
+    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink) catch |err| {
         logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
         const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
@@ -1048,6 +1056,7 @@ const MessageTask = struct {
     reply_to_id: ?i64,
     message_sender_id: []const u8,
     replace_message: bool,
+    heartbeat: ?*Atomic(i64),
 
     fn run(task: *MessageTask) void {
         processTelegramMessage(
@@ -1062,6 +1071,7 @@ const MessageTask = struct {
             task.reply_to_id,
             task.message_sender_id,
             task.replace_message,
+            task.heartbeat,
         );
     }
 
@@ -1249,11 +1259,58 @@ fn matrixRoomPeerId(reply_target: ?[]const u8) []const u8 {
 // TelegramLoopState — shared state between supervisor and polling thread
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Coarse phase of a polling thread. Recorded so the supervisor can report
+/// where a stalled poller is stuck when it declares the thread stale.
+pub const PollStep = enum(u8) {
+    startup = 0,
+    polling = 1,
+    dispatching = 2,
+};
+
+fn markPollStep(cell: *Atomic(u8), step: PollStep) void {
+    cell.store(@intFromEnum(step), .release);
+}
+
+/// Bump a poller's progress heartbeat. The poll loop bumps it as it enters a
+/// dispatch, and the running turn bumps it through `progressHeartbeatSink`
+/// (one hint per tool call) and, on streaming channels, per streamed chunk. The
+/// supervisor treats a frozen heartbeat as a stall even while the poller is
+/// dispatching, so a hung turn or worker join is still recovered.
+pub fn bumpProgress(cell: *Atomic(i64)) void {
+    cell.store(std_compat.time.timestamp(), .release);
+}
+
+fn progressHeartbeat(ctx: *anyopaque, _: agent_mod.ProgressHint) void {
+    const cell: *Atomic(i64) = @ptrCast(@alignCast(ctx));
+    bumpProgress(cell);
+}
+
+/// A `ProgressSink` that refreshes `cell` on every turn progress hint.
+pub fn progressHeartbeatSink(cell: *Atomic(i64)) agent_mod.ProgressSink {
+    return .{ .callback = progressHeartbeat, .ctx = @ptrCast(cell) };
+}
+
 pub const TelegramLoopState = struct {
     /// Updated after each pollUpdates() — epoch seconds.
     last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
     stop_requested: Atomic(bool),
+    /// Coarse phase of the polling thread (see `PollStep`).
+    step: Atomic(u8),
+    /// Poller-owned progress heartbeat (see `bumpProgress`): the poll loop bumps
+    /// it every iteration, and a turn running *on the polling thread* bumps it
+    /// through `progressHeartbeatSink`. Only the polling thread writes it, so a
+    /// frozen value means the poller itself stalled.
+    progress: Atomic(i64),
+    /// Progress of parallel worker turns (Telegram runs turns off-thread when
+    /// `session.max_concurrent_tasks > 1`). Deliberately separate from
+    /// `progress`: a worker that keeps streaming must not read as poller
+    /// liveness, or a wedged poller whose worker is still running would never be
+    /// declared stale (the exact stall supervision exists to recover).
+    turn_progress: Atomic(i64),
+    /// Set by the polling loop as its last action, so the supervisor can bound
+    /// how long it waits for the thread before detaching it.
+    exited: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
@@ -1261,6 +1318,10 @@ pub const TelegramLoopState = struct {
         return .{
             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
+            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
+            .progress = Atomic(i64).init(std_compat.time.timestamp()),
+            .turn_progress = Atomic(i64).init(std_compat.time.timestamp()),
+            .exited = Atomic(bool).init(false),
         };
     }
 };
@@ -1504,8 +1565,17 @@ pub fn runTelegramLoop(
     loop_state: *TelegramLoopState,
     tg_ptr: *telegram.TelegramChannel,
 ) void {
+    // Last action of the thread: lets the supervisor bound how long it waits
+    // before detaching a poller that will not come back.
+    defer loop_state.exited.store(true, .release);
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
+    // Remember the transcriber this poller installs so teardown only clears the
+    // shared field while it is still ours. A detached poller can outlive a
+    // respawn that installed its own transcriber; unconditionally destroying
+    // tg_ptr.transcriber would free the live one and null the field the new
+    // poller just set (voice transcription silently disabled).
+    var installed_transcriber: ?*voice.WhisperTranscriber = null;
     if (config.getProviderKey(trans.provider)) |key| {
         const wt = allocator.create(voice.WhisperTranscriber) catch {
             log.warn("Failed to allocate WhisperTranscriber", .{});
@@ -1517,11 +1587,14 @@ pub fn runTelegramLoop(
             .model = trans.model,
             .language = trans.language,
         };
+        installed_transcriber = wt;
         tg_ptr.transcriber = wt.transcriber();
     }
-    defer if (tg_ptr.transcriber) |t| {
-        allocator.destroy(@as(*voice.WhisperTranscriber, @ptrCast(@alignCast(t.ptr))));
-        tg_ptr.transcriber = null;
+    defer if (installed_transcriber) |wt| {
+        if (tg_ptr.transcriber) |t| {
+            if (t.ptr == @as(*anyopaque, @ptrCast(wt))) tg_ptr.transcriber = null;
+        }
+        allocator.destroy(wt);
     };
 
     // Restore persisted Telegram offset (OpenClaw parity).
@@ -1548,6 +1621,13 @@ pub fn runTelegramLoop(
 
     // Parallel worker bookkeeping.
     // Keep at most one in-flight worker per session_key to preserve order.
+    //
+    // The joins below are deliberately unbounded. A worker wedged in a non-network
+    // op cannot be joined with a timeout (std.Thread.join has none), and detaching
+    // it would let a hung turn keep holding its session lock while the channel
+    // silently kept polling - masking the stall. Instead the poller records a
+    // `progress` heartbeat (see bumpProgress) and the supervisor detaches and
+    // respawns a poller that stops making progress (see channel_manager).
     var active_worker_threads: std.StringHashMapUnmanaged(std.Thread) = .empty;
     var active_worker_order: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
@@ -1569,6 +1649,7 @@ pub fn runTelegramLoop(
     const enable_parallel = max_parallel_tasks > 1;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        markPollStep(&loop_state.step, .polling);
         const messages = tg_ptr.pollUpdates(allocator) catch |err| {
             log.warn("Telegram poll error: {}", .{err});
             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
@@ -1579,6 +1660,8 @@ pub fn runTelegramLoop(
         // Update activity after each poll (even if no messages)
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
+        markPollStep(&loop_state.step, .dispatching);
+        bumpProgress(&loop_state.progress);
         for (messages) |msg| {
             // Reply-to logic
             const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
@@ -1611,6 +1694,7 @@ pub fn runTelegramLoop(
                     msg.message_id.?,
                     msg.is_group,
                     msg.id,
+                    &loop_state.progress,
                 )) {
                     continue;
                 }
@@ -1758,6 +1842,7 @@ pub fn runTelegramLoop(
                         .reply_to_id = reply_to_id,
                         .message_sender_id = task_message_sender_id,
                         .replace_message = msg.replace_message,
+                        .heartbeat = &loop_state.turn_progress,
                     };
 
                     const thread = std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, messageTaskWorker, .{task}) catch |err| {
@@ -1814,6 +1899,7 @@ pub fn runTelegramLoop(
                 reply_to_id,
                 msg.id,
                 msg.replace_message,
+                &loop_state.progress,
             );
         }
 
@@ -1825,14 +1911,19 @@ pub fn runTelegramLoop(
         }
 
         if (tg_ptr.persistableUpdateOffset()) |persistable_update_id| {
-            persistTelegramUpdateOffsetIfAdvanced(
-                allocator,
-                config,
-                tg_ptr.account_id,
-                tg_ptr.bot_token,
-                &persisted_update_id,
-                persistable_update_id,
-            );
+            // A detached poller that resumes must not rewind the on-disk offset:
+            // the respawned poller may already have persisted a higher id, and
+            // this poller's local `persisted_update_id` is stale.
+            if (!loop_state.stop_requested.load(.acquire)) {
+                persistTelegramUpdateOffsetIfAdvanced(
+                    allocator,
+                    config,
+                    tg_ptr.account_id,
+                    tg_ptr.bot_token,
+                    &persisted_update_id,
+                    persistable_update_id,
+                );
+            }
         }
 
         // Periodic session eviction
@@ -1862,6 +1953,15 @@ pub const SignalLoopState = struct {
     last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
     stop_requested: Atomic(bool),
+    /// Coarse phase of the polling thread (see `PollStep`).
+    step: Atomic(u8),
+    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
+    /// supervisor treats a frozen heartbeat as a stall even while the poller is
+    /// dispatching, so a hung turn or worker join is still recovered.
+    progress: Atomic(i64),
+    /// Set by the polling loop as its last action, so the supervisor can bound
+    /// how long it waits for the thread before detaching it.
+    exited: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
@@ -1869,6 +1969,9 @@ pub const SignalLoopState = struct {
         return .{
             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
+            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
+            .progress = Atomic(i64).init(std_compat.time.timestamp()),
+            .exited = Atomic(bool).init(false),
         };
     }
 };
@@ -1882,6 +1985,15 @@ pub const WeixinLoopState = struct {
     last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
     stop_requested: Atomic(bool),
+    /// Coarse phase of the polling thread (see `PollStep`).
+    step: Atomic(u8),
+    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
+    /// supervisor treats a frozen heartbeat as a stall even while the poller is
+    /// dispatching, so a hung turn or worker join is still recovered.
+    progress: Atomic(i64),
+    /// Set by the polling loop as its last action, so the supervisor can bound
+    /// how long it waits for the thread before detaching it.
+    exited: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
@@ -1889,6 +2001,9 @@ pub const WeixinLoopState = struct {
         return .{
             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
+            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
+            .progress = Atomic(i64).init(std_compat.time.timestamp()),
+            .exited = Atomic(bool).init(false),
         };
     }
 };
@@ -1908,12 +2023,16 @@ pub fn runSignalLoop(
     loop_state: *SignalLoopState,
     sg_ptr: *signal.SignalChannel,
 ) void {
+    // Last action of the thread: lets the supervisor bound how long it waits
+    // before detaching a poller that will not come back.
+    defer loop_state.exited.store(true, .release);
     // Update activity timestamp at start
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        markPollStep(&loop_state.step, .polling);
         const messages = sg_ptr.pollMessages(allocator) catch |err| {
             log.warn("Signal poll error: {}", .{err});
             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
@@ -1924,6 +2043,8 @@ pub fn runSignalLoop(
         // Update activity after each poll (even if no messages)
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
+        markPollStep(&loop_state.step, .dispatching);
+        bumpProgress(&loop_state.progress);
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
             setScheduleToolContext(
@@ -1981,7 +2102,7 @@ pub fn runSignalLoop(
                 .is_group = msg.is_group,
             });
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Signal agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
@@ -2037,11 +2158,15 @@ pub fn runWeixinLoop(
     loop_state: *WeixinLoopState,
     wx_ptr: *weixin.WeixinChannel,
 ) void {
+    // Last action of the thread: lets the supervisor bound how long it waits
+    // before detaching a poller that will not come back.
+    defer loop_state.exited.store(true, .release);
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        markPollStep(&loop_state.step, .polling);
         const messages = wx_ptr.pollMessages(allocator) catch |err| {
             log.warn("Weixin poll error: {}", .{err});
             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
@@ -2051,6 +2176,8 @@ pub fn runWeixinLoop(
 
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
+        markPollStep(&loop_state.step, .dispatching);
+        bumpProgress(&loop_state.progress);
         for (messages) |msg| {
             const reply_target = msg.reply_target orelse msg.sender;
             setScheduleToolContext(
@@ -2094,7 +2221,7 @@ pub fn runWeixinLoop(
                 .is_group = false,
             });
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Weixin agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
@@ -2142,6 +2269,15 @@ pub const MatrixLoopState = struct {
     last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
     stop_requested: Atomic(bool),
+    /// Coarse phase of the polling thread (see `PollStep`).
+    step: Atomic(u8),
+    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
+    /// supervisor treats a frozen heartbeat as a stall even while the poller is
+    /// dispatching, so a hung turn or worker join is still recovered.
+    progress: Atomic(i64),
+    /// Set by the polling loop as its last action, so the supervisor can bound
+    /// how long it waits for the thread before detaching it.
+    exited: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
@@ -2149,6 +2285,9 @@ pub const MatrixLoopState = struct {
         return .{
             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
+            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
+            .progress = Atomic(i64).init(std_compat.time.timestamp()),
+            .exited = Atomic(bool).init(false),
         };
     }
 };
@@ -2162,6 +2301,15 @@ pub const MaxLoopState = struct {
     last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
     stop_requested: Atomic(bool),
+    /// Coarse phase of the polling thread (see `PollStep`).
+    step: Atomic(u8),
+    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
+    /// supervisor treats a frozen heartbeat as a stall even while the poller is
+    /// dispatching, so a hung turn or worker join is still recovered.
+    progress: Atomic(i64),
+    /// Set by the polling loop as its last action, so the supervisor can bound
+    /// how long it waits for the thread before detaching it.
+    exited: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
@@ -2169,6 +2317,9 @@ pub const MaxLoopState = struct {
         return .{
             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
+            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
+            .progress = Atomic(i64).init(std_compat.time.timestamp()),
+            .exited = Atomic(bool).init(false),
         };
     }
 };
@@ -2295,6 +2446,9 @@ pub fn runMatrixLoop(
     loop_state: *MatrixLoopState,
     mx_ptr: *matrix.MatrixChannel,
 ) void {
+    // Last action of the thread: lets the supervisor bound how long it waits
+    // before detaching a poller that will not come back.
+    defer loop_state.exited.store(true, .release);
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     const state_dir: ?[]u8 = matrix.MatrixChannel.stateDirFromConfigPath(allocator, config.config_path) catch |err| blk: {
@@ -2307,6 +2461,7 @@ pub fn runMatrixLoop(
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        markPollStep(&loop_state.step, .polling);
         const messages = mx_ptr.pollMessages(allocator) catch |err| {
             if (err == error.MatrixSyncPositionExpired) {
                 if (state_dir) |dir| mx_ptr.discardPersistedNextBatch(dir);
@@ -2322,6 +2477,8 @@ pub fn runMatrixLoop(
 
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
+        markPollStep(&loop_state.step, .dispatching);
+        bumpProgress(&loop_state.progress);
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
             setScheduleToolContext(
@@ -2373,7 +2530,7 @@ pub fn runMatrixLoop(
                 .group_id = if (msg.is_group) room_peer_id else null,
             });
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Matrix agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
@@ -2454,6 +2611,9 @@ pub fn runMaxLoop(
     loop_state: *MaxLoopState,
     mx_ptr: *max_mod.MaxChannel,
 ) void {
+    // Last action of the thread: lets the supervisor bound how long it waits
+    // before detaching a poller that will not come back.
+    defer loop_state.exited.store(true, .release);
     // 1. Fetch bot identity
     mx_ptr.channel().start() catch |err| {
         log.err("Max channel start failed: {}", .{err});
@@ -2468,6 +2628,7 @@ pub fn runMaxLoop(
     const max_backoff_ns: u64 = 30 * std.time.ns_per_s;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        markPollStep(&loop_state.step, .polling);
         const messages = mx_ptr.pollUpdates(allocator) catch |err| {
             log.warn("Max poll error: {}", .{err});
             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
@@ -2480,6 +2641,8 @@ pub fn runMaxLoop(
         backoff_ns = std.time.ns_per_s;
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
+        markPollStep(&loop_state.step, .dispatching);
+        bumpProgress(&loop_state.progress);
         for (messages) |msg| {
             const reply_target = msg.reply_target orelse msg.sender;
             setScheduleToolContext(
@@ -2538,7 +2701,7 @@ pub fn runMaxLoop(
             };
             const sink = mx_ptr.makeSink(&stream_ctx);
 
-            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, null) catch |err| {
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Max agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
@@ -3096,6 +3259,7 @@ test "telegram callback starts typing turn and cleans up on local slash miss" {
         77,
         false,
         "user_a",
+        null,
     );
 
     try std.testing.expect(!handled);

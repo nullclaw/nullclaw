@@ -491,7 +491,10 @@ fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []c
     try json_util.appendJsonString(&body_list, allocator, file_id);
     try body_list.appendSlice(allocator, "}");
 
-    const resp = try http_util.curlPost(allocator, url, body_list.items, &.{});
+    // Bound this Bot API call: it runs on the Telegram poller thread (voice
+    // transcription happens inside pollUpdates), so a stalled socket must not
+    // park the poller. The untimed curlPost had no --max-time.
+    const resp = try http_util.curlPostWithProxy(allocator, url, body_list.items, &.{}, null, "15");
     defer allocator.free(resp);
 
     // Parse response

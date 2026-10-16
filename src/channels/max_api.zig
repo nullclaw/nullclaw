@@ -72,15 +72,26 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     proxy: ?[]const u8,
+    /// Bot API base URL. Defaults to the public API; override to point at a
+    /// self-hosted server (or a local stub in tests).
+    api_base: []const u8 = BASE_URL,
+    /// Return canned responses instead of hitting the network. Defaults to true
+    /// under `zig test` so the suite never calls out; set false to exercise the
+    /// real transport (e.g. the bounded-timeout regression test).
+    stub: bool = builtin.is_test,
+    /// `--max-time` (decimal seconds) for the bounded write calls that run on
+    /// the poller path (edit/delete). Overridable so a test can assert the bound
+    /// without waiting out the production timeout.
+    write_timeout: []const u8 = "30",
 
     // ── URL builder ─────────────────────────────────────────────────────
 
     /// Build a full API URL into `buf`. Returns a slice of `buf`.
     ///   buildUrl(buf, "/me", null)         → "https://platform-api.max.ru/me"
     ///   buildUrl(buf, "/messages", "chat_id=123") → ".../messages?chat_id=123"
-    pub fn buildUrl(buf: []u8, path: []const u8, query: ?[]const u8) ![]const u8 {
+    pub fn buildUrl(self: Client, buf: []u8, path: []const u8, query: ?[]const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        try w.writeAll(BASE_URL);
+        try w.writeAll(self.api_base);
         try w.writeAll(path);
         if (query) |q| {
             try w.writeByte('?');
@@ -104,10 +115,13 @@ pub const Client = struct {
             return allocator.dupe(u8, "{\"user_id\":123,\"name\":\"TestBot\",\"username\":\"test_bot\"}");
         }
         var url_buf: [256]u8 = undefined;
-        const url = try buildUrl(&url_buf, "/me", null);
+        const url = try self.buildUrl(&url_buf, "/me", null);
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        return root.http_util.curlGetWithProxy(allocator, url, &.{auth}, "10", self.proxy);
+        // Bounded: getMe runs on the poller path (runMaxLoop startup and the
+        // supervisor health check), and curlGetWithProxy drops the bound for
+        // this credentialed request.
+        return root.http_util.httpRequestWithTimeout(allocator, .GET, url, null, &.{auth}, null, self.proxy, "10");
     }
 
     pub fn getMeOk(self: Client) bool {
@@ -174,11 +188,14 @@ pub const Client = struct {
         var query_buf: [256]u8 = undefined;
         var query_writer: std.Io.Writer = .fixed(&query_buf);
         try query_writer.print("chat_id={s}", .{encoded_chat_id});
-        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
+        const url = try self.buildUrl(&url_buf, "/messages", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        return root.http_util.curlPostWithProxy(allocator, url, body_json, &.{auth}, self.proxy, "30");
+        // Bounded and body-preserving: the reply send runs on the poller path,
+        // and curlPostWithProxy drops the bound for this credentialed request.
+        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body_json, &.{auth}, "application/json", self.proxy, "30");
+        return resp.body;
     }
 
     pub fn parseSentMessageMid(allocator: std.mem.Allocator, json: []const u8) ?SentMessageMeta {
@@ -201,7 +218,7 @@ pub const Client = struct {
     }
 
     pub fn editMessage(self: Client, allocator: std.mem.Allocator, message_id: []const u8, body_json: []const u8) ![]u8 {
-        if (comptime builtin.is_test) {
+        if (self.stub) {
             return allocator.dupe(u8, "{\"success\":true}");
         }
         var url_buf: [512]u8 = undefined;
@@ -210,11 +227,17 @@ pub const Client = struct {
         var query_buf: [256]u8 = undefined;
         var query_writer: std.Io.Writer = .fixed(&query_buf);
         try query_writer.print("message_id={s}", .{encoded_message_id});
-        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
+        const url = try self.buildUrl(&url_buf, "/messages", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        return root.http_util.curlPut(allocator, url, body_json, &.{auth});
+        // Bounded and body-preserving: streaming edits run on the poller path
+        // (runMaxLoop dispatches inline), so an untimed call can wedge the Max
+        // poller. Route through the bounded curl path, NOT curlPut: curlPut has
+        // no --max-time and its credentialed fallback silently uses the untimed
+        // std.http client.
+        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .PUT, url, body_json, &.{auth}, "application/json", null, self.write_timeout);
+        return resp.body;
     }
 
     pub fn deleteMessage(self: Client, allocator: std.mem.Allocator, message_id: []const u8) !void {
@@ -225,11 +248,11 @@ pub const Client = struct {
         var query_buf: [256]u8 = undefined;
         var query_writer: std.Io.Writer = .fixed(&query_buf);
         try query_writer.print("message_id={s}", .{encoded_message_id});
-        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
+        const url = try self.buildUrl(&url_buf, "/messages", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        try curlDelete(allocator, url, auth, self.proxy);
+        try curlDelete(allocator, url, auth, self.proxy, self.write_timeout);
     }
 
     // ── Callbacks ───────────────────────────────────────────────────────
@@ -252,7 +275,7 @@ pub const Client = struct {
         var query_buf: [384]u8 = undefined;
         var query_writer: std.Io.Writer = .fixed(&query_buf);
         try query_writer.print("callback_id={s}", .{encoded_callback_id});
-        const url = try buildUrl(&url_buf, "/answers", query_writer.buffered());
+        const url = try self.buildUrl(&url_buf, "/answers", query_writer.buffered());
 
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -272,8 +295,9 @@ pub const Client = struct {
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        const resp = try root.http_util.curlPostWithProxy(allocator, url, body.items, &.{auth}, self.proxy, "10");
-        allocator.free(resp);
+        // Bounded: callback answers run inline on the poller thread.
+        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body.items, &.{auth}, "application/json", self.proxy, "10");
+        allocator.free(resp.body);
     }
 
     // ── Updates (long-polling) ──────────────────────────────────────────
@@ -291,7 +315,7 @@ pub const Client = struct {
             defer allocator.free(encoded_marker);
             try qw.print("&marker={s}", .{encoded_marker});
         }
-        const url = try buildUrl(&url_buf, "/updates", qw.buffered());
+        const url = try self.buildUrl(&url_buf, "/updates", qw.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
@@ -301,7 +325,9 @@ pub const Client = struct {
         const timeout_val = std.fmt.parseInt(u32, timeout, 10) catch 30;
         const max_time = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_val + 5}) catch "35";
 
-        return root.http_util.curlGetWithProxy(allocator, url, &.{auth}, max_time, self.proxy);
+        // Bounded: this is the Max poller's long poll, and curlGetWithProxy
+        // drops the bound for this credentialed request.
+        return root.http_util.httpRequestWithTimeout(allocator, .GET, url, null, &.{auth}, null, self.proxy, max_time);
     }
 
     // ── Subscriptions (webhooks) ────────────────────────────────────────
@@ -311,7 +337,7 @@ pub const Client = struct {
             return allocator.dupe(u8, "{\"success\":true}");
         }
         var url_buf: [256]u8 = undefined;
-        const url = try buildUrl(&url_buf, "/subscriptions", null);
+        const url = try self.buildUrl(&url_buf, "/subscriptions", null);
 
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -334,7 +360,8 @@ pub const Client = struct {
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        return root.http_util.curlPostWithProxy(allocator, url, body.items, &.{auth}, self.proxy, "10");
+        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body.items, &.{auth}, "application/json", self.proxy, "10");
+        return resp.body;
     }
 
     pub fn unsubscribe(self: Client, allocator: std.mem.Allocator, webhook_url: []const u8) !void {
@@ -345,11 +372,11 @@ pub const Client = struct {
         var query_buf: [1024]u8 = undefined;
         var query_writer: std.Io.Writer = .fixed(&query_buf);
         try query_writer.print("url={s}", .{encoded_url});
-        const url = try buildUrl(&url_buf, "/subscriptions", query_writer.buffered());
+        const url = try self.buildUrl(&url_buf, "/subscriptions", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        try curlDelete(allocator, url, auth, self.proxy);
+        try curlDelete(allocator, url, auth, self.proxy, self.write_timeout);
     }
 
     // ── Typing indicator ────────────────────────────────────────────────
@@ -362,13 +389,13 @@ pub const Client = struct {
         var path_buf: [512]u8 = undefined;
         var path_writer: std.Io.Writer = .fixed(&path_buf);
         try path_writer.print("/chats/{s}/actions", .{encoded_chat_id});
-        const url = try buildUrl(&url_buf, path_writer.buffered(), null);
+        const url = try self.buildUrl(&url_buf, path_writer.buffered(), null);
 
         const body = "{\"action\":\"typing_on\"}";
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        const resp = try root.http_util.curlPostWithProxy(allocator, url, body, &.{auth}, self.proxy, "10");
-        allocator.free(resp);
+        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body, &.{auth}, "application/json", self.proxy, "10");
+        allocator.free(resp.body);
     }
 
     // ── File upload ─────────────────────────────────────────────────────
@@ -383,11 +410,12 @@ pub const Client = struct {
         var query_buf: [128]u8 = undefined;
         var query_writer: std.Io.Writer = .fixed(&query_buf);
         try query_writer.print("type={s}", .{encoded_file_type});
-        const url = try buildUrl(&url_buf, "/uploads", query_writer.buffered());
+        const url = try self.buildUrl(&url_buf, "/uploads", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
-        const upload_init_resp = try root.http_util.curlPostWithProxy(allocator, url, "", &.{auth}, self.proxy, "30");
+        const upload_init = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, "", &.{auth}, "application/json", self.proxy, "30");
+        const upload_init_resp = upload_init.body;
         errdefer allocator.free(upload_init_resp);
 
         const upload_desc = parseUploadDescriptor(allocator, upload_init_resp) orelse return error.CurlFailed;
@@ -442,8 +470,12 @@ pub const Client = struct {
 // Internal: DELETE via curl subprocess
 // ════════════════════════════════════════════════════════════════════════════
 
-fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []const u8, proxy: ?[]const u8) !void {
-    const resp = try root.http_util.httpRequestWithStatus(allocator, .DELETE, url, null, &.{auth_header}, null, proxy);
+fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []const u8, proxy: ?[]const u8, max_time: []const u8) !void {
+    // Bounded: deleteMessage and unsubscribe run on the poller path (inline
+    // dispatch), and httpRequestWithStatus takes the untimed std.http fallback
+    // for an Authorization header. The status-preserving variant keeps the body
+    // contract without dropping the bound.
+    const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .DELETE, url, null, &.{auth_header}, null, proxy, max_time);
     allocator.free(resp.body);
 }
 
@@ -466,8 +498,8 @@ fn curlMultipartUpload(
     try body.appendSlice(allocator, "--" ++ MAX_UPLOAD_BOUNDARY ++ "--\r\n");
 
     const content_type = "multipart/form-data; boundary=" ++ MAX_UPLOAD_BOUNDARY;
-    const resp = try root.http_util.httpRequestWithStatus(allocator, .POST, url, body.items, &.{auth_header}, content_type, proxy);
-    return resp.body;
+    // Bounded: the media upload runs on the polling thread's reply-send path.
+    return root.http_util.httpRequestWithTimeout(allocator, .POST, url, body.items, &.{auth_header}, content_type, proxy, "120");
 }
 
 fn appendMaxMultipartFile(
@@ -602,22 +634,85 @@ pub fn buildInlineKeyboardButtonsJson(
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
+fn testClient() Client {
+    return .{ .allocator = std.testing.allocator, .bot_token = "test-token", .proxy = null };
+}
+
 test "buildUrl without query" {
     var buf: [256]u8 = undefined;
-    const url = try Client.buildUrl(&buf, "/me", null);
+    const url = try testClient().buildUrl(&buf, "/me", null);
     try std.testing.expectEqualStrings("https://platform-api.max.ru/me", url);
 }
 
 test "buildUrl with query params" {
     var buf: [256]u8 = undefined;
-    const url = try Client.buildUrl(&buf, "/messages", "chat_id=123");
+    const url = try testClient().buildUrl(&buf, "/messages", "chat_id=123");
     try std.testing.expectEqualStrings("https://platform-api.max.ru/messages?chat_id=123", url);
 }
 
 test "buildUrl with compound query" {
     var buf: [512]u8 = undefined;
-    const url = try Client.buildUrl(&buf, "/updates", "timeout=30&types=message_created&marker=abc");
+    const url = try testClient().buildUrl(&buf, "/updates", "timeout=30&types=message_created&marker=abc");
     try std.testing.expectEqualStrings("https://platform-api.max.ru/updates?timeout=30&types=message_created&marker=abc", url);
+}
+
+const MaxStalledApiCtx = struct {
+    server: *std_compat.net.Server,
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// Accept one connection and hold it open without replying for up to ~8s: a
+/// silently-dropped socket (peer gone, no FIN/RST).
+fn serveMaxStalledApi(ctx: *MaxStalledApiCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+    const deadline = std_compat.time.nanoTimestamp() + 8 * std.time.ns_per_s;
+    while (!ctx.release.load(.acquire) and std_compat.time.nanoTimestamp() < deadline) {
+        std_compat.thread.sleep(5 * std.time.ns_per_ms);
+    }
+}
+
+// Regression for the Max poller path: editMessage streams message edits on the
+// poller thread (runMaxLoop dispatches inline), so a stalled socket must return
+// a bounded error. Drives the real call site (editMessage -> bounded transport):
+// reverting it to the untimed, unbounded curlPut makes it hang/ReadFailed.
+test "max editMessage returns a bounded error on a stalled socket" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = MaxStalledApiCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveMaxStalledApi, .{&ctx});
+
+    var base_buf: [64]u8 = undefined;
+    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+    const client = Client{
+        .allocator = allocator,
+        .bot_token = "test-token",
+        .proxy = "",
+        .api_base = api_base,
+        .stub = false,
+        .write_timeout = "2",
+    };
+
+    const start = std_compat.time.nanoTimestamp();
+    const result = client.editMessage(allocator, "mid-1", "{\"text\":\"x\"}");
+    const elapsed = std_compat.time.nanoTimestamp() - start;
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
+    }
+    // The bound must fire long before any TCP retransmit/keepalive timeout.
+    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
+
+    ctx.release.store(true, .release);
+    thread.join();
 }
 
 test "authHeader uses raw token format required by Max" {

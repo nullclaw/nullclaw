@@ -15,7 +15,7 @@ const platform = @import("platform.zig");
 
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
-const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CURL_STDERR_BYTES: usize = 16 * 1024;
 const MAX_CURL_RESPONSE_HEADERS_BYTES: usize = 64 * 1024;
@@ -951,6 +951,119 @@ pub fn httpGetWithProxy(
     proxy: ?[]const u8,
 ) ![]u8 {
     return httpRequest(allocator, .GET, url, null, headers, null, proxy);
+}
+
+/// HTTP POST JSON with a hard `--max-time` bound, via the curl subprocess.
+///
+/// The `std.http` path has no client-side socket timeout in Zig 0.16, so a
+/// request whose TCP connection is silently dropped (no FIN/RST) parks the
+/// reader until the kernel's TCP keepalive fires - the incident where
+/// Telegram's 30s `getUpdates` long poll froze the polling thread for the rest
+/// of the process lifetime. curl's `--max-time` turns that stall into
+/// `error.CurlTimeout`, which the caller can retry. `max_time` is a decimal
+/// seconds string (e.g. `"45"`).
+pub fn httpPostJsonWithProxyTimeout(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+    max_time: []const u8,
+) ![]u8 {
+    return httpRequestWithTimeout(allocator, .POST, url, body, headers, "application/json", proxy, max_time);
+}
+
+/// Response-size cap for a bounded GET that streams large media. Telegram's
+/// `getFile` serves documents up to ~20 MB (a self-hosted Bot API server more),
+/// so `DEFAULT_CURL_GET_MAX_BYTES` (4 MiB) would silently drop them.
+pub const DEFAULT_CURL_DOWNLOAD_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// HTTP GET with a hard `--max-time` bound and an explicit response-size cap,
+/// via the curl subprocess. See `httpPostJsonWithProxyTimeout` for why the
+/// poller path must not use the untimed `std.http` client.
+///
+/// Unlike `curlGetWithProxy` this neither falls back to the untimed std.http
+/// client for a credentialed request nor sets curl `--fail`: the bound must
+/// always hold, and a non-2xx stays `error.HttpStatusError` (matching
+/// `httpRequest`) instead of curl exit 22's `error.CurlFailed`.
+pub fn httpGetWithProxyTimeout(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+    max_time: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    const resp = try secureCurlRequestWithStatusAndHeaders(allocator, .{
+        .method = .GET,
+        .url = url,
+        .headers = headers,
+        .proxy = proxy,
+        .max_time = max_time,
+        .max_response_bytes = max_bytes,
+    });
+    allocator.free(resp.headers);
+    errdefer allocator.free(resp.body);
+    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
+    return resp.body;
+}
+
+/// HTTP request with an explicit content type and a hard `--max-time` bound,
+/// via the curl subprocess. Mirrors `httpRequest` (non-2xx is an error) but
+/// cannot block indefinitely on a stalled socket.
+pub fn httpRequestWithTimeout(
+    allocator: Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    content_type: ?[]const u8,
+    proxy: ?[]const u8,
+    max_time: []const u8,
+) ![]u8 {
+    const resp = try curlRequestWithStatusAndHeaders(allocator, .{
+        .method = method,
+        .url = url,
+        .body = body,
+        .headers = headers,
+        .content_type = content_type,
+        .proxy = proxy,
+        .max_time = max_time,
+    });
+    allocator.free(resp.headers);
+    errdefer allocator.free(resp.body);
+    // Mirror `httpRequest` exactly: a non-2xx response is error.HttpStatusError,
+    // not curl --fail's error.CurlFailed, so callers see the same error identity.
+    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
+    return resp.body;
+}
+
+/// HTTP request with a hard `--max-time` bound that returns the status code and
+/// body instead of failing on a non-2xx. Mirrors `httpRequestWithStatus` (used
+/// by channels that inspect the body for an error payload) but goes through the
+/// bounded curl path, so it neither blocks on a stalled socket nor drops the
+/// bound through `curlRequestWithProxy`'s credentialed std.http fallback.
+pub fn httpRequestWithStatusTimeout(
+    allocator: Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    content_type: ?[]const u8,
+    proxy: ?[]const u8,
+    max_time: []const u8,
+) !HttpResponse {
+    const resp = try curlRequestWithStatusAndHeaders(allocator, .{
+        .method = method,
+        .url = url,
+        .body = body,
+        .headers = headers,
+        .content_type = content_type,
+        .proxy = proxy,
+        .max_time = max_time,
+    });
+    allocator.free(resp.headers);
+    return .{ .status_code = resp.status_code, .body = resp.body };
 }
 
 const proxy_env_var_names = [_][]const u8{
@@ -2632,4 +2745,248 @@ test "initClientDefaultProxiesFromEnvMap parses proxy settings" {
     try std.testing.expectEqual(@as(u16, 8443), client.https_proxy.?.port);
     try std.testing.expect(client.http_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-http.example")));
     try std.testing.expect(client.https_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-https.example")));
+}
+
+const StalledSocketCtx = struct {
+    server: *std_compat.net.Server,
+    accepted: AtomicBool = AtomicBool.init(false),
+    release: AtomicBool = AtomicBool.init(false),
+};
+
+/// Accept one connection and never reply, holding the socket open. This is the
+/// incident's stalled `getUpdates` socket: the peer is gone but no FIN/RST ever
+/// arrives, so an untimed read blocks until TCP keepalive (default 2h).
+fn serveStalledSocket(ctx: *StalledSocketCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+    ctx.accepted.store(true, .release);
+    while (!ctx.release.load(.acquire)) std_compat.thread.sleep(5 * std.time.ns_per_ms);
+}
+
+// Regression: a Telegram-style long poll whose socket is silently dropped must
+// return a timeout error instead of hanging the polling thread forever - the
+// untimed `std.http` client has no read timeout in Zig 0.16. The bounded helper
+// must enforce curl's `--max-time`.
+test "bounded http post times out instead of hanging on a stalled socket" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = StalledSocketCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveStalledSocket, .{&ctx});
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/bot-test-token/getUpdates",
+        .{server.listen_address.in.getPort()},
+    );
+    defer allocator.free(url);
+
+    const start = std_compat.time.nanoTimestamp();
+    const result = httpPostJsonWithProxyTimeout(allocator, url, "{\"timeout\":30}", &.{}, "", "2");
+    const elapsed = std_compat.time.nanoTimestamp() - start;
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
+    }
+    // The bound must fire long before any TCP retransmit/keepalive timeout.
+    try std.testing.expect(elapsed < 10 * std.time.ns_per_s);
+
+    ctx.release.store(true, .release);
+    thread.join();
+}
+
+const FixedHttpResponseCtx = struct {
+    server: *std_compat.net.Server,
+    status_line: []const u8,
+    body: []const u8,
+};
+
+/// Accept one connection, drain the request, and reply with a fixed status line
+/// and body. `Connection: close` lets curl finish the response.
+fn serveFixedHttpResponse(ctx: *FixedHttpResponseCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+    var req_buf: [4096]u8 = undefined;
+    _ = conn.stream.read(&req_buf) catch {};
+    var head_buf: [256]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "{s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ ctx.status_line, ctx.body.len }) catch return;
+    conn.stream.writeAll(head) catch {};
+    conn.stream.writeAll(ctx.body) catch {};
+}
+
+// Regression: the bounded GET must keep `httpRequest`'s error identity - a
+// non-2xx is `error.HttpStatusError`, not curl `--fail`'s `error.CurlFailed`.
+test "bounded http get maps a non-2xx to HttpStatusError" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 404 Not Found", .body = "" };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/missing", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", 1024);
+    thread.join();
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.HttpStatusError), err);
+    }
+}
+
+// Regression: the bounded status-preserving request must keep httpRequestWithStatus'
+// contract - a non-2xx is returned with its body (not turned into an error) - so
+// Weixin can still read the error payload, unlike httpRequestWithTimeout.
+test "bounded http request with status preserves a non-2xx body" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 401 Unauthorized", .body = "{\"error\":\"nope\"}" };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/guarded", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const resp = httpRequestWithStatusTimeout(allocator, .DELETE, url, null, &.{}, null, "", "5") catch return error.TestUnexpectedResult;
+    thread.join();
+    defer allocator.free(resp.body);
+
+    try std.testing.expectEqual(@as(u16, 401), resp.status_code);
+    try std.testing.expectEqualStrings("{\"error\":\"nope\"}", resp.body);
+}
+
+// Regression: the bounded GET must enforce its size cap, so a caller that needs
+// a larger body (a media download) has to opt into a bigger cap explicitly
+// rather than silently truncating.
+test "bounded http get enforces the response size cap" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const big_body = try allocator.alloc(u8, 4096);
+    defer allocator.free(big_body);
+    @memset(big_body, 'x');
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = big_body };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/doc", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", 64);
+    thread.join();
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlReadError), err);
+    }
+}
+
+const StalledCredentialCtx = struct {
+    server: *std_compat.net.Server,
+    release: AtomicBool = AtomicBool.init(false),
+};
+
+fn serveStalledCredential(ctx: *StalledCredentialCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+    const deadline = std_compat.time.nanoTimestamp() + 10 * std.time.ns_per_s;
+    while (!ctx.release.load(.acquire) and std_compat.time.nanoTimestamp() < deadline) {
+        std_compat.thread.sleep(5 * std.time.ns_per_ms);
+    }
+}
+
+// Regression: a credentialed request must not silently fall back to the untimed
+// std.http client (`curlRequestWithProxy` does exactly that, dropping the bound).
+// A stalled socket with an Authorization header must still return error.CurlTimeout.
+test "bounded http request keeps the timeout for a credentialed request" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = StalledCredentialCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveStalledCredential, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/join", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const headers = [_][]const u8{"Authorization: Bearer secret-token"};
+    const start = std_compat.time.nanoTimestamp();
+    const result = httpRequestWithTimeout(allocator, .POST, url, "{}", &headers, "application/json", "", "2");
+    const elapsed = std_compat.time.nanoTimestamp() - start;
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
+    }
+    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
+
+    ctx.release.store(true, .release);
+    thread.join();
+}
+
+// Regression: the status-preserving bounded request (the Matrix poller's
+// /sync long poll routes through it) must keep the timeout for a credentialed
+// GET instead of falling back to the untimed std.http client.
+test "bounded status request keeps the timeout for a credentialed get" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = StalledCredentialCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveStalledCredential, .{&ctx});
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/_matrix/client/v3/sync?timeout=30000",
+        .{server.listen_address.in.getPort()},
+    );
+    defer allocator.free(url);
+
+    const headers = [_][]const u8{"Authorization: Bearer secret-token"};
+    const start = std_compat.time.nanoTimestamp();
+    const result = httpRequestWithStatusTimeout(allocator, .GET, url, null, &headers, null, null, "2");
+    const elapsed = std_compat.time.nanoTimestamp() - start;
+
+    if (result) |resp| {
+        allocator.free(resp.body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
+    }
+    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
+
+    ctx.release.store(true, .release);
+    thread.join();
 }

@@ -12,7 +12,12 @@ const ILINK_CLIENT_VERSION = "131329"; // 2.1.1 encoded as 0x00020101
 const CHANNEL_VERSION = "2.1.1";
 const WEIXIN_REPLY_TARGET_SEPARATOR: u8 = 0x1f;
 const SEND_TIMEOUT_SECS = "15";
-const GET_UPDATES_TIMEOUT_SECS = "35";
+/// Headroom over the server's long-poll so a normal empty poll returns before
+/// curl's `--max-time` fires: a bound at or below the long poll would turn
+/// every poll into error.CurlTimeout and spin the poller. The request carries
+/// no explicit long-poll timeout, so the margin is a guess pending the API's
+/// documented default.
+const GET_UPDATES_TIMEOUT_SECS = "45";
 const GET_UPDATES_ITEM_TYPE_TEXT: u8 = 1;
 const GET_UPDATES_ITEM_TYPE_VOICE: u8 = 3;
 const MESSAGE_TYPE_BOT: u8 = 2;
@@ -174,17 +179,22 @@ pub const WeixinChannel = struct {
         var headers = try AuthHeaderSet.init(self.allocator, token);
         defer headers.deinit(self.allocator);
 
-        const resp_body = root.http_util.curlPostWithProxy(
+        // Bounded: the reply send runs inline on the poller thread, and
+        // curlPostWithProxy drops the timeout for this credentialed request.
+        const resp = root.http_util.httpRequestWithStatusTimeout(
             self.allocator,
+            .POST,
             url,
             payload.items,
             &headers.headers,
+            "application/json",
             self.config.proxy,
             SEND_TIMEOUT_SECS,
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.WeixinApiError,
         };
+        const resp_body = resp.body;
         defer self.allocator.free(resp_body);
 
         try ensureApiResponseOk(self.allocator, resp_body);
@@ -204,17 +214,23 @@ pub const WeixinChannel = struct {
         var headers = try AuthHeaderSet.init(self.allocator, self.config.token);
         defer headers.deinit(self.allocator);
 
-        const resp_body = root.http_util.curlPostWithProxy(
+        // Bounded: this is the poller's long poll, and curlPostWithProxy would
+        // silently drop the timeout for this credentialed request (it falls back
+        // to the untimed std.http client for an Authorization header).
+        const resp = root.http_util.httpRequestWithStatusTimeout(
             self.allocator,
+            .POST,
             url,
             payload.items,
             &headers.headers,
+            "application/json",
             self.config.proxy,
             GET_UPDATES_TIMEOUT_SECS,
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.WeixinApiError,
         };
+        const resp_body = resp.body;
         defer self.allocator.free(resp_body);
 
         var parsed = try parseGetUpdatesResponse(allocator, resp_body, self.config.allow_from);

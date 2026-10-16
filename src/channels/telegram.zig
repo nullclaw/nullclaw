@@ -3362,12 +3362,16 @@ pub const TelegramChannel = struct {
         tg_ptr: *TelegramChannel,
         chat_id: []const u8,
         draft_id: u64 = 0,
+        /// Poller progress heartbeat, bumped on every streamed chunk so a
+        /// long-but-streaming turn is never mistaken for a stall.
+        heartbeat: ?*Atomic(i64) = null,
         filter: streaming.TagFilter = undefined,
     };
 
     fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
         if (event.stage != .chunk or event.text.len == 0) return;
         const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (ctx.heartbeat) |h| h.store(std_compat.time.timestamp(), .release);
         ctx.tg_ptr.sendDraftChunkForTurn(ctx.chat_id, ctx.draft_id, event.text) catch {};
     }
 

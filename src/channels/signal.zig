@@ -452,7 +452,9 @@ pub const SignalChannel = struct {
         const rpc_body = try body.toOwnedSlice(allocator);
         defer allocator.free(rpc_body);
 
-        const resp = root.http_util.curlPost(allocator, url, rpc_body, &.{}) catch |err| {
+        // Bounded: this runs on the signal polling thread (inside processEnvelope),
+        // so an untimed call could wedge the poller the way Telegram did.
+        const resp = root.http_util.curlPostWithProxy(allocator, url, rpc_body, &.{}, null, "15") catch |err| {
             log.warn("Signal fetch attachment {s} failed: {}", .{ attachment_id, err });
             return null;
         };
@@ -776,7 +778,7 @@ pub const SignalChannel = struct {
         var url_buf: [1024]u8 = undefined;
         const url = try self.rpcUrl(&url_buf);
 
-        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, rpc_body, &.{}, null, "30") catch |err| {
             log.warn("Signal RPC send failed: {}", .{err});
             return err;
         };
@@ -815,7 +817,7 @@ pub const SignalChannel = struct {
         var url_buf: [1024]u8 = undefined;
         const url = try self.sendUrl(&url_buf);
 
-        const resp = root.http_util.curlPost(self.allocator, url, rest_body, &.{}) catch |err| {
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, rest_body, &.{}, null, "60") catch |err| {
             log.warn("Signal REST send failed: {}", .{err});
             return err;
         };
@@ -859,7 +861,7 @@ pub const SignalChannel = struct {
         var url_buf: [1024]u8 = undefined;
         const url = self.rpcUrl(&url_buf) catch return;
 
-        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch return;
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, rpc_body, &.{}, null, "10") catch return;
         self.allocator.free(resp);
     }
 

@@ -454,7 +454,7 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
 
         const headers = [_][]const u8{auth_header};
-        const resp = try root.http_util.curlPut(self.allocator, url, body_list.items, &headers);
+        const resp = try root.http_util.httpRequestWithTimeout(self.allocator, .PUT, url, body_list.items, &headers, "application/json", null, "30");
         defer self.allocator.free(resp);
 
         if (std.mem.indexOf(u8, resp, "\"event_id\"") == null) {
@@ -491,11 +491,15 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPut(
+        const resp = root.http_util.httpRequestWithTimeout(
             self.allocator,
+            .PUT,
             url,
             "{\"typing\":true,\"timeout\":15000}",
             &headers,
+            "application/json",
+            null,
+            "10",
         ) catch return;
         self.allocator.free(resp);
     }
@@ -516,7 +520,11 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlGet(self.allocator, url, &headers, "10") catch return false;
+        // Bounded: `curlGet` falls back to the untimed std.http client for a
+        // credentialed GET, and healthCheck runs on the supervision thread - a
+        // silently dropped socket there would freeze supervision for every
+        // channel, not just this poller.
+        const resp = root.http_util.httpGetWithProxyTimeout(self.allocator, url, &headers, null, "10", root.http_util.DEFAULT_CURL_GET_MAX_BYTES) catch return false;
         defer self.allocator.free(resp);
 
         return std.mem.indexOf(u8, resp, "\"user_id\"") != null;
@@ -674,7 +682,12 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
 
         const headers = [_][]const u8{auth_header};
-        const resp = try root.http_util.curlPost(self.allocator, url, "{}", &headers);
+        // Bounded: auto-join runs on the matrix polling thread (inside
+        // pollMessages), so an untimed call could wedge the poller. Route through
+        // httpRequestWithTimeout, NOT curlPostWithProxy: the latter silently
+        // falls back to the untimed std.http client for a credentialed request
+        // and would drop this bound.
+        const resp = try root.http_util.httpRequestWithTimeout(self.allocator, .POST, url, "{}", &headers, "application/json", null, "15");
         defer self.allocator.free(resp);
     }
 
@@ -992,7 +1005,11 @@ pub const MatrixChannel = struct {
         defer allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlGetWithStatusAndTimeout(allocator, url, &headers, "35") catch |err| {
+        // Bounded and status-preserving: `curlGetWithStatusAndTimeout` falls
+        // back to the untimed std.http client for this credentialed request, so
+        // a silently dropped socket would park the poller for the rest of the
+        // process lifetime (the incident).
+        const resp = root.http_util.httpRequestWithStatusTimeout(allocator, .GET, url, null, &headers, null, null, "35") catch |err| {
             log.warn("Matrix sync failed: {}", .{err});
             return err;
         };
@@ -2302,4 +2319,57 @@ test "MatrixChannel recognizes expired sync position responses" {
         "{\"errcode\":\"M_UNKNOWN\",\"error\":\"Different error\"}",
     ));
     try std.testing.expect(!MatrixChannel.responseIndicatesExpiredPosition(allocator, "not-json"));
+}
+
+const StalledSyncServer = struct {
+    server: *std_compat.net.Server,
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// Accept one connection and never reply, holding it open: the incident's
+/// silently dropped socket, where no FIN/RST ever arrives.
+fn serveStalledSync(ctx: *StalledSyncServer) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+    while (!ctx.release.load(.acquire)) std_compat.thread.sleep(5 * std.time.ns_per_ms);
+}
+
+// Regression: the Matrix /sync long poll is a credentialed GET. It must be
+// time-bounded (curl --max-time) rather than falling back to the untimed
+// std.http client, which would park the poller until TCP keepalive (default 2h).
+test "MatrixChannel sync GET is time-bounded on a stalled socket" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = StalledSyncServer{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveStalledSync, .{&ctx});
+
+    var hs_buf: [128]u8 = undefined;
+    const homeserver = try std.fmt.bufPrint(&hs_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+    const ch = MatrixChannel.init(allocator, homeserver, "secret-token", "!room:example.org", &.{});
+
+    var url_buf: [4096]u8 = undefined;
+    const url = try ch.buildSyncUrl(&url_buf);
+    const auth_header = try ch.authHeader(allocator);
+    defer allocator.free(auth_header);
+    const headers = [_][]const u8{auth_header};
+
+    const start = std_compat.time.nanoTimestamp();
+    const result = root.http_util.httpRequestWithStatusTimeout(allocator, .GET, url, null, &headers, null, null, "2");
+    const elapsed = std_compat.time.nanoTimestamp() - start;
+
+    if (result) |resp| {
+        allocator.free(resp.body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
+    }
+    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
+
+    ctx.release.store(true, .release);
+    thread.join();
 }

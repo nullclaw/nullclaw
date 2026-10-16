@@ -1,6 +1,9 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const root = @import("root.zig");
+
+const log = std.log.scoped(.telegram_api);
 
 pub const SentMessageMeta = struct {
     message_id: ?i64 = null,
@@ -23,10 +26,13 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     proxy: ?[]const u8,
+    /// Bot API base URL. Defaults to the public API; override to point at a
+    /// self-hosted Bot API server (or a local stub in tests).
+    api_base: []const u8 = "https://api.telegram.org",
 
     pub fn apiUrl(self: Client, buf: []u8, method: []const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        try w.print("https://api.telegram.org/bot{s}/{s}", .{ self.bot_token, method });
+        try w.print("{s}/bot{s}/{s}", .{ self.api_base, self.bot_token, method });
         return w.buffered();
     }
 
@@ -254,10 +260,13 @@ pub const Client = struct {
     }
 
     pub fn downloadFile(self: Client, allocator: std.mem.Allocator, file_path: []const u8, timeout: []const u8) ![]u8 {
-        _ = timeout;
         var url_buf: [1024]u8 = undefined;
         const url = try self.fileUrl(&url_buf, file_path);
-        return root.http_util.httpGetWithProxy(allocator, url, &.{}, self.proxy);
+        // Bound the media download too: it runs on the poller (or turn) thread
+        // and must not park on a stalled socket. Use the large download cap, not
+        // the 4 MiB GET default, so documents/audio/photo up to the Bot API's
+        // ~20 MB limit still download.
+        return root.http_util.httpGetWithProxyTimeout(allocator, url, &.{}, self.proxy, timeout, root.http_util.DEFAULT_CURL_DOWNLOAD_MAX_BYTES);
     }
 
     pub fn postMultipart(
@@ -304,21 +313,37 @@ pub const Client = struct {
         try body.appendSlice(allocator, "--" ++ boundary ++ "--\r\n");
 
         const content_type = "multipart/form-data; boundary=" ++ boundary;
-        const resp = try root.http_util.httpRequest(allocator, .POST, url, body.items, &.{}, content_type, self.proxy);
+        // Media uploads can be large; give them a generous but hard bound so a
+        // stalled socket cannot wedge the sending thread.
+        const resp = try root.http_util.httpRequestWithTimeout(allocator, .POST, url, body.items, &.{}, content_type, self.proxy, "120");
         defer allocator.free(resp);
         if (responseHasTelegramError(resp)) return error.TelegramApiError;
     }
 
     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
-        _ = timeout;
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
-        return root.http_util.httpPostJsonWithProxy(allocator, url, body, &.{}, self.proxy);
+        // Bound every Bot API call. `getUpdates` long-polls for up to 30s, and
+        // the untimed std.http client would park the polling thread forever if
+        // the connection is silently dropped; curl's `--max-time` returns
+        // error.CurlTimeout instead, which the polling loop retries.
+        return root.http_util.httpPostJsonWithProxyTimeout(allocator, url, body, &.{}, self.proxy, timeout) catch |err| {
+            // Name the method and its bound so a stalled call is identifiable
+            // from logs (the incident left no record of which call hung). A
+            // getUpdates long-poll that merely times out is benign and can
+            // happen every poll cycle on a slow link, so it stays out of WARN.
+            if (err == error.CurlTimeout and std.mem.eql(u8, method, "getUpdates")) {
+                log.debug("telegram getUpdates timed out after {s}s", .{timeout});
+            } else {
+                log.warn("telegram {s} failed (max-time {s}s): {}", .{ method, timeout, err });
+            }
+            return err;
+        };
     }
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        try w.print("https://api.telegram.org/file/bot{s}/{s}", .{ self.bot_token, file_path });
+        try w.print("{s}/file/bot{s}/{s}", .{ self.api_base, self.bot_token, file_path });
         return w.buffered();
     }
 };
@@ -475,6 +500,78 @@ test "telegram api client builds method url" {
     var buf: [256]u8 = undefined;
     const url = try client.apiUrl(&buf, "getUpdates");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/getUpdates", url);
+}
+
+test "telegram api client honors a custom base url" {
+    const client = Client{
+        .allocator = std.testing.allocator,
+        .bot_token = "123:ABC",
+        .proxy = null,
+        .api_base = "http://127.0.0.1:8081",
+    };
+    var buf: [256]u8 = undefined;
+    const url = try client.apiUrl(&buf, "getUpdates");
+    try std.testing.expectEqualStrings("http://127.0.0.1:8081/bot123:ABC/getUpdates", url);
+}
+
+const StalledApiCtx = struct {
+    server: *std_compat.net.Server,
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// Accept one connection and hold it open without replying for up to ~8s, then
+/// close: the incident's silently-dropped `getUpdates` socket (peer gone, no
+/// FIN/RST). `release` lets the test end the hold early once the request
+/// returned.
+fn serveStalledApi(ctx: *StalledApiCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+    const deadline = std_compat.time.nanoTimestamp() + 8 * std.time.ns_per_s;
+    while (!ctx.release.load(.acquire) and std_compat.time.nanoTimestamp() < deadline) {
+        std_compat.thread.sleep(5 * std.time.ns_per_ms);
+    }
+}
+
+// Regression for the incident: `Client.getUpdates` runs on the Telegram polling
+// thread, so a stalled Bot API socket must return a bounded error instead of
+// parking the poller until TCP keepalive (default 2h). This drives the real
+// call site (`getUpdates` -> `post`), not just the bounded transport helper, so
+// reverting `post` to the untimed std.http client makes it fail.
+test "telegram getUpdates returns a bounded error on a stalled socket" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = StalledApiCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveStalledApi, .{&ctx});
+
+    var base_buf: [64]u8 = undefined;
+    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+    const client = Client{
+        .allocator = allocator,
+        .bot_token = "123:ABC",
+        .proxy = "",
+        .api_base = api_base,
+    };
+
+    const start = std_compat.time.nanoTimestamp();
+    const result = client.getUpdates(allocator, "{\"timeout\":30}", "2");
+    const elapsed = std_compat.time.nanoTimestamp() - start;
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
+    }
+    // The bound must fire long before any TCP retransmit/keepalive timeout.
+    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
+
+    ctx.release.store(true, .release);
+    thread.join();
 }
 
 test "telegram api responseHasTelegramError matches error payloads" {
