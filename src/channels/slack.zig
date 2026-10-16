@@ -6,6 +6,7 @@ const config_types = @import("../config_types.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
+const stream_presenter = @import("slack_stream_presenter.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -121,6 +122,19 @@ pub const SlackChannel = struct {
     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
     thread_ts: ?[]const u8 = null,
     reply_to_mode: config_types.SlackReplyToMode = .off,
+    /// Emit progressive replies through the streaming Web API / edited messages.
+    streaming_enabled: bool = false,
+    /// Set once a chat.startStream call proves this app/workspace can never
+    /// stream; every later turn uses the chat.postMessage + chat.update path.
+    native_stream_disabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Guards `stream_states` and the API calls made from it.
+    stream_mu: std_compat.sync.Mutex = .{},
+    stream_states: std.StringHashMapUnmanaged(stream_presenter.StreamState) = .empty,
+    /// Targets whose current turn was stopped. Queued `.chunk` events for them
+    /// are dropped so a stopped turn's leftovers cannot replay once the
+    /// outbound dispatcher catches up. Keyed by the exact outbound target and
+    /// expiring after the late-chunk grace window. Guarded by `stream_mu`.
+    stream_cancels: std.StringHashMapUnmanaged(i64) = .empty,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -219,6 +233,7 @@ pub const SlackChannel = struct {
         ch.signing_secret = cfg.signing_secret;
         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
         ch.reply_to_mode = cfg.reply_to_mode;
+        ch.streaming_enabled = cfg.streaming;
         return ch;
     }
 
@@ -357,6 +372,24 @@ pub const SlackChannel = struct {
         code: []const u8,
         needed: ?[]const u8 = null,
         provided: ?[]const u8 = null,
+    };
+
+    /// Owned `ts` / `error` fields of a Slack Web API response.
+    const SlackApiResult = struct {
+        ts: ?[]u8 = null,
+        error_code: ?[]u8 = null,
+
+        pub fn deinit(self: *SlackApiResult, allocator: std.mem.Allocator) void {
+            if (self.ts) |ts| allocator.free(ts);
+            if (self.error_code) |code| allocator.free(code);
+            self.* = .{};
+        }
+
+        pub fn takeTs(self: *SlackApiResult) ?[]u8 {
+            const ts = self.ts;
+            self.ts = null;
+            return ts;
+        }
     };
 
     fn slackApiErrorInfo(obj: std.json.ObjectMap) ?SlackApiErrorInfo {
@@ -959,10 +992,14 @@ pub const SlackChannel = struct {
 
     // ── Channel vtable ──────────────────────────────────────────────
 
+    /// `thread_ts` is passed explicitly rather than read from `self.thread_ts`
+    /// so callers on the streaming path do not depend on the mutable field that
+    /// `parseTarget` rewrites.
     fn appendPostMessageBody(
         self: *SlackChannel,
         body_list: *std.ArrayListUnmanaged(u8),
         actual_channel: []const u8,
+        thread_ts: ?[]const u8,
         text: []const u8,
     ) !void {
         const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
@@ -972,7 +1009,7 @@ pub const SlackChannel = struct {
         try body_list.appendSlice(self.allocator, actual_channel);
         try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
         try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
-        if (self.thread_ts) |tts| {
+        if (thread_ts) |tts| {
             try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
             try body_list.appendSlice(self.allocator, tts);
             try body_list.append(self.allocator, '"');
@@ -1176,6 +1213,10 @@ pub const SlackChannel = struct {
     /// Send a message to a Slack channel via chat.postMessage API.
     /// The target may contain "channel_id:thread_ts" for threaded replies.
     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
+        // Tests must never reach the network; payload builders are covered
+        // directly (see appendPostMessageBody tests).
+        if (builtin.is_test) return;
+
         const url = API_BASE ++ "/chat.postMessage";
 
         // Parse target for thread_ts (channel_id:thread_ts)
@@ -1184,7 +1225,7 @@ pub const SlackChannel = struct {
         // Build JSON body
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        try self.appendPostMessageBody(&body_list, actual_channel, text);
+        try self.appendPostMessageBody(&body_list, actual_channel, self.thread_ts, text);
 
         // Build auth header: "Authorization: Bearer xoxb-..."
         var auth_buf: [512]u8 = undefined;
@@ -1362,6 +1403,7 @@ pub const SlackChannel = struct {
         }
         self.deinitPendingInteractions();
         self.clearChannelCursors();
+        self.deinitStreamStates();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
             self.last_ts = "0";
@@ -1399,15 +1441,605 @@ pub const SlackChannel = struct {
         try self.stopTyping(recipient);
     }
 
+    // ── Streaming outbound ──────────────────────────────────────────
+    //
+    // Slack has two ways to show a reply while it is still being generated:
+    //
+    //   native   chat.startStream → throttled chat.appendStream → chat.stopStream.
+    //            Slack only accepts a stream inside a thread, so this path needs
+    //            a "channel_id:thread_ts" target (reply_to_mode = all, or an
+    //            inbound thread reply / assistant thread).
+    //   fallback chat.postMessage, then throttled chat.update edits of that same
+    //            message. Used for top-level targets and whenever the native
+    //            methods are unavailable to this app.
+    //
+    // Deltas are coalesced by slack_stream_presenter so a token stream turns into
+    // at most one API call per second per turn.
+
+    const StreamState = stream_presenter.StreamState;
+
+    fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        return self.streaming_enabled;
+    }
+
+    fn vtableSendEvent(
+        ptr: *anyopaque,
+        target: []const u8,
+        message: []const u8,
+        media: []const []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+
+        if (!self.streaming_enabled) {
+            if (stage == .final and message.len > 0) return vtableSend(ptr, target, message, media);
+            return;
+        }
+
+        switch (stage) {
+            .chunk => {
+                if (message.len == 0) return;
+                self.streamChunk(target, message);
+            },
+            .final => {
+                if (message.len == 0) {
+                    self.finishStreamStateFor(target);
+                    return;
+                }
+                try self.streamFinal(target, message, media);
+            },
+        }
+    }
+
+    fn deinitStreamStates(self: *SlackChannel) void {
+        self.stream_mu.lock();
+        defer self.stream_mu.unlock();
+        stream_presenter.deinitStreamStates(self.allocator, &self.stream_states);
+        var it = self.stream_cancels.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.stream_cancels.deinit(self.allocator);
+        self.stream_cancels = .empty;
+    }
+
+    fn vtableCancelStreams(ptr: *anyopaque, target: []const u8) void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        self.cancelStreams(target);
+    }
+
+    /// Mark `target` cancelled after a /stop, so the stopped turn's already
+    /// queued `.chunk` events are dropped instead of replaying. Cleared when the
+    /// stopped turn's final reply is delivered, or after the grace window.
+    pub fn cancelStreams(self: *SlackChannel, target: []const u8) void {
+        if (target.len == 0) return;
+
+        self.stream_mu.lock();
+        defer self.stream_mu.unlock();
+
+        const now_ms = std_compat.time.milliTimestamp();
+        self.pruneStreamCancelsLocked(now_ms);
+
+        const gop = self.stream_cancels.getOrPut(self.allocator, target) catch |err| {
+            log.warn("Slack stream cancel allocation failed: {}", .{err});
+            return;
+        };
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, target) catch {
+                _ = self.stream_cancels.remove(target);
+                log.warn("Slack stream cancel allocation failed: {}", .{error.OutOfMemory});
+                return;
+            };
+        }
+        gop.value_ptr.* = now_ms + stream_presenter.STREAM_LATE_CHUNK_GRACE_MS;
+    }
+
+    fn isStreamCancelledLocked(self: *SlackChannel, target: []const u8, now_ms: i64) bool {
+        const expiry = self.stream_cancels.get(target) orelse return false;
+        if (now_ms >= expiry) {
+            self.clearStreamCancelLocked(target);
+            return false;
+        }
+        return true;
+    }
+
+    fn clearStreamCancelLocked(self: *SlackChannel, target: []const u8) void {
+        if (self.stream_cancels.fetchRemove(target)) |entry| self.allocator.free(entry.key);
+    }
+
+    /// Drop expired cancel markers so a long-running bot does not accumulate one
+    /// entry per target it has ever stopped.
+    fn pruneStreamCancelsLocked(self: *SlackChannel, now_ms: i64) void {
+        var stale: [stream_presenter.STREAM_MAX_TRACKED_TARGETS][]const u8 = undefined;
+        var stale_len: usize = 0;
+        var it = self.stream_cancels.iterator();
+        while (it.next()) |entry| {
+            if (now_ms < entry.value_ptr.*) continue;
+            if (stale_len == stale.len) break;
+            stale[stale_len] = entry.key_ptr.*;
+            stale_len += 1;
+        }
+        for (stale[0..stale_len]) |key| {
+            if (self.stream_cancels.fetchRemove(key)) |entry| self.allocator.free(entry.key);
+        }
+    }
+
+    /// The turn ended without a reply body; close the turn so late deltas are
+    /// dropped instead of opening a new stream.
+    fn finishStreamStateFor(self: *SlackChannel, target: []const u8) void {
+        self.stream_mu.lock();
+        defer self.stream_mu.unlock();
+
+        const now_ms = std_compat.time.milliTimestamp();
+        if (self.stream_states.getPtr(target)) |state| state.finishTurn(self.allocator, now_ms);
+        self.clearStreamCancelLocked(target);
+    }
+
+    fn streamChunk(self: *SlackChannel, target: []const u8, chunk: []const u8) void {
+        // The mutex also covers the API call: chunks arrive on the outbound
+        // dispatcher thread while the final reply may arrive on the durable
+        // outbox worker, and both must see the same stream state.
+        self.stream_mu.lock();
+        defer self.stream_mu.unlock();
+
+        const now_ms = std_compat.time.milliTimestamp();
+        // A /stop cancelled this target: the deltas still queued ahead of the
+        // stop must not replay to the user once the dispatcher catches up.
+        if (self.isStreamCancelledLocked(target, now_ms)) return;
+        const state = self.ensureStreamStateLocked(target, now_ms) catch |err| {
+            log.warn("Slack streaming state allocation failed: {}", .{err});
+            return;
+        };
+        // The final reply may already have been delivered for this turn (see
+        // STREAM_LATE_CHUNK_GRACE_MS); those leftovers must not open a new stream.
+        if (state.send_failed or state.isLateChunk(now_ms)) return;
+
+        var flush = stream_presenter.appendStreamChunk(self.allocator, state, chunk, now_ms) catch |err| {
+            log.warn("Slack streaming buffer append failed: {}", .{err});
+            return;
+        } orelse return;
+        defer flush.deinit(self.allocator);
+
+        self.publishStreamFlushLocked(target, state, &flush);
+    }
+
+    fn ensureStreamStateLocked(self: *SlackChannel, target: []const u8, now_ms: i64) !*StreamState {
+        self.pruneFinishedStreamStatesLocked(now_ms);
+
+        const gop = try self.stream_states.getOrPut(self.allocator, target);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, target);
+            const has_thread = stream_presenter.resolveStreamTarget(target).thread_ts != null;
+            gop.value_ptr.* = .{
+                .mode = stream_presenter.chooseTurnTransport(
+                    has_thread,
+                    self.native_stream_disabled.load(.acquire),
+                ),
+            };
+        }
+        return gop.value_ptr;
+    }
+
+    /// Drop finished targets once the map grows, so a long-running bot does not
+    /// accumulate one entry per Slack thread it has ever answered in.
+    fn pruneFinishedStreamStatesLocked(self: *SlackChannel, now_ms: i64) void {
+        if (self.stream_states.count() <= stream_presenter.STREAM_MAX_TRACKED_TARGETS) return;
+
+        var stale: [stream_presenter.STREAM_MAX_TRACKED_TARGETS][]const u8 = undefined;
+        var stale_len: usize = 0;
+        var it = self.stream_states.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.finished_at_ms == 0) continue;
+            if (entry.value_ptr.isLateChunk(now_ms)) continue;
+            if (stale_len == stale.len) break;
+            stale[stale_len] = entry.key_ptr.*;
+            stale_len += 1;
+        }
+        for (stale[0..stale_len]) |key| {
+            stream_presenter.clearStreamState(self.allocator, &self.stream_states, key);
+        }
+    }
+
+    fn publishStreamFlushLocked(
+        self: *SlackChannel,
+        target: []const u8,
+        state: *StreamState,
+        flush: *const stream_presenter.StreamFlush,
+    ) void {
+        const parsed = stream_presenter.resolveStreamTarget(target);
+
+        if (state.mode == .native) {
+            if (flush.native_full) {
+                // The accumulated snapshot has outgrown Slack's message cap, so
+                // the next chat.appendStream would answer `msg_too_long` -- a
+                // per-call split cannot prevent a cumulative overflow. Close the
+                // stream and finish on the edited-message transport, whose
+                // chat.update is capped at STREAM_UPDATE_MAX_BYTES and whose
+                // overflow goes out as thread follow-ups.
+                if (state.message_ts.len > 0) {
+                    self.stopNativeStream(parsed, state.message_ts) catch |err| {
+                        log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
+                    };
+                }
+                state.mode = .fallback;
+            } else if (state.message_ts.len == 0) {
+                self.startNativeStreamLocked(parsed, state, flush.text) catch |err| {
+                    log.warn("Slack chat.startStream failed ({s}); using edited messages", .{@errorName(err)});
+                    state.mode = .fallback;
+                };
+            } else {
+                // Keep the native transport: the streamed message still has to be
+                // closed with chat.stopStream, and the final reply reconciles it.
+                self.appendNativeStreamLocked(parsed, state, flush.delta()) catch |err| {
+                    // A failed append -- most likely `msg_too_long` once the
+                    // message passes Slack's cumulative cap, which a per-call
+                    // split cannot foresee -- leaves the native stream unusable
+                    // for this turn. Close it now rather than only stopping live
+                    // updates: otherwise a turn with no final body can leave the
+                    // message stuck in the streaming state. Finish on the
+                    // edited-message transport, whose chat.update is capped and
+                    // splits, so the final reply is still delivered intact.
+                    log.warn("Slack chat.appendStream failed ({s}); finishing on edited messages", .{@errorName(err)});
+                    if (state.message_ts.len > 0) {
+                        self.stopNativeStream(parsed, state.message_ts) catch |stop_err| {
+                            log.warn("Slack chat.stopStream failed ({s})", .{@errorName(stop_err)});
+                        };
+                    }
+                    state.mode = .fallback;
+                    state.send_failed = true;
+                };
+            }
+            if (state.mode == .native) return;
+        }
+
+        if (state.mode != .fallback or state.send_failed) return;
+
+        if (state.message_ts.len == 0) {
+            const ts = self.postMessageForStream(parsed, flush.text) catch |err| {
+                log.warn("Slack streaming chat.postMessage failed ({s}); reply will be sent complete", .{@errorName(err)});
+                state.send_failed = true;
+                return;
+            };
+            defer self.allocator.free(ts);
+            state.setMessageTs(self.allocator, ts) catch |err| {
+                log.warn("Slack streaming state allocation failed: {}", .{err});
+                state.send_failed = true;
+            };
+            return;
+        }
+
+        self.updateStreamMessage(parsed, state.message_ts, flush.text) catch |err| {
+            log.warn("Slack streaming chat.update failed ({s}); continuing without live updates", .{@errorName(err)});
+            state.send_failed = true;
+        };
+    }
+
+    fn startNativeStreamLocked(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        state: *StreamState,
+        text: []const u8,
+    ) !void {
+        const thread_ts = parsed.thread_ts orelse {
+            // Defensive: ensureStreamStateLocked already picks the fallback
+            // transport for a top-level target.
+            state.mode = .fallback;
+            return error.SlackStreamNotThreaded;
+        };
+
+        const chunks = try stream_presenter.splitForLimit(
+            self.allocator,
+            text,
+            stream_presenter.STREAM_MARKDOWN_MAX_BYTES,
+        );
+        defer stream_presenter.freeChunks(self.allocator, chunks);
+
+        const body = try stream_presenter.buildStartStreamBody(
+            self.allocator,
+            parsed.channel_id,
+            thread_ts,
+            chunks[0],
+        );
+        defer self.allocator.free(body);
+
+        var result = try self.callSlackApi("chat.startStream", body, parsed.channel_id);
+        defer result.deinit(self.allocator);
+
+        if (result.error_code) |code| {
+            try self.recordNativeStreamFailure(code);
+            return error.SlackStreamRejected;
+        }
+        const ts = result.ts orelse return error.SlackStreamRejected;
+        try state.setMessageTs(self.allocator, ts);
+
+        for (chunks[1..]) |chunk| {
+            try self.appendNativeStreamLocked(parsed, state, chunk);
+        }
+    }
+
+    fn appendNativeStreamLocked(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        state: *StreamState,
+        text: []const u8,
+    ) !void {
+        if (text.len == 0) return;
+
+        const chunks = try stream_presenter.splitForLimit(
+            self.allocator,
+            text,
+            stream_presenter.STREAM_MARKDOWN_MAX_BYTES,
+        );
+        defer stream_presenter.freeChunks(self.allocator, chunks);
+
+        for (chunks) |chunk| {
+            const body = try stream_presenter.buildAppendStreamBody(
+                self.allocator,
+                parsed.channel_id,
+                state.message_ts,
+                chunk,
+            );
+            defer self.allocator.free(body);
+
+            var result = try self.callSlackApi("chat.appendStream", body, parsed.channel_id);
+            defer result.deinit(self.allocator);
+            if (result.error_code) |code| try self.recordNativeStreamFailure(code);
+        }
+    }
+
+    /// Map an API error to the retry policy for this turn and for the account.
+    fn recordNativeStreamFailure(self: *SlackChannel, code: []const u8) !void {
+        if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
+            if (!self.native_stream_disabled.swap(true, .acq_rel)) {
+                log.warn(
+                    "Slack native streaming unavailable for this app ({s}); falling back to edited messages",
+                    .{code},
+                );
+            }
+        }
+        return error.SlackStreamRejected;
+    }
+
+    fn postMessageForStream(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        text: []const u8,
+    ) ![]u8 {
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, text);
+
+        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
+        defer result.deinit(self.allocator);
+        return result.takeTs() orelse error.SlackStreamRejected;
+    }
+
+    fn updateStreamMessage(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        ts: []const u8,
+        markdown_text: []const u8,
+    ) !void {
+        const mrkdwn = try markdownToSlackMrkdwn(self.allocator, markdown_text);
+        defer self.allocator.free(mrkdwn);
+
+        // chat.update rejects text above 4,000 chars with `msg_too_long`; the
+        // final reply is delivered separately once it no longer fits.
+        const chunks = try stream_presenter.splitForLimit(
+            self.allocator,
+            mrkdwn,
+            stream_presenter.STREAM_UPDATE_MAX_BYTES,
+        );
+        defer stream_presenter.freeChunks(self.allocator, chunks);
+
+        const body = try stream_presenter.buildUpdateBody(self.allocator, parsed.channel_id, ts, chunks[0]);
+        defer self.allocator.free(body);
+
+        var result = try self.callSlackApi("chat.update", body, parsed.channel_id);
+        defer result.deinit(self.allocator);
+        if (result.error_code) |code| {
+            if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
+                self.native_stream_disabled.store(true, .release);
+            }
+            return error.SlackStreamRejected;
+        }
+    }
+
+    /// Deliver the authoritative final reply.
+    ///
+    /// The streamed text is only a preview: the model may have produced
+    /// intermediate text before a tool call, and redaction rehydration can
+    /// rewrite the reply after the last delta. When the streamed content is a
+    /// prefix of the final text we append the remainder and stop the stream, so
+    /// the message already shows the final reply. Otherwise the stream is
+    /// stopped and the final reply is posted as its own message, which is what
+    /// Telegram does for every turn.
+    fn streamFinal(
+        self: *SlackChannel,
+        target: []const u8,
+        message: []const u8,
+        media: []const []const u8,
+    ) !void {
+        self.stream_mu.lock();
+        defer self.stream_mu.unlock();
+
+        const now_ms = std_compat.time.milliTimestamp();
+        // Every queued delta was dequeued ahead of this final, so the stop marker
+        // has done its job and must not leak into the next turn -- including a
+        // turn that streamed nothing and returns early below without a state.
+        self.clearStreamCancelLocked(target);
+        const state = self.stream_states.getPtr(target) orelse
+            return vtableSend(@ptrCast(self), target, message, media);
+        // Keep the entry: late deltas of this turn are dropped by isLateChunk.
+        defer state.finishTurn(self.allocator, now_ms);
+
+        if (state.message_ts.len == 0) {
+            // Nothing was ever flushed (short reply inside the throttle window),
+            // or the fallback message could not be created.
+            return vtableSend(@ptrCast(self), target, message, media);
+        }
+
+        const parsed = stream_presenter.resolveStreamTarget(target);
+
+        if (state.mode == .native) {
+            const suffix = stream_presenter.pendingFinalSuffix(message, state.sent);
+            // The closing append must respect the same cumulative budget as the
+            // live flushes: when the answer lands inside one throttle window the
+            // whole remainder is appended in a single call, and chat.appendStream
+            // would answer `msg_too_long` past Slack's message cap. Finish on the
+            // edited-message transport instead so the answer is delivered intact.
+            const over_budget = if (suffix) |s|
+                stream_presenter.finalAppendOverflowsBudget(state.sent.len, s.len)
+            else
+                false;
+            const stream_completed = if (suffix != null and !over_budget) blk: {
+                self.appendNativeStreamLocked(parsed, state, suffix.?) catch |err| {
+                    log.warn("Slack chat.appendStream final delta failed ({s})", .{@errorName(err)});
+                    break :blk false;
+                };
+                break :blk true;
+            } else false;
+
+            self.stopNativeStream(parsed, state.message_ts) catch |err| {
+                log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
+            };
+            if (stream_completed) return;
+            // A streamed reasoning quote is deliberately absent from the final
+            // reply, so that turn's snapshot can never be a prefix of it.
+            // Rewrite the stopped message in place rather than leaving the
+            // thinking behind and posting the reply a second time. The same
+            // rewrite carries a final message that would overflow the stream
+            // budget.
+            if (state.rendered_reasoning or over_budget) {
+                return self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
+            }
+            // When the stream could not be completed the streamed message keeps
+            // an intermediate prefix, so the reply is posted again in full.
+            return vtableSend(@ptrCast(self), target, message, media);
+        }
+
+        try self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
+    }
+
+    fn deliverFallbackFinal(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        ts: []const u8,
+        message: []const u8,
+        media: []const []const u8,
+        target: []const u8,
+    ) !void {
+        const chunks = try stream_presenter.splitForLimit(
+            self.allocator,
+            message,
+            stream_presenter.STREAM_UPDATE_MAX_BYTES,
+        );
+        defer stream_presenter.freeChunks(self.allocator, chunks);
+
+        self.updateStreamMessage(parsed, ts, chunks[0]) catch |err| {
+            log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
+            return vtableSend(@ptrCast(self), target, message, media);
+        };
+
+        // Anything past the first chat.update-able slice goes out as follow-up
+        // messages in the same thread.
+        const followups = @min(chunks.len - 1, stream_presenter.STREAM_MAX_FOLLOWUPS);
+        if (chunks.len - 1 > followups) {
+            log.warn("Slack streaming reply truncated: {} overflow chunks dropped", .{chunks.len - 1 - followups});
+        }
+        for (chunks[1 .. 1 + followups]) |chunk| {
+            self.postStreamFollowup(parsed, chunk) catch |err| {
+                log.warn("Slack streaming follow-up post failed ({s})", .{@errorName(err)});
+                break;
+            };
+        }
+    }
+
+    fn postStreamFollowup(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        markdown_text: []const u8,
+    ) !void {
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, markdown_text);
+
+        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
+        result.deinit(self.allocator);
+    }
+
+    fn stopNativeStream(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        ts: []const u8,
+    ) !void {
+        const body = try stream_presenter.buildStopStreamBody(self.allocator, parsed.channel_id, ts);
+        defer self.allocator.free(body);
+
+        var result = try self.callSlackApi("chat.stopStream", body, parsed.channel_id);
+        defer result.deinit(self.allocator);
+        if (result.error_code) |code| try self.recordNativeStreamFailure(code);
+    }
+
+    /// POST a Slack Web API method and return the parsed `ts` / `error` fields.
+    /// Transport and JSON failures surface as errors; API-level failures are
+    /// reported through `error_code` so callers can apply a retry policy.
+    fn callSlackApi(
+        self: *SlackChannel,
+        endpoint: []const u8,
+        body: []const u8,
+        context: ?[]const u8,
+    ) !SlackApiResult {
+        // Streaming outbound must never touch the network under `zig build test`;
+        // the throttling/fallback state machine is covered through this stub.
+        if (builtin.is_test) {
+            return .{ .ts = try self.allocator.dupe(u8, "1700000000.000000") };
+        }
+
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ API_BASE, endpoint });
+        defer self.allocator.free(url);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
+        const auth_header = auth_writer.buffered();
+
+        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
+            log.err("Slack {s} POST failed: {}", .{ endpoint, err });
+            return error.SlackApiError;
+        };
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch
+            return error.SlackApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.SlackApiError;
+
+        var result = SlackApiResult{};
+        errdefer result.deinit(self.allocator);
+        if (parsed.value.object.get("ts")) |ts_val| {
+            if (ts_val == .string and ts_val.string.len > 0) {
+                result.ts = try self.allocator.dupe(u8, ts_val.string);
+            }
+        }
+        if (slackApiErrorInfo(parsed.value.object)) |info| {
+            logSlackApiError(endpoint, context, info);
+            result.error_code = try self.allocator.dupe(u8, info.code);
+        }
+        return result;
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendEvent = &vtableSendEvent,
         .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
+        .cancelStreams = &vtableCancelStreams,
     };
 
     pub fn channel(self: *SlackChannel) root.Channel {
@@ -1599,6 +2231,46 @@ test "slack channel init defaults" {
     try std.testing.expect(ch.thread_ts == null);
     try std.testing.expect(ch.app_token == null);
     _ = ch.channelName();
+}
+
+test "slack native stream finishes on the fallback transport past the message budget" {
+    // Regression: pre-fix, a chunk past Slack's cumulative message cap left the
+    // turn on the native transport, so the next chat.appendStream answered
+    // `msg_too_long`; the edited-message transport (chat.update + thread
+    // follow-ups) must carry the final answer intact instead.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    const target = "C123:1700000000.000100";
+    const big = "x" ** (stream_presenter.STREAM_TOTAL_MAX_BYTES + 1);
+    try ch.channel().sendEvent(target, big, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
+    try std.testing.expect(state.message_ts.len > 0);
+}
+
+test "slack native stream leaves for the fallback transport when a later flush crosses the budget" {
+    // Regression: pre-fix, a turn that started native and only crossed the
+    // budget on a later flush stayed native; it must close the stream and
+    // finish on the edited-message transport, keeping the ts for the rewrite.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    const target = "C123:1700000000.000100";
+    const part = "x" ** 7_000;
+    try ch.channel().sendEvent(target, part, &.{}, .chunk);
+    const first = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.native, first.mode);
+    try std.testing.expect(first.message_ts.len > 0);
+
+    // Force the next flush past the coalescing window without waiting a second.
+    first.last_flush_time = 0;
+    try ch.channel().sendEvent(target, part, &.{}, .chunk);
+
+    const second = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, second.mode);
+    try std.testing.expect(second.message_ts.len > 0);
 }
 
 test "slack initFromConfig maps pairing dm_policy to allowlist" {
@@ -2196,6 +2868,267 @@ test "slack channel vtable compiles" {
     try std.testing.expect(@TypeOf(vt) == root.Channel.VTable);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Streaming outbound
+//
+// `callSlackApi` is stubbed under `builtin.is_test`, so these tests drive the
+// whole start/append/stop and postMessage/update state machine without network.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn initStreamingChannel(streaming: bool) SlackChannel {
+    return SlackChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "sl-main",
+        .bot_token = "xoxb-test",
+        .streaming = streaming,
+    });
+}
+
+test "slack streaming is disabled by default" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{ .bot_token = "xoxb-test" });
+    defer ch.channel().stop();
+
+    try std.testing.expect(!ch.streaming_enabled);
+    try std.testing.expect(!ch.channel().supportsStreamingOutbound());
+}
+
+test "slack initFromConfig enables streaming from config" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    try std.testing.expect(ch.streaming_enabled);
+    try std.testing.expect(ch.channel().supportsStreamingOutbound());
+}
+
+test "slack streaming chunk opens a native stream for a thread target" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.native, state.mode);
+    try std.testing.expect(!state.send_failed);
+    try std.testing.expectEqualStrings("1700000000.000000", state.message_ts);
+}
+
+test "slack streaming keeps the native path across chunks of one turn" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    // A second delta inside the flush window is coalesced rather than sent, but
+    // the turn must keep using the native transport.
+    try ch.channel().sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.native, state.mode);
+    try std.testing.expectEqualStrings("x" ** 200, state.sent);
+}
+
+test "slack streaming uses edited messages when the target has no thread" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    try ch.channel().sendEvent("C1", "x" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
+    try std.testing.expectEqualStrings("1700000000.000000", state.message_ts);
+}
+
+test "slack streaming uses edited messages when native streaming is disabled" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    ch.native_stream_disabled.store(true, .release);
+
+    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
+}
+
+test "slack streaming final appends the remainder and closes the stream" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    // The final reply extends the streamed prefix, so no second message is posted.
+    try iface.sendEvent("C1:1700.1", ("x" ** 200) ++ " done", &.{}, .final);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.finished_at_ms != 0);
+    try std.testing.expectEqual(@as(usize, 0), state.buffer.items.len);
+}
+
+test "slack streaming final posts the reply when it diverges from the stream" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    // The model emitted text before a tool call, so the final reply is not an
+    // extension of the streamed prefix and is delivered as its own message.
+    try iface.sendEvent("C1:1700.1", "unrelated answer", &.{}, .final);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.finished_at_ms != 0);
+}
+
+test "slack streaming final rewrites the message after streamed reasoning" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    // reasoning_mode == .stream: the streamed preview carries the quoted
+    // thinking, which the final reply deliberately omits, so the snapshot can
+    // never be a prefix of it. The stopped message is rewritten in place with
+    // chat.update instead of posting the reply as a second message.
+    try iface.sendEvent("C1:1700.1", "<think>weighing the options</think>", &.{}, .chunk);
+    try iface.sendEvent("C1:1700.1", "final answer", &.{}, .final);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.finished_at_ms != 0);
+    try std.testing.expect(!state.rendered_reasoning);
+}
+
+test "slack streaming drops deltas that arrive after the final reply" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1:1700.1", ("x" ** 200) ++ " done", &.{}, .final);
+
+    // Regression: the durable outbox worker can deliver the final reply before
+    // the outbound dispatcher has drained the last deltas of the same turn.
+    // Those leftovers must not open a second stream.
+    try iface.sendEvent("C1:1700.1", "late tail deltas" ** 20, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), state.buffer.items.len);
+}
+
+test "slack streaming drops queued chunks for a cancelled target" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    // The turn opened a stream, then the user hit /stop.
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    {
+        // Advance the flush clock past the 1s floor so the next delta would reach
+        // the wire (and grow state.sent) if the cancel did not drop it.
+        const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+    }
+    iface.cancelStreams("C1:1700.1");
+
+    // Regression: deltas already queued ahead of the /stop must not replay once
+    // the outbound dispatcher catches up.
+    try iface.sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("x" ** 200, state.sent);
+}
+
+test "slack streaming flushes a later delta past the interval when not cancelled" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    // Positive control for the cancelled-target test above: the same clock
+    // advance with no /stop must let the delta through, proving the cancel is
+    // what dropped it.
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    {
+        const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+    }
+
+    try iface.sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(("x" ** 200) ++ ("y" ** 200), state.sent);
+}
+
+test "slack streaming final without streaming enabled is delivered complete" {
+    var ch = initStreamingChannel(false);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1:1700.1", "complete reply", &.{}, .final);
+
+    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
+}
+
+test "slack streaming final updates the fallback message in place" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1", ("x" ** 200) ++ " tail", &.{}, .final);
+
+    const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.finished_at_ms != 0);
+}
+
+test "slack streaming final splits overflowing fallback replies" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    const long = "z" ** (stream_presenter.STREAM_UPDATE_MAX_BYTES * 3);
+    try iface.sendEvent("C1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1", long, &.{}, .final);
+
+    const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.finished_at_ms != 0);
+}
+
+test "slack streaming ignores chunks when streaming is disabled" {
+    var ch = initStreamingChannel(false);
+    defer ch.channel().stop();
+
+    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+
+    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
+}
+
+test "slack streaming chunk for an empty message is ignored" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    try ch.channel().sendEvent("C1:1700.1", "", &.{}, .chunk);
+
+    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
+}
+
+test "slack streaming short reply never opens a stream" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+
+    try ch.channel().sendEvent("C1:1700.1", "ok", &.{}, .chunk);
+
+    // Nothing was flushed inside the coalescing window, so no message exists.
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
+    try std.testing.expectEqual(@as(usize, 0), state.sent.len);
+}
+
+test "slack stop releases streaming buffers" {
+    var ch = initStreamingChannel(true);
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1", "y" ** 200, &.{}, .chunk);
+
+    iface.stop();
+    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
+}
+
 test "sendMessage payload converts markdown to mrkdwn" {
     const allowed = [_][]const u8{};
     var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
@@ -2203,7 +3136,7 @@ test "sendMessage payload converts markdown to mrkdwn" {
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
     defer body_list.deinit(std.testing.allocator);
 
-    try ch.appendPostMessageBody(&body_list, "C123", "**hello** world");
+    try ch.appendPostMessageBody(&body_list, "C123", null, "**hello** world");
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body_list.items, .{});
     defer parsed.deinit();

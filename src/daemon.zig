@@ -1070,9 +1070,18 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
         return;
     };
     message.draft_id = ctx.draft_id;
-    ctx.event_bus.publishOutbound(message) catch |err| {
+    // A stream chunk is a droppable preview: never block the agent turn waiting
+    // for outbound-queue space. The single outbound dispatcher can be parked in
+    // a slow Slack call, and blocking here kept the turn alive (and deaf to
+    // /stop) until the backlog drained. A timeout of 0 drops the chunk the
+    // moment the queue is full instead of sleeping.
+    ctx.event_bus.publishOutboundTimeout(message, 0) catch |err| {
         message.deinit(ctx.allocator);
-        if (err != error.Closed) {
+        if (err == error.Timeout) {
+            // The dispatcher is behind; drop this preview instead of parking the
+            // turn on a full queue.
+            log.debug("inbound dispatch dropped a stream chunk: outbound queue full", .{});
+        } else if (err != error.Closed) {
             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
         }
         return;
@@ -1174,13 +1183,24 @@ fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !A
     };
 }
 
+/// Channels whose draft presenter knows how to render a forwarded `<think>`
+/// block. Everything else keeps the stripped preview: it has nowhere to put the
+/// reasoning, and forwarding the tags would leak them into a live message.
+fn channelShowsLiveReasoning(channel: []const u8) bool {
+    return std.mem.eql(u8, channel, "telegram") or std.mem.eql(u8, channel, "slack");
+}
+
 fn makeStreamingSinkForChannel(
     streaming_supported: bool,
     raw_sink: streaming.Sink,
     filter: *streaming.TagFilter,
+    stream_reasoning: bool,
 ) ?streaming.Sink {
     if (!streaming_supported) return null;
-    filter.* = streaming.TagFilter.init(raw_sink);
+    filter.* = streaming.TagFilter.initWithThinkMode(
+        raw_sink,
+        if (stream_reasoning) .passthrough else .strip,
+    );
     return filter.sink();
 }
 
@@ -1338,7 +1358,16 @@ fn processInboundMessage(
             .callback = publishStreamingChunk,
             .ctx = @ptrCast(&streaming_ctx),
         };
-        stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
+        // Reasoning is only forwarded when the session streams it and the
+        // outbound channel renders it; otherwise the preview stays stripped.
+        const stream_reasoning = channelShowsLiveReasoning(routing_plan.outbound_channel) and
+            runtime.session_mgr.streamsReasoning(routing_plan.session_key);
+        stream_sink = makeStreamingSinkForChannel(
+            use_streaming_outbound,
+            raw_sink,
+            &outbound_tag_filter,
+            stream_reasoning,
+        );
     }
 
     if (std.mem.eql(u8, msg.channel, "max")) {
@@ -1864,12 +1893,46 @@ test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
 
     var collector = Collector{};
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter).?;
+    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter, false).?;
     sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
     sink.emitFinal();
 
     try std.testing.expectEqualStrings("AB", collector.text());
     try std.testing.expect(collector.got_final);
+}
+
+test "makeStreamingSinkForChannel keeps reasoning when the session streams it" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    _ = makeStreamingSinkForChannel(true, .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter, true).?;
+    try std.testing.expectEqual(streaming.ThinkMode.passthrough, filter.think);
+}
+
+test "makeStreamingSinkForChannel strips reasoning by default" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    _ = makeStreamingSinkForChannel(true, .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter, false).?;
+    try std.testing.expectEqual(streaming.ThinkMode.strip, filter.think);
+}
+
+test "channelShowsLiveReasoning only enables channels that render it" {
+    try std.testing.expect(channelShowsLiveReasoning("telegram"));
+    try std.testing.expect(channelShowsLiveReasoning("slack"));
+    try std.testing.expect(!channelShowsLiveReasoning("max"));
+    try std.testing.expect(!channelShowsLiveReasoning("dingtalk"));
+    try std.testing.expect(!channelShowsLiveReasoning("web"));
 }
 
 test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
@@ -1881,7 +1944,7 @@ test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
     const sink = makeStreamingSinkForChannel(true, .{
         .callback = Noop.callback,
         .ctx = undefined,
-    }, &filter);
+    }, &filter, false);
     try std.testing.expect(sink != null);
 }
 
@@ -1894,8 +1957,38 @@ test "makeStreamingSinkForChannel returns null when streaming is disabled" {
     const sink = makeStreamingSinkForChannel(false, .{
         .callback = Noop.callback,
         .ctx = undefined,
-    }, &filter);
+    }, &filter, true);
     try std.testing.expect(sink == null);
+}
+
+test "publishStreamingChunk drops a preview instead of blocking on a full outbound queue" {
+    const allocator = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var filled: usize = 0;
+    while (filled < bus_mod.QUEUE_CAPACITY) : (filled += 1) {
+        try event_bus.publishOutbound(try bus_mod.makeOutbound(allocator, "c", "t", "x"));
+    }
+
+    var ctx = StreamingOutboundCtx{
+        .allocator = allocator,
+        .event_bus = &event_bus,
+        .channel = "c",
+        .account_id = null,
+        .chat_id = "t",
+    };
+    // Regression: a full queue used to park the turn in publishOutbound until the
+    // dispatcher drained, keeping it running and unresponsive to /stop. The
+    // bounded publish must drop the preview and return at once.
+    publishStreamingChunk(&ctx, .{ .stage = .chunk, .text = "hello" });
+    try std.testing.expect(!ctx.emitted_chunk);
+
+    event_bus.close();
+    while (event_bus.consumeOutbound()) |msg| {
+        var m = msg;
+        m.deinit(allocator);
+    }
 }
 
 test "pollDebouncedInbound keeps dispatcher alive across idle timeout" {

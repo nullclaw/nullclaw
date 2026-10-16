@@ -1016,6 +1016,116 @@ Common issues:
 - Bot offline: Check `nullclaw service status`, verify token hasn't been reset
 - No response in guilds: Check `require_mention` setting, verify Read Messages permission
 
+### Slack
+
+Slack example:
+
+```json
+{
+  "channels": {
+    "slack": {
+      "accounts": {
+        "default": {
+          "bot_token": "xoxb-YOUR_BOT_TOKEN",
+          "app_token": "xapp-YOUR_APP_TOKEN",
+          "channel_id": "C0123456789",
+          "allow_from": ["U0123456789"],
+          "reply_to_mode": "all",
+          "streaming": true
+        }
+      }
+    }
+  }
+}
+```
+
+Parameters:
+- `mode` (default: `socket`) - `socket` uses Socket Mode (needs `app_token`); `http` receives Events API webhooks at `webhook_path` and needs `signing_secret`
+- `bot_token` (required) - Bot User OAuth token (`xoxb-...`)
+- `app_token` (optional) - App-level token (`xapp-...`), required for `mode = socket`
+- `signing_secret` (optional) - Required for `mode = http`
+- `webhook_path` (default: `/slack/events`) - Webhook path for `mode = http`
+- `channel_id` (optional) - Channel polled by the history fallback when Socket Mode is unavailable
+- `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages; use `["*"]` only when you intentionally want an open bot
+- `dm_policy` (default: `pairing`) - `allow`, `deny`, `allowlist`/`pairing`
+- `group_policy` (default: `mention_only`) - `open`, `allowlist`, `mention_only`
+- `reply_to_mode` (default: `off`) - `off` threads only when the triggering message is already a thread reply; `all` always replies in a thread
+- `streaming` (default: `false`) - Show the reply while it is still being generated. See below
+
+#### Slack streaming replies
+
+With `streaming = true`, nullclaw publishes the model output progressively instead of
+waiting for the complete reply. Two transports are used, chosen per reply target:
+
+- **Native streaming** - for a threaded target (`reply_to_mode = all`, an inbound thread
+  reply, or an assistant thread) nullclaw calls `chat.startStream`, then throttled
+  `chat.appendStream` calls, then `chat.stopStream`. Slack only accepts a stream inside a
+  thread, so a top-level target never uses this path.
+- **Edited message** - for top-level targets, and whenever Slack rejects the native
+  methods, nullclaw posts one message with `chat.postMessage` and updates it with
+  throttled `chat.update` calls.
+
+Deltas are coalesced (at most one API call per second per turn) to stay inside Slack's
+per-method rate limits. Tool-call markup is always stripped before anything is sent. If a
+native streaming call fails with a permanent error (`channel_type_not_supported`,
+`missing_scope`, `invalid_thread_ts`, ...), nullclaw stops trying the native methods for
+that account and uses edited messages from then on. A turn whose streamed text grows past
+Slack's per-message cap also leaves the native transport: nullclaw closes the stream and
+finishes the turn on the edited-message transport (capped `chat.update` plus thread
+follow-ups), so a long reply is delivered intact instead of failing with `msg_too_long`.
+
+#### Live reasoning in drafts
+
+`/reasoning stream` makes the model's thinking visible while it is produced, in the live
+draft on Slack and Telegram. The thinking is rendered as a `>` quote (Slack blockquote,
+`>`-prefixed lines on Telegram drafts, which are sent without a parse mode) and the answer
+appears below it once the model starts writing. Long thinking is truncated to the platform
+limit keeping the tail, and the existing per-turn throttling applies to it like any other
+delta.
+
+The delivered reply never contains the thinking, whatever the mode:
+
+- `stream` - the thinking is shown live in the draft only.
+- `on` - the thinking is not shown live; a `Reasoning:` block is appended to the final reply.
+- `off` - the thinking is discarded.
+
+Because a streamed draft contains text the final reply omits, Slack rewrites the stopped
+message in place (`chat.update`) when a turn streamed reasoning, instead of posting the
+reply a second time. On channels that have nowhere to show reasoning, the live preview stays
+stripped.
+
+Required Slack app settings:
+
+1. Enable **Agents & AI Apps** (shown as **Agents**) under *Features* in the app settings.
+   This is the feature gate for `chat.startStream` and requires a paid Slack plan.
+2. Bot token scopes: `chat:write` (required for all outbound replies) plus `assistant:write`
+   (added automatically when the app is declared as an agent). Add `im:history` and
+   `channels:history` if you rely on history polling.
+3. Events: `app_mention`, `message.im`, `message.channels` (and
+   `assistant_thread_started` / `assistant_thread_context_changed` for assistant threads).
+4. Reinstall the app after changing scopes, then restart nullclaw.
+
+Without the feature or the scope, `streaming = true` is harmless: the first
+`chat.startStream` call is rejected, the reply falls back to the edited-message path, and
+the warning is logged once per account.
+
+Verification:
+```bash
+nullclaw channel start slack
+nullclaw channel status
+```
+
+`nullclaw channel start slack` starts only the first configured Slack account. For
+multi-account validation, run `nullclaw gateway` and send a test message to each configured bot.
+
+Common issues:
+- Replies arrive only when complete: check that `streaming` is `true`, that the app has the
+  Agents & AI Apps feature enabled, and look for `Slack native streaming unavailable for this app`
+  in the logs
+- `missing_scope` in the logs: reinstall the app after adding `chat:write` and `assistant:write`
+- No streaming in channels: Slack only streams inside threads, so set `reply_to_mode` to `all`
+- No response at all: check `allow_from`, and in groups that the bot is mentioned
+
 ### `memory`
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.

@@ -51,9 +51,25 @@ pub fn forwardProviderChunk(sink: Sink, chunk: providers.StreamChunk) void {
 // chunks before forwarding to an inner Sink.
 // ---------------------------------------------------------------------------
 
+/// What `TagFilter` does with `<think>…</think>` blocks.
+pub const ThinkMode = enum {
+    /// Drop the block and its tags, so reasoning never leaves the agent.
+    strip,
+    /// Forward the tags and the body untouched so a channel draft can render
+    /// the reasoning live. Used when `reasoning_mode == .stream` and the
+    /// outbound channel knows how to display it. Tool-call markup is still
+    /// stripped in both modes.
+    passthrough,
+};
+
 pub const TagFilter = struct {
     inner: Sink,
+    think: ThinkMode = .strip,
     state: State = .passthrough,
+    /// Nesting depth of the provider tool marker currently being suppressed.
+    opaque_depth: u8 = 0,
+    /// True when the marker being eaten is a closer (`</\u{FF5C}...`).
+    opaque_closer: bool = false,
     buf: [max_buf_len]u8 = undefined,
     buf_len: u8 = 0,
 
@@ -63,6 +79,10 @@ pub const TagFilter = struct {
         skip_to_angle_close, // prefix matched, eating until '>'
         inside_tag, // inside tag body, suppressing output
         maybe_close, // buffering after '<', checking if close tag matches
+        inside_think, // passthrough mode: inside <think>, body flows verbatim
+        opaque_marker, // provider tool marker: eat bytes up to its closing '>'
+        opaque_body, // inside a suppressed marker body
+        opaque_body_maybe_open, // inside a suppressed body, buffering after '<'
     };
 
     // Opening tag prefixes. After matching, skip until '>'.
@@ -86,6 +106,23 @@ pub const TagFilter = struct {
         "<|tool_call_end|>",
         "<|tool_result_end|>",
         "</think>",
+    };
+
+    // Used by `ThinkMode.passthrough`, which forwards the reasoning close tag
+    // instead of swallowing it.
+    const close_tag_think = "</think>";
+
+    // Provider tool-protocol markers that are neither `<tool_call>` nor user
+    // text. When a model falls back to its own text tool protocol the gateway
+    // can surface those bytes in the content stream - DeepSeek emits
+    // `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>` /
+    // `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke ...>` - and they must
+    // never reach a channel. The markers nest (`calls` wraps `invoke` wraps
+    // `parameter`), so the body is suppressed until the matching closer, in
+    // both think modes: it is tool markup, not reasoning and not an answer.
+    const opaque_marker_prefixes = [_][]const u8{
+        "<\u{FF5C}",
+        "</\u{FF5C}",
     };
 
     // Standalone control tokens that should be stripped, but do not wrap body text.
@@ -114,6 +151,12 @@ pub const TagFilter = struct {
 
     pub fn init(inner: Sink) TagFilter {
         return .{ .inner = inner };
+    }
+
+    /// Like `init`, but forwards `<think>` blocks to the inner sink instead of
+    /// dropping them.
+    pub fn initWithThinkMode(inner: Sink, think: ThinkMode) TagFilter {
+        return .{ .inner = inner, .think = think };
     }
 
     /// Return a Sink whose callback routes through this filter.
@@ -164,8 +207,13 @@ pub const TagFilter = struct {
                     if (self.buf_len > 1 and (b == '>' or b == ' ') and
                         matchesAnyPrefix(prefix[0 .. self.buf_len - 1], &open_prefixes))
                     {
+                        const forward_think = self.think == .passthrough and b == '>' and
+                            std.mem.eql(u8, prefix, "<think>");
                         self.buf_len = 0;
-                        if (b == '>') {
+                        if (forward_think) {
+                            self.inner.emitChunk("<think>");
+                            self.state = .inside_think;
+                        } else if (b == '>') {
                             self.state = .inside_tag;
                         } else {
                             self.state = .skip_to_angle_close;
@@ -175,6 +223,18 @@ pub const TagFilter = struct {
                     }
                     // Still a valid prefix of some open tag — keep buffering.
                     if (prefixOfAny(prefix, &open_prefixes) or prefixOfAny(prefix, &standalone_tags)) {
+                        clean_start = i + 1;
+                        continue;
+                    }
+                    // Provider tool marker (`<\u{FF5C}...` / `</\u{FF5C}...`): buffer
+                    // the opening bytes, then eat the marker and, for an opener,
+                    // suppress its body too.
+                    if (prefixOfAny(prefix, &opaque_marker_prefixes)) {
+                        if (matchesAnyPrefix(prefix, &opaque_marker_prefixes)) {
+                            self.opaque_closer = prefix.len > 1 and prefix[1] == '/';
+                            self.buf_len = 0;
+                            self.state = .opaque_marker;
+                        }
                         clean_start = i + 1;
                         continue;
                     }
@@ -218,10 +278,67 @@ pub const TagFilter = struct {
                     }
                     // Still a valid prefix of a close tag — keep buffering.
                 },
+                .opaque_marker => {
+                    // Drop the marker itself; the body is handled by the state
+                    // the closing '>' selects.
+                    clean_start = i + 1;
+                    if (b != '>') continue;
+                    if (self.opaque_closer) {
+                        if (self.opaque_depth > 0) self.opaque_depth -= 1;
+                    } else {
+                        self.opaque_depth +|= 1;
+                    }
+                    self.state = if (self.opaque_depth > 0) .opaque_body else .passthrough;
+                },
+                .opaque_body => {
+                    clean_start = i + 1;
+                    if (b == '<') {
+                        self.buf[0] = b;
+                        self.buf_len = 1;
+                        self.state = .opaque_body_maybe_open;
+                    }
+                },
+                .opaque_body_maybe_open => {
+                    clean_start = i + 1;
+                    self.buf[self.buf_len] = b;
+                    self.buf_len += 1;
+                    const prefix = self.buf[0..self.buf_len];
+                    if (matchesAnyPrefix(prefix, &opaque_marker_prefixes)) {
+                        self.opaque_closer = prefix[1] == '/';
+                        self.buf_len = 0;
+                        self.state = .opaque_marker;
+                        continue;
+                    }
+                    if (prefixOfAny(prefix, &opaque_marker_prefixes)) continue;
+                    // Ordinary text inside the suppressed body — keep dropping.
+                    self.buf_len = 0;
+                    self.state = .opaque_body;
+                },
+                .inside_think => {
+                    // Passthrough mode: the body is user-visible reasoning, so
+                    // forward it verbatim. The close tag is matched against the
+                    // caller's slice, which keeps the emitted bytes valid for
+                    // the whole call and needs no replay buffer.
+                    if (b != '<') continue;
+                    if (std.mem.startsWith(u8, text[i..], close_tag_think)) {
+                        if (i > clean_start) self.inner.emitChunk(text[clean_start..i]);
+                        self.inner.emitChunk(close_tag_think);
+                        self.state = .passthrough;
+                        // Skip the rest of the tag: none of its bytes is '<'.
+                        clean_start = i + close_tag_think.len;
+                    } else {
+                        // Not a close tag here (either ordinary '<' text or the
+                        // start of one split across chunks). Emitting it as
+                        // literal text yields the same bytes either way.
+                        if (i > clean_start) self.inner.emitChunk(text[clean_start..i]);
+                        self.inner.emitChunk(text[i .. i + 1]);
+                        clean_start = i + 1;
+                    }
+                },
             }
         }
         // Flush remaining clean text in passthrough mode.
-        if (self.state == .passthrough and clean_start < text.len)
+        if ((self.state == .passthrough or self.state == .inside_think) and clean_start < text.len)
             self.inner.emitChunk(text[clean_start..]);
     }
 
@@ -231,6 +348,8 @@ pub const TagFilter = struct {
             self.inner.emitChunk(self.buf[0..self.buf_len]);
         }
         self.buf_len = 0;
+        self.opaque_depth = 0;
+        self.opaque_closer = false;
         self.state = .passthrough;
     }
 
@@ -453,6 +572,113 @@ test "TagFilter passthrough without tags" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Hello world!", col.joined(&buf));
     try std.testing.expect(col.got_final);
+}
+
+test "TagFilter strips think blocks by default" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("<think>private</think>Visible");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Visible", col.joined(&buf));
+}
+
+test "TagFilter think passthrough forwards reasoning to the inner sink" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
+    const s = filter.sink();
+    s.emitChunk("<think>private</think>Visible");
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("<think>private</think>Visible", col.joined(&buf));
+}
+
+test "TagFilter think passthrough survives a split tag" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
+    const s = filter.sink();
+    s.emitChunk("<thi");
+    s.emitChunk("nk>hi</thi");
+    s.emitChunk("nk>done");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("<think>hi</think>done", col.joined(&buf));
+}
+
+test "TagFilter think passthrough keeps angle brackets inside reasoning" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
+    const s = filter.sink();
+    s.emitChunk("<think>a < b and c > d</think>ok");
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("<think>a < b and c > d</think>ok", col.joined(&buf));
+}
+
+test "TagFilter think passthrough still strips tool call markup" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
+    const s = filter.sink();
+    s.emitChunk("<think>thinking</think>A<tool_call>{\"name\":\"x\"}</tool_call>B");
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("<think>thinking</think>AB", col.joined(&buf));
+}
+
+test "TagFilter strips DeepSeek DSML tool markup" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk(
+        "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"command\">ls -la" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer",
+    );
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
+}
+
+test "TagFilter strips DSML markup in think passthrough mode" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
+    const s = filter.sink();
+    s.emitChunk(
+        "<think>plan</think><\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Done",
+    );
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("<think>plan</think>Done", col.joined(&buf));
+}
+
+test "TagFilter strips a DSML marker split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} ca");
+    s.emitChunk("lls>secret</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>B");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
+}
+
+test "TagFilter drops a stray DSML closer but keeps the answer" {
+    // Regression: a draft that only caught the tail of a marker still showed
+    // the raw `</|DSML| calls>` text ahead of the answer.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
 }
 
 test "TagFilter strips complete tool_call in single chunk" {

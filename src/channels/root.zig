@@ -189,6 +189,9 @@ pub const Channel = struct {
         supportsStreamingOutbound: *const fn (ptr: *anyopaque) bool = &defaultSupportsStreamingOutbound,
         /// Whether the channel can create, edit, and delete host-managed draft messages.
         supportsTrackedDrafts: *const fn (ptr: *anyopaque) bool = &defaultSupportsTrackedDrafts,
+        /// Optional: drop a target's already-queued `.chunk` events after a
+        /// /stop so a stopped turn's leftovers cannot replay to the user.
+        cancelStreams: ?*const fn (ptr: *anyopaque, target: []const u8) void = null,
     };
 
     pub fn start(self: Channel) !void {
@@ -272,6 +275,11 @@ pub const Channel = struct {
 
     pub fn supportsTrackedDrafts(self: Channel) bool {
         return self.vtable.supportsTrackedDrafts(self.ptr);
+    }
+
+    /// Drop queued stream chunks for `target` when the channel supports it.
+    pub fn cancelStreams(self: Channel, target: []const u8) void {
+        if (self.vtable.cancelStreams) |cancel| cancel(self.ptr, target);
     }
 };
 

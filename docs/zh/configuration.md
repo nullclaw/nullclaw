@@ -818,6 +818,89 @@ Max 说明：
 - `require_mention = true` 仅影响群聊。私聊和 `bot_started` deep link 不受影响。
 - Max inline button 在 nullclaw 中是一次性的：有效点击后原始键盘会被清除，避免过期按钮。
 
+### Slack
+
+Slack 示例：
+
+```json
+{
+  "channels": {
+    "slack": {
+      "accounts": {
+        "default": {
+          "bot_token": "xoxb-YOUR_BOT_TOKEN",
+          "app_token": "xapp-YOUR_APP_TOKEN",
+          "channel_id": "C0123456789",
+          "allow_from": ["U0123456789"],
+          "reply_to_mode": "all",
+          "streaming": true
+        }
+      }
+    }
+  }
+}
+```
+
+参数说明：
+
+- `mode`（默认 `socket`）——`socket` 使用 Socket Mode（需要 `app_token`）；`http` 在 `webhook_path` 接收 Events API webhook，需要 `signing_secret`
+- `bot_token`（必填）——Bot User OAuth token（`xoxb-...`）
+- `app_token`（可选）——App-level token（`xapp-...`），`mode = socket` 时必填
+- `signing_secret`（可选）——`mode = http` 时必填
+- `webhook_path`（默认 `/slack/events`）——`mode = http` 的 webhook 路径
+- `channel_id`（可选）——Socket Mode 不可用时，history 轮询回退所轮询的频道
+- `allow_from`（默认 `[]`）——用户 ID 白名单。留空或省略会拒绝所有入站消息；仅在确实需要开放 bot 时使用 `["*"]`
+- `dm_policy`（默认 `pairing`）——`allow`、`deny`、`allowlist`/`pairing`
+- `group_policy`（默认 `mention_only`）——`open`、`allowlist`、`mention_only`
+- `reply_to_mode`（默认 `off`）——`off` 仅在触发消息本身已是 thread 回复时才用 thread；`all` 始终在 thread 中回复
+- `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
+
+#### Slack 流式回复
+
+开启 `streaming = true` 后，nullclaw 会边生成边推送，而不是等完整回复再发送。按回复目标选择两条通路：
+
+- **原生流式**——目标是 thread 时（`reply_to_mode = all`、入站消息本身是 thread 回复，或 assistant thread），nullclaw 依次调用 `chat.startStream`、限流的 `chat.appendStream`，最后 `chat.stopStream`。Slack 只允许在 thread 内流式输出，因此顶层目标不会走这条通路。
+- **编辑消息**——顶层目标，或 Slack 拒绝原生方法时，nullclaw 用 `chat.postMessage` 发一条消息，再用限流的 `chat.update` 更新它。
+
+增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。当某一轮的流式文本超过 Slack 单条消息上限时，也会离开原生通路：nullclaw 关闭流式消息，并在编辑消息通路上结束该轮（受限的 `chat.update` 加 thread 追加消息），从而完整送达长回复，而不是以 `msg_too_long` 失败。
+
+#### 草稿中的实时推理
+
+使用 `/reasoning stream` 时，模型的思考过程会在生成过程中实时显示在 Slack 与 Telegram 的草稿里。思考内容以 `>` 引用形式渲染（Slack 为 blockquote；Telegram 草稿不设置 parse mode，因此是带 `>` 前缀的纯文本），模型开始写正文后答案出现在其下方。过长的思考会按平台上限截断并保留尾部，同时沿用原有的每轮限流。
+
+无论哪种模式，最终送达的回复都不包含思考内容：
+
+- `stream`——思考只在草稿中实时展示。
+- `on`——不实时展示，改由最终回复追加 `Reasoning:` 区块。
+- `off`——丢弃思考内容。
+
+由于草稿中包含最终回复不包含的文本，当某一轮流式输出了推理内容时，Slack 会用 `chat.update` 就地改写已结束的消息，而不是再发一条回复。对于没有地方展示推理内容的渠道，实时预览仍保持剥离。
+
+Slack 应用侧必需配置：
+
+1. 在应用设置的 *Features* 中启用 **Agents & AI Apps**（界面可能只显示 **Agents**）。这是 `chat.startStream` 的功能开关，且需要付费 Slack 套餐。
+2. Bot token scopes：`chat:write`（所有出站回复必需），以及 `assistant:write`（把应用声明为 agent 时会自动添加）。如果依赖 history 轮询，再加 `im:history` 与 `channels:history`。
+3. Events：`app_mention`、`message.im`、`message.channels`（assistant thread 另需 `assistant_thread_started` / `assistant_thread_context_changed`）。
+4. 修改 scope 后需重新安装应用，然后重启 nullclaw。
+
+即使没有该功能或 scope，`streaming = true` 也不会造成故障：第一次 `chat.startStream` 会被拒绝，回复自动回退到编辑消息通路，且每个账号只记录一次警告。
+
+验证：
+
+```bash
+nullclaw channel start slack
+nullclaw channel status
+```
+
+`nullclaw channel start slack` 只启动第一个配置的 Slack 账号。多账号验证请运行 `nullclaw gateway`，并给每个 bot 各发一条测试消息。
+
+常见问题：
+
+- 回复仍是完整后才出现：确认 `streaming` 为 `true`、应用已启用 Agents & AI Apps，并在日志中查找 `Slack native streaming unavailable for this app`
+- 日志出现 `missing_scope`：添加 `chat:write` 与 `assistant:write` 后重新安装应用
+- 频道里没有流式输出：Slack 只支持在 thread 内流式输出，请把 `reply_to_mode` 设为 `all`
+- 完全没有回复：检查 `allow_from`；在群里还需确认 bot 被 @ 提及
+
 ### `memory`
 
 - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。

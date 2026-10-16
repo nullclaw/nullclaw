@@ -673,6 +673,11 @@ pub const SlackConfig = struct {
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
     reply_to_mode: SlackReplyToMode = .off,
+    /// Stream replies while the model is still generating them.
+    /// In a thread this uses Slack's native chat.startStream/appendStream/stopStream;
+    /// elsewhere it falls back to a chat.postMessage that is edited with chat.update.
+    /// Off by default: it needs the app's "Agents & AI Apps" feature and paid-plan scopes.
+    streaming: bool = false,
 };
 
 pub const TeamsConfig = struct {

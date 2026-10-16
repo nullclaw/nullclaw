@@ -3362,6 +3362,10 @@ pub const TelegramChannel = struct {
         tg_ptr: *TelegramChannel,
         chat_id: []const u8,
         draft_id: u64 = 0,
+        /// `.passthrough` when the session streams reasoning, so the draft shows
+        /// the thinking as a quoted block instead of dropping it. The delivered
+        /// reply still goes through `stripThinkBlocks`.
+        think_mode: streaming.ThinkMode = .strip,
         filter: streaming.TagFilter = undefined,
     };
 
@@ -3380,7 +3384,7 @@ pub const TelegramChannel = struct {
             .callback = streamCallback,
             .ctx = @ptrCast(ctx),
         };
-        ctx.filter = streaming.TagFilter.init(raw);
+        ctx.filter = streaming.TagFilter.initWithThinkMode(raw, ctx.think_mode);
         return ctx.filter.sink();
     }
 };
@@ -5915,6 +5919,28 @@ test "TelegramChannel textDebounceSecsFromMs rounds up milliseconds" {
 test "supportsDraftPreviewTarget disables draft preview for topic targets" {
     try std.testing.expect(supportsDraftPreviewTarget("12345"));
     try std.testing.expect(!supportsDraftPreviewTarget("-100123#topic:77"));
+}
+
+test "makeSink follows the ctx think mode" {
+    var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
+    ch.streaming_enabled = true;
+
+    var ctx = TelegramChannel.StreamCtx{
+        .tg_ptr = &ch,
+        .chat_id = "12345",
+        .draft_id = 1,
+        .think_mode = .passthrough,
+    };
+    try std.testing.expect(ch.makeSink(&ctx) != null);
+    try std.testing.expectEqual(streaming.ThinkMode.passthrough, ctx.filter.think);
+
+    var plain = TelegramChannel.StreamCtx{
+        .tg_ptr = &ch,
+        .chat_id = "12345",
+        .draft_id = 2,
+    };
+    try std.testing.expect(ch.makeSink(&plain) != null);
+    try std.testing.expectEqual(streaming.ThinkMode.strip, plain.filter.think);
 }
 
 test "makeSink returns null for topic targets" {

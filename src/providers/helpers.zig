@@ -10,6 +10,48 @@ const ToolSpec = root.ToolSpec;
 const think_open_tag = "<think>";
 const think_close_tag = "</think>";
 
+// Provider tool-protocol markers, neither `<tool_call>` nor user text. A model
+// that falls back to its own text tool protocol (DeepSeek emits
+// `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>` wrapping
+// `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke ...>` and its parameter values) can
+// have those bytes land in the response text. They are stripped from every
+// user-visible string this module produces.
+const opaque_marker_open = "<\u{FF5C}";
+const opaque_marker_close = "</\u{FF5C}";
+
+fn hasOpaqueMarker(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, opaque_marker_open) != null or
+        std.mem.indexOf(u8, text, opaque_marker_close) != null;
+}
+
+/// Byte offset just past the provider tool marker region starting at `start`,
+/// or null when the bytes there are not such a marker. The markers nest, so the
+/// region runs from the opener to the matching closer; a stray closer ends the
+/// region by itself. An unterminated region consumes the rest of `text`.
+fn skipOpaqueMarkers(text: []const u8, start: usize) ?usize {
+    if (!std.mem.startsWith(u8, text[start..], opaque_marker_open) and
+        !std.mem.startsWith(u8, text[start..], opaque_marker_close)) return null;
+    var i = start;
+    var depth: usize = 0;
+    while (i < text.len) {
+        const is_close = std.mem.startsWith(u8, text[i..], opaque_marker_close);
+        const is_open = !is_close and std.mem.startsWith(u8, text[i..], opaque_marker_open);
+        if (!is_close and !is_open) {
+            i += 1;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, text, i, '>') orelse return text.len;
+        if (is_close) {
+            if (depth > 0) depth -= 1;
+        } else {
+            depth += 1;
+        }
+        i = gt + 1;
+        if (depth == 0) return i;
+    }
+    return text.len;
+}
+
 /// Result of splitting a response text at <think>…</think> blocks.
 pub const SplitThinkContent = struct {
     /// Text outside think blocks (the user-visible answer).
@@ -37,6 +79,12 @@ fn scanThinkContent(
             i += think_close_tag.len;
             continue;
         }
+        if (text[i] == '<') {
+            if (skipOpaqueMarkers(text, i)) |end| {
+                i = end;
+                continue;
+            }
+        }
         if (depth == 0) {
             try visible_out.append(allocator, text[i]);
         } else if (reasoning_out) |reasoning_buf| {
@@ -49,7 +97,9 @@ fn scanThinkContent(
 /// Split `text` into visible content and reasoning extracted from <think>…</think> blocks.
 /// Both returned slices are caller-owned (allocated with `allocator`).
 pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitThinkContent {
-    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+    if (std.mem.indexOf(u8, text, think_open_tag) == null and
+        std.mem.indexOf(u8, text, think_close_tag) == null and !hasOpaqueMarker(text))
+    {
         return .{
             .visible = try allocator.dupe(u8, text),
             .reasoning = null,
@@ -75,7 +125,9 @@ pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitT
 
 /// Strip all <think>…</think> blocks from `text`. Returns caller-owned slice.
 pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+    if (std.mem.indexOf(u8, text, think_open_tag) == null and
+        std.mem.indexOf(u8, text, think_close_tag) == null and !hasOpaqueMarker(text))
+    {
         return allocator.dupe(u8, text);
     }
 
@@ -88,6 +140,61 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
     const trimmed = std.mem.trim(u8, cleaned, " \t\r\n");
     if (trimmed.ptr == cleaned.ptr and trimmed.len == cleaned.len) return cleaned;
     defer allocator.free(cleaned);
+    return allocator.dupe(u8, trimmed);
+}
+
+/// Render `<think>…</think>` blocks as `>`-quoted lines instead of dropping
+/// them. Live channel drafts use this when `reasoning_mode == .stream` so the
+/// thinking is visible while it is produced; the delivered reply always goes
+/// through `stripThinkBlocks`, so the quote never reaches the final message.
+/// An unterminated block (mid-stream) is quoted up to the end of `text`.
+pub fn quoteThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, text, think_open_tag) == null) return stripThinkBlocks(allocator, text);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    var depth: usize = 0;
+    var at_line_start = false;
+    while (i < text.len) {
+        if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
+            depth += 1;
+            i += think_open_tag.len;
+            if (depth == 1) {
+                try out.appendSlice(allocator, "\n> ");
+                at_line_start = false;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
+            if (depth > 0) depth -= 1;
+            i += think_close_tag.len;
+            if (depth == 0) {
+                try out.appendSlice(allocator, "\n\n");
+                at_line_start = false;
+            }
+            continue;
+        }
+        if (text[i] == '<') {
+            if (skipOpaqueMarkers(text, i)) |end| {
+                i = end;
+                continue;
+            }
+        }
+        const byte = text[i];
+        if (depth > 0) {
+            if (at_line_start) try out.appendSlice(allocator, "> ");
+            at_line_start = byte == '\n';
+        }
+        try out.append(allocator, byte);
+        i += 1;
+    }
+
+    const quoted = try out.toOwnedSlice(allocator);
+    const trimmed = std.mem.trim(u8, quoted, " \t\r\n");
+    if (trimmed.ptr == quoted.ptr and trimmed.len == quoted.len) return quoted;
+    defer allocator.free(quoted);
     return allocator.dupe(u8, trimmed);
 }
 
@@ -865,4 +972,79 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
     const thinking = cfg.get("thinkingConfig").?.object;
     try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
     try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+}
+
+test "stripThinkBlocks drops provider tool markup" {
+    const alloc = std.testing.allocator;
+    const out = try stripThinkBlocks(
+        alloc,
+        "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"command\">ls -la" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>The answer",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("The answer", out);
+}
+
+test "stripThinkBlocks drops a stray closing marker and keeps the answer" {
+    const alloc = std.testing.allocator;
+    const out = try stripThinkBlocks(alloc, "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>The answer");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("The answer", out);
+}
+
+test "quoteThinkBlocks drops provider tool markup around reasoning" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(
+        alloc,
+        "<think>step one</think>" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>The answer",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("> step one\n\nThe answer", out);
+}
+
+test "splitThinkContent drops provider tool markup" {
+    const alloc = std.testing.allocator;
+    const split = try splitThinkContent(
+        alloc,
+        "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer",
+    );
+    defer alloc.free(split.visible);
+    if (split.reasoning) |r| alloc.free(r);
+    try std.testing.expectEqualStrings("Answer", split.visible);
+    try std.testing.expect(split.reasoning == null);
+}
+
+test "quoteThinkBlocks renders reasoning as a quote and keeps the answer" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "<think>step one\nstep two</think>The answer");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("> step one\n> step two\n\nThe answer", out);
+}
+
+test "quoteThinkBlocks leaves plain text untouched" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "Just the answer");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("Just the answer", out);
+}
+
+test "quoteThinkBlocks quotes an unterminated reasoning block" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "<think>still thinking");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("> still thinking", out);
+}
+
+test "quoteThinkBlocks drops a stray close tag" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "answer</think> tail");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("answer tail", out);
 }

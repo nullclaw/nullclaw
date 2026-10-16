@@ -75,10 +75,16 @@ fn hasPendingVisibleDraft(state: *const DraftState) bool {
     return hasVisibleDraftText(state.buffer.items[state.last_flush_len..]);
 }
 
+/// Snapshot the buffered draft for the wire.
+///
+/// `<think>` blocks only reach a channel when the daemon forwards them, which
+/// it does solely for `reasoning_mode == .stream`; in every other mode they are
+/// already stripped upstream, so quoting them here is a no-op and `.off`/`.on`
+/// drafts stay exactly as they were.
 fn snapshotDraftText(allocator: std.mem.Allocator, state: *const DraftState) ![]u8 {
-    const stripped = try providers.stripThinkBlocks(allocator, state.buffer.items);
-    defer allocator.free(stripped);
-    return allocator.dupe(u8, stripped);
+    const rendered = try providers.quoteThinkBlocks(allocator, state.buffer.items);
+    defer allocator.free(rendered);
+    return allocator.dupe(u8, rendered);
 }
 
 fn alignUtf8Start(text: []const u8, start: usize) usize {
@@ -268,7 +274,7 @@ test "appendDraftChunk flushes visible content after interval" {
     try std.testing.expectEqual(@as(usize, 5), draft.last_flush_len);
 }
 
-test "appendDraftChunk strips think blocks from flushed draft" {
+test "appendDraftChunk renders streamed reasoning as a quote" {
     var draft: DraftState = .{ .draft_id = 31 };
     defer draft.deinit(std.testing.allocator);
 
@@ -276,6 +282,26 @@ test "appendDraftChunk strips think blocks from flushed draft" {
         std.testing.allocator,
         &draft,
         "<think>private</think>Visible answer",
+        DRAFT_FLUSH_MIN_INTERVAL_MS + 1,
+    )) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqualStrings("> private\n\nVisible answer", flush.text);
+}
+
+test "appendDraftChunk leaves drafts without reasoning untouched" {
+    var draft: DraftState = .{ .draft_id = 32 };
+    defer draft.deinit(std.testing.allocator);
+
+    // reasoning_mode off/on: the daemon strips think blocks before they reach
+    // the channel, so the draft is exactly the visible answer.
+    const flush = (try appendDraftChunk(
+        std.testing.allocator,
+        &draft,
+        "Visible answer",
         DRAFT_FLUSH_MIN_INTERVAL_MS + 1,
     )) orelse return error.TestUnexpectedResult;
     defer {

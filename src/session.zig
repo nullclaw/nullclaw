@@ -2026,6 +2026,17 @@ pub const SessionManager = struct {
         return session.turn_running.load(.acquire);
     }
 
+    /// True when the session's agent streams reasoning to the caller
+    /// (`/reasoning stream`), which is what lets a channel draft show the
+    /// thinking live. Unknown sessions report false: a new session starts in
+    /// the default mode, which does not stream reasoning.
+    pub fn streamsReasoning(self: *SessionManager, session_key: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = self.sessions.get(session_key) orelse return false;
+        return session.agent.reasoning_mode == .stream;
+    }
+
     pub const InboundRouteAction = enum {
         process,
         skip,

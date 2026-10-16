@@ -65,6 +65,7 @@ pub const curlPostFormTimed = helpers.curlPostFormTimed;
 pub const SplitThinkContent = helpers.SplitThinkContent;
 pub const splitThinkContent = helpers.splitThinkContent;
 pub const stripThinkBlocks = helpers.stripThinkBlocks;
+pub const quoteThinkBlocks = helpers.quoteThinkBlocks;
 pub const extractReasoningTextFromDetails = helpers.extractReasoningTextFromDetails;
 pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
 pub const appendOpenAiBodyExtraParams = helpers.appendOpenAiBodyExtraParams;

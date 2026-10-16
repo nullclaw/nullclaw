@@ -7091,6 +7091,74 @@ test "parse slack accounts" {
     allocator.free(cfg.channels.slack);
 }
 
+test "parse slack streaming defaults to false" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(!cfg.channels.slack[0].streaming);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
+test "parse slack streaming from config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "streaming": true, "reply_to_mode": "all"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(cfg.channels.slack[0].streaming);
+    try std.testing.expect(cfg.channels.slack[0].reply_to_mode == .all);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
+test "save writes slack streaming" {
+    const allocator = std.testing.allocator;
+    const accounts = [_]SlackConfig{.{
+        .account_id = "main",
+        .bot_token = "xoxb-123",
+        .streaming = true,
+    }};
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    cfg.channels.slack = &accounts;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    try cfg.writeChannelsSection(&writer.writer);
+    out = writer.toArrayList();
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"streaming\": true") != null);
+}
+
+test "save omits slack streaming when disabled" {
+    const allocator = std.testing.allocator;
+    const accounts = [_]SlackConfig{.{
+        .account_id = "main",
+        .bot_token = "xoxb-123",
+    }};
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    cfg.channels.slack = &accounts;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    try cfg.writeChannelsSection(&writer.writer);
+    out = writer.toArrayList();
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"streaming\": false") != null);
+}
+
 test "parse irc accounts" {
     const allocator = std.testing.allocator;
     const json =

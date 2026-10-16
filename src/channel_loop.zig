@@ -980,6 +980,11 @@ fn processTelegramMessage(
         .tg_ptr = tg_ptr,
         .chat_id = sender,
         .draft_id = draft_turn_id,
+        // Telegram is served by this loop rather than daemon.processInboundMessage,
+        // so the reasoning passthrough that the daemon selects has to be selected
+        // here too. The draft shows the thinking as a quoted block; the delivered
+        // reply still goes through stripThinkBlocks and stays clean.
+        .think_mode = if (runtime.session_mgr.streamsReasoning(session_key)) .passthrough else .strip,
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
 
