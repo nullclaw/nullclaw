@@ -686,6 +686,13 @@ pub const TelegramChannel = struct {
     draft_global_suppress_until_ms: i64 = 0,
     streaming_enabled: bool = true,
     draft_previews_enabled: bool = true,
+    rich_messages_enabled: bool = false,
+    /// Best-effort one-time warning gate for the rich->legacy
+    /// fallback. Account sends can run concurrently, so this is an
+    /// atomic: a plain bool would be a data race (undefined
+    /// behaviour under Zig's memory model). A duplicated or missed
+    /// warning is harmless; only the log line is gated.
+    rich_fallback_warned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     status_reactions_enabled: bool = false,
     reaction_emojis: config_types.TelegramReactionEmojisConfig = .{},
     binding_commands_enabled: bool = true,
@@ -694,6 +701,10 @@ pub const TelegramChannel = struct {
     commands_menu_mode: config_types.TelegramCommandsMenuMode = .flat,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
+    /// Telegram rich messages accept up to 32768 UTF-8 characters per message.
+    pub const RICH_MAX_CHARS: usize = 32768;
+    /// Rich Markdown tables are limited to 20 columns; wider tables fall back to a code block.
+    pub const RICH_MAX_TABLE_COLUMNS: usize = 20;
     const CONTINUATION_MARKER = "\n\n\u{23EC}";
     const MIN_ADAPTIVE_SPLIT_LIMIT: usize = 256;
     const TYPING_INTERVAL_NS: u64 = 4 * std.time.ns_per_s;
@@ -753,6 +764,7 @@ pub const TelegramChannel = struct {
         ch.require_mention = cfg.require_mention;
         ch.streaming_enabled = cfg.streaming;
         ch.draft_previews_enabled = cfg.draft_previews;
+        ch.rich_messages_enabled = cfg.rich_messages;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.reaction_emojis = cfg.reaction_emojis;
         ch.binding_commands_enabled = cfg.binding_commands_enabled;
@@ -1515,6 +1527,58 @@ pub const TelegramChannel = struct {
         text: []const u8,
         reply_markup_json: ?[]const u8,
     ) !void {
+        if (self.rich_messages_enabled) {
+            return self.editMessageWithRichFallback(target, message_id, text, reply_markup_json);
+        }
+        return self.editMessageWithHtmlFallback(target, message_id, text, reply_markup_json);
+    }
+
+    /// Edit a message into a Telegram rich message (editMessageText rich_message),
+    /// falling back to the legacy HTML/plain edit on any failure.
+    fn editMessageWithRichFallback(
+        self: *TelegramChannel,
+        target: []const u8,
+        message_id: i64,
+        text: []const u8,
+        reply_markup_json: ?[]const u8,
+    ) !void {
+        const escaped = escapeRichMarkdown(self.allocator, text) catch {
+            return self.editMessageWithHtmlFallback(target, message_id, text, reply_markup_json);
+        };
+        defer self.allocator.free(escaped);
+
+        if (countCodepoints(escaped) > RICH_MAX_CHARS) {
+            return self.editMessageWithHtmlFallback(target, message_id, text, reply_markup_json);
+        }
+
+        const body = telegram_api.buildEditMessageRichBody(self.allocator, targetChatId(target), message_id, escaped, reply_markup_json) catch {
+            return self.editMessageWithHtmlFallback(target, message_id, text, reply_markup_json);
+        };
+        defer self.allocator.free(body);
+
+        const resp = self.api().editMessageRich(self.allocator, body) catch {
+            self.noteRichFallback();
+            return self.editMessageWithHtmlFallback(target, message_id, text, reply_markup_json);
+        };
+        defer self.allocator.free(resp);
+
+        if (telegram_api.responseHasTelegramError(resp)) {
+            if (!telegram_api.responseIsRichRelatedError(resp)) {
+                log.warn("telegram editMessageRich API error: {s}", .{util.previewUtf8(resp, 256).slice});
+                return error.TelegramApiError;
+            }
+            self.noteRichFallback();
+            return self.editMessageWithHtmlFallback(target, message_id, text, reply_markup_json);
+        }
+    }
+
+    fn editMessageWithHtmlFallback(
+        self: *TelegramChannel,
+        target: []const u8,
+        message_id: i64,
+        text: []const u8,
+        reply_markup_json: ?[]const u8,
+    ) !void {
         const html_text = markdownToTelegramHtml(self.allocator, text) catch {
             const resp = try self.api().editMessageText(self.allocator, targetChatId(target), message_id, text, reply_markup_json);
             defer self.allocator.free(resp);
@@ -1691,6 +1755,9 @@ pub const TelegramChannel = struct {
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
+        if (self.rich_messages_enabled) {
+            return self.sendSingleRichMessageWithFallback(target, text, reply_to, reply_markup_json);
+        }
         return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
             target,
             text,
@@ -1698,6 +1765,104 @@ pub const TelegramChannel = struct {
             reply_markup_json,
             outgoingChunkSplitLimit(text.len, null),
         );
+    }
+
+    /// Send text as a single Telegram rich message (Bot API sendRichMessage)
+    /// when rich_messages is enabled and the escaped reply fits within
+    /// RICH_MAX_CHARS. Otherwise, or on any rich send error, fall back to
+    /// the legacy HTML/plain split path.
+    fn sendSingleRichMessageWithFallback(
+        self: *TelegramChannel,
+        target: []const u8,
+        text: []const u8,
+        reply_to: ?i64,
+        reply_markup_json: ?[]const u8,
+    ) !SentMessageMeta {
+        if (text.len == 0) {
+            return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        }
+
+        const escaped = escapeRichMarkdown(self.allocator, text) catch {
+            return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        };
+        defer self.allocator.free(escaped);
+
+        if (countCodepoints(escaped) > RICH_MAX_CHARS) {
+            return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        }
+
+        const parsed_target = parseTelegramTarget(target);
+        const body = telegram_api.buildSendRichMessageBody(
+            self.allocator,
+            parsed_target.chat_id,
+            parsed_target.message_thread_id,
+            escaped,
+            reply_to,
+            reply_markup_json,
+        ) catch {
+            return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        };
+        defer self.allocator.free(body);
+
+        const resp = self.api().sendRichMessage(self.allocator, body) catch {
+            self.noteRichFallback();
+            return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        };
+        defer self.allocator.free(resp);
+
+        if (telegram_api.responseHasTelegramError(resp)) {
+            if (!telegram_api.responseIsRichRelatedError(resp)) {
+                if (telegram_api.responseIsMessageTooLong(resp)) return error.TelegramMessageTooLong;
+                log.warn("telegram sendRichMessage API error: {s}", .{util.previewUtf8(resp, 256).slice});
+                return error.TelegramApiError;
+            }
+            self.noteRichFallback();
+            return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        }
+
+        return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse .{};
+    }
+
+    /// Log the first rich->legacy fallback per account, then stay quiet.
+    fn noteRichFallback(self: *TelegramChannel) void {
+        if (self.rich_fallback_warned.swap(true, .monotonic)) return;
+        log.warn("telegram rich message send failed; falling back to HTML/plain for account {s}", .{self.account_id});
     }
 
     fn sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
@@ -3384,6 +3549,247 @@ pub const TelegramChannel = struct {
         return ctx.filter.sink();
     }
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// Rich Markdown Preparation (Bot API sendRichMessage)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Number of UTF-8 codepoints in `s` (an invalid byte counts as one codepoint).
+pub fn countCodepoints(s: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (n += 1) {
+        i += std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+    }
+    return n;
+}
+
+/// Prepare a Markdown document for Telegram's rich-message `markdown` field.
+///
+/// The reply text is the model's own GFM, so the syntax this feature advertises
+/// (`==mark==`, `||spoiler||`, `$math$`) is passed through verbatim: escaping it
+/// would make those features unreachable. Only `<` is escaped (to `\<`), because
+/// rich Markdown also parses raw HTML and the prompt tells the model not to emit
+/// it, so this keeps stray or echoed `<` from being parsed as a tag.
+///
+/// Caveat: the Bot API documents one rich-Markdown escape (`\#hashtag`) and
+/// states that Rich Markdown can contain arbitrary HTML; `\<` is therefore an
+/// assumption taken from GFM/CommonMark, where any ASCII punctuation may be
+/// backslash-escaped. If a client does not honour it, a raw `<b>` in model
+/// output renders as a literal tag instead of showing `<b>` (cosmetic, and only
+/// reachable when the model emits raw HTML despite the prompt telling it not
+/// to). `\`, `$`, `==` and `||` are left untouched (they are the advertised
+/// features).
+///
+/// GFM structure (`#`, `-`, `|`, `*`, `_`, `~`, `>`) is preserved so headings,
+/// lists and tables keep working. Code spans, fenced blocks and 4-space-indented
+/// code blocks are copied verbatim. A contiguous GFM table block (header row +
+/// delimiter row + body) wider than `RICH_MAX_TABLE_COLUMNS` is wrapped in a code
+/// fence (rendered as `<pre>`), because the rich API caps tables at 20 columns.
+pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var line_it = std.mem.splitScalar(u8, md, '\n');
+    while (line_it.next()) |line| try lines.append(allocator, line);
+
+    var fence: ?u8 = null;
+    var i: usize = 0;
+    while (i < lines.items.len) : (i += 1) {
+        const line = lines.items[i];
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        if (fence) |open_ch| {
+            try out.appendSlice(allocator, line);
+            if (closesRichFence(trimmed, open_ch)) fence = null;
+        } else if (richFenceChar(trimmed)) |open_ch| {
+            fence = open_ch;
+            try out.appendSlice(allocator, line);
+        } else if (richTableBlockEnd(lines.items, i)) |end| {
+            var max_cols: usize = 0;
+            for (lines.items[i..end]) |row| max_cols = @max(max_cols, richTableColumns(row));
+            if (max_cols > TelegramChannel.RICH_MAX_TABLE_COLUMNS) {
+                // Rows go through the same escaping as inline table rows:
+                // the fence only stops Markdown parsing, so a raw `<` in a
+                // cell would still be parsed as a rich HTML tag.
+                try out.appendSlice(allocator, "```");
+                for (lines.items[i..end]) |row| {
+                    try out.append(allocator, '\n');
+                    try appendRichLine(&out, allocator, row);
+                }
+                try out.appendSlice(allocator, "\n```");
+            } else {
+                for (lines.items[i..end], 0..) |row, k| {
+                    if (k != 0) try out.append(allocator, '\n');
+                    try appendRichLine(&out, allocator, row);
+                }
+            }
+            i = end - 1;
+        } else if (isIndentedCodeLine(line)) {
+            // 4-space/tab indented code blocks are copied verbatim: backslash
+            // escapes are not processed inside them, so escaping `<` there would
+            // show a literal `\<`.
+            try out.appendSlice(allocator, line);
+        } else {
+            try appendRichLine(&out, allocator, line);
+        }
+
+        if (i + 1 < lines.items.len) try out.append(allocator, '\n');
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Fence character for a line that opens a fenced code block, else null.
+fn richFenceChar(trimmed: []const u8) ?u8 {
+    if (trimmed.len < 3) return null;
+    const ch = trimmed[0];
+    if (ch != '`' and ch != '~') return null;
+    var run: usize = 0;
+    while (run < trimmed.len and trimmed[run] == ch) run += 1;
+    return if (run >= 3) ch else null;
+}
+
+/// True when `trimmed` closes a fence opened with `ch` (run of >= 3 fence chars, nothing else).
+fn closesRichFence(trimmed: []const u8, ch: u8) bool {
+    var run: usize = 0;
+    while (run < trimmed.len and trimmed[run] == ch) run += 1;
+    if (run < 3) return false;
+    return std.mem.trim(u8, trimmed[run..], " \t\r").len == 0;
+}
+
+/// True for a line indented far enough (>= 4 spaces or a leading tab) to open an
+/// indented code block, where backslash escapes are not processed.
+fn isIndentedCodeLine(line: []const u8) bool {
+    if (line.len == 0) return false;
+    if (line[0] == '\t') return true;
+    return std.mem.startsWith(u8, line, "    ");
+}
+
+/// True when a trimmed line looks like a GFM table row. GFM allows the leading
+/// pipe to be omitted (`A | B`), so any line containing a `|` counts; callers
+/// still require a delimiter row before treating a block as a table.
+fn isRichTableRow(trimmed: []const u8) bool {
+    return std.mem.indexOfScalar(u8, trimmed, '|') != null;
+}
+
+/// True for a GFM delimiter row (`| --- | :--: |` or `--- | ---`): contains at
+/// least one `|`, every character is `-`, `:`, `|`, or whitespace, and there is
+/// at least one `-`. The leading pipe is optional, matching GFM.
+fn isRichDelimiterRow(trimmed: []const u8) bool {
+    var pipes: usize = 0;
+    var dashes: usize = 0;
+    for (trimmed) |c| switch (c) {
+        '|' => pipes += 1,
+        '-' => dashes += 1,
+        ':', ' ', '\t', '\r' => {},
+        else => return false,
+    };
+    return pipes >= 1 and dashes >= 1;
+}
+
+/// If a GFM table block starts at `lines[start]` (a header row immediately
+/// followed by a delimiter row), return the exclusive end index of the block
+/// (the first following line that is not a table row). Else null.
+fn richTableBlockEnd(lines: []const []const u8, start: usize) ?usize {
+    if (start + 1 >= lines.len) return null;
+    if (!isRichTableRow(std.mem.trim(u8, lines[start], " \t\r"))) return null;
+    if (!isRichDelimiterRow(std.mem.trim(u8, lines[start + 1], " \t\r"))) return null;
+    var end = start + 2;
+    while (end < lines.len and isRichTableRow(std.mem.trim(u8, lines[end], " \t\r"))) : (end += 1) {}
+    return end;
+}
+
+/// Count table columns in a line (`|`-separated cells, trailing pipe optional).
+/// Pipes inside inline code spans are not separators, so a cell containing a
+/// code span with many pipes is not miscounted as a very wide table.
+fn richTableColumns(line: []const u8) usize {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    var pipes: usize = 0;
+    var last_is_pipe = false;
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        const c = trimmed[i];
+        if (c == '`') {
+            var run: usize = 0;
+            while (i + run < trimmed.len and trimmed[i + run] == '`') run += 1;
+            if (findBacktickRun(trimmed, i + run, run)) |close| {
+                i = close + run;
+            } else {
+                i += run;
+            }
+            last_is_pipe = false;
+            continue;
+        }
+        if (c == '|') pipes += 1;
+        last_is_pipe = c == '|';
+        i += 1;
+    }
+    if (pipes > 0 and last_is_pipe) return pipes - 1;
+    return pipes;
+}
+
+/// Escape a single non-fenced line: `<` -> `\<`, leaving inline code spans alone.
+fn appendRichLine(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    line: []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+
+        // Inline code span: copy verbatim, never escape inside.
+        if (c == '`') {
+            var run: usize = 0;
+            while (i + run < line.len and line[i + run] == '`') run += 1;
+            if (findBacktickRun(line, i + run, run)) |close| {
+                try out.appendSlice(allocator, line[i .. close + run]);
+                i = close + run;
+                continue;
+            }
+            try out.appendSlice(allocator, line[i .. i + run]);
+            i += run;
+            continue;
+        }
+
+        if (c == '<') {
+            // Leave an already-escaped `\<` alone so we never emit `\\<`: an odd
+            // run of backslashes before the `<` means it is already escaped.
+            var backslashes: usize = 0;
+            var k = i;
+            while (k > 0 and line[k - 1] == '\\') : (k -= 1) backslashes += 1;
+            if (backslashes % 2 == 1) {
+                try out.append(allocator, c);
+            } else {
+                try out.appendSlice(allocator, "\\<");
+            }
+            i += 1;
+            continue;
+        }
+
+        try out.append(allocator, c);
+        i += 1;
+    }
+}
+
+/// Start of the next backtick run of exactly `run_len` at or after `from`.
+fn findBacktickRun(line: []const u8, from: usize, run_len: usize) ?usize {
+    var i = from;
+    while (i < line.len) {
+        if (line[i] == '`') {
+            var run: usize = 0;
+            while (i + run < line.len and line[i + run] == '`') run += 1;
+            if (run == run_len) return i;
+            i += run;
+        } else {
+            i += 1;
+        }
+    }
+    return null;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Markdown → Telegram HTML Conversion
@@ -5967,4 +6373,227 @@ test "TelegramChannel double stop is safe" {
     ch.stop();
     // Second stop must be a no-op, not a deinit-on-undefined.
     ch.stop();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Rich Message (sendRichMessage) Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+fn expectRichEscaped(expected: []const u8, input: []const u8) !void {
+    const escaped = try escapeRichMarkdown(std.testing.allocator, input);
+    defer std.testing.allocator.free(escaped);
+    try std.testing.expectEqualStrings(expected, escaped);
+}
+
+test "telegram escapeRichMarkdown leaves mark, spoiler and math syntax intact" {
+    // These are exactly the features the rich prompt advertises; escaping them
+    // would make them unreachable, so they must pass through verbatim.
+    try expectRichEscaped("==important== and ||secret||", "==important== and ||secret||");
+    try expectRichEscaped("value $x^2$ end", "value $x^2$ end");
+    try expectRichEscaped("$$E = mc^2$$", "$$E = mc^2$$");
+}
+
+test "telegram escapeRichMarkdown leaves currency literal" {
+    try expectRichEscaped("Price is $400-600K today", "Price is $400-600K today");
+}
+
+test "telegram escapeRichMarkdown escapes raw HTML tags" {
+    try expectRichEscaped("\\<b>bold\\</b>", "<b>bold</b>");
+}
+
+test "telegram escapeRichMarkdown preserves the documented backslash escape" {
+    // The Bot API shows `\#hashtag` as the way to suppress hashtag detection,
+    // so the escaper must not double that backslash.
+    try expectRichEscaped("\\#hashtag and a \\ backslash", "\\#hashtag and a \\ backslash");
+}
+
+test "telegram escapeRichMarkdown preserves GFM structure" {
+    const input = "# Title\n- item *em* _it_\nkey=value\n> quote";
+    try expectRichEscaped(input, input);
+}
+
+test "telegram escapeRichMarkdown leaves inline code untouched" {
+    try expectRichEscaped("cost is `$400-600K` and \\<tag>", "cost is `$400-600K` and <tag>");
+}
+
+test "telegram escapeRichMarkdown leaves fenced code untouched" {
+    const input = "```\n$math$ ==x== ||y|| <b>\n```";
+    try expectRichEscaped(input, input);
+}
+
+test "telegram escapeRichMarkdown keeps a standalone spoiler line out of tables" {
+    // `||secret||` is not a GFM table (there is no delimiter row), so it must
+    // not be mistaken for one and must stay verbatim.
+    try expectRichEscaped("||secret||", "||secret||");
+    try expectRichEscaped("| not a table |", "| not a table |");
+}
+
+test "telegram escapeRichMarkdown keeps 20 column tables inline" {
+    const allocator = std.testing.allocator;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "|");
+    var c: usize = 0;
+    while (c < 20) : (c += 1) try input.appendSlice(allocator, " h |");
+    try input.appendSlice(allocator, "\n|");
+    c = 0;
+    while (c < 20) : (c += 1) try input.appendSlice(allocator, " - |");
+
+    const escaped = try escapeRichMarkdown(allocator, input.items);
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings(input.items, escaped);
+}
+
+test "telegram escapeRichMarkdown wraps tables wider than 20 columns in a code fence" {
+    const allocator = std.testing.allocator;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "|");
+    var c: usize = 0;
+    while (c < 21) : (c += 1) try input.appendSlice(allocator, " h |");
+    try input.appendSlice(allocator, "\n|");
+    c = 0;
+    while (c < 21) : (c += 1) try input.appendSlice(allocator, " - |");
+
+    const escaped = try escapeRichMarkdown(allocator, input.items);
+    defer allocator.free(escaped);
+    try std.testing.expect(std.mem.startsWith(u8, escaped, "```\n"));
+    try std.testing.expect(std.mem.endsWith(u8, escaped, "\n```"));
+    try std.testing.expect(std.mem.indexOf(u8, escaped, input.items) != null);
+}
+
+test "telegram initFromConfig enables rich messages when requested" {
+    const ch_on = TelegramChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-token",
+        .rich_messages = true,
+    });
+    try std.testing.expect(ch_on.rich_messages_enabled);
+
+    const ch_off = TelegramChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-token",
+    });
+    try std.testing.expect(!ch_off.rich_messages_enabled);
+}
+
+test "telegram noteRichFallback warns only once" {
+    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
+    try std.testing.expect(!ch.rich_fallback_warned.load(.monotonic));
+    ch.noteRichFallback();
+    try std.testing.expect(ch.rich_fallback_warned.load(.monotonic));
+    ch.noteRichFallback();
+    try std.testing.expect(ch.rich_fallback_warned.load(.monotonic));
+}
+
+test "telegram rich send error payloads distinguish rich from non-rich errors" {
+    // Rich-related errors trigger fallback
+    try std.testing.expect(telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse rich message\"}"));
+    try std.testing.expect(telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities: ...\"}"));
+    try std.testing.expect(telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is too long\"}"));
+    try std.testing.expect(telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":404,\"description\":\"Not Found\"}"));
+
+    // Non-rich errors must not be retried twice
+    try std.testing.expect(!telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":403,\"description\":\"Forbidden: bot was blocked by the user\"}"));
+    try std.testing.expect(!telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}"));
+    try std.testing.expect(!telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests\"}"));
+    try std.testing.expect(!telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: chat not found\"}"));
+    try std.testing.expect(!telegram_api.responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is not modified\"}"));
+}
+
+test "telegram legacy chunking is unchanged when rich messages are off" {
+    // Regression: the rich path must not affect the legacy limit.
+    // A 4000-char reply was one message before rich messages existed.
+    const allocator = std.testing.allocator;
+
+    const text = "a" ** 4000;
+    const chunks = try TelegramChannel.buildOutgoingTextChunks(allocator, text);
+    defer {
+        for (chunks) |chunk| chunk.deinit(allocator);
+        allocator.free(chunks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings(text, chunks[0].body);
+
+    // 4096 is still a single message; only above that does the legacy limit
+    // (4091) apply, exactly as at 5f1cade0.
+    const boundary = "a" ** 4096;
+    const one = try TelegramChannel.buildOutgoingTextChunks(allocator, boundary);
+    defer {
+        for (one) |chunk| chunk.deinit(allocator);
+        allocator.free(one);
+    }
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+
+    const long = "a" ** 5000;
+    const split = try TelegramChannel.buildOutgoingTextChunks(allocator, long);
+    defer {
+        for (split) |chunk| chunk.deinit(allocator);
+        allocator.free(split);
+    }
+    try std.testing.expectEqual(@as(usize, 2), split.len);
+    try std.testing.expectEqual(TelegramChannel.MAX_MESSAGE_LEN, split[0].body.len);
+}
+
+test "telegram escapeRichMarkdown does not double-escape an existing escape" {
+    try expectRichEscaped("\\<already>", "\\<already>");
+}
+
+test "telegram escapeRichMarkdown ignores pipes inside inline code for the column cap" {
+    const allocator = std.testing.allocator;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "| a | b |\n| - | - |\n| `");
+    var k: usize = 0;
+    while (k < 25) : (k += 1) try input.appendSlice(allocator, "x|");
+    try input.appendSlice(allocator, "` | c |");
+    // 2 columns, so the table must stay inline rather than being code-fenced.
+    try expectRichEscaped(input.items, input.items);
+}
+
+test "telegram escapeRichMarkdown leaves indented code blocks unescaped" {
+    try expectRichEscaped("    <div>", "    <div>");
+    try expectRichEscaped("\t<b>", "\t<b>");
+}
+
+test "telegram escapeRichMarkdown fences a pipe-less wide table" {
+    const allocator = std.testing.allocator;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+    var c: usize = 0;
+    while (c < 22) : (c += 1) {
+        if (c != 0) try input.appendSlice(allocator, " | ");
+        try input.appendSlice(allocator, "h");
+    }
+    try input.append(allocator, '\n');
+    c = 0;
+    while (c < 22) : (c += 1) {
+        if (c != 0) try input.appendSlice(allocator, " | ");
+        try input.appendSlice(allocator, "---");
+    }
+    const escaped = try escapeRichMarkdown(allocator, input.items);
+    defer allocator.free(escaped);
+    try std.testing.expect(std.mem.startsWith(u8, escaped, "```\n"));
+    try std.testing.expect(std.mem.endsWith(u8, escaped, "\n```"));
+}
+
+test "telegram escapeRichMarkdown escapes raw HTML inside wide table fences" {
+    const allocator = std.testing.allocator;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "| h | h<x |");
+    var c: usize = 2;
+    while (c < 22) : (c += 1) try input.appendSlice(allocator, " | h");
+    try input.appendSlice(allocator, "\n| - | - |");
+    c = 2;
+    while (c < 22) : (c += 1) try input.appendSlice(allocator, " | -");
+    const escaped = try escapeRichMarkdown(allocator, input.items);
+    defer allocator.free(escaped);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "h\\<x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "h<x") == null);
+}
+
+test "telegram countCodepoints counts UTF-8 codepoints correctly" {
+    try std.testing.expectEqual(@as(usize, 5), countCodepoints("hello"));
+    try std.testing.expectEqual(@as(usize, 2), countCodepoints("你好")); // 6 bytes, 2 codepoints
+    try std.testing.expectEqual(@as(usize, 32768), countCodepoints("a" ** 32768));
+    try std.testing.expectEqual(@as(usize, 32769), countCodepoints("a" ** 32769));
 }

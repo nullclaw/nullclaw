@@ -226,6 +226,14 @@ pub const Client = struct {
         return self.post(allocator, "sendMessageDraft", body, "10");
     }
 
+    pub fn sendRichMessage(self: Client, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+        return self.post(allocator, "sendRichMessage", body, "30");
+    }
+
+    pub fn editMessageRich(self: Client, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+        return self.post(allocator, "editMessageText", body, "30");
+    }
+
     pub fn getFilePath(self: Client, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -384,6 +392,58 @@ pub fn appendRawReplyMarkup(body: *std.ArrayListUnmanaged(u8), allocator: std.me
     }
 }
 
+/// Build a `sendRichMessage` request body carrying a Markdown `rich_message`.
+pub fn buildSendRichMessageBody(
+    allocator: std.mem.Allocator,
+    chat_id: []const u8,
+    message_thread_id: ?i64,
+    markdown: []const u8,
+    reply_to: ?i64,
+    reply_markup_json: ?[]const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"chat_id\":");
+    try body.appendSlice(allocator, chat_id);
+    try appendMessageThreadId(&body, allocator, message_thread_id);
+    try body.appendSlice(allocator, ",\"rich_message\":{\"markdown\":");
+    try root.json_util.appendJsonString(&body, allocator, markdown);
+    try body.appendSlice(allocator, "}");
+    try appendReplyTo(&body, allocator, reply_to);
+    try appendRawReplyMarkup(&body, allocator, reply_markup_json);
+    try body.appendSlice(allocator, "}");
+
+    return body.toOwnedSlice(allocator);
+}
+
+/// Build an `editMessageText` request body that edits a message into a Markdown `rich_message`.
+pub fn buildEditMessageRichBody(
+    allocator: std.mem.Allocator,
+    chat_id: []const u8,
+    message_id: i64,
+    markdown: []const u8,
+    reply_markup_json: ?[]const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"chat_id\":");
+    try body.appendSlice(allocator, chat_id);
+
+    var msg_id_buf: [32]u8 = undefined;
+    const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+    try body.appendSlice(allocator, ",\"message_id\":");
+    try body.appendSlice(allocator, msg_id_str);
+    try body.appendSlice(allocator, ",\"rich_message\":{\"markdown\":");
+    try root.json_util.appendJsonString(&body, allocator, markdown);
+    try body.appendSlice(allocator, "}");
+    try appendRawReplyMarkup(&body, allocator, reply_markup_json);
+    try body.appendSlice(allocator, "}");
+
+    return body.toOwnedSlice(allocator);
+}
+
 pub fn responseHasTelegramError(resp: []const u8) bool {
     return std.mem.indexOf(u8, resp, "\"error_code\"") != null or
         std.mem.indexOf(u8, resp, "\"ok\":false") != null;
@@ -392,6 +452,38 @@ pub fn responseHasTelegramError(resp: []const u8) bool {
 pub fn responseIsMessageTooLong(resp: []const u8) bool {
     return std.mem.indexOf(u8, resp, "MESSAGE_TOO_LONG") != null or
         std.mem.indexOf(u8, resp, "message is too long") != null;
+}
+
+/// Returns true if a Telegram error response is likely caused by rich-message formatting,
+/// unsupported rich API endpoint, or payload length, warranting a fallback to the legacy
+/// HTML/plain path. Non-rich errors (e.g. 403 Forbidden, 401 Unauthorized, 429 Too Many Requests,
+/// chat not found, user not found, message not modified) return false so they are not retried twice.
+pub fn responseIsRichRelatedError(resp: []const u8) bool {
+    if (!responseHasTelegramError(resp)) return false;
+
+    // Definite non-rich errors: status codes 401, 403, 429
+    if (std.mem.indexOf(u8, resp, "\"error_code\":401") != null or
+        std.mem.indexOf(u8, resp, "\"error_code\": 401") != null) return false;
+    if (std.mem.indexOf(u8, resp, "\"error_code\":403") != null or
+        std.mem.indexOf(u8, resp, "\"error_code\": 403") != null) return false;
+    if (std.mem.indexOf(u8, resp, "\"error_code\":429") != null or
+        std.mem.indexOf(u8, resp, "\"error_code\": 429") != null) return false;
+
+    // Common non-rich 400 Bad Request reasons
+    if (std.mem.indexOf(u8, resp, "chat not found") != null or
+        std.mem.indexOf(u8, resp, "user not found") != null or
+        std.mem.indexOf(u8, resp, "message thread not found") != null or
+        std.mem.indexOf(u8, resp, "message to edit not found") != null or
+        std.mem.indexOf(u8, resp, "message is not modified") != null or
+        std.mem.indexOf(u8, resp, "chat_write_forbidden") != null or
+        std.mem.indexOf(u8, resp, "PEER_ID_INVALID") != null or
+        std.mem.indexOf(u8, resp, "TOPIC_CLOSED") != null or
+        std.mem.indexOf(u8, resp, "TOPIC_DELETED") != null)
+    {
+        return false;
+    }
+
+    return true;
 }
 
 pub fn responseIsDraftPeerInvalid(resp: []const u8) bool {
@@ -482,6 +574,23 @@ test "telegram api responseHasTelegramError matches error payloads" {
     try std.testing.expect(!responseHasTelegramError("{\"ok\":true,\"result\":{}}"));
 }
 
+test "telegram api responseIsRichRelatedError classifies telegram error responses" {
+    // Rich-related / format errors warranting fallback
+    try std.testing.expect(responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse rich message\"}"));
+    try std.testing.expect(responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}"));
+    try std.testing.expect(responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: MESSAGE_TOO_LONG\"}"));
+    try std.testing.expect(responseIsRichRelatedError("{\"ok\":false,\"error_code\":404,\"description\":\"Not Found: method sendRichMessage\"}"));
+
+    // Non-rich errors must not be retried twice
+    try std.testing.expect(!responseIsRichRelatedError("{\"ok\":false,\"error_code\":403,\"description\":\"Forbidden: bot was blocked by the user\"}"));
+    try std.testing.expect(!responseIsRichRelatedError("{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}"));
+    try std.testing.expect(!responseIsRichRelatedError("{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests\"}"));
+    try std.testing.expect(!responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: chat not found\"}"));
+    try std.testing.expect(!responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is not modified\"}"));
+    try std.testing.expect(!responseIsRichRelatedError("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message to edit not found\"}"));
+    try std.testing.expect(!responseIsRichRelatedError("{\"ok\":true,\"result\":{}}"));
+}
+
 test "telegram api responseIsMessageTooLong matches telegram payloads" {
     try std.testing.expect(responseIsMessageTooLong(
         "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: MESSAGE_TOO_LONG\"}",
@@ -552,4 +661,55 @@ test "telegram api buildEditMessageTextBody omits parse mode for plain edits" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"plain text\"") != null);
+}
+
+test "telegram api buildSendRichMessageBody carries markdown rich_message" {
+    const body = try buildSendRichMessageBody(
+        std.testing.allocator,
+        "12345",
+        77,
+        "**hi** and a \"quote\"",
+        null,
+        null,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"chat_id\":12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message_thread_id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"rich_message\":{\"markdown\":") != null);
+    // The markdown is JSON-encoded, so an embedded quote is escaped.
+    try std.testing.expect(std.mem.indexOf(u8, body, "**hi** and a \\\"quote\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "parse_mode") == null);
+}
+
+test "telegram api buildSendRichMessageBody keeps reply markup and reply parameters" {
+    const body = try buildSendRichMessageBody(
+        std.testing.allocator,
+        "-100123",
+        null,
+        "hello",
+        42,
+        "{\"inline_keyboard\":[]}",
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reply_parameters\":{\"message_id\":42}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reply_markup\":{\"inline_keyboard\":[]}") != null);
+}
+
+test "telegram api buildEditMessageRichBody edits into a rich_message without parse_mode" {
+    const body = try buildEditMessageRichBody(
+        std.testing.allocator,
+        "12345",
+        42,
+        "==marked==",
+        null,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message_id\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"rich_message\":{\"markdown\":\"==marked==\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "parse_mode") == null);
 }

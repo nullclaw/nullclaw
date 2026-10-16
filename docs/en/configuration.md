@@ -741,6 +741,7 @@ Minimal end-to-end example:
           "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false,
+          "rich_messages": false,
           "binding_commands_enabled": true,
           "topic_commands_enabled": true,
           "topic_map_command_enabled": true,
@@ -774,6 +775,14 @@ About `draft_previews`:
 - `draft_previews=false` is the default and recommended setting.
 - When disabled, Telegram still shows activity/typing while the reply is being generated, but it does not use ephemeral `sendMessageDraft` previews.
 - Set `draft_previews=true` only if you explicitly want live partial previews and accept that Telegram may hide and replace those drafts before the final message lands.
+
+About `rich_messages`:
+
+- `rich_messages=false` is the default. When enabled, replies are sent with the Bot API `sendRichMessage` method using GFM Markdown, so the model can use headings, tables, task lists, footnotes, `==mark==`, `||spoiler||` and `$math$`.
+- It is off by default because some Desktop/Web/Android and third-party clients render rich messages as an unsupported placeholder.
+- Any rich send or edit that fails falls back to the normal HTML/plain-text path, so replies are never lost.
+- Tables wider than 20 columns are sent as a code block instead of a rich table.
+- Escaping caveat: the Bot API documents one rich-Markdown escape (`\#hashtag`) and states Rich Markdown can contain arbitrary HTML. `\<` escaping of raw `<` in model output (so it is not parsed as an HTML tag) follows GFM/CommonMark, where any ASCII punctuation may be backslash-escaped. If a client does not honour that escape, a stray raw HTML tag in a reply renders as a literal tag instead of showing the tag text (cosmetic, and only reachable when the model emits raw HTML despite the prompt telling it not to). `==`, `||` and `$math$` are passed through verbatim by design.
 
 About `account_id`:
 

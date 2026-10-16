@@ -728,6 +728,7 @@ fn telegramConversationContext(
     account_id: []const u8,
     sender: []const u8,
     is_group: bool,
+    rich_formatting: bool,
 ) ?ConversationContext {
     return buildConversationContext(.{
         .channel = "telegram",
@@ -736,6 +737,7 @@ fn telegramConversationContext(
         .peer_id = sender,
         .is_group = is_group,
         .group_id = if (is_group) sender else null,
+        .rich_formatting = rich_formatting,
     });
 }
 
@@ -759,7 +761,7 @@ fn handleTelegramInteractiveCallback(
         if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
     }
 
-    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group, tg_ptr.rich_messages_enabled);
 
     var response_owned = false;
     const response = blk: {
@@ -974,7 +976,7 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group, tg_ptr.rich_messages_enabled);
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -3032,7 +3034,7 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
 }
 
 test "telegramConversationContext keeps delivery target for callback-driven topic sessions" {
-    const context = telegramConversationContext("main", "-100123#topic:77", true) orelse return error.TestUnexpectedResult;
+    const context = telegramConversationContext("main", "-100123#topic:77", true, false) orelse return error.TestUnexpectedResult;
 
     // Regression: Telegram button callbacks must keep the outbound delivery target,
     // or scheduled/tool-driven follow-ups can route to the session peer only.

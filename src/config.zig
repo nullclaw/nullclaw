@@ -8257,3 +8257,23 @@ test "Config parseJson rejects truncated JSON" {
     const result = cfg.parseJson(malformed_json);
     try std.testing.expect(std.meta.isError(result));
 }
+
+test "parse telegram rich_messages defaults off and can be enabled" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "rich_messages": true}, "backup": {"bot_token": "backup:tok"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.telegram.len);
+    for (cfg.channels.telegram) |tg| {
+        if (std.mem.eql(u8, tg.account_id, "main")) {
+            try std.testing.expect(tg.rich_messages);
+        } else {
+            try std.testing.expect(!tg.rich_messages);
+        }
+        allocator.free(tg.account_id);
+        allocator.free(tg.bot_token);
+    }
+    allocator.free(cfg.channels.telegram);
+}

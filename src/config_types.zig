@@ -619,6 +619,10 @@ pub const TelegramConfig = struct {
     /// Show ephemeral sendMessageDraft previews while the reply is still being generated.
     /// Disabled by default because Telegram drafts can disappear and reappear in a confusing way.
     draft_previews: bool = false,
+    /// Send replies as Telegram rich messages (Bot API sendRichMessage). Disabled by
+    /// default because some Desktop/Web/Android/third-party clients render rich messages
+    /// as unsupported placeholders. When enabled, the model may use GFM Markdown.
+    rich_messages: bool = false,
     /// Show task lifecycle on the triggering user message via Telegram reactions.
     status_reactions: bool = false,
     /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.

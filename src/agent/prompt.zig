@@ -130,6 +130,8 @@ pub const ConversationContext = struct {
     peer_id: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
+    /// When true, the channel renders Telegram rich Markdown (GFM) replies.
+    rich_formatting: ?bool = null,
 
     /// Compute a hash fingerprint of sender-identifying fields so the system
     /// prompt can be rebuilt when the *sender* changes, not just when context
@@ -191,6 +193,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         .peer_id = peer_id,
         .group_id = group_id,
         .is_group = is_group,
+        .rich_formatting = args.rich_formatting,
     };
 }
 
@@ -343,6 +346,11 @@ pub fn buildSystemPrompt(
         }
         if (cc.sender_display_name) |dname| {
             try w.print("- Sender display name: {s}\n", .{dname});
+        }
+        if (cc.rich_formatting) |rich| {
+            if (rich) {
+                try w.writeAll("- This Telegram chat renders rich Markdown (GFM): headings, tables, task lists, code fences, and ==mark==/||spoiler||/$math$ are supported. Prefer Markdown; do not emit raw HTML.\n");
+            }
         }
         try w.writeAll("\n");
     }
@@ -2555,4 +2563,54 @@ test "buildSystemPrompt datetime appears before runtime" {
     const dt_pos = std.mem.indexOf(u8, prompt, "## Current Date & Time") orelse return error.SectionNotFound;
     const rt_pos = std.mem.indexOf(u8, prompt, "## Runtime") orelse return error.SectionNotFound;
     try std.testing.expect(dt_pos < rt_pos);
+}
+
+test "buildConversationContext preserves rich_formatting flag" {
+    const ctx = buildConversationContext(.{
+        .channel = "telegram",
+        .delivery_chat_id = "123",
+        .rich_formatting = true,
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?bool, true), ctx.rich_formatting);
+
+    const plain = buildConversationContext(.{
+        .channel = "telegram",
+        .delivery_chat_id = "123",
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?bool, null), plain.rich_formatting);
+}
+
+test "buildSystemPrompt mentions rich markdown only when enabled" {
+    const allocator = std.testing.allocator;
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const rich_ctx = buildConversationContext(.{
+        .channel = "telegram",
+        .delivery_chat_id = "123",
+        .rich_formatting = true,
+    });
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = rich_ctx,
+    });
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "rich Markdown") != null);
+
+    const plain_ctx = buildConversationContext(.{
+        .channel = "telegram",
+        .delivery_chat_id = "123",
+    });
+    const prompt_plain = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = plain_ctx,
+    });
+    defer allocator.free(prompt_plain);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_plain, "rich Markdown") == null);
 }

@@ -674,6 +674,7 @@ Telegram forum topics：
           "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false,
+          "rich_messages": false,
           "binding_commands_enabled": true,
           "topic_commands_enabled": true,
           "topic_map_command_enabled": true,
@@ -707,6 +708,14 @@ Telegram forum topics：
 - 默认值也是推荐值是 `false`。
 - 关闭后，Telegram 仍会在回复生成期间显示活动状态/typing，但不会使用临时的 `sendMessageDraft` 预览。
 - 只有在你明确想要实时部分预览，并且能接受 Telegram 在最终消息到达前隐藏、替换这些 draft 时，才建议设置 `draft_previews=true`。
+
+关于 `rich_messages`：
+
+- 默认值为 `false`。开启后回复改用 Bot API 的 `sendRichMessage` 方法以 GFM Markdown 发送，模型可以使用标题、表格、任务列表、脚注、`==mark==`、`||spoiler||` 和 `$math$`。
+- 默认关闭是因为部分 Desktop/Web/Android 以及第三方客户端会把富消息渲染为“不支持”的占位符。
+- 任何富消息发送或编辑失败都会回退到原有的 HTML/纯文本路径，回复不会丢失。
+- 超过 20 列的表格会退化为代码块发送。
+- 转义说明：Bot API 只文档化了一个富 Markdown 转义（`\#hashtag`），并说明富 Markdown 可包含任意 HTML。对模型输出中原始 `<` 的 `\<` 转义（避免被解析为 HTML 标签）遵循 GFM/CommonMark，那里任何 ASCII 标点都可以用反斜杠转义。如果客户端不识别该转义，回复里偶发的原始 HTML 标签会按字面标签渲染而不是显示标签文本（仅是外观问题，且只有在模型不顾提示仍输出原始 HTML 时才会发生）。`==`、`||` 和 `$math$` 按设计原样传递。
 
 关于 `account_id`：
 
