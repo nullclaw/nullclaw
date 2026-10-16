@@ -160,6 +160,9 @@ pub const ChatMessage = struct {
     name: ?[]const u8 = null,
     /// Tool call ID this message responds to.
     tool_call_id: ?[]const u8 = null,
+    /// Reasoning sent back on an assistant message, for endpoints that
+    /// require a thinking field on every assistant turn of the history.
+    reasoning_content: ?[]const u8 = null,
     /// Optional multimodal content parts (images, etc.). When set, providers
     /// serialize these instead of the plain `content` field.
     content_parts: ?[]const ContentPart = null,

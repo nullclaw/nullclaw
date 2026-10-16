@@ -214,6 +214,11 @@ pub const OpenAiCompatibleProvider = struct {
     /// When true, include `chat_template_kwargs.enable_thinking` in request
     /// bodies so custom vLLM/Qwen endpoints can opt into reasoning.
     chat_template_enable_thinking_param: bool = false,
+    /// Set once the endpoint rejected assistant history without a thinking
+    /// field (IFM K2: "Add a supported thinking field to each assistant
+    /// message"). From then on every assistant message carries
+    /// `reasoning_content`, empty because the history does not keep reasoning.
+    assistant_reasoning_field: bool = false,
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
@@ -1181,6 +1186,30 @@ pub const OpenAiCompatibleProvider = struct {
         allocator.free(messages);
     }
 
+    /// Copy of `messages` with an empty `reasoning_content` on every assistant
+    /// message, or null when the endpoint has not asked for it.
+    fn assistantReasoningMessages(self: *const OpenAiCompatibleProvider, allocator: std.mem.Allocator, messages: []const ChatMessage) !?[]ChatMessage {
+        if (!self.assistant_reasoning_field) return null;
+        const copy = try allocator.dupe(ChatMessage, messages);
+        for (copy) |*msg| {
+            if (msg.role == .assistant and msg.reasoning_content == null) msg.reasoning_content = "";
+        }
+        return copy;
+    }
+
+    /// True when `err` is the endpoint rejecting assistant history for a
+    /// missing thinking field and the request has not been resent with it yet.
+    /// Without the retry every later turn of the session fails the same way.
+    fn shouldRetryWithAssistantReasoning(self: *OpenAiCompatibleProvider, allocator: std.mem.Allocator, err: anyerror) bool {
+        if (err != error.ApiError or self.assistant_reasoning_field) return false;
+        const detail = (root.snapshotLastApiErrorDetail(allocator) catch return false) orelse return false;
+        defer allocator.free(detail);
+        if (std.ascii.indexOfIgnoreCase(detail, "thinking field") == null) return false;
+        log.warn("{s} requires a thinking field on assistant messages; resending with reasoning_content", .{self.name});
+        self.assistant_reasoning_field = true;
+        return true;
+    }
+
     fn streamChatImpl(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -1191,6 +1220,26 @@ pub const OpenAiCompatibleProvider = struct {
         callback_ctx: *anyopaque,
     ) anyerror!root.StreamChatResult {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return streamChatOnce(ptr, allocator, request, model, temperature, callback, callback_ctx) catch |err| {
+            if (!self.shouldRetryWithAssistantReasoning(allocator, err)) return err;
+            return streamChatOnce(ptr, allocator, request, model, temperature, callback, callback_ctx);
+        };
+    }
+
+    fn streamChatOnce(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        original_request: root.ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!root.StreamChatResult {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        const reasoning_messages = try self.assistantReasoningMessages(allocator, original_request.messages);
+        defer if (reasoning_messages) |msgs| allocator.free(msgs);
+        var request = original_request;
+        if (reasoning_messages) |msgs| request.messages = msgs;
         const effective_model = self.normalizeProviderModel(model);
 
         if (self.api_mode == .responses) {
@@ -1434,6 +1483,24 @@ pub const OpenAiCompatibleProvider = struct {
         temperature: f64,
     ) anyerror!ChatResponse {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return chatOnce(ptr, allocator, request, model, temperature) catch |err| {
+            if (!self.shouldRetryWithAssistantReasoning(allocator, err)) return err;
+            return chatOnce(ptr, allocator, request, model, temperature);
+        };
+    }
+
+    fn chatOnce(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        original_request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+    ) anyerror!ChatResponse {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        const reasoning_messages = try self.assistantReasoningMessages(allocator, original_request.messages);
+        defer if (reasoning_messages) |msgs| allocator.free(msgs);
+        var request = original_request;
+        if (reasoning_messages) |msgs| request.messages = msgs;
         const effective_model = self.normalizeProviderModel(model);
         const capped_request = self.capNonStreamingMaxTokens(request);
 
@@ -1554,6 +1621,10 @@ fn serializeMessagesInto(
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(buf, allocator, tc_id);
             }
+            if (msg.reasoning_content) |reasoning| {
+                try buf.appendSlice(allocator, ",\"reasoning_content\":");
+                try root.appendJsonString(buf, allocator, reasoning);
+            }
             try buf.append(allocator, '}');
         }
         return;
@@ -1608,6 +1679,10 @@ fn serializeMessagesInto(
         if (msg.tool_call_id) |tc_id| {
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try root.appendJsonString(buf, allocator, tc_id);
+        }
+        if (msg.reasoning_content) |reasoning| {
+            try buf.appendSlice(allocator, ",\"reasoning_content\":");
+            try root.appendJsonString(buf, allocator, reasoning);
         }
         try buf.append(allocator, '}');
     }
@@ -3287,4 +3362,51 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
     // Individual messages are each under the limit; verify the sum is what matters.
     const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
     try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
+}
+
+test "assistant reasoning_content is serialized only when set" {
+    // Regression: an OpenAI-compatible endpoint that requires a thinking
+    // field on assistant history (IFM K2 answers 400 "Add a supported
+    // thinking field to each assistant message") needs reasoning_content on
+    // assistant messages; it must be emitted only when set so that other
+    // endpoints are unaffected.
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("hi"),
+        .{ .role = .assistant, .content = "hello", .reasoning_content = "" },
+        ChatMessage.assistant("plain"),
+    };
+    const body = try buildChatRequestBody(allocator, .{ .messages = &msgs }, "k2", 0.7, false, false, false, false, false, null, null);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"hello\",\"reasoning_content\":\"\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"plain\"}") != null);
+}
+
+test "missing thinking field error switches assistant history to reasoning_content once" {
+    // Regression: IFM K2 rejected every turn after the first with that 400,
+    // so a session kept failing until /new; the provider must resend once
+    // with an empty reasoning_content, and only for that specific error.
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+    var p = OpenAiCompatibleProvider.init(allocator, "test", "https://example.com/v1", null, .bearer, null);
+    const msgs = [_]ChatMessage{ ChatMessage.user("hi"), ChatMessage.assistant("hello"), ChatMessage.user("bye") };
+
+    try std.testing.expect((try p.assistantReasoningMessages(allocator, &msgs)) == null);
+
+    // Unrelated API errors do not trigger the resend.
+    root.setLastApiErrorDetail("stream", "Rate limit exceeded");
+    try std.testing.expect(!p.shouldRetryWithAssistantReasoning(allocator, error.ApiError));
+
+    root.setLastApiErrorDetail("stream", "Add a supported thinking field to each assistant message in the multi-turn conversation history.");
+    try std.testing.expect(!p.shouldRetryWithAssistantReasoning(allocator, error.RateLimited));
+    try std.testing.expect(p.shouldRetryWithAssistantReasoning(allocator, error.ApiError));
+    // Only one resend: a second rejection is returned to the caller.
+    try std.testing.expect(!p.shouldRetryWithAssistantReasoning(allocator, error.ApiError));
+
+    const patched = (try p.assistantReasoningMessages(allocator, &msgs)).?;
+    defer allocator.free(patched);
+    try std.testing.expect(patched[0].reasoning_content == null);
+    try std.testing.expectEqualStrings("", patched[1].reasoning_content.?);
+    try std.testing.expect(patched[2].reasoning_content == null);
 }
