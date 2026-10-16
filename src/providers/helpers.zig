@@ -866,3 +866,686 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
     try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
     try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Garbled text tool-call markup
+// ════════════════════════════════════════════════════════════════════════════
+//
+// A model that falls back to a text tool-call dialect can end a reply with a
+// garbled call the parser cannot turn into an executable one: announcing more
+// work and then emitting a lone `</function>` closer, or a bare
+// `<function=name>` opener that never closes. `hasOrphanToolCallClose` is the
+// structural, language-independent signal the turn loop keys its bounded retry
+// on; `stripToolCallMarkup` removes the markup so the delivered reply never
+// carries it. Both skip Markdown code fences and inline spans, so a documented
+// sample is preserved.
+
+/// Byte range of a Markdown code fence or inline code span.
+pub const CodeRegion = struct { start: usize, end: usize };
+
+/// True when `pos` is inside one of the sorted, non-overlapping `regions`.
+pub fn isInsideCode(regions: []const CodeRegion, pos: usize) bool {
+    var lo: usize = 0;
+    var hi: usize = regions.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const region = regions[mid];
+        if (pos < region.start) {
+            hi = mid;
+        } else if (pos >= region.end) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn codeRunLen(text: []const u8, start: usize) usize {
+    const ch = text[start];
+    var i = start;
+    while (i < text.len and text[i] == ch) i += 1;
+    return i - start;
+}
+
+/// Byte ranges of Markdown code in `text`: fenced blocks (``` / ~~~, opened by
+/// a run of three or more at the start of a line) and inline code spans (a
+/// backtick run closed by an equal run). Caller frees the returned slice.
+pub fn findCodeRegions(allocator: std.mem.Allocator, text: []const u8) ![]CodeRegion {
+    return findCodeRegionsInternal(allocator, text, true);
+}
+
+/// Like `findCodeRegions` but does not treat a trailing *unterminated* fence as
+/// code, so a garbled closer after an unclosed fence is still scanned as
+/// visible text. The tool-call-markup scanners use this.
+pub fn findCodeRegionsForToolMarkup(allocator: std.mem.Allocator, text: []const u8) ![]CodeRegion {
+    return findCodeRegionsInternal(allocator, text, false);
+}
+
+fn findCodeRegionsInternal(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    unterminated_fence_is_code: bool,
+) ![]CodeRegion {
+    var regions: std.ArrayListUnmanaged(CodeRegion) = .empty;
+    errdefer regions.deinit(allocator);
+
+    var i: usize = 0;
+    var at_line_start = true;
+    var fence_ch: u8 = 0;
+    var fence_len: usize = 0;
+    var fence_start: usize = 0;
+    var span_len: usize = 0;
+    var span_start: usize = 0;
+    while (i < text.len) {
+        if (at_line_start) {
+            at_line_start = false;
+            var j = i;
+            var indent: usize = 0;
+            while (j < text.len and text[j] == ' ' and indent < 4) : (indent += 1) j += 1;
+            if (indent <= 3 and j < text.len and (text[j] == '`' or text[j] == '~')) {
+                const run = codeRunLen(text, j);
+                if (fence_ch == 0 and run >= 3) {
+                    fence_ch = text[j];
+                    fence_len = run;
+                    fence_start = i;
+                    i = j + run;
+                    continue;
+                }
+                if (fence_ch == text[j] and run >= fence_len) {
+                    try regions.append(allocator, .{ .start = fence_start, .end = j + run });
+                    fence_ch = 0;
+                    i = j + run;
+                    continue;
+                }
+            }
+            if (fence_ch != 0) {
+                // Inside a fence every byte is code until the next line start,
+                // where a closing fence can appear.
+                while (i < text.len and text[i] != '\n') i += 1;
+                if (i < text.len) {
+                    i += 1;
+                    at_line_start = true;
+                }
+                continue;
+            }
+        }
+        const b = text[i];
+        if (b == '\n') {
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+        if (b == '`') {
+            const run = codeRunLen(text, i);
+            if (span_len == 0) {
+                span_len = run;
+                span_start = i;
+            } else if (run == span_len) {
+                try regions.append(allocator, .{ .start = span_start, .end = i + run });
+                span_len = 0;
+            }
+            i += run;
+            continue;
+        }
+        i += 1;
+    }
+    // An unterminated fence runs to the end of the text (mid-stream). Callers
+    // that scan for tool-call markup opt out (see `findCodeRegionsForToolMarkup`)
+    // so an unclosed fence cannot hide a trailing garbled closer.
+    if (fence_ch != 0 and unterminated_fence_is_code) {
+        try regions.append(allocator, .{ .start = fence_start, .end = text.len });
+    }
+    // Regions are appended in the order they CLOSE, so a nested inline span that
+    // wraps a fenced block can precede the fence it contains. isInsideCode's
+    // binary search needs a sorted, non-overlapping list, so sort by start and
+    // merge overlaps in place (the wrapped fence and span become one region).
+    std.mem.sort(CodeRegion, regions.items, {}, struct {
+        fn lessThan(_: void, a: CodeRegion, b: CodeRegion) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+    var write: usize = 0;
+    for (regions.items) |region| {
+        if (write > 0 and region.start <= regions.items[write - 1].end) {
+            if (region.end > regions.items[write - 1].end)
+                regions.items[write - 1].end = region.end;
+        } else {
+            regions.items[write] = region;
+            write += 1;
+        }
+    }
+    regions.shrinkRetainingCapacity(write);
+    return regions.toOwnedSlice(allocator);
+}
+
+// Tool-call markup tag *names*. A model that falls back to one of these text
+// dialects can degenerate into a garbled call; the names mirror the dispatcher's
+// `<tool_call>` grammar plus the Anthropic `function`/`invoke` dialects and the
+// `antml:`/`mm:` namespaced variants a gateway can leak for a non-OpenAI model.
+const tool_call_open_tags = [_][]const u8{
+    "<tool_call",
+    "<tool_result",
+    "<tool_call_begin",
+    "<tool_result_begin",
+    "<|tool_call_begin|",
+    "<|tool_result_begin|",
+    "<function",
+    "<function_calls",
+    "<function_call",
+    "<function_response",
+    "<tool_calls",
+    "<invoke",
+    "<parameter",
+    "<antml:invoke",
+    "<antml:parameter",
+    "<antml:function_calls",
+    "<mm:tool_call",
+    "<mm:function_calls",
+    "<mm:invoke",
+    "<mm:parameter",
+};
+// Close tag *names*, without the trailing delimiter: a close is matched with
+// either a `>` or a whitespace delimiter, so a model that drops the `>`
+// (`</tool_call >`) still ends the block.
+const tool_call_close_names = [_][]const u8{
+    "</tool_call",
+    "</tool_result",
+    "<tool_call_end",
+    "<tool_result_end",
+    "<|tool_call_end|",
+    "<|tool_result_end|",
+    "</function",
+    "</function_calls",
+    "</function_call",
+    "</function_response",
+    "</tool_calls",
+    "</invoke",
+    "</parameter",
+    "</antml:invoke",
+    "</antml:parameter",
+    "</antml:function_calls",
+    "</mm:tool_call",
+    "</mm:function_calls",
+    "</mm:invoke",
+    "</mm:parameter",
+};
+const tool_call_standalone_names = [_][]const u8{
+    "<tool_calls_section_begin",
+    "<tool_calls_section_end",
+    "<tool_calls_section_end|",
+    "<|tool_calls_section_begin|",
+    "<|tool_calls_section_end|",
+    "<tool_call_argument_begin",
+    "<|tool_call_argument_begin|",
+};
+// The dispatcher's bracket grammar (`[tool_call]` / `[TOOL_CALL]`), matched as
+// exact literals.
+const bracket_tool_call_markers = [_][]const u8{
+    "[tool_call]",
+    "[TOOL_CALL]",
+    "[/tool_call]",
+    "[/TOOL_CALL]",
+};
+
+/// True when `text` contains any text tool-call markup tag.
+pub fn hasToolCallMarkup(text: []const u8) bool {
+    for (tool_call_open_tags) |t| {
+        if (std.mem.indexOf(u8, text, t) != null) return true;
+    }
+    for (tool_call_close_names) |t| {
+        if (std.mem.indexOf(u8, text, t) != null) return true;
+    }
+    for (tool_call_standalone_names) |t| {
+        if (std.mem.indexOf(u8, text, t) != null) return true;
+    }
+    for (bracket_tool_call_markers) |t| {
+        if (std.mem.indexOf(u8, text, t) != null) return true;
+    }
+    return false;
+}
+
+/// True when `name` is one of the two OpenAI XML `function`-dialect tag names,
+/// which bind their argument with `=` (`<function=read>`, `<parameter=path>`)
+/// instead of the `>`/whitespace delimiter of the other dialects.
+fn isFunctionDialectName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "<function") or std.mem.eql(u8, name, "<parameter");
+}
+
+/// True when the byte after a tool-call tag *name* may delimit it: `>` or any
+/// whitespace, or `=` for OpenAI's `<function=NAME>` / `<parameter=NAME>` form.
+pub fn toolTagDelimiterOk(name: []const u8, b: u8) bool {
+    if (b == '>' or std.ascii.isWhitespace(b)) return true;
+    return b == '=' and isFunctionDialectName(name);
+}
+
+/// True when an OpenAI `=`-dialect tag (`<function=NAME>` / `<parameter=NAME>`)
+/// starts at `start`.
+pub fn isFunctionDialectOpenAt(text: []const u8, start: usize) bool {
+    return std.mem.startsWith(u8, text[start..], "<function=") or
+        std.mem.startsWith(u8, text[start..], "<parameter=");
+}
+
+/// Offset just past the `>` that ends a tag token whose name already matched at
+/// `from`, or the offset of a `<` seen first (an unterminated token the caller
+/// drops and reprocesses from that `<`). A token with no `>` runs to end-of-text.
+fn scanTagTokenEnd(text: []const u8, from: usize) usize {
+    var i = from;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '>') return i + 1;
+        if (text[i] == '<') return i;
+    }
+    return text.len;
+}
+
+/// Byte offset just past a tool-call open tag starting at `start`, or null when
+/// the bytes there are not one. The longest name wins, and the tag must end on
+/// `>` or a whitespace delimiter (or `=` for the `function`/`parameter` dialect).
+pub fn matchToolCallOpenTag(text: []const u8, start: usize) ?usize {
+    var open_len: usize = 0;
+    for (tool_call_open_tags) |open| {
+        if (open.len <= open_len) continue;
+        if (!std.mem.startsWith(u8, text[start..], open)) continue;
+        const after = start + open.len;
+        if (after >= text.len) continue;
+        if (!toolTagDelimiterOk(open, text[after])) continue;
+        open_len = open.len;
+    }
+    if (open_len == 0) return null;
+    const after = start + open_len;
+    return if (text[after] == '>') after + 1 else scanTagTokenEnd(text, after);
+}
+
+/// Byte offset just past the close tag starting at `start`, or null. The name
+/// may be delimited by `>` or any whitespace; `eof_drops` selects the
+/// end-of-text behaviour: a delimiter-less close name at the very end is an
+/// unterminated token the top level drops (`text.len`), while a tool body
+/// simply stays open (null).
+fn matchToolCallClose(text: []const u8, start: usize, eof_drops: bool) ?usize {
+    for (tool_call_close_names) |name| {
+        if (!std.mem.startsWith(u8, text[start..], name)) continue;
+        const after = start + name.len;
+        if (after >= text.len) return if (eof_drops) text.len else null;
+        if (text[after] != '>' and !std.ascii.isWhitespace(text[after])) continue;
+        return scanTagTokenEnd(text, after);
+    }
+    return null;
+}
+
+fn nameFollowedByLt(text: []const u8, start: usize, names: []const []const u8) ?usize {
+    for (names) |name| {
+        if (!std.mem.startsWith(u8, text[start..], name)) continue;
+        const after = start + name.len;
+        if (after < text.len and text[after] == '<') return name.len;
+    }
+    return null;
+}
+
+/// Length of a complete tag *name* at `start` immediately followed by `<` (the
+/// model dropped the tag's `>`), or null. Mirrors the streaming filter's `.lt`
+/// fallback: the unterminated name is dropped and the `<` is reprocessed.
+fn unterminatedTagNameLen(text: []const u8, start: usize) ?usize {
+    return nameFollowedByLt(text, start, &tool_call_open_tags) orelse
+        nameFollowedByLt(text, start, &tool_call_close_names) orelse
+        nameFollowedByLt(text, start, &tool_call_standalone_names);
+}
+
+/// Byte offset just past a tool-call block opened at `start`, or null when no
+/// block open tag starts there or the block never closes (the caller then
+/// releases a plain opener as prose). The open tag may carry attributes, or the
+/// model may omit the `>` so the body starts right after the tag name.
+fn skipToolCallBlock(text: []const u8, start: usize) ?usize {
+    // Longest matching open tag wins, so `<function_calls` beats `<function`.
+    var open_len: usize = 0;
+    for (tool_call_open_tags) |open| {
+        if (open.len <= open_len) continue;
+        if (!std.mem.startsWith(u8, text[start..], open)) continue;
+        const after = start + open.len;
+        // A delimiter-less open name at the end of the text is an unterminated
+        // token: the remainder is dropped, exactly like the streaming filter.
+        if (after >= text.len) return text.len;
+        if (!toolTagDelimiterOk(open, text[after])) continue;
+        open_len = open.len;
+    }
+    if (open_len == 0) return null;
+    const tag_end = matchToolCallOpenTag(text, start) orelse return null;
+    var j = tag_end;
+    while (j < text.len) : (j += 1) {
+        if (text[j] != '<') continue;
+        if (matchToolCallClose(text, j, false)) |end| return end;
+    }
+    return null;
+}
+
+fn skipToolCallStandalone(text: []const u8, start: usize) ?usize {
+    for (tool_call_standalone_names) |name| {
+        if (!std.mem.startsWith(u8, text[start..], name)) continue;
+        const after = start + name.len;
+        if (after >= text.len) return text.len;
+        if (text[after] != '>' and !std.ascii.isWhitespace(text[after])) continue;
+        return scanTagTokenEnd(text, after);
+    }
+    return null;
+}
+
+/// Byte offset just past a `[tool_call]` / `[TOOL_CALL]` block starting at
+/// `start`, or null. A stray close marker is dropped on its own.
+fn skipBracketToolCall(text: []const u8, start: usize) ?usize {
+    const rest = text[start..];
+    const open: []const u8 = if (std.mem.startsWith(u8, rest, "[tool_call]"))
+        "[tool_call]"
+    else if (std.mem.startsWith(u8, rest, "[TOOL_CALL]"))
+        "[TOOL_CALL]"
+    else if (std.mem.startsWith(u8, rest, "[/tool_call]"))
+        "[/tool_call]"
+    else if (std.mem.startsWith(u8, rest, "[/TOOL_CALL]"))
+        "[/TOOL_CALL]"
+    else
+        return null;
+
+    if (open[1] == '/') return start + open.len; // stray close marker
+
+    const payload_start = start + open.len;
+    var close_end: ?usize = null;
+    for ([_][]const u8{ "[/tool_call]", "[/TOOL_CALL]" }) |close| {
+        if (std.mem.indexOf(u8, text[payload_start..], close)) |rel| {
+            const abs = payload_start + rel + close.len;
+            if (close_end == null or abs < close_end.?) close_end = abs;
+        }
+    }
+    return close_end;
+}
+
+/// Byte length of a `[tool_call]` / `[TOOL_CALL]` opener at `start`, or null.
+fn bracketOpenLen(text: []const u8, start: usize) ?usize {
+    if (std.mem.startsWith(u8, text[start..], "[tool_call]")) return "[tool_call]".len;
+    if (std.mem.startsWith(u8, text[start..], "[TOOL_CALL]")) return "[TOOL_CALL]".len;
+    return null;
+}
+
+/// Byte length of a `[/tool_call]` / `[/TOOL_CALL]` closer at `start`, or null.
+fn bracketCloseLen(text: []const u8, start: usize) ?usize {
+    if (std.mem.startsWith(u8, text[start..], "[/tool_call]")) return "[/tool_call]".len;
+    if (std.mem.startsWith(u8, text[start..], "[/TOOL_CALL]")) return "[/TOOL_CALL]".len;
+    return null;
+}
+
+/// True when `text` holds unbalanced angle-bracket tool-call markup outside any
+/// code fence or inline span: a `</…` close tag with no matching opener, or an
+/// OpenAI `=`-dialect opener (`<function=NAME>` / `<parameter=NAME>`) that never
+/// closes. That is the shape a model degenerates into when it announces more
+/// work and then emits a garbled text tool call (prod: a reply ending in a lone
+/// `</function>`; the `=` dialect: a reply ending in a bare `<function=web_search>`).
+/// It is a structural, language-independent signal, so the turn loop keys its
+/// bounded retry on it instead of on assistant prose. A balanced pair
+/// (`<function>…</function>`) is prose and does not qualify, and neither does
+/// markup inside a code sample. A stray bracket closer (`[/tool_call]`, the
+/// dispatcher's grammar) qualifies on the same terms. This detector is narrower
+/// than `stripToolCallMarkup`, which also drops a balanced pair from the
+/// delivered reply.
+pub fn hasOrphanToolCallClose(allocator: std.mem.Allocator, text: []const u8) !bool {
+    if (!hasToolCallMarkup(text)) return false;
+    const code = try findCodeRegionsForToolMarkup(allocator, text);
+    defer allocator.free(code);
+    var depth: usize = 0;
+    // Whether the outermost open tag is the `=` dialect, whose unclosed form is
+    // tool markup rather than a prose mention of a marker name.
+    var function_open = false;
+    // The dispatcher's bracket grammar is a separate dialect with its own depth.
+    var bracket_depth: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (isInsideCode(code, i)) {
+            i += 1;
+            continue;
+        }
+        if (text[i] == '[') {
+            // A stray `[/tool_call]` closer with no matching opener is the same
+            // garbled shape as an orphan angle-bracket closer, so the bounded
+            // retry fires for it too; a balanced bracket pair is a complete
+            // block (prose), and an unclosed `[tool_call]` opener is released as
+            // prose, exactly like the angle-bracket dialects.
+            if (bracketCloseLen(text, i)) |len| {
+                if (bracket_depth == 0) return true;
+                bracket_depth -= 1;
+                i += len;
+                continue;
+            }
+            if (bracketOpenLen(text, i)) |len| {
+                bracket_depth += 1;
+                i += len;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if (text[i] != '<') {
+            i += 1;
+            continue;
+        }
+        if (matchToolCallOpenTag(text, i)) |end| {
+            if (depth == 0 and isFunctionDialectOpenAt(text, i)) function_open = true;
+            depth += 1;
+            i = end;
+            continue;
+        }
+        if (matchToolCallClose(text, i, true)) |end| {
+            if (depth == 0) return true;
+            depth -= 1;
+            // Only the outermost *still-unclosed* opener decides the verdict: a
+            // balanced pair that closes back to depth 0 is prose, so clear the
+            // `=`-dialect flag rather than let it leak into a later plain opener.
+            if (depth == 0) function_open = false;
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    return depth > 0 and function_open;
+}
+
+/// Remove text tool-call markup from `text`, preserving Markdown code fences and
+/// inline spans (a documented sample is not markup). A closed block, a stray
+/// close tag, and a standalone marker are dropped whole; an unterminated
+/// `=`-dialect opener drops only the tag token, so trailing prose survives.
+///
+/// This is deliberately broader than `hasOrphanToolCallClose`: it also drops a
+/// balanced block (`<function>...</function>`), because the delivered reply must
+/// not carry markup even though the detector treats a balanced pair as prose and
+/// leaves it alone. The detector stays narrow so a prose mention of the markup
+/// does not trigger a retry; the stripper removes any markup it sees.
+pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (!hasToolCallMarkup(text)) return allocator.dupe(u8, text);
+    const code = try findCodeRegionsForToolMarkup(allocator, text);
+    defer allocator.free(code);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (isInsideCode(code, i)) {
+            try out.append(allocator, text[i]);
+            i += 1;
+            continue;
+        }
+        if (text[i] == '<') {
+            // An unterminated tag name (`<tool_call<`, ...): drop the name.
+            if (unterminatedTagNameLen(text, i)) |len| {
+                i += len;
+                continue;
+            }
+            // A closed tool-call block is markup: drop tags and body.
+            if (skipToolCallBlock(text, i)) |end| {
+                i = end;
+                continue;
+            }
+            // A `=`-dialect opener that never closes is a garbled text tool
+            // call, not prose, so drop the tag token only. A mid-sentence
+            // mention leaves trailing prose that is a real answer.
+            if (isFunctionDialectOpenAt(text, i)) {
+                i = matchToolCallOpenTag(text, i) orelse text.len;
+                continue;
+            }
+            if (skipToolCallStandalone(text, i)) |end| {
+                i = end;
+                continue;
+            }
+            // A stray close tag with no opener is still tool markup.
+            if (matchToolCallClose(text, i, true)) |end| {
+                i = end;
+                continue;
+            }
+        } else if (text[i] == '[') {
+            if (skipBracketToolCall(text, i)) |end| {
+                i = end;
+                continue;
+            }
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "stripToolCallMarkup drops a single stray function close tag" {
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "核心数据到手了。\n</function>");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("核心数据到手了。\n", out);
+}
+
+test "stripToolCallMarkup drops the OpenAI function= dialect block" {
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "prose\n<function=web_search>query</function>\nend");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("prose\n\nend", out);
+}
+
+test "stripToolCallMarkup drops a truncated function= opener" {
+    // Prod-adjacent shape: the model announces a tool call and emits only a bare
+    // `<function=NAME>` with no close. The opener is tool markup, not prose.
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "prose\n<function=web_search>");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("prose\n", out);
+}
+
+test "stripToolCallMarkup drops an orphan tool_call closer" {
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "answer\n</tool_call>");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("answer\n", out);
+}
+
+test "stripToolCallMarkup keeps a function= sample inside a code fence" {
+    const a = std.testing.allocator;
+    const doc = "Example:\n```xml\n<function=read><parameter=path>p</parameter></function>\n```\ndone";
+    const out = try stripToolCallMarkup(a, doc);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<function=read>") != null);
+}
+
+test "hasOrphanToolCallClose flags the function= dialect shapes" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try hasOrphanToolCallClose(a, "prose\n<function=web_search>"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</tool_call>"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "核心数据到手了。\n</function>"));
+    // A balanced pair is prose, not a garbled call.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "Use <function name=\"read\">body</function> in the docs."));
+    // An unclosed plain marker is released as prose, so it is not flagged.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "the <tool_call> marker"));
+}
+
+test "stripToolCallMarkup drops the function_call/function_response and namespaced closers" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "answer\n</function_call>",
+        "answer\n</function_response>",
+        "answer\n</antml:invoke>",
+        "answer\n</mm:parameter>",
+    };
+    for (cases) |c| {
+        const out = try stripToolCallMarkup(a, c);
+        defer a.free(out);
+        try std.testing.expectEqualStrings("answer\n", out);
+    }
+    // A closed `function_call` block is tool markup too.
+    const block = try stripToolCallMarkup(a, "A<function_call>x</function_call>B");
+    defer a.free(block);
+    try std.testing.expectEqualStrings("AB", block);
+}
+
+test "hasOrphanToolCallClose flags a lone namespaced or function_call closer" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</function_call>"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</function_response>"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</antml:invoke>"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</mm:parameter>"));
+}
+
+test "hasOrphanToolCallClose ignores a balanced pair before a plain unclosed opener" {
+    const a = std.testing.allocator;
+    // A balanced `=` pair that closes back to depth 0 must not leave the `=`
+    // flag set for a later, plain opener the code releases as prose.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "<function=x>ok</function> and the <tool_call> marker"));
+}
+
+test "stripToolCallMarkup keeps the prose after an unclosed = opener" {
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "The model emits <function=read> tags. Then the real answer here.");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("The model emits  tags. Then the real answer here.", out);
+}
+
+test "stripToolCallMarkup drops a lone closer after an unclosed fence" {
+    // The prod reply promised a comparison table, opened a ``` fence and then
+    // degenerated into a lone `</function>`. An unterminated fence must not hide
+    // the trailing garbled closer from the strip.
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{ "answer\n```\n</function>", "answer\n~~~\n</function>" };
+    for (cases) |input| {
+        const out = try stripToolCallMarkup(a, input);
+        defer a.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "</function") == null);
+    }
+}
+
+test "hasOrphanToolCallClose flags a lone closer after an unclosed fence" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n```\n</function>"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n~~~\n</function>"));
+    // A closed fence still preserves a documented sample.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "```\n</function>\n```"));
+}
+
+test "findCodeRegions returns a sorted, non-overlapping list when a span wraps a fence" {
+    // Regression: pre-fix regions were appended in the order they close, so an
+    // inline span opened before a fenced block that closes first produced an
+    // unsorted, overlapping list and broke isInsideCode's binary-search
+    // precondition.
+    const a = std.testing.allocator;
+    const regions = try findCodeRegions(a, "x`y\n```\nz\n```\nw`v");
+    defer a.free(regions);
+    var prev_end: usize = 0;
+    for (regions) |r| {
+        try std.testing.expect(r.start >= prev_end);
+        try std.testing.expect(r.end > r.start);
+        prev_end = r.end;
+    }
+    // The wrapped span is one code region: the span opener and a byte inside the
+    // fence both read as code.
+    try std.testing.expect(isInsideCode(regions, 1));
+    try std.testing.expect(isInsideCode(regions, 8));
+}
+
+test "hasOrphanToolCallClose flags a stray bracket closer" {
+    // Regression: pre-fix the detector scanned only '<', so a stray
+    // `[/tool_call]` was stripped by stripToolCallMarkup but never triggered the
+    // bounded retry.
+    const a = std.testing.allocator;
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n[/tool_call]"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n[/TOOL_CALL]"));
+    // A balanced bracket pair is a complete block, not an orphan closer.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "[tool_call]x[/tool_call]"));
+    // A stray bracket closer inside a code fence is a documented sample.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "```\n[/tool_call]\n```"));
+}

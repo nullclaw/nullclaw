@@ -223,6 +223,13 @@ pub const AnthropicProvider = struct {
             }
         }
 
+        // Structural stall signal: the provider stopped to invoke a tool.
+        // Read from provider output structure, never assistant prose.
+        const finish_tool_use = if (root_obj.get("stop_reason")) |sr|
+            (sr == .string and std.mem.eql(u8, sr.string, "tool_use"))
+        else
+            false;
+
         // Parse usage if present
         var usage = TokenUsage{};
         if (root_obj.get("usage")) |usage_obj| {
@@ -245,6 +252,7 @@ pub const AnthropicProvider = struct {
             .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
             .usage = usage,
             .model = try allocator.dupe(u8, model_str),
+            .finish_tool_use = finish_tool_use,
         };
     }
 
@@ -785,6 +793,32 @@ test "parseTextResponse classifies rate-limit errors" {
         \\{"error":{"type":"rate_limit_error","message":"Too many requests","status":429}}
     ;
     try std.testing.expectError(error.RateLimited, AnthropicProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseNativeResponse records finish_tool_use for stop_reason tool_use" {
+    const body =
+        \\{"content":[{"type":"text","text":"Let me check"}],"stop_reason":"tool_use","model":"claude-3-opus"}
+    ;
+    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c| std.testing.allocator.free(c);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(response.finish_tool_use);
+}
+
+test "parseNativeResponse leaves finish_tool_use false for stop_reason end_turn" {
+    const body =
+        \\{"content":[{"type":"text","text":"Done"}],"stop_reason":"end_turn","model":"claude-3-opus"}
+    ;
+    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (response.content) |c| std.testing.allocator.free(c);
+        std.testing.allocator.free(response.tool_calls);
+        std.testing.allocator.free(response.model);
+    }
+    try std.testing.expect(!response.finish_tool_use);
 }
 
 test "parseNativeResponse with text and tool_use" {

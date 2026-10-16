@@ -5383,12 +5383,25 @@ pub fn composeFinalReply(
     reasoning_content: ?[]const u8,
     usage: providers.TokenUsage,
 ) ![]const u8 {
+    // Never deliver tool-call markup to the user. A model can end its reply
+    // with a garbled text tool call (for example a lone `</function>` closer)
+    // that the parser could not turn into an executable call, so the delivered
+    // reply is assembled from a markup-free copy of the text. This is the only
+    // guard for that dialect: the streaming preview does not hide it, because
+    // src/streaming.zig TagFilter only suppresses `<tool_call*>`/`<tool_result*>`/
+    // `<think*`, so the `</function>`, `<function>`, `<invoke>`, `<parameter>`
+    // and `antml:`/`mm:` forms pass through on the live-preview surfaces (cli,
+    // telegram, max). The streaming half is a separate follow-up. Code fences
+    // and inline spans are preserved: a documented sample is not markup.
+    const clean_base = try providers.stripToolCallMarkup(self.allocator, base_text);
+    defer self.allocator.free(clean_base);
+
     // For reasoning_mode == .stream the thinking content is already printed
     // live during streaming via ThinkPassthroughFilter, so we must not
     // prepend it again here. Only .on mode shows the post-turn block.
     const show_reasoning = self.reasoning_mode == .on and reasoning_content != null and reasoning_content.?.len > 0;
     if (!show_reasoning and self.usage_mode == .off) {
-        return try self.allocator.dupe(u8, base_text);
+        return try self.allocator.dupe(u8, clean_base);
     }
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -5406,7 +5419,7 @@ pub fn composeFinalReply(
         }
         try w.writeAll("\n\n");
     }
-    try w.writeAll(base_text);
+    try w.writeAll(clean_base);
 
     switch (self.usage_mode) {
         .off => {},
@@ -5987,4 +6000,42 @@ test "composeFinalReply cost mode appends estimated cost" {
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "cost=$0.0075") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "session_cost=$0.0123") != null);
+}
+
+test "composeFinalReply strips a lone orphan tool-call closer from the final answer" {
+    // Regression: pre-fix the reply was delivered verbatim, so the orphan
+    // closer reached the user. Prod shape: the model announced one more round of
+    // work and then emitted a lone `</function>`; the parser found no executable
+    // call. composeFinalReply must strip it.
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off };
+    const usage = providers.TokenUsage{};
+    const prod = "核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n</function>";
+    const result = try composeFinalReply(&agent, prod, null, usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n", result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "</function") == null);
+}
+
+test "composeFinalReply strips the orphan closer even with a usage footer" {
+    // Regression: pre-fix the closer survived into the delivered reply, with
+    // the usage footer appended verbatim.
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off, .usage_mode = .tokens };
+    const usage = providers.TokenUsage{ .total_tokens = 7 };
+    const result = try composeFinalReply(&agent, "答案。\n</function>", null, usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "</function") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "total_tokens=7") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result, "答案。\n"));
+}
+
+test "composeFinalReply keeps a tool-call sample inside a code fence" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off };
+    const usage = providers.TokenUsage{};
+    const doc = "Example:\n```xml\n<function_calls></function_calls>\n```\ndone";
+    const result = try composeFinalReply(&agent, doc, null, usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<function_calls>") != null);
 }

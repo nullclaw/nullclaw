@@ -804,6 +804,13 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype, ctx: PromptContext) 
     try w.writeAll("You may use multiple tool calls in a single response. ");
     try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
     try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
+    if (tools.len > 0) {
+        try w.writeAll("EXECUTION BIAS:\n");
+        try w.writeAll("- If the request needs a tool, call it in this turn; do not describe the action you are about to take.\n");
+        try w.writeAll("- Saying you are checking, fetching, or fixing something is a progress update, not a final answer. Take the next available action in the same turn.\n");
+        try w.writeAll("- Never end a turn with only a promise of future work when a tool can perform it now.\n");
+        try w.writeAll("- Continue until the task is done or you hit a real blocker; report the blocker instead of promising to continue later.\n\n");
+    }
     try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
     try w.writeAll("If the user asks you to remember something across sessions, use `memory_store` before claiming it was saved.\n");
     try w.writeAll("Do not promise persistent recall unless the memory tool succeeded. If storage fails or is unavailable, say so plainly.\n\n");
@@ -1268,6 +1275,58 @@ test "buildToolInstructions includes Parameters when native tools disabled" {
 
     try std.testing.expect(std.mem.indexOf(u8, instructions, "**mock**: A mock tool") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "Parameters: `{\"value\":\"string\"}`") != null);
+}
+
+test "writeToolInstructionsSection emits EXECUTION BIAS only when tools are present" {
+    // Regression: pre-fix this section emitted no EXECUTION BIAS block, so the
+    // "EXECUTION BIAS:" assertion below failed (observed: std.testing.expect
+    // returned error.TestUnexpectedResult on pre-fix main 5f1cade0). The block
+    // is the prompt-side guard for the prose-shaped stall.
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        fn name(_: @This()) []const u8 {
+            return "mock";
+        }
+        fn description(_: @This()) []const u8 {
+            return "A mock tool";
+        }
+        fn parametersJson(_: @This()) []const u8 {
+            return "{}";
+        }
+    };
+    const tools = [_]MockTool{.{}};
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    try writeToolInstructionsSection(&buf_writer.writer, &tools, .{ .workspace_dir = "", .model_name = "", .tools = &.{} });
+    buf = buf_writer.toArrayList();
+    const with_tools = try buf.toOwnedSlice(allocator);
+    defer allocator.free(with_tools);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "EXECUTION BIAS:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "progress update, not a final answer") != null);
+
+    var buf2: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf2.deinit(allocator);
+    var buf_writer2: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf2);
+    try writeToolInstructionsSection(&buf_writer2.writer, &[_]MockTool{}, .{ .workspace_dir = "", .model_name = "", .tools = &.{} });
+    buf2 = buf_writer2.toArrayList();
+    const without_tools = try buf2.toOwnedSlice(allocator);
+    defer allocator.free(without_tools);
+    try std.testing.expect(std.mem.indexOf(u8, without_tools, "EXECUTION BIAS:") == null);
+}
+
+test "buildSystemPrompt omits EXECUTION BIAS when no tools are configured" {
+    // Not a regression test: pre-fix no prompt contained EXECUTION BIAS either,
+    // so this pins that the new block stays gated on tools.len > 0.
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "EXECUTION BIAS:") == null);
 }
 
 test "buildSystemPrompt includes core sections" {

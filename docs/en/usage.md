@@ -196,6 +196,19 @@ Checks:
 - Re-run with `nullclaw agent --verbose` if you still see `Unknown tool` for a scheduler-related name.
 - If you are pinned to an older binary, upgrade before changing your scheduler config. The problem is usually tool-name drift, not a disabled scheduler.
 
+### 7) The reply shows tool-call markup such as `</function>`
+
+What this usually means:
+
+- A model that falls back to a text tool-call dialect can end a reply with a garbled call the parser cannot turn into an executable one, for example a lone `</function>` closer, or a bare `<function=name>` opener that never closes.
+- NullClaw strips that markup from the delivered reply, so the final answer does not show it, and nudges the model once to call the tool through the tool interface or produce the final answer.
+- A streaming preview (CLI, Telegram, MAX) can still flash the raw markup while the reply streams, because the preview filter only suppresses `<tool_call*>`/`<tool_result*>`/`<think*` blocks; only the final reply is sanitized.
+
+Checks:
+
+- Confirm you are running a build that includes the garbled tool-call markup fix.
+- If the model keeps emitting text tool calls instead of native ones, prefer a provider/model that reports native tool calls.
+
 ## Post-Change Checklist
 
 After config edits:

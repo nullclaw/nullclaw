@@ -1006,8 +1006,15 @@ pub const OpenAiCompatibleProvider = struct {
 
         if (root_obj.get("choices")) |choices| {
             if (choices == .array and choices.array.items.len > 0) {
-                const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
+                const choice_obj = choices.array.items[0].object;
+                const msg = choice_obj.get("message") orelse return error.NoResponseContent;
                 const msg_obj = msg.object;
+                // Structural stall signal: the provider stopped to invoke a tool.
+                // Read from provider output structure, never assistant prose.
+                const finish_tool_use = if (choice_obj.get("finish_reason")) |fr|
+                    (fr == .string and std.mem.eql(u8, fr.string, "tool_calls"))
+                else
+                    false;
 
                 var content: ?[]const u8 = null;
                 errdefer if (content) |c| if (c.len > 0) allocator.free(c);
@@ -1119,6 +1126,7 @@ pub const OpenAiCompatibleProvider = struct {
                     .usage = usage,
                     .model = model_str,
                     .reasoning_content = reasoning_content,
+                    .finish_tool_use = finish_tool_use,
                 };
             }
         }
@@ -1815,6 +1823,39 @@ test "parseTextResponse strips think blocks" {
     const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("Visible answer", result);
+}
+
+test "parseNativeResponse records finish_tool_use for finish_reason tool_calls" {
+    const body =
+        \\{"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"shell","arguments":"{}"}}]}}],"model":"glm-5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.finish_tool_use);
+}
+
+test "parseNativeResponse leaves finish_tool_use false for finish_reason stop" {
+    const body =
+        \\{"choices":[{"finish_reason":"stop","message":{"content":"pong"}}],"model":"glm-5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(!result.finish_tool_use);
 }
 
 test "parseNativeResponse splits think blocks into content and reasoning_content" {
