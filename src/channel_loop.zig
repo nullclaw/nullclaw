@@ -946,6 +946,12 @@ fn processTelegramMessage(
     message_sender_id: []const u8,
     replace_message: bool,
 ) void {
+    // Route before starting the typing/draft turn: a message the router folds
+    // into the running turn (a /stop, or an injected/replaced message) must not
+    // start a new draft turn that resets or deletes the live draft the running
+    // turn is still streaming into.
+    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
+
     const typing_target = sender;
     const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
     defer {
@@ -982,8 +988,6 @@ fn processTelegramMessage(
         .draft_id = draft_turn_id,
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
-
-    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
@@ -3321,4 +3325,88 @@ test "telegram offset persistence helper retries after write failure" {
     try std.testing.expectEqual(@as(i64, 101), persisted_update_id);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 101), restored);
+}
+
+test "telegram /stop does not clobber the running turn's live draft" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer tg.channel().stop();
+
+    const session_key = "telegram:default:direct:12345";
+    const session = try runtime.session_mgr.getOrCreate(session_key);
+    session.agent.clearInterruptRequest();
+    defer session.turn_running.store(false, .release);
+
+    // The running turn owns the live draft and has streamed reasoning into it.
+    const owner_draft_id = try tg.beginDraftTurn("12345");
+    try std.testing.expect(owner_draft_id != 0);
+    tg.draft_mu.lock();
+    tg.draft_buffers.getPtr("12345").?.buffer.appendSlice(allocator, "<think>reasoning</think>") catch {};
+    tg.draft_mu.unlock();
+
+    const draft_counter_before = tg.draft_id_counter.load(.monotonic);
+    session.turn_running.store(true, .release);
+
+    // A /stop for the busy session is folded into the running turn by the
+    // router; it must not start a new draft turn that resets or deletes the
+    // live draft the running turn is still streaming into.
+    processTelegramMessage(
+        allocator,
+        runtime,
+        &tg,
+        session_key,
+        "/stop",
+        "12345",
+        1,
+        false,
+        null,
+        "user_a",
+        false,
+    );
+
+    // Regression: the pre-fix code started the typing/draft turn before routing,
+    // which rotated the draft id, cleared the buffer and then deleted the slot on
+    // return, dropping every later chunk of the running turn.
+    try std.testing.expect(session.agent.interrupt_requested.load(.acquire));
+    try std.testing.expectEqual(draft_counter_before, tg.draft_id_counter.load(.monotonic));
+
+    tg.draft_mu.lock();
+    defer tg.draft_mu.unlock();
+    const live = tg.draft_buffers.get("12345") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(owner_draft_id, live.draft_id);
+    try std.testing.expectEqualStrings("<think>reasoning</think>", live.buffer.items);
 }

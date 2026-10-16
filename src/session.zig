@@ -31,6 +31,7 @@ const onboard = @import("onboard.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const inbound_router = @import("inbound_router.zig");
+const control_plane = @import("control_plane.zig");
 const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const cron_mod = @import("cron.zig");
@@ -2035,6 +2036,22 @@ pub const SessionManager = struct {
     /// Returns .skip when the caller should not start a new turn.
     pub fn routeInbound(self: *SessionManager, session_key: []const u8, content: []const u8) InboundRouteAction {
         const session_hash = std.hash.Wyhash.hash(0, session_key);
+
+        // A stop command must reach a busy session even when the queue policy
+        // would drop it: it is the only way to interrupt a running turn. The
+        // incident dropped "/stop" with "session busy queue_mode=off" and the
+        // user could not stop a runaway generation. Signal the interrupt here,
+        // centrally, so every channel path (daemon/Slack, all channel_loop
+        // variants, callback queries, the sync Telegram path) benefits.
+        if (control_plane.isStopLikeCommand(content)) {
+            var interrupt = self.requestTurnInterrupt(session_key);
+            defer interrupt.deinit(self.allocator);
+            if (interrupt.requested) {
+                log.info("stop command interrupting running turn session=0x{x}", .{session_hash});
+                return .skip;
+            }
+        }
+
         return switch (inbound_router.route(self.routeInput(session_key))) {
             .inject, .replace_injection => blk: {
                 const injected = self.injectMidTurnIfRunning(session_key, content) catch |err| {
@@ -4040,6 +4057,44 @@ test "routeInbound handles active session routing side effects" {
     try testing.expectEqual(
         SessionManager.InboundRouteAction.process,
         sm.routeInbound(session_key, "queued message"),
+    );
+}
+
+test "routeInbound interrupts a busy session for /stop instead of dropping" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:stop";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .off;
+    session.agent.clearInterruptRequest();
+    defer session.turn_running.store(false, .release);
+
+    session.turn_running.store(true, .release);
+
+    // /stop must reach the busy session and set the interrupt flag rather than
+    // being dropped by the queue_mode=off busy gate.
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInbound(session_key, "/stop"),
+    );
+    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+
+    // A non-stop message in the same state is still dropped without interrupt.
+    session.agent.clearInterruptRequest();
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInbound(session_key, "just a message"),
+    );
+    try testing.expect(!session.agent.interrupt_requested.load(.acquire));
+
+    // /stop when no turn is running is routed normally (agent replies).
+    session.turn_running.store(false, .release);
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.process,
+        sm.routeInbound(session_key, "/stop"),
     );
 }
 

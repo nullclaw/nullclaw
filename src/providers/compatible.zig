@@ -1259,6 +1259,9 @@ pub const OpenAiCompatibleProvider = struct {
             callback,
             callback_ctx,
         ) catch |err| {
+            // /stop aborted the stream: propagate it so the agent ends the turn
+            // instead of masking the stop with a fresh non-streaming request.
+            if (err == error.Interrupted) return err;
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
                 // Cap the fallback timeout to 90 s — if streaming stalled (e.g. speed-limit

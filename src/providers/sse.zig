@@ -320,6 +320,33 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     return null;
 }
 
+/// Stop the cancel watcher, then kill and reap curl.
+///
+/// The watcher must be joined BEFORE `wait()` reaps the child: a still-running
+/// watcher otherwise calls `kill(child.id)` in the window after the kernel has
+/// returned that PID to the OS, and a freshly spawned process can reuse it, so
+/// the watcher would signal an unrelated process. This mirrors the established
+/// `http_util.abortCurlChild` ordering (stop watcher, then kill/wait).
+fn stopWatcherAndReap(
+    child: *std_compat.process.Child,
+    cancel_done: *std.atomic.Value(bool),
+    cancel_watcher: *?std.Thread,
+) void {
+    http_util.stopCancelWatcherAndReap(child, cancel_done, cancel_watcher);
+}
+
+/// True when a stdin write failure must be reported as a user interrupt.
+///
+/// A /stop raises the agent interrupt flag; the cancel watcher then kills curl
+/// mid-upload, so `writeAll(body)` fails with a broken pipe instead of reaching
+/// the read-loop interrupt check. Consulting the flag lets the caller end the
+/// turn with the interrupt reply rather than reporting the stop as a provider
+/// write failure.
+fn stdinWriteFailureIsInterrupt(cancel_flag: ?*const std.atomic.Value(bool)) bool {
+    if (cancel_flag) |flag| return flag.load(.acquire);
+    return false;
+}
+
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
 /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
@@ -433,19 +460,34 @@ pub fn curlStream(
         debug_log.info("curl process spawned, pid={d}", .{pid});
     }
 
+    // Abort the stream when the agent interrupt flag is raised (e.g. /stop
+    // during a runaway generation). Killing curl closes the stdout pipe, so
+    // the blocking read below returns and this function returns
+    // error.Interrupted so the caller ends the turn instead of retrying.
+    const cancel_flag = http_util.currentThreadInterruptFlag();
+    var cancel_done = std.atomic.Value(bool).init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
+    // Safety net only: every path below stops the watcher before reaping curl
+    // (see stopWatcherAndReap), because joining after wait() leaves a PID-reuse
+    // window. This defer is a no-op once that has happened.
+    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            // A /stop can kill curl before the body finishes uploading; the
+            // failed write would otherwise mask the interrupt as a provider error.
+            if (stdinWriteFailureIsInterrupt(cancel_flag)) return error.Interrupted;
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
         return error.CurlWriteError;
     }
 
@@ -464,6 +506,13 @@ pub fn curlStream(
     var in_reasoning = false;
 
     outer: while (true) {
+        // /stop: abort before draining the deltas curl already buffered in its
+        // stdout pipe. Reading them out (each through the stream callback) kept
+        // the turn alive for seconds after the stop.
+        if (http_util.interruptRequested()) {
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            return error.Interrupted;
+        }
         const n = stdout_file.read(&read_buf) catch |err| {
             if (log_enabled) {
                 debug_log.info("stdout read error: {}", .{err});
@@ -496,13 +545,13 @@ pub fn curlStream(
             if (parsed) |p| {
                 defer p.deinit();
                 if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
-                    _ = child.wait() catch {};
+                    stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
                     return error_classify.kindToError(kind);
                 }
             }
 
             // Return a meaningful error
-            _ = child.wait() catch {};
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
             debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
             return error.ServerError;
         }
@@ -520,6 +569,13 @@ pub fn curlStream(
                 switch (result) {
                     .delta => |content| {
                         defer content.deinit(allocator);
+                        // Check between deltas too: one 4 KiB read can carry
+                        // dozens of buffered deltas, and each callback may block
+                        // on a full outbound queue.
+                        if (http_util.interruptRequested()) {
+                            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                            return error.Interrupted;
+                        }
                         try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
                     },
                     .usage => |u| stream_usage = u,
@@ -540,6 +596,22 @@ pub fn curlStream(
 
     if (log_enabled) {
         debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
+    }
+
+    // A /stop raised the interrupt flag and the watcher killed curl, so the
+    // stream was cut. Return a distinct error rather than salvaging the partial
+    // text: this can happen before any byte arrives (accumulated_len == 0),
+    // where the old code returned error.CurlFailed and the compatible provider
+    // fell back to a fresh non-streaming request — silently ignoring the stop.
+    // The fallback/retry layers must propagate error.Interrupted and the agent
+    // must end the turn with the normal interrupt reply.
+    if (!saw_done) {
+        if (cancel_flag) |flag| {
+            if (flag.load(.acquire)) {
+                stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                return error.Interrupted;
+            }
+        }
     }
 
     // Parse a trailing line when the stream ends without a final '\n'.
@@ -571,6 +643,10 @@ pub fn curlStream(
     if (log_enabled) {
         debug_log.info("waiting for curl process to exit...", .{});
     }
+    // Join the watcher before reaping curl (PID-reuse window; see
+    // stopWatcherAndReap). The stdout stream is already at EOF, so the watcher
+    // has nothing left to unblock.
+    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
     const term = child.wait() catch |err| {
         log.err("curlStream child.wait failed: {}", .{err});
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
@@ -788,19 +864,26 @@ pub fn curlStreamAnthropic(
 
     try child.spawn();
 
+    // Abort the in-flight stream when the agent /stop raises the interrupt
+    // flag: the watcher kills curl and the read loop below returns
+    // error.Interrupted instead of running the request to completion.
+    var cancel_done = std.atomic.Value(bool).init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
+    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
         return error.CurlWriteError;
     }
 
@@ -819,6 +902,12 @@ pub fn curlStreamAnthropic(
     var read_buf: [4096]u8 = undefined;
 
     outer: while (true) {
+        // /stop: stop reading at the next delta boundary instead of draining
+        // every delta the provider already buffered.
+        if (http_util.interruptRequested()) {
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            return error.Interrupted;
+        }
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
 
@@ -836,6 +925,10 @@ pub fn curlStreamAnthropic(
                     },
                     .delta => |text| {
                         defer allocator.free(text);
+                        if (http_util.interruptRequested()) {
+                            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                            return error.Interrupted;
+                        }
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
@@ -857,12 +950,22 @@ pub fn curlStreamAnthropic(
     // Free owned event string
     if (current_event.len > 0) allocator.free(@constCast(current_event));
 
+    // A /stop killed curl before the stream finished: report the interrupt
+    // instead of salvaging the partial text as a completed response.
+    if (!saw_done and http_util.interruptRequested()) {
+        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+        return error.Interrupted;
+    }
+
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
+    // Join the watcher before reaping curl (PID-reuse window; see
+    // stopCancelWatcherAndReap). The stdout stream is already at EOF.
+    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
     const term = child.wait() catch |err| {
         log.err("curlStreamAnthropic child.wait failed: {}", .{err});
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
@@ -1265,4 +1368,83 @@ test "extractStreamUsage returns null for null usage field" {
         \\{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}],"usage":null}
     ;
     try std.testing.expect(extractStreamUsage(json) == null);
+}
+
+test "stdinWriteFailureIsInterrupt reports a stop, not a write error" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expect(!stdinWriteFailureIsInterrupt(&flag));
+    try std.testing.expect(!stdinWriteFailureIsInterrupt(null));
+    flag.store(true, .release);
+    // Regression: a /stop that kills curl mid-upload surfaces as a write error;
+    // the flag must win so the caller ends the turn with the interrupt reply.
+    try std.testing.expect(stdinWriteFailureIsInterrupt(&flag));
+}
+
+test "curlStream stops reading buffered deltas when the interrupt flag is raised" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // A local server that emits a bounded SSE stream and closes, so the read
+    // loop can only stop early by consulting the interrupt flag between deltas.
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const delta_count = 40;
+    const Ctx = struct {
+        server: *std_compat.net.Server,
+
+        fn serve(ctx: *@This()) void {
+            var conn = ctx.server.accept() catch return;
+            defer conn.stream.close();
+
+            // Read the request head so curl starts streaming.
+            var buf: [4096]u8 = undefined;
+            var filled: usize = 0;
+            while (filled < buf.len) {
+                const n = conn.stream.read(buf[filled..]) catch return;
+                if (n == 0) break;
+                filled += n;
+                if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+            }
+
+            conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n") catch return;
+            var i: usize = 0;
+            while (i < delta_count) : (i += 1) {
+                conn.stream.writeAll("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n") catch return;
+            }
+        }
+    };
+    var ctx = Ctx{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+    defer server_thread.join();
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/chat/completions", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    var flag = std.atomic.Value(bool).init(false);
+    http_util.setThreadInterruptFlag(&flag);
+    defer http_util.setThreadInterruptFlag(null);
+
+    const Counter = struct {
+        calls: usize = 0,
+        flag: *std.atomic.Value(bool),
+
+        fn cb(ptr: *anyopaque, _: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Raise the interrupt after the first delta, as /stop would mid-stream.
+            self.flag.store(true, .release);
+        }
+    };
+    var counter = Counter{ .flag = &flag };
+
+    const result = curlStream(allocator, url, "{}", null, &.{}, 0, Counter.cb, @ptrCast(&counter));
+
+    // Regression: without the read-loop interrupt check the loop drained every
+    // delta curl had already buffered (each through the callback) before the
+    // post-loop check ran, so the turn outlived the stop by seconds.
+    try std.testing.expectError(error.Interrupted, result);
+    try std.testing.expect(counter.calls <= 2);
 }

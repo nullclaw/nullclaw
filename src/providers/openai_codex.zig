@@ -457,19 +457,26 @@ fn codexStreamRequest(
 
     try child.spawn();
 
+    // Abort the in-flight stream when the agent /stop raises the interrupt
+    // flag: the watcher kills curl and the read loop below returns
+    // error.Interrupted instead of running the request to completion.
+    var cancel_done = std.atomic.Value(bool).init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
+    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
         return error.CurlWriteError;
     }
 
@@ -488,6 +495,12 @@ fn codexStreamRequest(
     var saw_terminal = false;
 
     outer: while (true) {
+        // /stop: stop reading at the next delta boundary instead of draining
+        // every delta the provider already buffered.
+        if (http_util.interruptRequested()) {
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            return error.Interrupted;
+        }
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
 
@@ -501,6 +514,10 @@ fn codexStreamRequest(
                 switch (result) {
                     .delta => |delta_evt| {
                         defer allocator.free(delta_evt.text);
+                        if (http_util.interruptRequested()) {
+                            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                            return error.Interrupted;
+                        }
                         const is_tool_payload = std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null;
                         const ends_stream = codexDeltaSourceEndsStream(delta_evt.source);
                         switch (delta_evt.source) {
@@ -566,14 +583,20 @@ fn codexStreamRequest(
         }
     }
 
+    // A /stop killed curl before the stream finished: report the interrupt
+    // instead of salvaging the partial text as a completed response.
+    if (!saw_terminal and http_util.interruptRequested()) {
+        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+        return error.Interrupted;
+    }
+
     if (saw_terminal) {
         // Regression: Codex can emit a terminal event before curl exits. Stop the
         // subprocess here so completed streams do not wait on a stalled socket.
         // NOTE: No direct unit test covers the child-kill path here. Under the
         // current Zig/macOS test runner, PATH-based curl interception is not
         // reliable enough for a deterministic subprocess regression test.
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
         if (accumulated.items.len == 0) return error.NoResponseContent;
         callback(ctx, root.StreamChunk.finalChunk());
         return finalizeCodexStreamResult(allocator, accumulated.items);
@@ -585,6 +608,9 @@ fn codexStreamRequest(
         if (n == 0) break;
     }
 
+    // Join the watcher before reaping curl (PID-reuse window; see
+    // stopCancelWatcherAndReap). The stdout stream is already at EOF.
+    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
     const term = child.wait() catch {
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
             callback(ctx, root.StreamChunk.finalChunk());

@@ -548,6 +548,12 @@ pub const Bus = struct {
         return self.outbound.publish(msg);
     }
 
+    /// Bounded variant for droppable outbound traffic (stream previews): never
+    /// blocks the producer for longer than `timeout_ms` when the queue is full.
+    pub fn publishOutboundTimeout(self: *Bus, msg: OutboundMessage, timeout_ms: u32) error{ Closed, Timeout }!void {
+        return self.outbound.publishTimeout(msg, timeout_ms);
+    }
+
     pub fn consumeOutbound(self: *Bus) ?OutboundMessage {
         return self.outbound.consume();
     }
@@ -781,6 +787,35 @@ test "bus roundtrip outbound" {
     var got = bus.consumeOutbound().?;
     defer got.deinit(alloc);
     try testing.expectEqualStrings("pong", got.content);
+}
+
+test "publishOutboundTimeout reports Timeout instead of blocking on a full queue" {
+    // Regression: the bus had no bounded outbound publish, so a producer (the
+    // daemon's stream-chunk preview) had no way to avoid parking on a full queue.
+    const alloc = testing.allocator;
+    var bus = Bus.init();
+    defer bus.close();
+
+    var filled: usize = 0;
+    while (filled < QUEUE_CAPACITY) : (filled += 1) {
+        try bus.publishOutbound(try makeOutbound(alloc, "c", "t", "x"));
+    }
+
+    const overflow = try makeOutbound(alloc, "c", "t", "y");
+    try testing.expectError(error.Timeout, bus.publishOutboundTimeout(overflow, 20));
+    overflow.deinit(alloc);
+
+    // Draining one entry makes room again.
+    var drained = bus.consumeOutbound().?;
+    drained.deinit(alloc);
+    const again = try makeOutbound(alloc, "c", "t", "z");
+    try bus.publishOutboundTimeout(again, 20);
+
+    bus.close();
+    while (bus.consumeOutbound()) |msg| {
+        var m = msg;
+        m.deinit(alloc);
+    }
 }
 
 test "bus close stops both queues" {

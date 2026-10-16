@@ -846,19 +846,26 @@ pub const GeminiProvider = struct {
 
         try child.spawn();
 
+        // Abort the in-flight stream when the agent /stop raises the interrupt
+        // flag: the watcher kills curl and the read loop below returns
+        // error.Interrupted instead of running the request to completion.
+        var cancel_done = std.atomic.Value(bool).init(false);
+        var cancel_watcher: ?std.Thread = null;
+        var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+        http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
+        defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+
         if (child.stdin) |stdin_file| {
             stdin_file.writeAll(body) catch {
                 stdin_file.close();
                 child.stdin = null;
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
+                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
                 return error.GeminiApiError;
             };
             stdin_file.close();
             child.stdin = null;
         } else {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
             return error.GeminiApiError;
         }
 
@@ -875,6 +882,12 @@ pub const GeminiProvider = struct {
         var saw_done = false;
 
         outer: while (true) {
+            // /stop: stop reading at the next delta boundary instead of draining
+            // every delta the provider already buffered.
+            if (http_util.interruptRequested()) {
+                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                return error.Interrupted;
+            }
             const n = file.read(&read_buf) catch break;
             if (n == 0) break;
 
@@ -891,6 +904,10 @@ pub const GeminiProvider = struct {
                     switch (result) {
                         .delta => |text| {
                             defer allocator.free(text);
+                            if (http_util.interruptRequested()) {
+                                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                                return error.Interrupted;
+                            }
                             try accumulated.appendSlice(allocator, text);
                             callback(ctx, root.StreamChunk.textDelta(text));
                         },
@@ -926,12 +943,22 @@ pub const GeminiProvider = struct {
             }
         }
 
+        // A /stop killed curl before the stream finished: report the interrupt
+        // instead of salvaging the partial text as a completed response.
+        if (!saw_done and http_util.interruptRequested()) {
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            return error.Interrupted;
+        }
+
         // Drain remaining stdout to prevent deadlock on wait()
         while (true) {
             const n = file.read(&read_buf) catch break;
             if (n == 0) break;
         }
 
+        // Join the watcher before reaping curl (PID-reuse window; see
+        // stopCancelWatcherAndReap). The stdout stream is already at EOF.
+        http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
         const term = child.wait() catch |err| {
             log.err("curlStreamGemini child.wait failed: {}", .{err});
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {

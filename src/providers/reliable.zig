@@ -427,7 +427,7 @@ pub const ReliableProvider = struct {
         allocator: std.mem.Allocator,
         request: ChatRequest,
         current_model: []const u8,
-    ) ?ChatResponse {
+    ) error{Interrupted}!?ChatResponse {
         var backoff_ms = self.base_backoff_ms;
         var attempt: u32 = 0;
         while (attempt <= self.max_retries) : (attempt += 1) {
@@ -444,6 +444,10 @@ pub const ReliableProvider = struct {
                 }
                 return annotated;
             } else |err| {
+                // A user /stop aborted the in-flight request. It must end the
+                // turn, not be retried or failed over to another provider.
+                if (err == error.Interrupted or err == error.CurlInterrupted) return error.Interrupted;
+
                 maybeRecordFallbackErrorDetail(prov, err);
                 self.storeErrorName(err);
                 const err_slice = self.lastErrorSlice();
@@ -546,7 +550,7 @@ pub const ReliableProvider = struct {
             if (target.explicit) {
                 if (!needs_vision or target.provider.supportsVisionForModel(target.model)) {
                     if (needs_vision) attempted_vision_provider = true;
-                    if (self.tryChatProvider(
+                    if (try self.tryChatProvider(
                         target.provider,
                         allocator,
                         request,
@@ -561,7 +565,7 @@ pub const ReliableProvider = struct {
             // Try primary provider (skip if it lacks vision and request needs it)
             if (!needs_vision or self.inner.supportsVisionForModel(current_model)) {
                 if (needs_vision) attempted_vision_provider = true;
-                if (self.tryChatProvider(
+                if (try self.tryChatProvider(
                     self.inner,
                     allocator,
                     request,
@@ -575,7 +579,7 @@ pub const ReliableProvider = struct {
             for (self.extras) |entry| {
                 if (!needs_vision or entry.provider.supportsVisionForModel(current_model)) {
                     if (needs_vision) attempted_vision_provider = true;
-                    if (self.tryChatProvider(
+                    if (try self.tryChatProvider(
                         entry.provider,
                         allocator,
                         request,
@@ -1172,6 +1176,24 @@ test "ReliableProvider vtable chat retries then recovers" {
     try std.testing.expectEqualStrings("MockProvider", result.provider);
     try std.testing.expectEqualStrings("model", result.model);
     try std.testing.expect(mock.call_count == 2);
+}
+
+test "ReliableProvider surfaces a user stop without retrying or failing over" {
+    var mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 100,
+        .fail_error = error.CurlInterrupted,
+        .supports_tools = false,
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 3, 50);
+    const prov = reliable.provider();
+
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs };
+    // Regression: a /stop aborts the in-flight request and must end the turn,
+    // not be retried or failed over to another provider.
+    try std.testing.expectError(error.Interrupted, prov.chat(std.testing.allocator, request, "model", 0.5));
+    try std.testing.expectEqual(@as(u32, 1), mock.call_count);
 }
 
 test "ReliableProvider vtable delegates supportsNativeTools" {
