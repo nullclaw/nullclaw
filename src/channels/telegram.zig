@@ -3156,6 +3156,59 @@ pub const TelegramChannel = struct {
         }
     }
 
+    /// Build the JSON body for one sendMessageDraft request. `html` adds
+    /// `parse_mode: "HTML"` so the draft renders like the final message.
+    fn buildDraftBody(
+        allocator: std.mem.Allocator,
+        parsed_target: ParsedTelegramTarget,
+        draft_id: u64,
+        text: []const u8,
+        html: bool,
+    ) ![]u8 {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer body.deinit(allocator);
+
+        try body.appendSlice(allocator, "{\"chat_id\":");
+        try body.appendSlice(allocator, parsed_target.chat_id);
+        try body.appendSlice(allocator, ",\"draft_id\":");
+        var id_buf: [20]u8 = undefined;
+        const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{draft_id});
+        try body.appendSlice(allocator, id_str);
+        try body.appendSlice(allocator, ",\"text\":");
+        try root.json_util.appendJsonString(&body, allocator, text);
+        if (html) try body.appendSlice(allocator, ",\"parse_mode\":\"HTML\"");
+        try telegram_api.appendMessageThreadId(&body, allocator, parsed_target.message_thread_id);
+        try body.appendSlice(allocator, "}");
+
+        return body.toOwnedSlice(allocator);
+    }
+
+    /// A draft sent as HTML falls back to plain text only when Telegram
+    /// rejects the entities it ended on; other errors keep their own handling.
+    fn draftNeedsPlainTextFallback(html_used: bool, resp: []const u8) bool {
+        return html_used and
+            telegram_api.responseHasTelegramError(resp) and
+            std.mem.indexOf(u8, resp, "can't parse entities") != null;
+    }
+
+    /// POST one sendMessageDraft; returns the owned response, or null when the
+    /// request could not be built or sent.
+    fn postDraft(
+        self: *TelegramChannel,
+        parsed_target: ParsedTelegramTarget,
+        draft_id: u64,
+        text: []const u8,
+        html: bool,
+    ) ?[]u8 {
+        const body = buildDraftBody(self.allocator, parsed_target, draft_id, text, html) catch return null;
+        defer self.allocator.free(body);
+
+        return self.api().sendMessageDraft(self.allocator, body) catch |err| {
+            log.warn("sendMessageDraft request failed: {}", .{err});
+            return null;
+        };
+    }
+
     fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8, started_at_ms: i64) void {
         if (!self.draft_previews_enabled) return;
         if (builtin.is_test) return;
@@ -3178,24 +3231,18 @@ pub const TelegramChannel = struct {
         ) catch return;
         defer self.allocator.free(preview_text);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
+        // Render the draft the same way the final message is rendered, so
+        // quotes, emphasis and code look identical before and after it lands.
+        const html_text = markdownToTelegramHtml(self.allocator, preview_text) catch null;
+        defer if (html_text) |h| self.allocator.free(h);
 
-        body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
-        body.appendSlice(self.allocator, parsed_target.chat_id) catch return;
-        body.appendSlice(self.allocator, ",\"draft_id\":") catch return;
-        var id_buf: [20]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{draft_id}) catch return;
-        body.appendSlice(self.allocator, id_str) catch return;
-        body.appendSlice(self.allocator, ",\"text\":") catch return;
-        root.json_util.appendJsonString(&body, self.allocator, preview_text) catch return;
-        telegram_api.appendMessageThreadId(&body, self.allocator, parsed_target.message_thread_id) catch return;
-        body.appendSlice(self.allocator, "}") catch return;
-
-        const resp = self.api().sendMessageDraft(self.allocator, body.items) catch |err| {
-            log.warn("sendMessageDraft request failed: {}", .{err});
-            return;
-        };
+        var resp = self.postDraft(parsed_target, draft_id, html_text orelse preview_text, html_text != null) orelse return;
+        if (draftNeedsPlainTextFallback(html_text != null, resp)) {
+            // A tail cut mid-markup can leave entities Telegram rejects; the
+            // plain text is always accepted.
+            self.allocator.free(resp);
+            resp = self.postDraft(parsed_target, draft_id, preview_text, false) orelse return;
+        }
         defer self.allocator.free(resp);
 
         if (telegram_api.responseHasTelegramError(resp)) {
@@ -3861,6 +3908,69 @@ test "telegram build send body" {
     var buf: [512]u8 = undefined;
     const body = try TelegramChannel.buildSendBody(&buf, "12345", "Hello!");
     try std.testing.expectEqualStrings("{\"chat_id\":12345,\"text\":\"Hello!\"}", body);
+}
+
+test "telegram buildDraftBody adds HTML parse_mode" {
+    const body = try TelegramChannel.buildDraftBody(
+        std.testing.allocator,
+        .{ .chat_id = "12345" },
+        7,
+        "Hello",
+        true,
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":12345,\"draft_id\":7,\"text\":\"Hello\",\"parse_mode\":\"HTML\"}",
+        body,
+    );
+}
+
+test "telegram buildDraftBody omits parse_mode for plain text" {
+    const body = try TelegramChannel.buildDraftBody(
+        std.testing.allocator,
+        .{ .chat_id = "12345" },
+        7,
+        "Hello",
+        false,
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":12345,\"draft_id\":7,\"text\":\"Hello\"}",
+        body,
+    );
+}
+
+test "telegram buildDraftBody includes message_thread_id when present" {
+    const body = try TelegramChannel.buildDraftBody(
+        std.testing.allocator,
+        .{ .chat_id = "-100200", .message_thread_id = 42 },
+        3,
+        "Hi",
+        true,
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":-100200,\"draft_id\":3,\"text\":\"Hi\",\"parse_mode\":\"HTML\",\"message_thread_id\":42}",
+        body,
+    );
+}
+
+test "telegram draftNeedsPlainTextFallback only on HTML entity error" {
+    const entity_error =
+        "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities: unsupported start tag\"}";
+    try std.testing.expect(TelegramChannel.draftNeedsPlainTextFallback(true, entity_error));
+    // A plain-text attempt never falls back.
+    try std.testing.expect(!TelegramChannel.draftNeedsPlainTextFallback(false, entity_error));
+    // The phrase without a Telegram error object is not a parse failure.
+    try std.testing.expect(!TelegramChannel.draftNeedsPlainTextFallback(
+        true,
+        "{\"ok\":true,\"result\":{\"text\":\"can't parse entities\"}}",
+    ));
+    // Other API errors keep their existing handling, not this fallback.
+    try std.testing.expect(!TelegramChannel.draftNeedsPlainTextFallback(
+        true,
+        "{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests: retry after 3\"}",
+    ));
 }
 
 test "telegram init stores fields" {
