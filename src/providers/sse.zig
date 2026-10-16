@@ -497,6 +497,14 @@ pub fn curlStream(
                 defer p.deinit();
                 if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
                     _ = child.wait() catch {};
+                    // Keep the provider's message: without it the channel can
+                    // only show a generic "An error occurred" for a 400.
+                    var summary_buf: [1024]u8 = undefined;
+                    if (error_classify.summarizeKnownApiError(p.value.object, &summary_buf)) |summary| {
+                        const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+                        defer if (sanitized) |s| allocator.free(s);
+                        root.setLastApiErrorDetail("stream", sanitized orelse summary);
+                    }
                     return error_classify.kindToError(kind);
                 }
             }

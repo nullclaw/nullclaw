@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
@@ -214,6 +215,17 @@ pub const OpenAiCompatibleProvider = struct {
     /// When true, include `chat_template_kwargs.enable_thinking` in request
     /// bodies so custom vLLM/Qwen endpoints can opt into reasoning.
     chat_template_enable_thinking_param: bool = false,
+    /// Set once the endpoint rejected assistant history without a thinking
+    /// field (IFM K2: "Add a supported thinking field to each assistant
+    /// message"). From then on every assistant message carries
+    /// `reasoning_content`, empty because the history does not keep reasoning.
+    assistant_reasoning_field: bool = false,
+    /// reasoning_effort limits learned from rejections ("Invalid value for
+    /// 'reasoning_effort'"), per model: one provider entry often serves models
+    /// with different limits (DeepSeek takes `max`, K2 stops at `high`).
+    learned_effort_limits: [8]LearnedEffortLimit = [_]LearnedEffortLimit{.{}} ** 8,
+    learned_effort_count: usize = 0,
+    learned_effort_mutex: std_compat.sync.Mutex = .{},
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
@@ -226,6 +238,19 @@ pub const OpenAiCompatibleProvider = struct {
     /// Optional compact JSON string of additional key-value pairs to merge into request bodies.
     extra_body_params: ?[]const u8 = null,
     allocator: std.mem.Allocator,
+
+    const EffortLimit = enum {
+        /// `xhigh`/`max` are sent as `high`.
+        capped_at_high,
+        /// The field is not sent at all.
+        unsupported,
+    };
+
+    const LearnedEffortLimit = struct {
+        model_buf: [128]u8 = undefined,
+        model_len: usize = 0,
+        limit: EffortLimit = .capped_at_high,
+    };
 
     const think_open_tag = "<think>";
     const think_close_tag = "</think>";
@@ -1181,6 +1206,107 @@ pub const OpenAiCompatibleProvider = struct {
         allocator.free(messages);
     }
 
+    /// Copy of `messages` with an empty `reasoning_content` on every assistant
+    /// message, or null when the endpoint has not asked for it.
+    fn assistantReasoningMessages(self: *const OpenAiCompatibleProvider, allocator: std.mem.Allocator, messages: []const ChatMessage) !?[]ChatMessage {
+        if (!self.assistant_reasoning_field) return null;
+        const copy = try allocator.dupe(ChatMessage, messages);
+        for (copy) |*msg| {
+            if (msg.role == .assistant and msg.reasoning_content == null) msg.reasoning_content = "";
+        }
+        return copy;
+    }
+
+    /// True when `err` is the endpoint rejecting assistant history for a
+    /// missing thinking field and the request has not been resent with it yet.
+    /// Without the retry every later turn of the session fails the same way.
+    fn shouldRetryWithAssistantReasoning(self: *OpenAiCompatibleProvider, allocator: std.mem.Allocator, err: anyerror) bool {
+        if (err != error.ApiError or self.assistant_reasoning_field) return false;
+        const detail = (root.snapshotLastApiErrorDetail(allocator) catch return false) orelse return false;
+        defer allocator.free(detail);
+        if (std.ascii.indexOfIgnoreCase(detail, "thinking field") == null) return false;
+        log.warn("{s} requires a thinking field on assistant messages; resending with reasoning_content", .{self.name});
+        self.assistant_reasoning_field = true;
+        return true;
+    }
+
+    /// Whether requests for `model` carry the top-level reasoning_effort that
+    /// appendCompatReasoningEffort adds. Must match the builders.
+    fn sendsCompatReasoningEffort(self: *const OpenAiCompatibleProvider, model: []const u8) bool {
+        return !root.isReasoningModel(model) and
+            !usesNativeThinkingParam(self.thinking_param, self.enable_thinking_param, self.reasoning_split_param, self.chat_template_enable_thinking_param);
+    }
+
+    fn learnedEffortLimit(self: *OpenAiCompatibleProvider, model: []const u8) ?EffortLimit {
+        self.learned_effort_mutex.lock();
+        defer self.learned_effort_mutex.unlock();
+        for (self.learned_effort_limits[0..self.learned_effort_count]) |*entry| {
+            if (std.mem.eql(u8, entry.model_buf[0..entry.model_len], model)) return entry.limit;
+        }
+        return null;
+    }
+
+    /// Record `limit` for `model`. Returns false when nothing changed (model
+    /// name too long to store, or the limit was already known), so the caller
+    /// does not resend an identical request.
+    fn learnEffortLimit(self: *OpenAiCompatibleProvider, model: []const u8, limit: EffortLimit) bool {
+        self.learned_effort_mutex.lock();
+        defer self.learned_effort_mutex.unlock();
+        for (self.learned_effort_limits[0..self.learned_effort_count]) |*entry| {
+            if (std.mem.eql(u8, entry.model_buf[0..entry.model_len], model)) {
+                if (entry.limit == limit) return false;
+                entry.limit = limit;
+                return true;
+            }
+        }
+        if (model.len > self.learned_effort_limits[0].model_buf.len) return false;
+        // When full, reuse the last slot rather than growing.
+        const index = @min(self.learned_effort_count, self.learned_effort_limits.len - 1);
+        const entry = &self.learned_effort_limits[index];
+        @memcpy(entry.model_buf[0..model.len], model);
+        entry.model_len = model.len;
+        entry.limit = limit;
+        if (self.learned_effort_count < self.learned_effort_limits.len) self.learned_effort_count += 1;
+        return true;
+    }
+
+    /// The reasoning_effort actually sent to `model` for `effort`, after any
+    /// limit learned from an earlier rejection.
+    fn effectiveReasoningEffort(self: *OpenAiCompatibleProvider, model: []const u8, effort: ?[]const u8) ?[]const u8 {
+        const raw = effort orelse return null;
+        return switch (self.learnedEffortLimit(model) orelse return raw) {
+            .capped_at_high => if (isEffortAboveHigh(raw)) "high" else raw,
+            .unsupported => null,
+        };
+    }
+
+    /// True when `err` is the endpoint rejecting the reasoning_effort that
+    /// appendCompatReasoningEffort sent. A level above `high` is lowered to
+    /// `high`; if `high` or lower is rejected too, the field is dropped for
+    /// this model. Either way the request is resent.
+    fn shouldRetryWithLowerEffort(self: *OpenAiCompatibleProvider, allocator: std.mem.Allocator, err: anyerror, model: []const u8, effort: ?[]const u8) bool {
+        if (err != error.ApiError or !self.sendsCompatReasoningEffort(model)) return false;
+        const sent = self.effectiveReasoningEffort(model, effort) orelse return false;
+        if (sent.len == 0 or std.ascii.eqlIgnoreCase(sent, "none")) return false;
+        const detail = (root.snapshotLastApiErrorDetail(allocator) catch return false) orelse return false;
+        defer allocator.free(detail);
+        if (std.ascii.indexOfIgnoreCase(detail, "reasoning_effort") == null) return false;
+        const limit: EffortLimit = if (isEffortAboveHigh(sent)) .capped_at_high else .unsupported;
+        if (!self.learnEffortLimit(model, limit)) return false;
+        log.warn("{s} rejected reasoning_effort={s} for {s}; resending {s}", .{
+            self.name,
+            sent,
+            model,
+            if (limit == .capped_at_high) "with high" else "without it",
+        });
+        return true;
+    }
+
+    fn shouldRetry(self: *OpenAiCompatibleProvider, allocator: std.mem.Allocator, err: anyerror, model: []const u8, effort: ?[]const u8) bool {
+        return self.shouldRetryWithAssistantReasoning(allocator, err) or
+            self.shouldRetryWithLowerEffort(allocator, err, model, effort);
+    }
+
     fn streamChatImpl(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -1191,6 +1317,32 @@ pub const OpenAiCompatibleProvider = struct {
         callback_ctx: *anyopaque,
     ) anyerror!root.StreamChatResult {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        // Each retry fixes one learned incompatibility (thinking field, effort
+        // above high, effort unsupported), so three are enough.
+        var retries: u8 = 0;
+        while (true) : (retries += 1) {
+            return streamChatOnce(ptr, allocator, request, model, temperature, callback, callback_ctx) catch |err| {
+                if (retries < 3 and self.shouldRetry(allocator, err, self.normalizeProviderModel(model), request.reasoning_effort)) continue;
+                return err;
+            };
+        }
+    }
+
+    fn streamChatOnce(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        original_request: root.ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!root.StreamChatResult {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        const reasoning_messages = try self.assistantReasoningMessages(allocator, original_request.messages);
+        defer if (reasoning_messages) |msgs| allocator.free(msgs);
+        var request = original_request;
+        if (reasoning_messages) |msgs| request.messages = msgs;
+        request.reasoning_effort = self.effectiveReasoningEffort(self.normalizeProviderModel(model), original_request.reasoning_effort);
         const effective_model = self.normalizeProviderModel(model);
 
         if (self.api_mode == .responses) {
@@ -1434,6 +1586,28 @@ pub const OpenAiCompatibleProvider = struct {
         temperature: f64,
     ) anyerror!ChatResponse {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        var retries: u8 = 0;
+        while (true) : (retries += 1) {
+            return chatOnce(ptr, allocator, request, model, temperature) catch |err| {
+                if (retries < 3 and self.shouldRetry(allocator, err, self.normalizeProviderModel(model), request.reasoning_effort)) continue;
+                return err;
+            };
+        }
+    }
+
+    fn chatOnce(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        original_request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+    ) anyerror!ChatResponse {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        const reasoning_messages = try self.assistantReasoningMessages(allocator, original_request.messages);
+        defer if (reasoning_messages) |msgs| allocator.free(msgs);
+        var request = original_request;
+        if (reasoning_messages) |msgs| request.messages = msgs;
+        request.reasoning_effort = self.effectiveReasoningEffort(self.normalizeProviderModel(model), original_request.reasoning_effort);
         const effective_model = self.normalizeProviderModel(model);
         const capped_request = self.capNonStreamingMaxTokens(request);
 
@@ -1554,6 +1728,10 @@ fn serializeMessagesInto(
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(buf, allocator, tc_id);
             }
+            if (msg.reasoning_content) |reasoning| {
+                try buf.appendSlice(allocator, ",\"reasoning_content\":");
+                try root.appendJsonString(buf, allocator, reasoning);
+            }
             try buf.append(allocator, '}');
         }
         return;
@@ -1609,6 +1787,10 @@ fn serializeMessagesInto(
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try root.appendJsonString(buf, allocator, tc_id);
         }
+        if (msg.reasoning_content) |reasoning| {
+            try buf.appendSlice(allocator, ",\"reasoning_content\":");
+            try root.appendJsonString(buf, allocator, reasoning);
+        }
         try buf.append(allocator, '}');
     }
 }
@@ -1639,6 +1821,9 @@ fn buildChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+    if (!usesNativeThinkingParam(thinking_param, enable_thinking_param, reasoning_split_param, chat_template_enable_thinking_param)) {
+        try appendCompatReasoningEffort(&buf, allocator, model, request.reasoning_effort);
+    }
     if (thinking_param) {
         if (reasoning_enabled) {
             try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
@@ -1699,6 +1884,9 @@ fn buildStreamingChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+    if (!usesNativeThinkingParam(thinking_param, enable_thinking_param, reasoning_split_param, chat_template_enable_thinking_param)) {
+        try appendCompatReasoningEffort(&buf, allocator, model, request.reasoning_effort);
+    }
     if (thinking_param) {
         if (reasoning_enabled) {
             try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
@@ -1731,6 +1919,36 @@ fn buildStreamingChatRequestBody(
     try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
 
     return try buf.toOwnedSlice(allocator);
+}
+
+/// appendGenerationFields sends reasoning_effort only for the OpenAI reasoning
+/// models it recognises, so `/think` had no effect on other OpenAI-compatible
+/// models (DeepSeek, Kimi, K2, ...) that take the same field. Send the level
+/// the user chose to those as well; `minimal` maps to `low`, and `xhigh`/`max`
+/// pass through for endpoints that support them (see shouldRetryWithLowerEffort).
+/// Not used for providers that map reasoning_effort to their own field.
+fn appendCompatReasoningEffort(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+) !void {
+    if (root.isReasoningModel(model)) return;
+    const raw = reasoning_effort orelse return;
+    if (raw.len == 0 or std.ascii.eqlIgnoreCase(raw, "none")) return;
+    try buf.appendSlice(allocator, ",\"reasoning_effort\":");
+    try root.appendJsonString(buf, allocator, if (std.ascii.eqlIgnoreCase(raw, "minimal")) "low" else raw);
+}
+
+/// Providers that translate reasoning_effort into their own request field
+/// (GLM `thinking`, Qwen `enable_thinking`, MiniMax `reasoning_split`, vLLM
+/// `chat_template_kwargs`) do not also get the top-level field.
+fn usesNativeThinkingParam(thinking_param: bool, enable_thinking_param: bool, reasoning_split_param: bool, chat_template_enable_thinking_param: bool) bool {
+    return thinking_param or enable_thinking_param or reasoning_split_param or chat_template_enable_thinking_param;
+}
+
+fn isEffortAboveHigh(effort: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(effort, "xhigh") or std.ascii.eqlIgnoreCase(effort, "max");
 }
 
 fn hasCompatReasoningEnabled(reasoning_effort: ?[]const u8) bool {
@@ -3287,4 +3505,123 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
     // Individual messages are each under the limit; verify the sum is what matters.
     const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
     try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
+}
+
+test "assistant reasoning_content is serialized only when set" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("hi"),
+        .{ .role = .assistant, .content = "hello", .reasoning_content = "" },
+        ChatMessage.assistant("plain"),
+    };
+    const body = try buildChatRequestBody(allocator, .{ .messages = &msgs }, "k2", 0.7, false, false, false, false, false, null, null);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"hello\",\"reasoning_content\":\"\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"assistant\",\"content\":\"plain\"}") != null);
+}
+
+test "missing thinking field error switches assistant history to reasoning_content once" {
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+    var p = OpenAiCompatibleProvider.init(allocator, "test", "https://example.com/v1", null, .bearer, null);
+    const msgs = [_]ChatMessage{ ChatMessage.user("hi"), ChatMessage.assistant("hello"), ChatMessage.user("bye") };
+
+    try std.testing.expect((try p.assistantReasoningMessages(allocator, &msgs)) == null);
+
+    // Unrelated API errors do not trigger the resend.
+    root.setLastApiErrorDetail("stream", "Rate limit exceeded");
+    try std.testing.expect(!p.shouldRetryWithAssistantReasoning(allocator, error.ApiError));
+
+    root.setLastApiErrorDetail("stream", "Add a supported thinking field to each assistant message in the multi-turn conversation history.");
+    try std.testing.expect(!p.shouldRetryWithAssistantReasoning(allocator, error.RateLimited));
+    try std.testing.expect(p.shouldRetryWithAssistantReasoning(allocator, error.ApiError));
+    // Only one resend: a second rejection is returned to the caller.
+    try std.testing.expect(!p.shouldRetryWithAssistantReasoning(allocator, error.ApiError));
+
+    const patched = (try p.assistantReasoningMessages(allocator, &msgs)).?;
+    defer allocator.free(patched);
+    try std.testing.expect(patched[0].reasoning_content == null);
+    try std.testing.expectEqualStrings("", patched[1].reasoning_content.?);
+    try std.testing.expect(patched[2].reasoning_content == null);
+}
+
+test "reasoning_effort reaches non-OpenAI compatible models" {
+    // Regression: appendGenerationFields emitted reasoning_effort only for
+    // the OpenAI reasoning models isReasoningModel recognised, so /think and
+    // the config level were silently dropped on other OpenAI-compatible
+    // models (DeepSeek, Kimi, K2) that take the same top-level field.
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{ChatMessage.user("hi")};
+    inline for (.{ .{ "high", "high" }, .{ "max", "max" }, .{ "minimal", "low" } }) |case| {
+        const body = try buildChatRequestBody(allocator, .{ .messages = &msgs, .reasoning_effort = case[0] }, "deepseek-v4", 0.7, false, false, false, false, false, null, null);
+        defer allocator.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"" ++ case[1] ++ "\"") != null);
+    }
+    const none = try buildStreamingChatRequestBody(allocator, .{ .messages = &msgs }, "deepseek-v4", 0.7, false, false, false, false, false, null, null);
+    defer allocator.free(none);
+    try std.testing.expect(std.mem.indexOf(u8, none, "reasoning_effort") == null);
+    // OpenAI reasoning models keep their own normalization (one field, max -> high).
+    const openai = try buildChatRequestBody(allocator, .{ .messages = &msgs, .reasoning_effort = "max" }, "gpt-5.2", 0.7, false, false, false, false, false, null, null);
+    defer allocator.free(openai);
+    try std.testing.expect(std.mem.indexOf(u8, openai, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, openai, "reasoning_effort"));
+}
+
+test "rejected reasoning_effort is lowered per model, then dropped" {
+    // Regression: an endpoint that rejects a level above high (IFM K2
+    // answers 400 "Invalid value for 'reasoning_effort'" for xhigh/max)
+    // failed the request instead of retrying; the level must be lowered to
+    // high for that model, then dropped if high is rejected too.
+    const allocator = std.testing.allocator;
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+    var p = OpenAiCompatibleProvider.init(allocator, "test", "https://example.com/v1", null, .bearer, null);
+
+    root.setLastApiErrorDetail("stream", "Invalid value for 'reasoning_effort'.");
+    // OpenAI reasoning models use their own normalization and are not touched.
+    try std.testing.expect(!p.shouldRetryWithLowerEffort(allocator, error.ApiError, "gpt-5.2", "max"));
+    try std.testing.expect(!p.shouldRetryWithLowerEffort(allocator, error.RateLimited, "k2", "max"));
+
+    try std.testing.expect(p.shouldRetryWithLowerEffort(allocator, error.ApiError, "k2", "max"));
+    try std.testing.expectEqualStrings("high", p.effectiveReasoningEffort("k2", "max").?);
+    try std.testing.expectEqualStrings("high", p.effectiveReasoningEffort("k2", "xhigh").?);
+    try std.testing.expectEqualStrings("low", p.effectiveReasoningEffort("k2", "low").?);
+    // Another model behind the same provider keeps its level.
+    try std.testing.expectEqualStrings("max", p.effectiveReasoningEffort("deepseek-v4", "max").?);
+
+    // `high` rejected as well: the field is dropped for that model only.
+    try std.testing.expect(p.shouldRetryWithLowerEffort(allocator, error.ApiError, "k2", "max"));
+    try std.testing.expect(p.effectiveReasoningEffort("k2", "max") == null);
+    try std.testing.expect(p.effectiveReasoningEffort("k2", "low") == null);
+    try std.testing.expect(!p.shouldRetryWithLowerEffort(allocator, error.ApiError, "k2", "max"));
+    try std.testing.expectEqualStrings("max", p.effectiveReasoningEffort("deepseek-v4", "max").?);
+
+    // Unrelated errors and providers with a native thinking field do not retry.
+    root.setLastApiErrorDetail("stream", "Rate limit exceeded");
+    try std.testing.expect(!p.shouldRetryWithLowerEffort(allocator, error.ApiError, "deepseek-v4", "max"));
+    root.setLastApiErrorDetail("stream", "Invalid value for 'reasoning_effort'.");
+    var glm = OpenAiCompatibleProvider.init(allocator, "glm", "https://example.com/v1", null, .bearer, null);
+    glm.thinking_param = true;
+    try std.testing.expect(!glm.shouldRetryWithLowerEffort(allocator, error.ApiError, "glm-4.7", "max"));
+}
+
+test "providers with a native thinking field do not get reasoning_effort" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{ChatMessage.user("hi")};
+    // thinking_param, enable_thinking_param, reasoning_split_param, chat_template_enable_thinking_param
+    const flag_sets = [_][4]bool{
+        .{ true, false, false, false },
+        .{ false, true, false, false },
+        .{ false, false, true, false },
+        .{ false, false, false, true },
+    };
+    for (flag_sets) |f| {
+        const body = try buildChatRequestBody(allocator, .{ .messages = &msgs, .reasoning_effort = "high" }, "qwen3", 0.7, false, f[0], f[1], f[2], f[3], null, null);
+        defer allocator.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+        const stream = try buildStreamingChatRequestBody(allocator, .{ .messages = &msgs, .reasoning_effort = "high" }, "qwen3", 0.7, false, f[0], f[1], f[2], f[3], null, null);
+        defer allocator.free(stream);
+        try std.testing.expect(std.mem.indexOf(u8, stream, "reasoning_effort") == null);
+    }
 }

@@ -3345,6 +3345,7 @@ fn parseReasoningEffort(raw: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
     if (std.ascii.eqlIgnoreCase(raw, "high")) return "high";
     if (std.ascii.eqlIgnoreCase(raw, "xhigh")) return "xhigh";
+    if (std.ascii.eqlIgnoreCase(raw, "max")) return "max";
     return null;
 }
 
@@ -3584,7 +3585,7 @@ fn handleThinkCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     const parsed = parseReasoningEffort(level) orelse
-        return try self.allocator.dupe(u8, "Invalid /think value. Use: off|minimal|low|medium|high|xhigh");
+        return try self.allocator.dupe(u8, "Invalid /think value. Use: off|minimal|low|medium|high|xhigh|max");
 
     self.reasoning_effort = if (parsed.len == 0) null else parsed;
     return try std.fmt.allocPrint(self.allocator, "Thinking set to: {s}", .{self.reasoning_effort orelse "off"});

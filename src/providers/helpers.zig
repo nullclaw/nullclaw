@@ -182,7 +182,7 @@ pub fn isReasoningModel(model: []const u8) bool {
 /// Always emits normalized `reasoning_effort` when set on a reasoning model.
 /// OpenAI-compatible reasoning values are normalized as:
 /// - `minimal` -> `low`
-/// - `xhigh` -> `high`
+/// - `xhigh`, `max` -> `high`
 pub fn appendGenerationFields(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -239,7 +239,7 @@ pub fn normalizeOpenAiReasoningEffort(reasoning_effort: ?[]const u8) ?[]const u8
     if (std.ascii.eqlIgnoreCase(raw, "minimal")) return "low";
     if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
     if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
-    if (std.ascii.eqlIgnoreCase(raw, "high") or std.ascii.eqlIgnoreCase(raw, "xhigh")) return "high";
+    if (std.ascii.eqlIgnoreCase(raw, "high") or std.ascii.eqlIgnoreCase(raw, "xhigh") or std.ascii.eqlIgnoreCase(raw, "max")) return "high";
     return raw;
 }
 
@@ -269,7 +269,7 @@ fn parseGeminiReasoningEffort(reasoning_effort: ?[]const u8) ?GeminiReasoningEff
     if (std.ascii.eqlIgnoreCase(raw, "low")) return .low;
     if (std.ascii.eqlIgnoreCase(raw, "medium")) return .medium;
     if (std.ascii.eqlIgnoreCase(raw, "high")) return .high;
-    if (std.ascii.eqlIgnoreCase(raw, "xhigh")) return .xhigh;
+    if (std.ascii.eqlIgnoreCase(raw, "xhigh") or std.ascii.eqlIgnoreCase(raw, "max")) return .xhigh;
     return null;
 }
 

@@ -290,7 +290,8 @@ fn buildCodexBody(
     try buf.appendSlice(allocator, ",\"store\":false,\"stream\":true");
 
     // Reasoning
-    const effort = reasoning_effort orelse "medium";
+    // Codex accepts minimal..high only; map xhigh/max like other OpenAI models.
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse "medium";
     try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":\"");
     try buf.appendSlice(allocator, effort);
     try buf.appendSlice(allocator, "\",\"summary\":\"auto\"}");
