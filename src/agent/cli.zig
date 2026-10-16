@@ -442,7 +442,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (parsed_args.model_override) |model| adjusted_profile.model = model;
         if (parsed_args.temperature_override) |temp| adjusted_profile.temperature = temp;
         selected_profile_storage = adjusted_profile;
+        // A profile with its own autonomy replaces the global block, as the
+        // gateway runtime does (SessionManager.makeAgentConfig), so
+        // `agent --agent guest` cannot run with the global yolo policy.
+        if (found_profile.autonomy) |autonomy| {
+            cfg.autonomy = autonomy;
+            cfg.syncFlatFields();
+        }
     }
+    const has_own_autonomy = if (selected_profile_storage) |profile| profile.autonomy != null else false;
 
     var selected_workspace_dir: ?[]const u8 = null;
     defer if (selected_workspace_dir) |workspace_dir| allocator.free(workspace_dir);
@@ -522,6 +530,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
         .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
         .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
+        .confine_paths = has_own_autonomy,
         .tracker = &tracker,
     };
 
@@ -586,6 +595,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
         .policy = &policy,
+        .withhold_escape_hatches = has_own_autonomy,
         .subagent_manager = &subagent_manager,
         .bootstrap_provider = bootstrap_provider,
         .backend_name = cfg.memory.backend,

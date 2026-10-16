@@ -301,6 +301,15 @@ pub const AutonomyConfig = struct {
     allowed_paths: []const []const u8 = &.{},
 };
 
+/// Free the heap slices owned by an AutonomyConfig (allowed_commands / allowed_paths).
+/// The struct itself is left untouched; callers must drop it after freeing.
+pub fn freeAutonomyConfig(allocator: std.mem.Allocator, autonomy: *const AutonomyConfig) void {
+    for (autonomy.allowed_commands) |cmd| allocator.free(cmd);
+    allocator.free(autonomy.allowed_commands);
+    for (autonomy.allowed_paths) |path| allocator.free(path);
+    allocator.free(autonomy.allowed_paths);
+}
+
 pub const DockerRuntimeConfig = struct {
     image: []const u8 = "alpine:3.24",
     network: []const u8 = "none",
@@ -1886,6 +1895,12 @@ pub const NamedAgentConfig = struct {
     /// outbound provider messages so user data does not leak to remote LLMs.
     /// Default true (secure-by-default). Disable explicitly for known-local-only agents.
     enable_pii_redaction: bool = true,
+    /// Optional per-agent security policy. When present it REPLACES the global
+    /// `autonomy` block for this agent (keys default to the secure
+    /// AutonomyConfig defaults, not the global values). Agents with their own
+    /// autonomy always run in a dedicated runtime and have global-scope escape
+    /// hatches (`spawn`, `schedule`) withheld.
+    autonomy: ?AutonomyConfig = null,
 };
 
 // ── MCP Server Config ──────────────────────────────────────────

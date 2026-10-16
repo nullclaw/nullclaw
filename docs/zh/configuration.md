@@ -330,6 +330,64 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 - 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
 - `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
 
+#### `agents.list[].autonomy`
+
+当某个命名 agent（例如只绑定单个聊天对端的 guest）需要使用比全局更严格的安全策略时，使用 `autonomy`。
+
+- 该对象支持与顶层 `autonomy` 相同的字段：`level`、`workspace_only`、`allowed_commands`、`allowed_paths`、`max_actions_per_hour`、`require_approval_for_medium_risk`、`block_high_risk_commands`、`block_medium_risk_commands`、`allow_raw_url_chars`。
+- 一旦设置，它会**替换**该 agent 的全局 `autonomy`。未写出的字段回落到 `AutonomyConfig` 的安全默认值（`supervised`、`workspace_only: true`、空的 `allowed_paths`、保守的命令白名单），**不会**从全局块继承。`level` 取值非法时会在加载配置时直接报错。
+- 即使没有设置 `workspace_path`，该 agent 也会拥有独立的 runtime 与独立的安全策略（限速、命令白名单、路径范围）。
+- 对于拥有独立 autonomy 的 agent，以下“在全局策略下执行工作”或“会触达工作区之外”的工具会被**移除**（否则它们会以该 agent 策略并未授予的权限执行）：
+  - `spawn` —— 后台 subagent 运行在全局 autonomy 下。
+  - `schedule` —— cron shell 任务运行在调度器的全局 shell 策略下。
+  - `image_info` —— 直接打开任意绝对路径、不做工作区/策略校验，是主机路径的元数据探测器（存在性、大小、格式）。
+  - `git`（`git_operations`）—— 会无视 `read_only` 意图直接写仓库（commit、checkout、reset 等）。
+  - `screenshot` —— 截取主机屏幕，泄露工作区之外的信息。
+  - MCP 工具 —— 每个已配置的 MCP server 会作为子进程启动并代理其工具，且不会经过该 agent 的策略。
+  - `delegate` —— 它可以指定任意已配置的 agent，并用运营者的 API key 调用该 agent 的 provider 和模型，访客因此可以消耗其他 agent 的 key，并把内容发给原本没有授权给它的 provider。
+
+  `cron_*` 系列工具本身就不在 agent 工具集中。
+- 涉及共享配置、在工作区之外写入、或读取主机状态的 slash 命令会被拦截：
+  - `/config`（`get`、`set`、`unset`、`apply`、`reload`、`validate`）会被拒绝。它会在全局策略下读写共享的 `config.json`，从而泄露 provider key 与 channel token，或让 guest 削弱主 agent 的 `autonomy`/`security` 配置块。
+  - `/capabilities` 只报告该 agent 自身的 runtime 工具，不再读取共享 `config.json` 来列出已配置的 channel 与工具。
+  - `/model` 仍然可以为该 agent 自身的会话切换模型，但不再把 `agents.defaults.model.primary` 持久化到全局配置，且交互式 provider/model 菜单不再读取共享 `config.json` —— 它改用公开模型列表，而不是全局 provider key。
+  - `/export` 会被拒绝：它接受任意绝对路径并截断/创建该文件，是一个可被绑定聊天对端触发的“整机文件写入”原语。
+  - 当该 Telegram 对端当前被路由到拥有独立 autonomy 的 agent 时，`/bind` 会被拒绝。否则 guest 可以用 `/bind clear` 回退到默认路由，或用 `/bind <其他 agent>` 迁移到无限制的 agent，从而逃离受限 agent。（`/bind status` 仍为只读。）
+  - 其余 slash 命令要么只影响自身会话（model、think、verbose、reasoning、usage、cost、queue、tts、focus/unfocus/dock/activation/send、session ttl、context、memory、skills、debug、stop、compact、doctor），要么作用于该 agent 自己的 subagent —— 而后者对它不可用，因为 `spawn` 工具已被移除（`/subagents spawn`、`/steer`、`/tell`、`/agents`、`/kill`、`/poll` 都会提示 subagent manager 已禁用）。`/bash`、`/approve`、`/exec`、`/elevated` 仍走该 agent 自己的 shell 工具与策略，因此下面的限制同样适用于它们。
+- 出站附件被限制：一次出站回复只能附带由**绝对路径**命名、且解析后（跟随符号链接）位于该 agent 工作区（及其自身 `allowed_paths`）之内的本地文件。相对路径会被拒绝，因为 channel 上传器（`curl --form file=@<target>`）会按自身进程 cwd 而非工作区解析它，导致上传的文件未必是检查所解析的那个。回复文本中目标落在工作区之外或为相对路径的旧式标记（`[IMAGE:…]`、`[DOCUMENT:…]`、`[FILE:…]`、`[PHOTO:…]`、`[VIDEO:…]`、`[AUDIO:…]`、`[VOICE:…]`）会在发送前被丢弃并记录日志，对所有会上传此类标记的 channel（Telegram、Max、Signal 等）都生效。远程 `http(s)` URL 不指向本地文件，不受影响。这是一条不经过工具调用的纯文本外泄路径，因此 `read_only` 同样适用。
+- shell 工具被限制在该 agent 的工作区内。命令会按 shell 视为 IFS 空白的所有字节（空格、tab、换行、垂直制表符、换页符）做词切分，随后任何命名路径的参数（绝对路径、`..` 回溯、`~`）都会被拒绝；命令中出现任何控制字节都会被直接拒绝，因为 shell 会据此切分出参数检查看不到的参数（`cat x\t/etc/passwd` 会执行 `cat x /etc/passwd`）。`$` 参数展开（`$IFS`、`$HOME`、`$1`、`$@` 等）、单引号之外的反斜杠转义，以及未加引号的 glob/花括号元字符也会被拒绝，因为 shell 会在执行时把它们展开或去转义成参数检查看不到的文本（`cat $IFS/etc/passwd` 和 `cat \/etc/passwd` 都会变成 `cat /etc/passwd`）。会直接拒绝执行来自工作区代码的命令 —— 包管理器及其 run/build 子命令（`npm`、`pnpm`、`yarn`、`npx`、`bun`、`deno`、`cargo`），以及会运行脚本的 git 子命令（`git bisect`、`git submodule`、`git filter-branch`、`git filter-repo`，外加 git `-c` 配置注入与 `!` 别名）—— 因为这类代码以 agent 进程的权限运行并绕过该限制。 此外，受限命令只能包含字母、数字、普通空格、分隔符 `;`、`|`、`&&`、`||` 以及标点 `-_./,:=+@%^`：任何引号、重定向（`<`、`>`）、转义、展开或通配字节都会被拒绝，因此 `cat ''/etc/passwd`、`cat '..'/x`、`cat </etc/passwd` 会被直接拒绝，而不会被 shell 重新解释。`find` 的写入/执行谓词（`-exec`、`-execdir`、`-ok`、`-okdir`、`-delete`、`-fprint*`、`-fls`）同样被拒绝。`nullclaw agent --agent <name>` 也使用同一套按 agent 的 autonomy。
+- **该 shell 限制是尽力而为的参数检查，而非文件系统 jail。** 它是在常见的无外部沙箱（bubblewrap/firejail/docker/landlock）场景下的纵深防御；若某命令通过该检查未覆盖的机制访问主机文件，仍可能绕过。对不可信的 guest，优先使用 `"level": "read_only"` —— 它会直接禁用**所有**工具调用，并让进程运行在外部沙箱中。
+- 没有 `autonomy` 块的 agent 仍然共用全局策略。
+
+示例 —— 一个只绑定单个 Telegram 对端、只读的 guest：
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "guest",
+        "model": { "primary": "anthropic/claude-haiku-3.5" },
+        "system_prompt": "You are a read-only guest. Answer questions, never modify anything.",
+        "autonomy": { "level": "read_only" }
+      }
+    ]
+  },
+  "bindings": [
+    {
+      "agent_id": "guest",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "direct", "id": "123456789" }
+      }
+    }
+  ]
+}
+```
+
+对不可信的 guest，优先使用 `"level": "read_only"`：它会禁用所有工具调用，只依赖上面的限制（shell 参数检查与出站附件检查）。当 guest 可以执行动作、但所有中高风险命令仍需审批时，改用 `"level": "supervised"`，并通过 `allowed_commands` / `allowed_paths` 授予一个明确而狭窄的范围。两种 level 都不是文件系统 jail —— 面对不可信输入时应配合外部沙箱。
+
 ### `messages.inbound`
 
 - `debounce_ms` 用来延迟处理连续快速到达的纯文本入站消息，把短时间内的多条碎片合并成一次 turn。

@@ -156,6 +156,7 @@ const SerializedNamedAgentConfig = struct {
     temperature: ?f64 = null,
     max_depth: u32 = 3,
     enable_pii_redaction: bool = true,
+    autonomy: ?config_types.AutonomyConfig = null,
 };
 
 const SerializedModelRouteConfig = struct {
@@ -176,6 +177,7 @@ fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentC
         if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
         if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
         if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+        if (agent_cfg.autonomy) |*autonomy| config_types.freeAutonomyConfig(allocator, autonomy);
     }
     allocator.free(agents);
 }
@@ -1224,9 +1226,17 @@ pub const Config = struct {
                 if (has_agents) {
                     const serialized_agents = try self.allocator.alloc(SerializedNamedAgentConfig, self.agents.len);
                     defer self.allocator.free(serialized_agents);
-                    var agent_count: usize = 0;
-                    errdefer {
-                        for (serialized_agents[0..agent_count]) |agent_cfg| {
+                    // Pre-initialize every slot and register the cleanup before
+                    // the serialization loop, so it is armed even when the loop
+                    // errors part-way: unfilled slots free a null api_key.
+                    // (Previously an errdefer over the filled prefix and this
+                    // defer both freed the same api_key strings on error — a
+                    // latent double free.)
+                    for (serialized_agents) |*slot| {
+                        slot.* = .{ .name = "", .provider = "", .model = "" };
+                    }
+                    defer {
+                        for (serialized_agents) |agent_cfg| {
                             if (agent_cfg.api_key) |value| self.allocator.free(value);
                         }
                     }
@@ -1242,13 +1252,8 @@ pub const Config = struct {
                             .temperature = agent_cfg.temperature,
                             .max_depth = agent_cfg.max_depth,
                             .enable_pii_redaction = agent_cfg.enable_pii_redaction,
+                            .autonomy = agent_cfg.autonomy,
                         };
-                        agent_count += 1;
-                    }
-                    defer {
-                        for (serialized_agents) |agent_cfg| {
-                            if (agent_cfg.api_key) |value| self.allocator.free(value);
-                        }
                     }
                     if (wrote_agent_field) {
                         try w.print(",\n", .{});
@@ -4857,6 +4862,156 @@ test "json parse agents" {
     try std.testing.expectEqual(@as(f64, 0.3), cfg.agents[1].temperature.?);
     try std.testing.expectEqual(@as(u32, 3), cfg.agents[1].max_depth);
     try std.testing.expect(!cfg.agents[1].enable_pii_redaction);
+}
+
+test "json parse agents.list autonomy replaces global with secure defaults" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"level": "yolo", "workspace_only": false, "allowed_commands": ["*"]},
+        \\ "agents": {"list": [
+        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "read_only"}},
+        \\  {"id": "plain", "provider": "anthropic", "model": "claude-haiku-3.5"}
+        \\]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+    defer {
+        for (cfg.autonomy.allowed_commands) |cmd| allocator.free(cmd);
+        allocator.free(cfg.autonomy.allowed_commands);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.agents.len);
+    const autonomy = cfg.agents[0].autonomy orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(AutonomyLevel.read_only, autonomy.level);
+    // Keys default to the secure AutonomyConfig defaults — NOT the global yolo block.
+    try std.testing.expect(autonomy.workspace_only);
+    try std.testing.expect(autonomy.block_high_risk_commands);
+    try std.testing.expect(autonomy.block_medium_risk_commands);
+    try std.testing.expect(autonomy.require_approval_for_medium_risk);
+    try std.testing.expectEqual(@as(usize, 0), autonomy.allowed_commands.len);
+    try std.testing.expectEqual(@as(usize, 0), autonomy.allowed_paths.len);
+    // An agent without an autonomy block keeps `null` so it uses the global policy.
+    try std.testing.expect(cfg.agents[1].autonomy == null);
+}
+
+test "json parse agents.list autonomy invalid level rejected" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents": {"list": [
+        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "god-mode"}}
+        \\]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
+}
+
+test "json parse top-level autonomy invalid level rejected" {
+    // The per-agent parser shares the top-level parser, so an unknown level is
+    // rejected in both places instead of silently falling back to a default.
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"level": "god-mode"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
+}
+
+test "agents.list autonomy round trips through save" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    const json =
+        \\{"agents": {"list": [
+        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "read_only", "workspace_only": true, "allowed_paths": ["/tmp/guest-shared"]}},
+        \\  {"id": "plain", "provider": "anthropic", "model": "claude-haiku-3.5"}
+        \\]}}
+    ;
+    var cfg = Config{ .workspace_dir = base, .config_path = config_path, .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"autonomy\"") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{ .workspace_dir = base, .config_path = config_path, .allocator = arena.allocator() };
+    try loaded.parseJson(content);
+    try std.testing.expectEqual(@as(usize, 2), loaded.agents.len);
+    const autonomy = loaded.agents[0].autonomy orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(AutonomyLevel.read_only, autonomy.level);
+    try std.testing.expect(autonomy.workspace_only);
+    try std.testing.expectEqual(@as(usize, 1), autonomy.allowed_paths.len);
+    try std.testing.expectEqualStrings("/tmp/guest-shared", autonomy.allowed_paths[0]);
+    try std.testing.expect(loaded.agents[1].autonomy == null);
+}
+
+test "invalid autonomy level aborts the parse before any field is written" {
+    const allocator = std.testing.allocator;
+    // Regression: `workspace` is parsed before `autonomy` in parseJson. An unknown level must
+    // fail the parse before that (or any) field is written, so Config.load does
+    // not keep a half-parsed config that silently drops the rest.
+    const json =
+        \\{"workspace": "/tmp/should-not-be-applied", "autonomy": {"level": "bogus"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
+    try std.testing.expect(cfg.workspace_dir_override == null);
+}
+
+test "invalid per-agent autonomy level aborts the parse before any field is written" {
+    const allocator = std.testing.allocator;
+    // Regression: an unknown per-agent level must fail the parse before any
+    // field is written, so Config.load does not keep a half-parsed config.
+    const json =
+        \\{"workspace": "/tmp/should-not-be-applied",
+        \\ "agents": {"list": [
+        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "god-mode"}}
+        \\]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
+    try std.testing.expect(cfg.workspace_dir_override == null);
+    try std.testing.expectEqual(@as(usize, 0), cfg.agents.len);
+}
+
+fn saveAgentsForAllocationTest(allocator: std.mem.Allocator, base: []const u8, config_path: []const u8) !void {
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.agents = &[_]NamedAgentConfig{
+        .{ .name = "guest-a", .provider = "anthropic", .model = "claude-haiku-3.5", .api_key = "sk-agent-a" },
+        .{ .name = "guest-b", .provider = "anthropic", .model = "claude-haiku-3.5", .api_key = "sk-agent-b" },
+    };
+    try cfg.save();
+}
+
+test "save frees serialized agent api keys when a later write fails" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    // Regression: Config.save serialized each agent's api_key into a scratch
+    // array that both an errdefer (over the filled prefix) and a defer (over the
+    // whole array) freed, so a failure after the loop — for example writing the
+    // serialized list — freed the same api_key strings twice.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, saveAgentsForAllocationTest, .{ base, config_path });
 }
 
 test "json parse root agent pii redaction flag" {

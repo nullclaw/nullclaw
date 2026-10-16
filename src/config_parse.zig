@@ -242,6 +242,7 @@ fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAge
     if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
     if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
     if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+    if (agent_cfg.autonomy) |*autonomy| types.freeAutonomyConfig(allocator, autonomy);
 }
 
 fn parsePrimaryModelObject(
@@ -442,6 +443,78 @@ fn parseDiagnosticsOtelHeaders(
     return try header_list.toOwnedSlice(allocator);
 }
 
+/// Reject an unknown autonomy `level` up front, before parseJson writes any
+/// field onto `self`. parseJson mutates `self` in place, so an error raised
+/// half-way through it leaves a partially-populated Config: Config.load keeps
+/// that half-built value (it only logs a warning), silently dropping every
+/// section that comes after the bad key. Validating the top-level and per-agent
+/// autonomy levels here turns a typo into a clean failure that falls back to
+/// defaults as a whole, instead of a config that is half-parsed.
+fn validateAutonomyLevels(root: std.json.ObjectMap) !void {
+    if (root.get("autonomy")) |aut| {
+        if (aut == .object) try validateAutonomyObjectLevel(aut.object);
+    }
+    const agents = root.get("agents") orelse return;
+    if (agents != .object) return;
+    const list = agents.object.get("list") orelse return;
+    if (list != .array) return;
+    for (list.array.items) |item| {
+        if (item != .object) continue;
+        const aut = item.object.get("autonomy") orelse continue;
+        if (aut == .object) try validateAutonomyObjectLevel(aut.object);
+    }
+}
+
+fn validateAutonomyObjectLevel(obj: std.json.ObjectMap) !void {
+    const v = obj.get("level") orelse return;
+    if (v != .string) return;
+    if (types.AutonomyLevel.fromString(v.string) == null) return error.InvalidAutonomyLevel;
+}
+
+/// Parse an `autonomy` JSON object into an AutonomyConfig. Keys that are absent
+/// keep the AutonomyConfig struct defaults (secure defaults), and the returned
+/// value REPLACES any other autonomy block rather than merging with it. A
+/// present-but-unrecognised `level` string is rejected (fail fast) instead of
+/// silently falling back to a default.
+fn parseAutonomyObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.AutonomyConfig {
+    var autonomy = types.AutonomyConfig{};
+    errdefer types.freeAutonomyConfig(allocator, &autonomy);
+
+    if (obj.get("workspace_only")) |v| {
+        if (v == .bool) autonomy.workspace_only = v.bool;
+    }
+    if (obj.get("max_actions_per_hour")) |v| {
+        if (v == .integer) autonomy.max_actions_per_hour = @intCast(v.integer);
+    }
+    // max_cost_per_day_cents: ignored (removed — never enforced at runtime)
+    if (obj.get("require_approval_for_medium_risk")) |v| {
+        if (v == .bool) autonomy.require_approval_for_medium_risk = v.bool;
+    }
+    if (obj.get("block_high_risk_commands")) |v| {
+        if (v == .bool) autonomy.block_high_risk_commands = v.bool;
+    }
+    if (obj.get("block_medium_risk_commands")) |v| {
+        if (v == .bool) autonomy.block_medium_risk_commands = v.bool;
+    }
+    if (obj.get("level")) |v| {
+        if (v == .string) {
+            autonomy.level = types.AutonomyLevel.fromString(v.string) orelse
+                return error.InvalidAutonomyLevel;
+        }
+    }
+    if (obj.get("allowed_commands")) |v| {
+        if (v == .array) autonomy.allowed_commands = try parseStringArray(allocator, v.array);
+    }
+    if (obj.get("allow_raw_url_chars")) |v| {
+        if (v == .bool) autonomy.allow_raw_url_chars = v.bool;
+    }
+    // forbidden_paths: ignored (removed — path security handled by path_security.zig)
+    if (obj.get("allowed_paths")) |v| {
+        if (v == .array) autonomy.allowed_paths = try parseStringArray(allocator, v.array);
+    }
+    return autonomy;
+}
+
 fn parseNamedAgentObject(
     allocator: std.mem.Allocator,
     config_path: []const u8,
@@ -541,6 +614,11 @@ fn parseNamedAgentObject(
     }
     if (item.object.get("enable_pii_redaction")) |v| {
         if (v == .bool) agent_cfg.enable_pii_redaction = v.bool;
+    }
+    if (item.object.get("autonomy")) |aut| {
+        if (aut == .object) {
+            agent_cfg.autonomy = try parseAutonomyObject(allocator, aut.object);
+        }
     }
     return agent_cfg;
 }
@@ -1109,6 +1187,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     defer parsed.deinit();
 
     const root = parsed.value.object;
+
+    // Reject an unknown autonomy level before any field is written onto `self`
+    // so Config.load does not keep a half-parsed config (see validateAutonomyLevels).
+    try validateAutonomyLevels(root);
+
     const explicit_provider_names = try collectExplicitProviderNames(self.allocator, root);
     defer if (explicit_provider_names.len > 0) self.allocator.free(explicit_provider_names);
 
@@ -1571,39 +1654,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     // Autonomy
     if (root.get("autonomy")) |aut| {
         if (aut == .object) {
-            if (aut.object.get("workspace_only")) |v| {
-                if (v == .bool) self.autonomy.workspace_only = v.bool;
-            }
-            if (aut.object.get("max_actions_per_hour")) |v| {
-                if (v == .integer) self.autonomy.max_actions_per_hour = @intCast(v.integer);
-            }
-            // max_cost_per_day_cents: ignored (removed — never enforced at runtime)
-            if (aut.object.get("require_approval_for_medium_risk")) |v| {
-                if (v == .bool) self.autonomy.require_approval_for_medium_risk = v.bool;
-            }
-            if (aut.object.get("block_high_risk_commands")) |v| {
-                if (v == .bool) self.autonomy.block_high_risk_commands = v.bool;
-            }
-            if (aut.object.get("block_medium_risk_commands")) |v| {
-                if (v == .bool) self.autonomy.block_medium_risk_commands = v.bool;
-            }
-            if (aut.object.get("level")) |v| {
-                if (v == .string) {
-                    if (types.AutonomyLevel.fromString(v.string)) |lvl| {
-                        self.autonomy.level = lvl;
-                    }
-                }
-            }
-            if (aut.object.get("allowed_commands")) |v| {
-                if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
-            }
-            if (aut.object.get("allow_raw_url_chars")) |v| {
-                if (v == .bool) self.autonomy.allow_raw_url_chars = v.bool;
-            }
-            // forbidden_paths: ignored (removed — path security handled by path_security.zig)
-            if (aut.object.get("allowed_paths")) |v| {
-                if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
-            }
+            self.autonomy = try parseAutonomyObject(self.allocator, aut.object);
         }
     }
 

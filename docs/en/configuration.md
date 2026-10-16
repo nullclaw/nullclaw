@@ -394,6 +394,64 @@ Practical effect:
 - Two named agents can share the same provider/model family but keep separate durable notes and separate workspaces.
 - `workspace_path` does not route chats by itself. Routing still comes from `bindings`, `/bind`, or explicit `--agent` / `/subagents spawn --agent`.
 
+#### `agents.list[].autonomy`
+
+Use `autonomy` when a named agent (for example a guest bound to a single chat peer) must run with a stricter security policy than the global one.
+
+- The object accepts the same keys as the top-level `autonomy` block: `level`, `workspace_only`, `allowed_commands`, `allowed_paths`, `max_actions_per_hour`, `require_approval_for_medium_risk`, `block_high_risk_commands`, `block_medium_risk_commands`, `allow_raw_url_chars`.
+- When present it **replaces** the global `autonomy` for that agent. Keys you omit fall back to the secure `AutonomyConfig` defaults (`supervised`, `workspace_only: true`, empty `allowed_paths`, the conservative command allowlist) — they are **not** inherited from the global block. An unknown `level` is rejected at config load.
+- The agent always gets its own runtime and its own security policy (rate limit, command allowlist, path scope), even without `workspace_path`.
+- Tools that run work under the global policy instead of the agent's, or that reach outside its workspace, are **withheld** from an agent with its own autonomy, because they would act with permissions the agent's policy does not grant:
+  - `spawn` — background subagents run under the global autonomy.
+  - `schedule` — cron shell jobs run under the scheduler's global shell policy.
+  - `image_info` — opens any absolute path with no workspace/policy check, so it is a host-path metadata oracle (existence, size, format).
+  - `git` (`git_operations`) — writes to the repository (commit, checkout, reset, …) regardless of `read_only` intent.
+  - `screenshot` — captures the host screen, leaking information outside the workspace.
+  - MCP tools — each configured MCP server is spawned as a child process and its tools are proxied without consulting the agent's policy.
+  - `delegate` — it can name any configured agent and run that agent's provider and model with the operator's API key, so a guest could spend other agents' keys and send its content to providers it was never given.
+
+  The `cron_*` tools are not part of the agent tool set at all.
+- Slash commands that touch the shared configuration, write outside the workspace, or read host state are gated:
+  - `/config` (`get`, `set`, `unset`, `apply`, `reload`, `validate`) is refused. It reads or rewrites the shared `config.json` under the global policy, which would leak provider keys and channel tokens or let the guest weaken the main agent's `autonomy`/`security` blocks.
+  - `/capabilities` reports only the agent's own runtime tools; it no longer reads the shared `config.json` to list configured channels and tools.
+  - `/model` still switches the model for that agent's own session, but no longer persists `agents.defaults.model.primary` to the global config, and the interactive provider/model menu does not read the shared `config.json` — it falls back to the public model list instead of the global provider keys.
+  - `/export` is refused: it takes an arbitrary absolute path and truncates/creates it, i.e. a whole-host file-write primitive reachable from a bound chat peer.
+  - Telegram `/bind` is refused when the peer is currently routed to an agent with its own autonomy. Otherwise the guest could `/bind clear` back to the default route or `/bind <other-agent>` to move to an unrestricted agent, escaping the restricted one. (`/bind status` stays read-only.)
+  - Every other slash command is session-local (model, think, verbose, reasoning, usage, cost, queue, tts, focus/unfocus/dock/activation/send, session ttl, context, memory, skills, debug, stop, compact, doctor), or operates on the agent's own subagents — which are unavailable to it because the `spawn` tool is withheld (`/subagents spawn`, `/steer`, `/tell`, `/agents`, `/kill`, `/poll` all report the subagent manager is disabled). `/bash`, `/approve`, `/exec` and `/elevated` still run through the agent's own shell tool and policy, so the confinement below applies to them.
+- Outbound attachments are confined: an outbound reply may only attach local files named by an **absolute** path that resolves (symlinks followed) inside the agent's workspace (plus its own `allowed_paths`). Relative targets are refused, because the channel uploader (`curl --form file=@<target>`) resolves them against its own process cwd rather than the workspace, so the uploaded file need not be the one the check resolved. Legacy reply markers (`[IMAGE:…]`, `[DOCUMENT:…]`, `[FILE:…]`, `[PHOTO:…]`, `[VIDEO:…]`, `[AUDIO:…]`, `[VOICE:…]`) whose target escapes the workspace or is relative are dropped and logged before the reply is sent, on every channel that uploads such markers (Telegram, Max, Signal, …). Remote `http(s)` URLs name no local file and are unaffected. This is a text-only exfiltration path that does not go through tool calls, so it also applies to `read_only`.
+- The shell tool is confined to the agent's workspace. The command is word-split on every byte the shell treats as IFS whitespace (space, tab, newline, vertical tab, form feed), and every resulting argument that names a path (absolute, `..` traversal or `~`) is rejected; a control byte anywhere in the command is rejected outright, because the shell splits on it into arguments the check would otherwise not see (`cat x\t/etc/passwd` runs `cat x /etc/passwd`). `$` parameter expansion (`$IFS`, `$HOME`, `$1`, `$@`, …), backslash escapes outside single quotes, and unquoted glob/brace metacharacters are rejected because the shell expands or unescapes them at execution time into text the argument check never sees (`cat $IFS/etc/passwd` and `cat \/etc/passwd` both become `cat /etc/passwd`). Commands that execute code taken from the workspace are refused outright — the package managers and their run/build verbs (`npm`, `pnpm`, `yarn`, `npx`, `bun`, `deno`, `cargo`) and the git subcommands that run a script (`git bisect`, `git submodule`, `git filter-branch`, `git filter-repo`, plus git `-c` config injection and `!`-aliases) — because such code runs with the agent's privileges and ignores the confinement. Beyond that, a confined command may contain only letters, digits, plain spaces, the separators `;`, `|`, `&&`, `||` and the punctuation `-_./,:=+@%^`: every quote, redirection (`<`, `>`), escape, expansion or glob byte is refused, so `cat ''/etc/passwd`, `cat '..'/x` and `cat </etc/passwd` are rejected rather than reinterpreted by the shell. `find` write/exec predicates (`-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-fprint*`, `-fls`) are refused too. The same per-agent autonomy applies to `nullclaw agent --agent <name>`.
+- **This shell confinement is a best-effort argument check, not a filesystem jail.** It is defence-in-depth for the common case of no external sandbox (bubblewrap/firejail/docker/landlock), and a command that reaches a host file through a mechanism the check does not model can still slip through. For an untrusted guest, prefer `"level": "read_only"`, which disables **all** tool calls outright, and run the process under an external sandbox.
+- Agents without an `autonomy` block keep using the shared global policy.
+
+Example — a guest bound to one Telegram peer, read-only:
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "guest",
+        "model": { "primary": "anthropic/claude-haiku-3.5" },
+        "system_prompt": "You are a read-only guest. Answer questions, never modify anything.",
+        "autonomy": { "level": "read_only" }
+      }
+    ]
+  },
+  "bindings": [
+    {
+      "agent_id": "guest",
+      "match": {
+        "channel": "telegram",
+        "account_id": "main",
+        "peer": { "kind": "direct", "id": "123456789" }
+      }
+    }
+  ]
+}
+```
+
+For an untrusted guest prefer `"level": "read_only"`: it disables all tool calls, and only the confinement above (shell argument check and outbound-attachment check) is relied upon. Use `"level": "supervised"` instead when the guest may act but every medium/high-risk command still needs approval; add `allowed_commands` / `allowed_paths` to grant a narrow, explicit scope. Neither level is a filesystem jail — pair it with an external sandbox for untrusted input.
+
 ### `messages.inbound`
 
 - `debounce_ms` delays handling rapid-fire plain-text inbound messages so several short fragments can collapse into one turn.

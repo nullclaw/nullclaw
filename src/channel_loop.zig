@@ -335,6 +335,40 @@ pub fn buildTelegramBindingStatusReply(
     return try out.toOwnedSlice(allocator);
 }
 
+/// True when the agent currently routed for this Telegram peer carries its own
+/// autonomy block (see NamedAgentConfig.autonomy). Such a peer is a restricted
+/// guest and must not be able to rebind itself out of that agent. Resolution
+/// mirrors buildTelegramBindingStatusReply; a resolution failure is treated as
+/// "not restricted" so a transient error cannot lock a peer out of /bind.
+fn telegramPeerRoutedAgentIsRestricted(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    sender: []const u8,
+    is_group: bool,
+) bool {
+    const base_chat_id = if (is_group) telegram.targetChatId(sender) else sender;
+    const thread_id = if (is_group) telegram.targetThreadId(sender) else null;
+    const peer_kind = currentTelegramBindingKind(is_group);
+    const peer_id = currentTelegramBindingPeerId(allocator, sender, is_group) catch return false;
+    defer allocator.free(peer_id);
+
+    const route = agent_routing.resolveRouteWithSession(allocator, .{
+        .channel = "telegram",
+        .account_id = account_id,
+        .peer = .{ .kind = peer_kind, .id = peer_id },
+        .parent_peer = if (is_group and thread_id != null)
+            .{ .kind = peer_kind, .id = base_chat_id }
+        else
+            null,
+    }, config.agent_bindings, config.agents, config.session) catch return false;
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    const profile = agent_bindings_config.findNamedAgent(config.agents, route.agent_id) orelse return false;
+    return profile.autonomy != null;
+}
+
 pub fn applyTelegramBindingCommand(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -352,6 +386,19 @@ pub fn applyTelegramBindingCommand(
     const binding_label = telegramBindingTargetLabel(is_group, thread_id);
     const peer_id = try currentTelegramBindingPeerId(allocator, sender, is_group);
     defer allocator.free(peer_id);
+
+    // A peer currently routed to an agent with its own autonomy must not rebind
+    // itself: `/bind clear` falls back to the default route and `/bind <other>`
+    // moves the peer to another agent, either of which would escape the
+    // restricted guest agent entirely. `/bind status`/`help` is read-only and
+    // returned above, so only the mutating forms are refused here.
+    if (telegramPeerRoutedAgentIsRestricted(allocator, config, account_id, sender, is_group)) {
+        return std.fmt.allocPrint(
+            allocator,
+            "This {s} is bound to an agent with its own autonomy; binding changes are disabled for it.",
+            .{binding_label},
+        );
+    }
 
     const binding_target = agent_bindings_config.BindingTarget{
         .channel = "telegram",
@@ -3131,6 +3178,46 @@ test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provis
 
     try std.testing.expect(std.mem.indexOf(u8, reply, "Effective agent: peer-") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: default") != null);
+}
+
+test "applyTelegramBindingCommand refuses rebinding a peer routed to a restricted agent" {
+    const allocator = std.testing.allocator;
+    const agents = [_]config_types.NamedAgentConfig{
+        .{ .name = "guest", .provider = "openai", .model = "gpt-4", .autonomy = .{ .level = .supervised } },
+        .{ .name = "plain", .provider = "openai", .model = "gpt-4" },
+    };
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "guest",
+            .match = .{
+                .channel = "telegram",
+                .peer = .{ .kind = .direct, .id = "123456" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .agents = &agents,
+        .agent_bindings = &bindings,
+    };
+
+    // The guest peer cannot clear its binding (which would fall back to the
+    // unrestricted default route)...
+    const cleared = try applyTelegramBindingCommand(allocator, &cfg, "main", "123456", false, "clear");
+    defer allocator.free(cleared);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "binding changes are disabled") != null);
+
+    // ...nor move itself to another agent.
+    const moved = try applyTelegramBindingCommand(allocator, &cfg, "main", "123456", false, "plain");
+    defer allocator.free(moved);
+    try std.testing.expect(std.mem.indexOf(u8, moved, "binding changes are disabled") != null);
+
+    // A peer routed to an agent without its own autonomy keeps the normal path.
+    const other = try applyTelegramBindingCommand(allocator, &cfg, "main", "999999", false, "nope");
+    defer allocator.free(other);
+    try std.testing.expect(std.mem.indexOf(u8, other, "binding changes are disabled") == null);
 }
 
 test "telegram update offset store roundtrip" {

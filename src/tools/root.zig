@@ -379,6 +379,11 @@ pub fn allTools(
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        /// Withhold tools that execute work outside the caller's security policy
+        /// (see the `spawn` / `schedule` note below). Set for agents that carry
+        /// their own autonomy so a restricted agent cannot reach the global
+        /// (possibly yolo) policy through them.
+        withhold_escape_hatches: bool = false,
         bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
         backend_name: []const u8 = "hybrid",
         sandbox_backend: ConfigSandboxBackend = .auto,
@@ -479,14 +484,27 @@ pub fn allTools(
     };
     try list.append(allocator, feh.tool());
 
-    const gt = try allocator.create(git.GitTool);
-    gt.* = .{ .workspace_dir = workspace_dir };
-    try list.append(allocator, gt.tool());
+    // git is withheld for an agent with its own autonomy: it writes to the
+    // repository (commit, checkout, reset, …) without consulting read_only
+    // intent, and `git` is a wide surface a restricted guest should not reach.
+    if (!opts.withhold_escape_hatches) {
+        const gt = try allocator.create(git.GitTool);
+        gt.* = .{ .workspace_dir = workspace_dir };
+        try list.append(allocator, gt.tool());
+    }
 
     // Tools without workspace_dir
-    const it = try allocator.create(image.ImageInfoTool);
-    it.* = .{};
-    try list.append(allocator, it.tool());
+    //
+    // image_info is registered only for unrestricted agents: it opens any
+    // absolute path directly (no workspace_dir, no allowed_paths, no policy),
+    // so a restricted agent could use it as a metadata oracle (existence, size
+    // and format) for files outside its workspace. It is withheld below with
+    // the other escape hatches.
+    if (!opts.withhold_escape_hatches) {
+        const it = try allocator.create(image.ImageInfoTool);
+        it.* = .{};
+        try list.append(allocator, it.tool());
+    }
 
     const calt = try allocator.create(calculator.CalculatorTool);
     calt.* = .{};
@@ -520,24 +538,41 @@ pub fn allTools(
     mft.* = .{};
     try list.append(allocator, mft.tool());
 
-    // Delegate and schedule tools
-    const dlt = try allocator.create(delegate.DelegateTool);
-    dlt.* = .{
-        .agents = opts.agents orelse &.{},
-        .configured_providers = opts.configured_providers,
-        .fallback_api_key = opts.fallback_api_key,
-        .depth = opts.delegate_depth,
-    };
-    try list.append(allocator, dlt.tool());
+    // Delegate tool. Withheld for a restricted agent: it can name ANY configured
+    // agent and run that agent's provider/model with the operator's resolved API
+    // key, so a guest could spend other agents' keys and send its content to
+    // providers it was never given.
+    if (!opts.withhold_escape_hatches) {
+        const dlt = try allocator.create(delegate.DelegateTool);
+        dlt.* = .{
+            .agents = opts.agents orelse &.{},
+            .configured_providers = opts.configured_providers,
+            .fallback_api_key = opts.fallback_api_key,
+            .depth = opts.delegate_depth,
+        };
+        try list.append(allocator, dlt.tool());
+    }
 
-    const scht = try allocator.create(schedule.ScheduleTool);
-    scht.* = .{};
-    try list.append(allocator, scht.tool());
+    // Escape hatches — tools that run work under the GLOBAL policy instead of
+    // the calling agent's, or that reach outside its workspace, so a restricted
+    // agent must not get them:
+    //   * schedule → creates cron shell jobs that execute under the scheduler's
+    //     global shell policy (cron.zig), bypassing the caller's policy.
+    //   * spawn    → the SubagentManager is bound to the global config, so
+    //     subagents run under the global autonomy (subagent_runner.zig).
+    // The cron_* tools (cron_add/list/remove/runs/run/update) are not registered
+    // here at all, so there is nothing to withhold for them. image_info, git and
+    // screenshot (above), `delegate` and the MCP tools (below) are withheld too.
+    if (!opts.withhold_escape_hatches) {
+        const scht = try allocator.create(schedule.ScheduleTool);
+        scht.* = .{};
+        try list.append(allocator, scht.tool());
 
-    // Spawn tool (async subagent)
-    const sp = try allocator.create(spawn.SpawnTool);
-    sp.* = .{ .manager = opts.subagent_manager };
-    try list.append(allocator, sp.tool());
+        // Spawn tool (async subagent)
+        const sp = try allocator.create(spawn.SpawnTool);
+        sp.* = .{ .manager = opts.subagent_manager };
+        try list.append(allocator, sp.tool());
+    }
 
     if (opts.http_enabled) {
         // Pushover notification tool (network egress, gated with HTTP tools).
@@ -576,7 +611,9 @@ pub fn allTools(
         try list.append(allocator, bt.tool());
     }
 
-    if (opts.screenshot_enabled) {
+    // screenshot captures the host screen, so it leaks information outside the
+    // agent's workspace; it is withheld for an agent with its own autonomy.
+    if (opts.screenshot_enabled and !opts.withhold_escape_hatches) {
         const sst = try allocator.create(screenshot.ScreenshotTool);
         sst.* = .{ .workspace_dir = workspace_dir };
         try list.append(allocator, sst.tool());
@@ -609,7 +646,13 @@ pub fn allTools(
     }
 
     // MCP tools — connect to configured servers and register their tools.
-    if (opts.mcp_server_configs.len > 0) {
+    //
+    // Withheld for an agent with its own autonomy: initMcpTools spawns each
+    // configured server as a child process (config.command + args) and proxies
+    // its tools, and MCP tool calls never consult the agent's SecurityPolicy —
+    // so a restricted agent would inherit a tool that runs work entirely
+    // outside its per-agent policy.
+    if (opts.mcp_server_configs.len > 0 and !opts.withhold_escape_hatches) {
         const mcp_tools = mcp_mod.initMcpTools(allocator, opts.mcp_server_configs) catch |err| blk: {
             std.log.warn("allTools: MCP init failed: {}", .{err});
             break :blk &[_]Tool{};
@@ -1172,6 +1215,51 @@ test "all tools wires subagent manager into spawn tool" {
         break;
     }
     try std.testing.expect(checked_spawn);
+}
+
+test "withhold_escape_hatches drops spawn, schedule, delegate, image_info, git and screenshot" {
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .withhold_escape_hatches = true,
+        .screenshot_enabled = true,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    for (tools) |t| {
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "delegate"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "schedule"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "cron_add"));
+        // image_info opens any absolute path with no policy, so it is withheld
+        // as a host-path metadata oracle.
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "image_info"));
+        // git writes to the repo ignoring read_only intent; screenshot leaks the
+        // host screen. Both are withheld for a restricted agent.
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "git_operations"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "screenshot"));
+    }
+}
+
+test "default allTools keeps spawn, schedule, image_info, git and screenshot" {
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .screenshot_enabled = true });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_spawn = false;
+    var saw_schedule = false;
+    var saw_image_info = false;
+    var saw_git = false;
+    var saw_screenshot = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "spawn")) saw_spawn = true;
+        if (std.mem.eql(u8, t.name(), "schedule")) saw_schedule = true;
+        if (std.mem.eql(u8, t.name(), "image_info")) saw_image_info = true;
+        if (std.mem.eql(u8, t.name(), "git_operations")) saw_git = true;
+        if (std.mem.eql(u8, t.name(), "screenshot")) saw_screenshot = true;
+    }
+    try std.testing.expect(saw_spawn);
+    try std.testing.expect(saw_schedule);
+    try std.testing.expect(saw_image_info);
+    try std.testing.expect(saw_git);
+    try std.testing.expect(saw_screenshot);
 }
 
 test "subagent tools use configured shell and file limits" {

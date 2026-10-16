@@ -286,6 +286,11 @@ pub const Agent = struct {
     workspace_dir_owned: bool = false,
     allowed_paths: []const []const u8 = &.{},
     multimodal_unrestricted: bool = false,
+    /// True when this agent was built from a named-agent profile that carries
+    /// its own autonomy block. Such an agent must not reach the global config
+    /// surface (`/config`, `/model` persistence), which reads or rewrites the
+    /// shared config.json under the global policy.
+    has_own_autonomy: bool = false,
     /// List of models that do not support image/vision input.
     /// When image markers are detected and the model is in this list,
     /// the agent will skip processing images instead of returning an error.
@@ -608,6 +613,7 @@ pub const Agent = struct {
             .workspace_dir_owned = workspace_dir_owned,
             .allowed_paths = cfg.autonomy.allowed_paths,
             .multimodal_unrestricted = cfg.autonomy.level == .yolo,
+            .has_own_autonomy = if (profile) |agent_profile| agent_profile.autonomy != null else false,
             .vision_disabled_models = cfg.agent.vision_disabled_models,
             .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
@@ -3655,8 +3661,18 @@ pub const Agent = struct {
         for (self.allowed_paths) |dir| {
             try appendMultimodalAllowedDir(arena, &allowed_dirs_list, dir);
         }
-        if (platform.getTempDir(arena) catch null) |tmp_dir| {
-            try appendMultimodalAllowedDir(arena, &allowed_dirs_list, tmp_dir);
+        // The platform temp dir is a host path outside the workspace. An agent
+        // with its own autonomy must not reach it: the marker scan counts image
+        // markers in the last user message, so a bound peer could send
+        // `[IMAGE:/tmp/<file>]` and have the agent read and forward that file
+        // to the model provider — a tool-less read outside the workspace that
+        // also applies to read_only. Only agents without their own autonomy
+        // (and the unrestricted skip_dir_check case, where allowed_dirs is moot)
+        // keep the temp dir.
+        if (!self.has_own_autonomy or self.multimodal_unrestricted) {
+            if (platform.getTempDir(arena) catch null) |tmp_dir| {
+                try appendMultimodalAllowedDir(arena, &allowed_dirs_list, tmp_dir);
+            }
         }
         const allowed = try allowed_dirs_list.toOwnedSlice(arena);
 
@@ -4562,6 +4578,124 @@ test "Agent buildProviderMessages allows workspace image paths" {
         }
     }
     try std.testing.expect(has_image_part);
+}
+
+test "Agent buildProviderMessages with own autonomy rejects platform temp dir images" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{};
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn supportsVision(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var tmp_ws = std.testing.tmpDir(.{});
+    defer tmp_ws.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace_path = try @import("compat").fs.Dir.wrap(tmp_ws.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_path);
+
+    // Create an image inside the platform temp dir (outside this agent's workspace).
+    const sys_temp = try platform.getTempDir(allocator);
+    defer allocator.free(sys_temp);
+    const temp_img_name = "nullclaw-test-guest-temp.png";
+    const temp_img_path = try std_compat.fs.path.join(allocator, &.{ sys_temp, temp_img_name });
+    defer allocator.free(temp_img_path);
+    {
+        const f = try std_compat.fs.createFileAbsolute(temp_img_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("\x89PNG\x0d\x0a\x1a\x0a");
+    }
+    defer std_compat.fs.deleteFileAbsolute(temp_img_path) catch {};
+
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .supports_vision = DummyProvider.supportsVision,
+        .supports_vision_for_model = DummyProvider.supportsVisionForModel,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const prov = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = prov,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "vision-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace_path,
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .has_own_autonomy = false,
+        .multimodal_unrestricted = false,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try std.fmt.allocPrint(allocator, "Inspect [IMAGE:{s}]", .{temp_img_path}),
+    });
+
+    // Positive control: without its own autonomy the agent keeps the previous
+    // behaviour and reads the temp-dir image.
+    {
+        var arena_impl = std.heap.ArenaAllocator.init(allocator);
+        defer arena_impl.deinit();
+        const messages = try agent.buildProviderMessages(arena_impl.allocator(), agent.model_name);
+        try std.testing.expectEqual(@as(usize, 1), messages.len);
+        var has_image_part = false;
+        if (messages[0].content_parts) |parts| {
+            for (parts) |part| {
+                if (part == .image_base64) has_image_part = true;
+            }
+        }
+        try std.testing.expect(has_image_part);
+    }
+
+    // With its own autonomy, the platform temp dir is not an allowed dir, so a
+    // peer-supplied `[IMAGE:/tmp/<file>]` must not be read: no image_base64 part.
+    agent.has_own_autonomy = true;
+    {
+        var arena_impl = std.heap.ArenaAllocator.init(allocator);
+        defer arena_impl.deinit();
+        const messages = try agent.buildProviderMessages(arena_impl.allocator(), agent.model_name);
+        try std.testing.expectEqual(@as(usize, 1), messages.len);
+        if (messages[0].content_parts) |parts| {
+            for (parts) |part| {
+                try std.testing.expect(part != .image_base64);
+            }
+        }
+    }
 }
 
 test "Agent max_tool_iterations default" {
@@ -8264,6 +8398,56 @@ test "slash /config reload returns summary" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "Config hot reload complete") != null);
+}
+
+test "slash /config is refused for an agent with its own autonomy" {
+    const allocator = std.testing.allocator;
+
+    // A restricted agent must not be able to read the global config.json (which
+    // holds provider keys and channel tokens) through /config get.
+    var guest = try makeTestAgent(allocator);
+    defer guest.deinit();
+    guest.has_own_autonomy = true;
+    const refused = (try guest.handleSlashCommand("/config get providers")).?;
+    defer allocator.free(refused);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "unavailable for this agent") != null);
+
+    // An agent without its own autonomy keeps the normal config surface.
+    var plain = try makeTestAgent(allocator);
+    defer plain.deinit();
+    try std.testing.expect(!plain.has_own_autonomy);
+    const show = (try plain.handleSlashCommand("/config show")).?;
+    defer allocator.free(show);
+    try std.testing.expect(std.mem.indexOf(u8, show, "unavailable for this agent") == null);
+}
+
+test "slash /export is refused for an agent with its own autonomy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const export_path = try std.fmt.allocPrint(allocator, "{s}/export-probe.md", .{base});
+    defer allocator.free(export_path);
+    const cmd = try std.fmt.allocPrint(allocator, "/export {s}", .{export_path});
+    defer allocator.free(cmd);
+
+    // A restricted agent must not be able to write an arbitrary absolute path
+    // (or truncate an existing file) through /export.
+    var guest = try makeTestAgent(allocator);
+    defer guest.deinit();
+    guest.has_own_autonomy = true;
+    const refused = (try guest.handleSlashCommand(cmd)).?;
+    defer allocator.free(refused);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "unavailable for this agent") != null);
+
+    // An agent without its own autonomy keeps the normal export surface.
+    var plain = try makeTestAgent(allocator);
+    defer plain.deinit();
+    try std.testing.expect(!plain.has_own_autonomy);
+    const exported = (try plain.handleSlashCommand(cmd)).?;
+    defer allocator.free(exported);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "unavailable for this agent") == null);
 }
 
 test "Agent streaming fields default to null" {

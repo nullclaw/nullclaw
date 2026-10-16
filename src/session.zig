@@ -36,8 +36,10 @@ const tools_mod = @import("tools/root.zig");
 const cron_mod = @import("cron.zig");
 const cron_add_mod = @import("tools/cron_add.zig");
 const Tool = tools_mod.Tool;
-const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const security = @import("security/policy.zig");
+const SecurityPolicy = security.SecurityPolicy;
 const streaming = @import("streaming.zig");
+const outbound_mod = @import("outbound.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
 const log = std.log.scoped(.session);
@@ -284,11 +286,25 @@ const AgentRuntime = struct {
     session_store: ?memory_mod.SessionStore,
     response_cache: ?*memory_mod.cache.ResponseCache,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
+    /// Security policy used for this agent's sessions and tools. Points at the
+    /// global SessionManager policy unless the agent declares its own autonomy,
+    /// in which case it points at `owned_policy`.
+    policy: ?*const SecurityPolicy = null,
+    /// Per-agent policy/tracker, owned only when the named agent has its own
+    /// autonomy block (see `createAgentSecurityPolicy`).
+    owned_policy: ?*SecurityPolicy = null,
 
     fn deinit(self: *AgentRuntime, allocator: Allocator) void {
         if (self.tools.len > 0) tools_mod.deinitTools(allocator, self.tools);
         if (self.bootstrap_provider) |bp| bp.deinit();
         if (self.mem_rt) |*rt| rt.deinit();
+        if (self.owned_policy) |policy| {
+            if (policy.tracker) |tracker| {
+                tracker.deinit();
+                allocator.destroy(tracker);
+            }
+            allocator.destroy(policy);
+        }
         allocator.free(self.workspace_dir);
         allocator.free(self.agent_id);
     }
@@ -1215,8 +1231,55 @@ pub const SessionManager = struct {
     fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
         if (named_agent) |cfg| {
             if (cfg.workspace_path != null) return true;
+            // An agent with its own autonomy needs a dedicated runtime so its
+            // stricter policy never falls back to the shared global one.
+            if (cfg.autonomy != null) return true;
         }
         return self.config.session.auto_provision_direct_agents and std.mem.startsWith(u8, agent_id, "peer-");
+    }
+
+    /// Build a SecurityPolicy + RateTracker from an autonomy block. Mirrors the
+    /// field mapping ChannelRuntime.init (channel_loop.zig) uses for the global
+    /// policy, but scoped to this agent's workspace. The returned policy owns
+    /// its tracker; free both with `destroyAgentSecurityPolicy`.
+    fn createAgentSecurityPolicy(
+        allocator: Allocator,
+        autonomy: config_types.AutonomyConfig,
+        workspace_dir: []const u8,
+    ) !*SecurityPolicy {
+        const tracker = try allocator.create(security.RateTracker);
+        errdefer allocator.destroy(tracker);
+        tracker.* = security.RateTracker.init(allocator, autonomy.max_actions_per_hour);
+        errdefer tracker.deinit();
+
+        const policy = try allocator.create(SecurityPolicy);
+        errdefer allocator.destroy(policy);
+        policy.* = .{
+            .autonomy = autonomy.level,
+            .workspace_dir = workspace_dir,
+            .workspace_only = autonomy.workspace_only,
+            .allowed_commands = security.resolveAllowedCommands(autonomy.level, autonomy.allowed_commands),
+            .max_actions_per_hour = autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = autonomy.block_high_risk_commands,
+            .block_medium_risk_commands = autonomy.block_medium_risk_commands,
+            .allow_raw_url_chars = autonomy.allow_raw_url_chars,
+            // Confine file-path arguments of the file-reading shell commands to
+            // this agent's workspace. Without an active external sandbox (the
+            // common case in a container) the shell tool would otherwise let a
+            // supervised guest `cat ../../../config.json` or `cat /etc/passwd`.
+            .confine_paths = true,
+            .tracker = tracker,
+        };
+        return policy;
+    }
+
+    fn destroyAgentSecurityPolicy(allocator: Allocator, policy: *SecurityPolicy) void {
+        if (policy.tracker) |tracker| {
+            tracker.deinit();
+            allocator.destroy(tracker);
+        }
+        allocator.destroy(policy);
     }
 
     fn sanitizePathComponent(allocator: Allocator, value: []const u8) ![]u8 {
@@ -1249,6 +1312,13 @@ pub const SessionManager = struct {
             cfg.default_provider = agent_cfg.provider;
             cfg.default_model = agent_cfg.model;
             if (agent_cfg.temperature) |t| cfg.default_temperature = t;
+            // Agent.fromConfigWithProfile derives security-relevant fields
+            // (exec_security/exec_ask, allowed_paths, multimodal_unrestricted,
+            // the skip_dir_check/allow_remote_fetch pair) straight from
+            // cfg.autonomy. Override the copied global block with the agent's own
+            // autonomy so a restricted guest does not inherit the global yolo
+            // permissions (e.g. reading any local image via [IMAGE:...]).
+            if (agent_cfg.autonomy) |autonomy| cfg.autonomy = autonomy;
         }
         cfg.syncFlatFields();
         return cfg;
@@ -1267,6 +1337,23 @@ pub const SessionManager = struct {
 
         const workspace_dir = try self.resolveAgentWorkspaceDir(agent_id, named_agent);
         errdefer self.allocator.free(workspace_dir);
+
+        const agent_autonomy: ?config_types.AutonomyConfig = if (named_agent) |cfg| cfg.autonomy else null;
+
+        // Agents with their own autonomy get a dedicated policy (and rate
+        // tracker) built from that autonomy. Everyone else keeps sharing the
+        // global SessionManager policy so existing configs behave exactly as
+        // before.
+        var owned_policy: ?*SecurityPolicy = null;
+        errdefer if (owned_policy) |policy| destroyAgentSecurityPolicy(self.allocator, policy);
+        if (agent_autonomy) |autonomy| {
+            owned_policy = try createAgentSecurityPolicy(self.allocator, autonomy, workspace_dir);
+        }
+        const runtime_policy: ?*const SecurityPolicy = if (owned_policy) |policy| policy else self.policy;
+        const runtime_allowed_paths: []const []const u8 = if (agent_autonomy) |autonomy|
+            autonomy.allowed_paths
+        else
+            self.config.autonomy.allowed_paths;
 
         var mem_rt = memory_mod.initRuntime(self.allocator, &self.config.memory, workspace_dir);
         errdefer if (mem_rt) |*rt| rt.deinit();
@@ -1296,13 +1383,17 @@ pub const SessionManager = struct {
             .web_search_fallback_providers = self.config.http_request.search_fallback_providers,
             .browser_enabled = self.config.browser.enabled,
             .screenshot_enabled = true,
+            // MCP tools spawn configured servers as child processes and never
+            // consult the agent policy; allTools skips them when
+            // withhold_escape_hatches is set (an agent with its own autonomy).
             .mcp_server_configs = self.config.mcp_servers,
             .agents = self.config.agents,
             .configured_providers = self.config.providers,
             .fallback_api_key = self.config.defaultProviderKey(),
             .tools_config = self.config.tools,
-            .allowed_paths = self.config.autonomy.allowed_paths,
-            .policy = self.policy,
+            .allowed_paths = runtime_allowed_paths,
+            .policy = runtime_policy,
+            .withhold_escape_hatches = agent_autonomy != null,
             .subagent_manager = self.subagent_manager,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = self.config.memory.backend,
@@ -1322,6 +1413,8 @@ pub const SessionManager = struct {
             .session_store = session_store,
             .response_cache = response_cache,
             .bootstrap_provider = bootstrap_provider,
+            .policy = runtime_policy,
+            .owned_policy = owned_policy,
         };
 
         tools_mod.bindMemoryTools(runtime.tools, runtime.mem);
@@ -1445,7 +1538,7 @@ pub const SessionManager = struct {
             self.observer,
             agent_profile,
         );
-        agent.policy = self.policy;
+        agent.policy = if (dedicated_runtime) |rt| rt.policy else self.policy;
         agent.session_store = selected_session_store;
         agent.response_cache = selected_response_cache;
         agent.mem_rt = selected_mem_rt;
@@ -1767,7 +1860,35 @@ pub const SessionManager = struct {
             }
         }
 
-        return maybe_response;
+        // Same session-boundary attachment filter as processMessageStreaming:
+        // a slash command's reply leaves the session here too (this backs the
+        // Telegram callback menus), so a command that emitted a local-file
+        // marker must be filtered for a restricted agent as well.
+        return try self.filterOutboundAttachmentMarkers(session, maybe_response.?);
+    }
+
+    /// Drop legacy outbound attachment markers whose local target does not
+    /// resolve inside `session`'s agent workspace (+ its allowed_paths). An
+    /// agent with its own autonomy must not be able to exfiltrate host files
+    /// through `[DOCUMENT:/abs/path]`-style markers in its reply text: the
+    /// outbound channels (telegram, max, signal, …) upload any absolute path
+    /// the reply names with no policy check, independent of tool calls (so this
+    /// also covers read_only). Returns an owned copy of `response` and frees the
+    /// input when a filter runs; an agent without its own autonomy is returned
+    /// unchanged.
+    fn filterOutboundAttachmentMarkers(
+        self: *SessionManager,
+        session: *Session,
+        response: []const u8,
+    ) ![]const u8 {
+        if (!session.agent.has_own_autonomy) return response;
+        const scope = outbound_mod.AttachmentScope{
+            .workspace_dir = session.agent.workspace_dir,
+            .allowed_paths = session.agent.allowed_paths,
+        };
+        const filtered = try outbound_mod.stripEscapingAttachmentMarkers(self.allocator, response, scope);
+        self.allocator.free(response);
+        return filtered;
     }
 
     /// Process a message within a session context and optionally forward text deltas and progress hints.
@@ -1958,6 +2079,11 @@ pub const SessionManager = struct {
                 },
             );
         }
+
+        // An agent with its own autonomy must not be able to exfiltrate files
+        // outside its workspace through legacy attachment markers in its reply
+        // text (see filterOutboundAttachmentMarkers).
+        response = try self.filterOutboundAttachmentMarkers(session, response);
 
         if (display_rehydrate_allowed) {
             if (session.agent.redactor) |r| {
@@ -3438,6 +3564,231 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
     const session = try sm.getOrCreate("agent:helper-bot:telegram:direct:42");
     try expectPathEndsWith(session.agent.workspace_dir, "agents/helper-workspace");
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "named agent autonomy gets a dedicated stricter runtime policy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    const agents = [_]NamedAgentConfig{
+        .{
+            .name = "guest",
+            .provider = "openrouter",
+            .model = "test/mock-model",
+            .autonomy = .{ .level = .supervised },
+        },
+        .{
+            .name = "plain",
+            .provider = "openrouter",
+            .model = "test/mock-model",
+        },
+        .{
+            .name = "worker",
+            .provider = "openrouter",
+            .model = "test/mock-model",
+            .workspace_path = "agents/worker-workspace",
+        },
+    };
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agents = &agents;
+    // Global autonomy is maximally permissive; the guest must not inherit it.
+    cfg.autonomy.level = .yolo;
+    cfg.autonomy.workspace_only = false;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    var global_tracker = security.RateTracker.init(testing.allocator, 20);
+    defer global_tracker.deinit();
+    var global_policy = SecurityPolicy{
+        .autonomy = .yolo,
+        .workspace_dir = base,
+        .workspace_only = false,
+        .tracker = &global_tracker,
+    };
+    sm.policy = &global_policy;
+
+    // Guest has its own autonomy but no workspace_path -> still a dedicated runtime.
+    const guest = try sm.getOrCreate("agent:guest:telegram:direct:42");
+    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+    const guest_policy = guest.agent.policy orelse return error.TestUnexpectedResult;
+    try testing.expect(guest_policy != &global_policy);
+    try testing.expectEqual(config_types.AutonomyLevel.supervised, guest_policy.autonomy);
+    try testing.expect(guest_policy.workspace_only);
+    // Supervised policy blocks command substitution; the global yolo policy allows it.
+    try testing.expect(!guest_policy.isCommandAllowed("echo $(whoami)"));
+    try testing.expect(global_policy.isCommandAllowed("echo $(whoami)"));
+    // Per-agent policies confine file-path arguments to the workspace so the
+    // guest cannot cat the global config.json; the global policy does not.
+    try testing.expect(guest_policy.confine_paths);
+    try testing.expect(!guest_policy.isCommandAllowed("cat ../../../config.json"));
+    try testing.expect(global_policy.isCommandAllowed("cat ../../../config.json"));
+
+    const guest_runtime = sm.agent_runtimes.get("guest") orelse return error.TestUnexpectedResult;
+    // The runtime config carries the agent's own autonomy, so Agent derives its
+    // exec/path/multimodal fields from it rather than the global yolo block.
+    try testing.expect(guest.agent.has_own_autonomy);
+    try testing.expect(!guest.agent.multimodal_unrestricted);
+    try testing.expectEqual(config_types.AutonomyLevel.supervised, guest_runtime.config.autonomy.level);
+    var saw_read = false;
+    for (guest_runtime.tools) |t| {
+        // Escape hatches run work under the global policy, so they are withheld.
+        try testing.expect(!std.mem.eql(u8, t.name(), "spawn"));
+        try testing.expect(!std.mem.eql(u8, t.name(), "schedule"));
+        // image_info opens any absolute path with no policy — withheld as a
+        // host-path metadata oracle.
+        try testing.expect(!std.mem.eql(u8, t.name(), "image_info"));
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const read_tool: *tools_mod.file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+        // No extra allowed paths, so absolute paths outside the workspace fail.
+        try testing.expectEqual(@as(usize, 0), read_tool.allowed_paths.len);
+        try expectPathContains(read_tool.workspace_dir, "/agents/guest/workspace");
+        saw_read = true;
+    }
+    try testing.expect(saw_read);
+
+    const parsed = try tools_mod.parseTestArgs("{\"path\": \"/tmp/nullclaw-outside-probe\"}");
+    defer parsed.deinit();
+    for (guest_runtime.tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const result = try t.execute(testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) testing.allocator.free(result.output);
+        try testing.expect(!result.success);
+        // ToolResult.fail carries a static message — do not free it.
+        try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Absolute paths not allowed") != null);
+    }
+
+    // An agent without autonomy keeps the shared global policy.
+    const plain = try sm.getOrCreate("agent:plain:telegram:direct:42");
+    try testing.expect(plain.agent.policy == &global_policy);
+    try testing.expect(!plain.agent.has_own_autonomy);
+    // The global policy is yolo, so a non-restricted agent keeps the permissive
+    // multimodal behaviour (no regression).
+    try testing.expect(plain.agent.multimodal_unrestricted);
+    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+
+    // A dedicated runtime without an autonomy block keeps the escape hatches.
+    const worker = try sm.getOrCreate("agent:worker:telegram:direct:42");
+    try testing.expect(worker.agent.policy == &global_policy);
+    const worker_runtime = sm.agent_runtimes.get("worker") orelse return error.TestUnexpectedResult;
+    var saw_spawn = false;
+    var saw_schedule = false;
+    var saw_image_info = false;
+    for (worker_runtime.tools) |t| {
+        if (std.mem.eql(u8, t.name(), "spawn")) saw_spawn = true;
+        if (std.mem.eql(u8, t.name(), "schedule")) saw_schedule = true;
+        if (std.mem.eql(u8, t.name(), "image_info")) saw_image_info = true;
+    }
+    try testing.expect(saw_spawn);
+    try testing.expect(saw_schedule);
+    try testing.expect(saw_image_info);
+}
+
+test "reply attachment markers escaping the workspace are dropped for an agent with its own autonomy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
+    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    try tmp_dir.writeFile(.{ .sub_path = "ok.txt", .data = "hi" });
+
+    const inside = try std.fmt.allocPrint(testing.allocator, "{s}/ok.txt", .{base});
+    defer testing.allocator.free(inside);
+    const reply = try std.fmt.allocPrint(
+        testing.allocator,
+        "here [DOCUMENT:/etc/passwd] and [FILE:{s}]",
+        .{inside},
+    );
+    defer testing.allocator.free(reply);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+
+    var mock = MockProvider{ .response = reply };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    // Simulate a named agent that carries its own autonomy (has_own_autonomy is
+    // set from the named-agent profile in Agent.fromConfigWithProfile).
+    const session = try sm.getOrCreate("user:1");
+    session.agent.has_own_autonomy = true;
+
+    const resp = try sm.processMessage("user:1", "hello", null);
+    defer testing.allocator.free(resp);
+    // The absolute path outside the workspace is dropped...
+    try testing.expect(std.mem.indexOf(u8, resp, "/etc/passwd") == null);
+    // ...while the in-workspace attachment survives.
+    try testing.expect(std.mem.indexOf(u8, resp, "ok.txt") != null);
+}
+
+test "reply attachment markers are kept for an agent without its own autonomy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
+    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+
+    var mock = MockProvider{ .response = "here [DOCUMENT:/etc/passwd] bye" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const resp = try sm.processMessage("user:1", "hello", null);
+    defer testing.allocator.free(resp);
+    // No regression: an agent without its own autonomy keeps the current
+    // behaviour (the channel decides whether to upload).
+    try testing.expect(std.mem.indexOf(u8, resp, "/etc/passwd") != null);
+}
+
+test "handleLocalSlashCommand drops escaping attachment markers for an agent with its own autonomy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
+    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:guest:telegram:direct:42";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.has_own_autonomy = true;
+
+    // A command that returns text containing an escaping marker is filtered:
+    // /whoami returns status text. We test filterOutboundAttachmentMarkers
+    // via a synthetic response to ensure handleLocalSlashCommand threads it.
+    const synthetic = "Status [DOCUMENT:/etc/passwd] done";
+    const filtered = try sm.filterOutboundAttachmentMarkers(session, try testing.allocator.dupe(u8, synthetic));
+    defer testing.allocator.free(filtered);
+    try testing.expect(std.mem.indexOf(u8, filtered, "/etc/passwd") == null);
+    try testing.expect(std.mem.indexOf(u8, filtered, "Status") != null);
 }
 
 test "handleLocalSlashCommand activates interactive skill session" {

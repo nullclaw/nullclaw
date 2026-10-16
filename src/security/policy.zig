@@ -102,6 +102,16 @@ pub const SecurityPolicy = struct {
     /// When true, skip the single-`&` check entirely so that bare
     /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
     allow_raw_url_chars: bool = false,
+    /// When true, EVERY command argument that names a path must resolve inside
+    /// the workspace: absolute paths, `..` traversal and `~` expansion are
+    /// rejected, and commands that execute code taken from the workspace
+    /// (package managers and their run/build verbs) are refused outright,
+    /// because such code runs with the agent's privileges and can read anything
+    /// the confinement hides. Set for per-agent policies so a restricted agent
+    /// cannot reach files outside its workspace (e.g. the global config.json or
+    /// /etc/passwd) through the shell tool when no external sandbox is active.
+    /// Left off for the global policy so existing setups keep their behaviour.
+    confine_paths: bool = false,
     tracker: ?*RateTracker = null,
 
     /// Classify command risk level.
@@ -682,17 +692,187 @@ fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool 
     return true;
 }
 
+/// True when no argument of `full_cmd` names a path outside the workspace: no
+/// absolute paths, no `..` traversal and no `~` expansion. Option values joined
+/// with `=` (e.g. `--file=/etc/passwd`) are checked by their value. The first
+/// token (the command itself) is skipped. Applied to every command argument for
+/// a confined policy — a command-specific allowlist is brittle, as
+/// `git diff --no-index <path>` reads any file without naming a file-reading
+/// command.
+/// A confined command may only contain bytes the shell takes literally, plus
+/// plain spaces between words and the separators the segment splitter already
+/// understands (`;`, `|`, `&&`, `||`). Every quote, redirection, escape,
+/// expansion or glob byte is refused, so the words the path check inspects are
+/// exactly the words `/bin/sh -c` passes to the command. Without this the
+/// check reads raw text the shell later rewrites: `cat ''/etc/passwd`
+/// concatenates to an absolute path, `cat '..'/x` hides a traversal, and
+/// `cat </etc/passwd` reads through an input redirection.
+fn confinedCommandCharsSafe(cmd: []const u8) bool {
+    for (cmd) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or switch (c) {
+            ' ', '-', '_', '.', '/', ',', ':', '=', '+', '@', '%', '^', ';', '|', '&' => true,
+            else => false,
+        } or c >= 0x80;
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn argsConfinedToWorkspace(full_cmd: []const u8) bool {
+    // Split on every byte the shell treats as IFS whitespace (space, tab,
+    // newline, vertical tab, form feed), not just space: the command is run by
+    // `/bin/sh -c`, which word-splits on all of them, so `cat x\t/etc/passwd`
+    // is `cat x /etc/passwd`. Splitting on space alone would keep
+    // "x\t/etc/passwd" as one token that is neither absolute nor a `..`
+    // traversal and let it through. Control bytes are also rejected outright
+    // (see commandHasControlChar) so this is defence in depth.
+    var iter = std.mem.tokenizeAny(u8, full_cmd, " \t\n\x0b\x0c");
+    _ = iter.next(); // skip the command word
+    while (iter.next()) |raw_arg| {
+        const arg = trimMatchingQuotes(std.mem.trim(u8, raw_arg, " \t"));
+        if (arg.len == 0) continue;
+        var candidate = arg;
+        if (std.mem.indexOfScalar(u8, arg, '=')) |eq| candidate = arg[eq + 1 ..];
+        if (candidate.len == 0) continue;
+        if (candidate[0] == '~') return false;
+        if (std_compat.fs.path.isAbsolute(candidate)) return false;
+        if (hasParentTraversalSegment(candidate)) return false;
+    }
+    return true;
+}
+
+/// Commands that execute code taken from the workspace (or fetched from the
+/// network) under the agent process's privileges. A confined policy refuses
+/// them outright: their build/run verbs run arbitrary code that ignores the
+/// workspace confinement (e.g. `cargo build` runs build.rs, `npm run <script>`
+/// and `npm exec` run package scripts), which is a full shell escape even when
+/// every argument names a path inside the workspace. Their network/state verbs
+/// (`install`, `add`, `publish`, …) are already medium risk and blocked.
+fn commandExecutesArbitraryCode(base: []const u8) bool {
+    const runners = [_][]const u8{ "npm", "pnpm", "yarn", "npx", "bun", "bunx", "deno", "cargo" };
+    for (runners) |name| {
+        if (std.mem.eql(u8, base, name)) return true;
+    }
+    return false;
+}
+
+/// True when `cmd` contains a shell construct that expands at execution time
+/// into text the workspace confinement never inspects. Two families:
+///   * a `$` expansion — `$IFS`, `$HOME`, `$1`, `$@`, `${...}`, `$(...)`, and
+///     ANSI-C quoting `$'...'` — which the shell substitutes before the command
+///     runs, so `cat $IFS/etc/passwd` becomes `cat /etc/passwd` while the raw
+///     argument names no absolute path. Any `$` outside single quotes is
+///     rejected: a `$` expansion also happens inside double quotes, and `$'...'`
+///     can synthesize separators from escape sequences, so the raw character is
+///     the only reliable thing to check. A single-quoted `$` is literal and
+///     stays allowed.
+///   * an unquoted glob/brace metacharacter — `cat {.,..}/etc/passwd`
+///     brace-expands to `cat ../etc/passwd`. Quoted metacharacters are literal
+///     and stay allowed (e.g. `find . -name '*.txt'`).
+fn commandHasShellExpansion(cmd: []const u8) bool {
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < cmd.len) : (i += 1) {
+        const c = cmd[i];
+        if (quote == '\'') {
+            if (c == '\'') quote = 0;
+            continue; // single quotes: everything literal, including `$` and globs
+        }
+        // A backslash outside single quotes is unescaped by the shell after the
+        // argument check has run on the raw text, so `cat \/etc/passwd` names
+        // an absolute path the check never sees. Refuse every escape instead of
+        // reproducing the shell's unescaping rules.
+        if (c == '\\') return true;
+        if (c == '$') return true;
+        if (quote == '"') {
+            if (c == '"') quote = 0;
+            continue; // double quotes still expand `$` (checked above) but not globs
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+            continue;
+        }
+        if (c == '*' or c == '?' or c == '[' or c == ']' or c == '{' or c == '}') return true;
+    }
+    return false;
+}
+
+/// True when `cmd` contains an ASCII control byte (tab, newline, vertical tab,
+/// form feed, carriage return, DEL, …). The shell word-splits on the IFS
+/// whitespace bytes, so a control byte smuggled inside an otherwise in-workspace
+/// token (`x\t/etc/passwd`) becomes a second word (`/etc/passwd`) that the
+/// argument check never inspected. `normalizeCommand` only rewrites `\n` `;` `|`
+/// and `&&`/`||`, so a tab reaches the analysis intact. A confined policy
+/// rejects every control byte outright: no legitimate single command needs one.
+fn commandHasControlChar(cmd: []const u8) bool {
+    for (cmd) |c| {
+        if (c < 0x20 or c == 0x7f) return true;
+    }
+    return false;
+}
+
+/// Git subcommands that run a command or script taken from the workspace (or
+/// the object store) under the agent's privileges, regardless of the arguments:
+/// `git bisect run ./script`, `git submodule foreach ...`,
+/// `git filter-branch --tree-filter ...`, `git filter-repo ...`. The executed
+/// code is named by the subcommand, not by a path argument, so the per-argument
+/// workspace check never sees it — the same class as the package managers, and
+/// a confined policy refuses them for the same reason. Scanned across all
+/// arguments (over-broad on purpose: a confined guest can rename a file rather
+/// than pass it to a read-only git verb).
+fn gitArgsExecuteArbitraryCode(full_cmd: []const u8) bool {
+    var iter = std.mem.tokenizeAny(u8, full_cmd, " \t\n\x0b\x0c");
+    _ = iter.next(); // skip "git"
+    while (iter.next()) |arg| {
+        if (std.ascii.eqlIgnoreCase(arg, "bisect") or
+            std.ascii.eqlIgnoreCase(arg, "submodule") or
+            std.ascii.eqlIgnoreCase(arg, "filter-branch") or
+            std.ascii.eqlIgnoreCase(arg, "filter-repo"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn isArgsSafe(self: *const SecurityPolicy, base_cmd: []const u8, full_cmd: []const u8) bool {
     const lower_base = lowerBuf(base_cmd);
     const lower_cmd = lowerBuf(full_cmd);
     const base = lower_base.slice();
     const cmd = lower_cmd.slice();
 
+    // Per-agent workspace confinement (confine_paths): a restricted agent must
+    // not reach files outside its workspace through the shell tool when no
+    // external sandbox is active. Applied to EVERY command rather than a
+    // file-reading denylist (which `git diff --no-index` and friends slip past):
+    // reject commands that execute workspace code (the package managers and the
+    // git subcommands that run a script), reject shell expansions and control
+    // bytes the argument check never sees, and reject any argument that names an
+    // absolute path, a `..` traversal or `~`.
+    if (self.confine_paths) {
+        if (!confinedCommandCharsSafe(full_cmd)) return false;
+        if (commandExecutesArbitraryCode(base)) return false;
+        if (std.mem.eql(u8, base, "git") and gitArgsExecuteArbitraryCode(full_cmd)) return false;
+        if (commandHasShellExpansion(full_cmd)) return false;
+        if (commandHasControlChar(full_cmd)) return false;
+        if (!argsConfinedToWorkspace(full_cmd)) return false;
+    }
+
     if (std.mem.eql(u8, base, "find")) {
-        // find -exec and find -ok allow arbitrary command execution
+        // find -exec/-execdir/-ok/-okdir run commands; -delete removes files;
+        // -fprint/-fprint0/-fprintf/-fls write to a file named by the next
+        // argument.
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
         while (iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "-exec") or std.mem.eql(u8, arg, "-ok")) {
+                return false;
+            }
+            if (self.confine_paths and (std.mem.eql(u8, arg, "-execdir") or
+                std.mem.eql(u8, arg, "-okdir") or
+                std.mem.eql(u8, arg, "-delete") or
+                std.mem.startsWith(u8, arg, "-fprint") or
+                std.mem.eql(u8, arg, "-fls")))
+            {
                 return false;
             }
         }
@@ -1546,6 +1726,172 @@ test "git -C stays workspace-scoped while lowercase -c remains blocked" {
 test "git -C absolute paths are allowed when workspace_only is disabled" {
     const p = SecurityPolicy{ .workspace_only = false };
     try std.testing.expect(p.isCommandAllowed("git -C /tmp/repo log"));
+}
+
+test "confine_paths blocks file args escaping the workspace" {
+    const confined = SecurityPolicy{ .confine_paths = true };
+    // Absolute paths and `..` traversal are rejected for any command, not just
+    // the file-reading ones.
+    try std.testing.expect(!confined.isCommandAllowed("cat /etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat ../../../config.json"));
+    try std.testing.expect(!confined.isCommandAllowed("cat ../config.json"));
+    try std.testing.expect(!confined.isCommandAllowed("cat --file=/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("head -n 5 /etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("tail /var/log/syslog"));
+    try std.testing.expect(!confined.isCommandAllowed("grep -r secret /etc"));
+    try std.testing.expect(!confined.isCommandAllowed("wc -l /etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("ls /root"));
+    try std.testing.expect(!confined.isCommandAllowed("find / -name id_rsa"));
+    // `git` is allowlisted but is not a file-reading command, so the old
+    // per-command denylist let `git diff --no-index <path>` read any host file.
+    // The general rule rejects the escaping path argument instead.
+    try std.testing.expect(!confined.isCommandAllowed("git diff --no-index /etc/passwd /dev/null"));
+    try std.testing.expect(!confined.isCommandAllowed("git diff --no-index ../../config.json /dev/null"));
+    try std.testing.expect(!confined.isCommandAllowed("git log --output=/tmp/x"));
+    // Package managers run code taken from the workspace (build.rs, npm scripts)
+    // with the agent's privileges, so they are refused regardless of arguments.
+    try std.testing.expect(!confined.isCommandAllowed("cargo build --release"));
+    try std.testing.expect(!confined.isCommandAllowed("cargo run"));
+    try std.testing.expect(!confined.isCommandAllowed("npm run build"));
+    try std.testing.expect(!confined.isCommandAllowed("npm exec foo"));
+    try std.testing.expect(!confined.isCommandAllowed("npx cowsay hi"));
+    // Relative paths inside the workspace are still allowed, and so are
+    // path-free commands that do not execute workspace code.
+    try std.testing.expect(confined.isCommandAllowed("cat file.txt"));
+    try std.testing.expect(confined.isCommandAllowed("ls -la"));
+    try std.testing.expect(confined.isCommandAllowed("grep foo notes/todo.md"));
+    try std.testing.expect(!confined.isCommandAllowed("find . -name '*.txt'"));
+    try std.testing.expect(confined.isCommandAllowed("git status"));
+    try std.testing.expect(confined.isCommandAllowed("git log --oneline"));
+
+    // The default (global) policy keeps its existing behaviour: confinement is
+    // opt-in for per-agent policies only.
+    const global = SecurityPolicy{};
+    try std.testing.expect(global.isCommandAllowed("cat /etc/passwd"));
+    try std.testing.expect(global.isCommandAllowed("ls /root"));
+    try std.testing.expect(global.isCommandAllowed("cargo build --release"));
+}
+
+test "confine_paths refuses quotes, redirections and find write predicates" {
+    const confined = SecurityPolicy{ .confine_paths = true };
+    // Quote-in-word concatenation: the shell joins '' and /etc/passwd.
+    try std.testing.expect(!confined.isCommandAllowed("cat ''/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat \"\"/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat '..'/config.json"));
+    // Input redirection glued to the path.
+    try std.testing.expect(!confined.isCommandAllowed("cat </etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat 0</etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("head <../config.json"));
+    // find predicates that run commands, delete, or write to a named file.
+    try std.testing.expect(!confined.isCommandAllowed("find . -fprint leak.txt"));
+    try std.testing.expect(!confined.isCommandAllowed("find . -fprintf leak.txt %f"));
+    try std.testing.expect(!confined.isCommandAllowed("find . -fls leak.txt"));
+    try std.testing.expect(!confined.isCommandAllowed("find . -delete"));
+    try std.testing.expect(!confined.isCommandAllowed("find . -execdir id"));
+    // Plain workspace commands still work.
+    try std.testing.expect(confined.isCommandAllowed("ls -la"));
+    try std.testing.expect(confined.isCommandAllowed("cat notes/a.txt"));
+    try std.testing.expect(confined.isCommandAllowed("grep -n todo src/main.zig"));
+    try std.testing.expect(confined.isCommandAllowed("find . -name a.txt"));
+    try std.testing.expect(confined.isCommandAllowed("ls docs && wc -l notes.txt"));
+    // The global policy keeps its behaviour.
+    const global = SecurityPolicy{};
+    try std.testing.expect(global.isCommandAllowed("find . -delete"));
+}
+
+test "confine_paths blocks shell $ parameter expansion" {
+    const confined = SecurityPolicy{ .confine_paths = true };
+    // `$IFS` expands to whitespace, so `cat $IFS/etc/passwd` runs
+    // `cat /etc/passwd` even though the raw argument names no absolute path.
+    try std.testing.expect(!confined.isCommandAllowed("cat $IFS/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat $HOME/x"));
+    try std.testing.expect(!confined.isCommandAllowed("cat $PWD/config.json"));
+    try std.testing.expect(!confined.isCommandAllowed("head $1"));
+    try std.testing.expect(!confined.isCommandAllowed("cat $@"));
+    try std.testing.expect(!confined.isCommandAllowed("ls $*"));
+    try std.testing.expect(!confined.isCommandAllowed("cat \"$HOME/x\""));
+    try std.testing.expect(!confined.isCommandAllowed("cat \"$IFS/etc/passwd\""));
+    // ANSI-C quoting expands escape sequences into path characters:
+    // `$'\057etc\057passwd'` is `/etc/passwd`.
+    try std.testing.expect(!confined.isCommandAllowed("cat $'\\057etc\\057passwd'"));
+    // A backslash outside single quotes is unescaped by the shell after the
+    // check, so `\/etc/passwd` is `/etc/passwd`.
+    try std.testing.expect(!confined.isCommandAllowed("cat \\/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat \\/etc\\/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("head -n1 x \\/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat \"\\/etc/passwd\""));
+    try std.testing.expect(!confined.isCommandAllowed("cat \\.\\./config.json"));
+    // Quotes are refused outright for a confined command (see
+    // confinedCommandCharsSafe), even where they would be harmless.
+    try std.testing.expect(!confined.isCommandAllowed("grep -n 'a\\b' notes.txt"));
+    // Any quote is refused, even single quotes around a literal `$`.
+    try std.testing.expect(!confined.isCommandAllowed("grep -n 'a$' notes.txt"));
+    try std.testing.expect(confined.isCommandAllowed("grep foo file.txt"));
+    // The global policy keeps its behaviour.
+    const global = SecurityPolicy{};
+    try std.testing.expect(global.isCommandAllowed("cat $IFS/etc/passwd"));
+    try std.testing.expect(global.isCommandAllowed("cat $HOME/x"));
+}
+
+test "confine_paths blocks unquoted glob and brace expansion" {
+    const confined = SecurityPolicy{ .confine_paths = true };
+    // Brace expansion synthesizes separators and `..`: `cat {.,..}/etc/passwd`
+    // expands to `cat ./etc/passwd ../etc/passwd`.
+    try std.testing.expect(!confined.isCommandAllowed("cat {.,..}/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat {/,}etc/passwd"));
+    // Unquoted glob metacharacters are refused outright.
+    try std.testing.expect(!confined.isCommandAllowed("ls *.txt"));
+    try std.testing.expect(!confined.isCommandAllowed("ls ?.txt"));
+    try std.testing.expect(!confined.isCommandAllowed("ls [a-z]*.txt"));
+    // Quoting a glob would make it literal, but quotes are refused outright.
+    try std.testing.expect(!confined.isCommandAllowed("find . -name '*.txt'"));
+    try std.testing.expect(!confined.isCommandAllowed("grep foo 'a*b' notes.txt"));
+    // The global policy keeps its behaviour.
+    const global = SecurityPolicy{};
+    try std.testing.expect(global.isCommandAllowed("cat {.,..}/etc/passwd"));
+    try std.testing.expect(global.isCommandAllowed("ls *.txt"));
+}
+
+test "confine_paths blocks IFS-whitespace and control-byte argument splitting" {
+    const confined = SecurityPolicy{ .confine_paths = true };
+    // `/bin/sh -c` word-splits on tab as well as space, so `cat x\t/etc/passwd`
+    // runs `cat x /etc/passwd`. Splitting on space alone left "x\t/etc/passwd"
+    // as one token that named no absolute path.
+    try std.testing.expect(!confined.isCommandAllowed("cat x\t/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("head -1 x\t/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat x\t~/config.json"));
+    try std.testing.expect(!confined.isCommandAllowed("ls -la\t/etc"));
+    // The other IFS whitespace bytes and a stray carriage return / DEL are
+    // rejected outright (no legitimate single command contains one).
+    try std.testing.expect(!confined.isCommandAllowed("cat x\x0b/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat x\x0c/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat x\r/etc/passwd"));
+    try std.testing.expect(!confined.isCommandAllowed("cat x\x7f/etc/passwd"));
+    // In-workspace commands with no control byte are unaffected.
+    try std.testing.expect(confined.isCommandAllowed("cat file.txt"));
+    try std.testing.expect(confined.isCommandAllowed("grep foo notes/todo.md"));
+    // The global policy keeps its behaviour.
+    const global = SecurityPolicy{};
+    try std.testing.expect(global.isCommandAllowed("cat x\t/etc/passwd"));
+}
+
+test "confine_paths blocks git subcommands that run workspace code" {
+    const confined = SecurityPolicy{ .confine_paths = true };
+    // `git bisect run <cmd>` and the other script-running subcommands execute
+    // workspace code named by the subcommand, not by a checked path argument.
+    try std.testing.expect(!confined.isCommandAllowed("git bisect run ./script.sh"));
+    try std.testing.expect(!confined.isCommandAllowed("git bisect start"));
+    try std.testing.expect(!confined.isCommandAllowed("git submodule foreach 'sh -c id'"));
+    try std.testing.expect(!confined.isCommandAllowed("git filter-branch --tree-filter './x' HEAD"));
+    try std.testing.expect(!confined.isCommandAllowed("git -c alias.x='!id' x"));
+    try std.testing.expect(!confined.isCommandAllowed("git alias.x '!id'"));
+    // Read-only git verbs inside the workspace stay allowed.
+    try std.testing.expect(confined.isCommandAllowed("git status"));
+    try std.testing.expect(confined.isCommandAllowed("git log --oneline"));
+    try std.testing.expect(confined.isCommandAllowed("git diff"));
+    // The global policy keeps its behaviour.
+    const global = SecurityPolicy{};
+    try std.testing.expect(global.isCommandAllowed("git bisect run ./script.sh"));
 }
 
 test "echo hello | tee /tmp/out is blocked" {

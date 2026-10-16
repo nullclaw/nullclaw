@@ -495,7 +495,13 @@ fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_num
     if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
     if (!@hasField(@TypeOf(self.*), "model_name")) return null;
 
-    var cfg_opt: ?config_module.Config = if (builtin.is_test) null else config_module.Config.load(self.allocator) catch null;
+    // A restricted agent must not read the shared config.json (provider keys,
+    // base URLs). It still gets the interactive menu, but without the global
+    // provider credentials: fetchModels falls back to the public model list.
+    var cfg_opt: ?config_module.Config = if (builtin.is_test or hasOwnAutonomy(self))
+        null
+    else
+        config_module.Config.load(self.allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
 
     const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
@@ -827,6 +833,9 @@ fn configPrimaryModelMutationValue(self: anytype, model: []const u8) ![]u8 {
 
 fn persistSelectedModelToConfig(self: anytype, model: []const u8) !void {
     if (builtin.is_test) return;
+    // A restricted agent switches model for its own session only; it must not
+    // rewrite the global agents.defaults.model.primary.
+    if (hasOwnAutonomy(self)) return;
 
     const value_raw = try configPrimaryModelMutationValue(self, model);
     defer self.allocator.free(value_raw);
@@ -3910,6 +3919,16 @@ fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
 }
 
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
+    // A restricted agent must not write files outside its workspace: /export
+    // takes an arbitrary absolute path and truncates/creates it, so it is a
+    // whole-host file write primitive reachable from a bound chat peer.
+    if (hasOwnAutonomy(self)) {
+        return try self.allocator.dupe(
+            u8,
+            "The /export command is unavailable for this agent: it has its own autonomy and cannot write files outside its workspace.",
+        );
+    }
+
     const raw_path = firstToken(arg);
     const path = if (raw_path.len == 0)
         try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std_compat.time.timestamp() })
@@ -5054,7 +5073,14 @@ fn handleCapabilitiesCommand(self: anytype, arg: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, arg, " \t");
     const as_json = std.mem.eql(u8, trimmed, "--json") or std.ascii.eqlIgnoreCase(trimmed, "json");
 
-    var cfg_opt: ?config_module.Config = config_module.Config.load(self.allocator) catch null;
+    // A restricted agent must not read the shared config.json: /capabilities
+    // would otherwise report the configured channel and tool names from the
+    // global config (structural information the /config refusal closes off).
+    // Such an agent reports only its own runtime tool set (cfg = null).
+    var cfg_opt: ?config_module.Config = if (hasOwnAutonomy(self))
+        null
+    else
+        config_module.Config.load(self.allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
     const cfg_ptr: ?*const config_module.Config = if (cfg_opt) |*cfg| cfg else null;
 
@@ -5069,7 +5095,25 @@ fn handleCapabilitiesCommand(self: anytype, arg: []const u8) ![]const u8 {
     return capabilities_mod.buildSummaryText(self.allocator, cfg_ptr, runtime_tools);
 }
 
+/// True when the agent was built from a named-agent profile that carries its
+/// own autonomy block. Such an agent is barred from the global config surface:
+/// `/config` reads and rewrites the shared config.json (provider api_keys,
+/// channel bot tokens, the autonomy/security blocks) under the global policy,
+/// which would let a restricted guest both exfiltrate secrets and weaken the
+/// main agent or any agent without its own autonomy.
+fn hasOwnAutonomy(self: anytype) bool {
+    if (comptime @hasField(@TypeOf(self.*), "has_own_autonomy")) return self.has_own_autonomy;
+    return false;
+}
+
 fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
+    if (hasOwnAutonomy(self)) {
+        return try self.allocator.dupe(
+            u8,
+            "The /config command is unavailable for this agent: it has its own autonomy and cannot read or change the global configuration.",
+        );
+    }
+
     const parsed = splitFirstToken(arg);
     const action = parsed.head;
 

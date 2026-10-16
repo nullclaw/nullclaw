@@ -5,6 +5,9 @@
 //! DingTalk. Channels can consume only the subset they support.
 
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("fs_compat.zig");
+const path_security = @import("tools/path_security.zig");
 
 pub const AttachmentKind = enum {
     image,
@@ -153,6 +156,161 @@ test "outbound has_legacy_attachment_markers detects supported markers" {
 test "outbound has_legacy_attachment_markers ignores plain text" {
     try std.testing.expect(!has_legacy_attachment_markers("No attachment markers here."));
     try std.testing.expect(!has_legacy_attachment_markers("[IMAGINE:/tmp/photo.png] is not a marker."));
+}
+
+/// Restricts which local files an agent's outbound reply may attach. Set for an
+/// agent that carries its own autonomy: a local attachment target must resolve
+/// (symlinks followed) inside the agent's workspace or one of its allowed_paths.
+/// Remote http(s) URLs name no local file and are always allowed.
+pub const AttachmentScope = struct {
+    workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
+};
+
+/// True when `target` may be attached under `scope`. Remote http(s) URLs name
+/// no local file and are always allowed. A local target must be an absolute
+/// path that resolves (symlinks followed) inside the agent's workspace or one
+/// of its allowed_paths.
+///
+/// Relative targets are refused. The outbound channels
+/// (telegram/max/signal `resolveAttachmentPath`) hand a relative target
+/// straight to `curl --form file=@<target>`, which resolves it against the
+/// *process* cwd — not the workspace this check resolves against. Keeping a
+/// relative marker would therefore allow a marker that resolves to a
+/// workspace file here while the channel uploads a different, cwd-relative
+/// file (e.g. the real config.json).
+pub fn attachmentTargetAllowed(
+    allocator: std.mem.Allocator,
+    scope: AttachmentScope,
+    target: []const u8,
+) bool {
+    const trimmed = std.mem.trim(u8, target, " \t");
+    if (trimmed.len == 0) return false;
+    if (std.mem.startsWith(u8, trimmed, "http://") or std.mem.startsWith(u8, trimmed, "https://")) return true;
+    if (!std_compat.fs.path.isAbsolute(trimmed)) return false;
+
+    const resolved = fs_compat.realpathAllocPath(allocator, trimmed) catch return false;
+    defer allocator.free(resolved);
+    const ws_resolved = fs_compat.realpathAllocPath(allocator, scope.workspace_dir) catch return false;
+    defer allocator.free(ws_resolved);
+    return path_security.isResolvedPathAllowed(allocator, resolved, ws_resolved, scope.allowed_paths);
+}
+
+const legacy_marker_kinds = [_][]const u8{ "image", "photo", "file", "document", "video", "audio", "voice" };
+
+/// Return the target of a legacy `[KIND:target]` attachment marker, or null when
+/// `marker` (the text between the brackets) is not a known marker.
+fn legacyMarkerTarget(marker: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, marker, ':') orelse return null;
+    const kind = std.mem.trim(u8, marker[0..colon], " ");
+    for (legacy_marker_kinds) |known| {
+        if (std.ascii.eqlIgnoreCase(kind, known)) {
+            const target = std.mem.trim(u8, marker[colon + 1 ..], " ");
+            return if (target.len == 0) null else target;
+        }
+    }
+    return null;
+}
+
+/// Remove legacy attachment markers whose local target escapes `scope` (an
+/// agent's workspace + allowed_paths). Remote URL targets are kept. Returns an
+/// owned copy of `text`; each dropped marker is logged. Used to keep an agent
+/// with its own autonomy from exfiltrating files outside its workspace through
+/// its reply text, independent of tool calls.
+pub fn stripEscapingAttachmentMarkers(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    scope: AttachmentScope,
+) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var cursor: usize = 0;
+    while (cursor < text.len) {
+        const open = std.mem.indexOfPos(u8, text, cursor, "[") orelse {
+            try out.appendSlice(allocator, text[cursor..]);
+            break;
+        };
+        try out.appendSlice(allocator, text[cursor..open]);
+
+        const close = std.mem.indexOfPos(u8, text, open, "]") orelse {
+            try out.appendSlice(allocator, text[open..]);
+            break;
+        };
+
+        const marker = text[open + 1 .. close];
+        if (legacyMarkerTarget(marker)) |target| {
+            if (attachmentTargetAllowed(allocator, scope, target)) {
+                try out.appendSlice(allocator, text[open .. close + 1]);
+            } else {
+                std.log.warn("dropped outbound attachment marker outside the agent workspace: {s}", .{marker});
+            }
+        } else {
+            try out.appendSlice(allocator, text[open .. close + 1]);
+        }
+        cursor = close + 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "attachmentTargetAllowed keeps workspace files and rejects escapes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    const base = try dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try dir.writeFile(.{ .sub_path = "notes.txt", .data = "hi" });
+    const inside = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "notes.txt" });
+    defer std.testing.allocator.free(inside);
+
+    const scope = AttachmentScope{ .workspace_dir = base };
+    try std.testing.expect(attachmentTargetAllowed(std.testing.allocator, scope, inside));
+    // Relative targets are refused because the channel uploader resolves them
+    // against the process cwd instead of the workspace.
+    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "notes.txt"));
+    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "./notes.txt"));
+    // Absolute paths outside the workspace, and `..` traversal, are refused.
+    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "/etc/passwd"));
+    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "../../config.json"));
+    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "/nonexistent-nullclaw-probe.txt"));
+    // Remote URLs name no local file.
+    try std.testing.expect(attachmentTargetAllowed(std.testing.allocator, scope, "https://example.com/x.png"));
+}
+
+test "stripEscapingAttachmentMarkers drops escapes and keeps workspace and urls" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    const base = try dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try dir.writeFile(.{ .sub_path = "report.pdf", .data = "hi" });
+    const inside = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "report.pdf" });
+    defer std.testing.allocator.free(inside);
+
+    const scope = AttachmentScope{ .workspace_dir = base };
+
+    const keep = try std.fmt.allocPrint(std.testing.allocator, "see [DOCUMENT:{s}] and [IMAGE:https://example.com/a.png]", .{inside});
+    defer std.testing.allocator.free(keep);
+    const kept = try stripEscapingAttachmentMarkers(std.testing.allocator, keep, scope);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "report.pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "https://example.com/a.png") != null);
+
+    // A marker pointing at an absolute path outside the workspace is dropped,
+    // while surrounding text survives.
+    const escape = "here you go [DOCUMENT:/etc/passwd] bye";
+    const stripped = try stripEscapingAttachmentMarkers(std.testing.allocator, escape, scope);
+    defer std.testing.allocator.free(stripped);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "/etc/passwd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "here you go") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "bye") != null);
+
+    // Non-marker brackets are untouched.
+    const plain = try stripEscapingAttachmentMarkers(std.testing.allocator, "hello [world] there", scope);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("hello [world] there", plain);
 }
 
 test "Payload toPlainText includes structured card fields and choices" {
