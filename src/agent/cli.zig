@@ -39,9 +39,9 @@ const commands = @import("commands.zig");
 const cost_mod = @import("../cost.zig");
 
 const CliStreamCtx = struct {
-    sink: streaming.Sink,
+    sink: streaming.Sink = undefined,
     emitted_text: bool = false,
-    filter: streaming.TagFilter = undefined,
+    filter: streaming.TagFilter = .{},
     /// When true, the streaming callback drops live token chunks; the full
     /// reply is printed once at end-of-turn so it can pass through
     /// `redactor.unredact()` and the user sees originals instead of
@@ -49,7 +49,12 @@ const CliStreamCtx = struct {
     /// the hood (lower TTFB, request can still be cancelled), only the live
     /// terminal render is suppressed.
     suppress_live: bool = false,
-    think_filter: streaming.ThinkPassthroughFilter = undefined,
+    think_filter: streaming.ThinkPassthroughFilter = .{},
+
+    fn deinit(self: *CliStreamCtx) void {
+        self.filter.deinit();
+        self.think_filter.deinit();
+    }
 };
 
 const CliProviderContext = struct {
@@ -174,6 +179,9 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
     filter.* = streaming.TagFilter.init(raw_sink);
+    // The terminal is append-only, so an orphan reasoning closer would print as
+    // a raw `</ifm|think>` with no way to drop the leaked draft before it.
+    filter.orphan_think_closer = .suppress;
     return filter.sink();
 }
 
@@ -181,6 +189,7 @@ fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) str
 /// instead of stripping them. Used when reasoning_mode == .stream.
 fn makeCliStreamSinkPassthrough(raw_sink: streaming.Sink, filter: *streaming.ThinkPassthroughFilter) streaming.Sink {
     filter.* = streaming.ThinkPassthroughFilter.init(raw_sink);
+    filter.filter.orphan_think_closer = .suppress;
     return filter.sink();
 }
 
@@ -649,6 +658,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             .sink = undefined,
             .suppress_live = shouldSuppressLiveForRedaction(agent.redactor, message),
         };
+        defer stream_ctx.deinit();
         const raw_stream_sink = streaming.Sink{
             .callback = cliStreamSinkCallback,
             .ctx = @ptrCast(&stream_ctx),
@@ -788,6 +798,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .sink = undefined,
         .suppress_live = false,
     };
+    defer stream_ctx.deinit();
     const raw_stream_sink = streaming.Sink{
         .callback = cliStreamSinkCallback,
         .ctx = @ptrCast(&stream_ctx),
@@ -1054,6 +1065,7 @@ test "cliStreamCallback handles empty delta" {
             .ctx = @ptrCast(&sink_ctx),
         },
     };
+    defer ctx.deinit();
     const chunk = providers.StreamChunk.finalChunk();
     cliStreamCallback(@ptrCast(&ctx), chunk);
     try std.testing.expect(!ctx.emitted_text);
@@ -1088,6 +1100,7 @@ test "cliStreamCallback text delta chunk" {
     var ctx = CliStreamCtx{
         .sink = undefined,
     };
+    defer ctx.deinit();
     const raw_sink = streaming.Sink{
         .callback = cliStreamSinkCallback,
         .ctx = @ptrCast(&ctx),
@@ -1115,7 +1128,8 @@ test "makeCliStreamSink strips streamed tool_call markup" {
     };
 
     var collector = Collector{};
-    var filter: streaming.TagFilter = undefined;
+    var filter: streaming.TagFilter = .{};
+    defer filter.deinit();
     const raw_sink = streaming.Sink{
         .callback = Collector.callback,
         .ctx = @ptrCast(&collector),
@@ -1123,6 +1137,7 @@ test "makeCliStreamSink strips streamed tool_call markup" {
     const filtered_sink = makeCliStreamSink(raw_sink, &filter);
 
     var ctx = CliStreamCtx{ .sink = filtered_sink };
+    defer ctx.deinit();
     cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta(
         "Let me check the projects for you.<tool_call>{\"name\":\"mcp_vikunja_vikunja_list_projects\",\"arguments\":{}}</tool_call>",
     ));
@@ -1131,10 +1146,77 @@ test "makeCliStreamSink strips streamed tool_call markup" {
     try std.testing.expectEqualStrings("Let me check the projects for you.", collector.buf[0..collector.len]);
 }
 
+test "makeCliStreamSinkPassthrough hides the streamed K2 tool call" {
+    const Collector = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+
+        fn callback(ctx_ptr: *anyopaque, event: streaming.Event) void {
+            if (event.stage != .chunk or event.text.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+            self.len += event.text.len;
+        }
+    };
+
+    var collector = Collector{};
+    var filter: streaming.ThinkPassthroughFilter = .{};
+    defer filter.deinit();
+    const raw_sink = streaming.Sink{
+        .callback = Collector.callback,
+        .ctx = @ptrCast(&collector),
+    };
+    const filtered_sink = makeCliStreamSinkPassthrough(raw_sink, &filter);
+
+    var ctx = CliStreamCtx{ .sink = filtered_sink };
+    defer ctx.deinit();
+    // Split inside "<tool_" and inside the JSON body.
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("<tool"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("_call>\n{\"name\": \"shell\", \"arg"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("uments\": {\"command\": \"echo leakcheck-5\"}}\n</tool_call>"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.finalChunk());
+
+    try std.testing.expectEqualStrings("", collector.buf[0..collector.len]);
+}
+
+test "makeCliStreamSinkPassthrough hides a tool call inside streamed reasoning" {
+    const Collector = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+
+        fn callback(ctx_ptr: *anyopaque, event: streaming.Event) void {
+            if (event.stage != .chunk or event.text.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+            self.len += event.text.len;
+        }
+    };
+
+    var collector = Collector{};
+    var filter: streaming.ThinkPassthroughFilter = .{};
+    defer filter.deinit();
+    const raw_sink = streaming.Sink{
+        .callback = Collector.callback,
+        .ctx = @ptrCast(&collector),
+    };
+    const filtered_sink = makeCliStreamSinkPassthrough(raw_sink, &filter);
+
+    var ctx = CliStreamCtx{ .sink = filtered_sink };
+    defer ctx.deinit();
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("<think>plan\n<tool"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("_call>{\"name\":\"shell\"}"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("</tool_call>\nend</think>Answer"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.finalChunk());
+
+    const expected = streaming.THINK_HEADER ++ "plan\n\nend" ++ streaming.THINK_FOOTER ++ "Answer";
+    try std.testing.expectEqualStrings(expected, collector.buf[0..collector.len]);
+}
+
 test "cliStreamCallback keeps emitted_text false for filtered tool_call-only chunk" {
     var ctx = CliStreamCtx{
         .sink = undefined,
     };
+    defer ctx.deinit();
     const raw_sink = streaming.Sink{
         .callback = cliStreamSinkCallback,
         .ctx = @ptrCast(&ctx),

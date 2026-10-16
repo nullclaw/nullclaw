@@ -1332,7 +1332,8 @@ fn processInboundMessage(
         .draft_id = outbound_draft_id,
     };
     var stream_sink: ?streaming.Sink = null;
-    var outbound_tag_filter: streaming.TagFilter = undefined;
+    var outbound_tag_filter: streaming.TagFilter = .{};
+    defer outbound_tag_filter.deinit();
     if (use_streaming_outbound) {
         const raw_sink = streaming.Sink{
             .callback = publishStreamingChunk,
@@ -1863,7 +1864,8 @@ test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
     };
 
     var collector = Collector{};
-    var filter: streaming.TagFilter = undefined;
+    var filter: streaming.TagFilter = .{};
+    defer filter.deinit();
     const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter).?;
     sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
     sink.emitFinal();
@@ -1872,12 +1874,49 @@ test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
     try std.testing.expect(collector.got_final);
 }
 
+test "makeStreamingSinkForChannel hides a tool call inside streamed reasoning" {
+    const Collector = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+
+        fn callback(ctx: *anyopaque, event: streaming.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (event.stage != .chunk or event.text.len == 0) return;
+            @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+            self.len += event.text.len;
+        }
+
+        fn sink(self: *@This()) streaming.Sink {
+            return .{ .callback = callback, .ctx = @ptrCast(self) };
+        }
+
+        fn text(self: *@This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    var collector = Collector{};
+    var filter: streaming.TagFilter = .{};
+    defer filter.deinit();
+    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter).?;
+    // Split inside "<tool_" and inside the JSON body.
+    sink.emitChunk("<think>plan\n<tool");
+    sink.emitChunk("_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"echo leakcheck-5\"}}\n</tool_call>");
+    sink.emitChunk("\nend</think>Answer");
+    sink.emitFinal();
+
+    // The channel sink strips reasoning, so only the answer survives; the
+    // tool-call tags and the JSON body never reach it.
+    try std.testing.expectEqualStrings("Answer", collector.text());
+}
+
 test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
     const Noop = struct {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
-    var filter: streaming.TagFilter = undefined;
+    var filter: streaming.TagFilter = .{};
+    defer filter.deinit();
     const sink = makeStreamingSinkForChannel(true, .{
         .callback = Noop.callback,
         .ctx = undefined,
@@ -1890,7 +1929,8 @@ test "makeStreamingSinkForChannel returns null when streaming is disabled" {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
-    var filter: streaming.TagFilter = undefined;
+    var filter: streaming.TagFilter = .{};
+    defer filter.deinit();
     const sink = makeStreamingSinkForChannel(false, .{
         .callback = Noop.callback,
         .ctx = undefined,

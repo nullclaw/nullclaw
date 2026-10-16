@@ -506,7 +506,11 @@ pub const SseStreamCtx = struct {
     request_id: []const u8,
     task_id: []const u8,
     context_id: []const u8,
-    filter: streaming.TagFilter = undefined,
+    filter: streaming.TagFilter = .{},
+
+    pub fn deinit(self: *SseStreamCtx) void {
+        self.filter.deinit();
+    }
 
     /// Write an SSE "data:" line with the given JSON payload.
     fn writeSseEvent(self: *SseStreamCtx, json_data: []const u8) void {
@@ -538,6 +542,9 @@ pub const SseStreamCtx = struct {
             .ctx = @ptrCast(self),
         };
         self.filter = streaming.TagFilter.init(raw_sink);
+        // An SSE stream is append-only: an orphan reasoning closer would emit
+        // the raw tag with no way to drop the leaked draft before it.
+        self.filter.orphan_think_closer = .suppress;
         return self.filter.sink();
     }
 };
@@ -664,6 +671,7 @@ pub fn handleStreamingRpc(
         .task_id = task.id,
         .context_id = task.context_id,
     };
+    defer sse_ctx.deinit();
     const sink = sse_ctx.makeSink();
     var progress_ctx = A2aProgressCtx{ .sse_ctx = &sse_ctx };
     const progress_sink = progress_ctx.makeSink();

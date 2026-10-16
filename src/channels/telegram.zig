@@ -3362,7 +3362,11 @@ pub const TelegramChannel = struct {
         tg_ptr: *TelegramChannel,
         chat_id: []const u8,
         draft_id: u64 = 0,
-        filter: streaming.TagFilter = undefined,
+        filter: streaming.TagFilter = .{},
+
+        pub fn deinit(self: *StreamCtx) void {
+            self.filter.deinit();
+        }
     };
 
     fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -5917,6 +5921,53 @@ test "supportsDraftPreviewTarget disables draft preview for topic targets" {
     try std.testing.expect(!supportsDraftPreviewTarget("-100123#topic:77"));
 }
 
+test "makeSink hides a K2 tool call inside streamed reasoning" {
+    const Collector = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+
+        fn callback(ctx: *anyopaque, event: streaming.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (event.stage != .chunk or event.text.len == 0) return;
+            @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+            self.len += event.text.len;
+        }
+
+        fn sink(self: *@This()) streaming.Sink {
+            return .{ .callback = callback, .ctx = @ptrCast(self) };
+        }
+
+        fn text(self: *@This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
+    ch.streaming_enabled = true;
+
+    var ctx = TelegramChannel.StreamCtx{
+        .tg_ptr = &ch,
+        .chat_id = "12345",
+        .draft_id = 1,
+    };
+    defer ctx.deinit();
+    var collector = Collector{};
+    const sink = ch.makeSink(&ctx).?;
+    // Redirect the constructed filter's output to the collector instead of the
+    // network draft sender.
+    ctx.filter.inner = collector.sink();
+
+    // Split inside "<tool_" and inside the JSON body.
+    sink.emitChunk("<think>plan\n<tool");
+    sink.emitChunk("_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"echo leakcheck-5\"}}\n</tool_call>");
+    sink.emitChunk("\nend</think>Answer");
+    sink.emitFinal();
+
+    // The draft strips reasoning, so only the answer survives; the tool-call
+    // tags and the JSON body never reach it.
+    try std.testing.expectEqualStrings("Answer", collector.text());
+}
+
 test "makeSink returns null for topic targets" {
     var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
     ch.streaming_enabled = true;
@@ -5926,6 +5977,7 @@ test "makeSink returns null for topic targets" {
         .chat_id = "-100123#topic:77",
         .draft_id = 1,
     };
+    defer ctx.deinit();
     try std.testing.expect(ch.makeSink(&ctx) == null);
 }
 

@@ -932,17 +932,17 @@ pub const Agent = struct {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
     }
 
-    fn selectDisplayText(response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
+    fn selectDisplayText(allocator: std.mem.Allocator, response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
         if (parsed_calls_len > 0) return parsed_text;
         if (parsed_text.len > 0) {
             // Some malformed/unclosed tool-call payloads can survive into parsed_text
             // via parser recovery fallbacks. Suppress them from user-visible output.
-            if (dispatcher.containsToolCallMarkup(parsed_text)) return "";
+            if (dispatcher.containsToolCallMarkup(allocator, parsed_text)) return "";
             return parsed_text;
         }
         // If tool-call markup exists but parsing produced no valid calls/text,
         // never show the raw payload to the user.
-        if (dispatcher.containsToolCallMarkup(response_text)) return "";
+        if (dispatcher.containsToolCallMarkup(allocator, response_text)) return "";
         return response_text;
     }
 
@@ -2547,7 +2547,7 @@ pub const Agent = struct {
             // When tool calls are present, only show parsed plain text (if any).
             // Never fall back to raw response_text here, otherwise markup like
             // <tool_call>...</tool_call> can leak to users.
-            const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
+            const display_text = selectDisplayText(self.allocator, response_text, parsed_text, parsed_calls.len);
 
             if (parsed_calls.len == 0) {
                 const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
@@ -2574,7 +2574,9 @@ pub const Agent = struct {
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
-                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
+                    const stripped = try providers.stripToolCallMarkup(self.allocator, display_text);
+                    defer self.allocator.free(stripped);
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(stripped) });
                     try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
                         "Do it in this turn by issuing the appropriate tool call(s). " ++
                         "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") });
@@ -2589,9 +2591,11 @@ pub const Agent = struct {
                 // leaving it buffered until an unrelated future message.
                 if (injection_followups < MAX_MID_TURN_INJECTION_FOLLOWUPS) {
                     if (try self.drainPendingInjection()) |injected| {
+                        const stripped = try providers.stripToolCallMarkup(self.allocator, display_text);
+                        defer self.allocator.free(stripped);
                         try self.appendOwnedHistoryMessage(.{
                             .role = .assistant,
-                            .content = try self.dupeForHistory(display_text),
+                            .content = try self.dupeForHistory(stripped),
                         });
                         const safe_injected = try self.redactOwnedForHistory(injected);
                         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = safe_injected });
@@ -2612,10 +2616,15 @@ pub const Agent = struct {
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
                 errdefer self.allocator.free(final_text);
 
-                // Dupe from display_text directly (not from final_text) to avoid double-dupe
+                // Store the same markup-free text the user saw: composeFinalReply
+                // strips tool-call markup for delivery, so history must match it
+                // (a re-render of history must not leak the closer, and the model
+                // must not re-read its own garbled text tool call next turn).
+                const history_text = try providers.stripToolCallMarkup(self.allocator, display_text);
+                defer self.allocator.free(history_text);
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
-                    .content = try self.dupeForHistory(display_text),
+                    .content = try self.dupeForHistory(history_text),
                 });
 
                 // Auto-compaction before hard trimming to preserve context.
@@ -9848,36 +9857,45 @@ test "Agent shouldForceActionFollowThrough ignores normal final answer" {
 
 test "Agent selectDisplayText hides malformed tool markup payload" {
     const raw = "<tool_call>web_search<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>";
-    const selected = Agent.selectDisplayText(raw, "", 0);
+    const selected = Agent.selectDisplayText(std.testing.allocator, raw, "", 0);
     try std.testing.expectEqualStrings("", selected);
 }
 
 test "Agent selectDisplayText hides orphan closing tool_call tag" {
     // Model emits </tool_call> without an opener — must not leak to user.
     const raw = "Here are the results:\n</tool_call>\nSome reply";
-    const selected = Agent.selectDisplayText(raw, "", 0);
+    const selected = Agent.selectDisplayText(std.testing.allocator, raw, "", 0);
     try std.testing.expectEqualStrings("", selected);
 
     const bracket_raw = "Here are the results:\n[/tool_call]\nSome reply";
-    const bracket_selected = Agent.selectDisplayText(bracket_raw, "", 0);
+    const bracket_selected = Agent.selectDisplayText(std.testing.allocator, bracket_raw, "", 0);
     try std.testing.expectEqualStrings("", bracket_selected);
 }
 
 test "Agent selectDisplayText keeps plain text when no markup exists" {
     const raw = "All good.";
-    const selected = Agent.selectDisplayText(raw, "", 0);
+    const selected = Agent.selectDisplayText(std.testing.allocator, raw, "", 0);
     try std.testing.expectEqualStrings("All good.", selected);
 }
 
 test "Agent selectDisplayText prefers parsed text when present" {
-    const selected = Agent.selectDisplayText("<tool_call>{}</tool_call>", "let me check", 1);
+    const selected = Agent.selectDisplayText(std.testing.allocator, "<tool_call>{}</tool_call>", "let me check", 1);
     try std.testing.expectEqualStrings("let me check", selected);
 }
 
 test "Agent selectDisplayText hides malformed tool markup present in parsed text" {
     const parsed_with_markup = "Some text <tool_call>{\"name\":\"shell\"";
-    const selected = Agent.selectDisplayText(parsed_with_markup, parsed_with_markup, 0);
+    const selected = Agent.selectDisplayText(std.testing.allocator, parsed_with_markup, parsed_with_markup, 0);
     try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent selectDisplayText keeps a fenced function closer run" {
+    // Regression: a fenced sample with three or more closers made
+    // containsToolCallMarkup return true, so the whole reply was blanked and
+    // the turn went to the empty-response retry, then error.NoResponseContent.
+    const raw = "Example:\n```xml\n</function></function></function>\n```\ndone";
+    const selected = Agent.selectDisplayText(std.testing.allocator, raw, "", 0);
+    try std.testing.expectEqualStrings(raw, selected);
 }
 
 test "Agent retries empty final response once before succeeding" {

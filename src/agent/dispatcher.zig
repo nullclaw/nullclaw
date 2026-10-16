@@ -1,5 +1,6 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const json_util = @import("../json_util.zig");
 const providers = @import("../providers/root.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -92,25 +93,23 @@ pub fn parseToolCalls(
     return parseXmlToolCalls(allocator, response);
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i <= haystack.len - needle.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
 /// Detect whether the response contains explicit tool-call markup tags.
 /// Used by the agent loop to avoid leaking raw tool XML-like payloads to users
 /// when parsing fails on malformed inner content.
-pub fn containsToolCallMarkup(text: []const u8) bool {
+pub fn containsToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) bool {
+    // Only the dispatcher's own unparsed markers are checked here. A legitimate
+    // answer may discuss or quote XML `<function>`/`<parameter>` markup, or show
+    // it in a code block, without containing a tool call; a false positive makes
+    // `selectDisplayText` drop the whole reply. The one XML-`function` shape that
+    // is never prose is a *run* of dangling closers — the runaway loop — and
+    // even that is skipped inside a code sample.
     return std.mem.indexOf(u8, text, "<tool_call>") != null or
         std.mem.indexOf(u8, text, "</tool_call>") != null or
         std.mem.indexOf(u8, text, "[TOOL_CALL]") != null or
         std.mem.indexOf(u8, text, "[tool_call]") != null or
         std.mem.indexOf(u8, text, "[/TOOL_CALL]") != null or
-        std.mem.indexOf(u8, text, "[/tool_call]") != null;
+        std.mem.indexOf(u8, text, "[/tool_call]") != null or
+        providers.helpers.hasRepetitiveToolCloseRun(allocator, text);
 }
 
 fn freeParsedToolCall(allocator: std.mem.Allocator, call: ParsedToolCall) void {
@@ -135,208 +134,53 @@ fn freeParsedToolCall(allocator: std.mem.Allocator, call: ParsedToolCall) void {
 /// SECURITY: This function only extracts JSON from within explicit `<tool_call>` tags.
 /// It does NOT parse raw JSON from the response body, which prevents prompt injection
 /// where malicious content could include JSON mimicking a tool call.
+/// Parse tool calls from an LLM response using XML-style `<tool_call>` tags.
+///
+/// The block scan and the inner-call parsers live in `providers.helpers`
+/// (`parseDispatcherXmlToolCalls`), so the display paths (`streaming.TagFilter`,
+/// `stripToolCallMarkup`) and the dispatcher decide "is this a text tool call"
+/// with the *same* code. This wrapper only maps the shared result onto the
+/// dispatcher's `ParsedToolCall` and strips trailing `<tool_result>` markup from
+/// the visible text, exactly as the old in-file parser did.
 pub fn parseXmlToolCalls(
     allocator: std.mem.Allocator,
     response: []const u8,
 ) !ParseResult {
-    var text_parts: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer text_parts.deinit(allocator);
+    const shared = try providers.helpers.parseDispatcherXmlToolCalls(allocator, response);
+    allocator.free(shared.blocks);
 
-    var calls: std.ArrayListUnmanaged(ParsedToolCall) = .empty;
-    errdefer {
-        for (calls.items) |call| freeParsedToolCall(allocator, call);
-        calls.deinit(allocator);
-    }
-
-    var remaining = response;
-
-    while (true) {
-        // Find next tool call marker: either <tool_call> or [TOOL_CALL] or [tool_call]
-        const marker_info: ?struct { start: usize, end: usize, open_char: u8, close_char: u8 } = blk: {
-            const xml_start = std.mem.indexOf(u8, remaining, "<tool_call>");
-            const br_start_upper = std.mem.indexOf(u8, remaining, "[TOOL_CALL]");
-            const br_start_lower = std.mem.indexOf(u8, remaining, "[tool_call]");
-
-            var best_start: ?usize = null;
-            var open_c: u8 = '<';
-            var close_c: u8 = '>';
-            const marker_len: usize = 11;
-
-            if (xml_start) |s| {
-                best_start = s;
-            }
-            if (br_start_upper) |s| {
-                if (best_start == null or s < best_start.?) {
-                    best_start = s;
-                    open_c = '[';
-                    close_c = ']';
-                }
-            }
-            if (br_start_lower) |s| {
-                if (best_start == null or s < best_start.?) {
-                    best_start = s;
-                    open_c = '[';
-                    close_c = ']';
-                }
-            }
-
-            if (best_start) |s| {
-                break :blk .{ .start = s, .end = s + marker_len, .open_char = open_c, .close_char = close_c };
-            }
-            break :blk null;
-        };
-
-        if (marker_info == null) break;
-        const info = marker_info.?;
-        const start = info.start;
-
-        const after_open = remaining[info.end..];
-        // Flexible closing tag:
-        // 1) Prefer tags whose name contains "tool_call"
-        // 2) Fallback to the first closing tag (handles malformed outputs like </arg_value>)
-        var strict_end: ?usize = null;
-        var strict_end_tag_len: usize = 0;
-        var fallback_first_end: ?usize = null;
-        var fallback_first_end_tag_len: usize = 0;
-        var fallback_last_end: ?usize = null;
-        var fallback_last_end_tag_len: usize = 0;
-        var search_idx: usize = 0;
-        while (search_idx < after_open.len) {
-            const next_open = std.mem.indexOfScalar(u8, after_open[search_idx..], info.open_char) orelse break;
-            const abs_open = search_idx + next_open;
-            if (abs_open + 1 < after_open.len and after_open[abs_open + 1] == '/') {
-                if (std.mem.indexOfScalar(u8, after_open[abs_open..], info.close_char)) |rel_close| {
-                    const abs_close = abs_open + rel_close;
-                    const tag_content = after_open[abs_open + 2 .. abs_close];
-                    if (fallback_first_end == null) {
-                        fallback_first_end = abs_open;
-                        fallback_first_end_tag_len = rel_close + 1;
-                    }
-                    fallback_last_end = abs_open;
-                    fallback_last_end_tag_len = rel_close + 1;
-                    if (containsIgnoreCase(tag_content, "tool_call")) {
-                        strict_end = abs_open;
-                        strict_end_tag_len = rel_close + 1;
-                        break;
-                    }
-                    search_idx = abs_close + 1;
-                } else {
-                    break;
-                }
-            } else {
-                search_idx = abs_open + 1;
-            }
-        }
-
-        const found_end = strict_end orelse fallback_first_end;
-        var end_tag_len = if (strict_end != null) strict_end_tag_len else fallback_first_end_tag_len;
-
-        if (found_end) |end| {
-            // Text before the tag
-            const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
-            if (before.len > 0) {
-                try text_parts.append(allocator, before);
-            }
-
-            var selected_end = end;
-            var parsed_call: ?ParsedToolCall = null;
-
-            // If we only have malformed close-tags (no strict </tool_call>),
-            // prefer the last close-tag first. This avoids truncating when JSON
-            // arguments contain an early `</...>` string (e.g. HTML content).
-            if (strict_end == null) {
-                if (fallback_last_end) |last_end| {
-                    if (last_end != selected_end) {
-                        const last_inner = std.mem.trim(u8, after_open[0..last_end], " \t\r\n");
-                        parsed_call = try parseInnerToolCall(allocator, last_inner);
-                        if (parsed_call != null) {
-                            selected_end = last_end;
-                            end_tag_len = fallback_last_end_tag_len;
-                        }
-                    }
-                }
-            }
-
-            if (parsed_call == null) {
-                const inner = std.mem.trim(u8, after_open[0..selected_end], " \t\r\n");
-                parsed_call = try parseInnerToolCall(allocator, inner);
-            }
-
-            if (parsed_call) |call| {
-                errdefer freeParsedToolCall(allocator, call);
-                try calls.append(allocator, call);
-            }
-
-            remaining = after_open[selected_end + end_tag_len ..];
-        } else {
-            // Unclosed tag — attempt conservative recovery for compact calls emitted at
-            // end-of-message (e.g. <tool_call>memory_list{"limit":10}).
-            const inner_unclosed = std.mem.trim(u8, after_open, " \t\r\n");
-            var recovered = false;
-
-            if (inner_unclosed.len > 0) {
-                if (inner_unclosed[0] == '{' and inner_unclosed[inner_unclosed.len - 1] == '}') {
-                    if (parseToolCallJson(allocator, inner_unclosed)) |call| {
-                        errdefer freeParsedToolCall(allocator, call);
-                        const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
-                        if (before.len > 0) try text_parts.append(allocator, before);
-                        try calls.append(allocator, call);
-                        recovered = true;
-                    } else |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => {},
-                    }
-                }
-
-                if (!recovered) {
-                    if (parseNamePrefixedJsonCall(allocator, inner_unclosed)) |call| {
-                        errdefer freeParsedToolCall(allocator, call);
-                        const before = std.mem.trim(u8, remaining[0..start], " \t\r\n");
-                        if (before.len > 0) try text_parts.append(allocator, before);
-                        try calls.append(allocator, call);
-                        recovered = true;
-                    } else |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => {},
-                    }
-                }
-            }
-
-            if (!recovered) {
-                const unresolved = std.mem.trim(u8, remaining, " \t\r\n");
-                if (unresolved.len > 0) {
-                    try text_parts.append(allocator, unresolved);
-                }
-            }
-
-            remaining = "";
-            break;
-        }
-    }
-
-    // Remaining text after last tool call
-    const trailing = std.mem.trim(u8, remaining, " \t\r\n");
-    if (trailing.len > 0) {
-        try text_parts.append(allocator, trailing);
-    }
-
-    // Join text parts
-    var text = if (text_parts.items.len == 0)
-        try allocator.dupe(u8, "")
-    else
-        try std.mem.join(allocator, "\n", text_parts.items);
-    errdefer allocator.free(text);
-
-    if (calls.items.len > 0) {
-        const sanitized_text = try stripToolResultMarkup(allocator, text);
-        allocator.free(text);
-        text = sanitized_text;
-    }
-
-    return .{
-        .text = text,
-        .calls = try calls.toOwnedSlice(allocator),
+    // Map the shared calls onto the dispatcher's `ParsedToolCall` (the XML path
+    // never carries a `tool_call_id`). Every step frees what the shared parse
+    // handed over on failure, so no allocation-failure path leaks.
+    const calls = allocator.alloc(ParsedToolCall, shared.calls.len) catch |err| {
+        freeDispatcherCalls(allocator, shared.calls);
+        allocator.free(shared.text);
+        return err;
     };
+    for (shared.calls, 0..) |call, idx| {
+        calls[idx] = .{ .name = call.name, .arguments_json = call.arguments_json };
+    }
+    allocator.free(shared.calls);
+
+    if (calls.len == 0) return .{ .text = shared.text, .calls = calls };
+
+    const sanitized = stripToolResultMarkup(allocator, shared.text) catch |err| {
+        for (calls) |call| freeParsedToolCall(allocator, call);
+        allocator.free(calls);
+        allocator.free(shared.text);
+        return err;
+    };
+    allocator.free(shared.text);
+    return .{ .text = sanitized, .calls = calls };
+}
+
+/// Free a slice of shared-parse calls: their owned strings and the slice itself.
+fn freeDispatcherCalls(allocator: std.mem.Allocator, calls: []providers.DispatcherCall) void {
+    for (calls) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    allocator.free(calls);
 }
 
 /// Format tool execution results as XML for the next LLM turn.
@@ -635,830 +479,15 @@ pub fn buildAssistantHistoryWithToolCalls(
     return buf.toOwnedSlice(allocator);
 }
 
-// ── Internal helpers ────────────────────────────────────────────────────
-
-/// Strip trailing XML tags (e.g. </arg_value>, </tool_call>) from a string.
-fn stripTrailingXml(input: []const u8) []const u8 {
-    const trimmed_right = std_compat.mem.trimRight(u8, input, " \t\r\n");
-    if (trimmed_right.len == 0 or trimmed_right[trimmed_right.len - 1] != '>') return input;
-
-    const end_tag = trimmed_right.len - 1;
-    const start_tag = std.mem.lastIndexOfScalar(u8, trimmed_right[0..end_tag], '<') orelse return input;
-    if (start_tag + 1 >= trimmed_right.len) return input;
-
-    const tag_head = trimmed_right[start_tag + 1];
-    const looks_like_tag = (tag_head == '/') or
-        (tag_head >= 'a' and tag_head <= 'z') or
-        (tag_head >= 'A' and tag_head <= 'Z');
-    if (!looks_like_tag) return input;
-
-    const tag_body = trimmed_right[start_tag + 1 .. end_tag];
-    if (std.mem.indexOfScalar(u8, tag_body, '"') != null or std.mem.indexOfScalar(u8, tag_body, '\'') != null) {
-        return input;
-    }
-
-    // Found what looks like a trailing tag <...> at end-of-string.
-    return std_compat.mem.trimRight(u8, trimmed_right[0..start_tag], " \t\r\n");
-}
-
-fn isToolNameChar(c: u8) bool {
-    return switch (c) {
-        'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => true,
-        else => false,
-    };
-}
-
-fn isPlausibleToolName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |c| {
-        if (!isToolNameChar(c)) return false;
-    }
-    return true;
-}
-
-fn hasMalformedQuotedColonToolName(raw_json: []const u8) bool {
-    const name_key = "\"name\"";
-    const name_idx = std.mem.indexOf(u8, raw_json, name_key) orelse return false;
-
-    var remaining = std.mem.trimStart(u8, raw_json[name_idx + name_key.len ..], " \t\r\n");
-    if (remaining.len == 0 or remaining[0] != ':') return false;
-
-    remaining = std.mem.trimStart(u8, remaining[1..], " \t\r\n");
-    if (remaining.len < 2 or remaining[0] != '"') return false;
-
-    remaining = remaining[1..];
-    if (remaining.len == 0 or remaining[0] != ':') return false;
-
-    remaining = std.mem.trimStart(u8, remaining[1..], " \t\r\n");
-    return remaining.len > 0 and remaining[0] == '"';
-}
-
-fn recoverToolNameFromRawJson(raw_json: []const u8) ?[]const u8 {
-    const name_key = "\"name\"";
-    const arguments_key = "\"arguments\"";
-
-    const name_idx = std.mem.indexOf(u8, raw_json, name_key) orelse return null;
-    const after_name = raw_json[name_idx + name_key.len ..];
-    const colon_idx = std.mem.indexOfScalar(u8, after_name, ':') orelse return null;
-    const after_colon = after_name[colon_idx + 1 ..];
-
-    const window = if (std.mem.indexOf(u8, after_colon, arguments_key)) |args_idx|
-        after_colon[0..args_idx]
-    else
-        after_colon;
-
-    var i: usize = 0;
-    while (i < window.len) : (i += 1) {
-        if (!isToolNameChar(window[i])) continue;
-
-        const start = i;
-        var end = i + 1;
-        while (end < window.len and isToolNameChar(window[end])) : (end += 1) {}
-
-        const candidate = window[start..end];
-        if (!std.mem.eql(u8, candidate, "name") and !std.mem.eql(u8, candidate, "arguments")) {
-            return candidate;
-        }
-
-        i = end;
-    }
-
-    return null;
-}
-
-fn extractRawArgumentsJson(raw_json: []const u8) ?[]const u8 {
-    const arguments_key = "\"arguments\"";
-    const args_idx = std.mem.indexOf(u8, raw_json, arguments_key) orelse return null;
-    const after_args = raw_json[args_idx + arguments_key.len ..];
-    const colon_idx = std.mem.indexOfScalar(u8, after_args, ':') orelse return null;
-    return extractJsonObject(after_args[colon_idx + 1 ..]);
-}
-
-fn normalizeSalvagedArgumentsJson(allocator: std.mem.Allocator, raw_json: []const u8) ![]u8 {
-    const args_src = extractRawArgumentsJson(raw_json) orelse return allocator.dupe(u8, "{}");
-    var parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args_src, .{}) catch blk: {
-        const repaired = repairJson(allocator, args_src) catch return allocator.dupe(u8, "{}");
-        defer allocator.free(repaired);
-        break :blk std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch return allocator.dupe(u8, "{}");
-    };
-    defer parsed_args.deinit();
-
-    return try std.json.Stringify.valueAlloc(allocator, parsed_args.value, .{});
-}
-
-fn salvageMalformedToolCallJson(allocator: std.mem.Allocator, raw_json: []const u8) !?ParsedToolCall {
-    if (!hasMalformedQuotedColonToolName(raw_json)) return null;
-
-    const recovered_name = recoverToolNameFromRawJson(raw_json) orelse return null;
-    if (!isPlausibleToolName(recovered_name)) return null;
-
-    const args_json = try normalizeSalvagedArgumentsJson(allocator, raw_json);
-    errdefer allocator.free(args_json);
-
-    return .{
-        .name = try allocator.dupe(u8, recovered_name),
-        .arguments_json = args_json,
-    };
-}
-
-fn repairMalformedParsedToolName(
-    allocator: std.mem.Allocator,
-    raw_json: []const u8,
-    call: *ParsedToolCall,
-) !void {
-    if (!hasMalformedQuotedColonToolName(raw_json)) return;
-    if (isPlausibleToolName(call.name)) return;
-
-    const recovered_name = recoverToolNameFromRawJson(raw_json) orelse return;
-    if (!isPlausibleToolName(recovered_name)) return;
-
-    allocator.free(call.name);
-    call.name = try allocator.dupe(u8, recovered_name);
-}
-
-fn parseInnerToolCall(allocator: std.mem.Allocator, inner: []const u8) !?ParsedToolCall {
-    const malformed_quoted_colon_name = hasMalformedQuotedColonToolName(inner);
-    if (malformed_quoted_colon_name) {
-        if (try salvageMalformedToolCallJson(allocator, inner)) |recovered| {
-            return recovered;
-        }
-    }
-    if (extractJsonObject(inner)) |json_slice| {
-        if (parseToolCallJson(allocator, json_slice)) |call| {
-            if (malformed_quoted_colon_name and !isPlausibleToolName(call.name)) {
-                if (try salvageMalformedToolCallJson(allocator, inner)) |recovered| {
-                    allocator.free(call.name);
-                    allocator.free(call.arguments_json);
-                    return recovered;
-                }
-            }
-            return call;
-        } else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {},
-        }
-    }
-    if (parseFunctionTagCall(allocator, inner)) |call| {
-        return call;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {},
-    }
-    if (parseInvokeTagCall(allocator, inner)) |call| {
-        return call;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {},
-    }
-    if (parseHybridTagCall(allocator, inner)) |call| {
-        return call;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {},
-    }
-    if (parseNamePrefixedJsonCall(allocator, inner)) |call| {
-        return call;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {},
-    }
-
-    return null;
-}
-
-/// Find the first JSON object `{...}` in a string, handling nesting.
-fn extractJsonObject(input: []const u8) ?[]const u8 {
-    // Strip markdown fences if present
-    var trimmed = input;
-    if (std.mem.indexOf(u8, trimmed, "```")) |fence_start| {
-        // Skip to end of first line (after ```json or ```)
-        const after_fence = trimmed[fence_start + 3 ..];
-        if (std.mem.indexOfScalar(u8, after_fence, '\n')) |nl| {
-            trimmed = after_fence[nl + 1 ..];
-        }
-        // Strip closing fence
-        if (std.mem.lastIndexOf(u8, trimmed, "```")) |close| {
-            trimmed = trimmed[0..close];
-        }
-    }
-
-    // Find first '{' or '[' — support both objects and arrays
-    const obj_pos = std.mem.indexOfScalar(u8, trimmed, '{');
-    const arr_pos = std.mem.indexOfScalar(u8, trimmed, '[');
-
-    const start_info: struct { pos: usize, open: u8, close: u8 } = blk: {
-        if (obj_pos) |op| {
-            if (arr_pos) |ap| {
-                // Both found — pick whichever comes first
-                if (ap < op) break :blk .{ .pos = ap, .open = '[', .close = ']' };
-                break :blk .{ .pos = op, .open = '{', .close = '}' };
-            }
-            break :blk .{ .pos = op, .open = '{', .close = '}' };
-        }
-        if (arr_pos) |ap| break :blk .{ .pos = ap, .open = '[', .close = ']' };
-        return null;
-    };
-
-    var depth: usize = 0;
-    var in_string = false;
-    var escaped = false;
-    var i: usize = start_info.pos;
-    while (i < trimmed.len) : (i += 1) {
-        const c = trimmed[i];
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (c == '\\' and in_string) {
-            escaped = true;
-            continue;
-        }
-        if (c == '"') {
-            in_string = !in_string;
-            continue;
-        }
-        if (!in_string) {
-            if (c == start_info.open) depth += 1;
-            if (c == start_info.close) {
-                if (depth > 0) depth -= 1;
-                if (depth == 0) return trimmed[start_info.pos .. i + 1];
-            }
-        }
-    }
-
-    return null;
-}
-
-/// Attempt to repair common JSON issues from LLM output.
-/// Handles: trailing commas, unbalanced braces/brackets, unbalanced quotes.
-pub fn repairJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    // Step 1: Copy input, fixing trailing commas and control chars in strings
-    var in_string = false;
-    var escaped = false;
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        const c = input[i];
-        if (escaped) {
-            try buf.append(allocator, c);
-            escaped = false;
-            continue;
-        }
-        if (in_string) {
-            if (c == '\\') {
-                escaped = true;
-                try buf.append(allocator, c);
-            } else if (c == '"') {
-                in_string = false;
-                try buf.append(allocator, c);
-            } else if (c == '\n') {
-                try buf.appendSlice(allocator, "\\n");
-            } else if (c == '\r') {
-                try buf.appendSlice(allocator, "\\r");
-            } else if (c == '\t') {
-                try buf.appendSlice(allocator, "\\t");
-            } else {
-                try buf.append(allocator, c);
-            }
-        } else {
-            if (c == '"') {
-                in_string = true;
-                try buf.append(allocator, c);
-            } else if (c == ',') {
-                // Check if next non-whitespace is } or ] (trailing comma)
-                var j = i + 1;
-                while (j < input.len and (input[j] == ' ' or input[j] == '\n' or input[j] == '\r' or input[j] == '\t')) j += 1;
-                if (j < input.len and (input[j] == '}' or input[j] == ']')) {
-                    // Skip trailing comma
-                } else {
-                    try buf.append(allocator, c);
-                }
-            } else {
-                try buf.append(allocator, c);
-            }
-        }
-    }
-
-    // Step 2: Balance quotes (if odd number of unescaped quotes, add closing quote)
-    var quote_count: usize = 0;
-    var esc2 = false;
-    for (buf.items) |c| {
-        if (esc2) {
-            esc2 = false;
-            continue;
-        }
-        if (c == '\\') {
-            esc2 = true;
-            continue;
-        }
-        if (c == '"') quote_count += 1;
-    }
-    if (quote_count % 2 != 0) {
-        try buf.append(allocator, '"');
-    }
-
-    // Step 3: Balance braces and brackets
-    var brace_depth: i32 = 0;
-    var bracket_depth: i32 = 0;
-    var in_str = false;
-    var esc3 = false;
-    for (buf.items) |c| {
-        if (esc3) {
-            esc3 = false;
-            continue;
-        }
-        if (c == '\\' and in_str) {
-            esc3 = true;
-            continue;
-        }
-        if (c == '"') in_str = !in_str;
-        if (!in_str) {
-            if (c == '{') brace_depth += 1;
-            if (c == '}') brace_depth -= 1;
-            if (c == '[') bracket_depth += 1;
-            if (c == ']') bracket_depth -= 1;
-        }
-    }
-    while (bracket_depth > 0) : (bracket_depth -= 1) {
-        try buf.append(allocator, ']');
-    }
-    while (brace_depth > 0) : (brace_depth -= 1) {
-        try buf.append(allocator, '}');
-    }
-
-    return try buf.toOwnedSlice(allocator);
-}
-
-/// Parse a JSON tool call object: {"name": "...", "arguments": {...}}
-/// Tries to parse as-is first, then applies JSON repair as fallback.
-fn parseToolCallJson(allocator: std.mem.Allocator, json_str: []const u8) !ParsedToolCall {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch blk: {
-        // JSON parse failed — try repair
-        const repaired = repairJson(allocator, json_str) catch return error.InvalidToolCallFormat;
-        defer allocator.free(repaired);
-        break :blk std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch {
-            if (try salvageMalformedToolCallJson(allocator, json_str)) |call| return call;
-            return error.InvalidToolCallFormat;
-        };
-    };
-    var call = try parseToolCallJsonInner(allocator, parsed);
-    errdefer {
-        allocator.free(call.name);
-        allocator.free(call.arguments_json);
-    }
-    try repairMalformedParsedToolName(allocator, json_str, &call);
-
-    // Fail closed on implausible names (e.g. ":") and make one last
-    // attempt to recover from malformed quoted-colon payloads.
-    if (!isPlausibleToolName(call.name)) {
-        if (try salvageMalformedToolCallJson(allocator, json_str)) |recovered| {
-            allocator.free(call.name);
-            allocator.free(call.arguments_json);
-            call = recovered;
-        }
-    }
-
-    if (!isPlausibleToolName(call.name)) {
-        return error.InvalidToolName;
-    }
-
-    return call;
-}
-
-fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(std.json.Value)) !ParsedToolCall {
-    defer parsed.deinit();
-
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.InvalidToolCallFormat,
-    };
-
-    // Extract name
-    const name_val = obj.get("name") orelse return error.MissingToolName;
-    const name_str = switch (name_val) {
-        .string => |s| s,
-        else => return error.InvalidToolName,
-    };
-
-    // Robustness: strip trailing XML tags and handle JSON-in-JSON hallucinations.
-    const resolved_name_src = stripTrailingXml(std.mem.trim(u8, name_str, " \t\r\n"));
-    var resolved_name_owned: ?[]u8 = null;
-
-    if (std.mem.startsWith(u8, resolved_name_src, "{")) {
-        const inner_parsed = std.json.parseFromSlice(std.json.Value, allocator, resolved_name_src, .{}) catch null;
-        if (inner_parsed) |p| {
-            defer p.deinit();
-            if (p.value == .object) {
-                if (p.value.object.get("name")) |n| {
-                    if (n == .string) {
-                        resolved_name_owned = try allocator.dupe(u8, std.mem.trim(u8, n.string, " \t\r\n"));
-                    }
-                }
-            }
-        }
-    }
-
-    const resolved_name = resolved_name_owned orelse try allocator.dupe(u8, resolved_name_src);
-    errdefer allocator.free(resolved_name);
-
-    if (resolved_name.len == 0) return error.EmptyToolName;
-
-    // Extract arguments — re-serialize to JSON string
-    const args_json = if (obj.get("arguments")) |args_val| blk: {
-        switch (args_val) {
-            .string => |s| {
-                // Arguments is a string (possibly a JSON string) — use as-is
-                break :blk try allocator.dupe(u8, s);
-            },
-            else => {
-                // Arguments is an object/value — serialize it
-                break :blk try std.json.Stringify.valueAlloc(allocator, args_val, .{});
-            },
-        }
-    } else try allocator.dupe(u8, "{}");
-    errdefer allocator.free(args_json);
-
-    return .{
-        .name = resolved_name,
-        .arguments_json = args_json,
-    };
-}
-
-/// Parse `<function=NAME><parameter=KEY>VALUE</parameter>...</function>` format.
-///
-/// Some open-source LLMs (Llama, Qwen, etc.) emit this XML-based format
-/// instead of JSON inside `<tool_call>` tags. Extracts function name and
-/// parameter key-value pairs, returning a `ParsedToolCall` with serialized
-/// JSON arguments.
-fn parseFunctionTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedToolCall {
-    // Expect: <function=NAME> ... </function>
-    const func_prefix = "<function=";
-    const func_start = std.mem.indexOf(u8, inner, func_prefix) orelse return error.NoFunctionTag;
-    const after_prefix = inner[func_start + func_prefix.len ..];
-    const name_end = std.mem.indexOfScalar(u8, after_prefix, '>') orelse return error.NoFunctionTag;
-    const func_name = std.mem.trim(u8, after_prefix[0..name_end], " \t\r\n");
-    if (func_name.len == 0) return error.EmptyFunctionName;
-
-    // Validate function name: only alphanumeric, underscore, dash, dot allowed
-    for (func_name) |c| {
-        switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {},
-            else => return error.InvalidFunctionName,
-        }
-    }
-
-    // Collect <parameter=KEY>VALUE</parameter> pairs — bounded by </function>
-    const full_body = after_prefix[name_end + 1 ..];
-    const body = if (std.mem.indexOf(u8, full_body, "</function>")) |fc|
-        full_body[0..fc]
-    else
-        full_body;
-
-    var args_buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer args_buf.deinit(allocator);
-    var args_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &args_buf);
-    const w = &args_writer.writer;
-    try w.writeByte('{');
-
-    var remaining = body;
-    var first = true;
-    const param_prefix = "<parameter=";
-    const param_close = "</parameter>";
-
-    while (std.mem.indexOf(u8, remaining, param_prefix)) |ps| {
-        const after_param = remaining[ps + param_prefix.len ..];
-        const key_end = std.mem.indexOfScalar(u8, after_param, '>') orelse break;
-        const key = std.mem.trim(u8, after_param[0..key_end], " \t\r\n");
-        if (key.len == 0) break;
-
-        const value_start = after_param[key_end + 1 ..];
-        const value_end_pos = std.mem.indexOf(u8, value_start, param_close) orelse break;
-        const value = std.mem.trim(u8, value_start[0..value_end_pos], " \t\r\n");
-
-        if (!first) try w.writeByte(',');
-        first = false;
-
-        // Write "key": "value" with JSON string escaping via Stringify.valueAlloc
-        const key_json = try std.json.Stringify.valueAlloc(allocator, key, .{});
-        defer allocator.free(key_json);
-        const val_json = try std.json.Stringify.valueAlloc(allocator, value, .{});
-        defer allocator.free(val_json);
-        try w.writeAll(key_json);
-        try w.writeByte(':');
-        try w.writeAll(val_json);
-
-        remaining = value_start[value_end_pos + param_close.len ..];
-    }
-
-    try w.writeByte('}');
-
-    args_buf = args_writer.toArrayList();
-    const args_json = try args_buf.toOwnedSlice(allocator);
-    errdefer allocator.free(args_json);
-    return .{
-        .name = try allocator.dupe(u8, func_name),
-        .arguments_json = args_json,
-    };
-}
-
-/// Parse `<invoke name=NAME><parameter name=KEY>VALUE</parameter>...</invoke>` format.
-///
-/// This is the tool-calling format typically used by MiniMax models.
-fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedToolCall {
-    // Expect: <invoke name="NAME"> ... </invoke>
-    const invoke_prefix = "<invoke name=";
-    const invoke_start = std.mem.indexOf(u8, inner, invoke_prefix) orelse return error.NoInvokeTag;
-    const after_prefix = inner[invoke_start + invoke_prefix.len ..];
-
-    // Tool name is usually in quotes: "name"
-    const name_quote = if (after_prefix.len > 0) after_prefix[0] else ' ';
-    if (name_quote != '"' and name_quote != '\'') return error.InvalidInvokeFormat;
-
-    const name_end = std.mem.indexOfScalar(u8, after_prefix[1..], name_quote) orelse return error.InvalidInvokeFormat;
-    const tool_name = std.mem.trim(u8, after_prefix[1 .. name_end + 1], " \t\r\n");
-    if (tool_name.len == 0) return error.EmptyToolName;
-    if (!isPlausibleToolName(tool_name)) return error.InvalidToolName;
-
-    const invoke_close_tag = "</invoke>";
-    // Look for the '>' that closes the <invoke ...> tag.
-    // It might not be immediately after the name (e.g. models sometimes insert a comma or space).
-    // Robustness: if we find "<parameter" before ">", then the ">" was missing entirely.
-    const invoke_tag_end_pos = blk: {
-        const next_gt = std.mem.indexOfScalar(u8, after_prefix[name_end + 1 ..], '>');
-        const next_param = std.mem.indexOf(u8, after_prefix[name_end + 1 ..], "<parameter");
-        if (next_gt) |gt_pos| {
-            if (next_param) |p_pos| {
-                if (p_pos < gt_pos) break :blk name_end; // missing '>', started param
-            }
-            break :blk name_end + 1 + gt_pos;
-        }
-        break :blk name_end;
-    };
-
-    const full_invoke_content = after_prefix[invoke_tag_end_pos + 1 ..];
-    const invoke_body = if (std.mem.indexOf(u8, full_invoke_content, invoke_close_tag)) |ic|
-        full_invoke_content[0..ic]
-    else
-        full_invoke_content;
-
-    var args_buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer args_buf.deinit(allocator);
-    var args_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &args_buf);
-    const w = &args_writer.writer;
-    try w.writeByte('{');
-
-    var remaining = invoke_body;
-    var first = true;
-    const param_close = "</parameter>";
-
-    while (remaining.len > 0) {
-        const ps = std.mem.indexOf(u8, remaining, "parameter name=") orelse break;
-        // Find the '<' before 'parameter'
-        var tag_start = ps;
-        while (tag_start > 0 and remaining[tag_start] != '<') tag_start -= 1;
-        if (remaining[tag_start] != '<') {
-            remaining = if (ps + 15 < remaining.len) remaining[ps + 15 ..] else "";
-            continue;
-        }
-
-        const after_param = remaining[ps + 15 ..];
-        const p_name_quote = if (after_param.len > 0) after_param[0] else ' ';
-        if (p_name_quote != '"' and p_name_quote != '\'') break;
-
-        const p_name_end = std.mem.indexOfScalar(u8, after_param[1..], p_name_quote) orelse break;
-        const key = std.mem.trim(u8, after_param[1 .. p_name_end + 1], " \t\r\n");
-        if (key.len == 0) break;
-
-        const p_tag_end = std.mem.indexOfScalar(u8, after_param[p_name_end + 1 ..], '>') orelse break;
-        const value_start = after_param[p_name_end + 1 + p_tag_end + 1 ..];
-        const value_end_pos = std.mem.indexOf(u8, value_start, param_close) orelse break;
-        const value = std.mem.trim(u8, value_start[0..value_end_pos], " \t\r\n");
-
-        if (!first) try w.writeByte(',');
-        first = false;
-
-        const key_json = try std.json.Stringify.valueAlloc(allocator, key, .{});
-        defer allocator.free(key_json);
-        const val_json = try std.json.Stringify.valueAlloc(allocator, value, .{});
-        defer allocator.free(val_json);
-        try w.writeAll(key_json);
-        try w.writeByte(':');
-        try w.writeAll(val_json);
-
-        remaining = value_start[value_end_pos + param_close.len ..];
-    }
-
-    try w.writeByte('}');
-
-    args_buf = args_writer.toArrayList();
-    const args_json = try args_buf.toOwnedSlice(allocator);
-    errdefer allocator.free(args_json);
-    return .{
-        .name = try allocator.dupe(u8, tool_name),
-        .arguments_json = args_json,
-    };
-}
-
-/// Parse mixed/hybrid formats like: {"name": "shell", <parameter name="command">ls</parameter>}
-/// This is a "greedy" fallback parser for highly malformed or mixed LLM output.
-fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedToolCall {
-    // 1. Greedy Name Extraction
-    const tool_name: []const u8 = blk: {
-        // Try JSON-style name
-        if (std.mem.indexOf(u8, inner, "\"name\":")) |idx| {
-            const after = inner[idx + 7 ..];
-            if (std.mem.indexOfScalar(u8, after, '"')) |q1| {
-                if (std.mem.indexOfScalar(u8, after[q1 + 1 ..], '"')) |q2| {
-                    break :blk std.mem.trim(u8, after[q1 + 1 .. q1 + 1 + q2], " \t\r\n");
-                }
-            }
-        }
-        // Try Invoke-style name
-        if (std.mem.indexOf(u8, inner, "<invoke name=")) |idx| {
-            const after = inner[idx + 13 ..];
-            if (after.len > 0) {
-                const quote = after[0];
-                if (quote == '"' or quote == '\'') {
-                    if (std.mem.indexOfScalar(u8, after[1..], quote)) |q_end| {
-                        break :blk std.mem.trim(u8, after[1 .. q_end + 1], " \t\r\n");
-                    }
-                }
-            }
-        }
-        // Try Function-style name
-        if (std.mem.indexOf(u8, inner, "<function=")) |idx| {
-            const after = inner[idx + 10 ..];
-            if (std.mem.indexOfScalar(u8, after, '>')) |end| {
-                break :blk std.mem.trim(u8, after[0..end], " \t\r\n");
-            }
-        }
-        // Try <tool name="..."> style
-        if (std.mem.indexOf(u8, inner, "<tool name=")) |idx| {
-            const after = inner[idx + 11 ..];
-            if (after.len > 0) {
-                const quote = after[0];
-                if (quote == '"' or quote == '\'') {
-                    if (std.mem.indexOfScalar(u8, after[1..], quote)) |q_end| {
-                        break :blk std.mem.trim(u8, after[1 .. q_end + 1], " \t\r\n");
-                    }
-                }
-            }
-        }
-        return error.NoToolNameFound;
-    };
-
-    if (tool_name.len == 0) return error.EmptyToolName;
-    if (!isPlausibleToolName(tool_name)) return error.InvalidToolName;
-
-    // 2. Greedy Parameter Collection
-    var args_buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer args_buf.deinit(allocator);
-    var args_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &args_buf);
-    const w = &args_writer.writer;
-    try w.writeByte('{');
-
-    var first = true;
-    var remaining = inner;
-
-    // Track keys we've already found to avoid duplicates
-    var found_keys = std.StringHashMap(void).init(allocator);
-    defer found_keys.deinit();
-
-    // Look for XML parameters
-    const p_close = "</parameter>";
-    var search_idx: usize = 0;
-    while (search_idx < remaining.len) {
-        const ps = std.mem.indexOf(u8, remaining[search_idx..], "parameter name=") orelse break;
-        const absolute_ps = search_idx + ps;
-        // Find the '<' before 'parameter'
-        var tag_start = absolute_ps;
-        while (tag_start > 0 and remaining[tag_start] != '<') tag_start -= 1;
-        if (remaining[tag_start] != '<') {
-            search_idx = absolute_ps + 15;
-            continue;
-        }
-
-        const after_param = remaining[absolute_ps + 15 ..];
-        if (after_param.len == 0) {
-            search_idx = absolute_ps + 15;
-            continue;
-        }
-        const quote = after_param[0];
-        if (quote != '"' and quote != '\'') {
-            search_idx = absolute_ps + 15;
-            continue;
-        }
-        if (std.mem.indexOfScalar(u8, after_param[1..], quote)) |q_end| {
-            const key = std.mem.trim(u8, after_param[1 .. q_end + 1], " \t\r\n");
-            if (std.mem.indexOfScalar(u8, after_param[q_end + 1 ..], '>')) |tag_end| {
-                const val_start = after_param[q_end + 1 + tag_end + 1 ..];
-                if (std.mem.indexOf(u8, val_start, p_close)) |val_end| {
-                    const value = std.mem.trim(u8, val_start[0..val_end], " \t\r\n");
-
-                    if (!found_keys.contains(key)) {
-                        if (!first) try w.writeByte(',');
-                        first = false;
-                        const key_json = try std.json.Stringify.valueAlloc(allocator, key, .{});
-                        defer allocator.free(key_json);
-                        const val_json = try std.json.Stringify.valueAlloc(allocator, value, .{});
-                        defer allocator.free(val_json);
-                        try w.writeAll(key_json);
-                        try w.writeByte(':');
-                        try w.writeAll(val_json);
-                        try found_keys.put(key, {});
-                    }
-                    search_idx = absolute_ps + 15 + q_end + 1 + tag_end + 1 + val_end + p_close.len;
-                    continue;
-                }
-            }
-        }
-        search_idx = absolute_ps + 15;
-    }
-
-    // Look for JSON-style simple key-value pairs (only strings for now as greedy fallback)
-    // Pattern: "key": "value"
-    search_idx = 0;
-    while (std.mem.indexOfScalar(u8, remaining[search_idx..], '"')) |q1| {
-        const absolute_q1 = search_idx + q1;
-        const after_q1 = remaining[absolute_q1 + 1 ..];
-        if (std.mem.indexOfScalar(u8, after_q1, '"')) |q2| {
-            const key = after_q1[0..q2];
-            const after_key = after_q1[q2 + 1 ..];
-            // Look for ':' and then another string
-            var i: usize = 0;
-            while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':')) i += 1;
-            if (i < after_key.len and after_key[i] == '"') {
-                const val_start = after_key[i + 1 ..];
-                if (std.mem.indexOfScalar(u8, val_start, '"')) |val_q_end| {
-                    const value = val_start[0..val_q_end];
-                    if (!found_keys.contains(key) and !std.mem.eql(u8, key, "name") and !std.mem.eql(u8, key, "arguments")) {
-                        if (!first) try w.writeByte(',');
-                        first = false;
-                        const key_json = try std.json.Stringify.valueAlloc(allocator, key, .{});
-                        defer allocator.free(key_json);
-                        const val_json = try std.json.Stringify.valueAlloc(allocator, value, .{});
-                        defer allocator.free(val_json);
-                        try w.writeAll(key_json);
-                        try w.writeByte(':');
-                        try w.writeAll(val_json);
-                        try found_keys.put(key, {});
-                    }
-                    search_idx = absolute_q1 + 1 + q2 + 1 + i + 1 + val_q_end + 1;
-                    continue;
-                }
-            }
-        }
-        search_idx = absolute_q1 + 1;
-    }
-
-    try w.writeByte('}');
-
-    args_buf = args_writer.toArrayList();
-    const args_json = try args_buf.toOwnedSlice(allocator);
-    errdefer allocator.free(args_json);
-    return .{
-        .name = try allocator.dupe(u8, tool_name),
-        .arguments_json = args_json,
-    };
-}
-
-/// Parse compact tool-call format: `tool_name{...json arguments...}`.
-///
-/// Some compatible providers occasionally emit this form inside `<tool_call>`
-/// when they fail to produce the strict JSON envelope.
-fn parseNamePrefixedJsonCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedToolCall {
-    const cleaned = std.mem.trim(u8, stripTrailingXml(inner), " \t\r\n");
-    const obj_start = std.mem.indexOfScalar(u8, cleaned, '{') orelse return error.NoPrefixedJsonCall;
-    if (obj_start == 0) return error.NoPrefixedJsonCall;
-
-    const name = std.mem.trim(u8, cleaned[0..obj_start], " \t\r\n:");
-    if (name.len == 0) return error.EmptyToolName;
-    for (name) |c| {
-        switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {},
-            else => return error.InvalidToolName,
-        }
-    }
-
-    const args_src = std.mem.trim(u8, cleaned[obj_start..], " \t\r\n");
-    var parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args_src, .{}) catch blk: {
-        const repaired = repairJson(allocator, args_src) catch return error.InvalidToolArguments;
-        defer allocator.free(repaired);
-        break :blk std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch return error.InvalidToolArguments;
-    };
-    defer parsed_args.deinit();
-
-    if (parsed_args.value != .object) return error.InvalidToolArguments;
-
-    const args_json = try std.json.Stringify.valueAlloc(allocator, parsed_args.value, .{});
-    errdefer allocator.free(args_json);
-    return .{
-        .name = try allocator.dupe(u8, name),
-        .arguments_json = args_json,
-    };
-}
+/// Find the first JSON object `{...}` in a string, handling nesting. Shared
+/// with the display paths via `json_util`, so the agent and the display locate
+/// the same tool-call object.
+pub const extractJsonObject = json_util.extractJsonObject;
+
+/// JSON repair for LLM output (trailing commas, unbalanced braces/brackets,
+/// unbalanced quotes). Shared with the display paths via `json_util`, so a text
+/// tool call the agent executes is recognised by exactly the same repair.
+pub const repairJson = json_util.repairJson;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
@@ -2047,57 +1076,6 @@ test "ToolExecutionResult default tool_call_id is null" {
 
 // ── Function-tag format tests (<function=name><parameter=key>value</parameter></function>) ──
 
-test "parseFunctionTagCall single parameter" {
-    const allocator = std.testing.allocator;
-    const inner = "<function=shell><parameter=command>ps aux | grep nullclaw</parameter></function>";
-    const call = try parseFunctionTagCall(allocator, inner);
-    defer {
-        allocator.free(call.name);
-        allocator.free(call.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", call.name);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "ps aux | grep nullclaw") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "command") != null);
-}
-
-test "parseFunctionTagCall multiple parameters" {
-    const allocator = std.testing.allocator;
-    const inner = "<function=file_write><parameter=path>/tmp/test.txt</parameter><parameter=content>hello world</parameter></function>";
-    const call = try parseFunctionTagCall(allocator, inner);
-    defer {
-        allocator.free(call.name);
-        allocator.free(call.arguments_json);
-    }
-    try std.testing.expectEqualStrings("file_write", call.name);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "path") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "/tmp/test.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "content") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "hello world") != null);
-}
-
-test "parseFunctionTagCall with whitespace and newlines" {
-    const allocator = std.testing.allocator;
-    const inner =
-        \\<function=shell>
-        \\<parameter=command>
-        \\ls -la
-        \\</parameter>
-        \\</function>
-    ;
-    const call = try parseFunctionTagCall(allocator, inner);
-    defer {
-        allocator.free(call.name);
-        allocator.free(call.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", call.name);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "ls -la") != null);
-}
-
-test "parseFunctionTagCall no function tag returns error" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.NoFunctionTag, parseFunctionTagCall(allocator, "just plain text"));
-}
-
 test "parseToolCalls handles function-tag format inside tool_call" {
     const allocator = std.testing.allocator;
     const response =
@@ -2146,24 +1124,6 @@ test "parseToolCalls function-tag with surrounding text" {
     try std.testing.expect(std.mem.indexOf(u8, result.text, "Let me check that.") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "Done.") != null);
 }
-
-test "parseFunctionTagCall value with quotes is JSON-escaped" {
-    const allocator = std.testing.allocator;
-    const inner = "<function=shell><parameter=command>echo \"hello world\"</parameter></function>";
-    const call = try parseFunctionTagCall(allocator, inner);
-    defer {
-        allocator.free(call.name);
-        allocator.free(call.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", call.name);
-    // Verify the JSON is valid by parsing it
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{});
-    defer parsed.deinit();
-    const cmd = parsed.value.object.get("command").?.string;
-    try std.testing.expectEqualStrings("echo \"hello world\"", cmd);
-}
-
-// ── Native tool dispatcher tests ────────────────────────────────
 
 test "isNativeFormat detects OpenAI tool_calls" {
     const native_response =
@@ -2501,18 +1461,37 @@ test "isNativeJsonFormat true with leading whitespace" {
 }
 
 test "containsToolCallMarkup detects xml and bracket variants" {
-    try std.testing.expect(containsToolCallMarkup("<tool_call>{}</tool_call>"));
-    try std.testing.expect(containsToolCallMarkup("[TOOL_CALL]{\"name\":\"shell\"}[/TOOL_CALL]"));
-    try std.testing.expect(containsToolCallMarkup("[tool_call]{\"name\":\"shell\"}[/tool_call]"));
-    try std.testing.expect(!containsToolCallMarkup("plain reply text"));
+    const a = std.testing.allocator;
+    try std.testing.expect(containsToolCallMarkup(a, "<tool_call>{}</tool_call>"));
+    try std.testing.expect(containsToolCallMarkup(a, "[TOOL_CALL]{\"name\":\"shell\"}[/TOOL_CALL]"));
+    try std.testing.expect(containsToolCallMarkup(a, "[tool_call]{\"name\":\"shell\"}[/tool_call]"));
+    try std.testing.expect(!containsToolCallMarkup(a, "plain reply text"));
 }
 
 test "containsToolCallMarkup detects orphan closing tag" {
+    const a = std.testing.allocator;
     // Model sometimes emits </tool_call> without an opener; must be suppressed.
-    try std.testing.expect(containsToolCallMarkup("Here are the results:\n</tool_call>\nSome reply"));
-    try std.testing.expect(containsToolCallMarkup("</tool_call>"));
-    try std.testing.expect(containsToolCallMarkup("Here are the results:\n[/TOOL_CALL]\nSome reply"));
-    try std.testing.expect(containsToolCallMarkup("[/tool_call]"));
+    try std.testing.expect(containsToolCallMarkup(a, "Here are the results:\n</tool_call>\nSome reply"));
+    try std.testing.expect(containsToolCallMarkup(a, "</tool_call>"));
+    try std.testing.expect(containsToolCallMarkup(a, "Here are the results:\n[/TOOL_CALL]\nSome reply"));
+    try std.testing.expect(containsToolCallMarkup(a, "[/tool_call]"));
+    // A degenerate loop of XML `function` closers is tool markup too.
+    try std.testing.expect(containsToolCallMarkup(a, "</function></function></function>"));
+    try std.testing.expect(containsToolCallMarkup(a, "</function>\n</function>\n</function>"));
+    // `</function_calls>` shares a prefix with `</function`; a run of it is
+    // the same runaway and must be detected too.
+    try std.testing.expect(containsToolCallMarkup(a, "</function_calls></function_calls></function_calls>"));
+    try std.testing.expect(!containsToolCallMarkup(a, "a plain answer"));
+    // Prose or a documented sample that merely names the XML `function`
+    // dialect must not be mistaken for an unparsed call: dropping the reply for
+    // it used to abort the turn with error.NoResponseContent.
+    try std.testing.expect(!containsToolCallMarkup(a, "Use the `<function>` and `<parameter>` tags like this."));
+    try std.testing.expect(!containsToolCallMarkup(a, "<function_calls><invoke name=\"shell\"></invoke></function_calls>"));
+    try std.testing.expect(!containsToolCallMarkup(a, "a single </function> closer"));
+    // Regression: a fenced sample with three closers blanked the whole reply
+    // (containsToolCallMarkup returned true, so selectDisplayText returned ""),
+    // which then aborted the turn with error.NoResponseContent.
+    try std.testing.expect(!containsToolCallMarkup(a, "```xml\n</function></function></function>\n```"));
 }
 
 test "isNativeJsonFormat false for XML response" {
@@ -2707,86 +1686,6 @@ test "repairJson handles combined issues" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("test", parsed.value.object.get("name").?.string);
-}
-
-test "parseToolCallJson with trailing comma repair" {
-    const allocator = std.testing.allocator;
-    const result = try parseToolCallJson(allocator, "{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"},}");
-    defer {
-        allocator.free(result.name);
-        allocator.free(result.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", result.name);
-}
-
-test "parseToolCallJson with unclosed brace repair" {
-    const allocator = std.testing.allocator;
-    const result = try parseToolCallJson(allocator, "{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}");
-    defer {
-        allocator.free(result.name);
-        allocator.free(result.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", result.name);
-}
-
-test "parseToolCallJson robustness" {
-    const allocator = std.testing.allocator;
-
-    // Case 1: JSON-in-JSON (name field is a whole JSON object)
-    const json1 = "{\"name\": \"{\\\"name\\\": \\\"shell\\\", \\\"arguments\\\": {}}\", \"arguments\": {}}";
-    const res1 = try parseToolCallJson(allocator, json1);
-    defer {
-        allocator.free(res1.name);
-        allocator.free(res1.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", res1.name);
-
-    // Case 2: Trailing XML tag in name (from logs)
-    const json2 = "{\"name\": \"shell</arg_value>\", \"arguments\": {\"command\": \"ls\"}}";
-    const res2 = try parseToolCallJson(allocator, json2);
-    defer {
-        allocator.free(res2.name);
-        allocator.free(res2.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", res2.name);
-
-    // Case 3: JSON-like name without nested "name" is rejected as invalid tool name.
-    const json3 = "{\"name\": \"{\\\"tool\\\":\\\"shell\\\"}\", \"arguments\": {}}";
-    try std.testing.expectError(error.InvalidToolName, parseToolCallJson(allocator, json3));
-}
-
-test "parseToolCallJson salvages malformed quoted colon tool name" {
-    const allocator = std.testing.allocator;
-    const raw = "{\"name\":\": \"memory_recall\", \"arguments\": {\"query\": \"Traumforschung kulturwissenschaftlich\"}}";
-
-    const result = try parseToolCallJson(allocator, raw);
-    defer {
-        allocator.free(result.name);
-        allocator.free(result.arguments_json);
-    }
-
-    try std.testing.expectEqualStrings("memory_recall", result.name);
-
-    const parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, result.arguments_json, .{});
-    defer parsed_args.deinit();
-    try std.testing.expectEqualStrings("Traumforschung kulturwissenschaftlich", parsed_args.value.object.get("query").?.string);
-}
-
-test "parseToolCallJson salvages malformed quoted colon tool name with repaired arguments" {
-    const allocator = std.testing.allocator;
-    const raw = "{\"name\" : \": \"memory_recall\", \"arguments\" : {\"query\": \"hello\",}}";
-
-    const result = try parseToolCallJson(allocator, raw);
-    defer {
-        allocator.free(result.name);
-        allocator.free(result.arguments_json);
-    }
-
-    try std.testing.expectEqualStrings("memory_recall", result.name);
-
-    const parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, result.arguments_json, .{});
-    defer parsed_args.deinit();
-    try std.testing.expectEqualStrings("hello", parsed_args.value.object.get("query").?.string);
 }
 
 test "parseToolCalls salvages malformed quoted colon tool name" {
@@ -2985,47 +1884,6 @@ test "parseXmlToolCalls square bracket format" {
 }
 
 // ── Hardening tests (issue #16 audit) ───────────────────────────
-
-test "parseFunctionTagCall parameters bounded by </function>" {
-    const allocator = std.testing.allocator;
-    // Two function blocks concatenated — second block's params must NOT leak into first
-    const inner = "<function=shell><parameter=command>echo hi</parameter></function><function=file_read><parameter=path>/etc/passwd</parameter></function>";
-    const call = try parseFunctionTagCall(allocator, inner);
-    defer {
-        allocator.free(call.name);
-        allocator.free(call.arguments_json);
-    }
-    try std.testing.expectEqualStrings("shell", call.name);
-    // Only "command" parameter should be present, not "path"
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "echo hi") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "/etc/passwd") == null);
-}
-
-test "parseFunctionTagCall rejects invalid function name with special chars" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(
-        error.InvalidFunctionName,
-        parseFunctionTagCall(allocator, "<function=shell\"><parameter=x>y</parameter></function>"),
-    );
-    try std.testing.expectError(
-        error.InvalidFunctionName,
-        parseFunctionTagCall(allocator, "<function=she<ll><parameter=x>y</parameter></function>"),
-    );
-    try std.testing.expectError(
-        error.InvalidFunctionName,
-        parseFunctionTagCall(allocator, "<function=she ll><parameter=x>y</parameter></function>"),
-    );
-}
-
-test "parseFunctionTagCall accepts valid names with dots dashes underscores" {
-    const allocator = std.testing.allocator;
-    const call = try parseFunctionTagCall(allocator, "<function=my-tool_v2.0><parameter=key>val</parameter></function>");
-    defer {
-        allocator.free(call.name);
-        allocator.free(call.arguments_json);
-    }
-    try std.testing.expectEqualStrings("my-tool_v2.0", call.name);
-}
 
 test "parseXmlToolCalls function-tag fallback when JSON has braces in value" {
     const allocator = std.testing.allocator;

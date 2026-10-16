@@ -14,6 +14,7 @@ const max_api = @import("max_api.zig");
 const max_ingress = @import("max_ingress.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 const streaming = @import("../streaming.zig");
+const providers = @import("../providers/root.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.max);
@@ -878,7 +879,13 @@ pub const MaxChannel = struct {
             return;
         }
 
-        const preview = buildDraftPreviewChunk(self.allocator, state.buffer.items) catch return;
+        // The buffer holds the filtered stream, but an orphan reasoning closer is
+        // released so a re-rendering presenter can drop the leaked draft before
+        // it. Do that here, exactly as the Telegram draft does, so the leaked
+        // draft never reaches a Max preview.
+        const visible = providers.stripThinkBlocks(self.allocator, state.buffer.items) catch return;
+        defer self.allocator.free(visible);
+        const preview = buildDraftPreviewChunk(self.allocator, visible) catch return;
         defer preview.deinit(self.allocator);
         if (preview.body.len == 0) return;
 
@@ -1418,7 +1425,11 @@ pub const MaxChannel = struct {
     pub const StreamCtx = struct {
         max_ptr: *MaxChannel,
         chat_id: []const u8,
-        filter: streaming.TagFilter = undefined,
+        filter: streaming.TagFilter = .{},
+
+        pub fn deinit(self: *StreamCtx) void {
+            self.filter.deinit();
+        }
     };
 
     fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -1938,6 +1949,18 @@ test "buildDraftPreviewChunk caps preview length with continuation marker" {
 
     try std.testing.expect(preview.body.len <= MAX_MESSAGE_LEN);
     try std.testing.expect(std.mem.endsWith(u8, preview.body, CONTINUATION_MARKER));
+}
+
+test "buildDraftPreviewChunk drops the leaked draft before an orphan closer" {
+    const allocator = std.testing.allocator;
+    // The streamed buffer holds the leaked draft followed by the gateway's
+    // orphan reasoning closer; the preview must show only the real answer.
+    const visible = try providers.stripThinkBlocks(allocator, "Draft answer.</ifm|think>Real answer.");
+    defer allocator.free(visible);
+    const preview = try buildDraftPreviewChunk(allocator, visible);
+    defer preview.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Real answer.", preview.body);
 }
 
 test "CONTINUATION_MARKER is correct" {
