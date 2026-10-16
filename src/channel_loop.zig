@@ -750,20 +750,29 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
 ) bool {
+    // Route before starting the typing/draft turn, mirroring processTelegramMessage:
+    // a callback the router folds into the running turn must not start a new
+    // draft turn and reset the running turn's live draft. Slash commands are
+    // handled locally and never consult the router, so they keep the indicator.
+    const is_slash_command = control_plane.parseSlashCommand(content) != null;
+    if (!is_slash_command and runtime.session_mgr.routeInbound(session_key, content) == .skip) {
+        return true;
+    }
+
     // Mirror processTelegramMessage: keep callback-query processing visible
     // during slow model calls from interactive Telegram buttons.
     const typing_target = sender;
-    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
+    const typing_turn = tg_ptr.startTypingTurn(typing_target) catch telegram.TelegramChannel.TypingTurn{};
     defer {
-        tg_ptr.stopTyping(typing_target) catch {};
-        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
+        if (typing_turn.started) tg_ptr.stopTyping(typing_target) catch {};
+        if (typing_turn.draft_id != 0) tg_ptr.finishDraftTurn(typing_target, typing_turn.draft_id) catch {};
     }
 
     const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var response_owned = false;
     const response = blk: {
-        if (control_plane.parseSlashCommand(content) != null) {
+        if (is_slash_command) {
             const maybe_local = runtime.session_mgr.handleLocalSlashCommand(session_key, content, conversation_context) catch |err| {
                 log.err("failed to handle telegram callback slash command locally: {}", .{err});
                 response_owned = true;
@@ -774,10 +783,6 @@ fn handleTelegramInteractiveCallback(
                 break :blk reply;
             }
             return false;
-        }
-
-        if (runtime.session_mgr.routeInbound(session_key, content) == .skip) {
-            return true;
         }
 
         const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
@@ -946,11 +951,16 @@ fn processTelegramMessage(
     message_sender_id: []const u8,
     replace_message: bool,
 ) void {
+    // Route before starting the typing/draft turn: a message the router folds
+    // into the running turn (injected/dropped) must not start a new draft turn
+    // and reset the running turn's live draft.
+    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
+
     const typing_target = sender;
-    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
+    const typing_turn = tg_ptr.startTypingTurn(typing_target) catch telegram.TelegramChannel.TypingTurn{};
     defer {
-        tg_ptr.stopTyping(typing_target) catch {};
-        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
+        if (typing_turn.started) tg_ptr.stopTyping(typing_target) catch {};
+        if (typing_turn.draft_id != 0) tg_ptr.finishDraftTurn(typing_target, typing_turn.draft_id) catch {};
     }
 
     // Set ScheduleTool context for delivery.
@@ -979,11 +989,9 @@ fn processTelegramMessage(
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
         .chat_id = sender,
-        .draft_id = draft_turn_id,
+        .draft_id = typing_turn.draft_id,
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
-
-    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {

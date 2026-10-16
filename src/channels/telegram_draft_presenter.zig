@@ -16,6 +16,10 @@ const DRAFT_PROGRESS_HEARTBEAT_ONLY = "Interim result is still being prepared.";
 
 pub const DraftState = struct {
     draft_id: u64,
+    /// True while a turn still owns this draft (it has begun a draft turn and
+    /// has not finished it). A later inbound message must not reset/rotate a
+    /// draft another turn is still streaming into.
+    active: bool = false,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
     last_flush_len: usize = 0,
     last_flush_time: i64 = 0,
