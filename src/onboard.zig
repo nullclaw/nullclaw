@@ -150,6 +150,7 @@ pub const known_providers = [_]ProviderInfo{
     // --- Tier 8: Emerging platforms ---
     .{ .key = "astrai", .label = "Astrai", .default_model = "astrai-model", .env_var = "ASTRAI_API_KEY" },
     .{ .key = "poe", .label = "Poe", .default_model = "poe-model", .env_var = "POE_API_KEY" },
+    .{ .key = "tsubasa", .label = "Tsubasa", .default_model = "tsubasa-fast", .env_var = "TSUBASA_API_KEY" },
 
     // --- Tier 9: Local/self-hosted ---
     .{ .key = "ollama", .label = "Ollama (local CLI)", .default_model = "llama4", .env_var = "API_KEY" },
@@ -356,6 +357,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "novita")) return &novita_fallback;
+    if (std.mem.eql(u8, canonical, "tsubasa")) return &.{ "tsubasa-fast", "tsubasa-pro" };
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
@@ -698,6 +700,8 @@ fn staticNativeModelCatalogForProvider(canonical: []const u8) ?NativeModelCatalo
             .url = ATLAS_CLOUD_MODELS_URL,
             .parse_options = .{ .require_chat_modalities = true },
         };
+    } else if (std.mem.eql(u8, canonical, "tsubasa")) {
+        return .{ .url = "https://api.tsubasa.sh/v1/models" };
     }
     return null;
 }
@@ -5451,6 +5455,14 @@ test "modelsDevProviderKey maps known providers" {
 }
 
 test "staticNativeModelCatalogForProvider maps native model endpoints" {
+    const tsubasa = staticNativeModelCatalogForProvider("tsubasa") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://api.tsubasa.sh/v1/models", tsubasa.url);
+    try std.testing.expect(!tsubasa.needs_auth);
+    const tsubasa_models = fallbackModelsForProvider("tsubasa");
+    try std.testing.expectEqual(@as(usize, 2), tsubasa_models.len);
+    try std.testing.expectEqualStrings("tsubasa-fast", tsubasa_models[0]);
+    try std.testing.expectEqualStrings("tsubasa-pro", tsubasa_models[1]);
+
     const nearai = staticNativeModelCatalogForProvider("nearai") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(NEARAI_MODELS_URL, nearai.url);
     try std.testing.expect(!nearai.needs_auth);

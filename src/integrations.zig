@@ -121,6 +121,7 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "Fireworks AI", .description = "Fast open-source inference", .category = .ai_model, .status = .available },
     .{ .name = "Cohere", .description = "Command R+ & embeddings", .category = .ai_model, .status = .available },
     .{ .name = "Novita AI", .description = "Multi-model inference platform", .category = .ai_model, .status = .available },
+    .{ .name = "Tsubasa", .description = "OpenAI-compatible inference", .category = .ai_model, .status = .available },
     // Productivity
     .{ .name = "GitHub", .description = "Code, issues, PRs", .category = .productivity, .status = .coming_soon },
     .{ .name = "Notion", .description = "Workspace & databases", .category = .productivity, .status = .coming_soon },
@@ -238,6 +239,12 @@ test "findIntegration finds Telegram" {
     try std.testing.expect(entry != null);
     try std.testing.expectEqualStrings("Telegram", entry.?.name);
     try std.testing.expectEqual(IntegrationCategory.chat, entry.?.category);
+}
+
+test "findIntegration finds Tsubasa" {
+    const entry = findIntegration("Tsubasa").?;
+    try std.testing.expectEqual(IntegrationCategory.ai_model, entry.category);
+    try std.testing.expectEqual(IntegrationStatus.available, entry.status);
 }
 
 test "findIntegration finds Evolink" {
