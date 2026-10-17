@@ -517,9 +517,9 @@ test "non-hint model uses default provider" {
     );
     defer router.deinit();
 
-    const result = router.resolve("anthropic/claude-sonnet-4-20250514");
+    const result = router.resolve("anthropic/claude-sonnet-4-6");
     try std.testing.expect(result[0] == 0);
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", result[1]);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-6", result[1]);
 }
 
 test "explicit provider ref resolves provider prefix" {

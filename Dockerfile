@@ -81,6 +81,7 @@ RUN apk add --no-cache ca-certificates curl git tzdata
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
+RUN chown -R 65534:65534 /nullclaw-data
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV NULLCLAW_HOME=/nullclaw-data

@@ -1028,7 +1028,7 @@ fn readChannelsObject(allocator: std.mem.Allocator) ReadConfigError!ParsedChanne
 
 fn writeResult(result: ProbeResult) !void {
     var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&buf);
     const out = &bw.interface;
 
     try out.writeAll("{\"channel\":");

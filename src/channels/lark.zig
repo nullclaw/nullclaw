@@ -70,7 +70,7 @@ const LarkWsEventBuffer = struct {
 
 const LarkWsPingLoopCtx = struct {
     ws: *websocket.WsClient,
-    running: *const std.atomic.Value(bool),
+    connection_running: *const std.atomic.Value(bool),
     ping_interval_ms: *AtomicU32,
     service_id: i32,
 };
@@ -95,6 +95,8 @@ pub const LarkChannel = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ws_thread: ?std.Thread = null,
+    lifecycle_mu: std_compat.sync.Mutex = .{},
+    ws_mu: std_compat.sync.Mutex = .{},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     /// Cached tenant access token (heap-allocated, owned by allocator).
     cached_token: ?[]const u8 = null,
@@ -462,6 +464,35 @@ pub const LarkChannel = struct {
             .webhook => self.running.load(.acquire),
             .websocket => self.running.load(.acquire) and self.connected.load(.acquire),
         };
+    }
+
+    fn shutdownActiveWebsocket(self: *LarkChannel) void {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+    }
+
+    fn closeOwnedWebsocket(self: *LarkChannel, ws: *websocket.WsClient) void {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        ws.deinit();
+    }
+
+    fn closeOwnedWebsocketStream(self: *LarkChannel, stream: std_compat.net.Stream) void {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        stream.close();
+    }
+
+    fn publishWebsocket(self: *LarkChannel, fd: SocketFd) bool {
+        self.ws_mu.lock();
+        defer self.ws_mu.unlock();
+        self.ws_fd.store(fd, .release);
+        if (self.running.load(.acquire)) return true;
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        return false;
     }
 
     fn componentAsSlice(component: std.Uri.Component) []const u8 {
@@ -1490,32 +1521,38 @@ pub const LarkChannel = struct {
         var path_buf: [2048]u8 = undefined;
         const connect_parts = try parseWebsocketConnectUrl(connect_cfg.url, &host_buf, &path_buf);
 
-        var ws = try websocket.WsClient.connect(
+        const ws_stream = try websocket.WsClient.connectTcp(self.allocator, connect_parts.host, connect_parts.port);
+        if (!self.publishWebsocket(ws_stream.handle)) {
+            self.closeOwnedWebsocketStream(ws_stream);
+            return error.ConnectionClosed;
+        }
+        var ws = websocket.WsClient.connectFromStream(
             self.allocator,
+            ws_stream,
             connect_parts.host,
-            connect_parts.port,
             connect_parts.path,
             &.{},
-        );
-
-        self.ws_fd.store(ws.stream.handle, .release);
+        ) catch |err| {
+            self.closeOwnedWebsocketStream(ws_stream);
+            return err;
+        };
         self.connected.store(true, .release);
         defer {
             self.connected.store(false, .release);
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
+            self.closeOwnedWebsocket(&ws);
         }
 
         var event_buffers: std.StringHashMapUnmanaged(LarkWsEventBuffer) = .empty;
         defer deinitLarkWsEventBuffers(self.allocator, &event_buffers);
 
         var ping_interval_ms = AtomicU32.init(connect_cfg.ping_interval_ms);
+        var connection_running = std.atomic.Value(bool).init(true);
         var ping_thread: ?std.Thread = null;
         var ping_ctx: LarkWsPingLoopCtx = undefined;
         if (connect_parts.service_id) |service_id| {
             ping_ctx = .{
                 .ws = &ws,
-                .running = &self.running,
+                .connection_running = &connection_running,
                 .ping_interval_ms = &ping_interval_ms,
                 .service_id = service_id,
             };
@@ -1524,7 +1561,13 @@ pub const LarkChannel = struct {
                 break :blk null;
             };
         }
-        defer if (ping_thread) |t| t.join();
+        defer {
+            // A connection cycle can end while the channel remains running. Stop the
+            // per-connection ping loop and unblock any TLS write before joining it.
+            connection_running.store(false, .release);
+            self.shutdownActiveWebsocket();
+            if (ping_thread) |t| t.join();
+        }
 
         while (self.running.load(.acquire)) {
             const maybe_message = ws.readMessage() catch |err| {
@@ -1572,6 +1615,8 @@ pub const LarkChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
 
@@ -1589,13 +1634,14 @@ pub const LarkChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.running.store(false, .release);
         self.connected.store(false, .release);
 
-        const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).close();
-        }
+        // shutdown() interrupts the gateway read and any ping write. The websocket
+        // thread retains final close ownership through WsClient.deinit().
+        self.shutdownActiveWebsocket();
 
         if (self.ws_thread) |t| {
             t.join();
@@ -2239,19 +2285,19 @@ fn deinitLarkWsEventBuffers(
 }
 
 fn larkWsPingLoop(ctx: *LarkWsPingLoopCtx) void {
-    while (ctx.running.load(.acquire)) {
+    while (ctx.connection_running.load(.acquire)) {
         const interval_ms = blk: {
             const current = ctx.ping_interval_ms.load(.acquire);
             break :blk if (current > 0) current else DEFAULT_LARK_PING_INTERVAL_MS;
         };
 
         var waited_ms: u32 = 0;
-        while (waited_ms < interval_ms and ctx.running.load(.acquire)) {
+        while (waited_ms < interval_ms and ctx.connection_running.load(.acquire)) {
             const step_ms: u32 = @min(interval_ms - waited_ms, @as(u32, 1000));
             std_compat.thread.sleep(@as(u64, step_ms) * std.time.ns_per_ms);
             waited_ms += step_ms;
         }
-        if (!ctx.running.load(.acquire)) break;
+        if (!ctx.connection_running.load(.acquire)) break;
 
         var ping_buf: [256]u8 = undefined;
         const ping = buildLarkWsPingFrame(&ping_buf, ctx.service_id) catch {
@@ -2259,7 +2305,7 @@ fn larkWsPingLoop(ctx: *LarkWsPingLoopCtx) void {
             continue;
         };
         ctx.ws.writeBinary(ping) catch |err| {
-            if (ctx.running.load(.acquire)) {
+            if (ctx.connection_running.load(.acquire)) {
                 log.warn("lark websocket ping failed: {}", .{err});
             }
             break;
@@ -2270,6 +2316,28 @@ fn larkWsPingLoop(ctx: *LarkWsPingLoopCtx) void {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "lark shutdown active websocket clears fd and closes peer" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+        ch.ws_fd.store(sockets[0], .release);
+
+        // Regression: per-connection ping cleanup must unblock TLS writes before join.
+        ch.shutdownActiveWebsocket();
+
+        try std.testing.expectEqual(invalid_socket, ch.ws_fd.load(.acquire));
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
+    }
+}
 
 test "lark parse valid text message" {
     const allocator = std.testing.allocator;

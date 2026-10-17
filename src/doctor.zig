@@ -329,7 +329,7 @@ pub fn runDoctor(
 pub fn run(allocator: std.mem.Allocator) !void {
     const stdout_file = std_compat.fs.File.stdout();
     var stdout_buf: [4096]u8 = undefined;
-    var bw = stdout_file.writer(&stdout_buf);
+    var bw = stdout_file.writerStreaming(&stdout_buf);
     const stdout = &bw.interface;
     const color = shouldColorize(stdout_file);
 

@@ -501,41 +501,62 @@ pub fn convertToolsResponses(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
 
 /// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
 /// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
-pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
-    _ = timeout_secs;
+fn curlTimeoutArg(buf: *[32]u8, timeout_secs: u64) ?[]const u8 {
+    if (timeout_secs == 0) return null;
+    return std.fmt.bufPrint(buf, "{d}", .{timeout_secs}) catch unreachable;
+}
+
+fn curlPostTypedTimed(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    content_type: []const u8,
+    timeout_secs: u64,
+) ![]u8 {
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
         error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);
-    // Provider requests often carry Authorization/x-api-key credentials.
-    // Use std.http so secrets are never exposed through child process argv.
-    return http_util.httpPostJsonWithProxy(allocator, url, body, headers, null);
+
+    var timeout_buf: [32]u8 = undefined;
+    const response = try http_util.curlRequestWithStatusAndHeaders(allocator, .{
+        .method = .POST,
+        .url = url,
+        .body = body,
+        .headers = headers,
+        .content_type = content_type,
+        .max_time = curlTimeoutArg(&timeout_buf, timeout_secs),
+        .resolve_entry = resolve_entry,
+        .accept_compression = true,
+        .std_http_defaults = true,
+    });
+    allocator.free(response.headers);
+    errdefer allocator.free(response.body);
+    if (response.status_code < 200 or response.status_code >= 300) return error.HttpStatusError;
+    return response.body;
+}
+
+pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
+    return curlPostTypedTimed(allocator, url, body, headers, "application/json", timeout_secs);
 }
 
 /// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
 /// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
 pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, timeout_secs: u64) ![]u8 {
-    _ = timeout_secs;
-    const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
-        error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    defer if (resolve_entry) |entry| allocator.free(entry);
-    return http_util.httpRequest(
-        allocator,
-        .POST,
-        url,
-        body,
-        &.{},
-        "application/x-www-form-urlencoded",
-        null,
-    );
+    return curlPostTypedTimed(allocator, url, body, &.{}, "application/x-www-form-urlencoded", timeout_secs);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "provider curl timeout argument preserves zero and finite values" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expect(curlTimeoutArg(&buf, 0) == null);
+    try std.testing.expectEqualStrings("300", curlTimeoutArg(&buf, 300).?);
+}
 
 test "convertToolsOpenAI produces valid JSON" {
     const alloc = std.testing.allocator;

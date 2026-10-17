@@ -13,7 +13,7 @@ const BUILD_FROM_SOURCE_ZIG_VERSION = "0.16.0";
 
 pub fn run() !void {
     var buf: [65536]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&buf);
     const out = &bw.interface;
 
     // ── Top-level fields ─────────────────────────────────────────────

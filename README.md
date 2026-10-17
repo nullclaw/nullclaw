@@ -380,7 +380,9 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
       "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
       "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
       "evolink": { "api_key": "YOUR_EVOLINK_API_KEY" },
+      "edenai": { "api_key": "YOUR_EDENAI_API_KEY" },
       "groq": { "api_key": "gsk_..." },
+      "azure": { "api_key": "YOUR_AZURE_OPENAI_API_KEY", "base_url": "https://your-resource.openai.azure.com" },
       "vertex": {
         "api_key": {
           "type": "service_account",
@@ -390,7 +392,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
         },
         "base_url": "https://aiplatform.googleapis.com/v1/projects/your-project/locations/global/publishers/google/models"
       },
-      "anthropic": { "api_key": "sk-ant-...", "base_url": "https://api.anthropic.com" }
+      "anthropic": { "api_key": "sk-ant-..." }
     }
   },
 
@@ -431,7 +433,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
           "host": "irc.libera.chat",
           "port": 6697,
           "nick": "nullclaw",
-          "channel": "#nullclaw",
+          "channels": ["#nullclaw"],
           "tls": true,
           "allow_from": ["user1"]
         },

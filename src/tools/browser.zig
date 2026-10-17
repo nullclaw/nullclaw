@@ -5,6 +5,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const http_util = @import("../http_util.zig");
 
 /// Maximum response body size for the "read" action (8 KB).
 const MAX_READ_BYTES: usize = 8192;
@@ -131,83 +132,47 @@ pub const BrowserTool = struct {
         };
         defer allocator.free(connect_host);
 
-        // Use curl to fetch the page. Flags:
-        //   -sS  silent but show errors
-        //   -L   follow redirects
-        //   -m 10  timeout 10 seconds
-        //   --max-filesize 65536  abort if body exceeds 64 KB
-        const max_size_str = std.fmt.comptimePrint("{d}", .{MAX_FETCH_BYTES});
         var resolve_entry: ?[]u8 = null;
         defer if (resolve_entry) |entry| allocator.free(entry);
-
-        var argv_buf: [16][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-sS";
-        argc += 1;
-        argv_buf[argc] = "-L";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "10";
-        argc += 1;
-        argv_buf[argc] = "--max-filesize";
-        argc += 1;
-        argv_buf[argc] = max_size_str;
-        argc += 1;
-        argv_buf[argc] = "--proto";
-        argc += 1;
-        argv_buf[argc] = "=https";
-        argc += 1;
-        argv_buf[argc] = "--proto-redir";
-        argc += 1;
-        argv_buf[argc] = "=https";
-        argc += 1;
-
         if (shouldUseCurlResolve(host)) {
             resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
-            argv_buf[argc] = "--resolve";
-            argc += 1;
-            argv_buf[argc] = resolve_entry.?;
-            argc += 1;
         }
 
-        argv_buf[argc] = "--";
-        argc += 1;
-        argv_buf[argc] = url;
-        argc += 1;
-
-        const proc = @import("process_util.zig");
-        const result = proc.run(allocator, argv_buf[0..argc], .{ .max_output_bytes = MAX_FETCH_BYTES }) catch {
-            return ToolResult.fail("Failed to spawn curl — is curl installed?");
+        // Do not auto-follow redirects: every destination needs its own DNS and
+        // private-address validation, otherwise a public URL can redirect curl
+        // into loopback/RFC1918 space.
+        const response = http_util.curlRequestWithStatusAndHeaders(allocator, .{
+            .method = .GET,
+            .url = url,
+            .max_time = "10",
+            .max_response_bytes = MAX_FETCH_BYTES,
+            .resolve_entry = resolve_entry,
+        }) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "curl request failed: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
-        defer allocator.free(result.stderr);
-        defer allocator.free(result.stdout);
+        defer allocator.free(response.headers);
+        defer allocator.free(response.body);
 
-        if (!result.success) {
-            if (result.exit_code) |code| {
-                const detail = if (result.stderr.len > 0) result.stderr else "curl request failed";
-                const msg = try std.fmt.allocPrint(allocator, "curl exited with code {d}: {s}", .{ code, detail });
-                return ToolResult{ .success = false, .output = "", .error_msg = msg };
-            }
-            return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
+        if (isRedirectStatus(response.status_code)) {
+            return ToolResult.fail("Redirect not followed: destination requires a separate security check");
         }
-
-        if (result.stdout.len == 0) {
+        if (response.body.len == 0) {
             const msg = try allocator.dupe(u8, "Page returned empty response");
             return ToolResult{ .success = true, .output = msg };
         }
 
-        // Truncate to MAX_READ_BYTES
-        const truncated = result.stdout.len > MAX_READ_BYTES;
-        const body_len = if (truncated) MAX_READ_BYTES else result.stdout.len;
+        const truncated = response.body.len > MAX_READ_BYTES;
+        const body_len = if (truncated) MAX_READ_BYTES else response.body.len;
         const suffix: []const u8 = if (truncated) "\n\n[Content truncated to 8 KB]" else "";
-
-        const output = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.stdout[0..body_len], suffix });
+        const output = try std.fmt.allocPrint(allocator, "{s}{s}", .{ response.body[0..body_len], suffix });
         return ToolResult{ .success = true, .output = output };
     }
 };
+
+fn isRedirectStatus(status_code: u16) bool {
+    return status_code >= 300 and status_code < 400;
+}
 
 fn shouldUseCurlResolve(host: []const u8) bool {
     return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
@@ -230,6 +195,15 @@ fn buildCurlResolveEntry(
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+
+test "browser read returns redirects for separate security validation" {
+    // Regression: following a redirect after validating only the first host can
+    // reach loopback/private networks through an attacker-controlled 30x.
+    try std.testing.expect(isRedirectStatus(301));
+    try std.testing.expect(isRedirectStatus(308));
+    try std.testing.expect(!isRedirectStatus(200));
+    try std.testing.expect(!isRedirectStatus(404));
+}
 
 test "browser tool name" {
     var bt = BrowserTool{};

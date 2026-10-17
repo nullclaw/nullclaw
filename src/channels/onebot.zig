@@ -196,6 +196,8 @@ pub const OneBotChannel = struct {
     dedup: DedupRing,
     running: Atomic(bool),
     connected: Atomic(bool),
+    lifecycle_mu: std_compat.sync.Mutex = .{},
+    gateway_socket_mu: std_compat.sync.Mutex = .{},
     ws_fd: Atomic(SocketFd),
     gateway_thread: ?std.Thread,
 
@@ -267,7 +269,7 @@ pub const OneBotChannel = struct {
         const user_str = std.fmt.bufPrint(&user_buf, "{d}", .{user_id}) catch return;
 
         // Allowlist check
-        if (self.config.allow_from.len > 0 and !root.isAllowedScoped("onebot channel", self.config.allow_from, user_str)) return;
+        if (!root.isAllowedScoped("onebot channel", self.config.allow_from, user_str)) return;
 
         // Extract chat_id (group_id for group messages, user_id for private)
         const chat_id_int = if (is_group) getJsonInt(val, "group_id") orelse return else user_id;
@@ -404,6 +406,8 @@ pub const OneBotChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *OneBotChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
@@ -414,14 +418,13 @@ pub const OneBotChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *OneBotChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.running.store(false, .release);
         self.connected.store(false, .release);
 
-        // Unblock a blocking read without stealing final ownership from WsClient.deinit().
-        const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
-        if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).shutdown(.recv) catch {};
-        }
+        // Interrupt reads and writes; the gateway worker retains final close ownership.
+        self.shutdownActiveGatewaySocket();
 
         if (self.gateway_thread) |t| {
             t.join();
@@ -474,6 +477,35 @@ pub const OneBotChannel = struct {
         self.connected.store(false, .release);
     }
 
+    fn shutdownActiveGatewaySocket(self: *OneBotChannel) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+    }
+
+    fn closeOwnedGatewaySocket(self: *OneBotChannel, ws: *websocket.WsClient) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        ws.deinit();
+    }
+
+    fn closeOwnedGatewayStream(self: *OneBotChannel, stream: std_compat.net.Stream) void {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        stream.close();
+    }
+
+    fn publishGatewaySocket(self: *OneBotChannel, fd: SocketFd) bool {
+        self.gateway_socket_mu.lock();
+        defer self.gateway_socket_mu.unlock();
+        self.ws_fd.store(fd, .release);
+        if (self.running.load(.acquire)) return true;
+        websocket.shutdownTrackedSocket(&self.ws_fd, invalid_socket, .both);
+        return false;
+    }
+
     fn runGatewayOnce(self: *OneBotChannel) !void {
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [512]u8 = undefined;
@@ -488,17 +520,23 @@ pub const OneBotChannel = struct {
             break :blk headers_buf[0..1];
         } else &.{};
 
-        var ws = if (parts.secure)
-            try websocket.WsClient.connect(self.allocator, parts.host, parts.port, parts.path, headers)
+        const stream = try websocket.WsClient.connectTcp(self.allocator, parts.host, parts.port);
+        if (!self.publishGatewaySocket(stream.handle)) {
+            self.closeOwnedGatewayStream(stream);
+            return error.ConnectionClosed;
+        }
+        var ws = (if (parts.secure)
+            websocket.WsClient.connectFromStream(self.allocator, stream, parts.host, parts.path, headers)
         else
-            try websocket.WsClient.connectPlain(self.allocator, parts.host, parts.port, parts.path, headers);
+            websocket.WsClient.connectPlainFromStream(self.allocator, stream, parts.host, parts.path, headers)) catch |err| {
+            self.closeOwnedGatewayStream(stream);
+            return err;
+        };
         defer {
             self.connected.store(false, .release);
-            self.ws_fd.store(invalid_socket, .release);
-            ws.deinit();
+            self.closeOwnedGatewaySocket(&ws);
         }
 
-        self.ws_fd.store(ws.stream.handle, .release);
         self.connected.store(true, .release);
 
         while (self.running.load(.acquire)) {
@@ -949,7 +987,10 @@ test "handleEvent private message" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{ .account_id = "onebot-main" });
+    var ch = OneBotChannel.init(alloc, .{
+        .account_id = "onebot-main",
+        .allow_from = &.{"12345"},
+    });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -977,6 +1018,7 @@ test "handleEvent group message with prefix" {
 
     var ch = OneBotChannel.init(alloc, .{
         .group_trigger_prefix = "/bot",
+        .allow_from = &.{"111"},
     });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
@@ -1002,6 +1044,7 @@ test "handleEvent group message without prefix skipped" {
 
     var ch = OneBotChannel.init(alloc, .{
         .group_trigger_prefix = "/bot",
+        .allow_from = &.{"111"},
     });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
@@ -1021,7 +1064,7 @@ test "handleEvent deduplication" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{});
+    var ch = OneBotChannel.init(alloc, .{ .allow_from = &.{"42"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -1074,7 +1117,7 @@ test "handleEvent with CQ tags in message" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{});
+    var ch = OneBotChannel.init(alloc, .{ .allow_from = &.{"55"} });
     ch.setBus(&event_bus_inst);
 
     const event_json =
@@ -1097,6 +1140,7 @@ test "handleEvent group message with mention passes prefix check" {
 
     var ch = OneBotChannel.init(alloc, .{
         .group_trigger_prefix = "/bot",
+        .allow_from = &.{"77"},
     });
     ch.setBus(&event_bus_inst);
 
@@ -1155,7 +1199,7 @@ test "handleEvent allow_from permits listed user" {
     try std.testing.expectEqualStrings("allowed user", msg.content);
 }
 
-test "handleEvent allow_from empty allows all" {
+test "handleEvent empty allow_from denies all" {
     const alloc = std.testing.allocator;
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
@@ -1170,9 +1214,8 @@ test "handleEvent allow_from empty allows all" {
     ;
     try ch.handleEvent(event_json);
 
-    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
-    defer msg.deinit(alloc);
-    try std.testing.expectEqualStrings("anyone allowed", msg.content);
+    // Regression: an omitted OneBot allowlist must fail closed.
+    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
 }
 
 test "extractParam finds correct values" {
@@ -1212,4 +1255,21 @@ test "OneBotChannel create + healthCheck + stop leaks zero bytes" {
     const ch = ch_struct.channel();
     _ = ch.healthCheck();
     ch.stop();
+}
+
+// Regression: stop can run while TCP connect is returning; a late socket must
+// never enter a blocking handshake, and the worker must remain its sole owner.
+test "onebot late socket after stop is interrupted and closed by owner" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void) return error.SkipZigTest;
+    const sockets = try websocket.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[1]);
+    var ch = OneBotChannel.init(std.testing.allocator, .{});
+    ch.running.store(true, .release);
+    OneBotChannel.vtableStop(&ch);
+    try std.testing.expect(!ch.publishGatewaySocket(sockets[0]));
+    try std.testing.expectEqual(invalid_socket, ch.ws_fd.load(.acquire));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(sockets[1], &byte));
+    ch.closeOwnedGatewayStream(.{ .handle = sockets[0] });
 }

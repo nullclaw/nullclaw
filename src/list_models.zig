@@ -73,7 +73,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Output as JSON array to stdout
     var stdout_buf: [65536]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     const out = &bw.interface;
     try writeModelsJson(out, models);
     try bw.interface.flush();
