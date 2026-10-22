@@ -837,8 +837,8 @@ pub const QQChannel = struct {
     force_heartbeat: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     gateway_socket_mu: std_compat.sync.Mutex = .{},
     ws_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(invalid_socket),
-    gateway_attempt_started_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    last_gateway_activity_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    gateway_attempt_started_ms: Atomic(i64) = Atomic(i64).init(0),
+    last_gateway_activity_ms: Atomic(i64) = Atomic(i64).init(0),
     hello_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     token_mu: std_compat.sync.Mutex = .{},
 
