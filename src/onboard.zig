@@ -109,7 +109,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
     .{ .key = "vertex", .label = "Google Vertex AI (Gemini)", .default_model = "gemini-2.5-pro", .env_var = "VERTEX_API_KEY" },
     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
-    .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
+    .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "openai/gpt-oss-120b", .env_var = "GROQ_API_KEY" },
 
     // --- Tier 3: OpenAI-compatible specialists ---
     .{ .key = "z.ai", .label = "Z.AI (Zhipu coding)", .default_model = "glm-5", .env_var = "ZAI_API_KEY" },
@@ -409,10 +409,8 @@ const openai_fallback = [_][]const u8{
     "o3-mini",
 };
 const groq_fallback = [_][]const u8{
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
 };
 const anthropic_fallback = [_][]const u8{
     "claude-opus-4-6",
@@ -4376,7 +4374,7 @@ test "defaultModelForProvider vertex aliases" {
 }
 
 test "defaultModelForProvider groq" {
-    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", defaultModelForProvider("groq"));
+    try std.testing.expectEqualStrings("openai/gpt-oss-120b", defaultModelForProvider("groq"));
 }
 
 test "defaultModelForProvider openrouter" {
