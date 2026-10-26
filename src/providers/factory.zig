@@ -74,8 +74,8 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "groq", .url = "https://api.groq.com/openai/v1", .display = "Groq" },
     .{ .name = "mistral", .url = "https://api.mistral.ai/v1", .display = "Mistral" },
     .{ .name = "deepseek", .url = "https://api.deepseek.com", .display = "DeepSeek" },
-    .{ .name = "xai", .url = "https://api.x.ai", .display = "xAI" },
-    .{ .name = "grok", .url = "https://api.x.ai", .display = "xAI" },
+    .{ .name = "xai", .url = "https://api.x.ai/v1", .display = "xAI" },
+    .{ .name = "grok", .url = "https://api.x.ai/v1", .display = "xAI" },
     .{ .name = "cerebras", .url = "https://api.cerebras.ai/v1", .display = "Cerebras" },
     .{ .name = "perplexity", .url = "https://api.perplexity.ai", .display = "Perplexity" },
     .{ .name = "cohere", .url = "https://api.cohere.com/compatibility", .display = "Cohere" },
@@ -865,6 +865,32 @@ test "findCompatProvider returns correct flags" {
     const xiaomi_alias = findCompatProvider("mimo").?;
     try std.testing.expect(xiaomi_alias.auth_style == .custom);
     try std.testing.expectEqualStrings("api-key", xiaomi_alias.custom_header.?);
+
+    // Regression: xAI and Grok use /v1 base URL so chat/completions resolves correctly.
+    const xai_p = findCompatProvider("xai").?;
+    try std.testing.expectEqualStrings("https://api.x.ai/v1", xai_p.url);
+    const grok_p = findCompatProvider("grok").?;
+    try std.testing.expectEqualStrings("https://api.x.ai/v1", grok_p.url);
+}
+
+test "fromConfig xai and grok providers use /v1 base url" {
+    const alloc = std.testing.allocator;
+
+    var h_xai = ProviderHolder.fromConfig(alloc, "xai", "xai-test-key", null, true, null, null, false, null);
+    defer h_xai.deinit();
+    try std.testing.expect(h_xai == .compatible);
+    try std.testing.expectEqualStrings("https://api.x.ai/v1", h_xai.compatible.base_url);
+    const xai_url = try h_xai.compatible.chatCompletionsUrl(alloc);
+    defer alloc.free(xai_url);
+    try std.testing.expectEqualStrings("https://api.x.ai/v1/chat/completions", xai_url);
+
+    var h_grok = ProviderHolder.fromConfig(alloc, "grok", "xai-test-key", null, true, null, null, false, null);
+    defer h_grok.deinit();
+    try std.testing.expect(h_grok == .compatible);
+    try std.testing.expectEqualStrings("https://api.x.ai/v1", h_grok.compatible.base_url);
+    const grok_url = try h_grok.compatible.chatCompletionsUrl(alloc);
+    defer alloc.free(grok_url);
+    try std.testing.expectEqualStrings("https://api.x.ai/v1/chat/completions", grok_url);
 }
 
 test "fromConfig keeps native_tools enabled for z.ai/glm aliases" {
