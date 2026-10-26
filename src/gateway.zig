@@ -4432,6 +4432,15 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                     }) catch null;
                     _ = publishToBus(eb, ctx.state.allocator, "line", uid, line_target, text, sk, meta);
                 } else if (ctx.session_mgr_opt) |sm| {
+                    if (evt.user_id) |sender_uid| {
+                        if (sender_uid.len > 0 and sender_uid[0] == 'U' and std.mem.eql(u8, line_peer.kind, "direct")) {
+                            var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
+                                .access_token = line_access_token,
+                                .channel_secret = line_channel_secret,
+                            });
+                            line_ch.startTyping(sender_uid) catch {};
+                        }
+                    }
                     const conversation_context: ?ConversationContext = simpleConversationContext(
                         "line",
                         line_account_id,

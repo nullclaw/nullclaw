@@ -139,6 +139,25 @@ fn buildPushRequestBody(allocator: std.mem.Allocator, user_id: []const u8, text:
     return try body_list.toOwnedSlice(allocator);
 }
 
+fn buildLoadingRequestBody(allocator: std.mem.Allocator, chat_id: []const u8, loading_seconds: ?u32) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
+    errdefer body_writer.deinit();
+    const w = &body_writer.writer;
+
+    try w.writeAll("{\"chatId\":");
+    try root.appendJsonStringW(w, chat_id);
+    if (loading_seconds) |sec| {
+        const clamped = std.math.clamp(sec, 5, 60);
+        try w.print(",\"loadingSeconds\":{d}", .{clamped});
+    }
+    try w.writeAll("}");
+
+    body_list = body_writer.toArrayList();
+    return try body_list.toOwnedSlice(allocator);
+}
+
 /// LINE Messaging API channel — webhook-based (push).
 ///
 /// Receives events via LINE webhook endpoint, sends replies via
@@ -151,7 +170,9 @@ pub const LineChannel = struct {
 
     pub const REPLY_URL = "https://api.line.me/v2/bot/message/reply";
     pub const PUSH_URL = "https://api.line.me/v2/bot/message/push";
+    pub const LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start";
     pub const MAX_MESSAGE_LEN: usize = 5000;
+    pub const DEFAULT_LOADING_SECONDS: u32 = 60;
 
     pub fn init(allocator: std.mem.Allocator, config: config_types.LineConfig) LineChannel {
         return .{
@@ -249,6 +270,49 @@ pub const LineChannel = struct {
             try self.replyMessage(target, text);
         }
     }
+
+    /// Display a loading animation in a 1-on-1 chat with a user.
+    ///
+    /// Per LINE Messaging API documentation, chatId must be a userId (starts with 'U')
+    /// in a 1-on-1 chat. Calls for group ('C') or room ('R') chats are ignored.
+    /// loading_seconds must be between 5 and 60 seconds (clamped automatically).
+    pub fn sendLoadingIndicator(self: *LineChannel, chat_id: []const u8, loading_seconds: ?u32) !void {
+        if (self.config.access_token.len == 0) return;
+        if (chat_id.len == 0 or chat_id[0] != 'U') return;
+
+        if (builtin.is_test) {
+            if (std.mem.indexOf(u8, chat_id, "fail_loading") != null) {
+                return error.LineApiError;
+            }
+            return;
+        }
+
+        const body = try buildLoadingRequestBody(self.allocator, chat_id, loading_seconds);
+        defer self.allocator.free(body);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{self.config.access_token});
+        const auth_header = auth_writer.buffered();
+
+        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, LOADING_URL, body, &.{auth_header}, null) catch |err| {
+            log.warn("sendLoadingIndicator failed: {}", .{err});
+            return error.LineApiError;
+        };
+        self.allocator.free(resp);
+    }
+
+    /// Start processing indicator for a recipient (displays a LINE loading animation).
+    pub fn startTyping(self: *LineChannel, recipient: []const u8) !void {
+        self.sendLoadingIndicator(recipient, DEFAULT_LOADING_SECONDS) catch |err| {
+            log.warn("LineChannel startTyping failed for {s}: {}", .{ recipient, err });
+        };
+    }
+
+    /// Stop processing indicator for a recipient.
+    /// No-op: LINE automatically dismisses the loading indicator when a reply is sent
+    /// or when loadingSeconds expires.
+    pub fn stopTyping(_: *LineChannel, _: []const u8) !void {}
 
     // ── Webhook Event Parsing ──────────────────────────────────────
 
@@ -413,12 +477,24 @@ pub const LineChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *LineChannel = @ptrCast(@alignCast(ptr));
+        try self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *LineChannel = @ptrCast(@alignCast(ptr));
+        try self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *LineChannel) root.Channel {
@@ -562,9 +638,34 @@ test "line buildPushRequestBody includes non-empty body" {
     try std.testing.expectEqualStrings("{\"to\":\"U123\",\"messages\":[{\"type\":\"text\",\"text\":\"hello push\"}]}", body);
 }
 
+test "line buildLoadingRequestBody formats correctly" {
+    const alloc = std.testing.allocator;
+
+    // With explicit loadingSeconds
+    const body1 = try buildLoadingRequestBody(alloc, "U4af4980629", 30);
+    defer alloc.free(body1);
+    try std.testing.expectEqualStrings("{\"chatId\":\"U4af4980629\",\"loadingSeconds\":30}", body1);
+
+    // Without loadingSeconds (omitted)
+    const body2 = try buildLoadingRequestBody(alloc, "U4af4980629", null);
+    defer alloc.free(body2);
+    try std.testing.expectEqualStrings("{\"chatId\":\"U4af4980629\"}", body2);
+
+    // Clamping lower bound (5..60)
+    const body3 = try buildLoadingRequestBody(alloc, "U4af4980629", 1);
+    defer alloc.free(body3);
+    try std.testing.expectEqualStrings("{\"chatId\":\"U4af4980629\",\"loadingSeconds\":5}", body3);
+
+    // Clamping upper bound (5..60)
+    const body4 = try buildLoadingRequestBody(alloc, "U4af4980629", 99);
+    defer alloc.free(body4);
+    try std.testing.expectEqualStrings("{\"chatId\":\"U4af4980629\",\"loadingSeconds\":60}", body4);
+}
+
 test "line api urls" {
     try std.testing.expectEqualStrings("https://api.line.me/v2/bot/message/reply", LineChannel.REPLY_URL);
     try std.testing.expectEqualStrings("https://api.line.me/v2/bot/message/push", LineChannel.PUSH_URL);
+    try std.testing.expectEqualStrings("https://api.line.me/v2/bot/chat/loading/start", LineChannel.LOADING_URL);
 }
 
 // ── Signature Verification Tests ────────────────────────────────
@@ -950,6 +1051,58 @@ test "line vtable compiles" {
     try std.testing.expect(@intFromPtr(LineChannel.vtable.send) != 0);
     try std.testing.expect(@intFromPtr(LineChannel.vtable.name) != 0);
     try std.testing.expect(@intFromPtr(LineChannel.vtable.healthCheck) != 0);
+    try std.testing.expect(@intFromPtr(LineChannel.vtable.startTyping) != 0);
+    try std.testing.expect(@intFromPtr(LineChannel.vtable.stopTyping) != 0);
+}
+
+test "line sendLoadingIndicator behavior and safety" {
+    var ch = LineChannel.init(std.testing.allocator, .{
+        .access_token = "valid_token",
+        .channel_secret = "secret",
+    });
+
+    // 1-on-1 user chat ID succeeds (in test mode bypass)
+    try ch.sendLoadingIndicator("U1234567890abcdef1234567890abcdef", 30);
+
+    // Simulated API failure
+    try std.testing.expectError(error.LineApiError, ch.sendLoadingIndicator("U_fail_loading", 30));
+
+    // Group chat ID (starts with 'C' or 'G') is ignored (no-op, not supported by LINE)
+    try ch.sendLoadingIndicator("C1234567890abcdef1234567890abcdef", 30);
+    try ch.sendLoadingIndicator("G1234567890abcdef1234567890abcdef", 30);
+
+    // Room chat ID (starts with 'R') is ignored
+    try ch.sendLoadingIndicator("R1234567890abcdef1234567890abcdef", 30);
+
+    // Empty or non-user chat ID is ignored
+    try ch.sendLoadingIndicator("", 30);
+    try ch.sendLoadingIndicator("invalid_id", 30);
+
+    // Empty token returns early without error
+    var ch_empty_token = LineChannel.init(std.testing.allocator, .{
+        .access_token = "",
+        .channel_secret = "secret",
+    });
+    try ch_empty_token.sendLoadingIndicator("U1234567890abcdef1234567890abcdef", 30);
+}
+
+test "line startTyping and stopTyping via channel interface" {
+    var ch = LineChannel.init(std.testing.allocator, .{
+        .access_token = "valid_token",
+        .channel_secret = "secret",
+    });
+    const iface = ch.channel();
+
+    // Calling startTyping and stopTyping on direct chat is safe
+    try iface.startTyping("U1234567890abcdef1234567890abcdef");
+    try iface.stopTyping("U1234567890abcdef1234567890abcdef");
+
+    // Calling on group or room is safe no-op
+    try iface.startTyping("C1234567890abcdef1234567890abcdef");
+    try iface.stopTyping("C1234567890abcdef1234567890abcdef");
+
+    // Error in startTyping is caught and logged gracefully (does not fail caller)
+    try iface.startTyping("U_fail_loading");
 }
 
 test "line channel interface" {
