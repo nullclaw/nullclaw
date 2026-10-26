@@ -7520,6 +7520,20 @@ test "multi-account channels keep all accounts sorted by account id" {
     try std.testing.expectEqualStrings("main", cfg.channels.whatsapp[1].account_id);
 }
 
+test "parse line config with require_mention" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"line": {"accounts": {"main": {"access_token": "tok1", "channel_secret": "sec1", "require_mention": true}, "default": {"access_token": "tok2", "channel_secret": "sec2"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.line.len);
+    try std.testing.expect(!cfg.channels.line[0].require_mention); // default account has require_mention=false
+    try std.testing.expect(cfg.channels.line[1].require_mention); // main account has require_mention=true
+}
+
 test "multi-account channels without default keep sorted order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

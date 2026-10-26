@@ -508,6 +508,7 @@ pub const GatewayState = struct {
     line_access_token: []const u8 = "",
     line_account_id: []const u8 = "default",
     line_allow_from: []const []const u8 = &.{},
+    line_require_mention: bool = false,
     lark_verification_token: []const u8 = "",
     lark_app_id: []const u8 = "",
     lark_app_secret: []const u8 = "",
@@ -2270,6 +2271,12 @@ fn telegramWebhookSecretMatches(raw_request: []const u8, configured_secret: ?[]c
 fn lineSenderAllowed(allow_from: []const []const u8, evt: channels.line.LineEvent) bool {
     const user_id = evt.user_id orelse return false;
     return channels.isAllowed(allow_from, user_id);
+}
+
+fn lineEventAllowedByMention(require_mention: bool, evt: channels.line.LineEvent) bool {
+    if (!require_mention) return true;
+    if (!evt.isGroupOrRoom()) return true;
+    return evt.is_mention;
 }
 
 fn tencentSenderAllowed(allow_from: []const []const u8, sender: []const u8) bool {
@@ -4363,6 +4370,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
         var line_access_token = ctx.state.line_access_token;
         var line_allow_from = ctx.state.line_allow_from;
         var line_account_id = ctx.state.line_account_id;
+        var line_require_mention = ctx.state.line_require_mention;
 
         const sig_header = extractHeader(ctx.raw_request, "X-Line-Signature");
         if (ctx.config_opt) |cfg| {
@@ -4382,11 +4390,13 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                 line_access_token = matched_line_cfg.access_token;
                 line_allow_from = matched_line_cfg.allow_from;
                 line_account_id = matched_line_cfg.account_id;
+                line_require_mention = matched_line_cfg.require_mention;
             } else if (cfg.channels.linePrimary()) |line_cfg| {
                 line_channel_secret = line_cfg.channel_secret;
                 line_access_token = line_cfg.access_token;
                 line_allow_from = line_cfg.allow_from;
                 line_account_id = line_cfg.account_id;
+                line_require_mention = line_cfg.require_mention;
             }
         } else if (line_channel_secret.len > 0) {
             const sig = sig_header orelse {
@@ -4407,6 +4417,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
         };
         for (events) |evt| {
             if (!lineSenderAllowed(line_allow_from, evt)) continue;
+            if (!lineEventAllowedByMention(line_require_mention, evt)) continue;
             if (evt.message_text) |text| {
                 var kb: [128]u8 = undefined;
                 const line_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
@@ -5912,6 +5923,7 @@ pub fn run(
             state.line_access_token = line_cfg.access_token;
             state.line_allow_from = line_cfg.allow_from;
             state.line_account_id = line_cfg.account_id;
+            state.line_require_mention = line_cfg.require_mention;
         }
         if (cfg.channels.larkPrimary()) |lark_cfg| {
             state.lark_verification_token = lark_cfg.verification_token orelse "";
@@ -8628,6 +8640,102 @@ test "line webhook caches reply token only after sender allowlist passes" {
     const cached = channels.line.takeReplyToken(allowed_id, &token_buf) orelse return error.TestExpectedEqual;
     // Regression: disallowed LINE events must not populate the async reply-token cache.
     try std.testing.expectEqualStrings("allowed_reply_token", cached);
+}
+
+test "line webhook with require_mention blocks unmentioned group messages but allows mentioned ones" {
+    if (!build_options.enable_channel_line) return error.SkipZigTest;
+
+    channels.line.resetReplyTokenCacheForTest();
+    defer channels.line.resetReplyTokenCacheForTest();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const allow_from = [_][]const u8{"*"};
+    state.line_allow_from = &allow_from;
+    state.line_access_token = "test-token";
+    state.line_require_mention = true;
+
+    const group_id = "C" ++ ("1" ** 32);
+    const user_id = "U" ++ ("2" ** 32);
+
+    // 1. Unmentioned group message -> blocked
+    const unmentioned_body =
+        \\{"events":[{"type":"message","replyToken":"unmentioned_token","source":{"type":"group","groupId":"
+    ++ group_id ++
+        \\","userId":"
+    ++ user_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"hello everyone"}}]}
+    ;
+    const unmentioned_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ unmentioned_body;
+    var unmentioned_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = unmentioned_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "unmentioned-line-test",
+    };
+    handleLineWebhookRoute(&unmentioned_ctx);
+
+    var token_buf: [512]u8 = undefined;
+    try std.testing.expect(channels.line.takeReplyToken(group_id, &token_buf) == null);
+
+    // 2. Mentioned group message (isSelf = true) -> allowed
+    const mentioned_body =
+        \\{"events":[{"type":"message","replyToken":"mentioned_token","source":{"type":"group","groupId":"
+    ++ group_id ++
+        \\","userId":"
+    ++ user_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m2","type":"text","text":"@bot hello","mention":{"mentionees":[{"index":0,"length":4,"type":"user","userId":"Ubot","isSelf":true}]}}}]}
+    ;
+    const mentioned_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ mentioned_body;
+    var mentioned_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = mentioned_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "mentioned-line-test",
+    };
+    handleLineWebhookRoute(&mentioned_ctx);
+
+    const cached_mentioned = channels.line.takeReplyToken(group_id, &token_buf) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("mentioned_token", cached_mentioned);
+
+    // 3. Direct user message without mention -> allowed even with require_mention=true
+    const dm_user_id = "U" ++ ("3" ** 32);
+    const dm_body =
+        \\{"events":[{"type":"message","replyToken":"dm_token","source":{"type":"user","userId":"
+    ++ dm_user_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m3","type":"text","text":"hello in private"}}]}
+    ;
+    const dm_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ dm_body;
+    var dm_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = dm_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "dm-line-test",
+    };
+    handleLineWebhookRoute(&dm_ctx);
+
+    const cached_dm = channels.line.takeReplyToken(dm_user_id, &token_buf) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("dm_token", cached_dm);
 }
 
 test "telegramChatId extracts nested message.chat.id" {

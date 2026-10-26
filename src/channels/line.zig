@@ -272,6 +272,9 @@ pub const LineChannel = struct {
         if (events_val != .array) return result.items;
         const events = events_val.array.items;
 
+        const destination_val = val.object.get("destination");
+        const destination = if (destination_val) |d| (if (d == .string) d.string else null) else null;
+
         for (events) |event| {
             if (event != .object) continue;
 
@@ -313,6 +316,7 @@ pub const LineChannel = struct {
             var message_type: ?[]const u8 = null;
             var message_text: ?[]const u8 = null;
             var message_id: ?[]const u8 = null;
+            var is_mention: bool = false;
 
             if (std.mem.eql(u8, event_type, "message")) {
                 const msg_obj = event.object.get("message") orelse continue;
@@ -330,6 +334,32 @@ pub const LineChannel = struct {
                         message_text = if (text_val) |t| (if (t == .string) t.string else null) else null;
                     }
                 }
+
+                if (msg_obj.object.get("mention")) |mention_val| {
+                    if (mention_val == .object) {
+                        if (mention_val.object.get("mentionees")) |mentionees_val| {
+                            if (mentionees_val == .array) {
+                                for (mentionees_val.array.items) |m| {
+                                    if (m != .object) continue;
+                                    if (m.object.get("isSelf")) |is_self_val| {
+                                        if (is_self_val == .bool and is_self_val.bool) {
+                                            is_mention = true;
+                                            break;
+                                        }
+                                    }
+                                    if (destination) |dest| {
+                                        if (m.object.get("userId")) |u_val| {
+                                            if (u_val == .string and std.mem.eql(u8, u_val.string, dest)) {
+                                                is_mention = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             try result.append(allocator, .{
@@ -343,14 +373,29 @@ pub const LineChannel = struct {
                 .message_text = if (message_text) |mt| try allocator.dupe(u8, mt) else null,
                 .message_id = if (message_id) |mid| try allocator.dupe(u8, mid) else null,
                 .timestamp = timestamp,
+                .is_mention = is_mention,
             });
         }
 
         return result.toOwnedSlice(allocator);
     }
 
-    /// Parse webhook events and filter by allow_from config.
-    /// Events from users not in the allowlist are skipped.
+    /// Check if an event occurs in a group or room.
+    pub fn isGroupOrRoom(evt: LineEvent) bool {
+        return evt.isGroupOrRoom();
+    }
+
+    /// Check whether a webhook event should be processed according to require_mention policy.
+    /// Direct messages (source type user / no group or room) always pass.
+    /// Group and room messages require explicit mention when require_mention is enabled.
+    pub fn shouldProcessEvent(self: *const LineChannel, evt: LineEvent) bool {
+        if (!self.config.require_mention) return true;
+        if (!evt.isGroupOrRoom()) return true;
+        return evt.is_mention;
+    }
+
+    /// Parse webhook events and filter by allow_from config and require_mention.
+    /// Events from users not in the allowlist or unmentioned group messages (when require_mention is set) are skipped.
     pub fn parseAndFilterEvents(
         self: *LineChannel,
         payload: []const u8,
@@ -360,12 +405,15 @@ pub const LineChannel = struct {
         // Filter in-place: keep only allowed events
         var kept: usize = 0;
         for (events) |*ev| {
-            if (ev.user_id) |uid| {
-                if (root.isAllowedScoped("line channel", self.config.allow_from, uid)) {
-                    events[kept] = ev.*;
-                    kept += 1;
-                    continue;
-                }
+            const sender_allowed = if (ev.user_id) |uid|
+                root.isAllowedScoped("line channel", self.config.allow_from, uid)
+            else
+                false;
+
+            if (sender_allowed and self.shouldProcessEvent(ev.*)) {
+                events[kept] = ev.*;
+                kept += 1;
+                continue;
             }
             ev.deinit(self.allocator);
         }
@@ -441,6 +489,15 @@ pub const LineEvent = struct {
     message_text: ?[]const u8 = null,
     message_id: ?[]const u8 = null,
     timestamp: u64 = 0,
+    is_mention: bool = false,
+
+    pub fn isGroupOrRoom(self: LineEvent) bool {
+        if (self.group_id != null or self.room_id != null) return true;
+        if (self.source_type) |st| {
+            if (std.mem.eql(u8, st, "group") or std.mem.eql(u8, st, "room")) return true;
+        }
+        return false;
+    }
 
     pub fn deinit(self: *LineEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.event_type);
@@ -507,6 +564,16 @@ test "line config defaults" {
         .channel_secret = "sec",
     };
     try std.testing.expectEqual(@as(u16, 3000), config.port);
+    try std.testing.expect(!config.require_mention);
+}
+
+test "line config custom require_mention" {
+    const config = config_types.LineConfig{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .require_mention = true,
+    };
+    try std.testing.expect(config.require_mention);
 }
 
 test "line config custom port" {
@@ -1269,4 +1336,202 @@ test "LineChannel sendMessage routing and fallback" {
     // 5. Both fail with cached token.
     cacheReplyToken("U1234567890123456789012_fail_push", "fail_reply");
     try std.testing.expectError(error.LineApiError, ch.sendMessage("U1234567890123456789012_fail_push", "hello"));
+}
+
+test "line parse text message with isSelf mention" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"events":[{"type":"message","replyToken":"tok","source":{"type":"group","groupId":"G123","userId":"U1"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"@bot hello","mention":{"mentionees":[{"index":0,"length":4,"type":"user","userId":"Ubot","isSelf":true}]}}}]}
+    ;
+
+    const events = try LineChannel.parseWebhookEvents(allocator, payload);
+    defer {
+        for (events) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0].is_mention);
+}
+
+test "line parse text message with non-bot mention" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"events":[{"type":"message","replyToken":"tok","source":{"type":"group","groupId":"G123","userId":"U1"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"@alice hello","mention":{"mentionees":[{"index":0,"length":6,"type":"user","userId":"Ualice","isSelf":false}]}}}]}
+    ;
+
+    const events = try LineChannel.parseWebhookEvents(allocator, payload);
+    defer {
+        for (events) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(!events[0].is_mention);
+}
+
+test "line parse text message with multiple mentions including isSelf" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"events":[{"type":"message","replyToken":"tok","source":{"type":"group","groupId":"G123","userId":"U1"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"@alice @bot hi","mention":{"mentionees":[{"index":0,"length":6,"type":"user","userId":"Ualice","isSelf":false},{"index":7,"length":4,"type":"user","userId":"Ubot","isSelf":true}]}}}]}
+    ;
+
+    const events = try LineChannel.parseWebhookEvents(allocator, payload);
+    defer {
+        for (events) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0].is_mention);
+}
+
+test "line parse text message with mention matching destination" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"destination":"Ubot","events":[{"type":"message","replyToken":"tok","source":{"type":"group","groupId":"G123","userId":"U1"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"@bot hi","mention":{"mentionees":[{"index":0,"length":4,"type":"user","userId":"Ubot"}]}}}]}
+    ;
+
+    const events = try LineChannel.parseWebhookEvents(allocator, payload);
+    defer {
+        for (events) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0].is_mention);
+}
+
+test "line shouldProcessEvent in direct message ignores require_mention" {
+    const allocator = std.testing.allocator;
+    const ch = LineChannel.init(allocator, .{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .require_mention = true,
+    });
+
+    const evt = LineEvent{
+        .event_type = "message",
+        .source_type = "user",
+        .user_id = "U123",
+        .is_mention = false,
+    };
+    try std.testing.expect(ch.shouldProcessEvent(evt));
+}
+
+test "line shouldProcessEvent in group blocks unmentioned message when require_mention is true" {
+    const allocator = std.testing.allocator;
+    const ch = LineChannel.init(allocator, .{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .require_mention = true,
+    });
+
+    const evt = LineEvent{
+        .event_type = "message",
+        .source_type = "group",
+        .group_id = "G123",
+        .user_id = "U123",
+        .is_mention = false,
+    };
+    try std.testing.expect(!ch.shouldProcessEvent(evt));
+}
+
+test "line shouldProcessEvent in group allows mentioned message when require_mention is true" {
+    const allocator = std.testing.allocator;
+    const ch = LineChannel.init(allocator, .{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .require_mention = true,
+    });
+
+    const evt = LineEvent{
+        .event_type = "message",
+        .source_type = "group",
+        .group_id = "G123",
+        .user_id = "U123",
+        .is_mention = true,
+    };
+    try std.testing.expect(ch.shouldProcessEvent(evt));
+}
+
+test "line shouldProcessEvent in room blocks unmentioned message when require_mention is true" {
+    const allocator = std.testing.allocator;
+    const ch = LineChannel.init(allocator, .{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .require_mention = true,
+    });
+
+    const evt = LineEvent{
+        .event_type = "message",
+        .source_type = "room",
+        .room_id = "R123",
+        .user_id = "U123",
+        .is_mention = false,
+    };
+    try std.testing.expect(!ch.shouldProcessEvent(evt));
+}
+
+test "line shouldProcessEvent in group allows message when require_mention is false" {
+    const allocator = std.testing.allocator;
+    const ch = LineChannel.init(allocator, .{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .require_mention = false,
+    });
+
+    const evt = LineEvent{
+        .event_type = "message",
+        .source_type = "group",
+        .group_id = "G123",
+        .user_id = "U123",
+        .is_mention = false,
+    };
+    try std.testing.expect(ch.shouldProcessEvent(evt));
+}
+
+test "line parseAndFilterEvents respects require_mention for group messages" {
+    const allocator = std.testing.allocator;
+    var ch = LineChannel.init(allocator, .{
+        .access_token = "tok",
+        .channel_secret = "sec",
+        .allow_from = &.{"*"},
+        .require_mention = true,
+    });
+
+    // 1. Unmentioned group message -> dropped
+    const unmentioned_payload =
+        \\{"events":[{"type":"message","replyToken":"tok1","source":{"type":"group","groupId":"G1","userId":"U1"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"hello all"}}]}
+    ;
+    const events1 = try ch.parseAndFilterEvents(unmentioned_payload);
+    defer allocator.free(events1);
+    try std.testing.expectEqual(@as(usize, 0), events1.len);
+
+    // 2. Mentioned group message -> kept
+    const mentioned_payload =
+        \\{"events":[{"type":"message","replyToken":"tok2","source":{"type":"group","groupId":"G1","userId":"U1"},"timestamp":1700000000000,"message":{"id":"m2","type":"text","text":"@bot hi","mention":{"mentionees":[{"index":0,"length":4,"type":"user","userId":"Ubot","isSelf":true}]}}}]}
+    ;
+    const events2 = try ch.parseAndFilterEvents(mentioned_payload);
+    defer {
+        for (events2) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events2);
+    }
+    try std.testing.expectEqual(@as(usize, 1), events2.len);
+    try std.testing.expectEqualStrings("@bot hi", events2[0].message_text.?);
 }

@@ -874,6 +874,7 @@ pub const LineConfig = struct {
     channel_secret: []const u8,
     port: u16 = 3000,
     allow_from: []const []const u8 = &.{},
+    require_mention: bool = false,
 };
 
 pub const QQGroupPolicy = enum {

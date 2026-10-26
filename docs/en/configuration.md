@@ -1002,6 +1002,33 @@ Parameters:
 
 NullClaw splits messages >2000 characters (Discord API limit).
 
+### LINE
+
+LINE example:
+
+```json
+{
+  "channels": {
+    "line": {
+      "accounts": {
+        "main": {
+          "access_token": "YOUR_LINE_CHANNEL_ACCESS_TOKEN",
+          "channel_secret": "YOUR_LINE_CHANNEL_SECRET",
+          "allow_from": ["*"],
+          "require_mention": true
+        }
+      }
+    }
+  }
+}
+```
+
+Parameters:
+- `access_token` (required) - Channel access token from the LINE Developers Console
+- `channel_secret` (required) - Channel secret for webhook signature verification (`X-Line-Signature`)
+- `allow_from` (default: []) - User ID allowlist. Empty list denies inbound messages. `["*"]` allows all users
+- `require_mention` (default: false) - When enabled, the bot only responds in group or room chats if explicitly mentioned (`mention.mentionees[].isSelf = true`). Direct messages are always processed normally
+
 Verification:
 ```bash
 nullclaw channel start discord

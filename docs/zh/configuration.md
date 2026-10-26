@@ -818,6 +818,33 @@ Max 说明：
 - `require_mention = true` 仅影响群聊。私聊和 `bot_started` deep link 不受影响。
 - Max inline button 在 nullclaw 中是一次性的：有效点击后原始键盘会被清除，避免过期按钮。
 
+### LINE
+
+LINE 示例：
+
+```json
+{
+  "channels": {
+    "line": {
+      "accounts": {
+        "main": {
+          "access_token": "YOUR_LINE_CHANNEL_ACCESS_TOKEN",
+          "channel_secret": "YOUR_LINE_CHANNEL_SECRET",
+          "allow_from": ["*"],
+          "require_mention": true
+        }
+      }
+    }
+  }
+}
+```
+
+参数说明：
+- `access_token`（必需）- LINE Developers 控制台的 Channel access token
+- `channel_secret`（必需）- 用于验证 Webhook 签名（`X-Line-Signature`）的 Channel secret
+- `allow_from`（默认：[]）- 用户 ID 白名单。空列表拒绝所有入站消息，`["*"]` 允许所有用户
+- `require_mention`（默认：false）- 启用后，Bot 在群组或多人聊天室中仅在被 @ 提及（`mention.mentionees[].isSelf = true`）时才会回复。私聊消息不受影响，始终正常响应
+
 ### `memory`
 
 - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
