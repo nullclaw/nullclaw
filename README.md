@@ -381,6 +381,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
       "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
       "evolink": { "api_key": "YOUR_EVOLINK_API_KEY" },
       "edenai": { "api_key": "YOUR_EDENAI_API_KEY" },
+      "obscurify-ai": { "api_key": "YOUR_OBSCURIFY_API_KEY" },
       "groq": { "api_key": "gsk_..." },
       "azure": { "api_key": "YOUR_AZURE_OPENAI_API_KEY", "base_url": "https://your-resource.openai.azure.com" },
       "vertex": {

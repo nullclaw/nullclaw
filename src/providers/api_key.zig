@@ -325,6 +325,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "atlas-cloud", .{ "ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY", "ATLAS_API_KEY" } },
         .{ "evolink", .{ "EVOLINK_API_KEY", "", "" } },
         .{ "edenai", .{ "EDENAI_API_KEY", "", "" } },
+        .{ "obscurify-ai", .{ "OBSCURIFY_API_KEY", "OBSCURIFY_AI_API_KEY", "" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
@@ -432,6 +433,13 @@ test "edenai env candidate is EDENAI_API_KEY across aliases" {
     try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("edenai")[0]);
     try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden-ai")[0]);
     try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden_ai")[0]);
+}
+
+test "obscurify-ai env candidate is OBSCURIFY_API_KEY across aliases" {
+    try std.testing.expectEqualStrings("OBSCURIFY_API_KEY", providerEnvCandidates("obscurify-ai")[0]);
+    try std.testing.expectEqualStrings("OBSCURIFY_API_KEY", providerEnvCandidates("obscurifyai")[0]);
+    try std.testing.expectEqualStrings("OBSCURIFY_API_KEY", providerEnvCandidates("obscurify_ai")[0]);
+    try std.testing.expectEqualStrings("OBSCURIFY_AI_API_KEY", providerEnvCandidates("obscurify-ai")[1]);
 }
 
 test "azure aliases share Azure env candidate" {

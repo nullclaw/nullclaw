@@ -21,6 +21,9 @@
       "edenai": {
         "api_key": "YOUR_EDENAI_API_KEY"
       },
+      "obscurify-ai": {
+        "api_key": "YOUR_OBSCURIFY_API_KEY"
+      },
       "azure": {
         "api_key": "YOUR_AZURE_OPENAI_API_KEY",
         "base_url": "https://your-resource.openai.azure.com"

@@ -122,6 +122,7 @@ nullclaw onboard --interactive
       "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
       "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
       "edenai": { "api_key": "YOUR_EDENAI_API_KEY" },
+      "obscurify-ai": { "api_key": "YOUR_OBSCURIFY_API_KEY" },
       "evolink": { "api_key": "YOUR_EVOLINK_API_KEY" },
       "anthropic": { "api_key": "sk-ant-..." },
       "openai": { "api_key": "sk-..." }
