@@ -6,6 +6,7 @@ This directory is the documentation index for nullclaw.
 
 - [`en/`](./en/) — English user and operator docs
 - [`zh/`](./zh/) — 中文使用与运维文档
+- [`ja/`](./ja/) — 日本語のユーザー・運用ドキュメント
 
 MB:## Core User Docs
 TJ:
