@@ -23,7 +23,7 @@ UI で nullclaw をもっと簡単にインストール・設定したいです�
 
 最小の完全自律型 AI アシスタント基盤です。5 ドルのボードにも収まる静的な Zig バイナリで、ミリ秒単位で起動し、libc 以外には何も必要としません。
 
-ドキュメント: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [コントリビュート](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
+ドキュメント: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [日本語](docs/ja/README.md) · [コントリビュート](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
 
 ```
 678 KB binary · <2 ms startup · 5,300+ tests · 50+ providers · 19 channels · Pluggable everything
