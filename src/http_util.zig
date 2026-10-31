@@ -458,6 +458,7 @@ pub const CurlRequestOptions = struct {
     url: []const u8,
     body: ?[]const u8 = null,
     headers: []const []const u8 = &.{},
+    /// When set, any caller "Content-Type" header in `headers` is dropped.
     content_type: ?[]const u8 = null,
     proxy: ?[]const u8 = null,
     max_time: ?[]const u8 = null,
@@ -618,7 +619,10 @@ fn secureCurlRequestWithStatusAndHeaders(
     for (spec.headers) |header| {
         try validateCurlHeaderLine(header);
         const parsed = parseHeader(header) orelse return error.InvalidHeader;
-        has_content_type = has_content_type or std.ascii.eqlIgnoreCase(parsed.name, "content-type");
+        const is_content_type = std.ascii.eqlIgnoreCase(parsed.name, "content-type");
+        // spec.content_type wins: sending both would duplicate the header.
+        if (is_content_type and spec.content_type != null) continue;
+        has_content_type = has_content_type or is_content_type;
         try all_headers.append(allocator, header);
     }
     // curl otherwise invents application/x-www-form-urlencoded for --data-binary,
@@ -801,6 +805,7 @@ fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !P
     return .{ .proxy_arena = proxy_arena, .client = client };
 }
 
+/// `content_type`, when set, replaces any caller "Content-Type" in `headers`.
 pub fn httpRequestWithStatusAndHeaders(
     allocator: Allocator,
     method: std.http.Method,
@@ -818,9 +823,12 @@ pub fn httpRequestWithStatusAndHeaders(
         header_count += 1;
     }
     for (headers) |header| {
-        if (header_count >= header_buf.len) return error.TooManyHeaders;
         try validateCurlHeaderLine(header);
-        header_buf[header_count] = parseHeader(header) orelse return error.InvalidHeader;
+        const parsed = parseHeader(header) orelse return error.InvalidHeader;
+        // content_type wins; see CurlRequestOptions.content_type.
+        if (content_type != null and std.ascii.eqlIgnoreCase(parsed.name, "content-type")) continue;
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = parsed;
         header_count += 1;
     }
 
@@ -1993,7 +2001,17 @@ const CredentialedCurlFallbackServerCtx = struct {
     saw_request: AtomicBool = AtomicBool.init(false),
     saw_expected_method: AtomicBool = AtomicBool.init(false),
     saw_authorization: AtomicBool = AtomicBool.init(false),
+    content_type_headers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 };
+
+fn countHeaderLines(request: []const u8, name: []const u8) usize {
+    var n: usize = 0;
+    var lines = std.mem.splitSequence(u8, request, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len > name.len and line[name.len] == ':' and std.ascii.eqlIgnoreCase(line[0..name.len], name)) n += 1;
+    }
+    return n;
+}
 
 fn serveCredentialedCurlFallbackTest(ctx: *CredentialedCurlFallbackServerCtx) void {
     var conn = ctx.server.accept() catch return;
@@ -2019,6 +2037,7 @@ fn serveCredentialedCurlFallbackTest(ctx: *CredentialedCurlFallbackServerCtx) vo
     if (std.mem.indexOf(u8, request, "Authorization: Bearer test-token") != null) {
         ctx.saw_authorization.store(true, .release);
     }
+    ctx.content_type_headers.store(countHeaderLines(request, "Content-Type"), .release);
 
     const response =
         "HTTP/1.1 200 OK\r\n" ++
@@ -2180,6 +2199,57 @@ test "secure curl transport preserves method body content type status and header
     try expectSecureCurlTransport(.POST, "untyped-body", null, false, true);
     try expectSecureCurlTransport(.DELETE, null, null, false, false);
     try expectSecureCurlTransport(.HEAD, null, null, false, false);
+}
+
+/// POSTs JSON through curlPostWithProxy with the given headers and checks that
+/// the local server received exactly one Content-Type line.
+fn expectSingleContentType(headers: []const []const u8) !void {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/search", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    var ctx = CredentialedCurlFallbackServerCtx{
+        .server = &server,
+        .expected_method = "POST",
+    };
+    var thread = try std.Thread.spawn(.{}, serveCredentialedCurlFallbackTest, .{&ctx});
+
+    const body = curlPostWithProxy(allocator, url, "{\"query\":\"q\"}", headers, null, "5") catch |err| {
+        if (!ctx.saw_request.load(.acquire)) unblockCredentialedCurlFallbackServer(&server);
+        thread.join();
+        return err;
+    };
+    defer allocator.free(body);
+    thread.join();
+
+    try std.testing.expectEqualStrings("{\"ok\":true}", body);
+    try std.testing.expect(ctx.saw_expected_method.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), ctx.content_type_headers.load(.acquire));
+}
+
+test "credentialed JSON POST sends a single Content-Type" {
+    // Regression: #1085. Web search providers pass "Content-Type:
+    // application/json" themselves; the request added its own copy and Exa
+    // answered 400 "expected object, received undefined", surfaced as
+    // exa:InvalidResponse. x-api-key routes this through the std.http
+    // fallback (curl on Android, where both paths share the fix).
+    try expectSingleContentType(&.{ "x-api-key: test-key", "Content-Type: application/json" });
+}
+
+test "plain curl JSON POST sends a single Content-Type" {
+    // Regression: #1085, same duplicate on the curl subprocess path (and therefore on
+    // the Android adapter, which shares secureCurlRequestWithStatusAndHeaders).
+    try expectSingleContentType(&.{ "Accept: application/json", "content-type: application/json" });
+}
+
+test "JSON POST without caller Content-Type still sends one" {
+    try expectSingleContentType(&.{"Accept: application/json"});
 }
 
 fn unblockCredentialedCurlFallbackServer(server: *std_compat.net.Server) void {
