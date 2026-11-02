@@ -783,6 +783,32 @@ fn contentTypeHeaderValue(header: []const u8) ?[]const u8 {
     return parsed.value;
 }
 
+// `std.http.Client` only understands http(s) proxies (`Proxy.Protocol`) and
+// silently ignores any other scheme, so a `socks5://` proxy makes the request
+// go out directly instead of through the tunnel the operator configured. Route
+// those requests through curl, which speaks SOCKS itself.
+fn isSocksProxyUrl(proxy: []const u8) bool {
+    const schemes = [_][]const u8{ "socks5h://", "socks5://", "socks4a://", "socks4://", "socks://" };
+    for (schemes) |scheme| {
+        if (proxy.len >= scheme.len and std.ascii.eqlIgnoreCase(proxy[0..scheme.len], scheme)) return true;
+    }
+    return false;
+}
+
+/// Returns an owned copy of the SOCKS proxy that applies to `url`, or null when
+/// std.http can handle the request. Uses the same precedence as
+/// `initProxyClientWithOptionalProxy`: an explicit `proxy` wins, otherwise the
+/// process proxy environment is consulted.
+fn socksProxyForUrl(allocator: Allocator, url: []const u8, proxy: ?[]const u8) !?[]const u8 {
+    if (proxy) |explicit| {
+        return if (isSocksProxyUrl(explicit)) try allocator.dupe(u8, explicit) else null;
+    }
+    var selection = try getProxyForUrl(allocator, url);
+    defer selection.deinit(allocator);
+    const value = selection.value orelse return null;
+    return if (isSocksProxyUrl(value)) try allocator.dupe(u8, value) else null;
+}
+
 fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !ProxyHttpClient {
     var proxy_client = try ProxyHttpClient.init(allocator);
     if (proxy == null) return proxy_client;
@@ -842,6 +868,24 @@ pub fn httpRequestWithStatusAndHeaders(
             .proxy = proxy,
             // curl forwards arbitrary custom headers across origins. Only
             // follow automatically when there are no caller headers to leak.
+            .max_redirects = if (method == .GET and body == null and headers.len == 0 and content_type == null) 3 else null,
+            .accept_compression = true,
+            .std_http_defaults = true,
+        });
+    }
+
+    // Regression: std.http drops socks:// proxies without a word, so a
+    // `socks5://` proxy config silently sent every request out directly (e.g.
+    // Telegram bot API calls bypassing the tunnel). curl handles SOCKS natively.
+    if (try socksProxyForUrl(allocator, url, proxy)) |socks_proxy| {
+        defer allocator.free(socks_proxy);
+        return secureCurlRequestWithStatusAndHeaders(allocator, .{
+            .method = method,
+            .url = url,
+            .body = body,
+            .headers = headers,
+            .content_type = content_type,
+            .proxy = socks_proxy,
             .max_redirects = if (method == .GET and body == null and headers.len == 0 and content_type == null) 3 else null,
             .accept_compression = true,
             .std_http_defaults = true,
@@ -2632,4 +2676,27 @@ test "initClientDefaultProxiesFromEnvMap parses proxy settings" {
     try std.testing.expectEqual(@as(u16, 8443), client.https_proxy.?.port);
     try std.testing.expect(client.http_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-http.example")));
     try std.testing.expect(client.https_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-https.example")));
+}
+
+test "socks proxy schemes are recognised" {
+    try std.testing.expect(isSocksProxyUrl("socks5://127.0.0.1:10812"));
+    try std.testing.expect(isSocksProxyUrl("SOCKS5H://127.0.0.1:10812"));
+    try std.testing.expect(isSocksProxyUrl("socks4a://127.0.0.1:1080"));
+    try std.testing.expect(isSocksProxyUrl("socks://127.0.0.1:1080"));
+    try std.testing.expect(!isSocksProxyUrl("http://127.0.0.1:10812"));
+    try std.testing.expect(!isSocksProxyUrl("https://proxy.example:8443"));
+    try std.testing.expect(!isSocksProxyUrl("socks5"));
+}
+
+test "socksProxyForUrl only captures socks proxies" {
+    const allocator = std.testing.allocator;
+
+    const socks = try socksProxyForUrl(allocator, "https://api.telegram.org", "socks5://127.0.0.1:10812");
+    try std.testing.expect(socks != null);
+    defer allocator.free(socks.?);
+    try std.testing.expectEqualStrings("socks5://127.0.0.1:10812", socks.?);
+
+    // http(s) proxies stay on the std.http path.
+    try std.testing.expect(try socksProxyForUrl(allocator, "https://api.telegram.org", "http://127.0.0.1:7890") == null);
+    try std.testing.expect(try socksProxyForUrl(allocator, "https://api.telegram.org", "https://proxy.example:8443") == null);
 }
