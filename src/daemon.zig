@@ -3168,6 +3168,46 @@ test "scheduler backoff progression" {
     try std.testing.expectEqual(@as(u64, 60), backoff); // stays at max
 }
 
+test "upsertSchedulerRuntimeJob allocation failures keep delivery cleanup balanced" {
+    // Regression: a failed replacement must not free a delivery string that
+    // scheduler teardown still owns. An arena lets the accounting detect a
+    // duplicate free without dereferencing released allocator metadata.
+    for (0..5) |fail_index| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        const allocator = failing.allocator();
+        var latest = CronScheduler.init(allocator, 32, true);
+        const job = try latest.addAgentJob("* * * * *", "summarize status", null, .{
+            .mode = .always,
+            .channel = "telegram",
+            .account_id = "primary",
+            .to = "chat-42",
+            .peer_kind = .group,
+            .peer_id = "group-42",
+            .thread_id = "77",
+        });
+        var runtime_job = job.*;
+        runtime_job.next_run_secs = 120;
+        runtime_job.last_run_secs = 60;
+        runtime_job.last_status = "ok";
+        runtime_job.delivery = .{
+            .mode = .on_error,
+            .channel = "slack",
+            .account_id = "backup",
+            .to = "chat-99",
+            .peer_kind = .channel,
+            .peer_id = "group-99",
+            .thread_id = "88",
+            .best_effort = false,
+        };
+        failing.fail_index = failing.alloc_index + fail_index;
+        try std.testing.expectError(error.OutOfMemory, upsertSchedulerRuntimeJob(allocator, &latest, &runtime_job));
+        latest.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const c = @cImport({
