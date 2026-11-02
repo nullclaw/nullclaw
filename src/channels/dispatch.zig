@@ -546,6 +546,16 @@ pub const SupervisedChannel = struct {
         self.backoff_ms = @min(delay, self.max_backoff_ms);
     }
 
+    /// Record that a restart has been launched. The channel process is up
+    /// again but is not proven healthy yet, so the failure budget and the
+    /// exponential backoff are deliberately preserved: only a successful
+    /// health probe (`recordSuccess`) resets them. Without this, a channel
+    /// that fails again immediately after each restart restarts forever at
+    /// attempt 1 with the initial backoff (hot restart loop).
+    pub fn recordRestartLaunched(self: *SupervisedChannel) void {
+        if (self.restart_count > 0) self.state = .restarting;
+    }
+
     /// Record a successful start / recovery. Resets restart count and
     /// backoff to initial values, sets state to `running`.
     pub fn recordSuccess(self: *SupervisedChannel) void {
@@ -1772,6 +1782,29 @@ test "supervised channel gave_up after max_restarts" {
     try std.testing.expectEqual(SupervisedChannel.State.gave_up, sc.state);
     try std.testing.expect(!sc.shouldRestart());
     try std.testing.expectEqual(@as(u32, 3), sc.restart_count);
+}
+
+test "supervised channel restart launch keeps failure budget" {
+    var mock = MockChannel{ .name_str = "test" };
+    var sc = spawnSupervisedChannel(mock.channel(), 5);
+
+    sc.recordFailure();
+    const first_backoff = sc.currentBackoffMs();
+
+    // Restart launched but not yet proven healthy: budget must survive.
+    sc.recordRestartLaunched();
+    try std.testing.expectEqual(@as(u32, 1), sc.restart_count);
+    try std.testing.expectEqual(first_backoff, sc.currentBackoffMs());
+
+    // Failing again after the restart must escalate, not restart the loop.
+    sc.recordFailure();
+    try std.testing.expectEqual(@as(u32, 2), sc.restart_count);
+    try std.testing.expect(sc.currentBackoffMs() > first_backoff);
+
+    // A healthy probe is still allowed to reset the budget.
+    sc.recordSuccess();
+    try std.testing.expectEqual(@as(u32, 0), sc.restart_count);
+    try std.testing.expectEqual(@as(u64, 1000), sc.currentBackoffMs());
 }
 
 test "supervised channel recordSuccess resets state" {

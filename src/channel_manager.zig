@@ -408,7 +408,7 @@ pub const ChannelManager = struct {
                                 log.err("Failed to restart {s} gateway: {}", .{ entry.name, err });
                                 continue;
                             };
-                            entry.supervised.recordSuccess();
+                            entry.supervised.recordRestartLaunched();
                             state.markRunning("channels");
                             health.markComponentOk(entry.name);
                         } else if (entry.supervised.state == .gave_up) {
@@ -455,7 +455,7 @@ pub const ChannelManager = struct {
                                 log.err("Failed to respawn {s} thread: {}", .{ entry.name, err });
                                 continue;
                             };
-                            entry.supervised.recordSuccess();
+                            entry.supervised.recordRestartLaunched();
                             state.markRunning("channels");
                             health.markComponentOk(entry.name);
                         }
