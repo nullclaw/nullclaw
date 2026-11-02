@@ -418,31 +418,36 @@ fn upsertSchedulerRuntimeJob(
         dst.session_target = runtime_job.session_target;
         // Update delivery config
         dst.delivery.mode = runtime_job.delivery.mode;
+        const channel_copy = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null;
         if (dst.delivery.channel_owned) {
             if (dst.delivery.channel) |c| allocator.free(c);
         }
-        dst.delivery.channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null;
+        dst.delivery.channel = channel_copy;
         dst.delivery.channel_owned = runtime_job.delivery.channel != null;
+        const account_id_copy = if (runtime_job.delivery.account_id) |account_id| try allocator.dupe(u8, account_id) else null;
         if (dst.delivery.account_id_owned) {
             if (dst.delivery.account_id) |account_id| allocator.free(account_id);
         }
-        dst.delivery.account_id = if (runtime_job.delivery.account_id) |account_id| try allocator.dupe(u8, account_id) else null;
+        dst.delivery.account_id = account_id_copy;
         dst.delivery.account_id_owned = runtime_job.delivery.account_id != null;
+        const to_copy = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null;
         if (dst.delivery.to_owned) {
             if (dst.delivery.to) |t| allocator.free(t);
         }
-        dst.delivery.to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null;
+        dst.delivery.to = to_copy;
         dst.delivery.to_owned = runtime_job.delivery.to != null;
+        const peer_id_copy = if (runtime_job.delivery.peer_id) |peer_id| try allocator.dupe(u8, peer_id) else null;
         if (dst.delivery.peer_id_owned) {
             if (dst.delivery.peer_id) |peer_id| allocator.free(peer_id);
         }
         dst.delivery.peer_kind = runtime_job.delivery.peer_kind;
-        dst.delivery.peer_id = if (runtime_job.delivery.peer_id) |peer_id| try allocator.dupe(u8, peer_id) else null;
+        dst.delivery.peer_id = peer_id_copy;
         dst.delivery.peer_id_owned = runtime_job.delivery.peer_id != null;
+        const thread_id_copy = if (runtime_job.delivery.thread_id) |thread_id| try allocator.dupe(u8, thread_id) else null;
         if (dst.delivery.thread_id_owned) {
             if (dst.delivery.thread_id) |thread_id| allocator.free(thread_id);
         }
-        dst.delivery.thread_id = if (runtime_job.delivery.thread_id) |thread_id| try allocator.dupe(u8, thread_id) else null;
+        dst.delivery.thread_id = thread_id_copy;
         dst.delivery.thread_id_owned = runtime_job.delivery.thread_id != null;
         dst.delivery.best_effort = runtime_job.delivery.best_effort;
         return;
@@ -3205,6 +3210,144 @@ test "upsertSchedulerRuntimeJob allocation failures keep delivery cleanup balanc
         try std.testing.expectError(error.OutOfMemory, upsertSchedulerRuntimeJob(allocator, &latest, &runtime_job));
         latest.deinit();
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "upsertSchedulerRuntimeJob clears delivery without allocating" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var latest = CronScheduler.init(allocator, 32, true);
+    defer latest.deinit();
+    const job = try latest.addAgentJob("* * * * *", "summarize status", null, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "primary",
+        .to = "chat-42",
+        .peer_kind = .group,
+        .peer_id = "group-42",
+        .thread_id = "77",
+    });
+    var runtime_job = job.*;
+    runtime_job.delivery = .{};
+    failing.fail_index = failing.alloc_index;
+    try upsertSchedulerRuntimeJob(allocator, &latest, &runtime_job);
+    try std.testing.expectEqualDeep(cron.DeliveryConfig{}, latest.listJobs()[0].delivery);
+}
+
+test "mergeSchedulerTickChangesAndSave keeps store intact when delivery copies fail" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
+    // Regression: replacing an existing job must unwind safely before saving,
+    // leaving the original store available for a later successful merge.
+    var stored = CronScheduler.init(allocator, 32, true);
+    defer stored.deinit();
+    const stored_job = try stored.addAgentJob("* * * * *", "summarize status", null, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "primary",
+        .to = "chat-42",
+        .peer_kind = .group,
+        .peer_id = "group-42",
+        .thread_id = "77",
+    });
+    stored_job.next_run_secs = 60;
+    try cron.saveJobs(&stored);
+    const leaf = try std.fmt.allocPrint(allocator, "cron-{d}.json", .{std.Thread.getCurrentId()});
+    defer allocator.free(leaf);
+    const path = try std_compat.fs.path.join(allocator, &.{ test_home, leaf });
+    defer allocator.free(path);
+    const original = try @import("fs_compat.zig").readFileAlloc(std_compat.fs.cwd(), allocator, path, 1024 * 1024);
+    defer allocator.free(original);
+
+    var runtime = CronScheduler.init(allocator, 32, true);
+    defer runtime.deinit();
+    const runtime_job = try runtime.addAgentJob("* * * * *", "summarize status", null, .{
+        .mode = .on_error,
+        .channel = "slack",
+        .account_id = "backup",
+        .to = "chat-99",
+        .peer_kind = .channel,
+        .peer_id = "group-99",
+        .thread_id = "88",
+        .best_effort = false,
+    });
+    runtime_job.next_run_secs = 60;
+    var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
+    defer {
+        clearSchedulerSnapshot(allocator, &before_tick);
+        before_tick.deinit(allocator);
+    }
+    try buildSchedulerSnapshot(allocator, &runtime, &before_tick);
+    runtime_job.next_run_secs = 120;
+    runtime_job.last_run_secs = 60;
+    runtime_job.last_status = "ok";
+    runtime_job.paused = true;
+    runtime_job.one_shot = true;
+    runtime_job.session_target = .main;
+    const expected = try cron.buildJobsJson(allocator, runtime.listJobs());
+    defer allocator.free(expected);
+
+    // Count the allocations before upsert, matching merge's load and ID map.
+    // Disable resizes in both passes so allocator layout cannot change the count.
+    const replacement_start = blk: {
+        var counting = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+        const counting_allocator = counting.allocator();
+        var latest = CronScheduler.init(counting_allocator, runtime.max_tasks, runtime.enabled);
+        defer latest.deinit();
+        try cron.loadJobsStrict(&latest);
+        var ids: std.StringHashMapUnmanaged(void) = .empty;
+        defer ids.deinit(counting_allocator);
+        try ids.put(counting_allocator, runtime_job.id, {});
+        break :blk counting.alloc_index;
+    };
+
+    for (0..5) |fail_index| {
+        try cron.saveJobs(&stored);
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = replacement_start + fail_index,
+            .resize_fail_index = 0,
+        });
+        try std.testing.expectError(error.OutOfMemory, mergeSchedulerTickChangesAndSave(failing.allocator(), &runtime, &before_tick));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        const unchanged = try @import("fs_compat.zig").readFileAlloc(std_compat.fs.cwd(), allocator, path, 1024 * 1024);
+        defer allocator.free(unchanged);
+        try std.testing.expectEqualStrings(original, unchanged);
+
+        try mergeSchedulerTickChangesAndSave(allocator, &runtime, &before_tick);
+        const saved = try @import("fs_compat.zig").readFileAlloc(std_compat.fs.cwd(), allocator, path, 1024 * 1024);
+        defer allocator.free(saved);
+        try std.testing.expectEqualStrings(expected, saved);
     }
 }
 
