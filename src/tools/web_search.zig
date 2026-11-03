@@ -9,6 +9,7 @@
 //!   - perplexity
 //!   - exa
 //!   - jina
+//!   - keenable (no API key required; explicit only, not part of `auto`)
 //!
 //! Provider selection:
 //! 1) `provider = "auto"` (default): tries a built-in chain.
@@ -45,6 +46,7 @@ const SearchProvider = enum {
     perplexity,
     exa,
     jina,
+    keenable,
 };
 
 const ProviderSearchError = search_common.ProviderSearchError;
@@ -67,7 +69,7 @@ pub const WebSearchTool = struct {
     pub const tool_name = "web_search";
     pub const tool_description = "Search the internet for real-time information, recipes, news, or technical documentation that might not be in your local knowledge base. Use this whenever the user asks for information from the web or the internet.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"},"provider":{"type":"string","description":"Optional provider override (auto,searxng,duckduckgo,ddg,brave,firecrawl,tavily,perplexity,exa,jina)"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"},"provider":{"type":"string","description":"Optional provider override (auto,searxng,duckduckgo,ddg,brave,firecrawl,tavily,perplexity,exa,jina,keenable)"}},"required":["query"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -91,7 +93,7 @@ pub const WebSearchTool = struct {
 
         var chain_buf: [MAX_PROVIDER_CHAIN]SearchProvider = undefined;
         const chain = buildProviderChain(self, provider_raw, &chain_buf) catch |err| switch (err) {
-            error.InvalidProvider => return ToolResult.fail("Invalid web_search provider. Supported: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina."),
+            error.InvalidProvider => return ToolResult.fail("Invalid web_search provider. Supported: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina, keenable."),
             else => return err,
         };
 
@@ -141,6 +143,7 @@ fn parseProvider(raw: []const u8) ?SearchProvider {
     if (std.ascii.eqlIgnoreCase(trimmed, "perplexity")) return .perplexity;
     if (std.ascii.eqlIgnoreCase(trimmed, "exa")) return .exa;
     if (std.ascii.eqlIgnoreCase(trimmed, "jina")) return .jina;
+    if (std.ascii.eqlIgnoreCase(trimmed, "keenable")) return .keenable;
     return null;
 }
 
@@ -155,6 +158,7 @@ fn providerName(provider: SearchProvider) []const u8 {
         .perplexity => "perplexity",
         .exa => "exa",
         .jina => "jina",
+        .keenable => "keenable",
     };
 }
 
@@ -304,6 +308,12 @@ fn executeWithProvider(
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "JINA_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
             defer allocator.free(api_key);
             return search_providers.jina.execute(allocator, query, api_key, self.timeout_secs);
+        },
+        .keenable => {
+            // Keenable works without a key; KEENABLE_API_KEY is optional.
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{"KEENABLE_API_KEY"});
+            defer if (api_key) |key| allocator.free(key);
+            return search_providers.keenable.execute(allocator, query, count, api_key, self.timeout_secs);
         },
     }
 }
@@ -486,6 +496,7 @@ test "WebSearchTool explicit duckduckgo returns setup guidance when it fails" {
 
 test "parseProvider accepts aliases" {
     try testing.expectEqual(SearchProvider.duckduckgo, parseProvider("ddg").?);
+    try testing.expectEqual(SearchProvider.keenable, parseProvider("keenable").?);
     try testing.expectEqual(SearchProvider.duckduckgo, parseProvider("duckduckgo").?);
     try testing.expectEqual(SearchProvider.brave, parseProvider("BRAVE").?);
     try testing.expect(parseProvider("google") == null);

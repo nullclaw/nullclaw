@@ -688,9 +688,9 @@ Use this when you want full web-search provider control plus unrestricted shell 
 
 - `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`); local/private SearXNG instances may also use plain HTTP such as `http://localhost:8888` or `http://192.168.1.10:8888/search`.
 - Invalid `http_request.search_base_url` now fails config validation at startup (no automatic fallback for malformed URL).
-- `http_request.search_provider` supports: `auto`, `searxng`, `duckduckgo` (`ddg`), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina`.
+- `http_request.search_provider` supports: `auto`, `searxng`, `duckduckgo` (`ddg`), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina`, `keenable`.
 - `http_request.search_fallback_providers` is optional and is tried in order when the primary provider fails.
-- Provider env vars: `BRAVE_API_KEY`, `FIRECRAWL_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY` (or shared `WEB_SEARCH_API_KEY` where supported). DuckDuckGo and SearXNG do not require API keys.
+- Provider env vars: `BRAVE_API_KEY`, `FIRECRAWL_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY` (or shared `WEB_SEARCH_API_KEY` where supported). DuckDuckGo, SearXNG and Keenable do not require API keys (`KEENABLE_API_KEY` is optional for higher limits; Keenable is used only when selected explicitly, not by `auto`).
 - `allowed_commands` entries support `"cmd"`, `"cmd *"`, and `"*"` formats.
   - `"cmd"` and `"cmd *"` both allow that command family at the allowlist stage.
   - `"*"` allows any command at the allowlist stage.
