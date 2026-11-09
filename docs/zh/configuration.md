@@ -140,6 +140,29 @@ nullclaw onboard --interactive
 - `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
 - `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
 
+#### OpenCode Go
+
+`opencode-go` 已内置，默认指向
+`https://opencode.ai/inference/go/openai/v1`。它会自动发送必需的
+`x-opencode-session` 请求头，值由稳定的会话 ID 哈希得到。
+
+```json
+{
+  "models": {
+    "providers": {
+      "opencode-go": {
+        "api_key": "oc_sk_...",
+        "user_agent": "nullclaw"
+      }
+    }
+  }
+}
+```
+
+凭据优先从 `OPENCODE_GO_API_KEY` 读取，其次使用 `OPENCODE_API_KEY`。
+`base_url` 可省略，因为内置地址已经正确；建议设置 `user_agent`，便于
+OpenCode 识别客户端。
+
 #### 原生 Anthropic provider
 
 NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API，无需经过 OpenRouter 或代理。

@@ -48,6 +48,10 @@ const CompatProvider = struct {
     auth_style: compatible.AuthStyle = .bearer,
     /// Custom auth header name when auth_style is .custom.
     custom_header: ?[]const u8 = null,
+    /// Optional request header carrying a stable per-conversation session ID.
+    /// OpenCode Go requires `x-opencode-session`; other compatible providers
+    /// leave this unset.
+    session_header: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
     native_tools: bool = true,
     /// When set, cap max_tokens in non-streaming requests to this value.
@@ -101,6 +105,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "synthetic", .url = "https://api.synthetic.new/openai/v1", .display = "Synthetic" },
     .{ .name = "opencode", .url = "https://opencode.ai/zen/v1", .display = "OpenCode Zen" },
     .{ .name = "opencode-zen", .url = "https://opencode.ai/zen/v1", .display = "OpenCode Zen" },
+    .{ .name = "opencode-go", .url = "https://opencode.ai/inference/go/openai/v1", .display = "OpenCode Go", .session_header = "x-opencode-session" },
     .{ .name = "astrai", .url = "https://as-trai.com/v1", .display = "Astrai" },
     .{ .name = "poe", .url = "https://api.poe.com/v1", .display = "Poe" },
 
@@ -465,6 +470,7 @@ pub const ProviderHolder = union(enum) {
                     if (c.reasoning_split_param) prov.reasoning_split_param = true;
                     if (c.chat_template_enable_thinking_param) prov.chat_template_enable_thinking_param = true;
                     if (c.disable_streaming) prov.disable_streaming = true;
+                    prov.session_header = c.session_header;
                 }
 
                 // Apply config-level overrides.
@@ -1352,4 +1358,51 @@ test "every ProviderHolder variant returns non-empty name matching key" {
 
         holder.deinit();
     }
+}
+
+test "opencode-go is a compatible provider with automatic session header" {
+    const alloc = std.testing.allocator;
+    var holder = ProviderHolder.fromConfig(
+        alloc,
+        "opencode-go",
+        "test-key",
+        null,
+        true,
+        null,
+        null,
+        false,
+        null,
+    );
+    defer holder.deinit();
+
+    try std.testing.expect(holder == .compatible);
+    try std.testing.expectEqualStrings("https://opencode.ai/inference/go/openai/v1", holder.compatible.base_url);
+    try std.testing.expectEqualStrings("x-opencode-session", holder.compatible.session_header.?);
+}
+
+test "compatibleProviderUrl returns OpenCode Go inference URL" {
+    try std.testing.expectEqualStrings(
+        "https://opencode.ai/inference/go/openai/v1",
+        compatibleProviderUrl("opencode-go").?,
+    );
+}
+
+test "opencode-go keeps session header when config overrides base_url" {
+    const alloc = std.testing.allocator;
+    var holder = ProviderHolder.fromConfig(
+        alloc,
+        "opencode-go",
+        "test-key",
+        "https://proxy.example.com/v1",
+        true,
+        null,
+        null,
+        false,
+        null,
+    );
+    defer holder.deinit();
+
+    try std.testing.expect(holder == .compatible);
+    try std.testing.expectEqualStrings("https://proxy.example.com/v1", holder.compatible.base_url);
+    try std.testing.expectEqualStrings("x-opencode-session", holder.compatible.session_header.?);
 }

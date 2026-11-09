@@ -156,6 +156,30 @@ Common per-provider fields:
 - `max_streaming_prompt_bytes`: skip streaming above this estimated prompt size.
 - `chat_template_enable_thinking_param`: for custom OpenAI-compatible vLLM/Qwen endpoints, map `reasoning_effort` to `chat_template_kwargs.enable_thinking`.
 
+#### OpenCode Go
+
+`opencode-go` is built in and points at
+`https://opencode.ai/inference/go/openai/v1`. It automatically sends the
+required `x-opencode-session` header with a stable, hashed session id.
+
+```json
+{
+  "models": {
+    "providers": {
+      "opencode-go": {
+        "api_key": "oc_sk_...",
+        "user_agent": "nullclaw"
+      }
+    }
+  }
+}
+```
+
+Credentials resolve from `OPENCODE_GO_API_KEY` first, then
+`OPENCODE_API_KEY`. `base_url` is optional because the built-in value is
+already correct. `user_agent` is recommended so OpenCode can identify the
+client.
+
 #### Native Anthropic provider
 
 NullClaw has a dedicated Anthropic provider that connects directly to the Anthropic API

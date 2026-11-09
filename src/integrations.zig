@@ -111,6 +111,7 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "Moonshot", .description = "Kimi & Kimi Coding", .category = .ai_model, .status = .available },
     .{ .name = "Synthetic", .description = "Synthetic AI models", .category = .ai_model, .status = .available },
     .{ .name = "OpenCode Zen", .description = "Code-focused AI models", .category = .ai_model, .status = .available },
+    .{ .name = "OpenCode Go", .description = "OpenCode Go subscription models", .category = .ai_model, .status = .available },
     .{ .name = "Z.AI", .description = "Z.AI inference", .category = .ai_model, .status = .available },
     .{ .name = "GLM", .description = "ChatGLM / Zhipu models", .category = .ai_model, .status = .available },
     .{ .name = "MiniMax", .description = "MiniMax AI models", .category = .ai_model, .status = .available },
