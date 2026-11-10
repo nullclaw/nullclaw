@@ -125,6 +125,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "atlas-cloud", .label = "Atlas Cloud", .default_model = "qwen/qwen3-32b", .env_var = "ATLASCLOUD_API_KEY" },
     .{ .key = "evolink", .label = "Evolink", .default_model = "gpt-5.2", .env_var = "EVOLINK_API_KEY" },
     .{ .key = "edenai", .label = "Eden AI (EU gateway)", .default_model = "anthropic/claude-sonnet-5", .env_var = "EDENAI_API_KEY" },
+    .{ .key = "uberllm", .label = "UberLLM", .default_model = "deepseek/deepseek-v4.1-flash", .env_var = "UBERLLM_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
     .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
@@ -452,6 +453,7 @@ const claude_cli_fallback = [_][]const u8{
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const NEARAI_MODELS_URL = "https://cloud-api.near.ai/v1/models";
 const ATLAS_CLOUD_MODELS_URL = "https://api.atlascloud.ai/v1/models";
+const UBERLLM_MODELS_URL = "https://api.uberllm.dev/v1/models";
 
 const ModelsDevProvider = struct {
     canonical: []const u8,
@@ -696,6 +698,11 @@ fn staticNativeModelCatalogForProvider(canonical: []const u8) ?NativeModelCatalo
     } else if (std.mem.eql(u8, canonical, "atlas-cloud")) {
         return .{
             .url = ATLAS_CLOUD_MODELS_URL,
+            .parse_options = .{ .require_chat_modalities = true },
+        };
+    } else if (std.mem.eql(u8, canonical, "uberllm")) {
+        return .{
+            .url = UBERLLM_MODELS_URL,
             .parse_options = .{ .require_chat_modalities = true },
         };
     }
@@ -3528,6 +3535,7 @@ test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlas"));
     try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlascloud"));
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("evolink"));
+    try std.testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", defaultModelForProvider("uberllm"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("xiaomi"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("mimo"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
@@ -3548,6 +3556,7 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas-cloud"));
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas"));
     try std.testing.expectEqualStrings("EVOLINK_API_KEY", providerEnvVar("evolink"));
+    try std.testing.expectEqualStrings("UBERLLM_API_KEY", providerEnvVar("uberllm"));
     try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
@@ -5460,6 +5469,11 @@ test "staticNativeModelCatalogForProvider maps native model endpoints" {
     try std.testing.expectEqualStrings(ATLAS_CLOUD_MODELS_URL, atlas.url);
     try std.testing.expect(!atlas.needs_auth);
     try std.testing.expect(atlas.parse_options.require_chat_modalities);
+
+    const uberllm = staticNativeModelCatalogForProvider("uberllm") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(UBERLLM_MODELS_URL, uberllm.url);
+    try std.testing.expect(!uberllm.needs_auth);
+    try std.testing.expect(uberllm.parse_options.require_chat_modalities);
 
     const openai = staticNativeModelCatalogForProvider("openai") orelse return error.TestUnexpectedResult;
     try std.testing.expect(openai.needs_auth);
