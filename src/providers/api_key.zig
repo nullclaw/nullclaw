@@ -312,6 +312,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "synthetic", .{ "SYNTHETIC_API_KEY", "", "" } },
         .{ "opencode", .{ "OPENCODE_API_KEY", "", "" } },
         .{ "opencode-zen", .{ "OPENCODE_API_KEY", "", "" } },
+        .{ "opencode-go", .{ "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "" } },
         .{ "minimax", .{ "MINIMAX_API_KEY", "", "" } },
         .{ "qwen", .{ "DASHSCOPE_API_KEY", "", "" } },
         .{ "dashscope", .{ "DASHSCOPE_API_KEY", "", "" } },
@@ -464,6 +465,39 @@ test "providerEnvCandidates includes onboarding env hints" {
 
         try std.testing.expect(matched);
     }
+}
+
+test "opencode-go env candidates prefer OPENCODE_GO_API_KEY then OPENCODE_API_KEY" {
+    const candidates = providerEnvCandidates("opencode-go");
+    try std.testing.expectEqualStrings("OPENCODE_GO_API_KEY", candidates[0]);
+    try std.testing.expectEqualStrings("OPENCODE_API_KEY", candidates[1]);
+}
+
+test "resolveApiKey opencode-go prefers OPENCODE_GO_API_KEY over OPENCODE_API_KEY" {
+    var env_guard = try platform.TestEnvGuard.capture(
+        std.testing.allocator,
+        &.{ "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY" },
+    );
+    defer env_guard.deinit();
+    try platform.setProcessEnv(std.testing.allocator, "OPENCODE_GO_API_KEY", "go-key");
+    try platform.setProcessEnv(std.testing.allocator, "OPENCODE_API_KEY", "zen-key");
+
+    const result = try resolveApiKey(std.testing.allocator, "opencode-go", null);
+    defer if (result) |value| std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("go-key", result.?);
+}
+
+test "resolveApiKey opencode-go falls back to OPENCODE_API_KEY" {
+    var env_guard = try platform.TestEnvGuard.captureAndClear(
+        std.testing.allocator,
+        &.{ "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY" },
+    );
+    defer env_guard.deinit();
+    try platform.setProcessEnv(std.testing.allocator, "OPENCODE_API_KEY", "zen-key");
+
+    const result = try resolveApiKey(std.testing.allocator, "opencode-go", null);
+    defer if (result) |value| std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("zen-key", result.?);
 }
 
 test "resolveApiKeyFromConfig finds key from providers" {

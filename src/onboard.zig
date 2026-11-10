@@ -129,6 +129,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
     .{ .key = "opencode-zen", .label = "OpenCode Zen", .default_model = "opencode-model", .env_var = "OPENCODE_API_KEY" },
+    .{ .key = "opencode-go", .label = "OpenCode Go", .default_model = "deepseek-v4.1-flash", .env_var = "OPENCODE_GO_API_KEY" },
     .{ .key = "minimax", .label = "MiniMax", .default_model = "minimax-m2.1", .env_var = "MINIMAX_API_KEY" },
 
     // --- Tier 5: Cloud gateways ---

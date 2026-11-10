@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
@@ -217,6 +218,9 @@ pub const OpenAiCompatibleProvider = struct {
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Optional request header carrying a stable per-conversation session ID.
+    /// OpenCode Go requires `x-opencode-session`.
+    session_header: ?[]const u8 = null,
     /// Primary OpenAI-compatible protocol to use for this provider.
     api_mode: CompatibleApiMode = .chat_completions,
     /// Maximum estimated request text bytes before streaming is skipped.
@@ -253,6 +257,35 @@ pub const OpenAiCompatibleProvider = struct {
     fn validateUserAgent(user_agent: []const u8) bool {
         // Disallow header injection and malformed values.
         return std.mem.indexOfAny(u8, user_agent, "\r\n") == null;
+    }
+
+    /// Build a `{header_name}: ses_{hash}` header line from a session id.
+    ///
+    /// Hashing keeps the value header-safe and avoids exposing channel or peer
+    /// identifiers to the upstream provider. The same session id always maps to
+    /// the same header value, which is what session-routing providers expect.
+    fn buildSessionHeader(
+        allocator: std.mem.Allocator,
+        header_name: []const u8,
+        session_id: []const u8,
+    ) ![]u8 {
+        if (header_name.len == 0 or std.mem.indexOfAny(u8, header_name, "\r\n:") != null) {
+            return error.CompatibleApiError;
+        }
+
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(session_id);
+        const digest = hasher.final();
+        return std.fmt.allocPrint(allocator, "{s}: ses_{x:0>16}", .{ header_name, digest });
+    }
+
+    /// Pick the session seed for the optional session header, falling back to
+    /// the provider name when a caller has no conversation id.
+    fn sessionSeed(self: *const OpenAiCompatibleProvider, session_id: ?[]const u8) []const u8 {
+        if (session_id) |sid| {
+            if (sid.len > 0) return sid;
+        }
+        return self.name;
     }
 
     fn trimTrailingSlash(s: []const u8) []const u8 {
@@ -825,7 +858,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        var headers_buf: [2][]const u8 = undefined;
+        var headers_buf: [3][]const u8 = undefined;
         var header_count: usize = 0;
         if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
@@ -839,6 +872,13 @@ pub const OpenAiCompatibleProvider = struct {
             if (!validateUserAgent(ua)) return error.CompatibleApiError;
             user_agent_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua}) catch return error.CompatibleApiError;
             headers_buf[header_count] = user_agent_hdr.?;
+            header_count += 1;
+        }
+        var session_hdr: ?[]u8 = null;
+        defer if (session_hdr) |h| allocator.free(h);
+        if (self.session_header) |header_name| {
+            session_hdr = try buildSessionHeader(allocator, header_name, self.sessionSeed(request.session_id));
+            headers_buf[header_count] = session_hdr.?;
             header_count += 1;
         }
 
@@ -1237,8 +1277,8 @@ pub const OpenAiCompatibleProvider = struct {
         else
             null;
 
-        // Build extra headers (User-Agent if configured)
-        var extra_headers: [1][]const u8 = undefined;
+        // Build extra headers (User-Agent and optional session header)
+        var extra_headers: [2][]const u8 = undefined;
         var extra_header_count: usize = 0;
         var user_agent_hdr: ?[]u8 = null;
         defer if (user_agent_hdr) |h| allocator.free(h);
@@ -1246,6 +1286,13 @@ pub const OpenAiCompatibleProvider = struct {
             if (!validateUserAgent(ua)) return error.CompatibleApiError;
             user_agent_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua}) catch return error.CompatibleApiError;
             extra_headers[extra_header_count] = user_agent_hdr.?;
+            extra_header_count += 1;
+        }
+        var session_hdr: ?[]u8 = null;
+        defer if (session_hdr) |h| allocator.free(h);
+        if (self.session_header) |header_name| {
+            session_hdr = try buildSessionHeader(allocator, header_name, self.sessionSeed(request.session_id));
+            extra_headers[extra_header_count] = session_hdr.?;
             extra_header_count += 1;
         }
 
@@ -1313,6 +1360,9 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror![]const u8 {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+        // chatWithSystem has no ChatRequest; use the one-shot message as the
+        // stable session seed for the optional session header.
+        const session_seed = self.sessionSeed(message);
 
         if (self.api_mode == .responses) {
             const messages = try buildSingleTurnMessages(allocator, system_prompt, message, self.merge_system_into_user);
@@ -1320,6 +1370,7 @@ pub const OpenAiCompatibleProvider = struct {
 
             const request = ChatRequest{
                 .messages = messages,
+                .session_id = if (self.session_header != null) session_seed else null,
                 .model = effective_model,
                 .temperature = temperature,
                 .timeout_secs = 0,
@@ -1372,8 +1423,8 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        // Build headers (auth + optional User-Agent)
-        var headers_buf: [2][]const u8 = undefined;
+        // Build headers (auth + optional User-Agent + optional session header).
+        var headers_buf: [3][]const u8 = undefined;
         var header_count: usize = 0;
         if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
@@ -1389,6 +1440,13 @@ pub const OpenAiCompatibleProvider = struct {
             headers_buf[header_count] = user_agent_hdr.?;
             header_count += 1;
         }
+        var session_hdr: ?[]u8 = null;
+        defer if (session_hdr) |h| allocator.free(h);
+        if (self.session_header) |header_name| {
+            session_hdr = try buildSessionHeader(allocator, header_name, session_seed);
+            headers_buf[header_count] = session_hdr.?;
+            header_count += 1;
+        }
 
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
@@ -1400,6 +1458,7 @@ pub const OpenAiCompatibleProvider = struct {
                 defer freeSingleTurnMessages(allocator, fallback_messages);
                 const fallback_request = ChatRequest{
                     .messages = fallback_messages,
+                    .session_id = if (self.session_header != null) session_seed else null,
                     .model = effective_model,
                     .temperature = temperature,
                     .timeout_secs = 0,
@@ -1464,8 +1523,8 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        // Build headers (auth + optional User-Agent)
-        var headers_buf: [2][]const u8 = undefined;
+        // Build headers (auth + optional User-Agent + optional session header)
+        var headers_buf: [3][]const u8 = undefined;
         var header_count: usize = 0;
         if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
@@ -1479,6 +1538,13 @@ pub const OpenAiCompatibleProvider = struct {
             if (!validateUserAgent(ua)) return error.CompatibleApiError;
             user_agent_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua}) catch return error.CompatibleApiError;
             headers_buf[header_count] = user_agent_hdr.?;
+            header_count += 1;
+        }
+        var session_hdr: ?[]u8 = null;
+        defer if (session_hdr) |h| allocator.free(h);
+        if (self.session_header) |header_name| {
+            session_hdr = try buildSessionHeader(allocator, header_name, self.sessionSeed(capped_request.session_id));
+            headers_buf[header_count] = session_hdr.?;
             header_count += 1;
         }
 
@@ -3287,4 +3353,113 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
     // Individual messages are each under the limit; verify the sum is what matters.
     const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
     try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
+}
+
+test "buildSessionHeader produces a stable x-opencode-session header" {
+    const first = try OpenAiCompatibleProvider.buildSessionHeader(std.testing.allocator, "x-opencode-session", "agent:korky");
+    defer std.testing.allocator.free(first);
+    const second = try OpenAiCompatibleProvider.buildSessionHeader(std.testing.allocator, "x-opencode-session", "agent:korky");
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(std.mem.startsWith(u8, first, "x-opencode-session: ses_"));
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOfAny(u8, first, "\r\n") == null);
+}
+
+test "buildSessionHeader distinguishes different session ids" {
+    const korky = try OpenAiCompatibleProvider.buildSessionHeader(std.testing.allocator, "x-opencode-session", "agent:korky");
+    defer std.testing.allocator.free(korky);
+    const ibhagwan = try OpenAiCompatibleProvider.buildSessionHeader(std.testing.allocator, "x-opencode-session", "agent:ibhagwan");
+    defer std.testing.allocator.free(ibhagwan);
+
+    try std.testing.expect(!std.mem.eql(u8, korky, ibhagwan));
+}
+
+const SessionHeaderServerCtx = struct {
+    server: *std_compat.net.Server,
+    saw_session_header: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_user_agent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn serveSessionHeaderTest(ctx: *SessionHeaderServerCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+
+    var request_buf: [16 * 1024]u8 = undefined;
+    var request_len: usize = 0;
+    while (request_len < request_buf.len) {
+        const read_len = conn.stream.read(request_buf[request_len..]) catch return;
+        if (read_len == 0) break;
+        request_len += read_len;
+        if (std.mem.indexOf(u8, request_buf[0..request_len], "\r\n\r\n") != null) break;
+    }
+
+    const request = request_buf[0..request_len];
+    if (std.mem.indexOf(u8, request, "x-opencode-session: ses_") != null) {
+        ctx.saw_session_header.store(true, .release);
+    }
+    if (std.mem.indexOf(u8, request, "User-Agent: nullclaw-test") != null) {
+        ctx.saw_user_agent.store(true, .release);
+    }
+
+    const body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+    var head_buf: [256]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body.len},
+    ) catch return;
+    conn.stream.writeAll(head) catch return;
+    conn.stream.writeAll(body) catch {};
+}
+
+test "compatible provider sends x-opencode-session from ChatRequest" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = SessionHeaderServerCtx{ .server = &server };
+    var thread = try std.Thread.spawn(.{}, serveSessionHeaderTest, .{&ctx});
+
+    const base_url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/v1",
+        .{server.listen_address.in.getPort()},
+    );
+    defer allocator.free(base_url);
+
+    var prov = OpenAiCompatibleProvider.init(
+        allocator,
+        "opencode-go",
+        base_url,
+        "test-key",
+        .bearer,
+        "nullclaw-test",
+    );
+    prov.session_header = "x-opencode-session";
+    const iface = prov.provider();
+    defer iface.deinit();
+
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{
+        .messages = &messages,
+        .session_id = "agent:korky",
+        .model = "test-model",
+        .temperature = 0.0,
+    };
+    var response = iface.chat(allocator, req, "test-model", 0.0) catch |err| {
+        const unblock = std_compat.net.tcpConnectToAddress(server.listen_address) catch null;
+        if (unblock) |stream| stream.close();
+        thread.join();
+        return err;
+    };
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqualStrings("ok", response.content.?);
+    thread.join();
+    try std.testing.expect(ctx.saw_session_header.load(.acquire));
+    try std.testing.expect(ctx.saw_user_agent.load(.acquire));
 }
