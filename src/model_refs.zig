@@ -71,7 +71,7 @@ const known_url_model_provider_namespaces = std.StaticStringMap(void).initCompti
     .{ "atlas-cloud", {} },
     .{ "evolink", {} },
     .{ "edenai", {} },
-    .{ "uberllm", {} },
+    .{ "martllm", {} },
     .{ "vercel-ai", {} },
     .{ "poe", {} },
     .{ "xiaomi", {} },

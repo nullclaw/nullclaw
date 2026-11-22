@@ -21,8 +21,8 @@
       "edenai": {
         "api_key": "YOUR_EDENAI_API_KEY"
       },
-      "uberllm": {
-        "api_key": "YOUR_UBERLLM_API_KEY"
+      "martllm": {
+        "api_key": "YOUR_MARTLLM_API_KEY"
       },
       "azure": {
         "api_key": "YOUR_AZURE_OPENAI_API_KEY",
