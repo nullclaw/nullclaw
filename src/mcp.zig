@@ -48,6 +48,10 @@ pub const McpServer = struct {
     http_client: ?http_util.ProxyHttpClient,
     next_id: u32,
     mcp_session_id: ?[]u8,
+    /// Number of live tool wrappers referencing this server. Each wrapper
+    /// with owns_server = true takes one reference in McpToolWrapper.tool
+    /// and releases it in deinit; the last release frees the server.
+    wrappers: usize = 0,
 
     pub fn init(allocator: Allocator, config: McpServerConfig) McpServer {
         return .{
@@ -515,7 +519,11 @@ pub const McpToolWrapper = struct {
         .deinit = &deinitImpl,
     };
 
+    /// Returns the Tool vtable view for this wrapper and takes one reference
+    /// on the shared server (only for wrappers with owns_server = true).
+    /// Must be called exactly once per wrapper, as initMcpTools does.
     pub fn tool(self: *McpToolWrapper) tools_mod.Tool {
+        if (self.owns_server) self.server.wrappers += 1;
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
@@ -553,9 +561,16 @@ pub const McpToolWrapper = struct {
         _ = allocator;
         const self: *McpToolWrapper = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
+        // Regression: tool_customizations removal of a disabled tool wrapper
+        // used to free the whole shared McpServer while other wrappers still
+        // held pointers to it, segfaulting (exit 139) on the next tools/call.
+        // The server is now reference-counted: the last wrapper frees it.
         if (self.owns_server) {
-            self.server.deinit();
-            alloc.destroy(self.server);
+            self.server.wrappers -= 1;
+            if (self.server.wrappers == 0) {
+                self.server.deinit();
+                alloc.destroy(self.server);
+            }
         }
         alloc.free(self.original_name);
         alloc.free(self.prefixed_name);
@@ -612,7 +627,7 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             }
         }
 
-        for (tool_defs, 0..) |td, idx| {
+        for (tool_defs) |td| {
             var wrapper = try allocator.create(McpToolWrapper);
             errdefer allocator.destroy(wrapper);
             const prefixed_name = try std.fmt.allocPrint(allocator, "mcp_{s}_{s}", .{ cfg.name, td.name });
@@ -620,13 +635,19 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             wrapper.* = .{
                 .allocator = allocator,
                 .server = server,
-                .owns_server = idx == 0,
+                .owns_server = true,
                 .original_name = td.name,
                 .prefixed_name = prefixed_name,
                 .desc = td.description,
                 .params_json = td.input_schema,
             };
-            try all_tools.append(allocator, wrapper.tool());
+            // tool() took a server reference for this wrapper; undo it when
+            // the append fails, since the errdefer destroys the wrapper
+            // without going through deinit.
+            all_tools.append(allocator, wrapper.tool()) catch |err| {
+                server.wrappers -= 1;
+                return err;
+            };
             transferred_count += 1;
         }
 
@@ -1014,4 +1035,53 @@ test "extractJsonFromSse reuses non-SSE fallback buffer" {
     const got = try extractJsonFromSse(std.testing.allocator, body);
     defer freeExtractedTestBody(body, got);
     try std.testing.expectEqual(body.ptr, got.ptr);
+}
+
+test "removing one mcp tool wrapper keeps shared server alive for others" {
+    // Regression: applyToolCustomizations deinits wrappers of tools disabled
+    // via tool_customizations; under the old ownership model the first
+    // wrapper (owns_server = idx == 0) freed the whole shared McpServer
+    // while the remaining wrappers still pointed at it, segfaulting
+    // (exit 139) on the next tools/call. Wrappers now share the server by
+    // reference count: deinit of one wrapper keeps the server alive for the
+    // rest, and the last deinit frees it exactly once. The test uses only
+    // the pre-fix API surface: it compiles on unpatched main, where it
+    // fails with a use-after-free (ABRT), and passes with the fix.
+    const alloc = std.testing.allocator;
+
+    const server = try alloc.create(McpServer);
+    server.* = McpServer.init(alloc, .{ .name = "probe" });
+
+    const w0 = try alloc.create(McpToolWrapper);
+    w0.* = .{
+        .allocator = alloc,
+        .server = server,
+        .owns_server = true,
+        .original_name = try alloc.dupe(u8, "tool"),
+        .prefixed_name = try alloc.dupe(u8, "mcp_probe_tool_0"),
+        .desc = try alloc.dupe(u8, "desc"),
+        .params_json = try alloc.dupe(u8, "{}"),
+    };
+    const w1 = try alloc.create(McpToolWrapper);
+    w1.* = .{
+        .allocator = alloc,
+        .server = server,
+        .owns_server = true,
+        .original_name = try alloc.dupe(u8, "tool"),
+        .prefixed_name = try alloc.dupe(u8, "mcp_probe_tool_1"),
+        .desc = try alloc.dupe(u8, "desc"),
+        .params_json = try alloc.dupe(u8, "{}"),
+    };
+
+    // Registration point: each wrapper takes one reference on the shared
+    // server here (a no-op before the fix, where only the first wrapper
+    // owned the server outright).
+    const t0 = w0.tool();
+    const t1 = w1.tool();
+
+    // Deiniting the first wrapper must keep the shared server alive; with
+    // the bug the server is freed here and the second deinit double-frees
+    // it, which testing.allocator reports as an abort.
+    t0.deinit(alloc);
+    t1.deinit(alloc);
 }
