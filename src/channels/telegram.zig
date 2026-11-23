@@ -3490,6 +3490,18 @@ pub fn markdownToTelegramHtml(allocator: std.mem.Allocator, md: []const u8) ![]u
             continue;
         }
 
+        // ── Markdown tables at line start ──
+        // A table starts at a line containing '|' whose next line is a
+        // delimiter row (cells of optional colons + 3+ dashes). Rendered as a
+        // monospace <pre> block with per-column codepoint alignment.
+        if (line_start and isMarkdownTableStart(md, i)) {
+            const table_end = collectMarkdownTableLines(md, i);
+            try renderMarkdownTable(&buf, allocator, md, i, table_end);
+            i = table_end;
+            line_start = true;
+            continue;
+        }
+
         // ── Bullet lists at line start ──
         if (line_start and md[i] == '-' and i + 1 < md.len and md[i + 1] == ' ') {
             try buf.appendSlice(allocator, "\u{2022} "); // • bullet
@@ -3593,6 +3605,224 @@ fn findTripleBacktick(md: []const u8, from: usize) ?usize {
         pos += 1;
     }
     return null;
+}
+
+/// Return the slice bounds of a line starting at `from` (excludes '\n').
+fn lineBounds(md: []const u8, from: usize) struct { start: usize, end: usize } {
+    const end = std.mem.indexOfScalarPos(u8, md, from, '\n') orelse md.len;
+    return .{ .start = from, .end = end };
+}
+
+/// Check whether the line starting at `pos` is a table delimiter row:
+/// '|'-separated cells, each consisting of optional ':' + 3+ '-' + optional ':'.
+/// Leading/trailing empty segments from bounding pipes are dropped.
+fn isTableDelimiterRow(line: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, line, '|') == null) return false;
+
+    // Collect trimmed cells, dropping leading/trailing empty segments.
+    var cells_buf: [64][]const u8 = undefined;
+    var cell_count: usize = 0;
+    var it = std.mem.splitScalar(u8, line, '|');
+    while (it.next()) |raw_cell| {
+        if (cell_count < cells_buf.len) {
+            cells_buf[cell_count] = std.mem.trim(u8, raw_cell, " \t\r");
+        }
+        cell_count += 1;
+    }
+    var begin: usize = 0;
+    while (begin < @min(cell_count, cells_buf.len) and cells_buf[begin].len == 0) begin += 1;
+    var end_idx: usize = @min(cell_count, cells_buf.len);
+    while (end_idx > begin and cells_buf[end_idx - 1].len == 0) end_idx -= 1;
+
+    if (cell_count > cells_buf.len) return false; // absurdly wide, not a table
+    if (end_idx - begin == 0) return false;
+
+    for (cells_buf[begin..end_idx]) |cell| {
+        if (cell.len == 0) return false;
+        var dashes: usize = 0;
+        var colons: usize = 0;
+        for (cell) |c| {
+            switch (c) {
+                '-' => dashes += 1,
+                ':' => colons += 1,
+                else => return false,
+            }
+        }
+        if (dashes < 3 or colons > 2) return false;
+    }
+    return true;
+}
+
+/// Check whether a markdown table starts at byte offset `pos` (must be at
+/// line start): current line contains '|' and the next line is a delimiter row.
+fn isMarkdownTableStart(md: []const u8, pos: usize) bool {
+    const line = lineBounds(md, pos);
+    if (std.mem.indexOfScalar(u8, md[line.start..line.end], '|') == null) return false;
+    if (line.end >= md.len) return false; // no next line
+    const next = lineBounds(md, line.end + 1);
+    return isTableDelimiterRow(md[next.start..next.end]);
+}
+
+/// Collect the header line and consecutive '|' lines starting at `pos`.
+/// Returns the byte offset just past the last consumed line (including its
+/// trailing '\n' when present). The delimiter line is skipped by the caller
+/// via renderMarkdownTable.
+fn collectMarkdownTableLines(md: []const u8, pos: usize) usize {
+    var cursor = pos;
+    var line_count: usize = 0;
+    while (cursor < md.len) {
+        const line = lineBounds(md, cursor);
+        if (line_count > 0 and (line.end == line.start or
+            std.mem.indexOfScalar(u8, md[line.start..line.end], '|') == null)) break;
+        line_count += 1;
+        if (line.end >= md.len) {
+            cursor = md.len;
+        } else {
+            cursor = line.end + 1;
+        }
+    }
+    return cursor;
+}
+
+/// Count UTF-8 codepoints in `s` (used for column alignment with Cyrillic text).
+fn countCodepoints(s: []const u8) usize {
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (idx < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[idx]) catch 1;
+        idx += len;
+        count += 1;
+    }
+    return count;
+}
+
+/// Split a table row into trimmed cells: split on '|', trim each cell,
+/// drop leading/trailing empty segments, pad to `column_count` with empty cells.
+fn splitTableRowCells(allocator: std.mem.Allocator, line: []const u8, column_count: usize) ![][]const u8 {
+    var cells: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer cells.deinit(allocator);
+
+    var it = std.mem.splitScalar(u8, line, '|');
+    while (it.next()) |raw_cell| {
+        try cells.append(allocator, std.mem.trim(u8, raw_cell, " \t\r"));
+    }
+    // Drop leading/trailing empty segments (from surrounding pipes).
+    var begin: usize = 0;
+    while (begin < cells.items.len and cells.items[begin].len == 0) begin += 1;
+    var end_idx: usize = cells.items.len;
+    while (end_idx > begin and cells.items[end_idx - 1].len == 0) end_idx -= 1;
+
+    const kept_count = end_idx - begin;
+    // GFM semantics: rows are clamped to `column_count` — excess cells are
+    // silently dropped, missing cells are padded with "" below. When no
+    // column count is known yet (column_count == 0, header probing), keep at
+    // least one slot so a non-empty row is never rendered as zero columns.
+    const out_count = if (column_count > 0) column_count else @max(kept_count, 1);
+    const out = try allocator.alloc([]const u8, out_count);
+    errdefer allocator.free(out);
+    for (out, 0..) |*slot, idx| {
+        if (idx < kept_count) {
+            slot.* = cells.items[begin + idx];
+        } else {
+            slot.* = "";
+        }
+    }
+    cells.deinit(allocator);
+    return out;
+}
+
+/// Render a markdown table (header line at `start`, last consumed byte at
+/// `end`) as a monospace `<pre>` block with per-column codepoint alignment.
+/// Embedded '|' in a cell deterministically splits into an extra cell.
+fn renderMarkdownTable(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, md: []const u8, start: usize, end: usize) !void {
+    var row_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer row_lines.deinit(allocator);
+
+    var cursor = start;
+    var row_idx: usize = 0;
+    while (cursor < end) {
+        const line = lineBounds(md, cursor);
+        const line_slice = md[line.start..@min(line.end, end)];
+        const is_delimiter = row_idx == 1 and isTableDelimiterRow(line_slice);
+        if (!is_delimiter and line_slice.len > 0) {
+            // Strip a trailing '\r' (CRLF input) so it cannot pollute the
+            // last cell's content or the column widths.
+            try row_lines.append(allocator, std.mem.trimEnd(u8, line_slice, "\r"));
+        }
+        if (line.end >= end or line.end >= md.len) break;
+        cursor = line.end + 1;
+        row_idx += 1;
+    }
+
+    if (row_lines.items.len == 0) return;
+
+    // Split all rows into cells; first row defines the column count.
+    var rows: std.ArrayListUnmanaged([][]const u8) = .empty;
+    defer {
+        for (rows.items) |cells| allocator.free(cells);
+        rows.deinit(allocator);
+    }
+
+    // First row defines the column count; an all-whitespace header row
+    // defines none (GFM-style fallback: data rows define the shape).
+    var column_count: usize = 0;
+    {
+        const first_cells = try splitTableRowCells(allocator, row_lines.items[0], 0);
+        defer allocator.free(first_cells);
+        var all_empty = true;
+        for (first_cells) |cell| {
+            if (cell.len > 0) all_empty = false;
+        }
+        if (!all_empty) column_count = first_cells.len;
+    }
+
+    // All-whitespace header: derive the column count from the widest data
+    // row. splitTableRowCells(line, 0) returns exactly the row's kept-cell
+    // count unless the row is entirely empty (kept 0 inflates to 1 empty
+    // cell), so a single empty result contributes 0 columns.
+    if (column_count == 0) {
+        for (row_lines.items[1..]) |line| {
+            const cells = try splitTableRowCells(allocator, line, 0);
+            defer allocator.free(cells);
+            const effective = if (cells.len == 1 and cells[0].len == 0) 0 else cells.len;
+            if (effective > column_count) column_count = effective;
+        }
+    }
+
+    for (row_lines.items) |line| {
+        const cells = try splitTableRowCells(allocator, line, column_count);
+        try rows.append(allocator, cells);
+    }
+
+    // Degenerate table (no columns anywhere, e.g. header and all rows are
+    // empty/bounding pipes only): skip rendering the block entirely so
+    // widths.len is never 0 and no widths[col] access can go out of bounds.
+    if (column_count == 0) return;
+
+    // Column width = max raw codepoint count per column.
+    const widths = try allocator.alloc(usize, column_count);
+    defer allocator.free(widths);
+    @memset(widths, 0);
+    for (rows.items) |cells| {
+        for (cells, 0..) |cell, col| {
+            const cp = countCodepoints(cell);
+            if (cp > widths[col]) widths[col] = cp;
+        }
+    }
+
+    try buf.appendSlice(allocator, "<pre>");
+    for (rows.items, 0..) |cells, r| {
+        if (r > 0) try buf.append(allocator, '\n');
+        try buf.append(allocator, '|');
+        for (cells, 0..) |cell, col| {
+            try buf.append(allocator, ' ');
+            try appendHtmlEscaped(buf, allocator, cell);
+            const pad = widths[col] - countCodepoints(cell);
+            for (0..pad) |_| try buf.append(allocator, ' ');
+            try buf.appendSlice(allocator, " |");
+        }
+    }
+    try buf.appendSlice(allocator, "</pre>\n");
 }
 
 /// Escape HTML entities for Telegram HTML parse_mode.
@@ -4381,6 +4611,112 @@ test "telegram markdownToTelegramHtml multiline blockquote followed by paragraph
     const html = try markdownToTelegramHtml(std.testing.allocator, "> line 1\n> \n> line 2\nVisible answer");
     defer std.testing.allocator.free(html);
     try std.testing.expectEqualStrings("<blockquote>line 1\n\nline 2\n</blockquote>Visible answer", html);
+}
+
+test "telegram markdownToTelegramHtml table two columns aligned" {
+    const md = "| Name | Value |\n|---|---|\n| alpha | one |\n| beta | two |";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>| Name  | Value |\n| alpha | one   |\n| beta  | two   |</pre>\n",
+        html,
+    );
+}
+
+test "telegram markdownToTelegramHtml table escapes HTML entities" {
+    const md = "| A & B | C < D |\n|---|---|\n| x > y | z\"w |";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    // Column widths are raw codepoint counts (A & B = 5, x > y = 5; C < D = 5,
+    // z"w = 3), so padding is computed before HTML escaping widens the cells.
+    try std.testing.expectEqualStrings(
+        "<pre>| A &amp; B | C &lt; D |\n| x &gt; y | z&quot;w   |</pre>\n",
+        html,
+    );
+}
+
+test "telegram markdownToTelegramHtml table between paragraphs" {
+    const md = "Intro paragraph.\n\n| H1 | H2 |\n|---|---|\n| a | b |\n\nOutro paragraph.";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "Intro paragraph.\n\n<pre>| H1 | H2 |\n| a  | b  |</pre>\n\nOutro paragraph.",
+        html,
+    );
+}
+
+test "telegram markdownToTelegramHtml single pipe without delimiter is passthrough" {
+    const html = try markdownToTelegramHtml(std.testing.allocator, "a | b | c\nplain text");
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("a | b | c\nplain text", html);
+}
+
+// Regression: data row with more cells than the header previously indexed
+// widths out of bounds; rows are now clamped to the header column count (GFM).
+test "telegram markdownToTelegramHtml table extra cell clamped to header columns" {
+    const md = "| Name | Value |\n|---|---|\n| alpha | one | extra |\n| beta | two |";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>| Name  | Value |\n| alpha | one   |\n| beta  | two   |</pre>\n",
+        html,
+    );
+}
+
+// Regression: all-whitespace header cells previously yielded zero widths and
+// an out-of-bounds panic; the column count now falls back to the data rows.
+test "telegram markdownToTelegramHtml table whitespace header uses data row columns" {
+    const md = "|   |   |\n|---|---|\n| a | bb |\n| ccc | d |";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>|     |    |\n| a   | bb |\n| ccc | d  |</pre>\n",
+        html,
+    );
+}
+
+// Pins the codepoint-count padding claimed for Cyrillic cells (bytes != columns).
+test "telegram markdownToTelegramHtml table cyrillic aligned by codepoints" {
+    const md = "| параметр | значение |\n|---|---|\n| альфа | один |\n| бета | два |";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>| параметр | значение |\n| альфа    | один     |\n| бета     | два      |</pre>\n",
+        html,
+    );
+}
+
+// Delimiter rows without bounding pipes still trigger table rendering (GFM).
+test "telegram markdownToTelegramHtml table delimiter without bounding pipes" {
+    const md = "| a | b |\n--- | ---\n| c | d |\nplain";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>| a | b |\n| c | d |</pre>\nplain",
+        html,
+    );
+}
+
+// Regression: CRLF line endings previously leaked '\r' into the last cell;
+// a CRLF table now renders exactly like its LF counterpart.
+test "telegram markdownToTelegramHtml table crlf rendered like lf" {
+    const md = "| a | b |\r\n|---|---|\r\n| c | d |\r\n";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>| a | b |\n| c | d |</pre>\n",
+        html,
+    );
+}
+
+test "telegram markdownToTelegramHtml table at eof without trailing newline" {
+    const md = "| H | L |\n|---|---|\n| x | y |";
+    const html = try markdownToTelegramHtml(std.testing.allocator, md);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>| H | L |\n| x | y |</pre>\n",
+        html,
+    );
 }
 
 test "telegram markdownToTelegramHtml escapes HTML entities" {
